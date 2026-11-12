@@ -1,0 +1,44 @@
+[
+  {
+    "file": "arith.rs",
+    "stdout": "-2147483648\n0\n-67153019\n4294967295\n4\n3 -3 -1\n3.5\n6000000000\n4294967295\n44\n0\n2147483647\n3\n-1\n2147483648 134217728\n-4 15\n2 7 5\n255\n1024\n1870418611\n2\n3\n-3\n5000000000\n65\na\n1\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "assert_msg.rs",
+    "stdout": "tri(10) = 55\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at assert_msg.rs:13:5:\nassertion `left == right` failed: tri(4) should be eleven\n  left: 10\n right: 11"
+  },
+  {
+    "file": "control.rs",
+    "stdout": "negative zero positive\n832040\n8\n111\nshadowed\n10\n3-4-5\n0 1 2 \n2 1 0 \n1 2 3 \n4 3 2 1 \n6 7\n3\nbig\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "format.rs",
+    "stdout": "crab has 10 legs\na b a\ncrab!\n[    crab] [crab    ] [  crab  ] [**crab***]\n[   10] [10   ] [-0010] [+10]\n3.14 3    3.142|\n\"crab\" 'c' \"tab\\there \\\"quoted\\\"\"\n1 1.0 0.30000000000000004 1e21\ninf -inf\n0.0000001 1e-7\n{literal} braces\n10-crab has len 7\n6\ntru\nCRAB\npadded\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "mandelbrot.rs",
+    "stdout": "\n                                        +.\n                                       .....#\n                                      ...++...\n                                   ....+####+..\n                               ........+####+......+\n                             ....+#++##########+.++++\n                           ....+.##################+..\n                  .............+###################+.+\n                 ...++.+++....+#####################+..\n                ....+#######++######################+.\n          .......+++#########+######################..\n    ##############################################....\n          .......+++#########+######################..\n                ....+#######++######################+.\n                 ...++.+++....+#####################+..\n                  .............+###################+.+\n                           ....+.##################+..\n                             ....+#++##########+.++++\n                               ........+####+......+\n                                   ....+####+..\n                                      ...++...\n                                       .....+\n                                        +.\ntotal iterations: 24818\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "numbers.rs",
+    "stdout": "1229 primes below 10000, largest 9973\ngcd(1071, 462) = 21\nsum of squares = 333833500\n1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz \n723471715 2497366906 2064144800 2008045182 3532304609 \n         609|76          |    3368    |\nhash = 1294555236\n1.4142 0.0000 2.7183\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "panic.rs",
+    "stdout": "5\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic.rs:3:9:\ncannot divide 1 by zero"
+  }
+]

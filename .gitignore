@@ -1,0 +1,5 @@
+/compiler/target/
+/pkg/
+/pkg-node/
+/node_modules/
+/test/out/

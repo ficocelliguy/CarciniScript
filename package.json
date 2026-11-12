@@ -1,0 +1,36 @@
+{
+  "name": "carciniscript",
+  "version": "0.1.0",
+  "description": "Compile a subset of Rust to ES modules with source maps, in the browser, at runtime.",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./node": {
+      "types": "./index.d.ts",
+      "default": "./node.cjs"
+    },
+    "./runtime": "./runtime/rt.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "node.cjs",
+    "pkg/",
+    "pkg-node/",
+    "runtime/"
+  ],
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "test": "node tools/build.mjs && cd compiler && cargo test && cd .. && node test/run.mjs",
+    "repl": "node tools/serve.mjs",
+    "test:browser": "node tools/browser-check.mjs",
+    "record-native": "node tools/record-native.mjs",
+    "sweep": "cd compiler && cargo run --release --example sweep --"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CarciniScript REPL</title>
+    <link rel="stylesheet" href="repl.css" />
+  </head>
+  <body>
+    <header>
+      <h1>CarciniScript <span class="sub">Rust → JS, in the browser</span></h1>
+      <label class="examples">
+        Example
+        <select id="examples"></select>
+      </label>
+      <button id="run" class="primary" title="Ctrl+Enter">▶ Run</button>
+      <button id="stop" disabled>■ Stop</button>
+      <button id="selftest">Self-test</button>
+      <span id="status" class="status">loading compiler…</span>
+    </header>
+    <main>
+      <section class="pane left">
+        <div class="pane-title">
+          <span id="filename">main.rs</span>
+          <span id="diag-summary" class="muted"></span>
+        </div>
+        <div id="rust-editor" class="editor"></div>
+        <ul id="diagnostics"></ul>
+      </section>
+      <section class="pane right">
+        <nav class="tabs">
+          <button data-tab="output" class="active">Output</button>
+          <button data-tab="js">Generated JS</button>
+          <button data-tab="selftest-panel">Self-test</button>
+          <span id="map-hint" class="muted"></span>
+        </nav>
+        <div id="output" class="tab-panel active"><pre id="output-log"></pre></div>
+        <div id="js" class="tab-panel"><div id="js-editor" class="editor"></div></div>
+        <div id="selftest-panel" class="tab-panel"><div id="selftest-results" class="muted">Run the self-test to verify the compiler in this browser.</div></div>
+      </section>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+    <script type="module" src="repl.js"></script>
+  </body>
+</html>

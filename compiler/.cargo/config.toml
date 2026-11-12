@@ -1,0 +1,4 @@
+# ra_ap_syntax drops parse trees on a background thread unless this cfg is set. wasm32 has no
+# threads, so the first dropped tree panics.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "no_salsa_async_drops"]
