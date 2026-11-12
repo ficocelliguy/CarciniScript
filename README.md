@@ -56,6 +56,11 @@ npm test
 
 ## Web REPL
 
+Try it online: **https://ficocelliguy.github.io/CarciniScript/**
+(rebuilt and deployed by `.github/workflows/pages.yml` on every push to `main`).
+
+To run it locally:
+
 ```sh
 npm run build && npm run repl     # then open http://localhost:8765/web-repl/
 ```

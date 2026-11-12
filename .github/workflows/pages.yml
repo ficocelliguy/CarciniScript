@@ -1,0 +1,62 @@
+# Builds the compiler to wasm and publishes the web REPL to GitHub Pages.
+# The site mirrors the repo layout the REPL expects (it loads ../index.js, ../pkg/, ../runtime/,
+# ../test/ fixtures and ../compiler/src/ for the self-test), with / redirecting to /web-repl/.
+name: Deploy web REPL to Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+      # Must match the wasm-bindgen crate version in compiler/Cargo.lock.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.130
+      - run: node tools/build.mjs
+      - name: Assemble site
+        run: |
+          mkdir -p _site/test _site/compiler
+          cp -r index.js pkg runtime web-repl _site/
+          cp -r test/fixtures test/ns _site/test/
+          cp -r compiler/src _site/compiler/
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8" />
+          <title>CarciniScript REPL</title>
+          <meta http-equiv="refresh" content="0; url=web-repl/" />
+          <a href="web-repl/">CarciniScript REPL</a>
+          HTML
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
