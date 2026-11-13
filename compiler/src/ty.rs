@@ -102,11 +102,26 @@ pub enum Ty {
     Str,
     Unit,
     Never,
-    /// The Netscript handle or one of its namespaces. Methods get snake_case → camelCase.
-    Ns,
+    /// A JS interface from the typed bindings (`NS`, `Server`, `Hacknet`, ...). Without bindings,
+    /// `NS` is untyped: any method or field is allowed and snake_case maps to camelCase.
+    Extern(String),
     Fn,
     /// The result of calling an `async fn`; `.await` unwraps it.
     Future(Box<Ty>),
+    /// `Vec<T>`. Slices (`&[T]`) and fixed-size arrays (`[T; N]`) are represented the same way:
+    /// all of them are JS arrays.
+    Vec(Box<Ty>),
+    /// `Option<T>`: `None` is `null` (and `undefined` from JS reads as `None`), `Some(x)` is `x`
+    /// itself. `Option<Option<T>>` and `Option<()>` would be ambiguous, so they're rejected.
+    Option(Box<Ty>),
+    /// What `v.iter()` / `v.iter_mut()` / `v.into_iter()` return. Only usable as a `for` loop
+    /// source until iterator adapters land.
+    Iter {
+        elem: Box<Ty>,
+        mutable: bool,
+    },
+    /// A type-inference variable. Only exists inside the type checker; never reaches codegen.
+    Var(u32),
     /// No type information (e.g. NS return values until phase 2 bindings). Lowered with plain JS
     /// semantics.
     Unknown,
@@ -123,7 +138,7 @@ impl Ty {
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             "String" | "str" => Ty::Str,
-            "NS" => Ty::Ns,
+            "NS" => Ty::Extern("NS".into()),
             _ => Ty::Unknown,
         }
     }
@@ -138,6 +153,40 @@ impl Ty {
             Ty::Int(IntKind::I32)
         } else {
             self
+        }
+    }
+
+    /// Values that are immutable in JS (numbers, strings, booleans), so copying a container of
+    /// them needs only a shallow copy.
+    pub fn is_js_primitive(&self) -> bool {
+        matches!(
+            self,
+            Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str
+        )
+    }
+
+    /// JS expression for `T::default()`, for `unwrap_or_default`.
+    pub fn default_js(&self) -> Option<&'static str> {
+        Some(match self {
+            Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => "0",
+            Ty::Bool => "false",
+            Ty::Str => "\"\"",
+            Ty::Char => r#""\0""#,
+            Ty::Vec(_) => "[]",
+            Ty::Option(_) => "null",
+            _ => return None,
+        })
+    }
+
+    /// Option types the null representation can't express.
+    pub fn has_ambiguous_option(&self) -> bool {
+        match self {
+            Ty::Option(inner) => {
+                matches!(**inner, Ty::Option(_) | Ty::Unit) || inner.has_ambiguous_option()
+            }
+            Ty::Vec(e) | Ty::Future(e) => e.has_ambiguous_option(),
+            Ty::Iter { elem, .. } => elem.has_ambiguous_option(),
+            _ => false,
         }
     }
 
@@ -171,10 +220,102 @@ impl Ty {
             Ty::Str => "String".into(),
             Ty::Unit => "()".into(),
             Ty::Never => "!".into(),
-            Ty::Ns => "NS".into(),
+            Ty::Extern(name) => name.clone(),
             Ty::Fn => "fn".into(),
             Ty::Future(t) => format!("impl Future<Output = {}>", t.describe()),
+            Ty::Vec(t) => format!("Vec<{}>", t.describe()),
+            Ty::Option(t) => format!("Option<{}>", t.describe()),
+            Ty::Iter {
+                elem,
+                mutable: false,
+            } => format!("std::slice::Iter<'_, {}>", elem.describe()),
+            Ty::Iter {
+                elem,
+                mutable: true,
+            } => format!("std::slice::IterMut<'_, {}>", elem.describe()),
+            Ty::Var(_) => "_".into(),
             Ty::Unknown => "{unknown}".into(),
         }
     }
+}
+
+/// Path segments with a leading `std::` / `core::` removed (`std::f64::consts::PI` → `f64::consts::PI`).
+pub fn std_tail<'a>(segs: &'a [&'a str]) -> &'a [&'a str] {
+    match segs {
+        ["std" | "core", rest @ ..] => rest,
+        all => all,
+    }
+}
+
+/// A std constant such as `i32::MAX` or `f64::consts::PI`, as a JS expression and its type.
+pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
+    if let [ty_name, konst] = tail {
+        if let Ty::Int(k) = Ty::from_name(ty_name) {
+            let (min, max) = k.min_max();
+            match *konst {
+                "MAX" => return Some((max, Ty::Int(k))),
+                "MIN" => return Some((min, Ty::Int(k))),
+                _ => {}
+            }
+        }
+        if let Ty::Float { f32 } = Ty::from_name(ty_name) {
+            let v = match *konst {
+                "INFINITY" => "Infinity",
+                "NEG_INFINITY" => "-Infinity",
+                "NAN" => "NaN",
+                "MAX" if !f32 => "Number.MAX_VALUE",
+                "MIN" if !f32 => "-Number.MAX_VALUE",
+                "EPSILON" if !f32 => "Number.EPSILON",
+                _ => return None,
+            };
+            return Some((v, Ty::Float { f32 }));
+        }
+    }
+    if let [ty @ ("f64" | "f32"), "consts", c] = tail {
+        let v = match *c {
+            "PI" => "Math.PI",
+            "E" => "Math.E",
+            "TAU" => "(2 * Math.PI)",
+            "SQRT_2" => "Math.SQRT2",
+            "LN_2" => "Math.LN2",
+            "LN_10" => "Math.LN10",
+            _ => return None,
+        };
+        return Some((v, Ty::Float { f32: *ty == "f32" }));
+    }
+    None
+}
+
+/// Float method names CarciniScript lowers. Values of unknown type (NS results until typed
+/// bindings land) are assumed to be `f64` when one of these is called on them.
+pub fn is_float_method(m: &str) -> bool {
+    matches!(
+        m,
+        "sqrt"
+            | "abs"
+            | "floor"
+            | "ceil"
+            | "trunc"
+            | "round"
+            | "exp"
+            | "ln"
+            | "log10"
+            | "log2"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "cbrt"
+            | "powi"
+            | "powf"
+            | "min"
+            | "max"
+            | "clamp"
+            | "is_nan"
+            | "is_finite"
+            | "to_string"
+    )
 }

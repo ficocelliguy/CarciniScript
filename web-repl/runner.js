@@ -88,7 +88,7 @@ self.onmessage = async ({ data }) => {
   const { code, sourceMap, filename, runtimeUrl, mock } = data;
   try {
     await import(runtimeUrl);
-    __crs.$setOutput(
+    κσ.$setOutput(
       (text) => post("out", { text }),
       (text) => post("err", { text }),
     );
@@ -104,10 +104,10 @@ self.onmessage = async ({ data }) => {
     const ns = mock === "hack-fixture" ? hackFixtureNs() : genericNs();
     const start = performance.now();
     await mod.main(ns);
-    __crs.$flush();
+    κσ.$flush();
     post("done", { exitCode: 0, ms: performance.now() - start });
   } catch (e) {
-    globalThis.__crs?.$flush();
+    globalThis.κσ?.$flush();
     if (e?.name === "CarciniPanic") {
       post("panic", { message: e.panicMessage, location: e.location });
       post("done", { exitCode: 101 });

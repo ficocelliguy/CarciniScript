@@ -30,15 +30,69 @@
     "panic": null
   },
   {
+    "file": "matching.rs",
+    "stdout": "negative zero small digit big even big odd \nABCF\nvowel consonant digit smiley other \nSome(4) None None\non\ngreen\ntotal 206 after 7\nsum 1023\nnot found\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "numbers.rs",
     "stdout": "1229 primes below 10000, largest 9973\ngcd(1071, 462) = 21\nsum of squares = 333833500\n1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz \n723471715 2497366906 2064144800 2008045182 3532304609 \n         609|76          |    3368    |\nhash = 1294555236\n1.4142 0.0000 2.7183\n",
     "exitCode": 0,
     "panic": null
   },
   {
+    "file": "option.rs",
+    "stdout": "Some(1) None\ntrue false false true\n4 -1 0\nSome(4) None Some(\"text\")\ntrue true\nSome(10) None\nNone Some(20)\nholds 9 | empty\ndigits: 113\nSome(1) Some(3) Some(2) None\n[30, 20, 10] None None\nlast word bb has 2 bytes\n[Some(\"x\"), None]\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at option.rs:76:23:\nthe reading should exist"
+  },
+  {
     "file": "panic.rs",
     "stdout": "5\n",
     "exitCode": 101,
     "panic": "thread 'main' panicked at panic.rs:3:9:\ncannot divide 1 by zero"
+  },
+  {
+    "file": "panic_option_unwrap.rs",
+    "stdout": "looking\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_option_unwrap.rs:4:19:\ncalled `Option::unwrap()` on a `None` value"
+  },
+  {
+    "file": "panic_vec_index_assign.rs",
+    "stdout": "before\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_vec_index_assign.rs:5:6:\nindex out of bounds: the len is 3 but the index is 4"
+  },
+  {
+    "file": "panic_vec_insert.rs",
+    "stdout": "before\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_vec_insert.rs:5:7:\ninsertion index (is 4) should be <= len (is 3)"
+  },
+  {
+    "file": "panic_vec_remove.rs",
+    "stdout": "before\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_vec_remove.rs:5:7:\nremoval index (is 4) should be < len (is 3)"
+  },
+  {
+    "file": "panic_vec_swap.rs",
+    "stdout": "before\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_vec_swap.rs:5:7:\nindex out of bounds: the len is 3 but the index is 4"
+  },
+  {
+    "file": "try_option.rs",
+    "stdout": "Some(427)\nNone\nNone\nSome(4) None\nSome(4)\nSome(12)\nNone\nNone\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "vec.rs",
+    "stdout": "[4, 3] len=2\nsorted [1, 1, 2, 3, 4, 5, 6, 9]\n[100, 6, 5, 4, 3, 2, 1, 1] removed=9 contains 5: true contains 7: false\ndoubled [200, 12, 10, 8, 6, 4, 2, 2]\ntruncated [200, 12, 10] empty=false\ncleared [] empty=true\nsum = 4000000005\n17 primes below 60: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]\n[[0, 1, 2, 3], [4, 5, -1, 7], [8, 9, 10, 11]]\ncopy unchanged: [0, 1, 2, 3] equal now: false\n[\"apple\", \"fig\", \"pear\", \"kiwi\"] -> apple, fig, pear, kiwi\ntotal length 16\n[1.0, 2.5, -0.0] ['a', '\\n']\na == b: true a != b: false\n[0, 1, 4, 9, 16] 5\ncounts [1, 1, 3]\nabout to index 5 of 3\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at vec.rs:108:26:\nindex out of bounds: the len is 3 but the index is 5"
   }
 ]

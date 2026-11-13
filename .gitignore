@@ -3,3 +3,4 @@
 /pkg-node/
 /node_modules/
 /test/out/
+.idea/

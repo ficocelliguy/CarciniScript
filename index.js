@@ -1,4 +1,4 @@
-import init, { initSync, compileJson, version } from "./pkg/carciniscript.js";
+import init, { initSync, compileJson, setNsBindings as setNsBindingsJson, version } from "./pkg/carciniscript.js";
 
 let ready = false;
 
@@ -19,6 +19,15 @@ export function initCarciniScriptSync(module) {
 export function compile(source, filename = "main.rs") {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
   return JSON.parse(compileJson(source, filename));
+}
+
+/**
+ * Install typed `NS` bindings: Rust declarations generated from NetscriptDefinitions.d.ts by
+ * `tools/dts2rs.mjs`. Returns a list of problems (empty when the bindings parsed cleanly).
+ */
+export function setNsBindings(text) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(setNsBindingsJson(text));
 }
 
 export { version };

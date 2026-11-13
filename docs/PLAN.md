@@ -13,7 +13,7 @@ integration shape as RapydScript-NS (`.py` scripts) in `bytburner-src`.
 |---|---|---|
 | Compile call | `web_repl().compile_mapped()`, sync, pure JS | Sync after one async `init()` (same as `@swc/wasm-web`) |
 | Output | ES module, `export async function main(ns)`; evaluator rewrites `import` specifiers to blob URLs | Same |
-| Runtime library | Baselib injected once onto `window` (`ρσ_*`) | Prebuilt runtime installed once on `globalThis.__crs` |
+| Runtime library | Baselib injected once onto `window` (`ρσ_*`) | Prebuilt runtime installed once on `globalThis.κσ` |
 | Source maps | v3 JSON from compiler mappings, inlined by `NetscriptJSEvaluator` | Same; no evaluator change |
 | Cross-file imports | `buildPythonVirtualFiles()` → `{ "dir/mod": code }` | Same with `.rs`; the type checker needs other files' signatures |
 | RAM cost | `parseAST()` compiles then acorn-parses the JS | Same, so output must keep literal `ns.hack(...)` member calls |
@@ -33,7 +33,7 @@ carciniscript/
   compiler/          Rust crate → wasm-bindgen
     parse            ra_ap_syntax (rust-analyzer's error-resilient parser)
     lower            CST → simplified HIR                     (phase 1)
-    typeck           local bidirectional inference            (spike: minimal)
+    typeck           whole-function inference + checking      (done for the current subset)
     codegen          HIR/AST → JS text + mapping records
     sourcemap        `sourcemap` crate → v3 JSON
   prelude/std.rs     std surface as Rust signatures + #[js = "..."] mappings   (phase 1)
@@ -64,7 +64,8 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 - **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). `i64`/`u64`/`usize`/`isize` are JS
   numbers (exact to 2^53; gap). `i128`/`u128` are BigInt. Integer `/` truncates and panics on zero;
   JS `%` already matches Rust's truncated remainder.
-- **Option:** `None` is `null` unless `T` is itself an `Option` (then tagged). The NS boundary is free.
+- **Option:** `None` is `null`, `Some(x)` is `x`. `Option<Option<T>>` and `Option<()>` are rejected.
+  The NS boundary is free: `undefined` results read as `None`.
 - **Result:** tagged object; `?` is an early return.
 - **Panics** throw `CarciniPanic` with `file:line:col` baked in at compile time.
 - **Structs/enums:** structs → classes with all `impl` blocks merged; field-less enums → numbers;
@@ -76,7 +77,7 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 - **`println!`** → `console.log`. Modules are cached across scripts, so there is no single `ns` to
   print to; scripts should use `ns.tprint(&format!(..))`.
 - **Modules:** each `.rs` file is a module; `use crate::a::b::item` → `import { item } from "a/b"`.
-- **Runtime names** live under `__crs` so none collide with NS function names in RAM calculation.
+- **Runtime names** live under `κσ` so none collide with NS function names in RAM calculation.
 
 ## Borrow checking (static, in the compiler)
 
@@ -133,8 +134,23 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      (cargo registry + std) with 0 panics.
    - [ ] Wire `.rs` into Bitburner. Done when `ns.hack(&t).await` runs, devtools breakpoints land on
      Rust lines, and RAM cost is right.
-1. **Core language:** structs, impls, enums, `match`, `Option`/`Result`/`?`, closures, `Vec`,
-   `String`, iterators, `HashMap`, derives, real type checker, move checking.
+1. **Core language:**
+   - [x] Type checker (`typeck.rs`): inference across a function body, rustc-style type and
+     mutability errors. Codegen reads its type table.
+   - [x] `Vec<T>`: `vec!`, array literals, bounds-checked indexing, mutation methods, `for` loops
+     (including `&mut`), `{:?}`, `==`, `clone`.
+   - [x] `Option`, `if let` / `while let` / `let ... else`, `match` (literals, ranges, `|`,
+     guards, `@`), exhaustiveness for `bool` / `Option` / catch-alls.
+   - [x] `?` on `Option` (`Result` comes with enums)
+   - [x] Typed NS bindings: `tools/dts2rs.mjs` generates `bindings/ns.rs` from
+     NetscriptDefinitions.d.ts; Bitburner regenerates its copy with `npm run generate:rust-bindings`
+     and a jest test fails when it's stale.
+   - [ ] Tuples and destructuring
+   - [ ] Closures and iterator adapters
+   - [ ] `HashMap` / `HashSet`
+   - [ ] `struct` + `impl` + derives, then `enum` with data
+   - [ ] Warn on `loop`/`while` with no `.await`
+   - [ ] Move checking
 2. **Multi-file:** `use` across files, virtual files, `dts2rs`, Monaco diagnostics.
 3. **Language service:** completion, hover, signature help from the checker's symbol tables.
 4. **Later:** generic trait dispatch (`T::assoc()`), `macro_rules!`, wider std, optional

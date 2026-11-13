@@ -1,11 +1,11 @@
-// CarciniScript runtime. Installs `globalThis.__crs` once. Works as a classic script (Bitburner
+// CarciniScript runtime. Installs `globalThis.κσ` once. Works as a classic script (Bitburner
 // injects it like RapydScript's baselib) or as a side-effect ES module import.
 //
 // Every helper name starts with `$` so none collide with Netscript function names: Bitburner's
 // RAM calculator charges for any identifier that matches an NS function, member properties included.
 (function () {
   "use strict";
-  if (globalThis.__crs) return;
+  if (globalThis.κσ) return;
 
   class CarciniPanic extends Error {
     constructor(message, location) {
@@ -78,6 +78,35 @@
     return c;
   }
 
+  // Rust's `==` for the values CarciniScript represents: structural for Vecs (JS arrays).
+  function eq(a, b) {
+    // `None` is null, but values from JS (NS results) may use undefined.
+    if (a == null || b == null) return a == b;
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!eq(a[i], b[i])) return false;
+      return true;
+    }
+    return a === b;
+  }
+
+  // Rust's `Ord`: numbers, bools, strings and (lexicographically) Vecs.
+  function cmp(a, b) {
+    if (Array.isArray(a) && Array.isArray(b)) {
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) {
+        const c = cmp(a[i], b[i]);
+        if (c !== 0) return c;
+      }
+      return a.length - b.length;
+    }
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  function clone(v) {
+    return Array.isArray(v) ? v.map(clone) : v;
+  }
+
   function assertFailed(op, a, b, location, debug, message) {
     const fmt = debug ?? String;
     const extra = message ? `: ${message()}` : "";
@@ -112,10 +141,10 @@
       throw new CarciniPanic(message, location);
     },
     $assertEq(a, b, location, debug, message) {
-      if (a !== b) assertFailed("==", a, b, location, debug, message);
+      if (!eq(a, b)) assertFailed("==", a, b, location, debug, message);
     },
     $assertNe(a, b, location, debug, message) {
-      if (a === b) assertFailed("!=", a, b, location, debug, message);
+      if (eq(a, b)) assertFailed("!=", a, b, location, debug, message);
     },
 
     // Integer arithmetic.
@@ -149,6 +178,75 @@
       return Math.min(Math.max(x, lo), hi);
     },
 
+    // Vec (JS arrays). Panic messages match rustc's.
+    $ix(v, i, location) {
+      if (i >= 0 && i < v.length) return i;
+      throw new CarciniPanic(`index out of bounds: the len is ${v.length} but the index is ${i}`, location);
+    },
+    $get(v, i, location) {
+      return v[rt.$ix(v, i, location)];
+    },
+    $vecRepeat(value, n, cloneEach) {
+      const v = new Array(n);
+      for (let i = 0; i < n; i++) v[i] = cloneEach ? clone(value) : value;
+      return v;
+    },
+    $vecInsert(v, i, x, location) {
+      if (i > v.length) {
+        throw new CarciniPanic(`insertion index (is ${i}) should be <= len (is ${v.length})`, location);
+      }
+      v.splice(i, 0, x);
+    },
+    $vecRemove(v, i, location) {
+      if (i >= v.length) {
+        throw new CarciniPanic(`removal index (is ${i}) should be < len (is ${v.length})`, location);
+      }
+      return v.splice(i, 1)[0];
+    },
+    $vecSwap(v, a, b, location) {
+      const x = v[rt.$ix(v, a, location)];
+      v[a] = v[rt.$ix(v, b, location)];
+      v[b] = x;
+    },
+    $vecTruncate(v, n) {
+      if (n < v.length) v.length = n;
+    },
+    $vecClear(v) {
+      v.length = 0;
+    },
+    $contains(v, x) {
+      return v.some((e) => eq(e, x));
+    },
+    // Not `push(...other)`: spreading a large array overflows the call stack.
+    $extend(v, other) {
+      for (const x of other) v.push(x);
+    },
+    $pop(v) {
+      return v.length ? v.pop() : null;
+    },
+    $first(v) {
+      return v.length ? v[0] : null;
+    },
+    $last(v) {
+      return v.length ? v[v.length - 1] : null;
+    },
+    $vget(v, i) {
+      return i >= 0 && i < v.length ? v[i] : null;
+    },
+    $eq: eq,
+
+    // Option: `None` is null (or undefined), `Some(x)` is x.
+    $unwrap(x, location) {
+      if (x == null) throw new CarciniPanic("called `Option::unwrap()` on a `None` value", location);
+      return x;
+    },
+    $expect(x, message, location) {
+      if (x == null) throw new CarciniPanic(message, location);
+      return x;
+    },
+    $cmp: cmp,
+    $clone: clone,
+
     // Strings.
     $utf8len(s) {
       let n = 0;
@@ -171,6 +269,12 @@
     },
     $dbgStr(s) {
       return `"${Array.from(s, (c) => escapeChar(c, '"')).join("")}"`;
+    },
+    $dbgOpt(x, fmt) {
+      return x == null ? "None" : `Some(${fmt(x)})`;
+    },
+    $dbgVec(v, fmt) {
+      return `[${v.map((x) => fmt(x)).join(", ")}]`;
     },
     $dbgChar(c) {
       return `'${escapeChar(c, "'")}'`;
@@ -208,5 +312,5 @@
     },
   };
 
-  globalThis.__crs = rt;
+  globalThis.κσ = rt;
 })();

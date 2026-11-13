@@ -24,7 +24,7 @@ export async function main(ns) {
     await ns.weaken(target);
   }
   const stolen = await ns.hack(target);
-  ns.tprint(`stole $${__crs.$fixed(stolen, 2)}`);
+  ns.tprint(`stole $${κσ.$fixed(stolen, 2)}`);
 }
 ```
 
@@ -37,7 +37,7 @@ export async function main(ns) {
 | Path | What |
 |---|---|
 | `compiler/` | Rust crate: `ra_ap_syntax` parser → codegen → source map. Builds to wasm (~700 KB). |
-| `runtime/rt.js` | Runtime helpers installed once on `globalThis.__crs`. |
+| `runtime/rt.js` | Runtime helpers installed once on `globalThis.κσ`. |
 | `index.js` | JS API: `initCarciniScript()`, then synchronous `compile(source, filename)`. |
 | `test/` | Differential fixtures (native rustc vs transpiled JS), NS mock scripts, source map checks. |
 | `web-repl/` | Browser REPL and self-test. |
@@ -83,11 +83,23 @@ generated JS or diagnostics without building wasm.
 ## Usage
 
 ```js
-import { initCarciniScript, compile } from "carciniscript";
-import "carciniscript/runtime"; // installs globalThis.__crs
+import { initCarciniScript, compile, setNsBindings } from "carciniscript";
+import "carciniscript/runtime"; // installs globalThis.κσ
 
 await initCarciniScript(); // once, at startup
+setNsBindings(nsBindingsText); // optional: typed NS (see below)
 const { code, sourceMap, diagnostics } = compile(source, "hack.rs");
+```
+
+### Typed NS bindings
+
+`tools/dts2rs.mjs` turns Bitburner's `NetscriptDefinitions.d.ts` into Rust declarations
+(`bindings/ns.rs`), which the compiler loads with `setNsBindings(text)`. With them, every `ns.*`
+call, field and namespace is type-checked: wrong argument types, misspelled methods ("did you
+mean"), and a forgotten `.await` are compile errors. Regenerate after NS API changes:
+
+```sh
+npm run bindings   # reads ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts
 ```
 
 `code` and `sourceMap` are `null` when there are errors. Diagnostics carry byte offsets plus

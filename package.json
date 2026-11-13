@@ -14,7 +14,8 @@
       "types": "./index.d.ts",
       "default": "./node.cjs"
     },
-    "./runtime": "./runtime/rt.js"
+    "./runtime": "./runtime/rt.js",
+    "./dts2rs": "./tools/dts2rs.mjs"
   },
   "files": [
     "index.js",
@@ -22,7 +23,8 @@
     "node.cjs",
     "pkg/",
     "pkg-node/",
-    "runtime/"
+    "runtime/",
+    "tools/dts2rs.mjs"
   ],
   "scripts": {
     "build": "node tools/build.mjs",
@@ -30,7 +32,11 @@
     "repl": "node tools/serve.mjs",
     "test:browser": "node tools/browser-check.mjs",
     "record-native": "node tools/record-native.mjs",
-    "sweep": "cd compiler && cargo run --release --example sweep --"
+    "sweep": "cd compiler && cargo run --release --example sweep --",
+    "bindings": "node tools/dts2rs.mjs ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts bindings/ns.rs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
 }

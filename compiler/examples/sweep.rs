@@ -35,6 +35,7 @@ fn main() {
         *LAST.lock().unwrap() = info.location().map(|l| l.to_string()).unwrap_or_default();
     }));
     let (mut ok, mut rejected, mut panics, mut bytes) = (0, 0, Vec::new(), 0usize);
+    let mut slowest = Vec::new();
     let start = std::time::Instant::now();
     for f in &files {
         let Ok(src) = std::fs::read_to_string(f) else {
@@ -42,7 +43,10 @@ fn main() {
         };
         bytes += src.len();
         let name = f.file_name().unwrap().to_string_lossy().to_string();
-        match std::panic::catch_unwind(|| carciniscript::compile(&src, &name)) {
+        let t0 = std::time::Instant::now();
+        let result = std::panic::catch_unwind(|| carciniscript::compile(&src, &name));
+        slowest.push((t0.elapsed(), f.clone(), src.len()));
+        match result {
             Ok(out) if out.code.is_some() => ok += 1,
             Ok(_) => rejected += 1,
             Err(e) => {
@@ -66,6 +70,10 @@ fn main() {
         start.elapsed(),
         panics.len()
     );
+    slowest.sort_by(|a, b| b.0.cmp(&a.0));
+    for (t, f, len) in slowest.iter().take(5) {
+        println!("slow {t:.2?} {} KB {}", len / 1024, f.display());
+    }
     for p in panics.iter().take(40) {
         println!("PANIC {p}");
     }

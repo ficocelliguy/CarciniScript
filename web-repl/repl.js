@@ -1,4 +1,4 @@
-import { initCarciniScript, compile, version } from "../index.js";
+import { initCarciniScript, compile, setNsBindings, version } from "../index.js";
 
 const $ = (id) => document.getElementById(id);
 const runtimeUrl = new URL("../runtime/rt.js", import.meta.url).href;
@@ -438,18 +438,20 @@ ${p.message}` : null;
 
   // 4. Runtime errors map back to Rust through the stack trace.
   {
-    const src = "pub async fn main(ns: NS) {\n    let x = 1;\n    ns.this_is_not_a_function_on_the_mock_so_it_returns_zero().await;\n    let n = ns.get_hostname();\n    ns.tprint(&format!(\"{x}\"));\n    n.foo();\n}\n";
+    // The generic mock's getServer() returns 0, so `.hostname` is undefined and `.len()` throws.
+    const src =
+      'pub async fn main(ns: NS) {\n    let x = 1;\n    let s = ns.get_server("nowhere");\n    ns.tprint(&format!("{x}"));\n    let n = s.hostname.len();\n    ns.tprint(&format!("{n}"));\n}\n';
     const out = compileTimed(src, "boom.rs");
     const maps = decodeMappings(JSON.parse(out.sourceMap).mappings);
     const { events } = await runInWorker(out.code, out.sourceMap, "boom.rs").promise;
     const err = events.find((e) => e.type === "error");
     const mapped = err ? mapStack(err.stack, maps, "boom.rs") : "";
-    add({ ok: mapped.includes("boom.rs:6:"), name: "runtime error → Rust location", detail: err ? `${err.message}` : "no error raised", pre: mapped || err?.stack });
+    add({ ok: mapped.includes("boom.rs:5:"), name: "runtime error → Rust location", detail: err ? `${err.message}` : "no error raised", pre: mapped || err?.stack });
   }
 
   // 5. Robustness: arbitrary Rust must produce diagnostics, never trap the wasm.
   {
-    const files = ["lib.rs", "codegen.rs", "fmt.rs", "ty.rs", "sourcemap.rs", "lineindex.rs"];
+    const files = ["lib.rs", "codegen.rs", "typeck.rs", "macros.rs", "bindings.rs", "fmt.rs", "ty.rs", "sourcemap.rs", "lineindex.rs"];
     let compiled = 0;
     let bytes = 0;
     const tStart = performance.now();
@@ -484,7 +486,7 @@ ${p.message}` : null;
 
     let fuzz = 0;
     crash = undefined;
-    const tokens = ["fn", "let", "mut", "if", "else", "while", "loop", "for", "in", "..", "..=", "{", "}", "(", ")", "[", "]", ";", ",", "x", "y", "1", "2.5", "\"s\"", "'c'", "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "!", "==", "<", "=", "+=", "as", "u8", "i32", "f64", "return", "break", "continue", "'a", ":", "->", "println!", "format!", "panic!", "\"{}\"", ".await", ".", "ns", "async", "pub", "match", "=>", "_", "::", "#", "struct", "impl"];
+    const tokens = ["fn", "let", "mut", "if", "else", "while", "loop", "for", "in", "..", "..=", "{", "}", "(", ")", "[", "]", ";", ",", "x", "y", "1", "2.5", "\"s\"", "'c'", "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "!", "==", "<", "=", "+=", "as", "u8", "i32", "f64", "return", "break", "continue", "'a", ":", "->", "println!", "format!", "panic!", "\"{}\"", ".await", ".", "ns", "async", "pub", "match", "=>", "_", "::", "#", "struct", "impl", "Some", "None", "@", "if let", "while let"];
     let seed = 12345;
     const rand = (n) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) % n);
     const fStart = performance.now();
@@ -511,6 +513,9 @@ ${p.message}` : null;
 async function boot() {
   const t0 = performance.now();
   await initCarciniScript();
+  // Typed NS bindings, generated from Bitburner's NetscriptDefinitions.d.ts (tools/dts2rs.mjs).
+  const bindingProblems = setNsBindings(await (await fetch("../bindings/ns.rs")).text());
+  if (bindingProblems.length) console.warn("NS bindings:", bindingProblems);
   const initMs = performance.now() - t0;
 
   const base = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/";
