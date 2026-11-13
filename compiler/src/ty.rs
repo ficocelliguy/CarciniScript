@@ -114,6 +114,21 @@ pub enum Ty {
     /// `Option<T>`: `None` is `null` (and `undefined` from JS reads as `None`), `Some(x)` is `x`
     /// itself. `Option<Option<T>>` and `Option<()>` would be ambiguous, so they're rejected.
     Option(Box<Ty>),
+    /// `(A, B, ...)` with at least one element (the empty tuple is `Unit`). A JS array.
+    Tuple(Vec<Ty>),
+    /// `HashSet<T>`: the runtime's `κσ.HashSet`, keyed by structural value.
+    Set(Box<Ty>),
+    /// `HashMap<K, V>`: the runtime's `κσ.HashMap`, keyed like `HashSet`.
+    Map(Box<Ty>, Box<Ty>),
+    /// What `map.entry(k)` returns; only usable with `.or_insert(..)` and friends.
+    Entry(Box<Ty>, Box<Ty>),
+    /// A closure or function value: `impl Fn(A, B) -> R`. A JS function.
+    Closure {
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+    },
+    /// `std::cmp::Ordering`: -1 (`Less`), 0 (`Equal`), 1 (`Greater`).
+    Ordering,
     /// What `v.iter()` / `v.iter_mut()` / `v.into_iter()` return. Only usable as a `for` loop
     /// source until iterator adapters land.
     Iter {
@@ -184,8 +199,37 @@ impl Ty {
             Ty::Option(inner) => {
                 matches!(**inner, Ty::Option(_) | Ty::Unit) || inner.has_ambiguous_option()
             }
-            Ty::Vec(e) | Ty::Future(e) => e.has_ambiguous_option(),
+            Ty::Vec(e) | Ty::Future(e) | Ty::Set(e) => e.has_ambiguous_option(),
+            Ty::Tuple(es) => es.iter().any(Ty::has_ambiguous_option),
+            Ty::Map(k, v) => k.has_ambiguous_option() || v.has_ambiguous_option(),
             Ty::Iter { elem, .. } => elem.has_ambiguous_option(),
+            _ => false,
+        }
+    }
+
+    /// Whether a float appears anywhere in the type: such types aren't `Ord` or `Hash`.
+    pub fn contains_float(&self) -> bool {
+        match self {
+            Ty::Float { .. } => true,
+            Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) => e.contains_float(),
+            Ty::Tuple(es) => es.iter().any(Ty::contains_float),
+            Ty::Map(k, v) => k.contains_float() || v.contains_float(),
+            _ => false,
+        }
+    }
+
+    /// Types with a `Default` (for `unwrap_or_default` and `entry(..).or_default()`).
+    pub fn has_default(&self) -> bool {
+        match self {
+            Ty::Int(_)
+            | Ty::IntLit
+            | Ty::Float { .. }
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Str
+            | Ty::Unit => true,
+            Ty::Vec(_) | Ty::Option(_) | Ty::Set(_) | Ty::Map(..) | Ty::Unknown => true,
+            Ty::Tuple(es) => es.iter().all(Ty::has_default),
             _ => false,
         }
     }
@@ -225,6 +269,14 @@ impl Ty {
             Ty::Future(t) => format!("impl Future<Output = {}>", t.describe()),
             Ty::Vec(t) => format!("Vec<{}>", t.describe()),
             Ty::Option(t) => format!("Option<{}>", t.describe()),
+            Ty::Tuple(es) => describe_tuple(es.iter().map(Ty::describe).collect()),
+            Ty::Set(t) => format!("HashSet<{}>", t.describe()),
+            Ty::Map(k, v) => format!("HashMap<{}, {}>", k.describe(), v.describe()),
+            Ty::Entry(k, v) => format!("Entry<'_, {}, {}>", k.describe(), v.describe()),
+            Ty::Closure { params, ret } => {
+                describe_closure(params.iter().map(Ty::describe).collect(), ret.describe())
+            }
+            Ty::Ordering => "Ordering".into(),
             Ty::Iter {
                 elem,
                 mutable: false,
@@ -236,6 +288,25 @@ impl Ty {
             Ty::Var(_) => "_".into(),
             Ty::Unknown => "{unknown}".into(),
         }
+    }
+}
+
+/// `impl Fn(A, B) -> R` (the `-> R` is left out for `()`).
+pub fn describe_closure(params: Vec<String>, ret: String) -> String {
+    let ret = if ret == "()" {
+        String::new()
+    } else {
+        format!(" -> {ret}")
+    };
+    format!("impl Fn({}){ret}", params.join(", "))
+}
+
+/// `(A, B)`, or `(A,)` for a one-element tuple.
+pub fn describe_tuple(parts: Vec<String>) -> String {
+    if parts.len() == 1 {
+        format!("({},)", parts[0])
+    } else {
+        format!("({})", parts.join(", "))
     }
 }
 

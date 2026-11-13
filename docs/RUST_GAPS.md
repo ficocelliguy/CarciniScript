@@ -27,6 +27,37 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **String sort order** compares UTF-16 code units; Rust compares UTF-8 bytes. The orders differ
   only between characters above U+FFFF and those in U+E000–U+FFFF.
 
+## Tuples and HashSet
+
+- **Tuples are JS arrays, copied at value boundaries.** Reading a tuple out of a local, field or
+  element into a `let`, an assignment, an argument, a return value or a tuple copies it, so later
+  mutation doesn't alias. A tuple stored inside a struct-like JS object from an NS call isn't
+  tracked.
+- **`HashMap::get_mut` needs a collection or tuple value.** For number, string or bool values the
+  binding would be a copy, so writes wouldn't reach the map; that's a compile error pointing to
+  `*map.entry(k).or_insert(..) += ..`. `iter_mut()` / `values_mut()` loops do write through.
+- **`HashSet` and `HashMap` iterate in insertion order.** Rust's order is unspecified (and randomized), so code
+  that depended on CarciniScript's order would already be wrong in Rust.
+
+## Closures and iterators
+
+- **`rev()` collects first.** JS iterators only go forward, so `.rev()` drains what's before it.
+  The output is the same unless the earlier adapters have side effects (`inspect`) or the
+  iterator is endless.
+- **Closure parameters are lenient about references.** `|x| ..`, `|&x| ..` and `|&&x| ..` all bind
+  the element itself; numbers and strings are values in JS either way. Rust's own type check
+  still applies to what you write, but CarciniScript accepts some forms rustc would reject.
+- **A closure passed where `&mut T` is expected can only write back through collections.** Map
+  slots (`retain`, `and_modify`) and `iter_mut().for_each` alias the real element; a named
+  function passed in their place gets a copy.
+- **`sum()` / `product()` without a type use the element type** where rustc asks for an
+  annotation.
+- **Generic functions take only `Fn`-bounded type parameters**, and each one is a single concrete
+  closure type, so a function can't be called with closures of different signatures.
+- **Strings compare by UTF-16 code units**, not bytes, in `cmp`, `sort` and `min`/`max`. The
+  order differs from Rust's only for characters outside the Basic Multilingual Plane.
+- **`windows` / `chunks` yield copies.** Rust yields borrowed slices; reading them is identical.
+
 ## Option and patterns
 
 - **`None` is `null`.** `Option<Option<T>>` and `Option<()>` can't be represented (`Some(None)`

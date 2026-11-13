@@ -13,6 +13,9 @@ use ra_ap_syntax::{
 use serde::Serialize;
 
 use crate::bindings::{self, bare};
+
+#[path = "codegen_ext.rs"]
+mod ext;
 use crate::fmt::{self, ArgRef, Piece, Spec};
 use crate::lineindex::{LineIndex, utf16_len};
 use crate::macros::{self, EDITION, MacroArg};
@@ -99,12 +102,16 @@ struct Out {
     col: u32,
     indent: usize,
     mappings: Vec<Mapping>,
+    /// (byte position in `code`, source offset) for each mapping, so captured output can be
+    /// turned back into a `Frag`.
+    marks: Vec<(usize, usize)>,
 }
 
 impl Out {
     fn write(&mut self, frag: &Frag, idx: &LineIndex) {
         for (src, text) in &frag.parts {
             if let Some(src) = src {
+                self.marks.push((self.code.len(), *src));
                 let (src_line, src_col) = idx.line_col(*src);
                 self.mappings.push(Mapping {
                     gen_line: self.line,
@@ -144,6 +151,14 @@ struct FnSig {
     params: Vec<Ty>,
     ret: Ty,
     is_async: bool,
+}
+
+/// Which part of each `[key, value]` slot a `for` loop over a map binds.
+#[derive(Clone, Copy)]
+enum MapPart {
+    Entries,
+    Keys,
+    Values,
 }
 
 /// A lowered pattern: conditions that must all hold, and `(name, mutable, js)` bindings.
@@ -293,7 +308,25 @@ fn template_escape(s: &str) -> String {
 
 /// True if lowering `node` may need to write statements before the expression that uses it.
 fn needs_hoist(node: &SyntaxNode) -> bool {
-    node.descendants().any(|n| {
+    use ra_ap_syntax::WalkEvent;
+    let mut walk = node.preorder();
+    while let Some(event) = walk.next() {
+        let WalkEvent::Enter(n) = event else { continue };
+        // A closure's body becomes its own JS function.
+        if n.kind() == SyntaxKind::CLOSURE_EXPR && &n != node {
+            walk.skip_subtree();
+            continue;
+        }
+        if hoists(&n) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Expressions that lower to statements.
+fn hoists(n: &SyntaxNode) -> bool {
+    {
         matches!(
             n.kind(),
             SyntaxKind::BLOCK_EXPR
@@ -307,7 +340,7 @@ fn needs_hoist(node: &SyntaxNode) -> bool {
                 | SyntaxKind::CONTINUE_EXPR
                 | SyntaxKind::TRY_EXPR
         )
-    })
+    }
 }
 
 /// A block that is just a tail expression with nothing to hoist, so it can become a JS expression.
@@ -408,6 +441,7 @@ pub fn compile(src: &str, filename: &str) -> CompileOutput {
             col: 0,
             indent: 0,
             mappings: Vec::new(),
+            marks: Vec::new(),
         },
         diags: Vec::new(),
         fns: HashMap::new(),
@@ -604,6 +638,9 @@ impl<'a> Codegen<'a> {
             ast::Type::RefType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::ParenType(p) => p.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::TupleType(tt) if tt.fields().next().is_none() => Ty::Unit,
+            ast::Type::TupleType(tt) => {
+                Ty::Tuple(tt.fields().map(|t| self.lower_type(&t)).collect())
+            }
             ast::Type::NeverType(_) => Ty::Never,
             ast::Type::SliceType(s) => Ty::Vec(Box::new(
                 s.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
@@ -615,6 +652,10 @@ impl<'a> Codegen<'a> {
                 let seg = p.path().and_then(|p| p.segment());
                 match seg.as_ref().and_then(|s| s.name_ref()) {
                     Some(n) if n.text() == "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+                    Some(n) if n.text() == "HashSet" => Ty::Set(Box::new(Ty::Unknown)),
+                    Some(n) if n.text() == "HashMap" => {
+                        Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+                    }
                     Some(n) => Ty::from_name(n.text()),
                     None => Ty::Unknown,
                 }
@@ -691,12 +732,23 @@ impl<'a> Codegen<'a> {
 
     fn emit_fn(&mut self, f: &ast::Fn) {
         let Some(name) = f.name() else { return };
-        if let Some(gp) = f.generic_param_list()
-            && gp
-                .generic_params()
-                .any(|p| !matches!(p, ast::GenericParam::LifetimeParam(_)))
-        {
-            self.unsupported(gp.syntax(), "generic type parameters", 1);
+        // Type parameters bounded by `Fn(..)` are closure types; other generics aren't supported.
+        if let Some(gp) = f.generic_param_list() {
+            let fn_bounded: Vec<String> = crate::typeck::generic_bounds(f)
+                .into_iter()
+                .filter(|(_, b)| crate::typeck::is_fn_bound(b))
+                .map(|(n, _)| n)
+                .collect();
+            let other = gp.generic_params().any(|p| match p {
+                ast::GenericParam::LifetimeParam(_) => false,
+                ast::GenericParam::TypeParam(tp) => !tp
+                    .name()
+                    .is_some_and(|n| fn_bounded.contains(&n.text().to_string())),
+                ast::GenericParam::ConstParam(_) => true,
+            });
+            if other {
+                self.unsupported(gp.syntax(), "generic type parameters", 1);
+            }
         }
         let sig = &self.fns[name.text()];
         let (js_name, ret, is_async, param_tys) = (
@@ -847,6 +899,24 @@ impl<'a> Codegen<'a> {
             self.emit_into(&init, &Dest::Discard, declared.as_ref());
             return;
         };
+        // `let v = map.entry(k).or_insert(0);`: `v` aliases the slot's value, so `*v += 1` sticks.
+        if let ast::Expr::MethodCallExpr(m) = &init
+            && let Some(slot) = self.entry_slot(m)
+        {
+            let s = self.temp();
+            self.line(
+                Frag::mapped(start, format!("const {s} = "))
+                    .append(slot)
+                    .push(";")
+                    .clone(),
+            );
+            let local = Local {
+                js: format!("{s}[1]"),
+                ty: Ty::Unknown,
+            };
+            self.declare(name.text(), Some(name.syntax()), local);
+            return;
+        }
         let block_like = matches!(init, ast::Expr::BlockExpr(_) | ast::Expr::LoopExpr(_))
             || matches!(&init, ast::Expr::IfExpr(i) if !if_is_ternary(i));
         let (js, ty) = if block_like {
@@ -856,6 +926,7 @@ impl<'a> Codegen<'a> {
             (js, ty)
         } else {
             let (frag, ty) = self.emit_expr(&init, declared.as_ref());
+            let frag = self.by_value(&init, frag, &ty);
             // Declare after lowering the initializer: `let x = x + 1` refers to the outer `x`.
             let js = self.fresh(name.text());
             let kw = if mutable { "let" } else { "const" };
@@ -901,6 +972,8 @@ impl<'a> Codegen<'a> {
             }
             _ => {
                 let (frag, ty) = self.emit_expr(e, expected);
+                // A block's value is moved out by value: copy tuples read from places.
+                let frag = self.by_value(e, frag, &ty);
                 let returns_value = !matches!(self.ret_ty, Ty::Unit | Ty::Never);
                 let stmt = match dest {
                     Dest::Assign(t) if ty != Ty::Unit && ty != Ty::Never => {
@@ -935,6 +1008,7 @@ impl<'a> Codegen<'a> {
                 Some(v) => {
                     let ret = self.ret_ty.clone();
                     let (frag, ty) = self.emit_expr(&v, Some(&ret));
+                    let frag = self.by_value(&v, frag, &ty);
                     let mut f = Frag::mapped(start, if ty == Ty::Unit { "" } else { "return " });
                     f.append(frag).push(";");
                     self.line(f);
@@ -1142,19 +1216,39 @@ impl<'a> Codegen<'a> {
         let label = self.label_prefix(f.label());
         let Some(iterable) = f.iterable() else { return };
 
-        // Accept `a..b`, `a..=b` and `(a..b).rev()`.
+        // Numeric `a..b`, `a..=b` and `(a..b).rev()` become counting loops; everything else
+        // (char ranges, `a..`, iterator chains) iterates with `for...of`.
+        let counting = |r: &ast::RangeExpr| r.start().is_some() && r.end().is_some();
+        let char_range = matches!(
+            self.ty_of(iterable.syntax()),
+            Some(Ty::Iter { elem, .. }) if *elem == Ty::Char
+        ) || {
+            // The checker types a loop's range through its bounds.
+            let r = match &iterable {
+                ast::Expr::MethodCallExpr(m) => m.receiver().map(|r| strip_refs(&r)),
+                other => Some(other.clone()),
+            };
+            match r {
+                Some(ast::Expr::RangeExpr(r)) => r
+                    .start()
+                    .or(r.end())
+                    .is_some_and(|e| self.ty_of(e.syntax()) == Some(Ty::Char)),
+                _ => false,
+            }
+        };
         let (range, rev) = match &iterable {
+            _ if char_range => return self.emit_for_vec(f, &iterable, &label),
+            ast::Expr::RangeExpr(r) if !counting(r) => {
+                return self.emit_for_vec(f, &iterable, &label);
+            }
             ast::Expr::RangeExpr(r) => (r.clone(), false),
             ast::Expr::MethodCallExpr(m)
                 if m.name_ref().is_some_and(|n| n.text() == "rev")
                     && m.arg_list().is_some_and(|a| a.args().next().is_none()) =>
             {
                 match m.receiver().map(|r| strip_refs(&r)) {
-                    Some(ast::Expr::RangeExpr(r)) => (r, true),
-                    _ => {
-                        self.unsupported(iterable.syntax(), "`for` over iterators", 1);
-                        return;
-                    }
+                    Some(ast::Expr::RangeExpr(r)) if counting(&r) => (r, true),
+                    _ => return self.emit_for_vec(f, &iterable, &label),
                 }
             }
             _ => return self.emit_for_vec(f, &iterable, &label),
@@ -1242,45 +1336,68 @@ impl<'a> Codegen<'a> {
         self.scopes.pop();
     }
 
-    /// `for x in v` / `&v` / `v.iter()` / `v.into_iter()` become `for...of`. `for x in &mut v` /
-    /// `v.iter_mut()` iterate by index with `x` aliasing `v[i]`, so `*x = ...` writes through.
+    /// `for x in v` / `&v` / `v.iter()` / `v.into_iter()` (Vec or HashSet) become `for...of`.
+    /// `for x in &mut v` / `v.iter_mut()` iterate by index with `x` aliasing `v[i]`, so `*x = ...`
+    /// writes through. `.enumerate()` iterates by index and binds `(i, element)`. Any irrefutable
+    /// pattern can be the loop variable.
     fn emit_for_vec(&mut self, f: &ast::ForExpr, iterable: &ast::Expr, label: &str) {
         let start = self.off(f.syntax());
-        // Peel `&`, `&mut` and the iterator methods down to the Vec itself.
-        let (source, by_mut_ref) = match iterable {
+        let is_call = |e: &ast::Expr, names: &[&str]| match e {
+            ast::Expr::MethodCallExpr(m) => {
+                m.name_ref().is_some_and(|n| names.contains(&n.text()))
+                    && m.arg_list().is_some_and(|a| a.args().next().is_none())
+            }
+            _ => false,
+        };
+        let receiver = |e: &ast::Expr| match e {
+            ast::Expr::MethodCallExpr(m) => m.receiver(),
+            _ => None,
+        };
+        // Peel `.enumerate()`, then `&`, `&mut` and the iterator methods down to the collection.
+        if let Some((map, part, mutable)) = self.map_iteration(iterable) {
+            return self.emit_for_map(f, &map, part, mutable, label);
+        }
+        let enumerate = is_call(iterable, &["enumerate"]);
+        let inner = if enumerate {
+            receiver(iterable)
+        } else {
+            Some(iterable.clone())
+        };
+        let Some(inner) = inner else { return };
+        let (source, mut by_mut_ref) = match &inner {
             ast::Expr::RefExpr(r) => (r.expr(), r.mut_token().is_some()),
-            ast::Expr::MethodCallExpr(m)
-                if m.name_ref()
-                    .is_some_and(|n| matches!(n.text(), "iter" | "iter_mut" | "into_iter"))
-                    && m.arg_list().is_some_and(|a| a.args().next().is_none()) =>
-            {
-                (
-                    m.receiver(),
-                    m.name_ref().is_some_and(|n| n.text() == "iter_mut"),
-                )
+            e if is_call(e, &["iter", "iter_mut", "into_iter"]) => {
+                let mutable = matches!(e, ast::Expr::MethodCallExpr(m) if m.name_ref().is_some_and(|n| n.text() == "iter_mut"));
+                (receiver(e), mutable)
             }
             other => (Some(other.clone()), false),
         };
         let Some(source) = source else { return };
+        // Iterators (and enumerating anything but a Vec) loop over the whole expression.
+        let mut enumerate = enumerate;
+        let source_ty = self.ty_of(source.syntax()).unwrap_or(Ty::Unknown);
+        let source = match source_ty {
+            Ty::Iter { mutable: false, .. } | Ty::Set(_)
+                if !by_mut_ref && (enumerate || matches!(source_ty, Ty::Iter { .. })) =>
+            {
+                enumerate = false;
+                by_mut_ref = false;
+                iterable.clone()
+            }
+            _ => source,
+        };
         let (sf, st) = self.emit_expr(&source, None);
-        if !matches!(st, Ty::Vec(_) | Ty::Unknown) {
+        if !matches!(
+            st,
+            Ty::Vec(_) | Ty::Set(_) | Ty::Iter { mutable: false, .. } | Ty::Unknown
+        ) {
             self.unsupported(iterable.syntax(), "`for` over this iterator", 1);
             return;
         }
-        let (name, mutable) = match f.pat() {
-            Some(ast::Pat::IdentPat(ip)) if ip.name().is_some() && ip.pat().is_none() => {
-                (ip.name(), ip.mut_token().is_some())
-            }
-            Some(ast::Pat::WildcardPat(_)) => (None, false),
-            Some(other) => {
-                self.unsupported(other.syntax(), "destructuring `for` patterns", 1);
-                return;
-            }
-            None => return,
-        };
+        let Some(pat) = f.pat() else { return };
         self.scopes.push(HashMap::new());
-        if by_mut_ref {
-            // The loop variable is a place (`v[i]`), so the Vec needs a name that's safe to repeat.
+        if by_mut_ref || enumerate {
+            // Index loop. The collection needs a name that's safe to repeat.
             let place = if is_pure(&source) {
                 sf.plain()
             } else {
@@ -1295,31 +1412,68 @@ impl<'a> Codegen<'a> {
                 start,
                 format!("{label}for (let {i} = 0; {i} < {place}.length; {i}++) {{"),
             ));
-            if let Some(n) = &name {
-                let local = Local {
-                    js: format!("{place}[{i}]"),
-                    ty: Ty::Unknown,
-                };
-                self.declare(n.text(), Some(n.syntax()), local);
+            self.out.indent += 1;
+            let element = format!("{place}[{i}]");
+            let mut pc = PatCode::default();
+            match (&pat, enumerate) {
+                // `(i, x)`: bind the index and the element directly, without building a pair.
+                (ast::Pat::TuplePat(tp), true) if tp.fields().count() == 2 => {
+                    let fields: Vec<ast::Pat> = tp.fields().collect();
+                    self.lower_pat(&fields[0], &i, &mut pc);
+                    self.lower_pat(&fields[1], &element, &mut pc);
+                }
+                (_, true) => self.lower_pat(&pat, &format!("[{i}, {element}]"), &mut pc),
+                (_, false) => self.lower_pat(&pat, &element, &mut pc),
             }
+            if by_mut_ref {
+                // Element bindings alias the Vec's slots; the index stays a copy.
+                let (index_binds, element_binds): (Vec<_>, Vec<_>) =
+                    pc.binds.into_iter().partition(|(_, _, js)| *js == i);
+                self.emit_binds(index_binds);
+                self.alias_binds(element_binds);
+            } else {
+                self.emit_binds(pc.binds);
+            }
+            self.out.indent -= 1;
         } else {
-            let (var, var_off) = match &name {
-                Some(n) => (self.fresh(n.text()), self.off(n.syntax())),
+            let simple = match &pat {
+                ast::Pat::IdentPat(ip) if ip.pat().is_none() => {
+                    ip.name().map(|n| (n, ip.mut_token().is_some()))
+                }
+                _ => None,
+            };
+            let (var, var_off) = match &simple {
+                Some((n, _)) => (self.fresh(n.text()), self.off(n.syntax())),
                 None => (self.temp(), start),
             };
-            let kw = if mutable { "let" } else { "const" };
+            let kw = if simple.as_ref().is_some_and(|(_, m)| *m) {
+                "let"
+            } else {
+                "const"
+            };
             let mut head = Frag::mapped(start, format!("{label}for ("));
             head.append(Frag::mapped(var_off, format!("{kw} {var}")))
                 .push(" of ")
                 .append(sf)
                 .push(") {");
             self.line(head);
-            if let Some(n) = &name {
-                let local = Local {
-                    js: var,
-                    ty: Ty::Unknown,
-                };
-                self.declare(n.text(), Some(n.syntax()), local);
+            match simple {
+                Some((n, _)) => self.declare(
+                    n.text(),
+                    Some(n.syntax()),
+                    Local {
+                        js: var,
+                        ty: Ty::Unknown,
+                    },
+                ),
+                None => {
+                    // Destructuring: bind the pattern against the element.
+                    self.out.indent += 1;
+                    let mut pc = PatCode::default();
+                    self.lower_pat(&pat, &var, &mut pc);
+                    self.emit_binds(pc.binds);
+                    self.out.indent -= 1;
+                }
             }
         }
         self.emit_body(f.loop_body());
@@ -1413,6 +1567,14 @@ impl<'a> Codegen<'a> {
                 (Frag::text("undefined"), Ty::Never)
             }
             ast::Expr::IndexExpr(ix) => self.emit_index(ix),
+            ast::Expr::ClosureExpr(c) => (self.emit_closure(c), Ty::Unknown),
+            ast::Expr::RangeExpr(r) => (
+                self.emit_range_value(r),
+                Ty::Iter {
+                    elem: Box::new(Ty::Unknown),
+                    mutable: false,
+                },
+            ),
             ast::Expr::TryExpr(t) => {
                 // `x?`: `const $t = x; if ($t == null) return null;`, then `$t` is the value.
                 let Some(inner) = t.expr() else {
@@ -1438,6 +1600,23 @@ impl<'a> Codegen<'a> {
                 (Frag::text(tmp), value)
             }
             ast::Expr::ArrayExpr(a) => self.emit_array(a),
+            ast::Expr::TupleExpr(t) if t.fields().next().is_some() => {
+                // `(a, b)` is `[a, b]`; elements taken from places are copied.
+                let items: Vec<Frag> = t
+                    .fields()
+                    .map(|f| {
+                        let (frag, ty) = self.emit_expr(&f, None);
+                        self.by_value(&f, frag, &ty)
+                    })
+                    .collect();
+                (
+                    Frag::text("[")
+                        .append(Frag::join(items, ", "))
+                        .push("]")
+                        .clone(),
+                    Ty::Unknown,
+                )
+            }
             ast::Expr::TupleExpr(t) if t.fields().next().is_none() => {
                 (Frag::text("undefined"), Ty::Unit)
             }
@@ -1447,7 +1626,6 @@ impl<'a> Codegen<'a> {
                     ast::Expr::ClosureExpr(_) => ("closures", 1),
                     ast::Expr::TupleExpr(_) => ("tuples", 1),
                     ast::Expr::RecordExpr(_) => ("struct literals", 1),
-                    ast::Expr::RangeExpr(_) => ("ranges outside `for` loops", 1),
                     _ => ("this expression", 1),
                 };
                 self.unsupported(other.syntax(), what, phase);
@@ -1548,6 +1726,14 @@ impl<'a> Codegen<'a> {
         if let Some((js, ty)) = std_const(std_tail(&segs)) {
             return (Frag::text(js), ty);
         }
+        if let [.., "Ordering", v @ ("Less" | "Equal" | "Greater")] = segs.as_slice() {
+            let n = match *v {
+                "Less" => "-1",
+                "Equal" => "0",
+                _ => "1",
+            };
+            return (Frag::text(n), Ty::Ordering);
+        }
         if let [.., "Option", "None"] = segs.as_slice() {
             return (Frag::text("null"), Ty::Option(Box::new(Ty::Unknown)));
         }
@@ -1633,16 +1819,46 @@ impl<'a> Codegen<'a> {
                     }
                     // `v[i] = x` lowers to `v[κσ.$ix(v, i)] = x`, which evaluates `v` twice.
                     ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| is_pure(&b)),
+                    // `(a, b) = (b, a)` is JS destructuring: `[a, b] = [b, a]`.
+                    ast::Expr::TupleExpr(_) => op.is_none(),
                     _ => false,
                 };
                 if !assignable {
                     self.unsupported(lhs.syntax(), "assignment to this place", 1);
                 }
-                let (lf, lt) = self.emit_expr(&lhs, None);
+                let (lf, lt) = match &lhs {
+                    // Destructuring targets are places, so no copies: `[a, b] = ...`.
+                    ast::Expr::TupleExpr(t) => {
+                        let targets: Vec<Frag> =
+                            t.fields().map(|f| self.emit_expr(&f, None).0).collect();
+                        let ty = self.ty_of(lhs.syntax()).unwrap_or(Ty::Unknown);
+                        (
+                            Frag::text("[")
+                                .append(Frag::join(targets, ", "))
+                                .push("]")
+                                .clone(),
+                            ty,
+                        )
+                    }
+                    _ => match self.entry_slot_of(&lhs) {
+                        Some(slot) => {
+                            // Evaluate the map, key and default once: `const $t = κσ.$slot(..)`.
+                            let t = self.temp();
+                            let mut decl = Frag::text(format!("const {t} = "));
+                            decl.append(slot).push(";");
+                            self.line(decl);
+                            (
+                                Frag::text(format!("{t}[1]")),
+                                self.ty_of(lhs.syntax()).unwrap_or(Ty::Unknown),
+                            )
+                        }
+                        None => self.emit_expr(&lhs, None),
+                    },
+                };
                 let (rf, rt) = self.operand(&rhs, Some(&lt));
                 let ty = Ty::unify(&lt, &rt).default_lit();
                 let value = match op {
-                    None => rf,
+                    None => self.by_value(&rhs, rf, &rt),
                     Some(op) => match self.arith(b, op, lf.clone(), rf, &ty) {
                         // Plain JS operators keep the compound form (`x += y`).
                         Ok(f) => f,
@@ -1675,7 +1891,20 @@ impl<'a> Codegen<'a> {
             BinaryOp::CmpOp(op) => {
                 let (lf, lt) = self.operand(&lhs, None);
                 let (rf, _) = self.operand(&rhs, Some(&lt));
-                if let (Ty::Vec(_) | Ty::Option(_), CmpOp::Eq { negated }) = (&lt, op) {
+                // Tuples and Vecs order lexicographically, like Rust's derived `Ord`.
+                if let (Ty::Vec(_) | Ty::Tuple(_), CmpOp::Ord { .. }) = (&lt, op) {
+                    let mut f = Frag::text("κσ.$cmp(");
+                    f.append(lf)
+                        .push(", ")
+                        .append(rf)
+                        .push(format!(") {} 0", op));
+                    return (f, Ty::Bool);
+                }
+                if let (
+                    Ty::Vec(_) | Ty::Option(_) | Ty::Tuple(_) | Ty::Set(_) | Ty::Map(..),
+                    CmpOp::Eq { negated },
+                ) = (&lt, op)
+                {
                     let mut f = Frag::text(if negated { "!κσ.$eq(" } else { "κσ.$eq(" });
                     f.append(lf).push(", ").append(rf).push(")");
                     return (f, Ty::Bool);
@@ -1864,22 +2093,45 @@ impl<'a> Codegen<'a> {
         (out, to)
     }
 
+    /// Tuples are values in Rust but shared arrays in JS. When one is read from a place (a local,
+    /// field or element) into a by-value position, copy it so later mutation can't alias.
+    fn by_value(&self, e: &ast::Expr, f: Frag, ty: &Ty) -> Frag {
+        let place = matches!(
+            strip_refs(e),
+            ast::Expr::PathExpr(_)
+                | ast::Expr::FieldExpr(_)
+                | ast::Expr::IndexExpr(_)
+                | ast::Expr::PrefixExpr(_)
+        );
+        if place && matches!(ty, Ty::Tuple(_)) {
+            Frag::text("κσ.$clone(").append(f).push(")").clone()
+        } else {
+            f
+        }
+    }
+
     fn emit_args(&mut self, args: Option<ast::ArgList>, expected: &[Ty]) -> Vec<Frag> {
         let Some(args) = args else { return vec![] };
         args.args()
             .enumerate()
             .map(|(i, a)| {
                 let exp = expected.get(i).cloned();
-                let (f, _) = self.emit_expr(&a, exp.as_ref());
-                f
+                let (f, ty) = self.emit_expr(&a, exp.as_ref());
+                self.by_value(&a, f, &ty)
             })
             .collect()
     }
 
     fn emit_call(&mut self, c: &ast::CallExpr) -> (Frag, Ty) {
         let Some(ast::Expr::PathExpr(callee)) = c.expr() else {
-            self.unsupported(c.syntax(), "calling this expression", 1);
-            return (Frag::text("undefined"), Ty::Unknown);
+            // `make_adder(1)(2)`: the callee evaluates to a JS function.
+            let Some(e) = c.expr() else {
+                return (Frag::text("undefined"), Ty::Unknown);
+            };
+            let (mut f, _) = self.receiver(&e);
+            let args = self.emit_args(c.arg_list(), &[]);
+            f.push("(").append(Frag::join(args, ", ")).push(")");
+            return (f, Ty::Unknown);
         };
         let path = callee.path().unwrap();
         let callee_off = self.off(callee.syntax());
@@ -1901,9 +2153,12 @@ impl<'a> Codegen<'a> {
             return (arg.wrap("(", ")"), Ty::Option(Box::new(Ty::Unknown)));
         }
         if let Some(name) = path.as_single_name_ref() {
-            if self.lookup(name.text()).is_some() {
-                self.unsupported(c.syntax(), "calling local variables", 1);
-                return (Frag::text("undefined"), Ty::Unknown);
+            // A local holding a closure or function (the type checker rejects other locals).
+            if let Some(local) = self.lookup(name.text()).cloned() {
+                let args = self.emit_args(c.arg_list(), &[]);
+                let mut f = Frag::mapped(callee_off, local.js);
+                f.push("(").append(Frag::join(args, ", ")).push(")");
+                return (f, Ty::Unknown);
             }
             let Some(sig) = self.fns.get(name.text()) else {
                 self.error(
@@ -1951,6 +2206,30 @@ impl<'a> Codegen<'a> {
         };
         match tail {
             ["String", "new"] => (Frag::text("\"\""), Ty::Str),
+            [.., "HashMap", "new" | "with_capacity"] => (
+                Frag::text("new κσ.HashMap()"),
+                Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+            ),
+            [.., "HashMap", "from"] => {
+                let a = self.emit_args(c.arg_list(), &[]);
+                let arg = a.into_iter().next().unwrap_or_else(|| Frag::text("[]"));
+                (
+                    Frag::text("κσ.HashMap.from(").append(arg).push(")").clone(),
+                    Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+                )
+            }
+            [.., "HashSet", "new" | "with_capacity"] => (
+                Frag::text("new κσ.HashSet()"),
+                Ty::Set(Box::new(Ty::Unknown)),
+            ),
+            [.., "HashSet", "from"] => {
+                let a = self.emit_args(c.arg_list(), &[]);
+                let arg = a.into_iter().next().unwrap_or_else(|| Frag::text("[]"));
+                (
+                    Frag::text("κσ.HashSet.from(").append(arg).push(")").clone(),
+                    Ty::Set(Box::new(Ty::Unknown)),
+                )
+            }
             // Capacity is only a hint; JS arrays grow on their own.
             ["Vec" | "vec", "new" | "with_capacity"] => {
                 (Frag::text("[]"), Ty::Vec(Box::new(Ty::Unknown)))
@@ -1991,8 +2270,14 @@ impl<'a> Codegen<'a> {
             return (Frag::text("undefined"), Ty::Unknown);
         };
         let (rf, rt) = self.receiver(&recv);
-        if name.as_tuple_field().is_some() {
-            self.unsupported(fe.syntax(), "tuple fields", 1);
+        if let Some(i) = name.as_tuple_field() {
+            if let Ty::Tuple(es) = &rt {
+                let ty = es.get(i).cloned().unwrap_or(Ty::Unknown);
+                let mut f = rf;
+                f.append(Frag::mapped(self.off(name.syntax()), format!("[{i}]")));
+                return (f, ty);
+            }
+            self.unsupported(fe.syntax(), "fields of this type", 1);
         }
         match rt {
             Ty::Extern(type_name) => {
@@ -2023,6 +2308,17 @@ impl<'a> Codegen<'a> {
         let name_off = self.off(name.syntax());
         let method = name.text().to_string();
         let node = m.syntax().clone();
+        if let Some(f) = self.iter_mut_for_each(m) {
+            return (f, Ty::Unit);
+        }
+        if let Some(f) = self.entry_and_modify(m) {
+            return (f, Ty::Unknown);
+        }
+        if let Some(slot) = self.entry_slot(m) {
+            // The value lives at `slot[1]`, so writes through it reach the map.
+            let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            return (slot.wrap("", "[1]"), ty);
+        }
         let (rf, rt) = self.receiver(&recv);
 
         if let Ty::Extern(type_name) = &rt {
@@ -2036,6 +2332,22 @@ impl<'a> Codegen<'a> {
             return (f, Ty::Unknown);
         }
 
+        if let Some(r) = self.emit_method_ext(m, &rf, &rt, &method) {
+            return r;
+        }
+        if let Ty::Map(k, v) = &rt {
+            let (k, v) = ((**k).clone(), (**v).clone());
+            return self.emit_map_method(m, rf, &k, &v, &method);
+        }
+        if let Ty::Set(elem) = &rt {
+            let elem = (**elem).clone();
+            return self.emit_set_method(m, rf, &elem, &method);
+        }
+        if let Ty::Tuple(_) = &rt
+            && matches!(method.as_str(), "clone" | "to_owned")
+        {
+            return (Frag::text("κσ.$clone(").append(rf).push(")").clone(), rt);
+        }
         if let Ty::Option(inner) = &rt {
             let inner = (**inner).clone();
             return self.emit_option_method(m, &recv, rf, &inner, &method);
@@ -2129,7 +2441,7 @@ impl<'a> Codegen<'a> {
                     "signum" => (fcall("Math.sign", vec![rf.clone()]), rt.clone()),
                     "rem_euclid" => (fcall("κσ.$remEuclid", vec![rf.clone(), a(0)]), rt.clone()),
                     "to_string" => (fcall("String", vec![rf.clone()]), Ty::Str),
-                    _ => return self.no_method(&node, &method, &rt),
+                    _ => self.no_method(&node, &method, &rt),
                 }
             }
             (Ty::Str, m) => match m {
@@ -2158,11 +2470,11 @@ impl<'a> Codegen<'a> {
                     f.push(" += ").append(a(0));
                     (f, Ty::Unit)
                 }
-                _ => return self.no_method(&node, &method, &rt),
+                _ => self.no_method(&node, &method, &rt),
             },
             (Ty::Bool | Ty::Char, "to_string") => (fcall("String", vec![rf.clone()]), Ty::Str),
             (Ty::Unknown, _) => (mcall(rf.clone(), &method, args.clone()), Ty::Unknown),
-            _ => return self.no_method(&node, &method, &rt),
+            _ => self.no_method(&node, &method, &rt),
         }
     }
 
@@ -2221,6 +2533,10 @@ impl<'a> Codegen<'a> {
                         .push((n, ip.mut_token().is_some(), subject.to_string()));
                 }
             }
+            ast::Pat::PathPat(pp) if crate::typeck::ordering_variant(pp.path()).is_some() => {
+                let n = crate::typeck::ordering_variant(pp.path()).unwrap();
+                out.conds.push(Frag::text(format!("{subject} === {n}")));
+            }
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => {
                 out.conds.push(Frag::text(format!("{subject} == null")))
             }
@@ -2248,12 +2564,8 @@ impl<'a> Codegen<'a> {
                     let ast::Pat::LiteralPat(lp) = b? else {
                         return None;
                     };
-                    if is_char {
-                        if let Some(LiteralKind::Char(c)) = lp.literal().map(|l| l.kind()) {
-                            return Some(Frag::text(
-                                (c.value().unwrap_or('\0') as u32).to_string(),
-                            ));
-                        }
+                    if is_char && let Some(LiteralKind::Char(c)) = lp.literal().map(|l| l.kind()) {
+                        return Some(Frag::text((c.value().unwrap_or('\0') as u32).to_string()));
                     }
                     Some(cg.pat_literal(&lp))
                 };
@@ -2283,9 +2595,27 @@ impl<'a> Codegen<'a> {
                 }
                 out.conds.push(Frag::join(alts, " || ").wrap("(", ")"));
             }
+            ast::Pat::TuplePat(tp) => {
+                // Elements are `subject[i]`; `..` skips the middle, so later fields count from the end.
+                let fields: Vec<ast::Pat> = tp.fields().collect();
+                let rest = fields
+                    .iter()
+                    .position(|f| matches!(f, ast::Pat::RestPat(_)));
+                let n = match self.ty_of(p.syntax()) {
+                    Some(Ty::Tuple(es)) => es.len(),
+                    _ => fields.len() - usize::from(rest.is_some()),
+                };
+                for (i, f) in fields.iter().enumerate() {
+                    let index = match rest {
+                        Some(r) if i == r => continue,
+                        Some(r) if i > r => n - (fields.len() - i),
+                        _ => i,
+                    };
+                    self.lower_pat(f, &format!("{subject}[{index}]"), out);
+                }
+            }
             other => {
                 let what = match other {
-                    ast::Pat::TuplePat(_) => "tuple patterns",
                     ast::Pat::SlicePat(_) => "slice patterns (`[first, .., last]`)",
                     ast::Pat::RecordPat(_) | ast::Pat::TupleStructPat(_) => {
                         "struct and enum patterns"
@@ -2307,6 +2637,21 @@ impl<'a> Codegen<'a> {
             Frag::text("-").append(f).clone()
         } else {
             f
+        }
+    }
+
+    /// Bind each name to its place directly, with no copy, so writes through it reach the
+    /// original (`for (i, x) in v.iter_mut().enumerate() { *x += i }`).
+    fn alias_binds(&mut self, binds: Vec<(ast::Name, bool, String)>) {
+        for (name, _, place) in binds {
+            self.declare(
+                name.text(),
+                Some(name.syntax()),
+                Local {
+                    js: place,
+                    ty: Ty::Unknown,
+                },
+            );
         }
     }
 
@@ -2497,7 +2842,7 @@ impl<'a> Codegen<'a> {
                 f.append(a(0)).push(")");
                 (f, inner.clone())
             }
-            "unwrap_or_default" => match inner.default_js() {
+            "unwrap_or_default" => match default_value(inner) {
                 Some(d) => (rf.clone().wrap("(", &format!(" ?? {d})")), inner.clone()),
                 None => self.no_method(m.syntax(), method, &opt),
             },
@@ -2513,6 +2858,305 @@ impl<'a> Codegen<'a> {
                 (f, opt)
             }
             _ => self.no_method(m.syntax(), method, &opt),
+        }
+    }
+
+    // ---------------------------------------------------------------- HashMap
+
+    /// `map.entry(k).or_insert(d)` / `.or_default()` / `.or_insert_with(Vec::new)`: the map's
+    /// `[key, value]` storage slot for `k`, inserting the default first if the key is missing.
+    fn entry_slot(&mut self, m: &ast::MethodCallExpr) -> Option<Frag> {
+        let method = m.name_ref()?.text().to_string();
+        if !matches!(
+            method.as_str(),
+            "or_insert" | "or_default" | "or_insert_with" | "or_insert_with_key"
+        ) {
+            return None;
+        }
+        let ast::Expr::MethodCallExpr(mut entry) = m.receiver()? else {
+            return None;
+        };
+        // `.and_modify(f)` between `entry` and `or_insert`: runs only when the key exists.
+        let mut modify = None;
+        if entry.name_ref()?.text() == "and_modify" {
+            let f = entry.arg_list()?.args().next()?;
+            let ast::Expr::MethodCallExpr(inner) = entry.receiver()? else {
+                return None;
+            };
+            modify = Some(f);
+            entry = inner;
+        }
+        if entry.name_ref()?.text() != "entry" {
+            return None;
+        }
+        let Some(Ty::Entry(_, v)) = self.ty_of(entry.syntax()) else {
+            return None;
+        };
+        let (mf, _) = self.receiver(&entry.receiver()?);
+        let key = self
+            .emit_args(entry.arg_list(), &[])
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Frag::text("undefined"));
+        let mut f = Frag::mapped(self.off(m.syntax()), "κσ.$slot(");
+        f.append(mf).push(", ").append(key).push(", ");
+        match method.as_str() {
+            "or_insert" => {
+                let value = self
+                    .emit_args(m.arg_list(), &[])
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Frag::text("undefined"));
+                f.append(value);
+            }
+            // `or_insert_with(|| ..)`: the closure is the lazy default.
+            // `or_insert_with_key(|k| ..)` gets the key too. Function values are called the same way.
+            "or_insert_with" | "or_insert_with_key"
+                if m.arg_list().and_then(|a| a.args().next()).is_some_and(|a| {
+                    matches!(a, ast::Expr::ClosureExpr(_))
+                        || matches!(self.ty_of(a.syntax()), Some(Ty::Closure { .. }))
+                }) =>
+            {
+                let arg = m.arg_list().and_then(|a| a.args().next()).unwrap();
+                let thunk = self.emit_expr(&arg, None).0;
+                f.append(thunk).push(", true");
+            }
+            // The default is only built when the key is missing.
+            _ => {
+                let made = default_value(&v).unwrap_or_else(|| "undefined".into());
+                f.push(format!("() => {made}, true"));
+            }
+        }
+        if method == "or_insert" {
+            f.push(", false");
+        }
+        if let Some(modify) = modify {
+            let mf = self.slot_modifier(modify);
+            f.push(", ").append(mf);
+        }
+        f.push(")");
+        Some(f)
+    }
+
+    /// The `and_modify` closure, called with the map slot; its `v` aliases `slot[1]`.
+    fn slot_modifier(&mut self, f: ast::Expr) -> Frag {
+        match f {
+            ast::Expr::ClosureExpr(c) => {
+                let s = self.temp();
+                let subjects = vec![vec![format!("{s}[1]")]];
+                self.emit_closure_aliased(&c, vec![s], subjects)
+            }
+            other => {
+                // A function value gets a copy; it can't write back.
+                let (ff, _) = self.emit_expr(&other, None);
+                let s = self.temp();
+                Frag::text(format!("({s}) => "))
+                    .append(ff)
+                    .push(format!("({s}[1])"))
+                    .clone()
+            }
+        }
+    }
+
+    /// A bare `map.entry(k).and_modify(f);` with no `or_*` after it.
+    fn entry_and_modify(&mut self, m: &ast::MethodCallExpr) -> Option<Frag> {
+        if m.name_ref()?.text() != "and_modify" {
+            return None;
+        }
+        let ast::Expr::MethodCallExpr(entry) = m.receiver()? else {
+            return None;
+        };
+        if entry.name_ref()?.text() != "entry" {
+            return None;
+        }
+        let (mf, _) = self.receiver(&entry.receiver()?);
+        let key = self
+            .emit_args(entry.arg_list(), &[])
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Frag::text("undefined"));
+        let modifier = self.slot_modifier(m.arg_list()?.args().next()?);
+        let mut f = Frag::mapped(self.off(m.syntax()), "κσ.$andModify(");
+        f.append(mf)
+            .push(", ")
+            .append(key)
+            .push(", ")
+            .append(modifier)
+            .push(")");
+        Some(f)
+    }
+
+    /// `entry_slot` for `*map.entry(..).or_insert(..)` (the deref is erased).
+    fn entry_slot_of(&mut self, e: &ast::Expr) -> Option<Frag> {
+        match e {
+            ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => {
+                self.entry_slot_of(&p.expr()?)
+            }
+            ast::Expr::ParenExpr(p) => self.entry_slot_of(&p.expr()?),
+            ast::Expr::MethodCallExpr(m) => self.entry_slot(m),
+            _ => None,
+        }
+    }
+
+    fn emit_map_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        rf: Frag,
+        k: &Ty,
+        v: &Ty,
+        method: &str,
+    ) -> (Frag, Ty) {
+        let name_off = m.name_ref().map(|n| self.off(n.syntax())).unwrap_or(0);
+        let args = self.emit_args(m.arg_list(), &[]);
+        let a = |i: usize| {
+            args.get(i)
+                .cloned()
+                .unwrap_or_else(|| Frag::text("undefined"))
+        };
+        let call = |js: &str, rest: Vec<Frag>| {
+            let mut f = rf.clone();
+            f.push(".")
+                .append(Frag::mapped(name_off, format!("${js}(")));
+            f.append(Frag::join(rest, ", ")).push(")");
+            f
+        };
+        let opt = Ty::Option(Box::new(v.clone()));
+        let map_ty = Ty::Map(Box::new(k.clone()), Box::new(v.clone()));
+        match method {
+            "insert" => (call("insert", vec![a(0), a(1)]), opt),
+            "get" | "get_mut" => (call("get", vec![a(0)]), opt),
+            "remove" => (call("remove", vec![a(0)]), opt),
+            "contains_key" => (call("containsKey", vec![a(0)]), Ty::Bool),
+            "len" => (call("len", vec![]), Ty::Int(IntKind::Usize)),
+            "is_empty" => (call("len", vec![]).wrap("(", " === 0)"), Ty::Bool),
+            "clear" => (call("clear", vec![]), Ty::Unit),
+            "clone" | "to_owned" => (call("clone", vec![]), map_ty),
+            "entry" | "keys" | "values" | "values_mut" | "iter" | "iter_mut" | "into_iter"
+            | "into_keys" | "into_values" => {
+                let what = if method == "entry" {
+                    "`.entry(..)` without `.or_insert(..)` / `.or_default()`".to_string()
+                } else {
+                    format!("`.{method}()` outside a `for` loop")
+                };
+                self.unsupported(m.syntax(), &what, 1);
+                (Frag::text("undefined"), Ty::Unknown)
+            }
+            _ => self.no_method(m.syntax(), method, &map_ty),
+        }
+    }
+
+    /// `for .. in &map / map.iter() / .keys() / .values() / .iter_mut() / .values_mut()`: the map
+    /// expression, which part of each entry the loop binds, and whether bindings write through.
+    fn map_iteration(&self, iterable: &ast::Expr) -> Option<(ast::Expr, MapPart, bool)> {
+        let is_map = |e: &ast::Expr| matches!(self.ty_of(e.syntax()), Some(Ty::Map(..)));
+        match iterable {
+            ast::Expr::RefExpr(r) => {
+                let inner = r.expr()?;
+                is_map(&inner).then(|| (inner, MapPart::Entries, r.mut_token().is_some()))
+            }
+            ast::Expr::MethodCallExpr(m)
+                if m.arg_list().is_some_and(|a| a.args().next().is_none()) =>
+            {
+                let recv = m.receiver()?;
+                if !is_map(&recv) {
+                    return None;
+                }
+                let (part, mutable) = match m.name_ref()?.text() {
+                    "iter" | "into_iter" => (MapPart::Entries, false),
+                    "iter_mut" => (MapPart::Entries, true),
+                    "keys" | "into_keys" => (MapPart::Keys, false),
+                    "values" | "into_values" => (MapPart::Values, false),
+                    "values_mut" => (MapPart::Values, true),
+                    _ => return None,
+                };
+                Some((recv, part, mutable))
+            }
+            e if is_map(e) => Some((e.clone(), MapPart::Entries, false)),
+            _ => None,
+        }
+    }
+
+    fn emit_for_map(
+        &mut self,
+        f: &ast::ForExpr,
+        map: &ast::Expr,
+        part: MapPart,
+        mutable: bool,
+        label: &str,
+    ) {
+        let start = self.off(f.syntax());
+        let (mf, _) = self.receiver(map);
+        let Some(pat) = f.pat() else { return };
+        let slot = self.temp();
+        let mut head = Frag::mapped(start, format!("{label}for (const {slot} of "));
+        head.append(mf).push(".$slots()) {");
+        self.line(head);
+        self.scopes.push(HashMap::new());
+        self.out.indent += 1;
+        let subject = match part {
+            MapPart::Entries => slot.clone(),
+            MapPart::Keys => format!("{slot}[0]"),
+            MapPart::Values => format!("{slot}[1]"),
+        };
+        let mut pc = PatCode::default();
+        self.lower_pat(&pat, &subject, &mut pc);
+        if mutable {
+            // Bindings alias the slot, so `*v += 1` updates the map.
+            self.alias_binds(pc.binds);
+        } else {
+            self.emit_binds(pc.binds);
+        }
+        self.out.indent -= 1;
+        self.emit_body(f.loop_body());
+        self.scopes.pop();
+    }
+
+    // ---------------------------------------------------------------- HashSet
+
+    fn emit_set_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        rf: Frag,
+        elem: &Ty,
+        method: &str,
+    ) -> (Frag, Ty) {
+        let name_off = m.name_ref().map(|n| self.off(n.syntax())).unwrap_or(0);
+        let args = self.emit_args(m.arg_list(), &[]);
+        let a = |i: usize| {
+            args.get(i)
+                .cloned()
+                .unwrap_or_else(|| Frag::text("undefined"))
+        };
+        // Runtime methods are `$`-prefixed so Bitburner's RAM calculator never mistakes them for
+        // NS functions (`ns.clear` exists, for one).
+        let call = |js: &str, rest: Vec<Frag>| {
+            let mut f = rf.clone();
+            f.push(".")
+                .append(Frag::mapped(name_off, format!("${js}(")));
+            f.append(Frag::join(rest, ", ")).push(")");
+            f
+        };
+        let set_ty = Ty::Set(Box::new(elem.clone()));
+        match method {
+            "insert" => (call("insert", vec![a(0)]), Ty::Bool),
+            "contains" => (call("contains", vec![a(0)]), Ty::Bool),
+            "remove" => (call("remove", vec![a(0)]), Ty::Bool),
+            "len" => (call("len", vec![]), Ty::Int(IntKind::Usize)),
+            "is_empty" => (call("len", vec![]).wrap("(", " === 0)"), Ty::Bool),
+            "clear" => (call("clear", vec![]), Ty::Unit),
+            "clone" | "to_owned" => (call("clone", vec![]), set_ty),
+            "is_subset" => (call("isSubset", vec![a(0)]), Ty::Bool),
+            "is_superset" => (call("isSuperset", vec![a(0)]), Ty::Bool),
+            "is_disjoint" => (call("isDisjoint", vec![a(0)]), Ty::Bool),
+            "iter" | "into_iter" => {
+                self.unsupported(
+                    m.syntax(),
+                    &format!("`.{method}()` outside a `for` loop"),
+                    1,
+                );
+                (Frag::text("undefined"), Ty::Unknown)
+            }
+            _ => self.no_method(m.syntax(), method, &set_ty),
         }
     }
 
@@ -2576,6 +3220,20 @@ impl<'a> Codegen<'a> {
         }
         let (bf, bt) = self.receiver(&base);
         let (xf, _) = self.emit_expr(&index, None);
+        if let Ty::Map(_, v) = &bt {
+            // rustc reports index panics at the `[`.
+            let bracket = ix
+                .l_brack_token()
+                .map(|t| self.base + usize::from(t.text_range().start()));
+            let loc = js_string(
+                &bracket
+                    .map(|o| self.location_at(o))
+                    .unwrap_or_else(|| self.location(ix.syntax())),
+            );
+            let mut f = Frag::text("κσ.$mapIndex(");
+            f.append(bf).push(", ").append(xf).push(format!(", {loc})"));
+            return (f, (**v).clone());
+        }
         let elem = match bt {
             Ty::Vec(e) => *e,
             _ => {
@@ -2998,6 +3656,32 @@ impl<'a> Codegen<'a> {
 }
 
 /// Runtime helper that renders `{:?}` for a type, or None when Debug equals Display.
+/// A JS expression building `T::default()`.
+fn default_value(ty: &Ty) -> Option<String> {
+    Some(match ty {
+        Ty::Set(_) => "new κσ.HashSet()".into(),
+        Ty::Map(..) => "new κσ.HashMap()".into(),
+        Ty::Tuple(es) => format!(
+            "[{}]",
+            es.iter()
+                .map(default_value)
+                .collect::<Option<Vec<_>>>()?
+                .join(", ")
+        ),
+        Ty::Unit => "undefined".into(),
+        other => other.default_js()?.into(),
+    })
+}
+
+/// `[fmt0, fmt1, ...]`: one `{:?}` formatter per tuple element.
+fn tuple_formatters(es: &[Ty]) -> String {
+    let fs: Vec<String> = es
+        .iter()
+        .map(|e| debug_fn(e).unwrap_or_else(|| "String".into()))
+        .collect();
+    format!("[{}]", fs.join(", "))
+}
+
 /// A JS function that renders `{:?}` for a type, or None when `String(x)` already matches Rust.
 fn debug_fn(ty: &Ty) -> Option<String> {
     match ty {
@@ -3005,6 +3689,7 @@ fn debug_fn(ty: &Ty) -> Option<String> {
         Ty::Char => Some("κσ.$dbgChar".into()),
         Ty::Float { .. } => Some("κσ.$dbgF".into()),
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),
+        Ty::Ordering => Some("κσ.$dbgOrdering".into()),
         Ty::Vec(e) => {
             let inner = debug_fn(e).unwrap_or_else(|| "String".into());
             Some(format!("((v) => κσ.$dbgVec(v, {inner}))"))
@@ -3013,6 +3698,21 @@ fn debug_fn(ty: &Ty) -> Option<String> {
             let inner = debug_fn(e).unwrap_or_else(|| "String".into());
             Some(format!("((v) => κσ.$dbgOpt(v, {inner}))"))
         }
+        Ty::Set(e) => {
+            let inner = debug_fn(e).unwrap_or_else(|| "String".into());
+            Some(format!("((v) => κσ.$dbgSet(v, {inner}))"))
+        }
+        Ty::Map(k, v) => {
+            let (kf, vf) = (
+                debug_fn(k).unwrap_or_else(|| "String".into()),
+                debug_fn(v).unwrap_or_else(|| "String".into()),
+            );
+            Some(format!("((m) => κσ.$dbgMap(m, {kf}, {vf}))"))
+        }
+        Ty::Tuple(es) => Some(format!(
+            "((v) => κσ.$dbgTuple(v, {}))",
+            tuple_formatters(es)
+        )),
         _ => None,
     }
 }
@@ -3026,6 +3726,21 @@ fn format_value(f: Frag, ty: &Ty, spec: &Spec) -> Frag {
     let numeric = ty.is_numeric() || *ty == Ty::Unknown;
     let mut s = if spec.debug {
         match ty {
+            Ty::Tuple(es) => call("κσ.$dbgTuple", f, &format!(", {}", tuple_formatters(es))),
+            Ty::Map(k, v) => call(
+                "κσ.$dbgMap",
+                f,
+                &format!(
+                    ", {}, {}",
+                    debug_fn(k).unwrap_or_else(|| "String".into()),
+                    debug_fn(v).unwrap_or_else(|| "String".into())
+                ),
+            ),
+            Ty::Set(e) => call(
+                "κσ.$dbgSet",
+                f,
+                &format!(", {}", debug_fn(e).unwrap_or_else(|| "String".into())),
+            ),
             Ty::Option(e) => call(
                 "κσ.$dbgOpt",
                 f,

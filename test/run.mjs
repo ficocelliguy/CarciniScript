@@ -267,7 +267,7 @@ function decodeMappings(mappings) {
 // The `fn main` wrapper is added; bodies start on line 2.
 const rejected = [
   ["assign to immutable", "let x = 1;\n    x = 2;", "3:5 cannot assign twice to immutable variable `x`"],
-  ["unsupported construct", "let f = |x: i32| x + 1;", "2:13 closures is not supported yet"],
+  ["unsupported construct", "let p = Point { x: 1 };", "2:13 struct literals is not supported yet"],
   [
     "element type inferred from a later push",
     "let mut v = Vec::new();\n    v.push(1u8);\n    v.push(\"x\");",
@@ -307,6 +307,49 @@ const rejected = [
   ["incompatible match arms", 'let x = match 1 {\n        1 => 2,\n        _ => "s",\n    };', "4:14 `match` arms have incompatible types"],
   // No fixed column: reported at the first expression whose type is ambiguous.
   ["nested Option", "let x: Option<Option<i32>> = None;", "`Option<Option<i32>>` is not supported yet"],
+  ["floats in a HashSet", "let mut s = std::collections::HashSet::new();\n    s.insert(1.5);", "the trait bound `f64: Hash` is not satisfied"],
+  ["tuple field out of range", "let t = (1, 2);\n    let x = t.2;", "3:13 no field `2` on type `({integer}, {integer})`"],
+  [
+    "non-exhaustive tuple match names the missing case",
+    "let t = (true, Some(1));\n    match t {\n        (true, _) => {}\n        (false, None) => {}\n    }",
+    "3:11 non-exhaustive patterns: `(false, Some(_))` not covered",
+  ],
+  ["Display of a tuple", 'println!("{}", (1, 2));', "2:14 `({integer}, {integer})` doesn't implement `std::fmt::Display`"],
+  ["tuple pattern arity", "let (a, b, c) = (1, 2);", "2:9 mismatched types: expected a tuple with 2 elements, found one with 3"],
+  ["assigning a field of an immutable tuple", "let t = (1, 2);\n    t.0 = 5;", "3:5 cannot borrow `t` as mutable"],
+  ["ordering sets", "let a = std::collections::HashSet::from([1]);\n    let b = a.clone();\n    let x = a < b;", "4:13 `HashSet<{integer}>` can't be compared"],
+  ["float HashMap keys", "let mut m = std::collections::HashMap::new();\n    m.insert(0.5, 1);", "the trait bound `f64: Hash` is not satisfied"],
+  [
+    "assigning through a HashMap index",
+    'let mut m = std::collections::HashMap::new();\n    m.insert("a", 1);\n    m["a"] = 2;',
+    "4:5 cannot assign to data in an index of a `HashMap`",
+  ],
+  [
+    "get_mut on number values",
+    'let mut m = std::collections::HashMap::new();\n    m.insert("a", 1);\n    if let Some(v) = m.get_mut("a") {\n        *v += 1;\n    }',
+    "4:22 `HashMap::get_mut` on a map of `{integer}` values isn't supported",
+  ],
+  ["Display of a HashMap", 'let m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();\n    println!("{}", m);', "3:14 `HashMap<i32, i32>` doesn't implement `std::fmt::Display`"],
+  [
+    "or_insert_with returning the wrong type",
+    'let mut m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();\n    m.entry(1).or_insert_with(|| "five");',
+    "3:34 mismatched types: expected `i32`, found `String`",
+  ],
+  [
+    "mutating an immutable HashMap",
+    "let m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();\n    m.insert(1, 2);",
+    "3:5 cannot borrow `m` as mutable, as it is not declared as mutable",
+  ],
+  ["closure argument type", 'let f = |x: i32| x + 1;\n    f("a");', "3:7 mismatched types: expected `i32`, found `String`"],
+  ["closure arity", "let f = |x: i32| x + 1;\n    f(1, 2);", "3:5 this closure takes 1 argument but 2 were supplied"],
+  ["calling a non-function", "let x = 5;\n    x(1);", "3:5 expected function, found `{integer}`"],
+  ["closure returning the wrong type", "let v = vec![1, 2];\n    v.iter().filter(|x| 1);", "3:25 mismatched types: expected `bool`, found `{integer}`"],
+  ["sort_by without an Ordering", "let mut v = vec![1, 2];\n    v.sort_by(|a, b| a < b);", "3:22 mismatched types: expected `Ordering`, found `bool`"],
+  ["max of floats", "let v = vec![1.5, 2.0];\n    let m = v.iter().max();", "3:13 the trait bound `{float}: Ord` is not satisfied"],
+  ["collect without a target", "let v = vec![1, 2];\n    let w = v.iter().map(|x| x * 2).collect();", "3:13 type annotations needed"],
+  ["map over iter_mut", "let mut v = vec![1, 2];\n    let w: Vec<i32> = v.iter_mut().map(|x| *x).collect();", "`iter_mut()` followed by `.map()` isn't supported yet"],
+  ["Display of an Ordering", 'println!("{}", 1.cmp(&2));', "2:14 `Ordering` doesn't implement `std::fmt::Display`"],
+  ["generic without an Fn bound", "}\nfn id<T>(x: T) -> T {\n    x", "3:6 generic type parameters is not supported yet"],
   ["mixed arithmetic", "let a: i32 = 1;\n    let b: f64 = 2.0;\n    let c = a + b;", "4:13 cannot add `f64` to `i32`"],
 ];
 for (const [label, body, want] of rejected) {
@@ -321,6 +364,7 @@ for (const [label, body, want] of rejected) {
 
 // Typed NS calls and `?`. Bodies go inside `pub async fn main(ns: NS)`, starting on line 2.
 const rejectedNs = [
+  ["`.await` in a closure", "let f = || ns.sleep(10).await;", "2:16 `await` is only allowed inside `async` functions and blocks"],
   [
     "forgotten .await",
     'let stolen: f64 = ns.hack("n00dles");',

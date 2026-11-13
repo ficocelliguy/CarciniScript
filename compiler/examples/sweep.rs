@@ -70,7 +70,7 @@ fn main() {
         start.elapsed(),
         panics.len()
     );
-    slowest.sort_by(|a, b| b.0.cmp(&a.0));
+    slowest.sort_by_key(|s| std::cmp::Reverse(s.0));
     for (t, f, len) in slowest.iter().take(5) {
         println!("slow {t:.2?} {} KB {}", len / 1024, f.display());
     }

@@ -486,7 +486,7 @@ ${p.message}` : null;
 
     let fuzz = 0;
     crash = undefined;
-    const tokens = ["fn", "let", "mut", "if", "else", "while", "loop", "for", "in", "..", "..=", "{", "}", "(", ")", "[", "]", ";", ",", "x", "y", "1", "2.5", "\"s\"", "'c'", "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "!", "==", "<", "=", "+=", "as", "u8", "i32", "f64", "return", "break", "continue", "'a", ":", "->", "println!", "format!", "panic!", "\"{}\"", ".await", ".", "ns", "async", "pub", "match", "=>", "_", "::", "#", "struct", "impl", "Some", "None", "@", "if let", "while let"];
+    const tokens = ["fn", "let", "mut", "if", "else", "while", "loop", "for", "in", "..", "..=", "{", "}", "(", ")", "[", "]", ";", ",", "x", "y", "1", "2.5", "\"s\"", "'c'", "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "!", "==", "<", "=", "+=", "as", "u8", "i32", "f64", "return", "break", "continue", "'a", ":", "->", "println!", "format!", "panic!", "\"{}\"", ".await", ".", "ns", "async", "pub", "match", "=>", "_", "::", "#", "struct", "impl", "Some", "None", "@", "if let", "while let", ".0", ".1", "HashSet::new()", "..", "(a, b)", "HashMap::new()", ".entry(k)", ".or_insert(0)", "*", "|x|", "||", "move", ".iter()", ".map(|x| x)", ".filter(|&x| x)", ".collect()", ".sum::<i32>()", "impl Fn(i32)", "Ordering::Less", ".cmp(&y)", ".chars()", ".rev()", "dyn"];
     let seed = 12345;
     const rand = (n) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) % n);
     const fStart = performance.now();

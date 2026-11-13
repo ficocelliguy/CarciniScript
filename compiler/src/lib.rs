@@ -1,5 +1,8 @@
 //! CarciniScript: compiles a subset of Rust to ES modules with source maps.
 
+// `sig(self, &[t.clone()], t)` reads better than `slice::from_ref`, and `t` moves right after.
+#![allow(clippy::cloned_ref_to_slice_refs)]
+
 mod bindings;
 mod codegen;
 mod fmt;

@@ -1,6 +1,6 @@
 # Rust feature support chart
 
-Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?` and typed NS bindings done). Legend — **Phase**: `0` spike · `1` core · `2` multi-file/NS · `3` language service · `4` later ·
+Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?`, typed NS bindings, tuples, `HashSet`, `HashMap`, closures and iterators done). Legend — **Phase**: `0` spike · `1` core · `2` multi-file/NS · `3` language service · `4` later ·
 `—` out of scope. **Status**: ✅ done · 🚧 in progress · ⬜ planned · ❌ won't support ·
 ⚠️ supported with a documented gap (see `RUST_GAPS.md`).
 
@@ -57,13 +57,16 @@ Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?` an
 | `for i in a..b` / `a..=b` / `.rev()` | 0 | ✅ | Counting `for` loop, no iterator allocated |
 | `for x in v` / `&v` / `.iter()` / `.into_iter()` over a `Vec` | 1 | ✅ | `for...of` |
 | `for x in &mut v` / `v.iter_mut()` | 1 | ✅ | Index loop; `x` aliases `v[i]`, so `*x += 1` writes through |
-| `for x in` other iterators (adapters, maps, strings) | 1 | ⬜ | `for...of` over runtime iterator |
+| `for (i, x) in v.iter().enumerate()` (also `iter_mut`), `for x in &set`, destructuring loop patterns | 1 | ✅ | Index loop binding `i` and `v[i]` directly; `for...of` over sets |
+| `for x in` other iterators (adapter chains, `s.chars()`, `'a'..='z'`, `0..`, `.enumerate()` of any iterator) | 1 | ✅ | `for...of` over a `κσ.Iter` |
 | `if let` / `while let` / `let ... else` | 1 | ✅ | Pattern test + bind; `while let` re-evaluates its scrutinee each iteration. Let-chains (`if let .. && ..`) ⬜ |
 | `match` on literals (incl. negative), ranges (`a..=b`, `a..b`, `a..`, `..=b`; ints and chars), `|`, guards, `x @ p`, `Some`/`None`, as a statement or a value | 1 | ✅ | if/else chain; a labeled block when guards are present |
-| Tuple, slice, struct and enum patterns | 1 | ⬜ | Arrive with tuples, structs and enums |
-| Exhaustiveness checking | 1 | ⚠️ | Catch-alls, `bool`, `Option`; guarded arms don't count. Integer ranges covering a whole type still need `_` |
-| Tuples, destructuring | 1 | ⬜ | Arrays |
-| Closures (`\|x\| ...`, `move`) | 1 | ⬜ | Arrow functions |
+| Tuple patterns, including `..` (`(first, .., last)`) and nesting | 1 | ✅ | Elements are `subject[i]` |
+| Slice, struct and enum patterns | 1 | ⬜ | Arrive with slices, structs and enums |
+| Exhaustiveness checking | 1 | ⚠️ | Pattern-matrix usefulness over `bool`, `Option` and tuples, naming the missing case ("`(false, Some(_))` not covered"); guarded arms don't count. Integer ranges covering a whole type still need `_` |
+| Tuples: `(a, b)`, `t.0`, `(A, B)` types, `let (a, b)`, `(a, b) = (b, a)`, `==`, `<` (lexicographic), `{:?}` | 1 | ✅ | JS arrays; copied when read from a place into a by-value position, so they behave as values |
+| Closures (`\|x\| ...`, `move`, block bodies, `return`, `?`, pattern parameters, captures read and written) | 1 | ✅ | Arrow functions. Parameter types come from annotations or the call site |
+| `impl Fn(A) -> R` / `&dyn Fn` / `fn(A) -> R` / `<F: Fn(A) -> R>` (also `where`) parameters and returns; named functions as values | 1 | ✅ | A JS function. Each `F` is one concrete closure type; other generics ⬜ |
 | `?` on `Option` | 1 | ✅ | `const $t = x; if ($t == null) return null;` |
 | `?` on `Result` | 1 | ⬜ | Arrives with enums |
 | References `&x`, `&mut x`, `*x` | 0 | ✅ | Erased |
@@ -91,20 +94,29 @@ Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?` an
 | Feature | Phase | Status | JS lowering / notes |
 |---|---|---|---|
 | `Option<T>` | 1 | ✅ | `None` = `null` (`undefined` from JS also reads as `None`), `Some(x)` = `x`. `is_some`, `is_none`, `unwrap`, `expect`, `unwrap_or`, `unwrap_or_default`, `take`, `replace`, `as_ref`, `cloned`, `==`, `{:?}`. `Option<Option<T>>` / `Option<()>` rejected |
-| `Option` methods taking closures (`map`, `and_then`, `unwrap_or_else`, ...) | 1 | ⬜ | Arrive with closures; currently a clear error |
+| `Option` methods taking closures | 1 | ✅ | `map`, `and_then`, `filter`, `unwrap_or_else`, `or_else`, `map_or`, `map_or_else`, `is_some_and`, `is_none_or`, plus `or`, `zip` |
 | `Result<T, E>` | 1 | ⬜ | Tagged object |
 | `String`, `&str` common methods | 0–1 | ⚠️ | JS string; `len()`/slicing via UTF-8 helpers |
-| `char` | 1 | ⬜ | One-code-point string |
+| `char` | 1 | ⚠️ | One-code-point string. `is_alphabetic`/`is_numeric`/`is_whitespace`/`is_ascii_*` and friends (Unicode regexes), `to_ascii_uppercase`/`lowercase`, `to_digit`, `is_digit`, `to_string`; `to_uppercase()` (an iterator) ⬜ |
 | `Vec<T>`, `&[T]`, `[T; N]` | 1 | ✅ | JS `Array`. `new`, `with_capacity`, `len`, `is_empty`, `push`, `insert`, `remove`, `swap`, `truncate`, `clear`, `reverse`, `sort`/`sort_unstable` (Rust `Ord`), `contains`, `extend_from_slice`, `join`, `concat`, `clone`/`to_vec`, `==`/`!=`, `{:?}`. Panic messages match rustc |
 | `Vec` methods returning `Option` (`pop`, `first`, `last`, `get`) | 1 | ✅ | `get_mut`/`first_mut`/`last_mut` ⬜ (they hand out references into the Vec) |
-| Iterator adapters (`map`, `filter`, `enumerate`, `zip`, `sum`, `collect`, ...) | 1 | ⬜ | Lazy runtime iterator |
-| `HashMap`, `HashSet` | 1 | ⬜ | Runtime class with structural key hashing |
+| Iterator sources | 1 | ✅ | `iter`/`into_iter` (Vec, HashSet, HashMap), `keys`/`values`, ranges as values (`0..n`, `1..`, `'a'..='z'`), `chars`, `split`, `split_whitespace`, `lines`, `windows`, `chunks` |
+| Iterator adapters | 1 | ✅ | Lazy `κσ.Iter`: `map`, `filter`, `filter_map`, `flat_map`, `flatten`, `enumerate`, `zip`, `chain`, `rev`, `take`, `skip`, `step_by`, `take_while`, `skip_while`, `inspect`, `cloned`, `copied`. `iter_mut()` only with `for_each` (and `enumerate`) |
+| Iterator consumers | 1 | ✅ | `collect` into `Vec`/`String`/`HashSet`/`HashMap` (from an annotation, turbofish or later use), `sum`/`product` (wrapping like the type), `count`, `last`, `nth`, `min`/`max` (+ `_by`, `_by_key`), `any`, `all`, `find`, `find_map`, `position`, `fold`, `reduce`, `for_each` |
+| `Vec` methods taking closures | 1 | ✅ | `sort_by`, `sort_by_key` (+ `_unstable`/`_cached`), `retain`, `dedup`, `dedup_by_key`, `extend` from any iterable |
+| `HashSet<T>` | 1 | ✅ | `κσ.HashSet`, keyed structurally (tuples work as elements). `new`, `from`, `insert`, `contains`, `remove`, `len`, `is_empty`, `clear`, `clone`, `is_subset`/`is_superset`/`is_disjoint`, `==`, `{:?}`, iteration. Float elements rejected (`f64: Hash`) |
+| `HashSet` set operations returning iterators (`union`, `intersection`, `difference`, `symmetric_difference`), `retain`, `extend` | 1 | ✅ | |
+| `HashMap<K, V>` | 1 | ✅ | `κσ.HashMap` of `[key, value]` slots, keyed like `HashSet`. `new`, `from`, `insert`/`remove` (old value as `Option`), `get`, `contains_key`, `len`, `is_empty`, `clear`, `clone`, `map[&k]` (rustc's panic), `==`, `{:?}`. Float keys rejected |
+| `entry(k).or_insert(v)` / `.or_default()` / `.or_insert_with(Vec::new)` | 1 | ✅ | The value is the slot's `[1]`, so `*map.entry(k).or_insert(0) += 1` writes back, as does `let n = map.entry(k).or_insert(0); *n += 1;` |
+| `for (k, v) in &map`, `.keys()`, `.values()`, `.iter_mut()`, `.values_mut()` | 1 | ✅ | `for...of` over slots; `_mut` forms alias the slot |
+| `get_mut` | 1 | ⚠️ | For collection and tuple values; number/string/bool values get an error pointing to `entry` |
+| `HashMap` methods taking closures or returning iterators: `retain`, `entry(k).and_modify(..)`, `or_insert_with(\|\| ..)`, `or_insert_with_key`, `extend`, `iter`/`keys`/`values` as iterators | 1 | ✅ | Closures that take `&mut V` alias the slot, so writes stick. `drain` ⬜ |
 | `BTreeMap`, `BTreeSet`, `VecDeque`, `BinaryHeap` | 4 | ⬜ | Runtime classes |
 | `Box<T>`, `Rc<T>`, `RefCell<T>`, `Cell<T>` | 1 | ⬜ | `Box`/`Rc` erased; `RefCell` optionally guarded |
 | `Arc`, `Mutex`, threads | — | ❌ | No threads in Bitburner |
 | `std::fs`, `std::net`, `std::process` | — | ❌ | Use the NS API |
 | `f64` / integer math methods (`sqrt`, `pow`, `round`, `abs`, `min`, ...) | 0 | ✅ | `Math.*`; `round` is half-away-from-zero |
-| `std::cmp::{min, max, Ordering}` | 1 | ⬜ | `Math.*` |
+| `Ordering`, `cmp`, `partial_cmp` | 1 | ✅ | -1 / 0 / 1. `reverse`, `then`, `then_with`, `is_lt` etc., matching on `Ordering::Less`, `{:?}`. `std::cmp::{min, max}` ⬜ |
 
 ## Netscript
 
@@ -142,13 +154,13 @@ so the work can be prioritized against real interest. The **Status** column repe
 | `let ... else` | ✅ | Called a "favorite pattern" several times: `let Some(x) = opt else { return; };`, `let Ok(lock) = m.write() else { ... };` |
 | `if let` / `while let` | ✅ | `while let Some(node) = tree.get(&seq) { match ... }`; `if let` in expression position |
 | `match` as an expression, guards, unwrapping by pattern | ✅ / ⬜ (enums, tuples) | The most praised feature overall. Users want "unwrap the value if it matches" plus `if`/`match`/`loop` that yield values |
-| Rest and slice patterns (`..`, `[first, .., last]`), destructuring | ⬜ | Rest patterns compared to JS spread; "rust has destructuring" |
+| Rest and slice patterns (`..`, `[first, .., last]`), destructuring | ⚠️ (tuple patterns and `..` ✅; slice patterns ⬜) | Rest patterns compared to JS spread; "rust has destructuring" |
 | `?` on `Result` / `Option` | `Option` ✅; `Result` ⬜ | Named as the reason Rust doesn't need exceptions |
-| Collecting into `Result`/`Option` (`collect::<Result<Vec<_>, _>>()`) | ⬜ | Short-circuits on the first `Err`; needs the turbofish and `FromIterator` for `Result` |
-| Turbofish `::<T>` | ⬜ | Needed for `collect`, `parse`, `throw_error::<...>` style calls |
-| `Option`/`Result` combinators | ⚠️ (`unwrap_or`, `unwrap_or_default` ✅; closure-taking ones ⬜) | `unwrap_or`, `unwrap_or_default`, `map_or`, `transpose`, `ok`, `flatten`, `inspect_err`, `bool::then` |
-| Iterator chains | ⬜ | `iter`/`into_iter`, `enumerate`, `zip`, `map`, `filter`, `sum`, `chars`, `cycle`, `collect::<String>()`. Long dot-chains are a common style |
-| Range values and range indexing | ⚠️ | `for` over ranges works. Still missing: `0..10` as a value and `arr[2..5]` / `s[1..]` slicing |
+| Collecting into `Result`/`Option` (`collect::<Result<Vec<_>, _>>()`) | ⬜ (turbofish and `collect` ✅) | Short-circuits on the first `Err`; needs the turbofish and `FromIterator` for `Result` |
+| Turbofish `::<T>` | ⚠️ (`collect::<..>()`, `sum::<..>()`, `product::<..>()` ✅) | Needed for `collect`, `parse`, `throw_error::<...>` style calls |
+| `Option`/`Result` combinators | ⚠️ (`Option`'s, closure-taking ones included, ✅; `Result` ⬜) | `unwrap_or`, `unwrap_or_default`, `map_or`, `transpose`, `ok`, `flatten`, `inspect_err`, `bool::then` |
+| Iterator chains | ✅ (`cycle` ⬜) | `iter`/`into_iter`, `enumerate`, `zip`, `map`, `filter`, `sum`, `chars`, `cycle`, `collect::<String>()`. Long dot-chains are a common style |
+| Range values and range indexing | ⚠️ | Ranges as values (iterators) ✅. Still missing: `arr[2..5]` / `s[1..]` slicing |
 | Enums with data (ADTs) | ⬜ | "What Rust calls enums are algebraic data types". Used for union types instead of TS enums |
 | `impl Default` + `unwrap_or_default` | ⬜ | `enum CardKey { SIX([u8; 6]) }` with a hand-written `Default` |
 | Method receivers `&self` / `&mut self` / `self` | ⬜ | Consuming `self` for builder/finalize patterns; assoc fns without `self` as static methods |
@@ -158,7 +170,7 @@ so the work can be prioritized against real interest. The **Status** column repe
 | Fully qualified disambiguation `<T as Trait>::method` | ⬜ | Rust's answer to same-named methods from two traits |
 | `From` / `Into` conversions | ⬜ | `impl From<X> for Y` then `.into()`, very common in binding code |
 | `std::ops` traits (`Deref`, `Add`, ...) | ⬜ | `impl Deref for Wrapper`. Operator overloading "possible but rarely used" |
-| Closures, including `move` | ⬜ | "Closures are extra incredible in rust" |
+| Closures, including `move` | ✅ | "Closures are extra incredible in rust" |
 | `macro_rules!` | ⬜ (4) | Discussed at length: `$(...)*` repetition, fragment specifiers (`ident`, `ty`, `tt`, `expr`, `literal`), recursive macros, hygiene, macros used to stamp out impls per numeric type |
 | `u128` / `i128` | ⬜ (4) | Widening multiply macros map `u64 → u128` |
 | Fixed-size arrays and boxed slices (`[u8; 6]`, `Box<[u8]>`) | ⚠️ / ⬜ | Bitboard-style code with `&= !mask` on array elements |

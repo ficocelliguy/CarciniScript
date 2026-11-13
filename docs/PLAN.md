@@ -145,9 +145,10 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] Typed NS bindings: `tools/dts2rs.mjs` generates `bindings/ns.rs` from
      NetscriptDefinitions.d.ts; Bitburner regenerates its copy with `npm run generate:rust-bindings`
      and a jest test fails when it's stale.
-   - [ ] Tuples and destructuring
-   - [ ] Closures and iterator adapters
-   - [ ] `HashMap` / `HashSet`
+   - [x] Tuples and destructuring (patterns, `enumerate`, swap assignment, value copies)
+   - [x] Closures and iterator adapters (plus `Ordering`, sorting with closures, and the `Option` / `HashSet` / `HashMap` methods they unblock)
+   - [x] `HashSet` (the starter-script milestone: `test/ns/crawl.rs`)
+   - [x] `HashMap` (including the `entry` API and write-through iteration)
    - [ ] `struct` + `impl` + derives, then `enum` with data
    - [ ] Warn on `loop`/`while` with no `.await`
    - [ ] Move checking
