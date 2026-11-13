@@ -128,6 +128,7 @@ impl Codegen<'_> {
         self.scopes.push(HashMap::new());
         let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
         let saved_async = std::mem::replace(&mut self.in_async, false);
+        let saved_loops = std::mem::take(&mut self.loop_dests);
         let (js_params, binds) = params(self, &rust_params);
         let head = format!("({}) => ", js_params.join(", "));
         let body = c.body();
@@ -168,6 +169,7 @@ impl Codegen<'_> {
         };
         self.ret_ty = saved_ret;
         self.in_async = saved_async;
+        self.loop_dests = saved_loops;
         self.scopes.pop();
         frag
     }
@@ -305,6 +307,21 @@ impl Codegen<'_> {
             f
         };
         let out = |f: Frag| Some((f, result_ty.clone()));
+        if let Some(r) = self.emit_std_method(m, rf, rt, method) {
+            return Some(r);
+        }
+        match (rt, method) {
+            (Ty::Result(t, e), m2) => return self.emit_result_method(m, rf, t, e, m2),
+            (Ty::Option(_), "ok_or" | "ok_or_else") => return Some(self.emit_ok_or(m, rf, method)),
+            (Ty::Str, "parse") => return Some(self.emit_parse(m, rf)),
+            (Ty::Formatter, "write_str") => {
+                let s = self.fn_arg(m.arg_list().and_then(|a| a.args().next()));
+                let mut f = Frag::text("κσ.$write(");
+                f.append(rf.clone()).push(", ").append(s).push(", false)");
+                return Some((f, result_ty.clone()));
+            }
+            _ => {}
+        }
         match (rt, method) {
             // ---- sources
             (Ty::Str, "chars") => out(helper("iter", vec![])),
@@ -500,6 +517,7 @@ impl Codegen<'_> {
                 "count" => "count",
                 "last" => "last",
                 "nth" => "nth",
+                "next" => "next",
                 "min" => "min",
                 "max" => "max",
                 "min_by_key" => "minByKey",

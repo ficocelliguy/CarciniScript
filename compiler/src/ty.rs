@@ -129,6 +129,18 @@ pub enum Ty {
     },
     /// `std::cmp::Ordering`: -1 (`Less`), 0 (`Equal`), 1 (`Greater`).
     Ordering,
+    /// A struct or enum declared in the file: an instance of its JS class.
+    Adt(String),
+    /// `Result<T, E>`: the runtime's `κσ.Ok(v)` / `κσ.Err(e)` (`$tag` 0 / 1, value at `[0]`).
+    Result(Box<Ty>, Box<Ty>),
+    /// `fmt::Formatter`: the buffer a `Display` impl writes into.
+    Formatter,
+    /// A generic function's type parameter, inside its body. Erased in JS.
+    Param(String),
+    /// `dyn Trait` / `impl Trait` / `Box<dyn Trait>`: any value whose type implements the trait.
+    Dyn(String),
+    /// `RefCell<T>` / `Cell<T>`: a `κσ.RefCell` holding the value at `.v`. (`Rc<T>` is erased.)
+    RefCell(Box<Ty>),
     /// What `v.iter()` / `v.iter_mut()` / `v.into_iter()` return. Only usable as a `for` loop
     /// source until iterator adapters land.
     Iter {
@@ -208,12 +220,36 @@ impl Ty {
     }
 
     /// Whether a float appears anywhere in the type: such types aren't `Ord` or `Hash`.
+    /// The types directly inside this one (`Vec<T>` → `[T]`).
+    pub fn inner_types(&self) -> Vec<Ty> {
+        match self {
+            Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) | Ty::RefCell(e) => {
+                vec![(**e).clone()]
+            }
+            Ty::Iter { elem, .. } => vec![(**elem).clone()],
+            Ty::Tuple(es) => es.clone(),
+            Ty::Map(k, v) | Ty::Entry(k, v) | Ty::Result(k, v) => {
+                vec![(**k).clone(), (**v).clone()]
+            }
+            Ty::Closure { params, ret } => [params.clone(), vec![(**ret).clone()]].concat(),
+            _ => vec![],
+        }
+    }
+
+    /// Visit this type and every type inside it.
+    pub fn walk(&self, f: &mut impl FnMut(&Ty)) {
+        f(self);
+        for t in self.inner_types() {
+            t.walk(f);
+        }
+    }
+
     pub fn contains_float(&self) -> bool {
         match self {
             Ty::Float { .. } => true,
             Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) => e.contains_float(),
             Ty::Tuple(es) => es.iter().any(Ty::contains_float),
-            Ty::Map(k, v) => k.contains_float() || v.contains_float(),
+            Ty::Map(k, v) | Ty::Result(k, v) => k.contains_float() || v.contains_float(),
             _ => false,
         }
     }
@@ -277,6 +313,12 @@ impl Ty {
                 describe_closure(params.iter().map(Ty::describe).collect(), ret.describe())
             }
             Ty::Ordering => "Ordering".into(),
+            Ty::Adt(n) => n.clone(),
+            Ty::Result(t, e) => format!("Result<{}, {}>", t.describe(), e.describe()),
+            Ty::Formatter => "Formatter<'_>".into(),
+            Ty::Param(n) => n.clone(),
+            Ty::Dyn(n) => format!("dyn {n}"),
+            Ty::RefCell(t) => format!("RefCell<{}>", t.describe()),
             Ty::Iter {
                 elem,
                 mutable: false,

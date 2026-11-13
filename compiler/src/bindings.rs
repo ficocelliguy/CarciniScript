@@ -61,6 +61,9 @@ pub struct ExternType {
 #[derive(Default)]
 pub struct Bindings {
     pub types: HashMap<String, ExternType>,
+    /// JS names Bitburner's RAM calculator charges for wherever they appear as identifiers (NS
+    /// functions and namespaces). User identifiers with these names get a `$` suffix.
+    pub ram_names: HashSet<String>,
 }
 
 thread_local! {
@@ -250,7 +253,20 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
     if !bindings.types.contains_key("NS") {
         errors.push("bindings don't declare `NS`".into());
     }
+    let mut ram = HashSet::new();
+    for t in bindings.types.values() {
+        ram.extend(t.methods.values().map(|m| m.js.clone()));
+    }
+    if let Some(ns) = bindings.types.get("NS") {
+        ram.extend(ns.fields.values().map(|f| f.js.clone()));
+    }
+    bindings.ram_names = ram;
     (bindings, errors)
+}
+
+/// Whether Bitburner charges RAM for an identifier named `js`.
+pub fn is_ram_name(js: &str) -> bool {
+    CURRENT.with(|c| c.borrow().ram_names.contains(js))
 }
 
 /// The closest name to `name` among `candidates`, for "did you mean" hints.

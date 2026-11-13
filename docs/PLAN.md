@@ -149,11 +149,16 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] Closures and iterator adapters (plus `Ordering`, sorting with closures, and the `Option` / `HashSet` / `HashMap` methods they unblock)
    - [x] `HashSet` (the starter-script milestone: `test/ns/crawl.rs`)
    - [x] `HashMap` (including the `entry` API and write-through iteration)
-   - [ ] `struct` + `impl` + derives, then `enum` with data
-   - [ ] Warn on `loop`/`while` with no `.await`
+   - [x] `struct` + `impl` + derives, then `enum` with data (plus `Result`, `?` on `Result`,
+     `impl Display`, `str::parse`, `matches!`)
+   - [x] Warn on `loop`/`while` with no `.await`
+   - [x] `const` / `static` items, generic functions (erased, with bounds), range slicing
    - [ ] Move checking
 2. **Multi-file:** `use` across files, virtual files, `dts2rs`, Monaco diagnostics.
+   - [x] `mod name;` + `use` through a host resolver; Bitburner passes the server's scripts (runtime,
+     RAM calculation and editor markers)
 3. **Language service:** completion, hover, signature help from the checker's symbol tables.
+   - [x] Hover and member completion (`hover`, `completions`), wired into Bitburner's Monaco
 4. **Later:** generic trait dispatch (`T::assoc()`), `macro_rules!`, wider std, optional
    overflow-checking mode, NLL-lite borrow warnings, performance.
 

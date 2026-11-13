@@ -38,7 +38,7 @@ export async function main(ns) {
 |---|---|
 | `compiler/` | Rust crate: `ra_ap_syntax` parser → codegen → source map. Builds to wasm (~700 KB). |
 | `runtime/rt.js` | Runtime helpers installed once on `globalThis.κσ`. |
-| `index.js` | JS API: `initCarciniScript()`, then synchronous `compile(source, filename)`. |
+| `index.js` | JS API: `initCarciniScript()`, then synchronous `compile(source, filename, resolve?)`. |
 | `test/` | Differential fixtures (native rustc vs transpiled JS), NS mock scripts, source map checks. |
 | `web-repl/` | Browser REPL and self-test. |
 | `tools/build.mjs` | Builds the wasm and bindings into `pkg/`. |
@@ -75,7 +75,12 @@ fixture output and panic messages match recorded native rustc output
 map positions, runtime-error mapping, and that arbitrary Rust never traps the wasm (the
 compiler's own source, every prefix of every fixture, and random token soup).
 
-`npm run sweep -- <dir>` runs the same crash check natively over any directory of `.rs` files.
+`npm run sweep -- <dir>` runs the same crash check natively over any directory of `.rs` files
+(`SWEEP_TRACE=1` prints each file first, to find one that takes the process down;
+`SWEEP_SERVICE=1` also runs hover and completion at a few positions per file).
+
+`node tools/diff-one.mjs file.rs [--js]` compiles one program with CarciniScript and with rustc,
+runs both and shows where their output differs.
 
 During development, `cargo run --example compile -- file.rs` (from `compiler/`) prints the
 generated JS or diagnostics without building wasm.
@@ -90,6 +95,23 @@ await initCarciniScript(); // once, at startup
 setNsBindings(nsBindingsText); // optional: typed NS (see below)
 const { code, sourceMap, diagnostics } = compile(source, "hack.rs");
 ```
+
+### Modules
+
+`mod util;` loads `util.rs` from the same directory, and its `pub` items are typed and usable
+(`use util::{helper, Target};` or `util::helper()`). The host supplies the files with a third
+argument: `compile(source, "lib/main.rs", (path) => files.get(path))` (here it asks for
+`lib/util.rs`). Each file compiles to its own ES module, importing its modules as
+`import * as util from "./util.rs"`, so the host loads them the way it loads any import. Bitburner
+passes the server's scripts.
+
+### Editor support
+
+`hover(source, filename, line, column, resolve?)` returns markdown for the symbol under the cursor
+(types, function signatures, NS docs with RAM costs), and `completions(...)` lists the members of
+the value before a `.` (or the names in scope for a plain identifier), and `signatureHelp(...)`
+gives parameter hints inside a call. They work on code with syntax errors. Bitburner registers them as Monaco
+hover and completion providers for `.rs` files.
 
 ### Typed NS bindings
 

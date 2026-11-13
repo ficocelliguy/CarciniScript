@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { initCarciniScriptSync, compile, setNsBindings } from "../index.js";
+import { initCarciniScriptSync, compile, setNsBindings, hover, completions, signatureHelp } from "../index.js";
 import "../runtime/rt.js";
 import { nativePanic } from "../tools/native-panic.mjs";
 
@@ -95,6 +95,37 @@ for (const f of fs.readdirSync(path.join(here, "fixtures")).filter((f) => f.ends
         diff.push(`  panic rustc=${JSON.stringify(native.panic)}\n        js=${JSON.stringify(js.panic)}`);
       }
       fail(name, `exit rustc=${native.code} js=${js.code}\n${diff.join("\n")}`);
+    } else pass(name);
+  } catch (e) {
+    fail(name, e.message);
+  }
+}
+
+// --- multi-file programs: test/modules/<name>/main.rs plus its `mod` files
+for (const dir of fs.readdirSync(path.join(here, "modules"))) {
+  const root = path.join(here, "modules", dir);
+  const name = `modules ${dir}`;
+  try {
+    const read = (p) => {
+      try {
+        return fs.readFileSync(path.join(root, p), "utf8");
+      } catch {
+        return undefined;
+      }
+    };
+    const outRoot = path.join(outDir, `modules-${dir}`);
+    fs.mkdirSync(outRoot, { recursive: true });
+    for (const f of fs.readdirSync(root).filter((f) => f.endsWith(".rs"))) {
+      const out = compile(read(f), f, read);
+      const errors = out.diagnostics.filter((d) => d.severity === "error");
+      if (errors.length) throw new Error(errors.map((d) => `${f}:${d.line}:${d.column}: ${d.message}`).join("\n"));
+      // Node can't import `.rs`; the compiled modules are written as `.mjs`.
+      fs.writeFileSync(path.join(outRoot, f.replace(/\.rs$/, ".mjs")), out.code.replace(/\.rs";/g, '.mjs";'));
+    }
+    const js = await runJs(path.join(outRoot, "main.mjs"));
+    const native = runNative(path.join(root, "main.rs"));
+    if (js.stdout !== native.stdout || js.code !== native.code) {
+      fail(name, `rustc:\n${native.stdout}\njs:\n${js.stdout}`);
     } else pass(name);
   } catch (e) {
     fail(name, e.message);
@@ -267,7 +298,7 @@ function decodeMappings(mappings) {
 // The `fn main` wrapper is added; bodies start on line 2.
 const rejected = [
   ["assign to immutable", "let x = 1;\n    x = 2;", "3:5 cannot assign twice to immutable variable `x`"],
-  ["unsupported construct", "let p = Point { x: 1 };", "2:13 struct literals is not supported yet"],
+  ["unsupported construct", "let v = vec![1];\n    let r = v.as_ptr();", "3:13 no method named `as_ptr`"],
   [
     "element type inferred from a later push",
     "let mut v = Vec::new();\n    v.push(1u8);\n    v.push(\"x\");",
@@ -349,7 +380,42 @@ const rejected = [
   ["collect without a target", "let v = vec![1, 2];\n    let w = v.iter().map(|x| x * 2).collect();", "3:13 type annotations needed"],
   ["map over iter_mut", "let mut v = vec![1, 2];\n    let w: Vec<i32> = v.iter_mut().map(|x| *x).collect();", "`iter_mut()` followed by `.map()` isn't supported yet"],
   ["Display of an Ordering", 'println!("{}", 1.cmp(&2));', "2:14 `Ordering` doesn't implement `std::fmt::Display`"],
-  ["generic without an Fn bound", "}\nfn id<T>(x: T) -> T {\n    x", "3:6 generic type parameters is not supported yet"],
+  ["missing struct field", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P { x: 1 };", "9:13 missing field `y` in initializer of `P`"],
+  ["unknown struct field", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P { x: 1, y: 2, z: 3 };", "9:29 struct `P` has no field named `z`"],
+  ["non-exhaustive enum match names the variant", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let e = E::A;\n    match e { E::A => {}, E::C { .. } => {} }", "10:11 non-exhaustive patterns: `E::B(_)` not covered"],
+  ["unknown method on a struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.len();", "10:5 no method named `len` found for struct `P` in the current scope"],
+  ["== without PartialEq", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let a = N { v: 1.0 };\n    let c = a == N { v: 2.0 };", "10:13 the trait bound `N: PartialEq` is not satisfied"],
+  ["Display of a struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    println!(\"{}\", P::new());", "9:14 `P` doesn't implement `std::fmt::Display`"],
+  ["Debug without the derive", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    println!(\"{:?}\", N { v: 1.0 });", "9:14 `N` doesn't implement `std::fmt::Debug`"],
+  ["assigning a field of an immutable struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.x = 5;", "10:5 cannot borrow `p` as mutable, as it is not declared as mutable"],
+  ["unknown variant", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let e = E::D;", "9:13 no variant or associated item named `D` found for enum `E`"],
+  ["associated function called as a method", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.new();", "(`new` is an associated function: call `P::new(..)`)"],
+  ["HashSet of a struct without Hash", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let mut s = std::collections::HashSet::new();\n    s.insert(N { v: 1.0 });", "the trait bound `N: Hash` is not satisfied"],
+  ["field access on an enum", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let e = E::B(1);\n    let v = e.v;", "10:13 no field `v` on type `E`"],
+  ["Copy without Clone", "}\n#[derive(Copy)]\nstruct Q { a: i32 }\nfn f() {", "the trait bound `Q: Clone` is not satisfied"],
+  ["Eq on a struct with an f64 field", "}\n#[derive(PartialEq, Eq)]\nstruct Q { a: f64 }\nfn f() {", "the trait `Eq` is not implemented for `f64` (field `a` of `Q`)"],
+  ["generic struct", "}\nstruct W<T> { v: T }\nfn f() {", "3:9 generic structs are not supported yet"],
+  ["mutating through &self", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&self) { self.a = 1; } }\nfn f() {", "4:24 cannot borrow `*self` as mutable, as it is behind a `&` reference"],
+  ["&mut self method on an immutable binding", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&mut self) { self.a = 1; } }\nfn g() {\n    let q = Q { a: 0 };\n    q.f();", "7:5 cannot borrow `q` as mutable, as it is not declared as mutable"],
+  ["trait impls", "}\nstruct Q;\nimpl Clone for Q { fn clone(&self) -> Q { Q } }\nfn f() {", "4:6 `impl Clone for ..` is not supported yet"],
+  ["`<` on a type parameter without PartialOrd", "}\nfn big<T>(a: T, b: T) -> bool {\n    a > b", "4:5 comparing with `<` on type parameter `T` needs a bound: add `T: PartialOrd`"],
+  ["generic call with an unsatisfied bound", "}\nfn show<T: std::fmt::Display>(x: T) {}\nfn f() {\n    show(vec![1]);", "5:5 the trait bound `Vec<i32>: Display` is not satisfied"],
+  ["division on a type parameter", "}\nfn half<T: Copy>(x: T, y: T) -> T {\n    x / y", "4:5 `/` on type parameter `T` isn't supported"],
+  ["unsupported trait bound", "}\nfn f<T: Into<f64>>(x: T) {", "3:9 the trait bound `Into` is not supported yet on type parameters"],
+  ["method outside a type parameter's bounds", "}\nfn f<T>(x: T) -> usize {\n    x.len()", "4:5 no method named `len` found for type parameter `T`"],
+  ["mutable slice", "let mut v = vec![1, 2, 3];\n    let s = &mut v[1..];", "3:13 mutable slices (`&mut v[a..b]`) are not supported yet"],
+  ["trait impl missing a method", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S {}\nfn f() {", "5:12 not all trait items implemented, missing: `a`"],
+  ["method that isn't in the trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } fn z(&self) {} }\nfn f() {", "5:44 method `z` is not a member of trait `T`"],
+  ["generic call with an unimplemented user trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn g<X: T>(x: X) -> i32 { x.a() }\nfn f() {\n    g(5);", "7:5 the trait bound `i32: T` is not satisfied"],
+  ["unknown method on dyn Trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } }\nfn f() {\n    let d: Box<dyn T> = Box::new(S);\n    d.c();", "8:5 no method named `c` found for `dyn T`"],
+  ["Box<dyn Trait> of a type without the impl", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn f() {\n    let d: Box<dyn T> = Box::new(S);", "6:34 the trait bound `S: T` is not satisfied"],
+  ["trait function without self", "}\ntrait M { fn make() -> Self; }\nfn f() {", "3:14 trait functions without `self` are not supported yet"],
+  ["non-exhaustive slice match names the missing length", "let v = vec![1];\n    match v.as_slice() { [] => {}, [x] => {} }", "3:11 non-exhaustive patterns: `[_, _, ..]` not covered"],
+  ["break with a value from a while loop", "while true { break 5; }", "2:18 `break` with value from a `while` or `for` loop"],
+  ["break outside a loop", "break;", "2:5 `break` outside of a loop"],
+  ["loop breaking with different types", "let x = loop { if true { break 1; } break \"s\"; };", "2:47 mismatched types: expected `{integer}`, found `String`"],
+  ["`&mut` to a number field passed to a function", "}\nstruct P { x: i32 }\nfn bump(v: &mut i32) { *v += 1; }\nfn f() {\n    let mut p = P { x: 1 };\n    bump(&mut p.x);", "7:15 passing a `&mut` to a number, string or bool inside a struct, tuple or Vec isn't supported yet"],
+  ["two nested functions with the same name", "}\nfn b() { fn h() {} }\nfn c() { fn h() {} }\nfn d() {", "4:13 the name `h` is defined multiple times"],
   ["mixed arithmetic", "let a: i32 = 1;\n    let b: f64 = 2.0;\n    let c = a + b;", "4:13 cannot add `f64` to `i32`"],
 ];
 for (const [label, body, want] of rejected) {
@@ -362,7 +428,107 @@ for (const [label, body, want] of rejected) {
   } else pass(name);
 }
 
+// Modules: each case is a set of files; the first is compiled.
+const rejectedFiles = [
+  ["module file not found", { "main.rs": "mod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `nope.rs`)"],
+  [
+    "importing a private function",
+    { "main.rs": "mod u;\nuse u::secret;\nfn main() {}", "u.rs": "fn secret() {}" },
+    "2:5 unresolved import `u::secret` (it doesn't exist or isn't `pub`)",
+  ],
+  [
+    "calling a private function through its module",
+    { "main.rs": "mod u;\nfn main() {\n    u::secret();\n}", "u.rs": "fn secret() {}" },
+    "3:5 cannot find function `secret` in module `u`",
+  ],
+  [
+    "circular modules",
+    { "main.rs": "mod a;\nfn main() {}", "a.rs": "mod main;\npub fn f() {}" },
+    "1:1 circular modules",
+  ],
+  ["crates other than std", { "main.rs": "use rand::Rng;\nfn main() {}" }, "1:5 unresolved import `rand`"],
+];
+for (const [label, files, want] of rejectedFiles) {
+  const name = `rejects: ${label}`;
+  const entry = Object.keys(files)[0];
+  const out = compile(files[entry], entry, (p) => files[p]);
+  const msgs = out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`);
+  if (out.code !== null || !msgs.some((m) => m.startsWith(want))) {
+    fail(name, `want: ${want}\ngot:\n${msgs.join("\n") || "(no diagnostics)"}`);
+  } else pass(name);
+}
+
+// --- language service: hover and completions (no NS bindings needed for these)
+{
+  const src = [
+    "#[derive(Debug, Clone)]",
+    "struct Target { host: String, money: f64 }",
+    "impl Target { fn score(&self) -> f64 { self.money * 2.0 } }",
+    "fn main() {",
+    "    let t = Target { host: String::from(" + '"' + "a" + '"' + "), money: 1.5 };",
+    "    let s = t.score();",
+    "    let v = vec![1, 2, 3];",
+    "    t.",
+    "}",
+  ].join("\n");
+  const checks = [
+    ["hover on a binding", () => hover(src, "svc.rs", 6, 9)?.contents, "s: f64"],
+    ["hover on a method", () => hover(src, "svc.rs", 6, 15)?.contents, "fn score() -> f64"],
+    ["hover on a Vec binding", () => hover(src, "svc.rs", 7, 9)?.contents, "v: Vec<i32>"],
+    ["struct members after `.`", () => completions(src, "svc.rs", 8, 7).map((c) => c.label).join(","), "clone,host,money,score"],
+    ["locals in scope", () => completions(src.replace("    t.", "    s"), "svc.rs", 8, 6).map((c) => c.label).join(","), "s"],
+    [
+      "signature help in a call",
+      () => {
+        const h = signatureHelp(src.replace("    t.", "    let q = t.score("), "svc.rs", 8, 24);
+        return h && `${h.label} @${h.active}`;
+      },
+      "fn score() -> f64 @0",
+    ],
+    [
+      "Vec methods after `.`",
+      () => completions(src.replace("    t.", "    v."), "svc.rs", 8, 7).some((c) => c.label === "binary_search"),
+      true,
+    ],
+  ];
+  for (const [label, run, want] of checks) {
+    const name = `service: ${label}`;
+    try {
+      const got = run();
+      const ok = typeof want === "string" && typeof got === "string" ? got.includes(want) : got === want;
+      if (ok) pass(name);
+      else fail(name, `want ${JSON.stringify(want)}\ngot  ${JSON.stringify(got)}`);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+}
+
 // Typed NS calls and `?`. Bodies go inside `pub async fn main(ns: NS)`, starting on line 2.
+// --- warnings: programs that compile, with the warning each must produce (line:col prefix).
+const warned = [
+  ["loop that never awaits", "let mut n = 0;\n    loop {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
+  ["while true that never awaits", "let mut n = 0;\n    while true {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
+];
+for (const [label, body, want] of warned) {
+  const name = `warns: ${label}`;
+  const out = compile(`fn main() {\n    ${body}\n}\n`, "warn.rs");
+  const msgs = out.diagnostics.filter((d) => d.severity === "warning").map((d) => `${d.line}:${d.column} ${d.message}`);
+  if (out.code === null || !msgs.some((m) => m.startsWith(want))) {
+    fail(name, `want: ${want}\ngot:\n${out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n") || "(no diagnostics)"}`);
+  } else pass(name);
+}
+const quiet = [
+  ["loop that awaits", "pub async fn main(ns: NS) {\n    loop {\n        ns.sleep(10.0).await;\n    }\n}\n"],
+  ["loop that breaks", "fn main() {\n    let mut n = 0;\n    loop {\n        n += 1;\n        if n > 3 {\n            break;\n        }\n    }\n}\n"],
+];
+for (const [label, src] of quiet) {
+  const name = `no warning: ${label}`;
+  const out = compile(src, "quiet.rs");
+  if (out.diagnostics.length) fail(name, out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n"));
+  else pass(name);
+}
+
 const rejectedNs = [
   ["`.await` in a closure", "let f = || ns.sleep(10).await;", "2:16 `await` is only allowed inside `async` functions and blocks"],
   [

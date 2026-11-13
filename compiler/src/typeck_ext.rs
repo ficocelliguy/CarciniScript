@@ -57,6 +57,8 @@ impl Checker<'_> {
         };
         let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
         let saved_async = std::mem::replace(&mut self.in_async, false);
+        // A closure body can't `break` out of the loop around it.
+        let saved_loops = std::mem::take(&mut self.loops);
         if let Some(body) = c.body() {
             let found = self.infer(&body, Some(&ret));
             if !self.unify(&found, &ret) {
@@ -70,6 +72,7 @@ impl Checker<'_> {
         }
         self.ret_ty = saved_ret;
         self.in_async = saved_async;
+        self.loops = saved_loops;
         self.scopes.pop();
         Ty::Closure {
             params: ptys,
@@ -78,7 +81,7 @@ impl Checker<'_> {
     }
 
     /// Check `arg` as a closure (or function item) of the given shape; returns its return type.
-    fn closure_arg(&mut self, arg: Option<&ast::Expr>, params: Vec<Ty>, ret: Ty) -> Ty {
+    pub(super) fn closure_arg(&mut self, arg: Option<&ast::Expr>, params: Vec<Ty>, ret: Ty) -> Ty {
         if let Some(a) = arg {
             let expected = Ty::Closure {
                 params,
@@ -146,7 +149,7 @@ impl Checker<'_> {
     }
 
     /// Reports a missing `Ord` (floats anywhere in the type) for sorting and min/max.
-    fn require_ord(&mut self, node: &SyntaxNode, t: &Ty, what: &str) {
+    pub(super) fn require_ord(&mut self, node: &SyntaxNode, t: &Ty, what: &str) {
         let z = self.zonk(t);
         if z.contains_float() || self.var_kind(t) == Some(VarKind::Float) {
             let msg = format!(
@@ -157,24 +160,12 @@ impl Checker<'_> {
         }
     }
 
-    fn turbofish(&mut self, m: &ast::MethodCallExpr) -> Option<Ty> {
+    pub(super) fn turbofish(&mut self, m: &ast::MethodCallExpr) -> Option<Ty> {
         use ra_ap_syntax::ast::HasGenericArgs;
         match m.generic_arg_list()?.generic_args().next()? {
             ast::GenericArg::TypeArg(ta) => ta.ty().map(|t| self.lower_type(&t)),
             _ => None,
         }
-    }
-
-    /// A function's type parameters bounded by `Fn(..)`/`FnMut(..)`/`FnOnce(..)` (inline or in a
-    /// `where` clause), as closure types. Other type parameters are left for codegen to report.
-    pub(super) fn fn_generics(&mut self, f: &ast::Fn) -> HashMap<String, Ty> {
-        let mut out = HashMap::new();
-        for (name, bounds) in generic_bounds(f) {
-            if let Some(ty) = self.lower_fn_bounds(&bounds) {
-                out.insert(name, ty);
-            }
-        }
-        out
     }
 
     /// Whether `collect` can build `target` from elements of `elem`. `None` means the target isn't
@@ -234,6 +225,30 @@ impl Checker<'_> {
             elem: Box::new(elem),
             mutable: false,
         };
+        if let Some(t) = self.std_method(m, recv, rt, method, args) {
+            return Some(t);
+        }
+        match self.shallow(rt) {
+            Ty::Result(t, e) => return self.result_method(m, *t, *e, method, args),
+            Ty::Option(inner) if matches!(method, "ok_or" | "ok_or_else") => {
+                return self.option_to_result(m, *inner, method, args);
+            }
+            Ty::Formatter if method == "write_str" => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let Some(a) = args.first() {
+                    self.check(a, &Ty::Str);
+                }
+                return Some(Ty::Result(
+                    Box::new(Ty::Unit),
+                    Box::new(Ty::Extern("fmt::Error".into())),
+                ));
+            }
+            Ty::Str if method == "parse" => {
+                let target = self.turbofish(m);
+                return Some(self.parse_method(m, target, expected));
+            }
+            _ => {}
+        }
         Some(match (self.shallow(rt), method) {
             // ---- iterator sources
             (Ty::Str, "chars") => {
@@ -475,6 +490,12 @@ impl Checker<'_> {
 
             // ---- iterators
             (Ty::Iter { elem, mutable }, m2) => {
+                if m2 == "next" {
+                    // Advancing an iterator held in a variable needs `let mut`.
+                    self.check_mutable(recv, super::Mutation::Borrow);
+                    self.arg_count(m.syntax(), "method", 0, args.len());
+                    return Some(Ty::Option(elem));
+                }
                 return self.iter_method(m, m2, *elem, mutable, args, expected);
             }
             _ => return None,
@@ -751,49 +772,6 @@ pub fn is_option_closure_method(m: &str) -> bool {
             | "or_else"
             | "zip"
     )
-}
-
-/// Each type parameter of `f` with its bounds, inline (`<F: Fn(i32)>`) or from `where F: ..`.
-pub fn generic_bounds(f: &ast::Fn) -> Vec<(String, ast::TypeBoundList)> {
-    use ra_ap_syntax::ast::{HasGenericParams, HasName, HasTypeBounds};
-    let mut out = Vec::new();
-    if let Some(gp) = f.generic_param_list() {
-        for p in gp.generic_params() {
-            let ast::GenericParam::TypeParam(p) = p else {
-                continue;
-            };
-            if let (Some(n), Some(b)) = (p.name(), p.type_bound_list()) {
-                out.push((n.text().to_string(), b));
-            }
-        }
-    }
-    if let Some(wc) = f.where_clause() {
-        for pred in wc.predicates() {
-            let name = match pred.ty() {
-                Some(ast::Type::PathType(pt)) => pt
-                    .path()
-                    .and_then(|p| p.as_single_name_ref())
-                    .map(|n| n.text().to_string()),
-                _ => None,
-            };
-            if let (Some(n), Some(b)) = (name, pred.type_bound_list()) {
-                out.push((n, b));
-            }
-        }
-    }
-    out
-}
-
-/// Whether a type bound list names `Fn`, `FnMut` or `FnOnce`.
-pub fn is_fn_bound(b: &ast::TypeBoundList) -> bool {
-    b.bounds().any(|b| match b.ty() {
-        Some(ast::Type::PathType(p)) => p
-            .path()
-            .and_then(|p| p.segment())
-            .and_then(|s| s.name_ref())
-            .is_some_and(|n| matches!(n.text().to_string().as_str(), "Fn" | "FnMut" | "FnOnce")),
-        _ => false,
-    })
 }
 
 /// `char` classification methods, as a JS regex the (one-char) string must match.

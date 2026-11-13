@@ -103,6 +103,28 @@ pub fn split_repeat(src: &str, base: usize, mc: &ast::MacroCall) -> Option<(Macr
     Some((value, count))
 }
 
+/// `matches!(x, P if g)` as the text of `match x { P if g => true, _ => false }`, laid out so `x`
+/// and `P` keep their source offsets (diagnostics and source maps stay right).
+pub fn matches_as_match(args: &[MacroArg]) -> Option<MacroArg> {
+    let [x, p] = args else { return None };
+    let gap = p.start.checked_sub(x.end())?;
+    if gap == 0 || x.start < 6 {
+        return None;
+    }
+    let text = format!(
+        "match {}{}{{{} => true, _ => false }}",
+        x.text,
+        " ".repeat(gap - 1),
+        p.text
+    );
+    Some(MacroArg {
+        start: x.start - 6,
+        text,
+        name: None,
+        single_token: None,
+    })
+}
+
 /// Parse a macro argument as an expression. Errors carry absolute byte ranges.
 pub fn parse_arg(arg: &MacroArg) -> (Option<ast::Expr>, Vec<(usize, usize, String)>) {
     let parse = ast::Expr::parse(&arg.text, EDITION);

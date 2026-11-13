@@ -18,14 +18,38 @@
     "panic": null
   },
   {
+    "file": "consts.rs",
+    "stdout": "0.25 64 n00dles hello\n[21, 22, 80] 3 (7, 'z')\nPoint { x: 5, y: 0 } Point { x: 0, y: 0 } false\n0 zero\n16 base\n64 limit\n3 other\n250\n123\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "control.rs",
     "stdout": "negative zero positive\n832040\n8\n111\nshadowed\n10\n3-4-5\n0 1 2 \n2 1 0 \n1 2 3 \n4 3 2 1 \n6 7\n3\nbig\n",
     "exitCode": 0,
     "panic": null
   },
   {
+    "file": "display.rs",
+    "stdout": "$1234.56 Money(123456) [$0.05]\n8 $1234.56\nidle / Idle\nhacking n00dles with 8 threads / Hacking { target: \"n00dles\", threads: 8 }\nfailed: no root / Failed(\"no root\")\n== income ==\nhack      $0.99\ngrow      $2500.75\n2 rows\n$0.01, $10.00\ntotal: $0.42\n4 home 16 home\n\"1-2!\\n$0.07\"\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "enums.rs",
+    "stdout": "Circle(1.0) 3 true\nRect { w: 2.0, h: 3.0 } 6 false\nEmpty 0 false\nRect { w: 4.0, h: 6.0 } true\n27\nw 4\n5 11 Low\ntrue Some(High)\nEast 1 true\nsay hi\nwait 5\nwait 1 for coffee\n(-5, 3)\nMove { dir: North, steps: 3 }\n[(North, 2), (East, 1), (West, 1)]\nwest\nNorth\nSouth\nSome(High) None\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "format.rs",
     "stdout": "crab has 10 legs\na b a\ncrab!\n[    crab] [crab    ] [  crab  ] [**crab***]\n[   10] [10   ] [-0010] [+10]\n3.14 3    3.142|\n\"crab\" 'c' \"tab\\there \\\"quoted\\\"\"\n1 1.0 0.30000000000000004 1e21\ninf -inf\n0.0000001 1e-7\n{literal} braces\n10-crab has len 7\n6\ntru\nCRAB\npadded\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generics.rs",
+    "stdout": "9 1.5 'z'\nScore(11)\n3 0\n6 0.75\nhp=42 name=ada ratio=0.5\nx [1, 2]\n-1 7\n[\"ab\", \"c\", \"ab\", \"c\"]\n200\n50\n",
     "exitCode": 0,
     "panic": null
   },
@@ -48,6 +72,18 @@
     "panic": null
   },
   {
+    "file": "let_chains.rs",
+    "stdout": "both, increasing\nother\nnegative\nother\nnone\npopped 4\n[1, 2]\n1 a\n3 c\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "loops_slices.rs",
+    "stdout": "64 4\nSome((2, 6)) None\n400 4\ndone\nempty | 0\none: 7 | 7\nbookends 3 | 12\n1 then 2 then 3 more | 9\n4 then 6 then 0 more | 10\ngo [\"north\", \"fast\"]\n1 a\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "mandelbrot.rs",
     "stdout": "\n                                        +.\n                                       .....#\n                                      ...++...\n                                   ....+####+..\n                               ........+####+......+\n                             ....+#++##########+.++++\n                           ....+.##################+..\n                  .............+###################+.+\n                 ...++.+++....+#####################+..\n                ....+#######++######################+.\n          .......+++#########+######################..\n    ##############################################....\n          .......+++#########+######################..\n                ....+#######++######################+.\n                 ...++.+++....+#####################+..\n                  .............+###################+.+\n                           ....+.##################+..\n                             ....+#++##########+.++++\n                               ........+####+......+\n                                   ....+####+..\n                                      ...++...\n                                       .....+\n                                        +.\ntotal iterations: 24818\n",
     "exitCode": 0,
@@ -56,6 +92,18 @@
   {
     "file": "matching.rs",
     "stdout": "negative zero small digit big even big odd \nABCF\nvowel consonant digit smiley other \nSome(4) None None\non\ngreen\ntotal 206 after 7\nsum 1023\nnot found\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "mut_refs.rs",
+    "stdout": "8\nHI!\ntrue false false\nSome(9) None None\n5 6\n14 0\n7 81\n2 1\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "nested_items.rs",
+    "stdout": "8 3 4 6 [1, 3] Pair { a: 4, b: 6 } 10\n",
     "exitCode": 0,
     "panic": null
   },
@@ -84,6 +132,18 @@
     "panic": "thread 'main' panicked at panic_option_unwrap.rs:4:19:\ncalled `Option::unwrap()` on a `None` value"
   },
   {
+    "file": "panic_slice_end.rs",
+    "stdout": "[2]\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_slice_end.rs:5:24:\nrange end index 5 out of range for slice of length 3"
+  },
+  {
+    "file": "panic_str_boundary.rs",
+    "stdout": "h\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at panic_str_boundary.rs:4:22:\nend byte index 2 is not a char boundary; it is inside 'é' (bytes 1..3 of string)"
+  },
+  {
     "file": "panic_vec_index_assign.rs",
     "stdout": "before\n",
     "exitCode": 101,
@@ -108,8 +168,50 @@
     "panic": "thread 'main' panicked at panic_vec_swap.rs:5:7:\nindex out of bounds: the len is 3 but the index is 4"
   },
   {
+    "file": "results.rs",
+    "stdout": "10 / 2 = Ok(5) (ok 5)\n7 / 0 = Err(DivByZero) (division by zero)\nx / 1 = Err(Parse(\"x\")) (bad number \"x\")\n-9 / 3 = Err(Negative(-3)) (other Negative(-3))\n1000 / 3 = Ok(333) (big 333)\n0 / 5 = Ok(0) (zero)\nOk(6) Err(ParseIntError { kind: InvalidDigit })\nOk(42) Err(ParseIntError { kind: PosOverflow })\nErr(ParseIntError { kind: InvalidDigit }) Err(ParseIntError { kind: Empty }) Ok(7)\nErr(ParseIntError { kind: NegOverflow }) Err(ParseIntError { kind: InvalidDigit })\nOk(2.5) Ok(1000.0) Err(ParseFloatError { kind: Invalid })\nOk(true) Err(ParseBoolError)\nerror: invalid digit found in string\n17 0.25\ntrue true 3 -1\nOk(6) Err(4)\nSome(3) Some(\"boom\")\nErr(\"3 too small\")\n4 103\ntrue false\nSome(5) None\nOk(5) Err(\"none\")\n[Ok(1), Err(\"invalid digit found in string\"), Ok(3)]\n[1, 3] true\n25\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at results.rs:96:20:\ndividing went wrong: DivByZero"
+  },
+  {
+    "file": "shared.rs",
+    "stdout": "[1, 2, 3, 4] 4\n20\n120 [\"+25\", \"+-5\"] 2\n120 [\"+25\", \"+-5\"] Account { balance: RefCell { value: 0 }, log: RefCell { value: [] }, visits: Cell { value: 2 } }\n14\nroot [\"leaf\", \"leaf\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "slices.rs",
+    "stdout": "[20, 30] [10, 20] [40, 50] [10, 20, 30, 40, 50] [20, 30, 40]\n120 0\n[1, 2] [3, 4] 4\n[20, 30, 40] [40, 30, 20]\n[10, 20][20, 30]\nh é wörld\n\"héllo\" 6\nhom\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "sorting.rs",
     "stdout": "less equal greater\nGreater Greater\nGreater\nSome(Greater) None\ntrue\n[(\"ada\", 36), (\"bob\", 30), (\"cy\", 30), (\"dee\", 25)]\n[(\"cy\", 30), (\"ada\", 36), (\"bob\", 30), (\"dee\", 25)]\n[-1.0, 0.5, 2.5, 9.75]\n9.75 Some(9.75)\n[1, 2, 3, 4, 1]\n[1, 2, 4, 1]\n[\"apple\", \"avocado\", \"banana\", \"blueberry\", \"cherry\"]\n[50, 31, 82]\nSome(8) None\nNone Some(3)\n99 5\n-1 true\ntrue Some(7) Some((4, 'z'))\n[1, 2, 3, 4, 5, 6, 7, 8]\n[4, 5]\n[1, 2, 3]\n[1, 2, 3, 6, 7, 8]\n[1, 3, 5, 10, 11]\n[(\"apple\", 3), (\"fig\", 13), (\"kiwi\", 99), (\"lime\", 3), (\"plum\", 5)]\n123 [\"apple\", \"fig\", \"kiwi\", \"lime\", \"plum\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "strings.rs",
+    "stdout": "Some(2)\nSome(17)\nSome((\"Hello\", \"World! hello\"))\nSome(\", World! hello\")\nNone\nello, World! hello\nlo, World! hello\n[(0, 'H'), (7, 'W')]\n[72, 101, 108]\n19\ntrue\ntrue\nHeLLo, WorLd! heLLo\n[\"Hello,\", \"World! hello\"]\n[\"hello\", \"World!\", \"Hello,\"]\nHello, World! hello!\nHello, World! helloHello, World! hello\nSome(5)\nfalse\nxyzab Some('c')\n[]\nabc\na-b-c\n17 289 -1 3\n2147483647 255\nNone None\n255 4\n7\n[\"a\", \"b\"]\nSome(1) true\n[3, 2, 1] Ok(1)\n\"3,1,2\"\nSome(3)\n6\n97 b\nSome('7')\n9\n3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "structs.rs",
+    "stdout": "Point { x: 3.0, y: 4.0 } Point { x: 0.0, y: 0.0 } 5\nPoint { x: 3.0, y: 4.0 } Point { x: 8.0, y: 3.0 }\nPoint { x: 3.0, y: 9.5 } Point { x: 9.5, y: 3.0 } true\nPoint { x: 0.0, y: 0.0 }\nVersion(1, 2, 3) true 11 Less\n[Version(1, 2, 0), Version(1, 2, 3), Version(1, 10, 0), Version(2, 0, 0)]\nSome(Version(2, 0, 0))\n1 0\nMarker true\n2 11 25 Point { x: 0.0, y: 0.0 }\nInventory { owner: \"ada\", items: [\"sword\", \"shield\"], gold: 25, origin: Point { x: 0.0, y: 0.0 } }\n[\"foodnstuff\", \"sigma\"]\n3\n[4, 16] [\"foodnstuff\", \"sigma\"]\nfoodnstuff\non the x axis at 2\non the y axis\non the diagonal\nsomewhere\n[Point { x: 11.0, y: -1.0 }, Point { x: 12.0, y: 2.0 }]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "structs_mut.rs",
+    "stdout": "P { x: 1, y: 2 } P { x: 101, y: 2 }\nP { x: 1, y: 2 } P { x: 0, y: -1 }\nOuter { inner: P { x: 50, y: 2 }, tag: \"t\", list: [P { x: -5, y: 2 }, P { x: 101, y: 7 }] } P { x: 1, y: 2 } P { x: 1, y: 2 }\nt t! 2\nCircle(3.0) Rect { w: 2.0, h: 3.0 }\n[Circle(2.25), Rect { w: 1.5, h: 1.5 }]\n[P { x: 3, y: 2 }, P { x: 303, y: 2 }] 310\n[[P { x: 0, y: 0 }, P { x: 0, y: 0 }], [P { x: 9, y: 0 }, P { x: 0, y: 0 }]]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "traits.rs",
+    "stdout": "circle with area 3.00 / big: false\n2x3 rect with area 6.00 / big: false\nsplat with area 4.50 / big: false\ndot with area 0.00 / big: false\n13.5\n45.0\ncircle with area 27.00\n1X1 RECT CIRCLE\n(r=1) Circle { r: 1.0 }\ndot\n",
     "exitCode": 0,
     "panic": null
   },
@@ -130,5 +232,11 @@
     "stdout": "[4, 3] len=2\nsorted [1, 1, 2, 3, 4, 5, 6, 9]\n[100, 6, 5, 4, 3, 2, 1, 1] removed=9 contains 5: true contains 7: false\ndoubled [200, 12, 10, 8, 6, 4, 2, 2]\ntruncated [200, 12, 10] empty=false\ncleared [] empty=true\nsum = 4000000005\n17 primes below 60: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]\n[[0, 1, 2, 3], [4, 5, -1, 7], [8, 9, 10, 11]]\ncopy unchanged: [0, 1, 2, 3] equal now: false\n[\"apple\", \"fig\", \"pear\", \"kiwi\"] -> apple, fig, pear, kiwi\ntotal length 16\n[1.0, 2.5, -0.0] ['a', '\\n']\na == b: true a != b: false\n[0, 1, 4, 9, 16] 5\ncounts [1, 1, 3]\nabout to index 5 of 3\n",
     "exitCode": 101,
     "panic": "thread 'main' panicked at vec.rs:108:26:\nindex out of bounds: the len is 3 but the index is 5"
+  },
+  {
+    "file": "vec_more.rs",
+    "stdout": "Ok(3) Err(2) Err(6)\nOk(0)\nOk(1)\n[1, 3] [5, 7, 9, 11] true true\n[3, 5] [1, 7, 9, 11]\n[1, 7] [9, 11]\n[1, 7, 100, 200] []\n[7, 100, 200, 1]\n[200, 1, 7, 100]\n200 [100, 1, 7]\n[7, 7, 7] [1, 2, 1, 2] true\n50 1 2\n[1, 2] Queue { items: [], name: \"jobs\" }\n[\"y\", \"z\"] [\"x\"]\n3 0 4 true\n32 16\nSome(127) None None\n255 -128 254\n1705032704 3\n[\"a\", \"b\", \"c,d\"]\n[\"d\", \"a,b,c\"]\n[\"c\", \"b\", \"a\"]\n[-1.0, 0.0, 2.5, NaN]\nSome('A') Some('b')\n8\n",
+    "exitCode": 0,
+    "panic": null
   }
 ]

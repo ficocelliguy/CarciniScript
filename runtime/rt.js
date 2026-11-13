@@ -82,6 +82,8 @@
   function eq(a, b) {
     // `None` is null, but values from JS (NS results) may use undefined.
     if (a == null || b == null) return a == b;
+    // Structs and enums: their derived `$eq`.
+    if (typeof a.$eq === "function") return a.$eq(b);
     if (a instanceof HashSet && b instanceof HashSet) return a.m.size === b.m.size && a.$isSubset(b);
     if (a instanceof HashMap && b instanceof HashMap) {
       if (a.m.size !== b.m.size) return false;
@@ -103,6 +105,7 @@
   function cmp(a, b) {
     // `None` sorts before every `Some`.
     if (a == null || b == null) return a == null ? (b == null ? 0 : -1) : 1;
+    if (typeof a.$cmp === "function") return a.$cmp(b);
     if (Array.isArray(a) && Array.isArray(b)) {
       const n = Math.min(a.length, b.length);
       for (let i = 0; i < n; i++) {
@@ -116,6 +119,7 @@
 
   function clone(v) {
     if (v instanceof HashSet || v instanceof HashMap) return v.$clone();
+    if (v != null && typeof v.$clone === "function") return v.$clone();
     return Array.isArray(v) ? v.map(clone) : v;
   }
 
@@ -421,6 +425,10 @@
       });
     }
     // ---- consumers
+    $next() {
+      const r = this.it.next();
+      return r.done ? null : r.value;
+    }
     $count() {
       let n = 0;
       for (const _ of iterable(this.it)) n++;
@@ -564,6 +572,66 @@
     return parts.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
   }
 
+
+  // Rust's `Result<T, E>`: `$tag` 0 is `Ok`, 1 is `Err`; the value is at `[0]`.
+  class Res {
+    constructor(tag, v) {
+      this.$tag = tag;
+      this[0] = v;
+    }
+    $eq(o) {
+      return this.$tag === o.$tag && eq(this[0], o[0]);
+    }
+    $cmp(o) {
+      if (this.$tag !== o.$tag) return this.$tag < o.$tag ? -1 : 1;
+      return cmp(this[0], o[0]);
+    }
+    $clone() {
+      return new Res(this.$tag, clone(this[0]));
+    }
+    $dbg() {
+      return `${this.$tag ? "Err" : "Ok"}(${rt.$dbg(this[0])})`;
+    }
+  }
+
+  // The error values of `str::parse`, with rustc's `Debug` and `Display` text.
+  const PARSE_MESSAGES = {
+    "ParseIntError:Empty": "cannot parse integer from empty string",
+    "ParseIntError:InvalidDigit": "invalid digit found in string",
+    "ParseIntError:PosOverflow": "number too large to fit in target type",
+    "ParseIntError:NegOverflow": "number too small to fit in target type",
+    "ParseFloatError:Empty": "cannot parse float from empty string",
+    "ParseFloatError:Invalid": "invalid float literal",
+    "ParseBoolError:": "provided string was not `true` or `false`",
+    "ParseCharError:EmptyString": "cannot parse char from empty string",
+    "ParseCharError:TooManyChars": "too many characters in string",
+  };
+  class ParseError {
+    constructor(type, kind) {
+      this.type = type;
+      this.kind = kind;
+    }
+    $eq(o) {
+      return this.type === o.type && this.kind === o.kind;
+    }
+    $dbg() {
+      return this.kind ? `${this.type} { kind: ${this.kind} }` : this.type;
+    }
+    toString() {
+      return PARSE_MESSAGES[`${this.type}:${this.kind}`];
+    }
+  }
+
+  // `RefCell<T>` / `Cell<T>`: the value at `.v`. No `$clone`: cloning an `Rc<RefCell<T>>` shares it.
+  class RefCell {
+    constructor(v, kind) {
+      this.v = v;
+      this.kind = kind;
+    }
+    $eq(o) {
+      return eq(this.v, o.v);
+    }
+  }
 
   function assertFailed(op, a, b, location, debug, message) {
     const fmt = debug ?? String;
@@ -749,11 +817,12 @@
     },
 
     // char methods.
-    $asciiUpper(c) {
-      return c >= "a" && c <= "z" ? c.toUpperCase() : c;
+    // ASCII-only case mapping, for chars and strings.
+    $asciiUpper(s) {
+      return s.replace(/[a-z]+/g, (m) => m.toUpperCase());
     },
-    $asciiLower(c) {
-      return c >= "A" && c <= "Z" ? c.toLowerCase() : c;
+    $asciiLower(s) {
+      return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
     },
     $toDigit(c, radix) {
       if (radix < 2 || radix > 36) throw new CarciniPanic("to_digit: invalid radix -- radix must be in the range 2 to 36 inclusive", "<std>");
@@ -911,6 +980,7 @@
     // Values whose type the compiler doesn't know yet (NS results until phase 2 bindings).
     $disp(x) {
       if (typeof x === "number") return fmtF(x);
+      if (x !== null && typeof x === "object" && typeof x.fmt === "function") return rt.$display(x);
       if (x === undefined) return "()";
       return String(x);
     },
@@ -918,7 +988,607 @@
       if (typeof x === "number") return dbgF(x);
       if (typeof x === "string") return rt.$dbgStr(x);
       if (x === undefined) return "()";
+      if (x !== null && typeof x.$dbg === "function") return x.$dbg();
       return String(x);
+    },
+    // `{:?}` of a generic value, whose type is erased: whole numbers print as integers (so a
+    // whole-number float prints without `.0`).
+    $dbgAny(x) {
+      if (typeof x === "number" && Number.isInteger(x) && !Object.is(x, -0)) return String(x);
+      if (typeof x === "string") return rt.$dbgStr(x);
+      if (Array.isArray(x)) return `[${x.map(rt.$dbgAny).join(", ")}]`;
+      return rt.$dbg(x);
+    },
+    // A struct or variant's `{:?}`: `Point { x: 1, y: 2 }`, or `Meters(5.0)` when `names` is null.
+    $dbgStruct(name, names, vals) {
+      if (names === null) return `${name}(${vals.join(", ")})`;
+      if (vals.length === 0) return name;
+      return `${name} { ${vals.map((v, i) => `${names[i]}: ${v}`).join(", ")} }`;
+    },
+    // `*r = v` for a `&mut` struct or enum: the object keeps its identity, its contents change.
+    $replace(target, value) {
+      if (target === value) return;
+      for (const k of Object.keys(target)) delete target[k];
+      Object.assign(target, value);
+    },
+    // `Display` impls write into a Formatter: `{ s: "" }`.
+    $write(f, s, nl) {
+      f.s += nl ? s + "\n" : s;
+      return new Res(0, undefined);
+    },
+    $display(v) {
+      const f = { s: "" };
+      v.fmt(f);
+      return f.s;
+    },
+    RefCell,
+    $cellReplace(c, v) {
+      const old = c.v;
+      c.v = v;
+      return old;
+    },
+    // Result.
+    Ok: (v) => new Res(0, v),
+    Err: (e) => new Res(1, e),
+    $dbgRes(r, tf, ef) {
+      return r.$tag ? `Err(${ef(r[0])})` : `Ok(${tf(r[0])})`;
+    },
+    $resUnwrap(r, ef, location) {
+      if (r.$tag) throw new CarciniPanic(`called \`Result::unwrap()\` on an \`Err\` value: ${ef(r[0])}`, location);
+      return r[0];
+    },
+    $resExpect(r, msg, ef, location) {
+      if (r.$tag) throw new CarciniPanic(`${msg}: ${ef(r[0])}`, location);
+      return r[0];
+    },
+    $resUnwrapErr(r, tf, location) {
+      if (!r.$tag) throw new CarciniPanic(`called \`Result::unwrap_err()\` on an \`Ok\` value: ${tf(r[0])}`, location);
+      return r[0];
+    },
+    $resExpectErr(r, msg, tf, location) {
+      if (!r.$tag) throw new CarciniPanic(`${msg}: ${tf(r[0])}`, location);
+      return r[0];
+    },
+    $resOr(r, d) {
+      return r.$tag ? d : r[0];
+    },
+    $resOrElse(r, f) {
+      return r.$tag ? f(r[0]) : r[0];
+    },
+    $resOk(r) {
+      return r.$tag ? null : r[0];
+    },
+    $resErr(r) {
+      return r.$tag ? r[0] : null;
+    },
+    $resMap(r, f) {
+      return r.$tag ? r : new Res(0, f(r[0]));
+    },
+    $resMapErr(r, f) {
+      return r.$tag ? new Res(1, f(r[0])) : r;
+    },
+    $resAndThen(r, f) {
+      return r.$tag ? r : f(r[0]);
+    },
+    $resOrElseRes(r, f) {
+      return r.$tag ? f(r[0]) : r;
+    },
+    $resIsOkAnd(r, f) {
+      return !r.$tag && f(r[0]);
+    },
+    $resIsErrAnd(r, f) {
+      return r.$tag === 1 && f(r[0]);
+    },
+    $resMapOr(r, d, f) {
+      return r.$tag ? d : f(r[0]);
+    },
+    $okOr(x, e) {
+      return x == null ? new Res(1, e) : new Res(0, x);
+    },
+    $okOrElse(x, f) {
+      return x == null ? new Res(1, f()) : new Res(0, x);
+    },
+    // `str::parse`, following std's rules: an optional sign (`-` only for signed types), then
+    // ASCII digits; no whitespace.
+    $parseInt(s, min, max) {
+      const err = (kind) => new Res(1, new ParseError("ParseIntError", kind));
+      if (s === "") return err("Empty");
+      let body = s;
+      let neg = false;
+      if (body[0] === "+" || body[0] === "-") {
+        neg = body[0] === "-";
+        body = body.slice(1);
+        if (neg && min >= 0) return err("InvalidDigit");
+      }
+      if (body === "" || !/^[0-9]+$/.test(body)) return err("InvalidDigit");
+      const v = BigInt(neg ? "-" + body : body);
+      if (v > BigInt(max)) return err("PosOverflow");
+      if (v < BigInt(min)) return err("NegOverflow");
+      return new Res(0, Number(v));
+    },
+    $parseFloat(s) {
+      const err = (kind) => new Res(1, new ParseError("ParseFloatError", kind));
+      if (s === "") return err("Empty");
+      if (!/^[+-]?(inf|infinity|nan|([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?)$/i.test(s)) return err("Invalid");
+      const neg = s[0] === "-";
+      const body = s.replace(/^[+-]/, "").toLowerCase();
+      if (body === "inf" || body === "infinity") return new Res(0, neg ? -Infinity : Infinity);
+      if (body === "nan") return new Res(0, NaN);
+      return new Res(0, Number(s));
+    },
+    $parseBool(s) {
+      if (s === "true") return new Res(0, true);
+      if (s === "false") return new Res(0, false);
+      return new Res(1, new ParseError("ParseBoolError", ""));
+    },
+    $parseChar(s) {
+      const cs = Array.from(s);
+      if (cs.length === 1) return new Res(0, cs[0]);
+      return new Res(1, new ParseError("ParseCharError", cs.length ? "TooManyChars" : "EmptyString"));
+    },
+
+    // `&v[lo..hi]` (hi null for `lo..`): a copy, with core's bounds checks and messages.
+    $slice(v, lo, hi, inclusive, location) {
+      const n = v.length;
+      if (hi === null) {
+        if (lo > n) throw new CarciniPanic(`range start index ${lo} out of range for slice of length ${n}`, location);
+        return v.slice(lo);
+      }
+      const end = inclusive ? hi + 1 : hi;
+      if (lo > end) throw new CarciniPanic(`slice index starts at ${lo} but ends at ${end}`, location);
+      if (end > n) throw new CarciniPanic(`range end index ${hi} out of range for slice of length ${n}`, location);
+      return v.slice(lo, end);
+    },
+    // `&s[lo..hi]` with UTF-8 byte offsets, panicking like `str` indexing does.
+    $strSlice(s, lo, hi, inclusive, location) {
+      // UTF-8 offset of each code point, and the matching UTF-16 offset.
+      const bytes = [];
+      const units = [];
+      const chars = [];
+      let b = 0;
+      let u = 0;
+      for (const c of s) {
+        bytes.push(b);
+        units.push(u);
+        chars.push(c);
+        const cp = c.codePointAt(0);
+        b += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        u += c.length;
+      }
+      const len = b;
+      const end = hi === null ? len : inclusive ? hi + 1 : hi;
+      const fail = (msg) => {
+        throw new CarciniPanic(msg, location);
+      };
+      if (lo > len) fail(`start byte index ${lo} is out of bounds for string of length ${len}`);
+      if (end > len) fail(`end byte index ${end} is out of bounds for string of length ${len}`);
+      if (lo > end) fail(`byte range starts at ${lo} but ends at ${end}`);
+      const unit = (byte) => {
+        if (byte === len) return u;
+        const i = bytes.indexOf(byte);
+        return i < 0 ? -1 : units[i];
+      };
+      for (const [which, at] of [["start", lo], ["end", end]]) {
+        if (unit(at) < 0) {
+          const i = bytes.findIndex((x, k) => x < at && (k + 1 === bytes.length ? len : bytes[k + 1]) > at);
+          const next = i + 1 < bytes.length ? bytes[i + 1] : len;
+          fail(
+            `${which} byte index ${at} is not a char boundary; it is inside ${rt.$dbgChar(chars[i])} (bytes ${bytes[i]}..${next} of string)`,
+          );
+        }
+      }
+      return s.slice(unit(lo), unit(end));
+    },
+    // ---- std surface: strings
+    // A string pattern as a predicate over one char, or null for a `&str` pattern.
+    $strFind(s, p, rev) {
+      let at;
+      if (typeof p === "function") {
+        const units = [];
+        let u = 0;
+        for (const c of s) {
+          if (p(c)) units.push(u);
+          u += c.length;
+        }
+        at = units.length ? (rev ? units[units.length - 1] : units[0]) : -1;
+      } else {
+        at = rev ? s.lastIndexOf(p) : s.indexOf(p);
+      }
+      return at < 0 ? null : rt.$utf8len(s.slice(0, at));
+    },
+    // Where pattern `p` matches in `s`: [start, end] in UTF-16 units, first or last.
+    $splitOnce(s, p, rev) {
+      let at, len;
+      if (typeof p === "function") {
+        let u = 0;
+        at = -1;
+        for (const c of s) {
+          if (p(c) && (rev || at < 0)) {
+            at = u;
+            len = c.length;
+          }
+          u += c.length;
+        }
+      } else {
+        at = rev ? s.lastIndexOf(p) : s.indexOf(p);
+        len = p.length;
+      }
+      return at < 0 ? null : [s.slice(0, at), s.slice(at + len)];
+    },
+    $stripPrefix(s, p) {
+      if (typeof p === "function") {
+        const c = Array.from(s)[0];
+        return c !== undefined && p(c) ? s.slice(c.length) : null;
+      }
+      return s.startsWith(p) ? s.slice(p.length) : null;
+    },
+    $stripSuffix(s, p) {
+      if (typeof p === "function") {
+        const cs = Array.from(s);
+        const c = cs[cs.length - 1];
+        return c !== undefined && p(c) ? s.slice(0, s.length - c.length) : null;
+      }
+      return s.endsWith(p) ? s.slice(0, s.length - p.length) : null;
+    },
+    $trimMatches(s, p, start, end) {
+      if (typeof p === "function" || Array.from(p).length === 1) {
+        const test = typeof p === "function" ? p : (c) => c === p;
+        const cs = Array.from(s);
+        let i = 0;
+        let j = cs.length;
+        if (start) while (i < j && test(cs[i])) i++;
+        if (end) while (j > i && test(cs[j - 1])) j--;
+        return cs.slice(i, j).join("");
+      }
+      if (p === "") return s;
+      if (start) while (s.startsWith(p)) s = s.slice(p.length);
+      if (end) while (s.endsWith(p)) s = s.slice(0, s.length - p.length);
+      return s;
+    },
+    $strContains(s, p) {
+      return typeof p === "function" ? Array.from(s).some(p) : s.includes(p);
+    },
+    $strStartsWith(s, p) {
+      return rt.$stripPrefix(s, p) !== null;
+    },
+    $strEndsWith(s, p) {
+      return rt.$stripSuffix(s, p) !== null;
+    },
+    // `replace` (n = Infinity) / `replacen`.
+    $strReplace(s, p, to, n) {
+      let out = "";
+      let count = 0;
+      if (typeof p === "function") {
+        for (const c of s) {
+          if (count < n && p(c)) {
+            out += to;
+            count++;
+          } else out += c;
+        }
+        return out;
+      }
+      if (p === "") {
+        // Rust inserts `to` between every char (and at both ends).
+        const cs = Array.from(s);
+        for (let i = 0; i <= cs.length; i++) {
+          if (count < n) {
+            out += to;
+            count++;
+          }
+          if (i < cs.length) out += cs[i];
+        }
+        return out;
+      }
+      let i = 0;
+      while (count < n) {
+        const at = s.indexOf(p, i);
+        if (at < 0) break;
+        out += s.slice(i, at) + to;
+        i = at + p.length;
+        count++;
+      }
+      return out + s.slice(i);
+    },
+    $charIndices(s) {
+      return Iter.of(function* () {
+        let b = 0;
+        for (const c of s) {
+          yield [b, c];
+          const cp = c.codePointAt(0);
+          b += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        }
+      });
+    },
+    $bytes(s) {
+      return new Iter(new TextEncoder().encode(s)[Symbol.iterator]());
+    },
+    // The pieces between matches of `p`, left to right.
+    $strPieces(s, p) {
+      if (typeof p !== "function") return s.split(p);
+      const out = [];
+      let cur = "";
+      for (const c of s) {
+        if (p(c)) {
+          out.push(cur);
+          cur = "";
+        } else cur += c;
+      }
+      out.push(cur);
+      return out;
+    },
+    $rsplit(s, p) {
+      return new Iter(rt.$strPieces(s, p).reverse()[Symbol.iterator]());
+    },
+    $splitTerminator(s, p) {
+      const parts = rt.$strPieces(s, p);
+      if (parts.length && parts[parts.length - 1] === "") parts.pop();
+      return new Iter(parts[Symbol.iterator]());
+    },
+    $strMatches(s, p) {
+      const out = [];
+      if (typeof p === "function") {
+        for (const c of s) if (p(c)) out.push(c);
+      } else if (p !== "") {
+        let i = 0;
+        for (;;) {
+          const at = s.indexOf(p, i);
+          if (at < 0) break;
+          out.push(p);
+          i = at + p.length;
+        }
+      }
+      return new Iter(out[Symbol.iterator]());
+    },
+    // `splitn` / `rsplitn`: at most n pieces; the last holds the rest of the string.
+    $splitn(s, n, p, rev) {
+      const parts = rt.$strPieces(s, p);
+      if (n === 0) return new Iter([][Symbol.iterator]());
+      if (parts.length <= n) return new Iter((rev ? parts.reverse() : parts)[Symbol.iterator]());
+      const sep = typeof p === "function" ? null : p;
+      if (sep === null) {
+        // Closure patterns: rebuild the rest from the original string.
+        const cs = Array.from(s);
+        const out = [];
+        let cur = "";
+        let i = rev ? cs.length - 1 : 0;
+        const step = rev ? -1 : 1;
+        while (rev ? i >= 0 : i < cs.length) {
+          if (out.length === n - 1) {
+            cur = rev ? cs.slice(0, i + 1).join("") : cs.slice(i).join("");
+            break;
+          }
+          if (p(cs[i])) {
+            out.push(cur);
+            cur = "";
+          } else cur = rev ? cs[i] + cur : cur + cs[i];
+          i += step;
+        }
+        out.push(cur);
+        return new Iter(out[Symbol.iterator]());
+      }
+      const out = rev ? parts.slice(parts.length - n + 1).reverse() : parts.slice(0, n - 1);
+      const rest = rev ? parts.slice(0, parts.length - n + 1).join(sep) : parts.slice(n - 1).join(sep);
+      out.push(rest);
+      return new Iter(out[Symbol.iterator]());
+    },
+    $eqIgnoreAsciiCase(a, b) {
+      return rt.$asciiLower(a) === rt.$asciiLower(b);
+    },
+    $isCharBoundary(s, i) {
+      if (i === 0) return true;
+      let b = 0;
+      for (const c of s) {
+        if (b === i) return true;
+        if (b > i) return false;
+        const cp = c.codePointAt(0);
+        b += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+      }
+      return b === i;
+    },
+    // The UTF-16 offset of byte offset `i`, or -1 if it isn't on a char boundary.
+    $unitOf(s, i) {
+      let b = 0;
+      let u = 0;
+      for (const c of s) {
+        if (b === i) return u;
+        if (b > i) return -1;
+        const cp = c.codePointAt(0);
+        b += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        u += c.length;
+      }
+      return b === i ? u : -1;
+    },
+    $strInsert(s, i, x, location) {
+      const u = rt.$unitOf(s, i);
+      if (u < 0) throw new CarciniPanic("assertion failed: self.is_char_boundary(idx)", location);
+      return s.slice(0, u) + x + s.slice(u);
+    },
+    $strTruncate(s, n, location) {
+      if (n >= rt.$utf8len(s)) return s;
+      const u = rt.$unitOf(s, n);
+      if (u < 0) throw new CarciniPanic("assertion failed: self.is_char_boundary(new_len)", location);
+      return s.slice(0, u);
+    },
+    $strPop(s) {
+      const cs = Array.from(s);
+      if (!cs.length) return [null, s];
+      const c = cs.pop();
+      return [c, s.slice(0, s.length - c.length)];
+    },
+    $strRemove(s, i, location) {
+      const u = rt.$unitOf(s, i);
+      if (i >= rt.$utf8len(s)) throw new CarciniPanic("cannot remove a char from the end of a string", location);
+      if (u < 0) throw new CarciniPanic("assertion failed: self.is_char_boundary(idx)", location);
+      const c = String.fromCodePoint(s.codePointAt(u));
+      return [c, s.slice(0, u) + s.slice(u + c.length)];
+    },
+
+    // ---- std surface: numbers
+    $checked(r, min, max) {
+      return Number.isFinite(r) && r >= min && r <= max ? r : null;
+    },
+    $checkedDiv(a, b) {
+      return b === 0 ? NaN : Math.trunc(a / b);
+    },
+    $checkedRem(a, b) {
+      return b === 0 ? NaN : a % b;
+    },
+    $saturate(r, min, max) {
+      return r < min ? min : r > max ? max : r;
+    },
+    // Bits of `x` as a two's-complement integer of `bits` width.
+    $bitsOf(x, bits) {
+      return BigInt.asUintN(bits, BigInt(Math.trunc(x)));
+    },
+    $countOnes(x, bits) {
+      let v = rt.$bitsOf(x, bits);
+      let n = 0;
+      while (v) {
+        n += Number(v & 1n);
+        v >>= 1n;
+      }
+      return n;
+    },
+    $countZeros(x, bits) {
+      return bits - rt.$countOnes(x, bits);
+    },
+    $leadingZeros(x, bits) {
+      const v = rt.$bitsOf(x, bits);
+      return v === 0n ? bits : bits - v.toString(2).length;
+    },
+    $trailingZeros(x, bits) {
+      let v = rt.$bitsOf(x, bits);
+      if (v === 0n) return bits;
+      let n = 0;
+      while (!(v & 1n)) {
+        v >>= 1n;
+        n++;
+      }
+      return n;
+    },
+    $isPowerOfTwo(x) {
+      return x > 0 && rt.$countOnes(x, 64) === 1;
+    },
+    // `f64::total_cmp`: -0 < +0, and NaN after everything.
+    $totalCmp(a, b) {
+      const key = (x) => (Number.isNaN(x) ? [2, 0] : [1, Object.is(x, -0) ? -Number.MIN_VALUE / 2 : x]);
+      const [ka, va] = key(a);
+      const [kb, vb] = key(b);
+      if (ka !== kb) return ka < kb ? -1 : 1;
+      if (Object.is(a, -0) && Object.is(b, 0)) return -1;
+      if (Object.is(a, 0) && Object.is(b, -0)) return 1;
+      return va < vb ? -1 : va > vb ? 1 : 0;
+    },
+    $fromDigit(d, radix) {
+      if (radix > 36) throw new CarciniPanic("from_digit: radix is too high (maximum 36)", "<std>");
+      return d < radix ? d.toString(radix) : null;
+    },
+    $fromU32(n) {
+      return n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff) ? null : String.fromCodePoint(n);
+    },
+
+    // ---- std surface: Vec
+    // std's binary search: `f` compares an element with the target.
+    $binarySearchBy(v, f) {
+      let size = v.length;
+      if (size === 0) return new Res(1, 0);
+      let base = 0;
+      while (size > 1) {
+        const half = size >> 1;
+        const mid = base + half;
+        if (f(v[mid]) <= 0) base = mid;
+        size -= half;
+      }
+      const c = f(v[base]);
+      return c === 0 ? new Res(0, base) : new Res(1, base + (c < 0 ? 1 : 0));
+    },
+    $splitAt(v, n, location) {
+      if (n > v.length) throw new CarciniPanic("mid > len", location);
+      return [v.slice(0, n), v.slice(n)];
+    },
+    $vecStartsWith(v, p) {
+      return p.length <= v.length && p.every((x, i) => eq(x, v[i]));
+    },
+    $vecEndsWith(v, p) {
+      const off = v.length - p.length;
+      return off >= 0 && p.every((x, i) => eq(x, v[off + i]));
+    },
+    $vecRepeatAll(v, n) {
+      const out = [];
+      for (let i = 0; i < n; i++) for (const x of v) out.push(clone(x));
+      return out;
+    },
+    $isSorted(v) {
+      for (let i = 1; i < v.length; i++) if (cmp(v[i - 1], v[i]) > 0) return false;
+      return true;
+    },
+    $drain(v, lo, hi, inclusive, location) {
+      const out = rt.$slice(v, lo, hi, inclusive, location);
+      v.splice(lo, out.length);
+      return new Iter(out[Symbol.iterator]());
+    },
+    $splitOff(v, at, location) {
+      if (at > v.length) {
+        throw new CarciniPanic(`\`at\` split index (is ${at}) should be <= len (is ${v.length})`, location);
+      }
+      return v.splice(at);
+    },
+    $append(v, other) {
+      for (const x of other) v.push(x);
+      other.length = 0;
+    },
+    $fill(v, x) {
+      for (let i = 0; i < v.length; i++) v[i] = clone(x);
+    },
+    $rotate(v, k, left, location) {
+      if (k > v.length) {
+        throw new CarciniPanic(left ? "assertion failed: mid <= self.len()" : "assertion failed: k <= self.len()", location);
+      }
+      const n = left ? k : v.length - k;
+      const moved = v.splice(0, n);
+      for (const x of moved) v.push(x);
+    },
+    $swapRemove(v, i, location) {
+      if (i >= v.length) {
+        throw new CarciniPanic(`swap_remove index (is ${i}) should be < len (is ${v.length})`, location);
+      }
+      const x = v[i];
+      const last = v.pop();
+      if (i < v.length) v[i] = last;
+      return x;
+    },
+
+    // ---- std::mem on `&mut` parameters (objects shared with the caller)
+    $swapContents(a, b) {
+      if (Array.isArray(a) && Array.isArray(b)) {
+        const t = a.splice(0, a.length, ...b);
+        b.splice(0, b.length, ...t);
+        return;
+      }
+      const t = Object.assign(Object.create(Object.getPrototypeOf(a)), a);
+      rt.$replace(a, b);
+      rt.$replace(b, t);
+    },
+    $replaceContents(a, value) {
+      if (Array.isArray(a)) return a.splice(0, a.length, ...value);
+      const old = Object.assign(Object.create(Object.getPrototypeOf(a)), a);
+      rt.$replace(a, value);
+      return old;
+    },
+    // A trait's default methods, added to an implementing class unless it defines its own.
+    $mixin(cls, defaults) {
+      for (const k of Object.getOwnPropertyNames(defaults)) {
+        if (!Object.prototype.hasOwnProperty.call(cls.prototype, k)) {
+          Object.defineProperty(cls.prototype, k, Object.getOwnPropertyDescriptor(defaults, k));
+        }
+      }
+    },
+    // `Ord::max` / `Ord::min`: on ties `max` returns the second argument and `min` the first.
+    $max(a, b) {
+      return cmp(b, a) >= 0 ? b : a;
+    },
+    $min(a, b) {
+      return cmp(b, a) < 0 ? b : a;
     },
     $plus(s) {
       s = String(s);

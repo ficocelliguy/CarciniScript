@@ -1,4 +1,12 @@
-import init, { initSync, compileJson, setNsBindings as setNsBindingsJson, version } from "./pkg/carciniscript.js";
+import init, {
+  initSync,
+  compileJson,
+  hoverJson,
+  completionsJson,
+  signatureHelpJson,
+  setNsBindings as setNsBindingsJson,
+  version,
+} from "./pkg/carciniscript.js";
 
 let ready = false;
 
@@ -16,9 +24,31 @@ export function initCarciniScriptSync(module) {
   ready = true;
 }
 
-export function compile(source, filename = "main.rs") {
+/**
+ * Compile Rust to an ES module. `resolve(path)` returns the source of another file, for `mod name;`
+ * (which reads `name.rs` next to `filename`), or undefined when there's no such file.
+ */
+export function compile(source, filename = "main.rs", resolve) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
-  return JSON.parse(compileJson(source, filename));
+  return JSON.parse(compileJson(source, filename, resolve));
+}
+
+/** Hover at a 1-based line and UTF-16 column: `{ contents (markdown), line, column, endLine, endColumn }` or null. */
+export function hover(source, filename, line, column, resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(hoverJson(source, filename, line, column, resolve));
+}
+
+/** Completions after a `.` at a 1-based line and UTF-16 column: `[{ label, kind, detail, documentation }]`. */
+export function completions(source, filename, line, column, resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(completionsJson(source, filename, line, column, resolve));
+}
+
+/** Parameter hints for the call around a 1-based line and UTF-16 column: `{ label, params, active, documentation }` or null. */
+export function signatureHelp(source, filename, line, column, resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(signatureHelpJson(source, filename, line, column, resolve));
 }
 
 /**

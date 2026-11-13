@@ -58,6 +58,43 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   order differs from Rust's only for characters outside the Basic Multilingual Plane.
 - **`windows` / `chunks` yield copies.** Rust yields borrowed slices; reading them is identical.
 
+## Structs, enums and Result
+
+- **Values of a struct or enum are JS objects shared by reference.** Moves make that invisible,
+  and `Copy` types are copied wherever Rust would copy them. A non-`Copy` value reached through
+  two paths at once (which Rust's borrow checker would reject) would show the aliasing.
+- **`*r = value` for a `&mut` struct replaces the object's contents in place** (`κσ.$replace`),
+  since JS can't rebind the caller's variable. The result is the same as Rust's.
+- **Generic structs, enums and impls aren't supported yet**, nor user-defined traits; `Display`
+  and `Default` are the trait impls that work. Derives cover the std ones.
+- **`?` needs the error types to match**: `From` conversions arrive with traits. Use
+  `.map_err(..)?`.
+- **`{:>10}` on a type with a `Display` impl ignores the width**, which matches Rust for impls
+  that use `write!` (rather than `f.pad`).
+- **Exhaustiveness checking gives up on very large matches** (it assumes they're covered).
+- **64-bit integers parse only within JS's safe integer range**; larger values report overflow.
+
+## Generics and slices
+
+- **Generic functions are erased, not monomorphized.** A `T` allows only operations from its
+  bounds; `/` and `%` on a `T` are rejected, because erased code can't tell integer division
+  from float division. `+`, `-` and `*` on a `T` don't wrap integer overflow.
+- **`{:?}` of a generic value prints whole-number floats without `.0`**, and one-character
+  strings and chars the same way, since the type is gone at run time.
+- **Every file is its own crate root for `mod`.** `mod x;` in `util.rs` loads `x.rs` next to
+  `util.rs` (rustc would look in `util/x.rs`), since each Bitburner script is compiled on its own.
+  Inline `mod x { .. }` blocks and `foo/mod.rs` aren't supported yet.
+- **Traits are for structs and enums declared in the file**, or imported from a module. `impl Trait for i32` and other
+  built-in types, trait functions without `self` (`T::new()`), associated types and consts, and
+  generic traits need type information at run time that erasure removes (phase 4).
+- **`&mut` to a number, string or bool inside a struct, tuple or Vec can't be passed to a
+  function** (the value would be copied). Pass the struct, or a `&mut` to a local and write it back.
+- **`RefCell` doesn't track borrows**, so a `borrow_mut` while another borrow is alive doesn't
+  panic. `Rc` is erased: `Rc::strong_count` and `Weak` aren't available, and `.clone()` on a
+  struct without `#[derive(Clone)]` is taken to be an `Rc` clone (it shares the value).
+- **Slices are copies.** `&v[1..3]` reads like Rust, but writes through a slice wouldn't reach
+  `v`, so `&mut v[a..b]` is rejected.
+
 ## Option and patterns
 
 - **`None` is `null`.** `Option<Option<T>>` and `Option<()>` can't be represented (`Some(None)`

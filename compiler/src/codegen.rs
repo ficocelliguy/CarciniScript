@@ -7,15 +7,21 @@ use ra_ap_syntax::{
     AstNode, AstToken, SourceFile, SyntaxKind, SyntaxNode,
     ast::{
         self, ArithOp, BinaryOp, CmpOp, ElseBranch, HasArgList, HasGenericParams, HasLoopBody,
-        HasModuleItem, HasName, LiteralKind, LogicOp, RangeItem, RangeOp, UnaryOp,
+        HasName, LiteralKind, LogicOp, RangeItem, RangeOp, UnaryOp,
     },
 };
 use serde::Serialize;
 
 use crate::bindings::{self, bare};
 
+#[path = "codegen_adt.rs"]
+mod adt_gen;
 #[path = "codegen_ext.rs"]
 mod ext;
+#[path = "codegen_res.rs"]
+mod res_gen;
+#[path = "codegen_std.rs"]
+mod std_gen;
 use crate::fmt::{self, ArgRef, Piece, Spec};
 use crate::lineindex::{LineIndex, utf16_len};
 use crate::macros::{self, EDITION, MacroArg};
@@ -146,6 +152,9 @@ struct Local {
     ty: Ty,
 }
 
+/// A `const` / `static` item: Rust name, name node, initializer, item node.
+type ConstItem = (String, ast::Name, Option<ast::Expr>, SyntaxNode);
+
 struct FnSig {
     js: String,
     params: Vec<Ty>,
@@ -178,6 +187,7 @@ impl PatCode {
     }
 }
 
+#[derive(Clone)]
 enum Dest {
     Discard,
     Assign(String),
@@ -242,7 +252,7 @@ const RESERVED: &[&str] = &[
 
 fn escape_ident(name: &str) -> String {
     let name = name.strip_prefix("r#").unwrap_or(name);
-    if RESERVED.contains(&name) {
+    if RESERVED.contains(&name) || bindings::is_ram_name(name) {
         format!("{name}$")
     } else {
         name.to_string()
@@ -358,9 +368,11 @@ fn simple_tail(block: &ast::BlockExpr) -> Option<ast::Expr> {
 }
 
 fn if_is_ternary(e: &ast::IfExpr) -> bool {
-    let cond_ok = e
-        .condition()
-        .is_some_and(|c| !needs_hoist(c.syntax()) && !matches!(c, ast::Expr::LetExpr(_)));
+    let cond_ok = e.condition().is_some_and(|c| {
+        !needs_hoist(c.syntax())
+            && !matches!(c, ast::Expr::LetExpr(_))
+            && !crate::typeck::is_let_chain(&c)
+    });
     let then_ok = e.then_branch().is_some_and(|b| simple_tail(&b).is_some());
     let else_ok = match e.else_branch() {
         Some(ElseBranch::Block(b)) => simple_tail(&b).is_some(),
@@ -415,6 +427,16 @@ fn is_pure(e: &ast::Expr) -> bool {
     }
 }
 
+fn strip_parens_expr(e: &ast::Expr) -> ast::Expr {
+    match e {
+        ast::Expr::ParenExpr(p) => p
+            .expr()
+            .map(|i| strip_parens_expr(&i))
+            .unwrap_or_else(|| e.clone()),
+        _ => e.clone(),
+    }
+}
+
 fn strip_refs(e: &ast::Expr) -> ast::Expr {
     match e {
         ast::Expr::ParenExpr(p) => p
@@ -430,6 +452,12 @@ fn strip_refs(e: &ast::Expr) -> ast::Expr {
 }
 
 pub fn compile(src: &str, filename: &str) -> CompileOutput {
+    compile_with(src, filename, &|_| None)
+}
+
+/// Compile `src`; `resolver` reads the files of its `mod` declarations (paths relative to the
+/// project root, like `lib/util.rs`).
+pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
     let parse = SourceFile::parse(src, EDITION);
     let mut cg = Codegen {
         src,
@@ -452,6 +480,10 @@ pub fn compile(src: &str, filename: &str) -> CompileOutput {
         ret_ty: Ty::Unit,
         in_async: false,
         types: Types::default(),
+        self_adt: None,
+        consts: HashMap::new(),
+        local_adts: Default::default(),
+        loop_dests: Vec::new(),
     };
     for e in parse.errors() {
         let r = e.range();
@@ -464,7 +496,7 @@ pub fn compile(src: &str, filename: &str) -> CompileOutput {
     }
     if cg.diags.is_empty() {
         let file = parse.tree();
-        let (types, type_diags) = typeck::check(&file, src);
+        let (types, type_diags) = typeck::check(&file, src, filename, resolver);
         cg.types = types;
         cg.emit_file(&file);
         // The type checker owns name and type errors. Codegen may report the same problem at the
@@ -520,6 +552,15 @@ struct Codegen<'a> {
     in_async: bool,
     /// Resolved types from the type checker, keyed by absolute source range.
     types: Types,
+    /// The struct or enum whose `impl` is being emitted (`Self`).
+    self_adt: Option<String>,
+    /// `const` and `static` items: Rust name → JS name.
+    consts: HashMap<String, String>,
+    /// Structs and enums declared in this file (not imported).
+    local_adts: std::collections::HashSet<String>,
+    /// Enclosing loops, innermost last: (label, where a `loop`'s `break value` goes; None for
+    /// `while`/`for`).
+    loop_dests: Vec<(Option<String>, Option<Dest>, bool)>,
 }
 
 impl<'a> Codegen<'a> {
@@ -597,6 +638,20 @@ impl<'a> Codegen<'a> {
         name
     }
 
+    /// A node's absolute source range (the type checker's table key).
+    fn range_of(&self, n: &SyntaxNode) -> (usize, usize) {
+        let r = n.text_range();
+        (
+            self.base + usize::from(r.start()),
+            self.base + usize::from(r.end()),
+        )
+    }
+
+    /// Whether the binding named at `name` lives in a cell.
+    fn is_boxed(&self, name: &SyntaxNode) -> bool {
+        self.types.boxed.contains(&self.range_of(name))
+    }
+
     fn temp(&mut self) -> String {
         self.tmp += 1;
         format!("$t{}", self.tmp)
@@ -656,6 +711,18 @@ impl<'a> Codegen<'a> {
                     Some(n) if n.text() == "HashMap" => {
                         Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
                     }
+                    Some(n)
+                        if self
+                            .types
+                            .adts
+                            .defs
+                            .contains_key(n.text().to_string().as_str()) =>
+                    {
+                        Ty::Adt(n.text().to_string())
+                    }
+                    Some(n) if n.text() == "Self" && self.self_adt.is_some() => {
+                        Ty::Adt(self.self_adt.clone().unwrap())
+                    }
                     Some(n) => Ty::from_name(n.text()),
                     None => Ty::Unknown,
                 }
@@ -668,7 +735,7 @@ impl<'a> Codegen<'a> {
 
     fn emit_file(&mut self, file: &ast::SourceFile) {
         // Pass 1: signatures, so calls can be lowered before the callee is emitted.
-        for item in file.items() {
+        for item in crate::adt::all_items(file) {
             if let ast::Item::Fn(f) = &item
                 && let Some(name) = f.name()
             {
@@ -696,26 +763,119 @@ impl<'a> Codegen<'a> {
                 self.fns.insert(name.text().to_string(), sig);
             }
         }
+        // Functions and constants from `mod` files live on their module's namespace.
+        for module in self.types.modules.clone() {
+            self.used_names.insert(escape_ident(&module.name), 1);
+        }
+        for imp in self.types.imported.clone() {
+            let js = format!("{}.{}", escape_ident(&imp.module), escape_ident(&imp.js));
+            match imp.sig {
+                Some(sig) => {
+                    let sig = FnSig {
+                        js,
+                        params: sig.params,
+                        ret: sig.ret,
+                        is_async: sig.is_async,
+                    };
+                    self.fns.insert(imp.name, sig);
+                }
+                None => {
+                    self.consts.insert(imp.name, js);
+                }
+            }
+        }
+        // `const` / `static` items are module-level `const`s, emitted last (see `emit_consts`).
+        for item in crate::adt::all_items(file) {
+            let name = match &item {
+                ast::Item::Const(k) => k.name(),
+                ast::Item::Static(s) => s.name(),
+                _ => None,
+            };
+            if let Some(n) = name {
+                let js = escape_ident(n.text().to_string().as_str());
+                self.used_names.insert(js.clone(), 1);
+                self.consts.insert(n.text().to_string(), js);
+            }
+        }
+        for item in crate::adt::all_items(file) {
+            let name = match &item {
+                ast::Item::Struct(s) => s.name(),
+                ast::Item::Enum(e) => e.name(),
+                _ => None,
+            };
+            if let Some(n) = name {
+                self.local_adts.insert(n.text().to_string());
+            }
+        }
+        // `impl` blocks are emitted inside their type's class.
+        let mut impls: HashMap<String, Vec<ast::Impl>> = HashMap::new();
+        for item in crate::adt::all_items(file) {
+            if let ast::Item::Impl(imp) = &item
+                && let (_, Some(t)) = crate::adt::impl_parts(imp)
+            {
+                impls.entry(t).or_default().push(imp.clone());
+            }
+        }
         // Pass 2: code.
         let globals = self.used_names.clone();
-        for item in file.items() {
+        for item in crate::adt::all_items(file) {
             match &item {
                 ast::Item::Fn(f) => {
                     self.used_names = globals.clone();
                     self.tmp = 0;
                     self.emit_fn(f);
                 }
-                // Imports are resolved in phase 2; the spike's prelude is built in.
+                ast::Item::Struct(s) => {
+                    if let Some(n) = s.name() {
+                        self.used_names = globals.clone();
+                        let imps = impls
+                            .get(n.text().to_string().as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        self.emit_adt(s.syntax(), &n, &imps);
+                    }
+                }
+                ast::Item::Enum(e) => {
+                    if let Some(n) = e.name() {
+                        self.used_names = globals.clone();
+                        let imps = impls
+                            .get(n.text().to_string().as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        self.emit_adt(e.syntax(), &n, &imps);
+                    }
+                }
+                // Checked by the type checker; emitted with their type.
+                ast::Item::Impl(_) => {}
+                ast::Item::Trait(t) => {
+                    self.used_names = globals.clone();
+                    self.emit_trait_defaults(t);
+                }
+                ast::Item::Const(_) | ast::Item::Static(_) => {}
+                // `use` only brings names into scope; the type checker resolves them.
                 ast::Item::Use(_) => {}
+                // `mod util;` → `import * as util from "./util.rs";`
+                ast::Item::Module(m) => {
+                    if let Some(n) = m.name()
+                        && let Some(module) = self
+                            .types
+                            .modules
+                            .iter()
+                            .find(|x| x.name == n.text())
+                            .cloned()
+                    {
+                        let mut line = Frag::mapped(self.item_start(m.syntax()), "import * as ");
+                        line.append(Frag::mapped(
+                            self.off(n.syntax()),
+                            escape_ident(&module.name),
+                        ))
+                        .push(format!(" from {};", js_string(&module.specifier)));
+                        self.line(line);
+                        self.line(Frag::default());
+                    }
+                }
                 other => {
                     let kind = match other {
-                        ast::Item::Struct(_) => "`struct`",
-                        ast::Item::Enum(_) => "`enum`",
-                        ast::Item::Impl(_) => "`impl` blocks",
-                        ast::Item::Trait(_) => "`trait`",
-                        ast::Item::Const(_) => "`const` items",
-                        ast::Item::Static(_) => "`static` items",
-                        ast::Item::Module(_) => "`mod`",
                         ast::Item::MacroRules(_) => "`macro_rules!`",
                         _ => "this item",
                     };
@@ -728,26 +888,98 @@ impl<'a> Codegen<'a> {
                 }
             }
         }
+        self.emit_mixins();
+        self.emit_consts(file);
+    }
+
+    /// `export const NAME = value;` for each `const` / `static`, after everything else (JS `const`s
+    /// can't be read before their declaration runs, and Rust allows any order), ordered so each
+    /// comes after the constants it reads.
+    fn emit_consts(&mut self, file: &ast::SourceFile) {
+        let mut items: Vec<ConstItem> = Vec::new();
+        for item in crate::adt::all_items(file) {
+            let (name, body) = match &item {
+                ast::Item::Const(k) => (k.name(), k.body()),
+                ast::Item::Static(s) => (s.name(), s.body()),
+                _ => continue,
+            };
+            if let Some(n) = name {
+                items.push((n.text().to_string(), n, body, item.syntax().clone()));
+            }
+        }
+        // Depth-first topological order over the constants each initializer reads.
+        let index: HashMap<String, usize> = items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (it.0.clone(), i))
+            .collect();
+        let deps: Vec<Vec<usize>> = items
+            .iter()
+            .map(|(_, _, body, _)| {
+                body.iter()
+                    .flat_map(|b| b.syntax().descendants().filter_map(ast::PathExpr::cast))
+                    .filter_map(|p| p.path()?.as_single_name_ref().map(|n| n.text().to_string()))
+                    .filter_map(|n| index.get(&n).copied())
+                    .collect()
+            })
+            .collect();
+        let mut order = Vec::with_capacity(items.len());
+        let mut state = vec![0u8; items.len()]; // 0 unvisited, 1 in progress, 2 done
+        for start in 0..items.len() {
+            let mut stack = vec![(start, 0usize)];
+            while let Some((i, next)) = stack.pop() {
+                if next == 0 {
+                    if state[i] != 0 {
+                        continue;
+                    }
+                    state[i] = 1;
+                }
+                if let Some(&d) = deps[i].get(next) {
+                    stack.push((i, next + 1));
+                    if state[d] == 0 {
+                        stack.push((d, 0));
+                    }
+                } else {
+                    state[i] = 2;
+                    order.push(i);
+                }
+            }
+        }
+        let mut slots: Vec<Option<ConstItem>> = items.into_iter().map(Some).collect();
+        for i in order {
+            let Some((rust, name, body, node)) = slots[i].take() else {
+                continue;
+            };
+            self.scopes.push(HashMap::new());
+            self.ret_ty = Ty::Unit;
+            self.in_async = false;
+            let js = self.consts[&rust].clone();
+            let value = match &body {
+                Some(e) => {
+                    let (f, ty) = self.emit_expr(e, None);
+                    self.by_value(e, f, &ty)
+                }
+                None => Frag::text("undefined"),
+            };
+            let mut line = Frag::mapped(self.item_start(&node), "export const ");
+            line.append(Frag::mapped(self.off(name.syntax()), js))
+                .push(" = ")
+                .append(value)
+                .push(";");
+            self.line(line);
+            self.scopes.pop();
+        }
     }
 
     fn emit_fn(&mut self, f: &ast::Fn) {
         let Some(name) = f.name() else { return };
-        // Type parameters bounded by `Fn(..)` are closure types; other generics aren't supported.
         if let Some(gp) = f.generic_param_list() {
-            let fn_bounded: Vec<String> = crate::typeck::generic_bounds(f)
-                .into_iter()
-                .filter(|(_, b)| crate::typeck::is_fn_bound(b))
-                .map(|(n, _)| n)
-                .collect();
-            let other = gp.generic_params().any(|p| match p {
-                ast::GenericParam::LifetimeParam(_) => false,
-                ast::GenericParam::TypeParam(tp) => !tp
-                    .name()
-                    .is_some_and(|n| fn_bounded.contains(&n.text().to_string())),
-                ast::GenericParam::ConstParam(_) => true,
-            });
-            if other {
-                self.unsupported(gp.syntax(), "generic type parameters", 1);
+            // Type parameters are erased; const generics aren't supported.
+            if gp
+                .generic_params()
+                .any(|p| matches!(p, ast::GenericParam::ConstParam(_)))
+            {
+                self.unsupported(gp.syntax(), "const generic parameters", 4);
             }
         }
         let sig = &self.fns[name.text()];
@@ -771,7 +1003,13 @@ impl<'a> Codegen<'a> {
                     Some(ast::Pat::IdentPat(ip)) if ip.name().is_some() => {
                         let n = ip.name().unwrap();
                         let js = self.fresh(n.text());
-                        self.declare(n.text(), Some(n.syntax()), Local { js: js.clone(), ty });
+                        // A `&mut i32` parameter receives a cell.
+                        let access = if self.is_boxed(n.syntax()) {
+                            format!("{js}[0]")
+                        } else {
+                            js.clone()
+                        };
+                        self.declare(n.text(), Some(n.syntax()), Local { js: access, ty });
                         params.push(Frag::mapped(self.off(n.syntax()), js));
                     }
                     Some(ast::Pat::WildcardPat(_)) => params.push(Frag::text(self.temp())),
@@ -810,7 +1048,9 @@ impl<'a> Codegen<'a> {
         dest: &Dest,
         expected: Option<&Ty>,
     ) -> Ty {
-        if let Some(m) = block.modifier() {
+        if let Some(m) = block.modifier()
+            && !matches!(m, ast::BlockModifier::Label(_))
+        {
             let what = match m {
                 ast::BlockModifier::Async(_) => "`async` blocks",
                 ast::BlockModifier::Unsafe(_) => "`unsafe` blocks",
@@ -823,9 +1063,6 @@ impl<'a> Codegen<'a> {
             };
             self.unsupported(block.syntax(), what, phase);
             return Ty::Unknown;
-        }
-        if let Some(l) = block.label() {
-            self.unsupported(l.syntax(), "labeled blocks", 1);
         }
         let Some(list) = block.stmt_list() else {
             return Ty::Unit;
@@ -855,10 +1092,8 @@ impl<'a> Codegen<'a> {
                 Some(e) => self.emit_into(&e, &Dest::Discard, None) == Ty::Never,
                 None => false,
             },
-            ast::Stmt::Item(item) => {
-                self.unsupported(item.syntax(), "items nested inside functions", 1);
-                false
-            }
+            // Nested items are emitted at the top level (see `adt::all_items`).
+            ast::Stmt::Item(_) => false,
         }
     }
 
@@ -917,6 +1152,53 @@ impl<'a> Codegen<'a> {
             self.declare(name.text(), Some(name.syntax()), local);
             return;
         }
+        // `let b = cell.borrow_mut();`: `b` aliases the cell's value.
+        if let ast::Expr::MethodCallExpr(m) = strip_parens_expr(&init)
+            && m.name_ref().is_some_and(|n| n.text() == "borrow_mut")
+            && let Some(recv) = m.receiver()
+            && matches!(self.ty_of(recv.syntax()), Some(Ty::RefCell(_)))
+        {
+            let (rf, _) = self.emit_expr(&recv, None);
+            let js = self.fresh(name.text());
+            let mut f = Frag::mapped(start, "const ");
+            f.append(Frag::mapped(self.off(name.syntax()), js.clone()))
+                .push(" = ")
+                .append(rf)
+                .push(";");
+            self.line(f);
+            let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            self.declare(
+                name.text(),
+                Some(name.syntax()),
+                Local {
+                    js: format!("{js}.v"),
+                    ty,
+                },
+            );
+            return;
+        }
+        // `let r = &mut n;` with `n` in a cell: `r` holds the same cell.
+        if let ast::Expr::RefExpr(r) = strip_parens_expr(&init)
+            && r.mut_token().is_some()
+            && let Some(ast::Expr::PathExpr(p)) = r.expr()
+            && let Some(local) = p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .and_then(|n| self.lookup(n.text().to_string().as_str()).cloned())
+            && let Some(cell) = local.js.strip_suffix("[0]").map(str::to_string)
+        {
+            let js = self.fresh(name.text());
+            let mut f = Frag::mapped(start, "const ");
+            f.append(Frag::mapped(self.off(name.syntax()), js.clone()))
+                .push(format!(" = {cell};"));
+            self.line(f);
+            let local = Local {
+                js: format!("{js}[0]"),
+                ty: local.ty,
+            };
+            self.declare(name.text(), Some(name.syntax()), local);
+            return;
+        }
         let block_like = matches!(init, ast::Expr::BlockExpr(_) | ast::Expr::LoopExpr(_))
             || matches!(&init, ast::Expr::IfExpr(i) if !if_is_ternary(i));
         let (js, ty) = if block_like {
@@ -929,7 +1211,11 @@ impl<'a> Codegen<'a> {
             let frag = self.by_value(&init, frag, &ty);
             // Declare after lowering the initializer: `let x = x + 1` refers to the outer `x`.
             let js = self.fresh(name.text());
-            let kw = if mutable { "let" } else { "const" };
+            let kw = if mutable || self.is_boxed(name.syntax()) {
+                "let"
+            } else {
+                "const"
+            };
             let mut f = Frag::mapped(start, format!("{kw} "));
             f.append(Frag::mapped(self.off(name.syntax()), js.clone()));
             f.push(" = ").append(frag).push(";");
@@ -937,6 +1223,13 @@ impl<'a> Codegen<'a> {
             (js, ty)
         };
         let ty = declared.unwrap_or(ty);
+        // A `&mut` to this binding is taken somewhere: it lives in a cell, `[value]`.
+        let js = if self.is_boxed(name.syntax()) {
+            self.line(Frag::text(format!("{js} = [{js}];")));
+            format!("{js}[0]")
+        } else {
+            js
+        };
         self.declare(name.text(), Some(name.syntax()), Local { js, ty });
     }
 
@@ -944,6 +1237,24 @@ impl<'a> Codegen<'a> {
     fn emit_into(&mut self, e: &ast::Expr, dest: &Dest, expected: Option<&Ty>) -> Ty {
         let start = self.off(e.syntax());
         match e {
+            ast::Expr::BlockExpr(b)
+                if matches!(b.modifier(), Some(ast::BlockModifier::Label(_))) =>
+            {
+                // `'a: { .. }` → `$a: { .. }`; `break 'a v` assigns `dest` and leaves the block.
+                let rust = b
+                    .label()
+                    .and_then(|l| l.lifetime())
+                    .map(|l| l.text().to_string());
+                let label = self.label_prefix(b.label());
+                self.line(Frag::mapped(start, format!("{label}{{")));
+                self.out.indent += 1;
+                self.loop_dests.push((rust, Some(dest.clone()), true));
+                let ty = self.emit_block_body(b, dest, expected);
+                self.loop_dests.pop();
+                self.out.indent -= 1;
+                self.close_line("}", Some(b));
+                self.ty_of(b.syntax()).unwrap_or(ty)
+            }
             ast::Expr::BlockExpr(b) => {
                 self.line(Frag::mapped(start, "{"));
                 self.out.indent += 1;
@@ -955,15 +1266,33 @@ impl<'a> Codegen<'a> {
             ast::Expr::IfExpr(i) => self.emit_if_stmt(i, dest, expected, false),
             ast::Expr::MatchExpr(m) => self.emit_match(m, dest, expected),
             ast::Expr::WhileExpr(w) => {
+                let label = w
+                    .label()
+                    .and_then(|l| l.lifetime())
+                    .map(|l| l.text().to_string());
+                self.loop_dests.push((label, None, false));
                 self.emit_while(w);
+                self.loop_dests.pop();
                 Ty::Unit
             }
             ast::Expr::LoopExpr(l) => {
+                let label = l
+                    .label()
+                    .and_then(|l| l.lifetime())
+                    .map(|l| l.text().to_string());
+                self.loop_dests.push((label, Some(dest.clone()), false));
                 self.emit_loop(l);
-                Ty::Unit
+                self.loop_dests.pop();
+                self.ty_of(l.syntax()).unwrap_or(Ty::Unit)
             }
             ast::Expr::ForExpr(f) => {
+                let label = f
+                    .label()
+                    .and_then(|l| l.lifetime())
+                    .map(|l| l.text().to_string());
+                self.loop_dests.push((label, None, false));
                 self.emit_for(f);
+                self.loop_dests.pop();
                 Ty::Unit
             }
             ast::Expr::ReturnExpr(_) | ast::Expr::BreakExpr(_) | ast::Expr::ContinueExpr(_) => {
@@ -1020,7 +1349,23 @@ impl<'a> Codegen<'a> {
             },
             ast::Expr::BreakExpr(b) => {
                 if let Some(v) = b.expr() {
-                    self.unsupported(v.syntax(), "`break` with a value", 1);
+                    // The value goes where the target `loop`'s value goes.
+                    let rust_label = b.lifetime().map(|l| l.text().to_string());
+                    let target = match &rust_label {
+                        Some(l) => self
+                            .loop_dests
+                            .iter()
+                            .rev()
+                            .find(|(x, ..)| x.as_ref() == Some(l)),
+                        None => self.loop_dests.iter().rev().find(|e| !e.2),
+                    };
+                    let dest = target
+                        .and_then(|(_, d, _)| d.clone())
+                        .unwrap_or(Dest::Discard);
+                    self.emit_into(&v, &dest, None);
+                    if matches!(dest, Dest::Return) {
+                        return;
+                    }
                 }
                 let label = b
                     .lifetime()
@@ -1050,6 +1395,9 @@ impl<'a> Codegen<'a> {
         let Some(cond) = i.condition() else {
             return Ty::Unknown;
         };
+        if crate::typeck::is_let_chain(&cond) {
+            return self.emit_if_chain(i, &cond, dest, expected, is_else_if);
+        }
         // `if let PAT = EXPR`: test the pattern, then bind inside the `then` block.
         let (cf, binds) = match &cond {
             ast::Expr::LetExpr(le) => {
@@ -1111,6 +1459,97 @@ impl<'a> Codegen<'a> {
         Ty::unify(&then_ty, &else_ty)
     }
 
+    /// Open one nested `if` per part of a let-chain; returns how many were opened. Each part's
+    /// statements run only once the parts before it held.
+    fn open_chain(&mut self, cond: &ast::Expr) -> usize {
+        let mut opened = 0;
+        for part in crate::typeck::chain_parts(cond) {
+            let (cf, binds) = match &part {
+                ast::Expr::LetExpr(le) => {
+                    let (Some(e), Some(p)) = (le.expr(), le.pat()) else {
+                        continue;
+                    };
+                    let subject = self.subject(&e);
+                    let mut pc = PatCode::default();
+                    self.lower_pat(&p, &subject, &mut pc);
+                    (
+                        pc.condition().unwrap_or_else(|| Frag::text("true")),
+                        pc.binds,
+                    )
+                }
+                other => (self.emit_expr(other, Some(&Ty::Bool)).0, Vec::new()),
+            };
+            let mut head = Frag::mapped(self.off(part.syntax()), "if (");
+            head.append(cf).push(") {");
+            self.line(head);
+            self.out.indent += 1;
+            self.emit_binds(binds);
+            opened += 1;
+        }
+        opened
+    }
+
+    fn close_chain(&mut self, opened: usize) {
+        for _ in 0..opened {
+            self.out.indent -= 1;
+            self.line(Frag::text("}"));
+        }
+    }
+
+    /// `if let A = a && b && let C = c { .. } else { .. }`: nested `if`s around the `then` block,
+    /// and a flag for the `else`.
+    fn emit_if_chain(
+        &mut self,
+        i: &ast::IfExpr,
+        cond: &ast::Expr,
+        dest: &Dest,
+        expected: Option<&Ty>,
+        is_else_if: bool,
+    ) -> Ty {
+        if is_else_if {
+            self.line(Frag::text("} else {"));
+            self.out.indent += 1;
+        }
+        let matched = self.temp();
+        let has_else = i.else_branch().is_some();
+        if has_else {
+            self.line(Frag::mapped(
+                self.off(i.syntax()),
+                format!("let {matched} = false;"),
+            ));
+        }
+        self.scopes.push(HashMap::new());
+        let opened = self.open_chain(cond);
+        if has_else {
+            self.line(Frag::text(format!("{matched} = true;")));
+        }
+        let then_ty = match i.then_branch() {
+            Some(b) => self.emit_block_body(&b, dest, expected),
+            None => Ty::Unit,
+        };
+        self.close_chain(opened);
+        self.scopes.pop();
+        let else_ty = match i.else_branch() {
+            Some(e) => {
+                self.line(Frag::text(format!("if (!{matched}) {{")));
+                self.out.indent += 1;
+                let t = match e {
+                    ElseBranch::Block(b) => self.emit_block_body(&b, dest, expected),
+                    ElseBranch::IfExpr(ei) => self.emit_if_stmt(&ei, dest, expected, false),
+                };
+                self.out.indent -= 1;
+                self.line(Frag::text("}"));
+                t
+            }
+            None => Ty::Unit,
+        };
+        if is_else_if {
+            self.out.indent -= 1;
+            self.line(Frag::text("}"));
+        }
+        Ty::unify(&then_ty, &else_ty)
+    }
+
     fn label_prefix(&self, l: Option<ast::Label>) -> String {
         l.and_then(|l| l.lifetime())
             .map(|lt| format!("${}: ", &lt.text()[1..]))
@@ -1158,6 +1597,26 @@ impl<'a> Codegen<'a> {
         let start = self.off(w.syntax());
         let label = self.label_prefix(w.label());
         let Some(cond) = w.condition() else { return };
+        if crate::typeck::is_let_chain(&cond) {
+            // `while (true) { if (a) { if (b) { $m = true; body } } if (!$m) break; }`
+            self.line(Frag::mapped(start, format!("{label}while (true) {{")));
+            self.out.indent += 1;
+            let matched = self.temp();
+            self.line(Frag::text(format!("let {matched} = false;")));
+            self.scopes.push(HashMap::new());
+            let opened = self.open_chain(&cond);
+            self.line(Frag::text(format!("{matched} = true;")));
+            let body = w.loop_body();
+            if let Some(b) = &body {
+                self.emit_block_body(b, &Dest::Discard, Some(&Ty::Unit));
+            }
+            self.close_chain(opened);
+            self.scopes.pop();
+            self.line(Frag::text(format!("if (!{matched}) break;")));
+            self.out.indent -= 1;
+            self.close_line("}", body.as_ref());
+            return;
+        }
         if let ast::Expr::LetExpr(le) = &cond {
             // The scrutinee is re-evaluated each iteration; `continue` re-runs it too.
             let (Some(e), Some(p)) = (le.expr(), le.pat()) else {
@@ -1525,6 +1984,50 @@ impl<'a> Codegen<'a> {
             ast::Expr::PrefixExpr(p) => self.emit_prefix(p, expected),
             ast::Expr::BinExpr(b) => self.emit_bin(b, expected),
             ast::Expr::CastExpr(c) => self.emit_cast(c),
+            ast::Expr::CallExpr(c)
+                if crate::typeck::result_ctor_call(c).is_some()
+                    && self.lookup("Ok").is_none()
+                    && !self.fns.contains_key("Ok") =>
+            {
+                self.emit_result_ctor(c, crate::typeck::result_ctor_call(c).unwrap())
+            }
+            ast::Expr::CallExpr(c) if crate::typeck::is_cell_new(c) => {
+                let arg = match c.arg_list().and_then(|a| a.args().next()) {
+                    Some(a) => {
+                        let (f, t) = self.emit_expr(&a, None);
+                        self.by_value(&a, f, &t)
+                    }
+                    None => Frag::text("undefined"),
+                };
+                let kind = if c.syntax().text().to_string().contains("RefCell") {
+                    "RefCell"
+                } else {
+                    "Cell"
+                };
+                let mut f = Frag::mapped(self.off(c.syntax()), "new κσ.RefCell(");
+                f.append(arg).push(format!(", \"{kind}\")"));
+                (f, self.ty_of(c.syntax()).unwrap_or(Ty::Unknown))
+            }
+            ast::Expr::CallExpr(c)
+                if crate::typeck::is_box_new(c) || crate::typeck::is_rc_call(c) =>
+            {
+                // `Box::new(x)` is `x`.
+                match c.arg_list().and_then(|a| a.args().next()) {
+                    Some(a) => {
+                        let (f, t) = self.emit_expr(&a, expected);
+                        (self.by_value(&a, f, &t), t)
+                    }
+                    None => (Frag::text("undefined"), Ty::Unknown),
+                }
+            }
+            ast::Expr::CallExpr(c) if crate::typeck::is_default_call(c) => {
+                let ty = self
+                    .ty_of(c.syntax())
+                    .or_else(|| expected.cloned())
+                    .unwrap_or(Ty::Unknown);
+                let js = default_value(&ty).unwrap_or_else(|| "undefined".into());
+                (Frag::mapped(self.off(c.syntax()), js), ty)
+            }
             ast::Expr::CallExpr(c) => self.emit_call(c),
             ast::Expr::MethodCallExpr(m) => self.emit_method(m),
             ast::Expr::FieldExpr(fe) => self.emit_field(fe),
@@ -1567,6 +2070,7 @@ impl<'a> Codegen<'a> {
                 (Frag::text("undefined"), Ty::Never)
             }
             ast::Expr::IndexExpr(ix) => self.emit_index(ix),
+            ast::Expr::RecordExpr(r) => self.emit_record(r),
             ast::Expr::ClosureExpr(c) => (self.emit_closure(c), Ty::Unknown),
             ast::Expr::RangeExpr(r) => (
                 self.emit_range_value(r),
@@ -1588,6 +2092,15 @@ impl<'a> Codegen<'a> {
                 let q = t
                     .question_mark_token()
                     .map(|q| self.base + usize::from(q.text_range().start()));
+                // `Result`: return the `Err` itself; the value is `$t[0]`.
+                if let Ty::Result(x, _) = ty {
+                    let early = format!("if ({tmp}.$tag === 1) return {tmp};");
+                    self.line(match q {
+                        Some(o) => Frag::mapped(o, early),
+                        None => Frag::text(early),
+                    });
+                    return (Frag::text(format!("{tmp}[0]")), *x);
+                }
                 let early = format!("if ({tmp} == null) return null;");
                 self.line(match q {
                     Some(o) => Frag::mapped(o, early),
@@ -1703,10 +2216,23 @@ impl<'a> Codegen<'a> {
         };
         if let Some(name) = path.as_single_name_ref() {
             if let Some(local) = self.lookup(name.text()) {
+                // `&mut n` / a `&mut` parameter passed on: the cell itself.
+                if self.types.cell_args.contains(&self.range_of(p.syntax()))
+                    && let Some(cell) = local.js.strip_suffix("[0]")
+                {
+                    return (Frag::text(cell.to_string()), local.ty.clone());
+                }
                 return (Frag::text(local.js.clone()), local.ty.clone());
             }
             if let Some(f) = self.fns.get(name.text()) {
                 return (Frag::text(f.js.clone()), Ty::Fn);
+            }
+            if let Some(js) = self.consts.get(name.text().to_string().as_str()) {
+                let ty = self.ty_of(p.syntax()).unwrap_or(Ty::Unknown);
+                return (Frag::text(js.clone()), ty);
+            }
+            if let Some(r) = self.emit_adt_path(&[name.text().to_string()]) {
+                return r;
             }
             if name.text() == "None" {
                 return (Frag::text("null"), Ty::Option(Box::new(Ty::Unknown)));
@@ -1722,6 +2248,27 @@ impl<'a> Codegen<'a> {
             .filter_map(|s| s.name_ref())
             .map(|n| n.text().to_string())
             .collect();
+        if let [single] = self.strip_modules(&segs).as_slice() {
+            if let Some(js) = self.consts.get(single) {
+                let ty = self.ty_of(p.syntax()).unwrap_or(Ty::Unknown);
+                return (Frag::text(js.clone()), ty);
+            }
+            if let Some(f) = self.fns.get(single) {
+                return (Frag::text(f.js.clone()), Ty::Fn);
+            }
+        }
+        if let Some(r) = self.emit_adt_path(&segs) {
+            return r;
+        }
+        if matches!(
+            segs.iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [.., "String", "from"] | [.., "ToString", "to_string"]
+        ) {
+            return (Frag::text("String"), Ty::Unknown);
+        }
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         if let Some((js, ty)) = std_const(std_tail(&segs)) {
             return (Frag::text(js), ty);
@@ -1869,6 +2416,23 @@ impl<'a> Codegen<'a> {
                         }
                     },
                 };
+                // `*r = v` / `*self = v` with `r` a `&mut` to a struct or enum: the JS variable
+                // holds the object itself, so replace its contents in place.
+                let through_ref = match strip_refs(&lhs) {
+                    ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => {
+                        matches!(
+                            p.expr().map(|e| strip_refs(&e)),
+                            Some(ast::Expr::PathExpr(_))
+                        )
+                    }
+                    ast::Expr::PathExpr(_) => lf.plain() == "this",
+                    _ => false,
+                };
+                if op.is_none() && through_ref && matches!(lt, Ty::Adt(_)) {
+                    let mut f = Frag::text("κσ.$replace(");
+                    f.append(lf).push(", ").append(value).push(")");
+                    return (f, Ty::Unit);
+                }
                 let mut f = lf;
                 f.push(" = ").append(value);
                 (f, Ty::Unit)
@@ -1892,7 +2456,9 @@ impl<'a> Codegen<'a> {
                 let (lf, lt) = self.operand(&lhs, None);
                 let (rf, _) = self.operand(&rhs, Some(&lt));
                 // Tuples and Vecs order lexicographically, like Rust's derived `Ord`.
-                if let (Ty::Vec(_) | Ty::Tuple(_), CmpOp::Ord { .. }) = (&lt, op) {
+                if let (Ty::Vec(_) | Ty::Tuple(_) | Ty::Adt(_) | Ty::Param(_), CmpOp::Ord { .. }) =
+                    (&lt, op)
+                {
                     let mut f = Frag::text("κσ.$cmp(");
                     f.append(lf)
                         .push(", ")
@@ -1901,7 +2467,14 @@ impl<'a> Codegen<'a> {
                     return (f, Ty::Bool);
                 }
                 if let (
-                    Ty::Vec(_) | Ty::Option(_) | Ty::Tuple(_) | Ty::Set(_) | Ty::Map(..),
+                    Ty::Vec(_)
+                    | Ty::Option(_)
+                    | Ty::Tuple(_)
+                    | Ty::Set(_)
+                    | Ty::Map(..)
+                    | Ty::Adt(_)
+                    | Ty::Result(..)
+                    | Ty::Param(_),
                     CmpOp::Eq { negated },
                 ) = (&lt, op)
                 {
@@ -2065,6 +2638,7 @@ impl<'a> Codegen<'a> {
                 g
             }
             (Ty::Bool, Ty::Int(_)) => f.wrap("(", " ? 1 : 0)"),
+            (Ty::Adt(n), Ty::Int(_)) => self.enum_discriminant(f, n),
             (Ty::Char, Ty::Int(k)) => {
                 let g = f.wrap("", ".codePointAt(0)");
                 match k.wrap_parts() {
@@ -2096,6 +2670,17 @@ impl<'a> Codegen<'a> {
     /// Tuples are values in Rust but shared arrays in JS. When one is read from a place (a local,
     /// field or element) into a by-value position, copy it so later mutation can't alias.
     fn by_value(&self, e: &ast::Expr, f: Frag, ty: &Ty) -> Frag {
+        // `&x` / `&mut x` pass the value itself (a reference), not a copy.
+        let mut inner = e.clone();
+        while let ast::Expr::ParenExpr(p) = &inner {
+            match p.expr() {
+                Some(i) => inner = i,
+                None => break,
+            }
+        }
+        if matches!(inner, ast::Expr::RefExpr(_)) {
+            return f;
+        }
         let place = matches!(
             strip_refs(e),
             ast::Expr::PathExpr(_)
@@ -2103,7 +2688,7 @@ impl<'a> Codegen<'a> {
                 | ast::Expr::IndexExpr(_)
                 | ast::Expr::PrefixExpr(_)
         );
-        if place && matches!(ty, Ty::Tuple(_)) {
+        if place && self.copied_on_read(ty) {
             Frag::text("κσ.$clone(").append(f).push(")").clone()
         } else {
             f
@@ -2120,6 +2705,59 @@ impl<'a> Codegen<'a> {
                 self.by_value(&a, f, &ty)
             })
             .collect()
+    }
+
+    /// A call of the function `name` (local or imported).
+    fn emit_fn_call(&mut self, c: &ast::CallExpr, name: &str, callee_off: usize) -> (Frag, Ty) {
+        let Some(sig) = self.fns.get(name) else {
+            let callee = c
+                .expr()
+                .map(|e| e.syntax().clone())
+                .unwrap_or_else(|| c.syntax().clone());
+            self.error(
+                &callee,
+                format!("cannot find function `{name}` in this scope"),
+            );
+            return (Frag::text("undefined"), Ty::Unknown);
+        };
+        let (js, params, ret, is_async) = (
+            sig.js.clone(),
+            sig.params.clone(),
+            sig.ret.clone(),
+            sig.is_async,
+        );
+        let n_args = c.arg_list().map(|a| a.args().count()).unwrap_or(0);
+        if n_args != params.len() {
+            self.error(
+                c.syntax(),
+                format!(
+                    "this function takes {} argument(s) but {} were supplied",
+                    params.len(),
+                    n_args
+                ),
+            );
+        }
+        let args = self.emit_args(c.arg_list(), &params);
+        let mut f = Frag::mapped(callee_off, js);
+        f.push("(").append(Frag::join(args, ", ")).push(")");
+        let ty = if is_async {
+            Ty::Future(Box::new(ret))
+        } else {
+            ret
+        };
+        (f, ty)
+    }
+
+    /// `crate::util::x` / `util::x` → `x` when `util` is a loaded module.
+    fn strip_modules(&self, segs: &[String]) -> Vec<String> {
+        let mut i = 0;
+        while i + 1 < segs.len()
+            && (matches!(segs[i].as_str(), "crate" | "self")
+                || self.types.adts.modules.contains(&segs[i]))
+        {
+            i += 1;
+        }
+        segs[i..].to_vec()
     }
 
     fn emit_call(&mut self, c: &ast::CallExpr) -> (Frag, Ty) {
@@ -2160,45 +2798,32 @@ impl<'a> Codegen<'a> {
                 f.push("(").append(Frag::join(args, ", ")).push(")");
                 return (f, Ty::Unknown);
             }
-            let Some(sig) = self.fns.get(name.text()) else {
-                self.error(
-                    callee.syntax(),
-                    format!("cannot find function `{}` in this scope", name.text()),
-                );
-                return (Frag::text("undefined"), Ty::Unknown);
-            };
-            let (js, params, ret, is_async) = (
-                sig.js.clone(),
-                sig.params.clone(),
-                sig.ret.clone(),
-                sig.is_async,
-            );
-            let n_args = c.arg_list().map(|a| a.args().count()).unwrap_or(0);
-            if n_args != params.len() {
-                self.error(
-                    c.syntax(),
-                    format!(
-                        "this function takes {} argument(s) but {} were supplied",
-                        params.len(),
-                        n_args
-                    ),
-                );
+            if !self.fns.contains_key(name.text().to_string().as_str())
+                && let Some(r) = self.emit_adt_call(c, &[name.text().to_string()])
+            {
+                return r;
             }
-            let args = self.emit_args(c.arg_list(), &params);
-            let mut f = Frag::mapped(callee_off, js);
-            f.push("(").append(Frag::join(args, ", ")).push(")");
-            let ty = if is_async {
-                Ty::Future(Box::new(ret))
-            } else {
-                ret
-            };
-            return (f, ty);
+            return self.emit_fn_call(c, name.text().to_string().as_str(), callee_off);
         }
         let segs: Vec<String> = path
             .segments()
             .filter_map(|s| s.name_ref())
             .map(|n| n.text().to_string())
             .collect();
+        if let [single] = self.strip_modules(&segs).as_slice()
+            && self.fns.contains_key(single)
+        {
+            return self.emit_fn_call(c, single, callee_off);
+        }
+        if let Some(r) = self.emit_adt_call(c, &segs) {
+            return r;
+        }
+        {
+            let ss: Vec<&str> = segs.iter().map(String::as_str).collect();
+            if let Some(r) = self.emit_std_call(c, &ss) {
+                return r;
+            }
+        }
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         let tail = match segs.as_slice() {
             ["std" | "core", rest @ ..] => rest,
@@ -2270,6 +2895,9 @@ impl<'a> Codegen<'a> {
             return (Frag::text("undefined"), Ty::Unknown);
         };
         let (rf, rt) = self.receiver(&recv);
+        if let Ty::Adt(n) = &rt {
+            return self.emit_adt_field(rf, n, &name);
+        }
         if let Some(i) = name.as_tuple_field() {
             if let Ty::Tuple(es) = &rt {
                 let ty = es.get(i).cloned().unwrap_or(Ty::Unknown);
@@ -2332,6 +2960,103 @@ impl<'a> Codegen<'a> {
             return (f, Ty::Unknown);
         }
 
+        if let Ty::Adt(n) = &rt
+            && let Some(r) = self.emit_adt_method(m, &rf, n, &method)
+        {
+            return r;
+        }
+        if let Ty::RefCell(inner) = &rt {
+            let name_off = self.off(name.syntax());
+            let ret = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            let arg = m
+                .arg_list()
+                .and_then(|a| a.args().next())
+                .map(|a| {
+                    let (f, t) = self.emit_expr(&a, None);
+                    self.by_value(&a, f, &t)
+                })
+                .unwrap_or_else(|| Frag::text("undefined"));
+            let f = match method.as_str() {
+                // The value lives at `.v`, which stays assignable: `*c.borrow_mut() += 1`.
+                "borrow" | "borrow_mut" | "get" | "into_inner" => {
+                    let mut f = rf.clone();
+                    f.push(".").append(Frag::mapped(name_off, "v"));
+                    f
+                }
+                "set" => {
+                    let mut f = Frag::text("(");
+                    f.append(rf.clone())
+                        .push(".v = ")
+                        .append(arg)
+                        .push(", undefined)");
+                    f
+                }
+                "replace" | "take" => {
+                    let new = if method == "take" {
+                        Frag::text(default_value(inner).unwrap_or_else(|| "undefined".into()))
+                    } else {
+                        arg
+                    };
+                    let mut f = Frag::mapped(name_off, "κσ.$cellReplace(");
+                    f.append(rf.clone()).push(", ").append(new).push(")");
+                    f
+                }
+                // Through an `Rc` (erased), cloning shares the cell.
+                _ => rf.clone(),
+            };
+            return (f, ret);
+        }
+        if let Ty::Param(_) = &rt {
+            let name_off = self.off(name.syntax());
+            let ret = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            let arg = m
+                .arg_list()
+                .and_then(|a| a.args().next())
+                .map(|a| self.emit_expr(&a, None).0)
+                .unwrap_or_else(|| Frag::text("undefined"));
+            let helper = |js: &str, with_arg: bool| {
+                let mut f = Frag::mapped(name_off, format!("κσ.${js}("));
+                f.append(rf.clone());
+                if with_arg {
+                    f.push(", ").append(arg.clone());
+                }
+                f.push(")");
+                f
+            };
+            let f = match method.as_str() {
+                "clone" => helper("clone", false),
+                "to_string" => helper("disp", false),
+                "eq" => helper("eq", true),
+                "ne" => helper("eq", true).wrap("!", ""),
+                "cmp" | "partial_cmp" => helper("cmp", true),
+                "max" => helper("max", true),
+                "min" => helper("min", true),
+                // A method from a trait bound: dynamic dispatch.
+                _ => {
+                    let args = self.emit_args(m.arg_list(), &[]);
+                    let mut f = rf.clone();
+                    f.push(".")
+                        .append(Frag::mapped(name_off, adt_gen::prop(&method)))
+                        .push("(")
+                        .append(Frag::join(args, ", "))
+                        .push(")");
+                    f
+                }
+            };
+            return (f, ret);
+        }
+        if let Ty::Dyn(_) = &rt {
+            // `dyn Trait`: dynamic dispatch.
+            let name_off = self.off(name.syntax());
+            let args = self.emit_args(m.arg_list(), &[]);
+            let mut f = rf.clone();
+            f.push(".")
+                .append(Frag::mapped(name_off, adt_gen::prop(&method)))
+                .push("(")
+                .append(Frag::join(args, ", "))
+                .push(")");
+            return (f, self.ty_of(m.syntax()).unwrap_or(Ty::Unknown));
+        }
         if let Some(r) = self.emit_method_ext(m, &rf, &rt, &method) {
             return r;
         }
@@ -2524,6 +3249,24 @@ impl<'a> Codegen<'a> {
             ast::Pat::IdentPat(ip) if is_none_binding(ip) => {
                 out.conds.push(Frag::text(format!("{subject} == null")))
             }
+            ast::Pat::IdentPat(ip) if self.unit_struct_pat(ip).is_some() => {
+                self.lower_adt_pat(p, subject, out);
+            }
+            ast::Pat::IdentPat(ip)
+                if ip.pat().is_none()
+                    && ip.mut_token().is_none()
+                    && ip.name().is_some_and(|n| {
+                        self.consts.contains_key(n.text().to_string().as_str())
+                    }) =>
+            {
+                let js = self.consts[ip.name().unwrap().text().to_string().as_str()].clone();
+                let primitive = self.ty_of(p.syntax()).is_some_and(|t| t.is_js_primitive());
+                out.conds.push(Frag::text(if primitive {
+                    format!("{subject} === {js}")
+                } else {
+                    format!("κσ.$eq({subject}, {js})")
+                }));
+            }
             ast::Pat::IdentPat(ip) => {
                 if let Some(sub) = ip.pat() {
                     self.lower_pat(&sub, subject, out);
@@ -2539,6 +3282,10 @@ impl<'a> Codegen<'a> {
             }
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => {
                 out.conds.push(Frag::text(format!("{subject} == null")))
+            }
+            ast::Pat::TupleStructPat(tp) if crate::typeck::result_variant(tp.path()).is_some() => {
+                let v = crate::typeck::result_variant(tp.path()).unwrap();
+                self.lower_result_pat(tp, v, subject, out);
             }
             ast::Pat::TupleStructPat(tp) if path_is(tp.path(), "Some") => {
                 // `Some(x)` is represented by `x` itself.
@@ -2614,6 +3361,46 @@ impl<'a> Codegen<'a> {
                     self.lower_pat(f, &format!("{subject}[{index}]"), out);
                 }
             }
+            ast::Pat::SlicePat(sp) => {
+                // Length test, then elements from the front and (after `..`) from the back.
+                let pats: Vec<ast::Pat> = sp.pats().collect();
+                let is_rest = |f: &ast::Pat| {
+                    matches!(f, ast::Pat::RestPat(_))
+                        || matches!(f, ast::Pat::IdentPat(ip) if matches!(ip.pat(), Some(ast::Pat::RestPat(_))))
+                };
+                let rest_at = pats.iter().position(is_rest);
+                let fixed = pats.len() - usize::from(rest_at.is_some());
+                out.conds.push(Frag::text(match rest_at {
+                    Some(_) => format!("{subject}.length >= {fixed}"),
+                    None => format!("{subject}.length === {fixed}"),
+                }));
+                for (i, f) in pats.iter().enumerate() {
+                    match rest_at {
+                        Some(r) if i == r => {
+                            if let ast::Pat::IdentPat(ip) = f
+                                && let Some(n) = ip.name()
+                            {
+                                let after = pats.len() - r - 1;
+                                out.binds.push((
+                                    n,
+                                    ip.mut_token().is_some(),
+                                    format!("{subject}.slice({r}, {subject}.length - {after})"),
+                                ));
+                            }
+                        }
+                        Some(r) if i > r => {
+                            let from_end = pats.len() - i;
+                            self.lower_pat(
+                                f,
+                                &format!("{subject}[{subject}.length - {from_end}]"),
+                                out,
+                            );
+                        }
+                        _ => self.lower_pat(f, &format!("{subject}[{i}]"), out),
+                    }
+                }
+            }
+            other if self.lower_adt_pat(other, subject, out) => {}
             other => {
                 let what = match other {
                     ast::Pat::SlicePat(_) => "slice patterns (`[first, .., last]`)",
@@ -2658,12 +3445,28 @@ impl<'a> Codegen<'a> {
     /// `const x = subject;` for each binding, in the current scope.
     fn emit_binds(&mut self, binds: Vec<(ast::Name, bool, String)>) {
         for (name, mutable, js_value) in binds {
+            // A `&mut` binding into the matched place aliases it.
+            let r = (
+                self.off(name.syntax()),
+                self.base + usize::from(name.syntax().text_range().end()),
+            );
+            if self.types.mut_bindings.contains(&r) {
+                self.alias_binds(vec![(name, mutable, js_value)]);
+                continue;
+            }
             let js = self.fresh(name.text());
             let kw = if mutable { "let" } else { "const" };
+            let boxed = self.is_boxed(name.syntax());
+            let value = if boxed {
+                format!("[{js_value}]")
+            } else {
+                js_value
+            };
             self.line(Frag::mapped(
                 self.off(name.syntax()),
-                format!("{kw} {js} = {js_value};"),
+                format!("{kw} {js} = {value};"),
             ));
+            let js = if boxed { format!("{js}[0]") } else { js };
             self.declare(
                 name.text(),
                 Some(name.syntax()),
@@ -3186,7 +3989,12 @@ impl<'a> Codegen<'a> {
         let elem = self.vec_elem(a.syntax());
         let f = match a.kind() {
             ast::ArrayExprKind::ElementList(items) => {
-                let items: Vec<Frag> = items.map(|i| self.emit_expr(&i, None).0).collect();
+                let items: Vec<Frag> = items
+                    .map(|i| {
+                        let (f, t) = self.emit_expr(&i, None);
+                        self.by_value(&i, f, &t)
+                    })
+                    .collect();
                 Frag::text("[")
                     .append(Frag::join(items, ", "))
                     .push("]")
@@ -3214,9 +4022,37 @@ impl<'a> Codegen<'a> {
         let (Some(base), Some(index)) = (ix.base(), ix.index()) else {
             return (Frag::text("undefined"), Ty::Unknown);
         };
-        if let ast::Expr::RangeExpr(_) = index {
-            self.unsupported(ix.syntax(), "slicing (`v[a..b]`)", 1);
-            return (Frag::text("undefined"), Ty::Unknown);
+        if let ast::Expr::RangeExpr(r) = &index {
+            use ra_ap_syntax::ast::RangeItem;
+            let (bf, bt) = self.receiver(&base);
+            let lo = r
+                .start()
+                .map(|e| self.emit_expr(&e, None).0)
+                .unwrap_or_else(|| Frag::text("0"));
+            let hi = r
+                .end()
+                .map(|e| self.emit_expr(&e, None).0)
+                .unwrap_or_else(|| Frag::text("null"));
+            let inclusive = r.op_kind() == Some(RangeOp::Inclusive);
+            // Like indexing, rustc reports slicing panics at the `[`.
+            let bracket = ix
+                .l_brack_token()
+                .map(|t| self.base + usize::from(t.text_range().start()));
+            let loc = js_string(
+                &bracket
+                    .map(|o| self.location_at(o))
+                    .unwrap_or_else(|| self.location(ix.syntax())),
+            );
+            let name = if bt == Ty::Str { "strSlice" } else { "slice" };
+            let mut f = Frag::mapped(self.off(ix.syntax()), format!("κσ.${name}("));
+            f.append(bf)
+                .push(", ")
+                .append(lo)
+                .push(", ")
+                .append(hi)
+                .push(format!(", {inclusive}, {loc})"));
+            let ty = self.ty_of(ix.syntax()).unwrap_or(bt);
+            return (f, ty);
         }
         let (bf, bt) = self.receiver(&base);
         let (xf, _) = self.emit_expr(&index, None);
@@ -3380,6 +4216,17 @@ impl<'a> Codegen<'a> {
         res
     }
 
+    /// A macro argument in a by-value position (a `vec!` element): copies tuples and `Copy`
+    /// structs read from places.
+    fn emit_macro_arg_by_value(&mut self, arg: &MacroArg) -> Frag {
+        let (expr, _) = macros::parse_arg(arg);
+        let (f, ty) = self.emit_macro_arg(arg, None);
+        match expr {
+            Some(e) => self.by_value(&e, f, &ty),
+            None => f,
+        }
+    }
+
     fn emit_macro(&mut self, mc: &ast::MacroCall) -> (Frag, Ty) {
         let name = mc
             .path()
@@ -3487,15 +4334,63 @@ impl<'a> Codegen<'a> {
                 }
                 let items: Vec<Frag> = args
                     .iter()
-                    .map(|a| self.emit_macro_arg(a, None).0)
+                    .map(|a| self.emit_macro_arg_by_value(a))
                     .collect();
                 let mut f = Frag::mapped(start, "[");
                 f.append(Frag::join(items, ", ")).push("]");
                 (f, Ty::Vec(Box::new(elem)))
             }
-            "matches" | "write" | "writeln" => {
-                self.unsupported(mc.syntax(), &format!("`{name}!`"), 1);
-                (Frag::text("undefined"), Ty::Unknown)
+            "matches" => {
+                let Some(arg) = macros::matches_as_match(&args) else {
+                    return (Frag::text("false"), Ty::Bool);
+                };
+                let (expr, _) = macros::parse_arg(&arg);
+                let Some(expr) = expr else {
+                    return (Frag::text("false"), Ty::Bool);
+                };
+                // An arrow function called in place, so the `match` stays an expression.
+                let saved = std::mem::replace(&mut self.base, arg.start);
+                let body = self.capture(|cg| {
+                    cg.emit_into(&expr, &Dest::Return, Some(&Ty::Bool));
+                });
+                self.base = saved;
+                let mut f = Frag::mapped(
+                    start,
+                    "(() => {
+",
+                );
+                f.append(body)
+                    .push(format!("{}}})()", "  ".repeat(self.out.indent)));
+                (f, Ty::Bool)
+            }
+            "write" | "writeln" => {
+                let fmt_result = Ty::Result(
+                    Box::new(Ty::Unit),
+                    Box::new(Ty::Extern("fmt::Error".into())),
+                );
+                let Some(target) = args.first() else {
+                    return (Frag::text("undefined"), fmt_result);
+                };
+                let (tf, tt) = self.emit_macro_arg(target, None);
+                let tpl = if args.len() > 1 {
+                    self.format_args(mc, &args[1..])
+                } else {
+                    Frag::text("\"\"")
+                };
+                let nl = name == "writeln";
+                if tt == Ty::Str {
+                    // `write!(s, ..)` appends to the string.
+                    let mut f = Frag::mapped(start, "(");
+                    f.append(tf).push(" += ").append(tpl);
+                    if nl {
+                        f.push(" + \"\\n\"");
+                    }
+                    f.push(", κσ.Ok(undefined))");
+                    return (f, fmt_result);
+                }
+                let mut f = Frag::mapped(start, "κσ.$write(");
+                f.append(tf).push(", ").append(tpl).push(format!(", {nl})"));
+                (f, fmt_result)
             }
             _ => {
                 self.unsupported(mc.syntax(), &format!("macro `{name}!` (`macro_rules!`)"), 4);
@@ -3669,6 +4564,7 @@ fn default_value(ty: &Ty) -> Option<String> {
                 .join(", ")
         ),
         Ty::Unit => "undefined".into(),
+        Ty::Adt(n) => format!("{}.default()", escape_ident(n)),
         other => other.default_js()?.into(),
     })
 }
@@ -3690,6 +4586,21 @@ fn debug_fn(ty: &Ty) -> Option<String> {
         Ty::Float { .. } => Some("κσ.$dbgF".into()),
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),
         Ty::Ordering => Some("κσ.$dbgOrdering".into()),
+        Ty::Adt(_) => Some("κσ.$dbg".into()),
+        Ty::Param(_) => Some("κσ.$dbgAny".into()),
+        Ty::RefCell(t) => {
+            let inner = debug_fn(t).unwrap_or_else(|| "String".into());
+            Some(format!(
+                "((c) => `${{c.kind}} {{ value: ${{({inner})(c.v)}} }}`)"
+            ))
+        }
+        Ty::Result(t, e) => {
+            let (tf, ef) = (
+                debug_fn(t).unwrap_or_else(|| "String".into()),
+                debug_fn(e).unwrap_or_else(|| "String".into()),
+            );
+            Some(format!("((r) => κσ.$dbgRes(r, {tf}, {ef}))"))
+        }
         Ty::Vec(e) => {
             let inner = debug_fn(e).unwrap_or_else(|| "String".into());
             Some(format!("((v) => κσ.$dbgVec(v, {inner}))"))
@@ -3724,6 +4635,16 @@ fn format_value(f: Frag, ty: &Ty, spec: &Spec) -> Frag {
         g
     };
     let numeric = ty.is_numeric() || *ty == Ty::Unknown;
+    // A user `Display` impl formats itself; like `write!`-based impls in Rust, it ignores width.
+    if !spec.debug && matches!(ty, Ty::Adt(_)) {
+        return call("κσ.$display", f, "");
+    }
+    // A generic value: decided at run time.
+    let f = if !spec.debug && matches!(ty, Ty::Param(_)) {
+        call("κσ.$disp", f, "")
+    } else {
+        f
+    };
     let mut s = if spec.debug {
         match ty {
             Ty::Tuple(es) => call("κσ.$dbgTuple", f, &format!(", {}", tuple_formatters(es))),

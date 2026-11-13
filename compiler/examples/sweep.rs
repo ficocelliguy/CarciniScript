@@ -43,8 +43,33 @@ fn main() {
         };
         bytes += src.len();
         let name = f.file_name().unwrap().to_string_lossy().to_string();
+        // `SWEEP_TRACE=1` names each file first, to find one that crashes the process.
+        if std::env::var_os("SWEEP_TRACE").is_some() {
+            eprintln!("{}", f.display());
+        }
         let t0 = std::time::Instant::now();
-        let result = std::panic::catch_unwind(|| carciniscript::compile(&src, &name));
+        // `mod x;` reads `x.rs` next to the file, exercising the module loader too.
+        let dir = f.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let resolve = |p: &str| std::fs::read_to_string(dir.join(p)).ok();
+        let result = std::panic::catch_unwind(|| {
+            let out = carciniscript::compile_with(&src, &name, &resolve);
+            // `SWEEP_SERVICE=1`: also hover and complete at a few spots (the language service runs
+            // on every keystroke, so it must not panic either).
+            let lines = src.lines().count().max(1) as u32;
+            let spots = if std::env::var_os("SWEEP_SERVICE").is_some() {
+                4
+            } else {
+                0
+            };
+            for k in 1..=spots {
+                let line = 1 + (lines - 1) * k / 4;
+                for col in [1, 5, 13] {
+                    carciniscript::service::hover(&src, &name, line, col, &resolve);
+                    carciniscript::service::completions(&src, &name, line, col, &resolve);
+                }
+            }
+            out
+        });
         slowest.push((t0.elapsed(), f.clone(), src.len()));
         match result {
             Ok(out) if out.code.is_some() => ok += 1,
