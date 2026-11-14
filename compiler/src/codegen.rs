@@ -20,6 +20,10 @@ mod adt_gen;
 mod coll_gen;
 #[path = "codegen_ext.rs"]
 mod ext;
+#[path = "codegen_json.rs"]
+mod json_gen;
+#[path = "codegen_quote.rs"]
+mod quote_gen;
 #[path = "codegen_res.rs"]
 mod res_gen;
 #[path = "codegen_std.rs"]
@@ -52,6 +56,9 @@ pub struct CompileOutput {
     pub code: Option<String>,
     pub source_map: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Files the output depends on besides its `mod` files (which it imports): the proc-macro
+    /// crates it used. A host that caches compiled scripts recompiles when one changes.
+    pub dependencies: Vec<String>,
 }
 
 /// A piece of JS expression text. `Some(offset)` parts record a source mapping from the current
@@ -407,6 +414,35 @@ fn receiver_needs_parens(e: &ast::Expr) -> bool {
         || matches!(e, ast::Expr::Literal(l) if matches!(l.kind(), LiteralKind::IntNumber(_) | LiteralKind::FloatNumber(_)))
 }
 
+/// An integer literal other than zero (`x / 7`, `i % 2`): dividing by it can't panic.
+fn nonzero_literal(e: Option<ast::Expr>) -> bool {
+    match e.map(|e| strip_parens_expr(&e)) {
+        Some(ast::Expr::Literal(l)) => match l.kind() {
+            LiteralKind::IntNumber(n) => n.value().is_ok_and(|v| v != 0),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// An index cheap enough to evaluate three times for an inline bounds check: a name, a literal,
+/// a field, or arithmetic on those (`i`, `j - 1`, `self.pos + 2`).
+fn cheap_index(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::PathExpr(_) | ast::Expr::Literal(_) => true,
+        ast::Expr::ParenExpr(p) => p.expr().is_some_and(|i| cheap_index(&i)),
+        ast::Expr::FieldExpr(f) => f.expr().is_some_and(|i| cheap_index(&i)),
+        ast::Expr::BinExpr(b) => {
+            matches!(
+                b.op_kind(),
+                Some(BinaryOp::ArithOp(ArithOp::Add | ArithOp::Sub))
+            ) && b.lhs().is_some_and(|l| cheap_index(&l))
+                && b.rhs().is_some_and(|r| cheap_index(&r))
+        }
+        _ => false,
+    }
+}
+
 /// Expressions that are side-effect free and cheap, so lowering may evaluate them twice
 /// (`v[κσ.$ix(v, i)]` reads `v` for the bounds check and again for the access).
 fn is_pure(e: &ast::Expr) -> bool {
@@ -488,6 +524,19 @@ pub(crate) fn int_bounds(k: IntKind) -> (String, String) {
 /// Compile `src`; `resolver` reads the files of its `mod` declarations (paths relative to the
 /// project root, like `lib/util.rs`).
 pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
+    // (A proc-macro crate compiled for this compile keeps its own list.)
+    let outer = crate::procmacro::take_dependencies();
+    let mut out = compile_files(src, filename, resolver);
+    out.dependencies = crate::procmacro::take_dependencies();
+    crate::procmacro::restore_dependencies(outer);
+    out
+}
+
+fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
+    // A proc-macro crate: `use proc_macro::..` set aside and `TokenStream` a `String`.
+    if crate::procmacro::is_proc_crate(src) {
+        return compile_files(&crate::procmacro::prepared(src), filename, resolver);
+    }
     // `macro_rules!` macros are expanded and inline modules flattened first; positions are
     // reported in `src`.
     if src.contains("macro_rules!")
@@ -496,9 +545,12 @@ pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> Co
         || src.contains("super::")
         || src.contains("type ")
         || src.contains("use ")
+        || crate::ufcs::has_prim_paths(src)
+        // (`mac::show!(..)`, `#[derive(mac::Show)]`: a proc-macro crate, maybe)
+        || src.contains("::")
     {
         let macros = crate::mbe::imported_macros(src, filename, resolver);
-        match crate::mbe::preprocess_with(src, &macros) {
+        match crate::mbe::preprocess_with(src, &macros, Some((filename, resolver))) {
             Ok(Some(pre)) => {
                 let map = std::rc::Rc::new(pre.map);
                 return compile_text(&pre.text, src, Some(map), pre.names, filename, resolver);
@@ -527,6 +579,7 @@ pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> Co
                     code: None,
                     source_map: None,
                     diagnostics,
+                    dependencies: Vec::new(),
                 };
             }
         }
@@ -543,8 +596,17 @@ fn compile_text(
     filename: &str,
     resolver: typeck::Resolver,
 ) -> CompileOutput {
+    // `std::time`'s types, compiled in after the program when it uses them.
+    let with_time = crate::stdtime::with_prelude(src);
+    let prelude_at = if with_time.is_some() {
+        src.len()
+    } else {
+        usize::MAX
+    };
+    let src = with_time.as_deref().unwrap_or(src);
     let parse = SourceFile::parse(src, EDITION);
     let mut cg = Codegen {
+        serde: None,
         src,
         filename,
         idx: match &map {
@@ -578,6 +640,7 @@ fn compile_text(
         dict_scope: Vec::new(),
         in_trait_default: false,
         loop_dests: Vec::new(),
+        prelude_at,
     };
     for e in parse.errors() {
         let r = e.range();
@@ -637,11 +700,17 @@ fn compile_text(
         code,
         source_map,
         diagnostics,
+        dependencies: Vec::new(),
     }
 }
 
 struct Codegen<'a> {
     src: &'a str,
+    /// Where the `std::time` prelude starts in `src` (`usize::MAX` without one): its code has no
+    /// source mappings, and its panics are located in `<std>`.
+    prelude_at: usize,
+    /// `#[serde(..)]` attributes of the file's types, read when `JSON` first needs them.
+    serde: Option<std::rc::Rc<HashMap<String, crate::json::SerdeInfo>>>,
     filename: &'a str,
     idx: LineIndex<'a>,
     out: Out,
@@ -734,11 +803,24 @@ impl<'a> Codegen<'a> {
     }
 
     fn location_at(&self, offset: usize) -> String {
+        if offset >= self.prelude_at {
+            return "<std>".into();
+        }
         let (l, c) = self.idx.line_col(offset);
         format!("{}:{}:{}", self.filename, l + 1, c + 1)
     }
 
     fn line(&mut self, frag: Frag) {
+        if self.prelude_at != usize::MAX {
+            let mut frag = frag;
+            for (src, _) in &mut frag.parts {
+                if src.is_some_and(|s| s >= self.prelude_at) {
+                    *src = None;
+                }
+            }
+            self.out.line(&frag, &self.idx);
+            return;
+        }
         self.out.line(&frag, &self.idx);
     }
 
@@ -843,6 +925,7 @@ impl<'a> Codegen<'a> {
     fn lower_type(&mut self, t: &ast::Type) -> Ty {
         match t {
             ast::Type::RefType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
+            ast::Type::PtrType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::ParenType(p) => p.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::TupleType(tt) if tt.fields().next().is_none() => Ty::Unit,
             ast::Type::TupleType(tt) => {
@@ -1437,6 +1520,33 @@ impl<'a> Codegen<'a> {
             self.emit_into(&init, &Dest::Discard, declared.as_ref());
             return;
         };
+        // `let p = &mut x as *mut i32;`: `p` holds x's cell (or `null`).
+        if self
+            .types
+            .ptrs
+            .cells
+            .contains(&self.range_of(name.syntax()))
+        {
+            let (f, ty) = self.emit_expr(&init, declared.as_ref());
+            let js = self.fresh(name.text());
+            let kw = if mutable { "let" } else { "const" };
+            let mut line = Frag::mapped(start, format!("{kw} "));
+            line.append(Frag::mapped(self.off(name.syntax()), js.clone()))
+                .push(" = ")
+                .append(f)
+                .push(";");
+            self.line(line);
+            let ty = declared.unwrap_or(ty);
+            self.declare(
+                name.text(),
+                Some(name.syntax()),
+                Local {
+                    js: format!("{js}[0]"),
+                    ty,
+                },
+            );
+            return;
+        }
         // `let v = map.entry(k).or_insert(0);`: `v` aliases the slot's value, so `*v += 1` sticks.
         if let ast::Expr::MethodCallExpr(m) = &init
             && let Some(slot) = self.entry_slot(m)
@@ -2546,7 +2656,8 @@ impl<'a> Codegen<'a> {
                 if matches!(ty, Ty::Int(IntKind::I128 | IntKind::U128)) {
                     return (Frag::text(format!("{value}n")), ty);
                 }
-                if value > (1u128 << 53) {
+                // (Powers of two and the like are exact: `0x4000_0000_0000_0000`.)
+                if value > (1u128 << 53) && (value as f64) as u128 != value {
                     self.warn(
                         l.syntax(),
                         "integer literal exceeds 2^53 and loses precision as a JS number",
@@ -2663,6 +2774,18 @@ impl<'a> Codegen<'a> {
             }
         }
         if let Some(r) = self.emit_adt_path(&segs) {
+            // An associated function as a value that takes classes (`Stack::<T>::make`): bound.
+            if let Some(tys) = self
+                .types
+                .dict_args
+                .get(&self.range_of(p.syntax()))
+                .cloned()
+            {
+                let ds: Vec<String> = tys.iter().map(|t| self.dict_of(t)).collect();
+                let mut f = Frag::text("((...$a) => ");
+                f.append(r.0).push(format!("(...$a, {}))", ds.join(", ")));
+                return (f, r.1);
+            }
             return r;
         }
         if matches!(
@@ -2802,6 +2925,27 @@ impl<'a> Codegen<'a> {
             return (f.at(self.off(b.syntax())), ty);
         }
         match op {
+            // `p = &mut y as *mut i32;` with `p` holding a cell: point it at y's.
+            BinaryOp::Assignment { op: None }
+                if self
+                    .types
+                    .ptrs
+                    .repoints
+                    .contains(&self.range_of(b.syntax())) =>
+            {
+                let cell = match &lhs {
+                    ast::Expr::PathExpr(p) => p
+                        .path()
+                        .and_then(|p| p.as_single_name_ref())
+                        .and_then(|n| self.lookup(n.text().to_string().as_str()))
+                        .and_then(|l| l.js.strip_suffix("[0]").map(str::to_string)),
+                    _ => None,
+                };
+                let (rf, _) = self.emit_expr(&rhs, None);
+                let mut f = Frag::text(cell.unwrap_or_else(|| "undefined".into()));
+                f.push(" = ").append(rf);
+                (f, Ty::Unit)
+            }
             BinaryOp::Assignment { op } => {
                 let assignable = match strip_refs(&lhs) {
                     ast::Expr::PathExpr(_) | ast::Expr::FieldExpr(_) | ast::Expr::PrefixExpr(_) => {
@@ -3120,6 +3264,17 @@ impl<'a> Codegen<'a> {
                         if k == IntKind::I32 { f } else { wrap(f) }
                     }
                     ArithOp::Add | ArithOp::Sub | ArithOp::Mul => return plain(l, r),
+                    // A nonzero literal divisor can't panic: plain JS.
+                    ArithOp::Div if nonzero_literal(b.rhs()) => {
+                        let mut f = Frag::text("Math.trunc(");
+                        f.append(l).push(" / ").append(r).push(")");
+                        if narrow { wrap(f) } else { f }
+                    }
+                    ArithOp::Rem if nonzero_literal(b.rhs()) => {
+                        let mut f = l;
+                        f.push(" % ").append(r);
+                        f.wrap("(", ")")
+                    }
                     ArithOp::Div => {
                         let f = call("κσ.$idiv", l, r);
                         if narrow { wrap(f) } else { f }
@@ -3167,6 +3322,10 @@ impl<'a> Codegen<'a> {
         let (Some(inner), Some(target)) = (c.expr(), c.ty()) else {
             return (Frag::text("undefined"), Ty::Unknown);
         };
+        // `&mut x as *mut i32`: the same reference (a cell for numbers).
+        if crate::typeck::is_ptr_type(&target) {
+            return self.emit_expr(&inner, None);
+        }
         // The type checker's type knows trait objects and closure types (`Box<dyn Score>`).
         let to = match self.ty_of(c.syntax()) {
             Some(t @ (Ty::Dyn(_) | Ty::Closure { .. })) => t,
@@ -3488,6 +3647,9 @@ impl<'a> Codegen<'a> {
             {
                 return r;
             }
+            if let Some(r) = self.emit_js_bound(c) {
+                return r;
+            }
             return self.emit_fn_call(c, name.text().to_string().as_str(), callee_off);
         }
         let segs: Vec<String> = std_alias.unwrap_or_else(|| {
@@ -3501,11 +3663,33 @@ impl<'a> Codegen<'a> {
         {
             return self.emit_fn_call(c, single, callee_off);
         }
+        // `TokenStream::from_iter(tokens)`
+        if let [.., ty, f] = segs.as_slice()
+            && ty == "TokenStream"
+            && f == "from_iter"
+            && self.types.adts.defs.contains_key("TokenStream")
+        {
+            let a = match c.arg_list().and_then(|l| l.args().next()) {
+                Some(a) => self.emit_expr(&a, None).0,
+                None => Frag::text("undefined"),
+            };
+            let text = a.wrap("κσ.$tokensJoin(", ")");
+            return (
+                self.construct("TokenStream", 0, vec![text]),
+                Ty::Adt("TokenStream".into(), vec![]),
+            );
+        }
         if let Some(r) = self.emit_adt_call(c, &segs) {
             return r;
         }
         {
             let ss: Vec<&str> = segs.iter().map(String::as_str).collect();
+            if let Some(r) = self.emit_js_bound(c) {
+                return r;
+            }
+            if let Some(r) = self.emit_js_call(c, &ss) {
+                return r;
+            }
             if let Some(r) = self.emit_std_call(c, &ss) {
                 return r;
             }
@@ -3573,6 +3757,8 @@ impl<'a> Codegen<'a> {
                 let a = self.emit_args(c.arg_list(), &[]);
                 (a.into_iter().next().unwrap_or_else(|| Frag::text("0")), ty)
             }
+            // A `js` type's missing associated function: the type checker said so.
+            [.., t, _] if bindings::is_js_type(t) => (Frag::text("undefined"), Ty::Unknown),
             _ => {
                 self.error(
                     callee.syntax(),
@@ -3608,6 +3794,18 @@ impl<'a> Codegen<'a> {
                 let js = extern_js_name(&type_name, name.text(), false);
                 let mut f = rf;
                 f.append(Frag::mapped(self.off(name.syntax()), member(&js)));
+                // `#[array]`: an array-like property (`children`).
+                let b = bindings::current();
+                let array = b
+                    .types
+                    .get(&type_name)
+                    .and_then(|t| t.fields.get(&bare(name.text())))
+                    .is_some_and(|fd| fd.array);
+                let f = if array {
+                    f.wrap("κσ.$arrayOf(", ")")
+                } else {
+                    f
+                };
                 (f, Ty::Unknown)
             }
             Ty::Unknown => {
@@ -3708,6 +3906,44 @@ impl<'a> Codegen<'a> {
         let name_off = self.off(name.syntax());
         let method = name.text().to_string();
         let node = m.syntax().clone();
+        // `stream.extend(tokens)` on a proc-macro crate's `TokenStream`.
+        if method == "extend"
+            && matches!(self.ty_of(recv.syntax()), Some(Ty::Adt(n, _)) if n == "TokenStream")
+            && self.types.adts.defs.contains_key("TokenStream")
+        {
+            let (rf, _) = self.emit_expr(&recv, None);
+            let a = match m.arg_list().and_then(|l| l.args().next()) {
+                Some(a) => self.emit_expr(&a, None).0,
+                None => Frag::text("undefined"),
+            };
+            let mut f = rf.wrap("(", ").__push(κσ.$tokensJoin(");
+            f.append(a).push("))");
+            return (f, Ty::Unit);
+        }
+        // `p.is_null()`, `p.as_ref()`, .. on a raw pointer (a cell for numbers).
+        if let Some(&in_cell) = self.types.ptrs.methods.get(&self.range_of(&node)) {
+            let (rf, _) = self.emit_expr(&recv, None);
+            let ty = self.ty_of(&node).unwrap_or(Ty::Unknown);
+            let f = match (method.as_str(), in_cell) {
+                ("is_null", _) => rf.wrap("(", " == null)"),
+                ("as_ref" | "as_mut", true) => rf.wrap("κσ.$ptrGet(", ")"),
+                ("read", true) => rf.wrap("(", ")[0]"),
+                ("write", true) => {
+                    let v = match m.arg_list().and_then(|a| a.args().next()) {
+                        Some(a) => {
+                            let (f, t) = self.emit_expr(&a, None);
+                            self.by_value(&a, f, &t)
+                        }
+                        None => Frag::text("undefined"),
+                    };
+                    let mut f = rf.wrap("(", ")[0] = ");
+                    f.append(v);
+                    f.wrap("(", ", undefined)")
+                }
+                _ => rf,
+            };
+            return (f.at(name_off), ty);
+        }
         if let Some(f) = self.iter_mut_for_each(m) {
             return (f, Ty::Unit);
         }
@@ -3829,13 +4065,28 @@ impl<'a> Codegen<'a> {
         };
 
         if let Ty::Extern(type_name) = &rt {
+            let b = bindings::current();
+            let sig = b
+                .types
+                .get(type_name)
+                .and_then(|t| t.methods.get(&bare(&method)));
+            // `clone()` of a JS value: the same handle (a DOM node), or a copy of an array.
+            if sig.is_none() && matches!(method.as_str(), "clone" | "to_owned") {
+                return (rf.wrap("κσ.$clone(", ")"), rt.clone());
+            }
             // NS API: snake_case Rust names map to the camelCase JS API, kept as a literal
             // `ns.method(...)` member call so Bitburner's RAM calculator sees it.
             let args = self.emit_args(m.arg_list(), &[]);
             let mut f = rf;
             let js = extern_js_name(type_name, &method, true);
             f.append(Frag::mapped(name_off, member(&js)));
-            f.push("(").append(Frag::join(args, ", ")).push(")");
+            // `#[getter]`: a property; `#[array]`: an array-like result (`querySelectorAll`).
+            if !sig.is_some_and(|s| s.getter) {
+                f.push("(").append(Frag::join(args, ", ")).push(")");
+            }
+            if sig.is_some_and(|s| s.array) {
+                f = f.wrap("κσ.$arrayOf(", ")");
+            }
             return (f, Ty::Unknown);
         }
 
@@ -4002,6 +4253,9 @@ impl<'a> Codegen<'a> {
                     "clamp" => (fcall("κσ.$clamp", vec![rf.clone(), a(0), a(1)]), rt.clone()),
                     "is_nan" => (fcall("Number.isNaN", vec![rf.clone()]), Ty::Bool),
                     "is_finite" => (fcall("Number.isFinite", vec![rf.clone()]), Ty::Bool),
+                    "to_string" if rt == Ty::Float { f32: true } => {
+                        (fcall("κσ.$fmtF32", vec![rf.clone()]), Ty::Str)
+                    }
                     "to_string" => (fcall("κσ.$fmtF", vec![rf.clone()]), Ty::Str),
                     _ => unreachable!(),
                 }
@@ -4607,7 +4861,7 @@ impl<'a> Codegen<'a> {
             },
             "take" => (swap(self, Frag::text("null")), opt),
             "replace" => (swap(self, a(0)), opt),
-            "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" => (rf, opt),
+            "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" | "upgrade" => (rf, opt),
             "transpose" => {
                 let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
                 (helper("optTranspose", vec![], None), ty)
@@ -5083,7 +5337,33 @@ impl<'a> Codegen<'a> {
             .types
             .slice_views
             .contains(&self.range_of(strip_parens_expr(&base).syntax()));
-        let f = if is_pure(&base) || view {
+        let f = if is_pure(&base) && !view && cheap_index(&index) {
+            // The bounds check inline (about twice as fast as calling `κσ.$ix`):
+            // `v[(i >= 0 && i < v.length ? i : κσ.$oob(v, i, loc))]`.
+            let x = if matches!(
+                strip_parens_expr(&index),
+                ast::Expr::PathExpr(_) | ast::Expr::Literal(_)
+            ) {
+                xf
+            } else {
+                xf.wrap("(", ")")
+            };
+            let mut f = bf.clone();
+            f.push("[(")
+                .append(x.clone())
+                .push(" >= 0 && ")
+                .append(x.clone())
+                .push(" < ")
+                .append(bf.clone())
+                .push(".length ? ")
+                .append(x.clone())
+                .push(" : κσ.$oob(")
+                .append(bf)
+                .push(", ")
+                .append(x)
+                .push(format!(", {loc}))]"));
+            f
+        } else if is_pure(&base) || view {
             let mut f = bf.clone();
             f.push("[κσ.$ix(")
                 .append(bf)
@@ -5165,6 +5445,14 @@ impl<'a> Codegen<'a> {
             "contains" => (helper("contains", vec![a(0)]), Ty::Bool),
             "extend_from_slice" => (helper("extend", vec![a(0)]), Ty::Unit),
             "join" => (mcall("join", vec![a(0)]), Ty::Str),
+            "concat" if matches!(elem, Ty::Vec(_)) => {
+                let flat = mcall("flat", vec![]);
+                let f = match elem {
+                    Ty::Vec(inner) if !inner.is_js_primitive() => flat.wrap("", ".map(κσ.$clone)"),
+                    _ => flat,
+                };
+                (f, elem.clone())
+            }
             "concat" => (mcall("join", vec![Frag::text("\"\"")]), Ty::Str),
             "clone" | "to_owned" | "to_vec" => {
                 // Elements that are immutable in JS only need a shallow copy.
@@ -5246,6 +5534,25 @@ impl<'a> Codegen<'a> {
         let args = self.macro_args(mc);
         let rt = |f: &str| format!("κσ.${f}");
         match name.as_str() {
+            "quote" | "quote_spanned" => self.emit_quote(mc),
+            // (An error from the type checker.)
+            "compile_error" => (Frag::text("undefined"), Ty::Never),
+            // `format_ident!(..)`: an `Ident` (in a proc-macro crate).
+            "format_ident" if self.types.adts.defs.contains_key("Ident") => {
+                let args: Vec<_> = args
+                    .into_iter()
+                    .filter(|a| a.name.as_deref() != Some("span"))
+                    .collect();
+                let tpl = if args.is_empty() {
+                    Frag::text("\"\"")
+                } else {
+                    self.format_args(mc, &args)
+                };
+                (
+                    self.construct("Ident", 0, vec![tpl]),
+                    Ty::Adt("Ident".into(), vec![]),
+                )
+            }
             "println" | "print" | "eprintln" | "eprint" | "format" => {
                 let tpl = if args.is_empty() {
                     Frag::text("\"\"")
@@ -5632,6 +5939,8 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
     match ty {
         Ty::Str => Some("κσ.$dbgStr".into()),
         Ty::Char => Some("κσ.$dbgChar".into()),
+        // (An `f32` prints its own shortest digits, not the double's.)
+        Ty::Float { f32: true } => Some("κσ.$dbgF32".into()),
         Ty::Float { .. } => Some("κσ.$dbgF".into()),
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),
         Ty::Ordering => Some("κσ.$dbgOrdering".into()),
@@ -5691,6 +6000,17 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
     }
 }
 
+/// `name(f, extra..)`.
+fn call_with_spec(name: &str, f: Frag, extra: Vec<Frag>) -> Frag {
+    let mut g = Frag::text(format!("{name}("));
+    g.append(f);
+    for e in extra {
+        g.push(", ").append(e);
+    }
+    g.push(")");
+    g
+}
+
 fn format_value(
     f: Frag,
     ty: &Ty,
@@ -5707,6 +6027,30 @@ fn format_value(
         g
     };
     let numeric = ty.is_numeric() || *ty == Ty::Unknown;
+    // A struct or enum with a spec (`{:>8}`, `{:.2?}`): its own `fmt` gets the spec through the
+    // Formatter (`f.width()`, `f.pad(..)`); a derived `{:?}` is padded as before.
+    if matches!(ty, Ty::Adt(..))
+        && spec.kind.is_none()
+        && (width.is_some() || precision.is_some() || spec.plus || spec.alt || spec.zero)
+    {
+        let opt = |v: Option<Frag>| v.unwrap_or_else(|| Frag::text("null"));
+        let mut o = Frag::text("{ w: ");
+        o.append(opt(width)).push(", p: ").append(opt(precision));
+        let align = spec
+            .align
+            .map(|c| js_string(&c.to_string()))
+            .unwrap_or_else(|| "null".into());
+        let fill = js_string(&spec.fill.unwrap_or(' ').to_string());
+        o.push(format!(
+            ", align: {align}, fill: {fill}, plus: {}, alt: {}, zero: {} }}",
+            spec.plus, spec.alt, spec.zero
+        ));
+        if !spec.debug {
+            return call_with_spec("κσ.$displaySpec", f, vec![o]);
+        }
+        let d = debug_fn(ty).unwrap_or_else(|| "κσ.$dbg".into());
+        return call_with_spec("κσ.$dbgSpec", f, vec![o, Frag::text(d)]);
+    }
     // A user `Display` impl formats itself; like `write!`-based impls in Rust, it ignores width.
     if !spec.debug && matches!(ty, Ty::Adt(..)) {
         return call("κσ.$display", f, "");
@@ -5824,6 +6168,7 @@ fn format_value(
         }
     } else {
         match ty {
+            Ty::Float { f32: true } => call("κσ.$fmtF32", f, ""),
             Ty::Float { .. } => call("κσ.$fmtF", f, ""),
             Ty::Unknown => call("κσ.$disp", f, ""),
             _ => f,

@@ -10,6 +10,14 @@ use crate::ty::{IntKind, Ty};
 
 const U32: Ty = Ty::Int(IntKind::U32);
 
+/// An iterator over `elem`s.
+fn iter_of(elem: Ty) -> Ty {
+    Ty::Iter {
+        elem: Box::new(elem),
+        mutable: false,
+    }
+}
+
 /// The unsigned type of the same width (`i32::abs_diff` returns `u32`).
 fn unsigned(k: IntKind) -> IntKind {
     match k {
@@ -244,6 +252,61 @@ impl Checker<'_> {
                 count(self, 0);
                 Ty::Bool
             }
+            (Ty::Int(k), "div_euclid") => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Int(k));
+                }
+                Ty::Int(k)
+            }
+            (Ty::Int(k), "isqrt") => {
+                count(self, 0);
+                Ty::Int(k)
+            }
+            (Ty::Int(_), "ilog2" | "ilog10") => {
+                count(self, 0);
+                U32
+            }
+            (Ty::Int(k), "is_positive" | "is_negative") if k.is_signed() => {
+                count(self, 0);
+                Ty::Bool
+            }
+            (Ty::Float { f32 }, "to_bits") => {
+                count(self, 0);
+                Ty::Int(if f32 { IntKind::U32 } else { IntKind::U64 })
+            }
+            (
+                Ty::Float { f32 },
+                "hypot" | "rem_euclid" | "div_euclid" | "copysign" | "log" | "abs_sub",
+            ) => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Float { f32 });
+                }
+                Ty::Float { f32 }
+            }
+            (Ty::Float { f32 }, "mul_add") => {
+                count(self, 2);
+                for a in args.iter().take(2) {
+                    self.check(a, &Ty::Float { f32 });
+                }
+                Ty::Float { f32 }
+            }
+            (
+                Ty::Float { f32 },
+                "to_radians" | "to_degrees" | "recip" | "fract" | "signum" | "exp2" | "exp_m1"
+                | "ln_1p" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh",
+            ) => {
+                count(self, 0);
+                Ty::Float { f32 }
+            }
+            (
+                Ty::Float { .. },
+                "is_sign_negative" | "is_sign_positive" | "is_infinite" | "is_normal",
+            ) => {
+                count(self, 0);
+                Ty::Bool
+            }
             (Ty::Float { f32 }, "total_cmp") => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -391,6 +454,11 @@ impl Checker<'_> {
             ["std" | "core", rest @ ..] => rest,
             all => all,
         };
+        // `std::rc::Rc::downgrade` / `sync::Arc::..`
+        let tail = match tail {
+            ["rc" | "sync", rest @ ..] => rest,
+            t => t,
+        };
         let count = |c2: &mut Self, n: usize| c2.arg_count(c.syntax(), "function", n, args.len());
         let a0 = args.first();
         let a1 = args.get(1);
@@ -462,6 +530,79 @@ impl Checker<'_> {
                     self.infer(a, None);
                 }
                 Ty::from_name(t)
+            }
+            // `Rc::downgrade(&rc)`: a `Weak` is the value itself (or `null`).
+            ["Rc" | "Arc", "downgrade"] => {
+                count(self, 1);
+                let t = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
+                Ty::Option(Box::new(t))
+            }
+            ["Weak", "new"] => {
+                count(self, 0);
+                Ty::Option(Box::new(self.fresh(VarKind::General)))
+            }
+            ["Rc" | "Arc", "ptr_eq"] => {
+                count(self, 2);
+                let t = self.fresh(VarKind::General);
+                for a in args.iter().take(2) {
+                    self.check(a, &t);
+                }
+                Ty::Bool
+            }
+            ["Rc" | "Arc", f @ ("strong_count" | "weak_count")] => {
+                let msg = format!(
+                    "`Rc::{f}` isn't supported: JS values have no reference counts (the garbage collector frees them)"
+                );
+                self.error(c.syntax(), msg);
+                for a in args {
+                    self.infer(a, None);
+                }
+                USIZE
+            }
+            // `u32::default()`, `String::default()`
+            [t, "default"] if Ty::from_name(t) != Ty::Unknown => {
+                count(self, 0);
+                Ty::from_name(t)
+            }
+            // `std::iter::repeat(x)` and friends.
+            ["iter", "repeat" | "once"] => {
+                count(self, 1);
+                let t = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
+                iter_of(t)
+            }
+            ["iter", "empty"] => {
+                count(self, 0);
+                iter_of(self.fresh(VarKind::General))
+            }
+            ["iter", "repeat_with"] => {
+                count(self, 1);
+                let t = self.fresh(VarKind::General);
+                self.closure_arg(a0, vec![], t.clone());
+                iter_of(t)
+            }
+            ["iter", "from_fn"] => {
+                count(self, 1);
+                let t = self.fresh(VarKind::General);
+                self.closure_arg(a0, vec![], Ty::Option(Box::new(t.clone())));
+                iter_of(t)
+            }
+            ["iter", "successors"] => {
+                count(self, 2);
+                let t = self.fresh(VarKind::General);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Option(Box::new(t.clone())));
+                }
+                self.closure_arg(a1, vec![t.clone()], Ty::Option(Box::new(t.clone())));
+                iter_of(t)
+            }
+            // `f64::from_bits(u)` / `f32::from_bits(u)`
+            [t @ ("f64" | "f32"), "from_bits"] => {
+                count(self, 1);
+                let f32 = *t == "f32";
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Int(if f32 { IntKind::U32 } else { IntKind::U64 }));
+                }
+                Ty::Float { f32 }
             }
             // `std::hint::black_box(x)`: `x`, opaque to the optimizer (there's none here).
             ["hint", "black_box"] => {

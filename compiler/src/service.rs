@@ -81,16 +81,28 @@ impl Analysis {
 }
 
 pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis {
+    // (A proc-macro crate as it compiles; positions are unchanged.)
+    let prepared;
+    let src = if crate::procmacro::is_proc_crate(src) {
+        prepared = crate::procmacro::prepared(src);
+        prepared.as_str()
+    } else {
+        src
+    };
     let macros = crate::mbe::imported_macros(src, filename, resolver);
-    if let Ok(Some(exp)) = crate::mbe::preprocess_with(src, &macros) {
-        let file = SourceFile::parse(&exp.text, EDITION).tree();
-        let (types, _) = typeck::check(&file, &exp.text, filename, resolver);
+    if let Ok(Some(exp)) = crate::mbe::preprocess_with(src, &macros, Some((filename, resolver))) {
+        // (`std::time`'s prelude after the program, as it compiles.)
+        let text = crate::stdtime::with_prelude(&exp.text).unwrap_or(exp.text);
+        let file = SourceFile::parse(&text, EDITION).tree();
+        let (types, _) = typeck::check(&file, &text, filename, resolver);
         return Analysis {
             file,
             types,
             map: Some(std::rc::Rc::new(exp.map)),
         };
     }
+    let with_time = crate::stdtime::with_prelude(src);
+    let src = with_time.as_deref().unwrap_or(src);
     let file = SourceFile::parse(src, EDITION).tree();
     let (types, _) = typeck::check(&file, src, filename, resolver);
     Analysis {
@@ -381,7 +393,12 @@ pub fn completions(
     let Some(rt) = receiver.and_then(|r| type_at(types, r.syntax())) else {
         return vec![];
     };
+    // (Not the operator impls' internal names, `add$0`, or the `std::time` prelude's private
+    // `__` fields.)
     members(&rt, types)
+        .into_iter()
+        .filter(|c| !c.label.contains('$') && !c.label.starts_with("__"))
+        .collect()
 }
 
 /// Locals declared before `offset` in the enclosing function, then the file's items.
@@ -898,6 +915,7 @@ pub fn std_methods(t: &Ty) -> &'static [&'static str] {
             "inspect",
             "last",
             "map",
+            "map_while",
             "max",
             "max_by",
             "max_by_key",
@@ -910,12 +928,14 @@ pub fn std_methods(t: &Ty) -> &'static [&'static str] {
             "product",
             "reduce",
             "rev",
+            "scan",
             "skip",
             "skip_while",
             "step_by",
             "sum",
             "take",
             "take_while",
+            "unzip",
             "zip",
         ],
         Ty::Option(_) => &[
@@ -1013,7 +1033,13 @@ pub fn std_methods(t: &Ty) -> &'static [&'static str] {
             "clamp",
             "cmp",
             "count_ones",
+            "div_euclid",
+            "ilog10",
+            "ilog2",
+            "is_negative",
+            "is_positive",
             "is_power_of_two",
+            "isqrt",
             "leading_zeros",
             "max",
             "min",
@@ -1034,23 +1060,38 @@ pub fn std_methods(t: &Ty) -> &'static [&'static str] {
             "atan2",
             "ceil",
             "clamp",
+            "copysign",
             "cos",
+            "div_euclid",
             "exp",
             "floor",
+            "fract",
+            "hypot",
             "is_finite",
+            "is_infinite",
             "is_nan",
+            "is_sign_negative",
             "ln",
+            "log",
             "log10",
+            "log2",
             "max",
             "min",
+            "mul_add",
             "partial_cmp",
             "powf",
             "powi",
+            "recip",
+            "rem_euclid",
             "round",
             "signum",
             "sin",
             "sqrt",
             "tan",
+            "tanh",
+            "to_bits",
+            "to_degrees",
+            "to_radians",
             "to_string",
             "total_cmp",
             "trunc",

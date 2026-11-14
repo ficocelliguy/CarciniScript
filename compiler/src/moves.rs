@@ -650,6 +650,25 @@ impl Walker<'_> {
             ast::Expr::MacroExpr(m) => {
                 let Some(mc) = m.macro_call() else { return };
                 let name = macros::macro_name(&mc).unwrap_or_default();
+                // A `quote!` template isn't code: only its `#var`s read variables.
+                if matches!(name.as_str(), "quote" | "quote_spanned" | "parse_quote") {
+                    fn vars(parts: &[macros::QuotePart], out: &mut Vec<String>) {
+                        for p in parts {
+                            match p {
+                                macros::QuotePart::Var { name, .. } => out.push(name.clone()),
+                                macros::QuotePart::Rep { parts, .. } => vars(parts, out),
+                                macros::QuotePart::Text(_) => {}
+                            }
+                        }
+                    }
+                    let mut names = Vec::new();
+                    vars(&macros::quote_parts(&mc, self.base), &mut names);
+                    let at = self.range(mc.syntax());
+                    for n in names {
+                        self.touch(&n, at, st, Mode::Use);
+                    }
+                    return;
+                }
                 let mode = if name == "vec" {
                     Mode::Move("into a `vec!`")
                 } else {

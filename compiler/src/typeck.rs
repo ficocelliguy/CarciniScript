@@ -22,8 +22,14 @@ mod conv;
 mod ext;
 #[path = "typeck_gen.rs"]
 mod generic;
+#[path = "typeck_js.rs"]
+mod js;
 #[path = "typeck_mod.rs"]
 mod modules;
+#[path = "typeck_ptr.rs"]
+mod ptr;
+#[path = "typeck_quote.rs"]
+mod quote;
 #[path = "typeck_res.rs"]
 mod res;
 #[path = "typeck_std.rs"]
@@ -32,6 +38,8 @@ mod std_lib;
 mod traits;
 pub use ext::{char_predicate, is_option_closure_method};
 pub use modules::{Imported, ModuleRef, Resolver, module_path, use_leaves};
+pub use ptr::{Ptrs, cellable as ptr_cellable, is_ptr_type, transmute_name};
+pub use quote::QuoteTok;
 pub use res::{is_std_error, result_ctor_call, result_variant};
 
 use ra_ap_syntax::{
@@ -102,6 +110,15 @@ pub struct Types {
     pub conversions: HashMap<(usize, usize), crate::adt::Conv>,
     /// std functions imported by name: name -> path after `std` (`max` -> `cmp::max`).
     pub std_fns: HashMap<String, Vec<String>>,
+    /// Raw pointers.
+    pub ptrs: Ptrs,
+    /// How each `#var` of a `quote!` becomes tokens, by the name's range.
+    pub quote_vars: HashMap<(usize, usize), QuoteTok>,
+    /// The variables each `quote!` repetition iterates, by the offset of its `#`.
+    pub quote_reps: HashMap<usize, Vec<String>>,
+    /// Calls of the `js` crate's bound functions, by the call's range: (type for an associated
+    /// function, function name).
+    pub js_calls: HashMap<(usize, usize), (Option<String>, String)>,
 }
 
 impl Types {
@@ -196,6 +213,12 @@ impl<'a> Checker<'a> {
             generic_calls: Vec::new(),
             last_type_args: Vec::new(),
             borrow_events: Default::default(),
+            ptrs: Default::default(),
+            quote_vars: Default::default(),
+            quote_reps: Default::default(),
+            pending_json: Vec::new(),
+            js_calls: HashMap::new(),
+            js_imports: HashMap::new(),
             opaque_index_mut: Default::default(),
             static_muts: Default::default(),
             statics: Default::default(),
@@ -250,6 +273,15 @@ impl<'a> Checker<'a> {
                     .and_then(|r| r.ty())
                     .map(|t| self.lower_type(&t))
                     .unwrap_or(Ty::Unit);
+                if let Some(t) = f.ret_type().and_then(|r| r.ty())
+                    && is_ptr_type(&t)
+                    && self.cellable(&ret)
+                {
+                    self.error(
+                        t.syntax(),
+                        "returning a raw pointer to a number, string or bool isn't supported yet",
+                    );
+                }
                 self.leave_generics();
                 let sig = FnSig {
                     params,
@@ -379,6 +411,8 @@ pub fn check(
             severity: "error",
         });
     }
+    // (Before the definitions move out: methods' type parameters are looked up there.)
+    let (dict_params, dict_args) = c.finish_dicts();
     let adts = std::mem::take(&mut c.adts);
     let mut_bindings = std::mem::take(&mut c.mut_bindings);
     let boxed = std::mem::take(&mut c.boxed);
@@ -391,11 +425,14 @@ pub fn check(
     let slice_views = std::mem::take(&mut c.slice_views);
     let derefs = std::mem::take(&mut c.derefs);
     let qualified_calls = std::mem::take(&mut c.qualified_calls);
-    let (dict_params, dict_args) = c.finish_dicts();
     let modules = std::mem::take(&mut c.modules);
     let imported = std::mem::take(&mut c.imported);
     let conversions = std::mem::take(&mut c.conversions);
     let std_fns = std::mem::take(&mut c.std_fns);
+    let ptrs = std::mem::take(&mut c.ptrs);
+    let quote_vars = std::mem::take(&mut c.quote_vars);
+    let quote_reps = std::mem::take(&mut c.quote_reps);
+    let js_calls = std::mem::take(&mut c.js_calls);
     (
         Types {
             map,
@@ -417,6 +454,10 @@ pub fn check(
             imported,
             conversions,
             std_fns,
+            ptrs,
+            quote_vars,
+            quote_reps,
+            js_calls,
         },
         c.diags,
     )
@@ -464,6 +505,15 @@ struct Checker<'a> {
     slice_views: std::collections::HashSet<(usize, usize)>,
     derefs: HashMap<(usize, usize), (bool, Ty)>,
     qualified_calls: HashMap<(usize, usize), QualifiedCall>,
+    ptrs: Ptrs,
+    quote_vars: HashMap<(usize, usize), QuoteTok>,
+    quote_reps: HashMap<usize, Vec<String>>,
+    /// `JSON::stringify(&v)` / `JSON::parse::<T>(s)` types to check once settled: (type, node,
+    /// whether parsing).
+    pending_json: Vec<(Ty, SyntaxNode, bool)>,
+    js_calls: HashMap<(usize, usize), (Option<String>, String)>,
+    /// `use js::set_timeout as later;`: local name → the `js` crate's function.
+    js_imports: HashMap<String, String>,
     /// Qualified calls whose `Self` is settled at the end of the function: (call, `Self`,
     /// whether the trait is local, node).
     pending_qualified: Vec<((usize, usize), Ty, bool, SyntaxNode)>,
@@ -789,6 +839,7 @@ impl<'a> Checker<'a> {
     fn lower_type(&mut self, t: &ast::Type) -> Ty {
         match t {
             ast::Type::RefType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
+            ast::Type::PtrType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::ParenType(p) => p.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::TupleType(tt) if tt.fields().next().is_none() => Ty::Unit,
             ast::Type::TupleType(tt) => {
@@ -933,6 +984,20 @@ impl<'a> Checker<'a> {
                 }
                 // `Box<T>`, `Rc<T>` and `Arc<T>` are just `T` (shared immutable data can't tell
                 // sharing from copying).
+                // `Weak<T>`: the value or `null` (`Weak::new()`); `upgrade()` hands it back.
+                if name == "Weak" {
+                    let arg = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .and_then(|l| l.generic_args().next());
+                    let inner = match arg {
+                        Some(ast::GenericArg::TypeArg(ta)) => {
+                            ta.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown)
+                        }
+                        _ => self.fresh(VarKind::General),
+                    };
+                    return Ty::Option(Box::new(inner));
+                }
                 if matches!(name.as_str(), "Box" | "Rc" | "Arc") {
                     let arg = seg
                         .clone()
@@ -1013,6 +1078,14 @@ impl<'a> Checker<'a> {
                 {
                     return t.clone();
                 }
+                // `Date`, `js::JsonError`: the `js` crate's types (JS objects).
+                if bindings::is_js_type(&name) {
+                    return Ty::Extern(name);
+                }
+                // `js::JsValue`: any JS value, unchecked (what `js::global(..)` returns).
+                if name == "JsValue" {
+                    return Ty::Unknown;
+                }
                 let ty = Ty::from_name(&name);
                 if ty == Ty::Unknown {
                     self.error(
@@ -1042,6 +1115,8 @@ impl<'a> Checker<'a> {
     fn ref_kind(t: &ast::Type) -> Option<bool> {
         match t {
             ast::Type::RefType(r) => Some(r.mut_token().is_some()),
+            // A raw pointer to a number is a cell, `*const` too (writes elsewhere show through).
+            ast::Type::PtrType(_) => Some(true),
             _ => None,
         }
     }
@@ -1086,6 +1161,10 @@ impl<'a> Checker<'a> {
                         let r = self.range(n.syntax());
                         self.boxed.insert(r);
                     }
+                    if p.ty().is_some_and(|t| is_ptr_type(&t)) {
+                        let r = self.range(n.syntax());
+                        self.ptrs.locals.insert(r);
+                    }
                     let local = Local {
                         ty,
                         mutable: ip.mut_token().is_some(),
@@ -1117,6 +1196,7 @@ impl<'a> Checker<'a> {
         self.resolve_intos();
         self.resolve_collects();
         self.resolve_parses();
+        self.resolve_json();
         self.resolve_bounds();
         self.resolve_qualified();
         let mut calls = std::mem::take(&mut self.generic_calls);
@@ -1194,8 +1274,8 @@ impl<'a> Checker<'a> {
             let t = if broke { value } else { t };
             return self.record(b.syntax(), t);
         }
-        if b.modifier().is_some() {
-            return self.record(b.syntax(), Ty::Unknown); // async/unsafe blocks: codegen reports
+        if b.modifier().is_some() && !matches!(b.modifier(), Some(ast::BlockModifier::Unsafe(_))) {
+            return self.record(b.syntax(), Ty::Unknown); // async blocks: codegen reports
         }
         self.block_body(b, expected)
     }
@@ -1252,7 +1332,10 @@ impl<'a> Checker<'a> {
         {
             self.box_if_needed(&inner);
         }
-        let init_ref = match l.initializer() {
+        let pointer = l.ty().is_some_and(|t| is_ptr_type(&t))
+            || l.initializer().is_some_and(|i| self.is_ptr(&i));
+        let init_ref = match l.initializer().map(|i| ptr::unsafe_tail(&i)) {
+            _ if pointer => Some(true),
             Some(ast::Expr::RefExpr(r)) => Some(r.mut_token().is_some()),
             // `let v = map.entry(k).or_insert(0);` is a `&mut V` into the map.
             Some(ast::Expr::MethodCallExpr(m))
@@ -1295,7 +1378,12 @@ impl<'a> Checker<'a> {
                 }),
                 decl: None,
             };
+            let ty = local.ty.clone();
             self.declare(&name, local);
+            // A raw pointer doesn't borrow.
+            if self.ptr_let(l, &name, &ty) {
+                return;
+            }
             // `let r = &v;` / `let r = v.first();`: `r` borrows `v` while it's used.
             if let Some(init) = l.initializer()
                 && let Some((of, mutable)) = self.borrowed_local(&init)
@@ -1396,7 +1484,7 @@ impl<'a> Checker<'a> {
             }
         }
         let mut_source = through_place
-            || match scrutinee.map(strip_parens) {
+            || match scrutinee.map(ptr::unsafe_tail) {
                 Some(ast::Expr::RefExpr(r)) => r.mut_token().is_some(),
                 Some(ast::Expr::MethodCallExpr(m)) => m.name_ref().is_some_and(|n| {
                     matches!(
@@ -2267,6 +2355,37 @@ impl<'a> Checker<'a> {
             }
             ast::Expr::PrefixExpr(p) => self.prefix(p, expected),
             ast::Expr::BinExpr(b) => self.bin(b, expected),
+            ast::Expr::CastExpr(c) if c.ty().is_some_and(|t| is_ptr_type(&t)) => {
+                // `&mut x as *mut i32`, `p as *const T`: the same reference.
+                let to = c.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                if let Some(inner) = c.expr() {
+                    let t = self.infer(&inner, None);
+                    if matches!(strip_parens(&inner), ast::Expr::Literal(_)) {
+                        self.error(
+                            c.syntax(),
+                            "casting an integer to a raw pointer isn't supported: values have no memory addresses",
+                        );
+                    } else {
+                        self.expect(inner.syntax(), &t, &to);
+                    }
+                }
+                to
+            }
+            ast::Expr::CastExpr(c)
+                if c.expr().is_some_and(|i| self.is_ptr(&i))
+                    && c.ty().is_some_and(|t| {
+                        matches!(Ty::from_name(&t.syntax().text().to_string()), Ty::Int(_))
+                    }) =>
+            {
+                if let Some(inner) = c.expr() {
+                    self.infer(&inner, None);
+                }
+                self.error(
+                    c.syntax(),
+                    "casting a raw pointer to an integer isn't supported: values have no memory addresses (compare pointers with `std::ptr::eq`)",
+                );
+                Ty::Unknown
+            }
             ast::Expr::CastExpr(c) => {
                 let to = c.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
                 // `x as Box<dyn Trait>`: a coercion, checked like one.
@@ -2347,7 +2466,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ast::Expr::CallExpr(c) => self.call(c),
+            ast::Expr::CallExpr(c) => self.call(c, expected),
             ast::Expr::MethodCallExpr(m) => self.method(m, expected),
             ast::Expr::FieldExpr(f) => {
                 let Some(recv) = f.expr() else {
@@ -2916,6 +3035,9 @@ impl<'a> Checker<'a> {
                 Ty::Unit
             }
             BinaryOp::Assignment { op } => {
+                if op.is_none() {
+                    self.ptr_assign(b);
+                }
                 let through = Self::place_root(&lhs).is_some_and(|(_, t)| t);
                 self.check_mutable(
                     &lhs,
@@ -3052,7 +3174,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn call(&mut self, c: &ast::CallExpr) -> Ty {
+    fn call(&mut self, c: &ast::CallExpr, expected: Option<&Ty>) -> Ty {
         let args: Vec<ast::Expr> = c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
         let Some(ast::Expr::PathExpr(callee)) = c.expr() else {
             // `make_adder(1)(2)`: call whatever the expression evaluates to.
@@ -3120,6 +3242,12 @@ impl<'a> Checker<'a> {
             {
                 return t;
             }
+            // `use js::set_timeout;` then `set_timeout(..)`.
+            if !self.fns.contains_key(name.text().to_string().as_str())
+                && let Some(t) = self.js_bound_call(c, &[&*name.text().to_string()], &args)
+            {
+                return t;
+            }
             return self.call_fn(c, name.text().to_string().as_str(), &path, &args);
         }
 
@@ -3149,12 +3277,40 @@ impl<'a> Checker<'a> {
             }
             return Ty::Unknown;
         }
+        // `TokenStream::from_iter(tokens)`
+        if let [.., ty, f] = names.as_slice()
+            && ty == "TokenStream"
+            && f == "from_iter"
+            && self.adts.method("TokenStream", "__push").is_some()
+        {
+            self.arg_count(c.syntax(), "function", 1, args.len());
+            if let Some(a) = args.first() {
+                let at = self.infer(a, None);
+                self.require_tokens(a.syntax(), &at);
+            }
+            return Ty::Adt("TokenStream".into(), vec![]);
+        }
         if let Some(t) = self.adt_call(c, &names, &args) {
             return t;
         }
         {
             let ns: Vec<&str> = names.iter().map(String::as_str).collect();
             if let Some(t) = self.coll_call(c, &ns, &args) {
+                return t;
+            }
+            let tail = match ns.as_slice() {
+                ["std" | "core", rest @ ..] => rest,
+                all => all,
+            };
+            if let Some(t) = self.ptr_call(c, tail, &args, expected) {
+                return t;
+            }
+            // `JSON::parse::<T>(s)` (the `js` crate), and its bound functions (`Date::now()`,
+            // `js::set_timeout(..)`).
+            if let Some(t) = self.js_call(c, tail, &args, expected) {
+                return t;
+            }
+            if let Some(t) = self.js_bound_call(c, &ns, &args) {
                 return t;
             }
             if let Some(t) = self.std_call(c, &ns, &args) {
@@ -3354,6 +3510,29 @@ impl<'a> Checker<'a> {
             loose(self);
             return Ty::Unknown;
         };
+        if sig.is_static {
+            let msg = format!(
+                "`{method}` is an associated function of `{name}`, not a method: call `{name}::{method}(..)`"
+            );
+            self.error(m.syntax(), msg);
+        }
+        let label = format!("{name}::{method}");
+        self.extern_args(m.syntax(), &label, sig, args);
+        if sig.is_async {
+            Ty::Future(Box::new(sig.ret.clone()))
+        } else {
+            sig.ret.clone()
+        }
+    }
+
+    /// The arguments of a bound JS function or method (`label` names it in messages).
+    pub(super) fn extern_args(
+        &mut self,
+        node: &SyntaxNode,
+        label: &str,
+        sig: &bindings::Method,
+        args: &[ast::Expr],
+    ) {
         let required = sig.params.iter().filter(|p| !p.optional).count();
         let max = if sig.variadic.is_some() {
             usize::MAX
@@ -3368,10 +3547,11 @@ impl<'a> Checker<'a> {
                 (r, m) => format!("{r} to {m} arguments"),
             };
             self.error(
-                m.syntax(),
+                node,
                 format!(
-                    "`{name}::{method}` takes {range} but {} were supplied",
-                    args.len()
+                    "`{label}` takes {range} but {} {} supplied",
+                    args.len(),
+                    if args.len() == 1 { "was" } else { "were" }
                 ),
             );
         }
@@ -3389,11 +3569,6 @@ impl<'a> Checker<'a> {
             } else {
                 self.check(a, &ty);
             }
-        }
-        if sig.is_async {
-            Ty::Future(Box::new(sig.ret.clone()))
-        } else {
-            sig.ret.clone()
         }
     }
 
@@ -3578,8 +3753,14 @@ impl<'a> Checker<'a> {
 
     /// An argument for a `&mut i32`-style parameter: `&mut n`, or a `&mut` parameter passed on.
     pub(super) fn cell_arg(&mut self, a: &ast::Expr) {
+        // A raw pointer argument (`&x as *const i32`, `ptr::null_mut()`, a pointer local).
+        if self.is_ptr(a) {
+            self.ptr_cell(a);
+            return;
+        }
         match strip_parens(a) {
-            ast::Expr::RefExpr(r) if r.mut_token().is_some() => {
+            // (`&x` for a `*const i32` parameter too.)
+            ast::Expr::RefExpr(r) => {
                 let Some(inner) = r.expr() else { return };
                 match strip_parens(&inner) {
                     ast::Expr::PathExpr(_) => self.box_if_needed(&inner),
@@ -3675,6 +3856,9 @@ impl<'a> Checker<'a> {
         };
         let method = name.text().to_string();
         let args: Vec<ast::Expr> = m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+        if let Some(t) = self.ptr_method(m, &recv, &method, &args) {
+            return t;
+        }
         // `(lo..hi).contains(&x)`
         if method == "contains"
             && let ast::Expr::RangeExpr(r) = strip_parens(&recv)
@@ -3693,6 +3877,12 @@ impl<'a> Checker<'a> {
             return Ty::Bool;
         }
         let mut rt = self.infer(&recv, None);
+        // `stream.extend(tokens)` in a proc-macro crate: a token stream or any iterable of tokens.
+        if method == "extend"
+            && let Some(t) = self.token_extend(m, &recv, &rt, &args)
+        {
+            return t;
+        }
         // `stack.push(1)` through `impl Deref`: a method the type itself doesn't have.
         if let Some((n, target)) = self.deref_target(&rt)
             && self.adts.method(&n, &method).is_none()
@@ -4014,6 +4204,8 @@ impl<'a> Checker<'a> {
                     }
                     "contains" => sig(self, &[elem], Ty::Bool),
                     "extend_from_slice" => sig(self, &[Ty::Vec(Box::new(elem))], Ty::Unit),
+                    // `[[1, 2], [3]].concat()`: the inner Vecs one after another.
+                    "concat" if matches!(self.shallow(&elem), Ty::Vec(_)) => sig(self, &[], elem),
                     "join" | "concat" => {
                         if !self.unify(&elem, &Ty::Str) {
                             let msg = format!(
@@ -4079,6 +4271,8 @@ impl<'a> Checker<'a> {
                 let inner = (**inner).clone();
                 match m2 {
                     "is_some" | "is_none" => sig(self, &[], Ty::Bool),
+                    // `weak.upgrade()` (a `Weak<T>` is an `Option<T>` here)
+                    "upgrade" => sig(self, &[], Ty::Option(Box::new(inner))),
                     "unwrap" => sig(self, &[], inner),
                     "expect" => sig(self, &[Ty::Str], inner),
                     "unwrap_or" => sig(self, &[inner.clone()], inner),
@@ -4584,8 +4778,33 @@ impl<'a> Checker<'a> {
             }
             return Ty::Vec(Box::new(elem));
         }
+        if matches!(name.as_str(), "quote" | "quote_spanned") {
+            return self.quote_macro(mc);
+        }
+        // `compile_error!("..")` (a proc macro's `Error::to_compile_error()`): the message.
+        if name == "compile_error" {
+            let args = macros::split_args(self.src, self.base, mc);
+            let msg = args
+                .first()
+                .and_then(macros::format_string)
+                .unwrap_or_else(|| "compile_error! invoked".into());
+            self.error(mc.syntax(), msg);
+            return Ty::Never;
+        }
         let args = macros::split_args(self.src, self.base, mc);
         match name.as_str() {
+            // `format_ident!("get_{}", name)`: an `Ident` (in a proc-macro crate).
+            "format_ident" if self.adts.defs.contains_key("Ident") => {
+                // (`span = ..` places the identifier; spans aren't tracked.)
+                let args: Vec<_> = args
+                    .into_iter()
+                    .filter(|a| a.name.as_deref() != Some("span"))
+                    .collect();
+                if !args.is_empty() {
+                    self.format_args(&args);
+                }
+                Ty::Adt("Ident".into(), vec![])
+            }
             "println" | "print" | "eprintln" | "eprint" | "format" | "panic" | "unreachable"
             | "todo" | "unimplemented" => {
                 if !args.is_empty() {
@@ -4803,7 +5022,18 @@ impl<'a> Checker<'a> {
                 Ty::Dyn(tr) => {
                     !self.trait_includes(tr, if spec.debug { "Debug" } else { "Display" })
                 }
-                Ty::Extern(n) if is_std_error(n) => false,
+                // (A JS type prints with `{}` when it declares `to_string`: `Date`, `Url`, ..)
+                Ty::Extern(n)
+                    if is_std_error(n)
+                        || (bindings::is_js_type(n)
+                            && self
+                                .bindings
+                                .types
+                                .get(n)
+                                .is_some_and(|t| t.methods.contains_key("to_string"))) =>
+                {
+                    false
+                }
                 Ty::Adt(n, _) => match self.adts.defs.get(n) {
                     Some(d) if spec.debug => !d.implements("Debug"),
                     Some(d) => !d.display,
@@ -5151,12 +5381,17 @@ fn names_std_error(t: &ast::Type) -> bool {
 /// For `impl Iterator<Item = T>` / `dyn Iterator<..>`: `Some(Some(T))`, or `Some(None)` without an
 /// `Item`; `None` for other types.
 fn iterator_item(t: &ast::Type) -> Option<Option<ast::Type>> {
-    use ra_ap_syntax::ast::HasGenericArgs;
     let list = match t {
         ast::Type::ImplTraitType(i) => i.type_bound_list()?,
         ast::Type::DynTraitType(d) => d.type_bound_list()?,
         _ => return None,
     };
+    bounds_iterator_item(&list)
+}
+
+/// `iterator_item` of a bound list (`I: Iterator<Item = T>`).
+pub(super) fn bounds_iterator_item(list: &ast::TypeBoundList) -> Option<Option<ast::Type>> {
+    use ra_ap_syntax::ast::HasGenericArgs;
     list.bounds().find_map(|b| match b.ty()? {
         ast::Type::PathType(p) => {
             let seg = p.path()?.segment()?;
@@ -5458,13 +5693,22 @@ impl Checker<'_> {
         if param == "Self" {
             return;
         }
-        match self.cur_fn.clone() {
+        // A free function's type parameter, or a method's own (`fn parse<T: Parse>(&self)`);
+        // an `impl<T>`'s would need the class per value.
+        let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
+            Some((ty, m)) => self
+                .adts
+                .method(ty, m)
+                .is_some_and(|s| s.dict_names().iter().any(|p| p == param)),
+            None => true,
+        });
+        match own {
             Some(f) => {
                 self.dict_uses.insert((f, param.to_string()));
             }
             None => self.error(
                 node,
-                format!("`{param}::..` on a type parameter of a method isn't supported yet (it works in free functions)"),
+                format!("`{param}::..` on a type parameter of an `impl` isn't supported yet in methods with `self` (it works on a function's or method's own type parameters, and in associated functions)"),
             ),
         }
     }
@@ -5521,10 +5765,19 @@ impl Checker<'_> {
         let mut needs: std::collections::HashSet<(String, String)> =
             std::mem::take(&mut self.dict_uses);
         let param_names = |c: &Self, f: &str| -> Vec<String> {
-            c.fns
-                .get(f)
-                .map(|s| s.type_params.iter().map(|(n, _)| n.clone()).collect())
-                .unwrap_or_default()
+            match f.split_once("::") {
+                // A method: `Type::name`.
+                Some((ty, m)) => c
+                    .adts
+                    .method(ty, m)
+                    .map(|s| s.dict_names())
+                    .unwrap_or_default(),
+                None => c
+                    .fns
+                    .get(f)
+                    .map(|s| s.type_params.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default(),
+            }
         };
         loop {
             let mut grew = false;

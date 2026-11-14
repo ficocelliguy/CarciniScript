@@ -23,6 +23,8 @@ import {
 import "../runtime/rt.js";
 import { nativePanic } from "../tools/native-panic.mjs";
 
+// `js::Date`'s local time is UTC in the tests (the native shim has no time zones).
+process.env.TZ = "UTC";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const outDir = path.join(here, "out");
 fs.mkdirSync(outDir, { recursive: true });
@@ -149,6 +151,129 @@ for (const dir of fs.readdirSync(path.join(here, "modules"))) {
     if (js.stdout !== native.stdout || js.code !== native.code) {
       fail(name, `rustc:\n${native.stdout}\njs:\n${js.stdout}`);
     } else pass(name);
+  } catch (e) {
+    fail(name, e.message);
+  }
+}
+
+// --- proc macros: test/procmacro/<name>/main.rs plus proc-macro crates (`<crate>.rs`, the files
+// with `#[proc_macro..]` functions). Natively each crate is a `proc-macro = true` crate of a
+// cargo workspace; the build directory is shared between cases.
+for (const dir of fs.readdirSync(path.join(here, "procmacro"))) {
+  const root = path.join(here, "procmacro", dir);
+  const name = `procmacro ${dir}`;
+  try {
+    const read = (p) => {
+      try {
+        return fs.readFileSync(path.join(root, p), "utf8");
+      } catch {
+        return undefined;
+      }
+    };
+    const out = compile(read("main.rs"), "main.rs", read);
+    const errors = out.diagnostics.filter((d) => d.severity === "error");
+    if (errors.length) throw new Error(errors.map((d) => `main.rs:${d.line}:${d.column}: ${d.message}`).join("\n"));
+    const jsPath = path.join(outDir, `procmacro-${dir}.mjs`);
+    fs.writeFileSync(jsPath, out.code);
+    const js = await runJs(jsPath);
+    // The cargo workspace.
+    const ws = path.join(outDir, `procmacro-${dir}`);
+    const crates = fs.readdirSync(root).filter((f) => f !== "main.rs" && /#\[proc_macro/.test(read(f)));
+    fs.rmSync(ws, { recursive: true, force: true });
+    fs.mkdirSync(path.join(ws, "app", "src"), { recursive: true });
+    const members = ["app"];
+    const deps = [];
+    for (const f of crates) {
+      const c = path.basename(f, ".rs");
+      members.push(c);
+      deps.push(`${c} = { path = "../${c}" }`);
+      fs.mkdirSync(path.join(ws, c, "src"), { recursive: true });
+      // The `quote` crate (and `proc_macro2`) when the macros use them: from cargo's cache.
+      const text = read(f);
+      const crateDeps = [
+        /\bquote\b/.test(text) ? 'quote = "1"' : "",
+        /\bproc_macro2\b/.test(text) ? 'proc-macro2 = "1"' : "",
+        /\bsyn\b/.test(text) ? 'syn = { version = "2", features = ["full"] }' : "",
+      ].filter(Boolean);
+      fs.writeFileSync(
+        path.join(ws, c, "Cargo.toml"),
+        `[package]\nname = "${c}"\nversion = "0.1.0"\nedition = "2024"\n[lib]\nproc-macro = true\n[dependencies]\n${crateDeps.join("\n")}\n`,
+      );
+      fs.copyFileSync(path.join(root, f), path.join(ws, c, "src", "lib.rs"));
+    }
+    fs.writeFileSync(path.join(ws, "Cargo.toml"), `[workspace]\nmembers = ${JSON.stringify(members)}\nresolver = "2"\n`);
+    fs.writeFileSync(path.join(ws, "app", "Cargo.toml"), `[package]\nname = "app_${dir}"\nversion = "0.1.0"\nedition = "2024"\n[dependencies]\n${deps.join("\n")}\n`);
+    fs.copyFileSync(path.join(root, "main.rs"), path.join(ws, "app", "src", "main.rs"));
+    const r = spawnSync("cargo", ["run", "-q", "--offline", "-p", `app_${dir}`, "--target-dir", path.join(outDir, `procmacro-target-${dir}`)], {
+      cwd: ws,
+      encoding: "utf8",
+    });
+    // (101 is also cargo's exit code for a build error: only a panic message makes it a run.)
+    if (r.status !== 0 && !(r.status === 101 && r.stderr.includes("panicked at"))) {
+      throw new Error(`cargo failed:\n${r.stderr}`);
+    }
+    const nativeStdout = r.stdout.replace(/\r\n/g, "\n");
+    if (js.stdout !== nativeStdout || js.code !== r.status) {
+      fail(name, `cargo:\n${nativeStdout}\njs:\n${js.stdout}`);
+    } else pass(name);
+  } catch (e) {
+    fail(name, e.message);
+  }
+}
+
+// --- JS globals: test/js/*.rs use the built-in `js` crate (`Date`, `JSON`). Natively that's
+// test/js/shim (serde_json, a UTC `Date`), in one cargo workspace with each test as a binary.
+{
+  const programs = fs.readdirSync(path.join(here, "js")).filter((f) => f.endsWith(".rs"));
+  const ws = path.join(outDir, "js-ws");
+  fs.mkdirSync(path.join(ws, "js", "src"), { recursive: true });
+  fs.mkdirSync(path.join(ws, "app", "src", "bin"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "Cargo.toml"), `[workspace]\nmembers = ["js", "app"]\nresolver = "2"\n`);
+  fs.writeFileSync(
+    path.join(ws, "js", "Cargo.toml"),
+    `[package]\nname = "js"\nversion = "0.1.0"\nedition = "2024"\n[dependencies]\nserde = "1"\nserde_json = "1"\n`,
+  );
+  fs.copyFileSync(path.join(here, "js", "shim", "lib.rs"), path.join(ws, "js", "src", "lib.rs"));
+  fs.writeFileSync(
+    path.join(ws, "app", "Cargo.toml"),
+    `[package]\nname = "app"\nversion = "0.1.0"\nedition = "2024"\n[dependencies]\njs = { path = "../js" }\nserde = { version = "1", features = ["derive"] }\n`,
+  );
+  for (const f of programs) fs.copyFileSync(path.join(here, "js", f), path.join(ws, "app", "src", "bin", f));
+  for (const f of programs) {
+    const name = `js ${f}`;
+    try {
+      const out = compile(fs.readFileSync(path.join(here, "js", f), "utf8"), f);
+      if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+      const jsPath = path.join(outDir, `js-${f.replace(/\.rs$/, ".mjs")}`);
+      fs.writeFileSync(jsPath, out.code);
+      const js = await runJs(jsPath);
+      const r = spawnSync("cargo", ["run", "-q", "--offline", "--bin", path.basename(f, ".rs")], { cwd: ws, encoding: "utf8" });
+      if (r.status !== 0 && !(r.status === 101 && r.stderr.includes("panicked at"))) {
+        throw new Error(`cargo failed:\n${r.stderr}`);
+      }
+      const nativeStdout = r.stdout.replace(/\r\n/g, "\n");
+      if (js.stdout !== nativeStdout || js.code !== r.status) {
+        fail(name, `cargo:\n${nativeStdout}\njs:\n${js.stdout}`);
+      } else pass(name);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+}
+
+// --- JS globals with no native counterpart (timers, URLs, crypto): test/js-node/*.rs under
+// Node, against the expected output in the matching .out file.
+for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsWith(".rs"))) {
+  const name = `js-node ${f}`;
+  try {
+    const out = compile(fs.readFileSync(path.join(here, "js-node", f), "utf8"), f);
+    if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+    const jsPath = path.join(outDir, `js-node-${f.replace(/\.rs$/, ".mjs")}`);
+    fs.writeFileSync(jsPath, out.code);
+    const js = await runJs(jsPath);
+    const want = fs.readFileSync(path.join(here, "js-node", f.replace(/\.rs$/, ".out")), "utf8").replace(/\r\n/g, "\n");
+    if (js.stdout !== want || js.code !== 0) fail(name, `want:\n${want}\ngot (exit ${js.code}):\n${js.stdout}${js.panic ?? ""}`);
+    else pass(name);
   } catch (e) {
     fail(name, e.message);
   }
@@ -468,7 +593,7 @@ const rejected = [
   ["generic call with an unimplemented user trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn g<X: T>(x: X) -> i32 { x.a() }\nfn f() {\n    g(5);", "7:5 the trait bound `i32: T` is not satisfied"],
   ["unknown method on dyn Trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } }\nfn f() {\n    let d: Box<dyn T> = Box::new(S);\n    d.c();", "8:5 no method named `c` found for `dyn T`"],
   ["Box<dyn Trait> of a type without the impl", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn f() {\n    let d: Box<dyn T> = Box::new(S);", "6:34 the trait bound `S: T` is not satisfied"],
-  ["`T::make()` on a method's type parameter", "}\ntrait M { fn make() -> Self; }\nstruct S;\nimpl S {\n    fn g<T: M>(&self) -> T {\n        T::make()\n    }\n}\nfn f() {", "7:9 `T::..` on a type parameter of a method isn't supported yet"],
+  ["`T::make()` on an impl's type parameter", "}\ntrait M { fn make() -> Self; }\nstruct S<T> { t: T }\nimpl<T: M> S<T> {\n    fn g(&self) -> T {\n        T::make()\n    }\n}\nfn f() {", "7:9 `T::..` on a type parameter of an `impl` isn't supported yet"],
   ["calling a function the bound doesn't have", "}\ntrait M { fn make() -> Self; }\nfn g<T: M>() -> T {\n    T::build()\n}\nfn f() {", "5:5 no function or associated item named `build` found for type parameter `T`"],
   ["non-exhaustive slice match names the missing length", "let v = vec![1];\n    match v.as_slice() { [] => {}, [x] => {} }", "3:11 non-exhaustive patterns: `[_, _, ..]` not covered"],
   ["break with a value from a while loop", "while true { break 5; }", "2:18 `break` with value from a `while` or `for` loop"],
@@ -541,6 +666,29 @@ const rejected = [
   ["a missing item named inside a macro", "}\nmod geo {\n    pub const UNIT: &str = \"m\";\n}\nfn f() {\n    println!(\"{}\", geo::UNITS);", "7:20 cannot find `UNITS` in module `geo`"],
   ["reaching into a private nested module", "}\nmod a {\n    mod b {\n        pub fn f() {}\n    }\n}\nfn g() {\n    a::b::f();", "9:5 module `b` is private"],
   ["a `super::` path to a missing item", "}\nmod a {\n    pub mod b {\n        pub fn f() -> i32 {\n            super::missing()\n        }\n    }\n}\nfn g() {", "6:13 cannot find `missing` in module `a`"],
+  ["pointer arithmetic", "let v = [1, 2];\n    let p: *const i32 = &v[0];\n    let q = unsafe { p.add(1) };", "4:22 `add()` on a raw pointer isn't supported"],
+  ["JSON of a closure", "let f = |x: i32| x + 1;\n    let s = js::JSON::stringify(&f);", "3:33 the trait bound `impl Fn(i32) -> i32: Serialize` is not satisfied"],
+  ["JSON::parse without a target type", "let v = js::JSON::parse(\"1\");", "2:13 type annotations needed: say what to parse into"],
+  ["a misspelled Date method", "let d = js::Date::new();\n    let h = d.get_hour();", "3:13 no method named `get_hour` found for `Date`; did you mean `get_hours`?"],
+  ["Date::utc with too few arguments", "let t = js::Date::utc(2024);", "2:13 `Date::utc` takes 2 to 7 arguments but 1 was supplied"],
+  ["a misspelled js associated function", "let t = js::Date::pars(\"x\");", "2:13 no function or associated item named `pars` found for `Date`; did you mean `parse`?"],
+  ["a js method called as an associated function", "let t = js::Date::get_time();", "2:13 `Date::get_time` is a method: call it on a value (`x.get_time(..)`)"],
+  ["a js associated function called as a method", "let d = js::Date::new();\n    let t = d.now();", "3:13 `now` is an associated function of `Date`, not a method: call `Date::now(..)`"],
+  ["a js function with no arguments", "let s = js::btoa();", "2:13 `js::btoa` takes 1 argument but 0 were supplied"],
+  ["a js function given the wrong type", "let s = js::btoa(5);", "2:22 mismatched types"],
+  ["a timer handler that isn't a closure", "js::set_timeout(5, 10.0);", "2:21 mismatched types"],
+  ["Promise::all of plain values", "let x = js::Promise::all(vec![1, 2]);", "2:30 `Promise::all` takes a `Vec` of futures (unawaited async calls), found `Vec<{integer}>`"],
+  ["a js function that isn't imported", "let s = btoa(\"a\");", "2:13 cannot find function `btoa` in this scope"],
+  ["structured_clone of a type without Clone", "}\nstruct P {\n    x: i32,\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = js::structured_clone(&p);", "8:34 the trait bound `P: Clone` is not satisfied (`structured_clone` copies Rust values by their `Clone`)"],
+  ["a pointer cast to an integer", "let x = 1;\n    let p = &x as *const i32;\n    let a = p as usize;", "4:13 casting a raw pointer to an integer isn't supported"],
+  ["an integer cast to a pointer", "let p = 0x1000 as *const i32;", "2:13 casting an integer to a raw pointer isn't supported"],
+  ["transmute between sizes", "let x: u64 = unsafe { std::mem::transmute(1u32) };", "2:27 cannot transmute between types of different sizes"],
+  ["transmute of a Vec", "let x: u64 = unsafe { std::mem::transmute(vec![1u8]) };", "2:27 `transmute` from `Vec<u8>` to `u64` isn't supported"],
+  ["a pointer to a number in a struct", "}\nstruct S {\n    p: *mut i32,\n}\nfn g() {", "4:8 a raw pointer to a number, string or bool in a struct isn't supported yet"],
+  ["reference counts", "let r = std::rc::Rc::new(1);\n    let n = std::rc::Rc::strong_count(&r);","3:13 `Rc::strong_count` isn't supported"],
+  ["a mismatch inside `u32::pow(..)`", "let x = u32::pow(2, \"a\");", "2:25 mismatched types: expected `u32`, found `String`"],
+  ["unzip of non-pairs","let v: (Vec<i32>, Vec<i32>) = vec![1, 2].into_iter().unzip();", "2:35 `unzip` needs an iterator of pairs"],
+  ["returning a pointer to a number", "}\nfn g(p: *mut i32) -> *mut i32 {\n    p", "3:22 returning a raw pointer to a number, string or bool isn't supported yet"],
 ];
 for (const [label, body, want] of rejected) {
   const name = `rejects: ${label}`;
@@ -560,6 +708,92 @@ const rejectedFiles = [
     "2:5 unresolved import `geo::shapes::nope` (it doesn't exist or isn't `pub`)",
   ],
   ["module file not found", { "main.rs": "mod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `nope.rs` and `nope/mod.rs`)"],
+  [
+    "a proc macro that panics",
+    {
+      "main.rs": "fn main() {\n    let x = mac::boom!(1 2);\n}",
+      "mac.rs": "use proc_macro::TokenStream;\n#[proc_macro]\npub fn boom(input: TokenStream) -> TokenStream {\n    panic!(\"can't use {}\", input)\n}",
+    },
+    "2:13 proc macro panicked: can't use 1 2",
+  ],
+  [
+    "a Vec spliced outside a `quote!` repetition",
+    {
+      "mac.rs": "use proc_macro::TokenStream;\nuse quote::quote;\n#[proc_macro]\npub fn m(input: TokenStream) -> TokenStream {\n    let v = vec![1, 2];\n    quote!(#v).into()\n}",
+    },
+    "6:13 the trait bound `Vec<{integer}>: ToTokens` is not satisfied",
+  ],
+  [
+    "a `quote!` repetition over a number",
+    {
+      "mac.rs": "use proc_macro::TokenStream;\nuse quote::quote;\n#[proc_macro]\npub fn m(input: TokenStream) -> TokenStream {\n    let n = 3;\n    quote!(#(#n),*).into()\n}",
+    },
+    "6:15 `#(..)*` needs a collection or iterator to repeat over, and `n` is `{integer}`",
+  ],
+  [
+    "an unknown variable in `quote!`",
+    {
+      "mac.rs": "use proc_macro::TokenStream;\nuse quote::quote;\n#[proc_macro]\npub fn m(input: TokenStream) -> TokenStream {\n    quote!(fn #name() {}).into()\n}",
+    },
+    "5:16 cannot find value `name` in this scope",
+  ],
+  ["`quote!` outside a proc-macro crate", { "main.rs": "fn main() {\n    let t = quote!(x);\n}" }, "2:13 `quote!` works in proc-macro crates"],
+  [
+    "a `syn::Error` from a derive",
+    {
+      "main.rs": "use mac::OnlyStructs;\n#[derive(OnlyStructs)]\nenum E { A }\nfn main() {}",
+      "mac.rs": "use proc_macro::TokenStream;\nuse syn::{parse_macro_input, Data, DeriveInput};\n#[proc_macro_derive(OnlyStructs)]\npub fn only(input: TokenStream) -> TokenStream {\n    let input = parse_macro_input!(input as DeriveInput);\n    match input.data {\n        Data::Struct(_) => TokenStream::new(),\n        _ => syn::Error::new(input.ident.span(), \"OnlyStructs needs a struct\").to_compile_error().into(),\n    }\n}",
+    },
+    "2:1 OnlyStructs needs a struct",
+  ],
+  [
+    "a `parse_macro_input!` failure",
+    {
+      "main.rs": "use mac::label;\n#[label(42)]\nfn f() {}\nfn main() {}",
+      "mac.rs": "use proc_macro::TokenStream;\nuse syn::{parse_macro_input, LitStr};\n#[proc_macro_attribute]\npub fn label(attr: TokenStream, item: TokenStream) -> TokenStream {\n    let _l = parse_macro_input!(attr as LitStr);\n    item\n}",
+    },
+    "2:1 expected string literal, found `42`",
+  ],
+  [
+    "a `lookahead1` error from a custom parser",
+    {
+      "main.rs": "use mac::pick;\nfn main() {\n    let x = pick!(;);\n}",
+      "mac.rs": "use proc_macro::TokenStream;\nuse syn::parse::{Parse, ParseStream};\nuse syn::{parse_macro_input, Ident, LitInt, Result, Token};\nstruct Pick;\nimpl Parse for Pick {\n    fn parse(input: ParseStream) -> Result<Self> {\n        let la = input.lookahead1();\n        if la.peek(Ident) || la.peek(LitInt) || la.peek(Token![-]) {\n            Ok(Pick)\n        } else {\n            Err(la.error())\n        }\n    }\n}\n#[proc_macro]\npub fn pick(input: TokenStream) -> TokenStream {\n    let _p = parse_macro_input!(input as Pick);\n    TokenStream::new()\n}",
+    },
+    "3:13 expected one of: identifier, integer literal, `-`",
+  ],
+  [
+    "a missing `Token![=]`",
+    {
+      "main.rs": "use mac::assign;\nfn main() {\n    assign!(x 1);\n}",
+      "mac.rs": "use proc_macro::TokenStream;\nuse syn::{parse::ParseStream, parse_macro_input, Ident, LitInt, Result, Token};\nfn parse(input: ParseStream) -> Result<(Ident, LitInt)> {\n    let name: Ident = input.parse()?;\n    input.parse::<Token![=]>()?;\n    Ok((name, input.parse()?))\n}\n#[proc_macro]\npub fn assign(input: TokenStream) -> TokenStream {\n    let _a = parse_macro_input!(input with parse);\n    TokenStream::new()\n}",
+    },
+    "3:5 expected `=`, found `1`",
+  ],
+  [
+    "a proc macro that never finishes",
+    {
+      "main.rs": "use mac::spin;\nfn main() {\n    spin!();\n}",
+      "mac.rs": "use proc_macro::TokenStream;\n#[proc_macro]\npub fn spin(input: TokenStream) -> TokenStream {\n    let mut n = 0u64;\n    loop {\n        n += 1;\n    }\n}",
+    },
+    "3:5 the proc macro ran too long",
+  ],
+  [
+    "a proc macro crate that doesn't compile",
+    {
+      "main.rs": "use mac::Nothing;\n#[derive(Nothing)]\nstruct S;\nfn main() {}",
+      "mac.rs": "use proc_macro::TokenStream;\n#[proc_macro_derive(Nothing)]\npub fn nothing(input: TokenStream) -> TokenStream {\n    let n: i32 = \"x\";\n    TokenStream::new()\n}",
+    },
+    "2:1 the proc macro crate doesn't compile: mac.rs:4:18: mismatched types",
+  ],
+  [
+    "a type error in a proc macro's output",
+    {
+      "main.rs": "use mac::make;\nfn main() {\n    let n: i32 = make!();\n}",
+      "mac.rs": "use proc_macro::TokenStream;\n#[proc_macro]\npub fn make(_input: TokenStream) -> TokenStream {\n    \"\\\"text\\\"\".parse().unwrap()\n}",
+    },
+    "3:18 mismatched types: expected `i32`, found `String`",
+  ],
   [
     "importing a private function",
     { "main.rs": "mod u;\nuse u::secret;\nfn main() {}", "u.rs": "fn secret() {}" },

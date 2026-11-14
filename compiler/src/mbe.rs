@@ -570,10 +570,16 @@ impl Matcher<'_> {
                         break;
                     }
                     let t = toks[end].text();
-                    if generic {
+                    // An expression's turbofish (`parse::<Map<K, V>>()`) holds commas too.
+                    let prev = |k: usize| end.checked_sub(k).and_then(|j| toks[j].text());
+                    let turbofish =
+                        prev(1) == Some("::") || (prev(1) == Some(":") && prev(2) == Some(":"));
+                    if generic || angle > 0 || (t == Some("<") && turbofish) {
                         match t {
                             Some("<") => angle += 1,
-                            Some(">") if angle > 0 => angle -= 1,
+                            Some(">") if angle > 0 && !matches!(prev(1), Some("-") | Some("=")) => {
+                                angle -= 1
+                            }
                             _ => {}
                         }
                     }
@@ -945,10 +951,14 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
 
 /// Expand every `macro_rules!` macro in `src`. Errors are (start, end, message) at original
 /// offsets.
-pub fn expand(src: &str) -> Result<Option<Expansion>, Vec<(usize, usize, String)>> {
+/// `expand` on text already rewritten by earlier passes, whose `map` leads back to the source.
+fn expand_with(
+    src: &str,
+    map: OffsetMap,
+) -> Result<Option<Expansion>, Vec<(usize, usize, String)>> {
+    let mut map = map;
     let mut expansions = 0usize;
     let mut text = src.to_string();
-    let mut map = OffsetMap::identity(src.len());
     let mut rounds = 0;
     let mut changed = false;
     loop {
@@ -1048,7 +1058,7 @@ pub struct Preprocessed {
 
 /// `None` when `src` needs neither step.
 pub fn preprocess(src: &str) -> Result<Option<Preprocessed>, Vec<(usize, usize, String)>> {
-    preprocess_with(src, "")
+    preprocess_with(src, "", None)
 }
 
 /// `preprocess`, with `macros` (definitions from other files, see `imported_macros`) usable too.
@@ -1056,6 +1066,7 @@ pub fn preprocess(src: &str) -> Result<Option<Preprocessed>, Vec<(usize, usize, 
 pub fn preprocess_with(
     src: &str,
     macros: &str,
+    procs: Option<(&str, crate::typeck::Resolver)>,
 ) -> Result<Option<Preprocessed>, Vec<(usize, usize, String)>> {
     let full = if macros.is_empty() {
         src.to_string()
@@ -1065,8 +1076,12 @@ pub fn preprocess_with(
     let mut text = full.clone();
     let mut map = OffsetMap::identity(full.len());
     let mut changed = false;
-    if full.contains("macro_rules!")
-        && let Some(e) = expand(&full)?
+    // Proc macros first: their output may define or use `macro_rules!` macros.
+    if let Some((filename, resolver)) = procs {
+        changed |= crate::procmacro::expand(&mut text, &mut map, filename, resolver)?;
+    }
+    if text.contains("macro_rules!")
+        && let Some(e) = expand_with(&text, map.clone())?
     {
         text = e.text;
         map = e.map;
@@ -1093,6 +1108,9 @@ pub fn preprocess_with(
     if crate::alias::has_aliases(&text) {
         crate::alias::expand(&mut text, &mut map);
         changed = true;
+    }
+    if crate::ufcs::has_prim_paths(&text) {
+        changed |= crate::ufcs::expand(&mut text, &mut map);
     }
     Ok(changed.then_some(Preprocessed { text, map, names }))
 }

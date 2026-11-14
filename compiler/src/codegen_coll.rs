@@ -7,7 +7,7 @@ use ra_ap_syntax::{
     ast::{self, HasArgList},
 };
 
-use super::{Codegen, Frag};
+use super::{Codegen, Frag, strip_parens_expr};
 use crate::ty::{Coll, Ty};
 
 impl Codegen<'_> {
@@ -67,6 +67,9 @@ impl Codegen<'_> {
                 Coll::BTreeMap,
                 "first_key_value" | "last_key_value" | "pop_first" | "pop_last" | "append",
             ) => method,
+            (Coll::BTreeMap | Coll::BTreeSet, "range") => {
+                return Some(self.emit_btree_range(m, &rf));
+            }
             _ => return None,
         };
         let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
@@ -137,6 +140,34 @@ impl Codegen<'_> {
         };
         let start = self.off(m.syntax());
         Some((f.at(start), ty))
+    }
+}
+
+impl Codegen<'_> {
+    /// `map.range(lo..hi)` → `map.$range(lo, hi, inclusive)` (`undefined` for an open end).
+    fn emit_btree_range(&mut self, m: &ast::MethodCallExpr, rf: &Frag) -> (Frag, Ty) {
+        use ra_ap_syntax::ast::RangeItem;
+        let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+        let range = m.arg_list().and_then(|l| l.args().next());
+        let Some(ast::Expr::RangeExpr(r)) = range.map(|e| strip_parens_expr(&e)) else {
+            return (Frag::text("undefined"), ty);
+        };
+        let mut bound = |b: Option<ast::Expr>| match b {
+            Some(b) => {
+                let (f, t) = self.emit_expr(&b, None);
+                self.by_value(&b, f, &t)
+            }
+            None => Frag::text("undefined"),
+        };
+        let (lo, hi) = (bound(r.start()), bound(r.end()));
+        let inclusive = r.op_kind() == Some(ast::RangeOp::Inclusive);
+        let mut f = rf.clone();
+        f.push(".$range(")
+            .append(lo)
+            .push(", ")
+            .append(hi)
+            .push(format!(", {inclusive})"));
+        (f.at(self.off(m.syntax())), ty)
     }
 }
 

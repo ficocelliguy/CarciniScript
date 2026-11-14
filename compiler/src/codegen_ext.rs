@@ -56,11 +56,17 @@ impl Codegen<'_> {
                     {
                         let n = ip.name().unwrap();
                         let name = cg.fresh(n.text());
+                        // (`scan`'s state over a number: the closure gets a cell.)
+                        let access = if cg.is_boxed(n.syntax()) {
+                            format!("{name}[0]")
+                        } else {
+                            name.clone()
+                        };
                         cg.declare(
                             n.text(),
                             Some(n.syntax()),
                             Local {
-                                js: name.clone(),
+                                js: access,
                                 ty: Ty::Unknown,
                             },
                         );
@@ -321,6 +327,34 @@ impl Codegen<'_> {
                 f.append(rf.clone()).push(", ").append(s).push(", false)");
                 return Some((f, result_ty.clone()));
             }
+            (Ty::Formatter, "pad" | "__pad_whole") => {
+                let s = self.fn_arg(m.arg_list().and_then(|a| a.args().next()));
+                let mut f = Frag::text("κσ.$fmtPad(");
+                f.append(rf.clone()).push(", ").append(s);
+                f.push(if method == "pad" {
+                    ", true)"
+                } else {
+                    ", false)"
+                });
+                return Some((f, result_ty.clone()));
+            }
+            // The spec (`f.o`, absent without one).
+            (Ty::Formatter, spec) => {
+                let (field, default) = match spec {
+                    "width" => ("w", "null"),
+                    "precision" => ("p", "null"),
+                    "fill" => ("fill", "\" \""),
+                    "sign_plus" => ("plus", "false"),
+                    "alternate" => ("alt", "false"),
+                    "sign_aware_zero_pad" => ("zero", "false"),
+                    "sign_minus" => return Some((Frag::text("false"), Ty::Bool)),
+                    _ => return None,
+                };
+                let mut f = Frag::text("(");
+                f.append(rf.clone())
+                    .push(format!(".o?.{field} ?? {default})"));
+                return Some((f, result_ty.clone()));
+            }
             _ => {}
         }
         match (rt, method) {
@@ -576,6 +610,8 @@ impl Codegen<'_> {
                 "position" => "position",
                 "rposition" => "rposition",
                 "partition" => "partition",
+                "unzip" => "unzip",
+                "map_while" => "mapWhile",
                 "find_map" => "findMap",
                 "reduce" => "reduce",
                 "for_each" => "forEach",
@@ -622,6 +658,25 @@ impl Codegen<'_> {
                 let f = self.fn_arg(a1);
                 call("fold", vec![init, f])
             }
+            "scan" => {
+                let boxed = a0
+                    .as_ref()
+                    .and_then(|a| self.ty_of(a.syntax()))
+                    .is_some_and(|t| crate::typeck::ptr_cellable(&t));
+                let init = self.fn_arg(a0);
+                let f = self.fn_arg(a1);
+                call("scan", vec![init, f, Frag::text(boxed.to_string())])
+            }
+            // `impl Sum for T`: `T.sum(iter)`.
+            "sum" | "product" if matches!(result_ty, Ty::Adt(n, _) if self.types.adts.method(n, method).is_some()) =>
+            {
+                let Ty::Adt(n, _) = result_ty else {
+                    unreachable!()
+                };
+                let mut f = Frag::text(format!("{}.{method}(", self.class(n)));
+                f.append(rf.clone()).push(")");
+                f
+            }
             "sum" | "product" => {
                 let (mut op, start) = arith_fold(method, result_ty);
                 // Debug builds: a sum or product past the type's range panics.
@@ -647,6 +702,11 @@ impl Codegen<'_> {
                     _ => "collectVec",
                 };
                 match result_ty {
+                    // `trees.collect::<TokenStream>()` in a proc-macro crate.
+                    Ty::Adt(n, _) if n == "TokenStream" => {
+                        let text = rf.clone().wrap("κσ.$tokensJoin(", ")");
+                        self.construct("TokenStream", 0, vec![text])
+                    }
                     Ty::Result(c, _) => call(
                         "collectResult",
                         vec![Frag::text(format!("\"${}\"", into(c)))],
@@ -693,6 +753,9 @@ fn arith_fold(method: &str, ty: &Ty) -> (String, &'static str) {
             format!("(a, b) => κσ.$w128(a * b, {})", k.is_signed()),
             "1n",
         ),
+        // (`f32`: each step rounded to f32, as the hardware does.)
+        ("sum", Ty::Float { f32: true }) => ("(a, b) => Math.fround(a + b)".into(), "-0"),
+        ("product", Ty::Float { f32: true }) => ("(a, b) => Math.fround(a * b)".into(), "1"),
         ("sum", Ty::Float { .. }) => ("(a, b) => a + b".into(), "-0"),
         ("sum", _) => (format!("(a, b) => {}", wrap("a + b")), "0"),
         ("product", Ty::Float { .. }) => ("(a, b) => a * b".into(), "1"),

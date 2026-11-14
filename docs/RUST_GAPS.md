@@ -12,7 +12,7 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   detected, though the values themselves are inexact there (see below).
 - **64-bit integers are JS numbers.** `i64`, `u64`, `isize` and `usize` are exact only up to 2^53.
   They don't wrap at 2^64, and casting a negative value to an unsigned 64-bit type keeps the sign.
-  Literals above 2^53 produce a warning. Their bitwise operators are exact (through BigInt) for
+  Literals above 2^53 that a double can't hold exactly produce a warning. Their bitwise operators are exact (through BigInt) for
   values that fit, but a result above 2^53, such as `!0u64`, is rounded like any other.
 - **Unconstrained types aren't errors.** rustc reports "type annotations needed" for a value
   whose type nothing determines (e.g. an empty `Vec::new()` that's never used). CarciniScript
@@ -103,13 +103,19 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   from float division. `+`, `-` and `*` on a `T` don't wrap integer overflow.
 - **`{:?}` of a generic value prints whole-number floats without `.0`**, and one-character
   strings and chars the same way, since the type is gone at run time.
+- **A width on a derived `{:?}` pads the whole value.** Rust passes the width to each field
+  (`{:>8?}` of `P { x: 1 }` is `P { x:        1 }`, and of `vec![1]` is `[       1]`); here the
+  result is padded as one string. Hand-written `Debug` / `Display` impls get the width through
+  the Formatter, as in Rust.
 - **Every file is its own crate root for `mod`.** `mod x;` in `util.rs` loads `x.rs` next to
   `util.rs` when there is one, since each Bitburner script is compiled on its own (and may be run
   directly); otherwise `x/mod.rs`, then `util/x.rs` like rustc. For the same reason `super::` works only inside inline `mod x { .. }` blocks, not at the top of a
   module file, and `crate::` names this file.
 - **Generics are erased, so a few things need help at run time.** `T::new()`, `T::CONST` and
-  `T::default()` work in free functions, which get `T`'s class as a hidden argument, but not yet
-  on a method's own type parameters. Generic traits (`trait Convert<T>`) and associated types
+  `T::default()` work in free functions, on a method's own type parameters and on an `impl<T>`'s
+  in its associated functions, which get `T`'s class as a hidden argument, but not on an
+  `impl<T>`'s in methods with `self` (the class would have to travel with the value). Generic
+  traits (`trait Convert<T>`) and associated types
   declared in your traits aren't supported.
 - **`&mut` to a number, string or bool inside a struct, tuple or Vec can't be passed to a
   function** (the value would be copied). Pass the struct, or a `&mut` to a local and write it back.
@@ -154,6 +160,93 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `Server & { isOnline?: boolean }` is typed as the named interface; its extra fields are dropped.
 - **Without bindings** (`setNsBindings` not called), `NS` is entirely untyped and snake_case names
   map to camelCase.
+
+## Proc macros
+
+- **A `TokenStream` is text.** `to_string()` gives the tokens with the source's spacing (one space
+  where there was whitespace, comments dropped) but without the line breaks rustc's printer adds
+  to long items, so code that splits on `\n` can differ. `quote!` output keeps its template's
+  spacing too, where `proc_macro2` prints a space between most tokens (`fn f () {}`); only
+  macros that inspect that text can tell. Building a stream from token trees joins them with
+  spaces (none after a `Joint` punct), not rustc's exact spacing.
+- **`quote!`** splices values by their type as the `quote` crate's `ToTokens` does; types
+  without it (a `Vec` outside a repetition, your own structs) are errors.
+- **`syn` is a subset.** The prelude covers your own `impl Parse` types on a `ParseStream`,
+  `Token![..]`, `parse_quote!`, and parsing derive input, functions, structs, enums, literals,
+  identifiers, paths, types and expressions. Types and expressions are token lists, not `syn`'s
+  enums: `input.parse::<Expr>()` takes tokens up to the next `,` or `;` (or `=>`) outside `<..>`,
+  and a `Type` also stops at `=`, `>` and `{`, which covers fields, arguments and `key = value`
+  lists but not every grammar. `peek2` / `peek3` count token trees, so a `::` ahead counts as two.
+  Parse errors have `syn`'s wording where it's simple, and point at the invocation rather than
+  at the offending token (no spans). The prelude's names (`TkComma` for `Token![,]`,
+  `IDENT` for `peek(Ident)`) show up in a macro crate's own error messages.
+- **Output is spliced as text.** It's re-parsed in place, so names it introduces can clash with the
+  caller's (rustc's `Span::call_site()` behaves the same; `Span::mixed_site()` hygiene isn't
+  available). An expression macro's output is parenthesized, as rustc treats it as one expression.
+- **Helper attributes** (`#[proc_macro_derive(Name, attributes(helper))]`) stay on the item and are
+  ignored.
+
+## Rc and Weak
+
+- **A `Weak` never expires.** Nothing is freed while reachable, so `upgrade()` returns `Some`
+  even after every `Rc` is dropped, and there are no `strong_count` / `weak_count`.
+
+## JS globals (the `js` crate)
+
+- **`JSON` goes by the static type.** It writes and reads what serde_json would for the type in
+  the source, so a value behind a type parameter in a generic function is written as JS sees it
+  (`JSON::stringify(&x)` with `x: T` gives JS's `JSON.stringify`). The serde derives aren't
+  needed, and only the `#[serde(..)]` attributes listed in FEATURES apply (no `flatten`,
+  `tag`/`untagged` enums, `with`, or custom `Serialize` impls).
+- **64-bit integers past 2^53** are JS numbers here, so `u64::MAX` reads in and writes out
+  inexactly (`i128`/`u128` are exact).
+- **`JsonError` has no position.** serde_json says `missing field `x` at line 1 column 8`; here
+  it's `missing field `x``. Some syntax errors are worded differently.
+- **`HashMap` keys come out in insertion order** (serde_json's follow its hash order, which
+  varies anyway); `BTreeMap` is sorted in both.
+- **`Date` is JS's.** Local time is the browser's time zone, and the string forms (`{}`,
+  `to_locale_string`) are the browser's.
+- **DOM values are handles, not owned data.** `Element`, `Document`, `Storage` and friends are
+  the live JS objects: `clone()` copies the handle, not the node, and changes through any copy
+  show everywhere (a `let mut` is still needed to assign a field, as in Rust). There's no
+  `web_sys`-style `Result` for a JS exception: a bad selector or a failed `fetch` throws.
+- **Timer ids are `f64`.** `set_timeout` returns what JS does (a number in the browser), only
+  good for `clear_timeout`. Closures given to timers and event listeners stay alive as long as JS
+  holds them; there's no `Closure::forget`.
+- **`JsValue` is untyped.** `js::global(..)`, `Response::json()` and `console::log`'s arguments
+  aren't checked; read typed data with `JSON::parse::<T>`.
+- **`Promise::all` / `race` take a `Vec` of futures** (unawaited async calls). They start when
+  called, as JS promises do, not when polled.
+- **`JsValue` doesn't solve inference.** `let v: JsValue = JSON::parse(s).unwrap()` asks for
+  a type; write `JSON::parse::<JsValue>(s)`.
+
+## std::time
+
+- **`Instant` has the browser's resolution**: `performance.now()` is microseconds or coarser
+  (browsers round it), and it counts from page load, so `{:?}` of an `Instant` isn't rustc's.
+  `SystemTime::now()` is `Date.now()`, whole milliseconds; its `{:?}` is Linux's form.
+- **`u64` seconds are JS numbers**, exact up to 2^53 seconds; `Duration::MAX` is inexact.
+  `as_millis` / `as_micros` / `as_nanos` are `u128`, exact.
+- **Panics inside these types are located in `<std>`.** rustc reports the caller's line for
+  `Duration / 0` and `Instant ± Duration` overflow (`#[track_caller]`, which user code can't use
+  here either); the messages match.
+- **Only programs that name `time::` get the types**, and not when they declare their own
+  `Duration`, `Instant` or `SystemTime`. `2 * duration` (`u32 * Duration`) isn't available:
+  write `duration * 2`.
+
+## Raw pointers
+
+- **Pointers have no addresses.** A raw pointer is the object it points at (or a cell for a
+  number, string, bool or Option), so there's no pointer arithmetic, no casts between pointers
+  and integers, and `transmute` only reinterprets same-size numbers, `char` and `bool`. All of
+  these are errors.
+- **Dangling pointers don't dangle.** A pointer outlives what it points at: reading through it
+  after the value is dropped (or after `Box::from_raw` freed it) still sees the last value
+  instead of being undefined behavior. A null pointer read throws a JS `TypeError`, not a
+  segfault.
+- **`*const` writes aren't rejected.** Writing through a `*const T` is accepted.
+- **Pointers to numbers stay in locals and parameters.** Such a pointer in a struct field or as a
+  function's return value is an error for now (a pointer to a struct can go anywhere).
 
 ## Checking
 

@@ -55,6 +55,15 @@
     return expandExponent(String(x));
   }
 
+  function shortF32(x) {
+    if (!Number.isFinite(x) || x === 0) return x;
+    for (let p = 1; p <= 9; p++) {
+      const y = Number(x.toPrecision(p));
+      if (Math.fround(y) === x) return y;
+    }
+    return x;
+  }
+
   // Debug for f64: integral values get ".0"; very large/small values use exponent notation.
   function dbgF(x) {
     if (!Number.isFinite(x) || Object.is(x, -0)) return Object.is(x, -0) ? "-0.0" : fmtF(x);
@@ -293,6 +302,217 @@
   // Rust's iterator adapters over a JS iterator. Lazy like Rust's: nothing runs until a consumer
   // (`$collectVec`, `$sum`, `for...of`, ...) pulls items. Methods are `$`-prefixed for Bitburner's
   // RAM calculator.
+  // Adapter iterators. Classes rather than generators: V8 runs them several times faster.
+  const DONE = Object.freeze({ value: undefined, done: true });
+  class AdapterIt {
+    [Symbol.iterator]() {
+      return this;
+    }
+  }
+  class MapIt extends AdapterIt {
+    constructor(src, f) {
+      super();
+      this.src = src;
+      this.f = f;
+    }
+    next() {
+      const r = this.src.next();
+      return r.done ? r : { value: this.f(r.value), done: false };
+    }
+  }
+  class FilterIt extends AdapterIt {
+    constructor(src, p) {
+      super();
+      this.src = src;
+      this.p = p;
+    }
+    next() {
+      for (;;) {
+        const r = this.src.next();
+        if (r.done || this.p(r.value)) return r;
+      }
+    }
+  }
+  class FilterMapIt extends AdapterIt {
+    constructor(src, f) {
+      super();
+      this.src = src;
+      this.f = f;
+    }
+    next() {
+      for (;;) {
+        const r = this.src.next();
+        if (r.done) return r;
+        const y = this.f(r.value);
+        if (y != null) return { value: y, done: false };
+      }
+    }
+  }
+  class EnumerateIt extends AdapterIt {
+    constructor(src) {
+      super();
+      this.src = src;
+      this.i = 0;
+    }
+    next() {
+      const r = this.src.next();
+      return r.done ? r : { value: [this.i++, r.value], done: false };
+    }
+  }
+  class TakeIt extends AdapterIt {
+    constructor(src, n) {
+      super();
+      this.src = src;
+      this.n = n;
+    }
+    next() {
+      if (this.n <= 0) return DONE;
+      this.n--;
+      return this.src.next();
+    }
+  }
+  class SkipIt extends AdapterIt {
+    constructor(src, n) {
+      super();
+      this.src = src;
+      this.n = n;
+    }
+    next() {
+      while (this.n > 0) {
+        this.n--;
+        const r = this.src.next();
+        if (r.done) return r;
+      }
+      return this.src.next();
+    }
+  }
+  class StepByIt extends AdapterIt {
+    constructor(src, n) {
+      super();
+      this.src = src;
+      this.n = n;
+      this.first = true;
+    }
+    next() {
+      if (this.first) {
+        this.first = false;
+        return this.src.next();
+      }
+      for (let k = 1; k < this.n; k++) {
+        const r = this.src.next();
+        if (r.done) return r;
+      }
+      return this.src.next();
+    }
+  }
+  class TakeWhileIt extends AdapterIt {
+    constructor(src, p) {
+      super();
+      this.src = src;
+      this.p = p;
+      this.over = false;
+    }
+    next() {
+      if (this.over) return DONE;
+      const r = this.src.next();
+      if (r.done) return r;
+      if (!this.p(r.value)) {
+        this.over = true;
+        return DONE;
+      }
+      return r;
+    }
+  }
+  class SkipWhileIt extends AdapterIt {
+    constructor(src, p) {
+      super();
+      this.src = src;
+      this.p = p;
+      this.skipping = true;
+    }
+    next() {
+      if (this.skipping) {
+        for (;;) {
+          const r = this.src.next();
+          if (r.done) return r;
+          if (!this.p(r.value)) {
+            this.skipping = false;
+            return r;
+          }
+        }
+      }
+      return this.src.next();
+    }
+  }
+  class ZipIt extends AdapterIt {
+    constructor(a, b) {
+      super();
+      this.a = a;
+      this.b = b;
+    }
+    next() {
+      const x = this.a.next();
+      if (x.done) return x;
+      const y = this.b.next();
+      if (y.done) return y;
+      return { value: [x.value, y.value], done: false };
+    }
+  }
+  class ChainIt extends AdapterIt {
+    constructor(a, other) {
+      super();
+      this.a = a;
+      this.other = other;
+      this.second = null;
+    }
+    next() {
+      if (this.second === null) {
+        const r = this.a.next();
+        if (!r.done) return r;
+        this.second = items(this.other)[Symbol.iterator]();
+      }
+      return this.second.next();
+    }
+  }
+  // `flat_map` / `flatten`: each item's items in turn.
+  class FlatMapIt extends AdapterIt {
+    constructor(src, f) {
+      super();
+      this.src = src;
+      this.f = f;
+      this.inner = null;
+    }
+    next() {
+      for (;;) {
+        if (this.inner !== null) {
+          const r = this.inner.next();
+          if (!r.done) return r;
+          this.inner = null;
+        }
+        const o = this.src.next();
+        if (o.done) return o;
+        this.inner = items(this.f(o.value))[Symbol.iterator]();
+      }
+    }
+  }
+  // An integer range (`lo..hi`, `lo..=hi`, `lo..`: `end` is Infinity); BigInts for `i128`.
+  class RangeIt extends AdapterIt {
+    constructor(i, end, one) {
+      super();
+      this.i = i;
+      this.end = end;
+      this.one = one;
+    }
+    next() {
+      if (this.i < this.end) {
+        const v = this.i;
+        this.i += this.one;
+        return { value: v, done: false };
+      }
+      return DONE;
+    }
+  }
+
   class Iter {
     constructor(it) {
       this.it = it;
@@ -305,62 +525,28 @@
     }
     // ---- adapters
     $map(f) {
-      const src = this.it;
-      return Iter.of(function* () {
-        for (const x of iterable(src)) yield f(x);
-      });
+      return new Iter(new MapIt(this.it, f));
     }
     $filter(p) {
-      const src = this.it;
-      return Iter.of(function* () {
-        for (const x of iterable(src)) if (p(x)) yield x;
-      });
+      return new Iter(new FilterIt(this.it, p));
     }
     $filterMap(f) {
-      const src = this.it;
-      return Iter.of(function* () {
-        for (const x of iterable(src)) {
-          const y = f(x);
-          if (y != null) yield y;
-        }
-      });
+      return new Iter(new FilterMapIt(this.it, f));
     }
     $flatMap(f) {
-      const src = this.it;
-      return Iter.of(function* () {
-        for (const x of iterable(src)) yield* items(f(x));
-      });
+      return new Iter(new FlatMapIt(this.it, f));
     }
     $flatten() {
-      const src = this.it;
-      return Iter.of(function* () {
-        for (const x of iterable(src)) yield* items(x);
-      });
+      return new Iter(new FlatMapIt(this.it, (x) => x));
     }
     $enumerate() {
-      const src = this.it;
-      return Iter.of(function* () {
-        let i = 0;
-        for (const x of iterable(src)) yield [i++, x];
-      });
+      return new Iter(new EnumerateIt(this.it));
     }
     $zip(other) {
-      const src = this.it;
-      return Iter.of(function* () {
-        const b = items(other)[Symbol.iterator]();
-        for (const x of iterable(src)) {
-          const y = b.next();
-          if (y.done) return;
-          yield [x, y.value];
-        }
-      });
+      return new Iter(new ZipIt(this.it, items(other)[Symbol.iterator]()));
     }
     $chain(other) {
-      const src = this.it;
-      return Iter.of(function* () {
-        yield* iterable(src);
-        yield* items(other);
-      });
+      return new Iter(new ChainIt(this.it, other));
     }
     // Repeats what the source yields; the source is read once and remembered.
     $cycle() {
@@ -383,50 +569,43 @@
       });
     }
     $take(n) {
-      const src = this.it;
-      return Iter.of(function* () {
-        if (n <= 0) return;
-        let i = 0;
-        for (const x of iterable(src)) {
-          yield x;
-          if (++i >= n) return;
-        }
-      });
+      return new Iter(new TakeIt(this.it, n));
     }
     $skip(n) {
-      const src = this.it;
-      return Iter.of(function* () {
-        let i = 0;
-        for (const x of iterable(src)) if (i++ >= n) yield x;
-      });
+      return new Iter(new SkipIt(this.it, n));
     }
     $stepBy(n) {
       if (n === 0) throw new CarciniPanic("assertion failed: step != 0", "<std>");
+      return new Iter(new StepByIt(this.it, n));
+    }
+    // `scan(init, |state, x| ..)`: `boxed` when the state is a number, string, .. (the closure
+    // gets a cell); stops at the first `None`.
+    $scan(init, f, boxed) {
       const src = this.it;
       return Iter.of(function* () {
-        let i = 0;
-        for (const x of iterable(src)) if (i++ % n === 0) yield x;
+        const state = boxed ? [init] : init;
+        for (const x of iterable(src)) {
+          const y = f(state, x);
+          if (y == null) return;
+          yield y;
+        }
+      });
+    }
+    $mapWhile(f) {
+      const src = this.it;
+      return Iter.of(function* () {
+        for (const x of iterable(src)) {
+          const y = f(x);
+          if (y == null) return;
+          yield y;
+        }
       });
     }
     $takeWhile(p) {
-      const src = this.it;
-      return Iter.of(function* () {
-        for (const x of iterable(src)) {
-          if (!p(x)) return;
-          yield x;
-        }
-      });
+      return new Iter(new TakeWhileIt(this.it, p));
     }
     $skipWhile(p) {
-      const src = this.it;
-      return Iter.of(function* () {
-        let skipping = true;
-        for (const x of iterable(src)) {
-          if (skipping && p(x)) continue;
-          skipping = false;
-          yield x;
-        }
-      });
+      return new Iter(new SkipWhileIt(this.it, p));
     }
     $inspect(f) {
       const src = this.it;
@@ -528,6 +707,16 @@
     $find(p) {
       for (const x of iterable(this.it)) if (p(x)) return x;
       return null;
+    }
+    // `unzip()`: pairs into two Vecs.
+    $unzip() {
+      const a = [];
+      const b = [];
+      for (const [x, y] of iterable(this.it)) {
+        a.push(x);
+        b.push(y);
+      }
+      return [a, b];
     }
     $partition(p) {
       const yes = [];
@@ -791,6 +980,23 @@
         this.$synced(() => this.m.delete(key(keyOf(x))));
         return x;
       }
+      // `range(lo..hi)` / `range(lo..=hi)` / `range(lo..)` / `range(..hi)`: the entries with
+      // keys in it, in order (`undefined` for an open end).
+      $range(lo, hi, inclusive) {
+        if (lo !== undefined && hi !== undefined && cmp(lo, hi) > 0) {
+          throw new CarciniPanic(`range start is greater than range end in ${this.constructor.name}`, "<std>");
+        }
+        this.$sort();
+        const all = Array.from(this.m.values());
+        return Iter.of(function* () {
+          for (const x of all) {
+            const k = keyOf(x);
+            if (lo !== undefined && cmp(k, lo) < 0) continue;
+            if (hi !== undefined && (inclusive ? cmp(k, hi) > 0 : cmp(k, hi) >= 0)) return;
+            yield k === x ? x : [x[0], x[1]];
+          }
+        });
+      }
     };
   }
 
@@ -1049,6 +1255,51 @@
       const r = rt.$irem(a, b);
       return r < 0 ? r + Math.abs(b) : r;
     },
+    $divEuclid(a, b) {
+      const q = rt.$idiv(a, b);
+      return a % b < 0 ? (b > 0 ? q - 1 : q + 1) : q;
+    },
+    // Float `rem_euclid` / `div_euclid`: no panic on zero (NaN, like Rust).
+    $fremEuclid(a, b) {
+      const r = a % b;
+      return r < 0 ? r + Math.abs(b) : r;
+    },
+    $fdivEuclid(a, b) {
+      const q = Math.trunc(a / b);
+      return a % b < 0 ? (b > 0 ? q - 1 : q + 1) : q;
+    },
+    // `f64::signum`: 1.0 for +0.0, -1.0 for -0.0, NaN for NaN.
+    $fsignum(x) {
+      if (Number.isNaN(x)) return NaN;
+      return x > 0 || Object.is(x, 0) ? 1 : -1;
+    },
+    $fract(x) {
+      return x - Math.trunc(x);
+    },
+    $isSignNegative(x) {
+      return x < 0 || Object.is(x, -0);
+    },
+    $isNormal(x) {
+      return Number.isFinite(x) && Math.abs(x) >= 2.2250738585072014e-308;
+    },
+    $copysign(a, b) {
+      const neg = b < 0 || Object.is(b, -0) || (Number.isNaN(b) && rt.$transmute(b, "f64", "u64") >= 2 ** 63);
+      return neg ? -Math.abs(a) : Math.abs(a);
+    },
+    // `ilog2` / `ilog10`: panics for zero and negatives, like Rust.
+    $ilog(x, base) {
+      if (x <= 0) throw new CarciniPanic("argument of integer logarithm must be positive", "<std>");
+      let n = 0;
+      for (let v = typeof x === "bigint" ? x : Math.trunc(x); v >= base; v = typeof v === "bigint" ? v / BigInt(base) : Math.floor(v / base)) n++;
+      return n;
+    },
+    $isqrt(x) {
+      if (x < 0) throw new CarciniPanic("argument of integer square root cannot be negative", "<std>");
+      let r = Math.floor(Math.sqrt(x));
+      while (r * r > x) r--;
+      while ((r + 1) * (r + 1) <= x) r++;
+      return r;
+    },
     $ipow32(x, n) {
       let result = 1;
       for (let i = 0; i < n; i++) result = Math.imul(result, x);
@@ -1074,6 +1325,10 @@
     },
     $get(v, i, location) {
       return v[rt.$ix(v, i, location)];
+    },
+    // The failing side of an inline bounds check.
+    $oob(v, i, location) {
+      throw new CarciniPanic(`index out of bounds: the len is ${v.length} but the index is ${i}`, location);
     },
     $vecRepeat(value, n, cloneEach) {
       const v = new Array(n);
@@ -1423,6 +1678,67 @@
     $iter(x) {
       return new Iter(x[Symbol.iterator]());
     },
+    // A token value's text for `quote!` (`None` is nothing).
+    $tt(x) {
+      return x == null ? "" : x.__tt();
+    },
+    // Tokens as text: a token value, or an iterable of them (a `Punct` that's `Joint` gets no
+    // space after it).
+    $tokensJoin(x) {
+      if (x == null) return "";
+      if (typeof x.__tt === "function") return x.__tt();
+      let s = "";
+      for (const t of x) {
+        const text = rt.$tokensJoin(t);
+        if (!text) continue;
+        s += text;
+        if (!(t != null && typeof t.__joint === "function" && t.__joint())) s += " ";
+      }
+      return s.trim();
+    },
+    // `quote!`'s `#( .. ) sep *`: `f` over the variables' items together (as far as the shortest
+    // goes), joined by the separator.
+    $quoteRep(lists, f, sep) {
+      const arrays = lists.map((x) => (Array.isArray(x) ? x : Array.from(x instanceof HashMap ? x.$entries() : x)));
+      const n = arrays.length ? Math.min(...arrays.map((a) => a.length)) : 0;
+      const out = [];
+      for (let i = 0; i < n; i++) out.push(f(...arrays.map((a) => a[i])));
+      return out.join(sep ? `${sep} ` : " ");
+    },
+    // `std::iter::repeat(x)` (each item a clone), `once`, `empty`, `repeat_with`, `from_fn`,
+    // `successors`.
+    $iterRepeat(x) {
+      return Iter.of(function* () {
+        for (;;) yield clone(x);
+      });
+    },
+    $iterOnce(x) {
+      return Iter.of(function* () {
+        yield x;
+      });
+    },
+    $iterEmpty() {
+      return Iter.of(function* () {});
+    },
+    $repeatWith(f) {
+      return Iter.of(function* () {
+        for (;;) yield f();
+      });
+    },
+    $fromFn(f) {
+      return Iter.of(function* () {
+        for (;;) {
+          const y = f();
+          if (y == null) return;
+          yield y;
+        }
+      });
+    },
+    $successors(first, f) {
+      return Iter.of(function* () {
+        for (let x = first; x != null; x = f(x)) yield x;
+      });
+    },
     // `lo..hi`, `lo..=hi` and `lo..` (hi null); chars when `isChar`, skipping surrogates.
     $range(lo, hi, inclusive, isChar) {
       if (isChar) {
@@ -1434,11 +1750,8 @@
       }
       // `i128` / `u128` ranges step in BigInts.
       const one = typeof lo === "bigint" ? 1n : 1;
-      return Iter.of(function* () {
-        if (hi === null) for (let i = lo; ; i += one) yield i;
-        const end = inclusive ? hi + one : hi;
-        for (let i = lo; i < end; i += one) yield i;
-      });
+      const end = hi === null ? Infinity : inclusive ? hi + one : hi;
+      return new Iter(new RangeIt(lo, end, one));
     },
     $split(s, p) {
       return new Iter(s.split(p)[Symbol.iterator]());
@@ -1519,6 +1832,10 @@
     // Formatting.
     $fmtF: fmtF,
     $dbgF: dbgF,
+    // `f32`: the shortest digits that read back as the same f32 (`0.1`, not the double's
+    // `0.10000000149011612`), then formatted like an f64.
+    $fmtF32: (x) => fmtF(shortF32(x)),
+    $dbgF32: (x) => dbgF(shortF32(x)),
     // `{:.p}`: like `toFixed`, except that an exact tie rounds to even, as Rust does
     // (`format!("{:.0}", 2.5)` is "2"; JS's `toFixed` rounds ties up).
     $fixed(x, p) {
@@ -1634,6 +1951,8 @@
       if (typeof x === "string") return rt.$dbgStr(x);
       if (x === undefined) return "()";
       if (x !== null && typeof x.$dbg === "function") return x.$dbg();
+      // `js::Date`: `Date(2024-03-01T12:00:00.000Z)`
+      if (x instanceof Date) return `Date(${Number.isNaN(x.getTime()) ? "Invalid Date" : x.toISOString()})`;
       return String(x);
     },
     // `{:?}` of a generic value, whose type is erased: whole numbers print as integers (so a
@@ -1656,6 +1975,48 @@
       for (const k of Object.keys(target)) delete target[k];
       Object.assign(target, value);
     },
+    // `p.as_ref()` on a raw pointer to a cell: the value, or `None` for a null pointer.
+    $ptrGet(cell) {
+      return cell == null ? null : cell[0];
+    },
+    // `mem::transmute::<From, To>(x)` between same-size numbers (and `char`, `bool`): the bytes
+    // reinterpreted. 64-bit integers are JS numbers, 128-bit ones BigInts.
+    $transmute(x, from, to) {
+      const dv = new DataView(new ArrayBuffer(16));
+      switch (from) {
+        case "i8": case "u8": dv.setUint8(0, Number(x) & 0xff); break;
+        case "bool": dv.setUint8(0, x ? 1 : 0); break;
+        case "i16": case "u16": dv.setUint16(0, Number(x) & 0xffff, true); break;
+        case "i32": case "u32": dv.setUint32(0, Number(x) >>> 0, true); break;
+        case "char": dv.setUint32(0, x.codePointAt(0), true); break;
+        case "f32": dv.setFloat32(0, x, true); break;
+        case "f64": dv.setFloat64(0, x, true); break;
+        case "i64": case "u64": dv.setBigUint64(0, BigInt.asUintN(64, BigInt(x)), true); break;
+        default: {
+          const v = BigInt.asUintN(128, BigInt(x));
+          dv.setBigUint64(0, v & 0xffffffffffffffffn, true);
+          dv.setBigUint64(8, v >> 64n, true);
+        }
+      }
+      switch (to) {
+        case "i8": return dv.getInt8(0);
+        case "u8": return dv.getUint8(0);
+        case "bool": return dv.getUint8(0) !== 0;
+        case "i16": return dv.getInt16(0, true);
+        case "u16": return dv.getUint16(0, true);
+        case "i32": return dv.getInt32(0, true);
+        case "u32": return dv.getUint32(0, true);
+        case "char": return String.fromCodePoint(dv.getUint32(0, true));
+        case "f32": return dv.getFloat32(0, true);
+        case "f64": return dv.getFloat64(0, true);
+        case "i64": return Number(dv.getBigInt64(0, true));
+        case "u64": return Number(dv.getBigUint64(0, true));
+        default: {
+          const v = dv.getBigUint64(0, true) | (dv.getBigUint64(8, true) << 64n);
+          return to === "i128" ? BigInt.asIntN(128, v) : v;
+        }
+      }
+    },
     // `Display` impls write into a Formatter: `{ s: "" }`.
     $write(f, s, nl) {
       f.s += nl ? s + "\n" : s;
@@ -1665,6 +2026,32 @@
       const f = { s: "" };
       v.fmt(f);
       return f.s;
+    },
+    // `{:>8}` / `{:.2?}` of a value with its own `fmt`: the impl gets the spec
+    // `o = { w, p, align, fill, plus, alt, zero }` (`f.width()`, `f.precision()`, ..) and, like
+    // Rust, pads only if it asks to (`f.pad(..)`). A derived `{:?}` (`dbg`) is padded here.
+    $displaySpec(v, o) {
+      const f = { s: "", o };
+      v.fmt(f);
+      return f.s;
+    },
+    $dbgSpec(v, o, dbg) {
+      if (v !== null && typeof v === "object" && typeof v.fmt$dbg === "function") {
+        const f = { s: "", o };
+        v.fmt$dbg(f);
+        return f.s;
+      }
+      let s = dbg(v);
+      if (o.alt) s = rt.$pretty(s);
+      if (o.w != null) s = rt.$pad(s, o.w, o.align, o.fill, o.zero, false);
+      return s;
+    },
+    // `f.pad(s)`: cut to the precision, then pad to the width (left-aligned by default).
+    $fmtPad(f, s, cut) {
+      const o = f.o;
+      if (o && cut && o.p != null) s = rt.$truncChars(s, o.p);
+      if (o && o.w != null) s = rt.$pad(s, o.w, o.align, o.fill, false, false);
+      return rt.$write(f, s, false);
     },
     RefCell,
     $cellReplace(c, v) {
@@ -2369,5 +2756,590 @@
     },
   };
 
+  // ---- `js::JSON`: serde_json's format, by a schema of the static type that codegen writes
+  // (`{t:"struct", cls, fields: [{key, js, s, def}]}`, ..). Definitions of structs and enums are
+  // `{t:"lazy", get}`, so recursive types work.
+
+  /// Why `JSON::parse` failed (`message()`, `{}`), as serde_json words it, without a position.
+  class JsonError {
+    constructor(msg) {
+      this.msg = msg;
+    }
+    message() {
+      return this.msg;
+    }
+    toString() {
+      return this.msg;
+    }
+    $dbg() {
+      return `JsonError(${rt.$dbgStr(this.msg)})`;
+    }
+  }
+  rt.JsonError = JsonError;
+
+  function jsonSchema(s) {
+    if (s.t === "lazy") {
+      s.v ??= s.get();
+      return s.v;
+    }
+    return s;
+  }
+
+  // A float as serde_json writes it (ryu): shortest digits, `1.0` for whole numbers, an
+  // exponent past 1e16 (f64) / 1e13 (f32) or below 1e-5 / 1e-6.
+  function ryu(x, f32) {
+    if (x === 0) return Object.is(x, -0) ? "-0.0" : "0.0";
+    let text = x.toExponential();
+    if (f32) {
+      for (let p = 1; p <= 9; p++) {
+        const s = x.toPrecision(p);
+        if (Math.fround(Number(s)) === x) {
+          text = Number(s).toExponential();
+          break;
+        }
+      }
+    }
+    const m = /^(-?)(\d)(?:\.(\d+))?e([+-]\d+)$/.exec(text);
+    const sign = m[1];
+    const digits = m[2] + (m[3] ?? "");
+    const kk = Number(m[4]) + 1;
+    const len = digits.length;
+    const k = kk - len;
+    const [maxK, minK] = f32 ? [13, -6] : [16, -5];
+    let out;
+    if (k >= 0 && kk <= maxK) out = digits + "0".repeat(k) + ".0";
+    else if (kk > 0 && kk <= maxK) out = digits.slice(0, kk) + "." + digits.slice(kk);
+    else if (kk > minK && kk <= 0) out = "0." + "0".repeat(-kk) + digits;
+    else {
+      // (serde_json writes `1e+16` / `1e-7`.)
+      const e = kk - 1 >= 0 ? `e+${kk - 1}` : `e${kk - 1}`;
+      out = len === 1 ? digits + e : `${digits[0]}.${digits.slice(1)}${e}`;
+    }
+    return sign + out;
+  }
+
+  function jsonOut(v, s, pretty, ind) {
+    s = jsonSchema(s);
+    const inner = ind + "  ";
+    const arr = (items) => {
+      if (items.length === 0) return "[]";
+      return pretty ? `[\n${items.map((i) => inner + i).join(",\n")}\n${ind}]` : `[${items.join(",")}]`;
+    };
+    const obj = (pairs) => {
+      if (pairs.length === 0) return "{}";
+      const sep = pretty ? ": " : ":";
+      const items = pairs.map(([k, x]) => JSON.stringify(k) + sep + x);
+      return pretty ? `{\n${items.map((i) => inner + i).join(",\n")}\n${ind}}` : `{${items.join(",")}}`;
+    };
+    const sub = (x, ss) => jsonOut(x, ss, pretty, inner);
+    switch (s.t) {
+      case "int":
+        return String(v);
+      case "big":
+        return v.toString();
+      case "float":
+        return Number.isFinite(v) ? ryu(v, s.f32) : "null";
+      case "bool":
+        return v ? "true" : "false";
+      case "str":
+      case "char":
+        return JSON.stringify(v);
+      case "unit":
+        return "null";
+      case "opt":
+        return v == null ? "null" : jsonOut(v, s.s, pretty, ind);
+      case "vec":
+      case "set":
+        return arr(Array.from(v, (x) => sub(x, s.s)));
+      case "tuple":
+        return arr(s.s.map((e, i) => sub(v[i], e)));
+      case "map":
+        return obj(Array.from(v.$entries(), ([k, x]) => [String(k), sub(x, s.v)]));
+      case "cell":
+        return jsonOut(v.v, s.s, pretty, ind);
+      case "result":
+        return obj([[v.$tag === 0 ? "Ok" : "Err", sub(v[0], v.$tag === 0 ? s.ok : s.err)]]);
+      case "struct":
+        return jsonFields(v, s.shape, s.fields, pretty, ind, obj, arr, sub);
+      case "enum": {
+        const variant = s.variants[v.$tag];
+        if (variant.shape === "unit") return JSON.stringify(variant.key);
+        const content = (ind2) =>
+          jsonFields(v, variant.shape, variant.fields, pretty, ind2, objAt(ind2), arrAt(ind2), (x, ss) =>
+            jsonOut(x, ss, pretty, ind2 + "  "),
+          );
+        return obj([[variant.key, content(inner)]]);
+      }
+      default:
+        return JSON.stringify(v) ?? "null";
+    }
+    function objAt(i2) {
+      return (pairs) => {
+        if (pairs.length === 0) return "{}";
+        const sep = pretty ? ": " : ":";
+        const items = pairs.map(([k, x]) => JSON.stringify(k) + sep + x);
+        return pretty ? `{\n${items.map((i) => i2 + "  " + i).join(",\n")}\n${i2}}` : `{${items.join(",")}}`;
+      };
+    }
+    function arrAt(i2) {
+      return (items) => {
+        if (items.length === 0) return "[]";
+        return pretty ? `[\n${items.map((i) => i2 + "  " + i).join(",\n")}\n${i2}]` : `[${items.join(",")}]`;
+      };
+    }
+  }
+
+  // A struct's (or variant's) fields: an object, an array (tuple), the value itself (one
+  // unnamed field), or `null` (unit).
+  function jsonFields(v, shape, fields, pretty, ind, obj, arr, sub) {
+    if (shape === "unit") return "null";
+    if (shape === "tuple") {
+      if (fields.length === 1) return jsonOut(v[0], fields[0].s, pretty, ind);
+      return arr(fields.map((f, i) => sub(v[i], f.s)));
+    }
+    return obj(fields.filter((f) => !f.skipOut).map((f) => [f.key, sub(v[f.js], f.s)]));
+  }
+
+  rt.$jsonStringify = (v, schema, pretty) => jsonOut(v, schema, pretty, "");
+
+  // ---- the `js` crate's other helpers
+  // An array-like value (`NodeList`, `HTMLCollection`) as an array; null as empty.
+  rt.$arrayOf = (x) => (x == null ? [] : Array.from(x));
+  // `Url::parse`: the URL, or null when it doesn't parse.
+  rt.$urlParse = (text, base) => {
+    try {
+      return new URL(text, base);
+    } catch {
+      return null;
+    }
+  };
+  rt.$randomBytes = (n) => Array.from(globalThis.crypto.getRandomValues(new Uint8Array(n)));
+  rt.$sleep = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+  // `js::structured_clone`: a deep copy. Rust values copy by their `Clone` (keeping their
+  // classes), JS values (NS objects, parsed JSON) by the browser's `structuredClone`.
+  rt.$structuredClone = (v) => {
+    if (v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) return v.map(rt.$structuredClone);
+    if (typeof v.$clone === "function") return v.$clone();
+    if (v instanceof RefCell) return new RefCell(rt.$structuredClone(v.v), v.kind);
+    return globalThis.structuredClone(v);
+  };
+  rt.$global = (name) => globalThis[name];
+  rt.$setGlobal = (name, value) => {
+    globalThis[name] = value;
+  };
+
+  // ---- parsing: JSON text to tagged values (`{k:"num", raw, int}` keeps `1` and `1.0` apart,
+  // as serde_json does), with serde_json's syntax errors.
+  function jsonLex(text) {
+    let i = 0;
+    const fail = (msg) => {
+      throw new JsonError(msg);
+    };
+    const ws = () => {
+      while (i < text.length && " \t\n\r".includes(text[i])) i++;
+    };
+    const value = (what) => {
+      ws();
+      if (i >= text.length) fail(`EOF while parsing ${what}`);
+      const c = text[i];
+      if (c === "{") {
+        i++;
+        const pairs = [];
+        ws();
+        if (text[i] === "}") {
+          i++;
+          return { k: "obj", v: pairs };
+        }
+        for (;;) {
+          ws();
+          if (i >= text.length) fail("EOF while parsing an object");
+          if (text[i] !== '"') fail(text[i] === "}" ? "trailing comma" : "key must be a string");
+          const key = string();
+          ws();
+          if (i >= text.length) fail("EOF while parsing an object");
+          if (text[i] !== ":") fail("expected `:`");
+          i++;
+          pairs.push([key, value("a value")]);
+          ws();
+          if (i >= text.length) fail("EOF while parsing an object");
+          if (text[i] === ",") {
+            i++;
+            continue;
+          }
+          if (text[i] === "}") {
+            i++;
+            return { k: "obj", v: pairs };
+          }
+          fail("expected `,` or `}`");
+        }
+      }
+      if (c === "[") {
+        i++;
+        const items = [];
+        ws();
+        if (text[i] === "]") {
+          i++;
+          return { k: "arr", v: items };
+        }
+        for (;;) {
+          ws();
+          if (text[i] === "]") fail("trailing comma");
+          items.push(value("a list"));
+          ws();
+          if (i >= text.length) fail("EOF while parsing a list");
+          if (text[i] === ",") {
+            i++;
+            continue;
+          }
+          if (text[i] === "]") {
+            i++;
+            return { k: "arr", v: items };
+          }
+          fail("expected `,` or `]`");
+        }
+      }
+      if (c === '"') return { k: "str", v: string() };
+      for (const [word, node] of [
+        ["true", { k: "bool", v: true }],
+        ["false", { k: "bool", v: false }],
+        ["null", { k: "null" }],
+      ]) {
+        if (c === word[0]) {
+          for (let j = 0; j < word.length; j++) {
+            if (i + j >= text.length) fail(`EOF while parsing ${what}`);
+            if (text[i + j] !== word[j]) fail("expected ident");
+          }
+          i += word.length;
+          return node;
+        }
+      }
+      const m = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/.exec(text.slice(i));
+      if (!m || m[0] === "-") fail(c === "-" ? "invalid number" : "expected value");
+      i += m[0].length;
+      return { k: "num", raw: m[0], int: !m[2] && !m[3] };
+    };
+    const string = () => {
+      i++;
+      let out = "";
+      for (;;) {
+        if (i >= text.length) fail("EOF while parsing a string");
+        const c = text[i];
+        if (c === '"') {
+          i++;
+          return out;
+        }
+        if (c < " ") fail("control character (\\u0000-\\u001F) found while parsing a string");
+        if (c === "\\") {
+          const e = text[i + 1];
+          if (e === undefined) fail("EOF while parsing a string");
+          const simple = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" }[e];
+          if (simple !== undefined) {
+            out += simple;
+            i += 2;
+            continue;
+          }
+          if (e === "u") {
+            const hex = text.slice(i + 2, i + 6);
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail(hex.length < 4 ? "EOF while parsing a string" : "invalid escape");
+            out += String.fromCharCode(parseInt(hex, 16));
+            i += 6;
+            continue;
+          }
+          fail("invalid escape");
+        }
+        out += c;
+        i++;
+      }
+    };
+    const v = value("a value");
+    ws();
+    if (i < text.length) fail("trailing characters");
+    return v;
+  }
+
+  // What a JSON value is, as serde words an unexpected one.
+  function jsonUnexpected(n) {
+    switch (n.k) {
+      case "null":
+        return "null";
+      case "bool":
+        return `boolean \`${n.v}\``;
+      case "num": {
+        if (n.int) return `integer \`${n.raw}\``;
+        let f = fmtF(Number(n.raw));
+        if (!/[.eEi]|NaN/.test(f)) f += ".0";
+        return `floating point \`${f}\``;
+      }
+      case "str":
+        return `string ${rt.$dbgStr(n.v)}`;
+      case "arr":
+        return "sequence";
+      default:
+        return "map";
+    }
+  }
+
+  // What a schema expects, as serde's visitors word it.
+  function jsonExpecting(s) {
+    s = jsonSchema(s);
+    switch (s.t) {
+      case "int":
+      case "big":
+        return s.name;
+      case "float":
+        return s.f32 ? "f32" : "f64";
+      case "bool":
+        return "a boolean";
+      case "char":
+        return "a character";
+      case "str":
+        return "a string";
+      case "unit":
+        return "unit";
+      case "opt":
+        return jsonExpecting(s.s);
+      case "vec":
+      case "set":
+        return "a sequence";
+      case "tuple":
+        return `a tuple of size ${s.s.length}`;
+      case "map":
+        return "a map";
+      case "cell":
+        return jsonExpecting(s.s);
+      case "result":
+        return "enum Result";
+      case "struct":
+        if (s.shape === "unit") return `unit struct ${s.name}`;
+        if (s.shape === "tuple") return s.fields.length === 1 ? `tuple struct ${s.name}` : `tuple struct ${s.name}`;
+        return `struct ${s.name}`;
+      case "enum":
+        return `enum ${s.name}`;
+      default:
+        return "any value";
+    }
+  }
+
+  function jsonInvalid(n, s) {
+    return new JsonError(`invalid type: ${jsonUnexpected(n)}, expected ${typeof s === "string" ? s : jsonExpecting(s)}`);
+  }
+
+  function oneOf(names) {
+    const q = names.map((n) => `\`${n}\``);
+    if (q.length === 0) return "there are no variants";
+    if (q.length === 1) return `expected ${q[0]}`;
+    if (q.length === 2) return `expected ${q[0]} or ${q[1]}`;
+    return `expected one of ${q.join(", ")}`;
+  }
+
+  // A plain JS value of an untyped (`JsValue`) part.
+  function jsonPlain(n) {
+    switch (n.k) {
+      case "null":
+        return null;
+      case "num":
+        return Number(n.raw);
+      case "arr":
+        return n.v.map(jsonPlain);
+      case "obj":
+        return Object.fromEntries(n.v.map(([k, x]) => [k, jsonPlain(x)]));
+      default:
+        return n.v;
+    }
+  }
+
+  function jsonIn(n, s) {
+    s = jsonSchema(s);
+    switch (s.t) {
+      case "int": {
+        if (n.k !== "num") throw jsonInvalid(n, s);
+        if (!n.int) throw jsonInvalid(n, s);
+        const big = BigInt(n.raw);
+        if (big < BigInt(s.min) || big > BigInt(s.max)) {
+          throw new JsonError(`invalid value: integer \`${n.raw}\`, expected ${s.name}`);
+        }
+        return Number(n.raw);
+      }
+      case "big": {
+        if (n.k !== "num" || !n.int) throw jsonInvalid(n, s);
+        return BigInt(n.raw);
+      }
+      case "float": {
+        if (n.k !== "num") throw jsonInvalid(n, s);
+        const x = Number(n.raw);
+        return s.f32 ? Math.fround(x) : x;
+      }
+      case "bool":
+        if (n.k !== "bool") throw jsonInvalid(n, s);
+        return n.v;
+      case "str":
+        if (n.k !== "str") throw jsonInvalid(n, s);
+        return n.v;
+      case "char":
+        if (n.k !== "str") throw jsonInvalid(n, s);
+        if ([...n.v].length !== 1) {
+          throw new JsonError(`invalid value: string ${rt.$dbgStr(n.v)}, expected a character`);
+        }
+        return n.v;
+      case "unit":
+        if (n.k !== "null") throw jsonInvalid(n, s);
+        return undefined;
+      case "opt":
+        return n.k === "null" ? null : jsonIn(n, s.s);
+      case "vec": {
+        if (n.k !== "arr") throw jsonInvalid(n, s);
+        return n.v.map((x) => jsonIn(x, s.s));
+      }
+      case "set": {
+        if (n.k !== "arr") throw jsonInvalid(n, s);
+        const items = n.v.map((x) => jsonIn(x, s.s));
+        if (s.cls === "BTreeSet") return rt.BTreeSet.from(items);
+        const out = new rt[s.cls]();
+        for (const x of items) out.$insert(x);
+        return out;
+      }
+      case "tuple": {
+        if (n.k !== "arr") throw jsonInvalid(n, s);
+        if (n.v.length < s.s.length) {
+          throw new JsonError(`invalid length ${n.v.length}, expected a tuple of size ${s.s.length}`);
+        }
+        if (n.v.length > s.s.length) throw new JsonError("trailing characters");
+        return s.s.map((e, i) => jsonIn(n.v[i], e));
+      }
+      case "map": {
+        if (n.k !== "obj") throw jsonInvalid(n, s);
+        const pairs = [];
+        const ks = jsonSchema(s.k);
+        for (const [k, x] of n.v) {
+          let key = k;
+          if (ks.t === "int" || ks.t === "big") {
+            if (!/^-?\d+$/.test(k)) throw jsonInvalid({ k: "str", v: k }, ks);
+            key = jsonIn({ k: "num", raw: k, int: true }, ks);
+          } else if (ks.t === "char") {
+            key = jsonIn({ k: "str", v: k }, ks);
+          }
+          pairs.push([key, jsonIn(x, s.v)]);
+        }
+        if (s.cls === "BTreeMap") return rt.BTreeMap.from(pairs);
+        const out = new rt.HashMap();
+        for (const [k, x] of pairs) out.$insert(k, x);
+        return out;
+      }
+      case "cell":
+        return new rt.RefCell(jsonIn(n, s.s), "RefCell");
+      case "result": {
+        if (n.k !== "obj" || n.v.length !== 1) throw jsonInvalid(n, s);
+        const [k, x] = n.v[0];
+        if (k === "Ok") return rt.Ok(jsonIn(x, s.ok));
+        if (k === "Err") return rt.Err(jsonIn(x, s.err));
+        throw new JsonError(`unknown variant \`${k}\`, ${oneOf(["Ok", "Err"])}`);
+      }
+      case "struct":
+        return jsonBuild(n, s.shape, s.fields, s, (args) => new s.cls(...args));
+      case "enum": {
+        let key;
+        let content = null;
+        if (n.k === "str") key = n.v;
+        else if (n.k === "obj" && n.v.length === 1) [key, content] = n.v[0];
+        else throw jsonInvalid(n, s);
+        const variant = s.variants.find((v) => v.key === key);
+        if (!variant) throw new JsonError(`unknown variant \`${key}\`, ${oneOf(s.variants.map((v) => v.key))}`);
+        if (variant.shape === "unit") {
+          if (content !== null && content.k !== "null") throw jsonInvalid(content, "unit variant");
+          return s.cls[variant.js];
+        }
+        if (content === null) {
+          const what = variant.shape === "named" ? "struct variant" : variant.fields.length === 1 ? "newtype variant" : "tuple variant";
+          throw new JsonError(`invalid type: unit variant, expected ${what}`);
+        }
+        const expecting = variant.shape === "named" ? `struct variant ${s.name}::${variant.js}` : `tuple variant ${s.name}::${variant.js}`;
+        return jsonBuild(content, variant.shape, variant.fields, expecting, (args) => s.cls[variant.js](...args));
+      }
+      default:
+        return jsonPlain(n);
+    }
+  }
+
+  // A struct's (or variant's) value from an object, an array, its one field's value, or null.
+  function jsonBuild(n, shape, fields, expecting, make) {
+    const expect = typeof expecting === "string" ? expecting : jsonExpecting(expecting);
+    if (shape === "unit") {
+      if (n.k !== "null") throw jsonInvalid(n, expect);
+      return make([]);
+    }
+    if (shape === "tuple" && fields.length === 1) return make([jsonIn(n, fields[0].s)]);
+    if (n.k === "arr") {
+      const live = fields.filter((f) => !f.skipIn);
+      if (n.v.length < live.length) {
+        throw new JsonError(`invalid length ${n.v.length}, expected ${expect} with ${live.length} element${live.length === 1 ? "" : "s"}`);
+      }
+      if (n.v.length > live.length) throw new JsonError("trailing characters");
+      let k = 0;
+      return make(fields.map((f) => (f.skipIn ? f.def() : jsonIn(n.v[k++], f.s))));
+    }
+    if (shape === "tuple" || n.k !== "obj") throw jsonInvalid(n, expect);
+    const seen = new Set();
+    const got = new Map();
+    for (const [k, x] of n.v) {
+      const f = fields.find((f) => f.key === k && !f.skipIn);
+      if (!f) continue;
+      if (seen.has(k)) throw new JsonError(`duplicate field \`${k}\``);
+      seen.add(k);
+      got.set(f, x);
+    }
+    return make(
+      fields.map((f) => {
+        if (got.has(f)) return jsonIn(got.get(f), f.s);
+        if (f.def) return f.def();
+        if (jsonSchema(f.s).t === "opt") return null;
+        throw new JsonError(`missing field \`${f.key}\``);
+      }),
+    );
+  }
+
+  rt.$jsonParse = (text, schema) => {
+    try {
+      return rt.Ok(jsonIn(jsonLex(text), schema));
+    } catch (e) {
+      if (e instanceof JsonError) return rt.Err(e);
+      throw e;
+    }
+  };
+
   globalThis.κσ = rt;
+
+  // Proc macros: the compiler calls this with a proc-macro crate compiled to JS, a function of
+  // it, and the input (and an attribute macro's arguments); the result is the output's source.
+  // Failures are thrown as strings, which the compiler reports at the invocation.
+  const macroCrates = new Map();
+  // Loop steps of the macro running now (`κσ.$tick()` at the top of each loop).
+  let macroSteps = 0;
+  rt.$tick = () => {
+    if (++macroSteps > 10_000_000) throw "the proc macro ran too long (more than 10,000,000 loop steps)";
+  };
+  globalThis.__carciniRunMacro = (code, name, input, attr) => {
+    macroSteps = 0;
+    let crate = macroCrates.get(code);
+    if (!crate) {
+      const body = code.replace(/^export (?=(async )?function |class |const |let )/gm, "");
+      const names = [...code.matchAll(/^export (?:async )?function ([\w$]+)/gm)].map((m) => m[1]);
+      try {
+        crate = new Function(`${body}\nreturn { ${names.join(", ")} };`)();
+      } catch (e) {
+        throw `the proc macro crate didn't load: ${e?.message ?? e}`;
+      }
+      if (macroCrates.size > 16) macroCrates.clear();
+      macroCrates.set(code, crate);
+    }
+    const f = crate[name];
+    if (typeof f !== "function") throw `the proc macro crate has no function \`${name}\``;
+    let out;
+    try {
+      out = attr === undefined || attr === null ? f(input) : f(attr, input);
+    } catch (e) {
+      throw e instanceof CarciniPanic ? e.panicMessage : String(e?.message ?? e);
+    }
+    return String(out);
+  };
 })();

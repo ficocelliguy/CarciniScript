@@ -105,6 +105,40 @@ argument: `compile(source, "lib/main.rs", (path) => files.get(path))` (here it a
 `import * as util from "./util.rs"`, so the host loads them the way it loads any import. Bitburner
 passes the server's scripts.
 
+### Proc macros
+
+A file with `#[proc_macro]`, `#[proc_macro_derive(Name)]` or `#[proc_macro_attribute]` functions
+is a proc-macro crate, used as in Rust: `use mac::{show, Show};` then `show!(..)` or
+`#[derive(Show)]` (or `mac::show!(..)`, `#[mac::traced]`), with `mac.rs` read through `resolve`
+like a module file. Read the input with `input.to_string()`; return
+`format!(..).parse().unwrap()`, build it with `quote!` (and `format_ident!`), walk its token
+trees (`for tt in input`), or parse it with `syn` (`parse_macro_input!(input as DeriveInput)`, or
+your own `impl Parse` on a `ParseStream` with `Token![..]`):
+built-in stand-ins for `proc_macro2`, `quote` and the common parts of `syn`. The crate is compiled to JS and run during the compile by the
+runtime (`carciniscript/runtime` must be loaded); a panic, or a loop running past 10,000,000
+steps, is an error at the invocation. `compile` returns the crates a file used in
+`dependencies`, so a host that caches compiled scripts can recompile when one changes (Bitburner
+does).
+
+### JS globals
+
+The built-in `js` crate reaches JS globals with Rust types: `use js::{Date, JSON};`, then
+`Date::now()`, `Date::from_millis(ms).to_iso_string()`, `JSON::stringify(&state)` and
+`JSON::parse::<State>(&text)` (serde_json's format and error messages, going by the type;
+`#[derive(Serialize, Deserialize)]` and `#[serde(rename_all = "camelCase")]` are understood).
+`JsonError` and `Date` print with `{}` and `{:?}`.
+
+The rest of the browser comes the same way (declared in `bindings/js.rs`): `js::document()`
+(`query_selector`, `create_element`, `Element` fields and methods, events with Rust closures),
+`js::window()`, `js::local_storage()`, `js::location()`, `js::navigator()` (clipboard),
+`js::console::log(..)`, `js::Math::random()`, `js::performance::now()`, `js::crypto`,
+`js::Url::parse(..)`, `js::fetch(url).await`, `js::btoa` / `atob`, timers
+(`js::set_timeout(|| .., ms)`, `js::sleep(ms).await`), `js::Promise::all(futures).await` and
+`js::global(name)` / `set_global`, `js::structured_clone(&x)`. Functions can be imported by name
+(`use js::{btoa, sleep};`). `std::time::{Duration, Instant, SystemTime}` work as in Rust
+(`let t = Instant::now(); .. println!("{:.2?}", t.elapsed());`), on `performance.now()`.
+In Bitburner, `js::document()` and `js::window()` cost 25 GB like their JS names.
+
 ### Editor support
 
 `hover(source, filename, line, column, resolve?)` returns markdown for the symbol under the cursor

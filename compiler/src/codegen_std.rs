@@ -255,6 +255,92 @@ impl Codegen<'_> {
             }
             (Ty::Int(_), "is_power_of_two") => helper("isPowerOfTwo", vec![]),
             (Ty::Float { .. }, "total_cmp") => helper("totalCmp", self.arg_frags(m)),
+            (Ty::Int(_), "div_euclid") => helper("divEuclid", self.arg_frags(m)),
+            (Ty::Int(_), "isqrt") => helper("isqrt", vec![]),
+            (Ty::Int(_), "ilog2") => helper("ilog", vec![Frag::text("2")]),
+            (Ty::Int(_), "ilog10") => helper("ilog", vec![Frag::text("10")]),
+            (Ty::Int(_), "is_positive") => rf.clone().wrap("(", " > 0)"),
+            (Ty::Int(_), "is_negative") => rf.clone().wrap("(", " < 0)"),
+            (Ty::Float { f32 }, "to_bits") => helper(
+                "transmute",
+                vec![Frag::text(if *f32 {
+                    "\"f32\", \"u32\""
+                } else {
+                    "\"f64\", \"u64\""
+                })],
+            ),
+            (
+                Ty::Float { f32 },
+                m2 @ ("to_radians" | "to_degrees" | "recip" | "fract" | "exp2"),
+            ) => {
+                let f = match m2 {
+                    // As in std: `x * (PI / 180)`, `x * (180 / PI)`.
+                    "to_radians" => rf.clone().wrap("(", " * (Math.PI / 180))"),
+                    "to_degrees" if *f32 => rf
+                        .clone()
+                        .wrap("(", " * 57.2957795130823208767981548141051703)"),
+                    "to_degrees" => rf.clone().wrap("(", " * (180 / Math.PI))"),
+                    "recip" => rf.clone().wrap("(1 / ", ")"),
+                    "fract" => rf.clone().wrap("κσ.$fract(", ")"),
+                    _ => rf.clone().wrap("(2 ** ", ")"),
+                };
+                if *f32 { f.wrap("Math.fround(", ")") } else { f }
+            }
+            (Ty::Float { .. }, "signum") => helper("fsignum", vec![]),
+            (
+                Ty::Float { .. },
+                m2 @ ("exp_m1" | "ln_1p" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh"),
+            ) => {
+                let js = match m2 {
+                    "exp_m1" => "expm1",
+                    "ln_1p" => "log1p",
+                    other => other,
+                };
+                rf.clone().wrap(&format!("Math.{js}("), ")")
+            }
+            (Ty::Float { .. }, "hypot") => {
+                let mut f = Frag::text("Math.hypot(");
+                f.append(rf.clone())
+                    .push(", ")
+                    .append(Frag::join(self.arg_frags(m), ", "))
+                    .push(")");
+                f
+            }
+            (Ty::Float { .. }, "rem_euclid") => helper("fremEuclid", self.arg_frags(m)),
+            (Ty::Float { .. }, "div_euclid") => helper("fdivEuclid", self.arg_frags(m)),
+            (Ty::Float { .. }, "copysign") => helper("copysign", self.arg_frags(m)),
+            (Ty::Float { .. }, "log") => {
+                let mut f = Frag::text("(Math.log(");
+                f.append(rf.clone())
+                    .push(") / Math.log(")
+                    .append(Frag::join(self.arg_frags(m), ", "))
+                    .push("))");
+                f
+            }
+            (Ty::Float { .. }, "abs_sub") => {
+                let mut f = Frag::text("Math.max(");
+                f.append(rf.clone())
+                    .push(" - ")
+                    .append(Frag::join(self.arg_frags(m), ", "))
+                    .push(", 0)");
+                f
+            }
+            (Ty::Float { .. }, "mul_add") => {
+                let mut all = self.arg_frags(m);
+                all.resize(2, Frag::text("0"));
+                let mut f = rf.clone().wrap("(", " * ");
+                f.append(all[0].clone())
+                    .push(" + ")
+                    .append(all[1].clone())
+                    .push(")");
+                f
+            }
+            (Ty::Float { .. }, "is_sign_negative") => helper("isSignNegative", vec![]),
+            (Ty::Float { .. }, "is_sign_positive") => {
+                helper("isSignNegative", vec![]).wrap("!", "")
+            }
+            (Ty::Float { .. }, "is_infinite") => rf.clone().wrap("(Math.abs(", ") === Infinity)"),
+            (Ty::Float { .. }, "is_normal") => helper("isNormal", vec![]),
 
             // ---- Vec
             (Ty::Vec(_), "binary_search") => {
@@ -342,6 +428,10 @@ impl Codegen<'_> {
             ["std" | "core", rest @ ..] => rest,
             all => all,
         };
+        let tail = match tail {
+            ["rc" | "sync", rest @ ..] => rest,
+            t => t,
+        };
         let start = self.off(c.syntax());
         let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
         let args: Vec<ast::Expr> = c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
@@ -400,6 +490,73 @@ impl Codegen<'_> {
                 emit(self, 0)
             }
             ["hint", "black_box"] => emit(self, 0),
+            ["Rc" | "Arc", "downgrade"] => self.emit_expr(args.first()?, None).0,
+            ["Weak", "new"] => Frag::mapped(start, "null"),
+            // (An error from the type checker.)
+            ["Rc" | "Arc", "strong_count" | "weak_count"] => Frag::mapped(start, "0"),
+            ["Rc" | "Arc", "ptr_eq"] => {
+                let a = self.emit_expr(args.first()?, None).0;
+                let b = self.emit_expr(args.get(1)?, None).0;
+                let mut f = Frag::mapped(start, "(");
+                f.append(a).push(" === ").append(b).push(")");
+                f
+            }
+            [t, "default"] if Ty::from_name(t) != Ty::Unknown => Frag::mapped(
+                start,
+                default_value(&Ty::from_name(t)).unwrap_or_else(|| "undefined".into()),
+            ),
+            ["iter", "repeat"] => call("iterRepeat", vec![emit(self, 0)]),
+            ["iter", "once"] => call("iterOnce", vec![emit(self, 0)]),
+            ["iter", "empty"] => call("iterEmpty", vec![]),
+            ["iter", "repeat_with"] => call("repeatWith", vec![emit(self, 0)]),
+            ["iter", "from_fn"] => call("fromFn", vec![emit(self, 0)]),
+            ["iter", "successors"] => call("successors", vec![emit(self, 0), emit(self, 1)]),
+            [t @ ("f64" | "f32"), "from_bits"] => {
+                let names = if *t == "f32" {
+                    "\"u32\", \"f32\""
+                } else {
+                    "\"u64\", \"f64\""
+                };
+                call("transmute", vec![emit(self, 0), Frag::text(names)])
+            }
+            // Raw pointers: `null`, identity, and cells for numbers (`[v]`).
+            ["ptr", "null" | "null_mut"] => Frag::mapped(start, "null"),
+            ["ptr", "eq" | "addr_eq"] => {
+                let a = self.emit_expr(args.first()?, None).0;
+                let b = self.emit_expr(args.get(1)?, None).0;
+                let mut f = Frag::mapped(start, "(");
+                f.append(a).push(" === ").append(b).push(")");
+                f
+            }
+            ["ptr", "read"] => {
+                let (a, t) = self.emit_expr(args.first()?, None);
+                if crate::typeck::ptr_cellable(&t) {
+                    a.wrap("(", ")[0]")
+                } else {
+                    a
+                }
+            }
+            ["Box", "into_raw"] if crate::typeck::ptr_cellable(&ty) => emit(self, 0).wrap("[", "]"),
+            ["Box", "into_raw" | "from_raw" | "leak"] => emit(self, 0),
+            ["mem", "transmute"] => {
+                let a = args.first()?;
+                let (f, t) = self.emit_expr(a, None);
+                let from = self.ty_of(a.syntax()).unwrap_or(t).default_lit();
+                let (Some(from), Some(to)) = (
+                    crate::typeck::transmute_name(&from),
+                    crate::typeck::transmute_name(&ty),
+                ) else {
+                    return Some((f, ty));
+                };
+                if from == to {
+                    f
+                } else {
+                    call(
+                        "transmute",
+                        vec![f, Frag::text(format!("\"{from}\", \"{to}\""))],
+                    )
+                }
+            }
             ["mem", "swap"] => {
                 let (a, b) = (args.first()?.clone(), args.get(1)?.clone());
                 let (af, _) = self.emit_expr(&strip_refs(&a), None);

@@ -243,6 +243,17 @@ impl Codegen<'_> {
         js_name: Option<String>,
     ) {
         let Some(name) = f.name() else { return };
+        // `T::make()` in the body: the method takes `T`'s class (as free functions do).
+        let dict_key = match &self_ty {
+            Ty::Adt(n, _) => Some(format!(
+                "{n}::{}",
+                js_name.clone().unwrap_or_else(|| name.text().to_string())
+            )),
+            _ => None,
+        };
+        let dicts = dict_key
+            .and_then(|k| self.types.dict_params.get(&k).cloned())
+            .unwrap_or_default();
         let saved_tmp = self.tmp;
         let saved_names = self.used_names.clone();
         self.tmp = 0;
@@ -289,6 +300,10 @@ impl Codegen<'_> {
                 }
             }
         }
+        for d in &dicts {
+            params.push(Frag::text(format!("${d}")));
+        }
+        let saved_dicts = std::mem::replace(&mut self.dict_scope, dicts);
         let mut header = Frag::mapped(self.item_start(f.syntax()), "");
         // (In an object literal, `close` is `},`: no `static` there.)
         if sig.receiver.is_none() && close == "}" {
@@ -323,6 +338,7 @@ impl Codegen<'_> {
         self.out.indent -= 1;
         self.close_line(close, f.body().as_ref());
         self.scopes.pop();
+        self.dict_scope = saved_dicts;
         self.tmp = saved_tmp;
         self.used_names = saved_names;
     }
@@ -539,8 +555,17 @@ impl Codegen<'_> {
                 vec![format!("$clone() {{ return {}(); }}", call("clone"))],
             );
         }
-        // `impl Iterator`: `for...of` and the runtime's iterators drive its `next`.
-        if self.types.adts.iter_items.contains_key(&def.name) {
+        // `impl IntoIterator`: `for...of` goes through its `into_iter()`.
+        if self.types.adts.into_iters.contains(&def.name) {
+            lines(
+                self,
+                vec![format!(
+                    "[Symbol.iterator]() {{ return this{}()[Symbol.iterator](); }}",
+                    super::member(&prop("into_iter"))
+                )],
+            );
+        } else if self.types.adts.iter_items.contains_key(&def.name) {
+            // `impl Iterator`: `for...of` and the runtime's iterators drive its `next`.
             lines(
                 self,
                 vec![format!(
@@ -721,7 +746,7 @@ impl Codegen<'_> {
     // ------------------------------------------------------------ expressions
 
     /// Construct variant `v` of `adt` from field values in declaration order.
-    fn construct(&self, adt: &str, v: usize, args: Vec<Frag>) -> Frag {
+    pub(super) fn construct(&self, adt: &str, v: usize, args: Vec<Frag>) -> Frag {
         let def = &self.types.adts.defs[adt];
         let cls = self.class(adt);
         let variant = &def.variants[v];
@@ -931,7 +956,18 @@ impl Codegen<'_> {
                 };
                 match sig.receiver {
                     None => {
-                        let args = self.emit_args(c.arg_list(), &sig.params);
+                        let mut args = self.emit_args(c.arg_list(), &sig.params);
+                        // The classes for `T::make()` in its body.
+                        if let Some(tys) = self
+                            .types
+                            .dict_args
+                            .get(&self.range_of(c.syntax()))
+                            .cloned()
+                        {
+                            for t in &tys {
+                                args.push(Frag::text(self.dict_of(t)));
+                            }
+                        }
                         let mut f = Frag::mapped(start, format!("{cls}.{js}("));
                         f.append(Frag::join(args, ", ")).push(")");
                         (f, ret)
@@ -994,7 +1030,18 @@ impl Codegen<'_> {
         if let Some(sig) = self.types.adts.method(adt, method).cloned()
             && sig.receiver.is_some()
         {
-            let args = self.emit_args(m.arg_list(), &sig.params);
+            let mut args = self.emit_args(m.arg_list(), &sig.params);
+            // The classes for the method's `T::make()` calls.
+            if let Some(tys) = self
+                .types
+                .dict_args
+                .get(&self.range_of(m.syntax()))
+                .cloned()
+            {
+                for t in &tys {
+                    args.push(Frag::text(self.dict_of(t)));
+                }
+            }
             let mut f = rf.clone();
             f.push(".")
                 .append(Frag::mapped(name_off, prop(method)))

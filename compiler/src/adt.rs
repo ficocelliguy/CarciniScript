@@ -119,6 +119,25 @@ pub struct Method {
     pub receiver: Option<Receiver>,
 }
 
+impl Method {
+    /// The type parameters a method can take classes for (`T::make()` in its body): its own,
+    /// and for an associated function (no `self`) also its `impl`'s, which a call names
+    /// (`Stack::<T>::make()`) or infers.
+    pub fn dict_names(&self) -> Vec<String> {
+        let mut out = self.type_params.clone();
+        if self.receiver.is_none() {
+            for a in &self.impl_args {
+                if let Ty::Param(p) = a
+                    && !out.contains(p)
+                {
+                    out.push(p.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TraitMethod {
     pub name: String,
@@ -170,8 +189,10 @@ pub struct Adts {
     /// `impl fmt::Debug for T`: the absolute offset of its `fmt`'s name, by `T`. That `fmt` is
     /// stored (and emitted) as `fmt$dbg`, apart from a `Display` impl's `fmt`.
     pub debug_fmt: HashMap<String, usize>,
-    /// `impl Iterator for T { type Item = X; .. }`: `X`, by `T`.
+    /// `impl Iterator for T { type Item = X; .. }`: `X`, by `T`. Also `impl IntoIterator`.
     pub iter_items: HashMap<String, Ty>,
+    /// Types with `impl IntoIterator` (iterated through their `into_iter()`, not `next()`).
+    pub into_iters: std::collections::HashSet<String>,
 }
 
 /// Methods every struct or enum has (derived or from the runtime), which a custom iterator's
@@ -426,6 +447,8 @@ pub fn derives_of(item: &impl HasAttrs) -> Vec<String> {
 
 /// The derives CarciniScript implements.
 pub const KNOWN_DERIVES: &[&str] = &[
+    "Serialize",
+    "Deserialize",
     "Debug",
     "Clone",
     "Copy",

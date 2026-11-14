@@ -517,7 +517,24 @@ impl Checker<'_> {
                 self.std_fns
                     .insert(alias, vec![module.to_string(), f.to_string()]);
             }
-            ["std" | "core" | "alloc", ..] | [] => {}
+            // `use js::set_timeout;` / `use js::*;`: the `js` crate's functions by name.
+            ["js", f] if self.bindings.functions.contains_key(*f) => {
+                let alias = tree
+                    .rename()
+                    .and_then(|r| r.name())
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_else(|| f.to_string());
+                self.js_imports.insert(alias, f.to_string());
+            }
+            ["js"] if tree.star_token().is_some() => {
+                let b = self.bindings.clone();
+                for f in b.functions.keys() {
+                    self.js_imports.insert(f.clone(), f.clone());
+                }
+            }
+            // The `js` crate (`use js::{Date, JSON};`), and serde's derives (accepted; `JSON`
+            // goes by types, not traits).
+            ["std" | "core" | "alloc" | "js" | "serde", ..] | [] => {}
             [first, rest @ ..] if self.module_exports.contains_key(*first) => {
                 // `use geo::shapes::area`: down through `pub mod`s first.
                 let mut module = first.to_string();

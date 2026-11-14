@@ -163,6 +163,84 @@ try {
   report(diag.includes("error"), "unsupported features → diagnostics", diag);
   await screenshot("repl-unsupported.png");
 
+  // 5. The `js` crate's DOM, storage and browser globals. Programs run in a Worker (no DOM), so
+  // this compiles in the editor and runs the module on the page itself.
+  const dom = [
+    "use js::{Element, document, local_storage, location, navigator, window};",
+    "",
+    "fn main() {",
+    "    let doc = document();",
+    "    let mut host = doc.create_element(\"div\");",
+    "    host.id = \"js-check\".to_string();",
+    "    host.inner_html = \"<p class='a'>one</p><p class='a b'>two</p><span>three</span>\".to_string();",
+    "    doc.body.append_child(&host);",
+    "    let found = doc.get_element_by_id(\"js-check\").unwrap();",
+    "    let ps: Vec<Element> = found.query_selector_all(\"p.a\");",
+    "    let texts: Vec<String> = ps.iter().map(|p| p.text_content.clone()).collect();",
+    "    println!(\"{} {:?} {}\", found.children.len(), texts, doc.query_selector(\"#nope\").is_none());",
+    "    let mut span = found.query_selector(\"span\").unwrap();",
+    "    span.class_list.add(\"hot\");",
+    "    span.set_attribute(\"data-n\", \"7\");",
+    "    span.style.color = \"red\".to_string();",
+    "    println!(\"{} {} {:?} {}\", span.tag_name, span.class_list.contains(\"hot\"), span.get_attribute(\"data-n\"), span.style.color);",
+    "    println!(\"{} {}\", span.matches(\"#js-check span.hot\"), span.closest(\"div\").unwrap().id);",
+    "    let clicks = std::rc::Rc::new(std::cell::Cell::new(0));",
+    "    let seen = clicks.clone();",
+    "    span.add_event_listener(\"click\", move |e| {",
+    "        seen.set(seen.get() + 1);",
+    "        println!(\"clicked {}\", e.r#type);",
+    "    });",
+    "    span.click();",
+    "    span.click();",
+    "    println!(\"clicks: {}\", clicks.get());",
+    "    let alias = span.clone();",
+    "    alias.class_list.add(\"shared\");",
+    "    println!(\"shared: {}\", span.class_list.contains(\"shared\"));",
+    "    host.remove();",
+    "    println!(\"removed: {}\", doc.get_element_by_id(\"js-check\").is_none());",
+    "",
+    "    let store = local_storage();",
+    "    store.set_item(\"carcini\", \"42\");",
+    "    println!(\"{:?} {:?}\", store.get_item(\"carcini\"), store.get_item(\"missing\"));",
+    "    store.remove_item(\"carcini\");",
+    "    println!(\"{:?}\", store.get_item(\"carcini\"));",
+    "",
+    "    let w = window();",
+    "    println!(\"{} {}\", w.inner_width > 0.0, w.match_media(\"(min-width: 1px)\").matches);",
+    "    println!(\"{} {}\", location().pathname, navigator().user_agent.contains(\"Mozilla\"));",
+    "}",
+  ].join("\n");
+  await evaluate(`carcini.editor.setValue(${JSON.stringify(dom)})`);
+  await waitFor("carcini.js.getValue().includes('js-check')");
+  const domOut = await evaluate(`(async () => {
+    await import(new URL("../runtime/rt.js", location.href).href);
+    const lines = [];
+    κσ.$setOutput((l) => lines.push(l), (l) => lines.push("[stderr] " + l));
+    const url = URL.createObjectURL(new Blob([carcini.js.getValue()], { type: "text/javascript" }));
+    try {
+      await (await import(url)).main();
+    } catch (e) {
+      lines.push("threw: " + (e.panicMessage ?? e.message));
+    }
+    κσ.$flush();
+    return lines.join("\\n");
+  })()`);
+  const domWant = [
+    '3 ["one", "two"] true',
+    'SPAN true Some("7") red',
+    "true js-check",
+    "clicked click",
+    "clicked click",
+    "clicks: 2",
+    "shared: true",
+    "removed: true",
+    'Some("42") None',
+    "None",
+    "true true",
+    "/web-repl/ true",
+  ].join("\n");
+  report(domOut === domWant, "js crate: DOM, storage, window", domOut === domWant ? "" : `\n${domOut}\n--- want\n${domWant}`);
+
   report(consoleErrors.length === 0, "no uncaught page errors", consoleErrors.join("\n"));
 } catch (e) {
   report(false, "browser check", e.message);

@@ -270,6 +270,35 @@ impl Checker<'_> {
             (Coll::BTreeMap, "first_key_value" | "last_key_value" | "pop_first" | "pop_last") => {
                 sig(self, &[], opt(elem))
             }
+            // `map.range(lo..hi)`: the entries whose keys are in the range, in order.
+            (Coll::BTreeMap | Coll::BTreeSet, "range") => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                let key = match view {
+                    Ty::Map(k, _) => (**k).clone(),
+                    _ => elem.clone(),
+                };
+                match args.first().map(super::strip_parens) {
+                    Some(ast::Expr::RangeExpr(r)) => {
+                        use ra_ap_syntax::ast::RangeItem;
+                        for b in [r.start(), r.end()].into_iter().flatten() {
+                            self.check(&b, &key);
+                        }
+                        self.record(r.syntax(), Ty::Unknown);
+                    }
+                    Some(other) => {
+                        self.error(
+                            other.syntax(),
+                            "`range` takes a range expression here (`a..b`, `a..=b`, `a..`, `..b`); `Bound` pairs aren't supported yet",
+                        );
+                        self.infer(&other, None);
+                    }
+                    None => {}
+                }
+                Ty::Iter {
+                    elem: Box::new(elem),
+                    mutable: false,
+                }
+            }
             (_, m2) if shared(kind, m2) => return None,
             _ => {
                 let msg = format!(

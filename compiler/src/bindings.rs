@@ -42,6 +42,13 @@ pub struct Method {
     pub ret: Ty,
     pub is_async: bool,
     pub doc: String,
+    /// No `self`: called on the type (`Date::now()`), `js` naming the whole JS callee
+    /// (`globalThis.Date.now`, `new globalThis.Date`).
+    pub is_static: bool,
+    /// `#[getter]`: the JS expression itself, not a call (`js::document()` is `globalThis.document`).
+    pub getter: bool,
+    /// `#[array]`: the result is array-like (a `NodeList`): made a JS array (`null` → empty).
+    pub array: bool,
 }
 
 // Parameter names and docs are kept for the language service (hover, signature help).
@@ -50,6 +57,8 @@ pub struct Field {
     pub js: String,
     pub ty: Ty,
     pub doc: String,
+    /// `#[array]`: an array-like value (an `HTMLCollection`), read as a JS array.
+    pub array: bool,
 }
 
 #[derive(Default)]
@@ -61,13 +70,49 @@ pub struct ExternType {
 #[derive(Default)]
 pub struct Bindings {
     pub types: HashMap<String, ExternType>,
+    /// Free functions (the `js` crate's `js::set_timeout(..)`, `js::document()`).
+    pub functions: HashMap<String, Method>,
     /// JS names Bitburner's RAM calculator charges for wherever they appear as identifiers (NS
     /// functions and namespaces). User identifiers with these names get a `$` suffix.
     pub ram_names: HashSet<String>,
 }
 
+/// The JS globals scripts reach through the `js` crate (`js::Date`): always there, next to
+/// the NS bindings.
+const JS: &str = include_str!("../../bindings/js.rs");
+
+/// `bindings` plus the JS globals' types (theirs don't count toward RAM names).
+fn with_js(mut bindings: Bindings) -> Bindings {
+    let (js, _) = parse(JS);
+    for (name, ty) in js.types {
+        bindings.types.entry(name).or_insert(ty);
+    }
+    for (name, f) in js.functions {
+        bindings.functions.entry(name).or_insert(f);
+    }
+    bindings
+}
+
 thread_local! {
-    static CURRENT: RefCell<Rc<Bindings>> = RefCell::new(Rc::new(Bindings::default()));
+    /// The type names the `js` crate declares (`Date`, `Element`, `console`, ..).
+    static JS_TYPE_NAMES: HashSet<String> = {
+        let file = SourceFile::parse(JS, EDITION).tree();
+        file.items()
+            .filter_map(|i| match i {
+                ast::Item::Struct(s) => s.name().map(|n| n.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+}
+
+/// Whether `name` is a type of the `js` crate.
+pub fn is_js_type(name: &str) -> bool {
+    JS_TYPE_NAMES.with(|t| t.contains(name))
+}
+
+thread_local! {
+    static CURRENT: RefCell<Rc<Bindings>> = RefCell::new(Rc::new(with_js(Bindings::default())));
 }
 
 /// The bindings compiles currently use.
@@ -78,7 +123,7 @@ pub fn current() -> Rc<Bindings> {
 /// Parse and install bindings. Returns problems found (the parsable parts are still installed).
 pub fn set(text: &str) -> Vec<String> {
     let (bindings, errors) = parse(text);
-    CURRENT.with(|c| *c.borrow_mut() = Rc::new(bindings));
+    CURRENT.with(|c| *c.borrow_mut() = Rc::new(with_js(bindings)));
     errors
 }
 
@@ -122,11 +167,43 @@ fn doc(item: &impl HasAttrs) -> String {
 fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
     match t {
         ast::Type::RefType(r) => r.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
+        ast::Type::PtrType(r) => r.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
         ast::Type::ParenType(p) => p.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
         ast::Type::SliceType(s) => Ty::Vec(Box::new(
             s.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
         )),
         ast::Type::TupleType(tt) if tt.fields().next().is_none() => Ty::Unit,
+        // `impl Fn(f64) -> bool`: a callback.
+        ast::Type::ImplTraitType(i) => {
+            let Some(seg) = i
+                .type_bound_list()
+                .and_then(|l| l.bounds().next())
+                .and_then(|b| match b.ty()? {
+                    ast::Type::PathType(p) => p.path()?.segment(),
+                    _ => None,
+                })
+            else {
+                return Ty::Unknown;
+            };
+            let params = seg
+                .parenthesized_arg_list()
+                .map(|l| {
+                    l.type_args()
+                        .filter_map(|a| a.ty())
+                        .map(|t| lower(&t, structs))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ret = seg
+                .ret_type()
+                .and_then(|r| r.ty())
+                .map(|t| lower(&t, structs))
+                .unwrap_or(Ty::Unit);
+            Ty::Closure {
+                params,
+                ret: Box::new(ret),
+            }
+        }
         ast::Type::PathType(p) => {
             let Some(seg) = p.path().and_then(|p| p.segment()) else {
                 return Ty::Unknown;
@@ -188,6 +265,7 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
                         js,
                         ty: lower(&fty, &structs),
                         doc: doc(&f),
+                        array: attr_value(&f, "array").is_some(),
                     };
                     ty.fields.insert(bare(fname.text()), field);
                 }
@@ -210,41 +288,15 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
                         continue;
                     };
                     let Some(fname) = f.name() else { continue };
-                    let mut params = Vec::new();
-                    let mut variadic = None;
-                    for p in f
-                        .param_list()
-                        .map(|l| l.params().collect::<Vec<_>>())
-                        .unwrap_or_default()
-                    {
-                        let pty = p.ty().map(|t| lower(&t, &structs)).unwrap_or(Ty::Unknown);
-                        if attr_value(&p, "variadic").is_some() {
-                            variadic = Some(pty);
-                            continue;
-                        }
-                        let name = p
-                            .pat()
-                            .map(|x| x.syntax().text().to_string())
-                            .unwrap_or_default();
-                        params.push(Param {
-                            name,
-                            ty: pty,
-                            optional: attr_value(&p, "optional").is_some(),
-                        });
-                    }
-                    let method = Method {
-                        js: attr_value(&f, "js").unwrap_or_else(|| bare(fname.text())),
-                        params,
-                        variadic,
-                        ret: f
-                            .ret_type()
-                            .and_then(|r| r.ty())
-                            .map(|t| lower(&t, &structs))
-                            .unwrap_or(Ty::Unit),
-                        is_async: f.async_token().is_some(),
-                        doc: doc(&f),
-                    };
-                    ty.methods.insert(bare(fname.text()), method);
+                    ty.methods
+                        .insert(bare(fname.text()), method_of(&f, &structs));
+                }
+            }
+            ast::Item::Fn(f) => {
+                if let Some(fname) = f.name() {
+                    bindings
+                        .functions
+                        .insert(bare(fname.text()), method_of(&f, &structs));
                 }
             }
             _ => {}
@@ -262,6 +314,48 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
     }
     bindings.ram_names = ram;
     (bindings, errors)
+}
+
+/// A declared function or method's signature.
+fn method_of(f: &ast::Fn, structs: &HashSet<String>) -> Method {
+    let fname = f.name().map(|n| n.text().to_string()).unwrap_or_default();
+    let mut params = Vec::new();
+    let mut variadic = None;
+    for p in f
+        .param_list()
+        .map(|l| l.params().collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let pty = p.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown);
+        if attr_value(&p, "variadic").is_some() {
+            variadic = Some(pty);
+            continue;
+        }
+        let name = p
+            .pat()
+            .map(|x| x.syntax().text().to_string())
+            .unwrap_or_default();
+        params.push(Param {
+            name,
+            ty: pty,
+            optional: attr_value(&p, "optional").is_some(),
+        });
+    }
+    Method {
+        js: attr_value(f, "js").unwrap_or_else(|| bare(&fname)),
+        params,
+        variadic,
+        ret: f
+            .ret_type()
+            .and_then(|r| r.ty())
+            .map(|t| lower(&t, structs))
+            .unwrap_or(Ty::Unit),
+        is_async: f.async_token().is_some(),
+        doc: doc(f),
+        is_static: f.param_list().and_then(|l| l.self_param()).is_none(),
+        getter: attr_value(f, "getter").is_some(),
+        array: attr_value(f, "array").is_some(),
+    }
 }
 
 /// Whether Bitburner charges RAM for an identifier named `js`.

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::{AstNode, SyntaxNode, ast};
+use ra_ap_syntax::{AstNode, SyntaxNode, ast, ast::HasName};
 
 use super::{Checker, Mutation, USIZE, VarKind};
 use crate::ty::Ty;
@@ -199,6 +199,10 @@ impl Checker<'_> {
                 self.shallow(elem),
                 Ty::Char | Ty::Str | Ty::Unknown | Ty::Var(_)
             ),
+            // `trees.collect::<TokenStream>()` in a proc-macro crate.
+            Ty::Adt(n, _) if n == "TokenStream" && self.adts.method(&n, "__push").is_some() => {
+                self.tokens_like(&Ty::Vec(Box::new(elem.clone())))
+            }
             Ty::Unknown => true,
             Ty::Var(_) => return None,
             _ => false,
@@ -257,7 +261,9 @@ impl Checker<'_> {
             Ty::Option(inner) if matches!(method, "ok_or" | "ok_or_else") => {
                 return self.option_to_result(m, *inner, method, args);
             }
-            Ty::Formatter if method == "write_str" => {
+            // `f.pad(s)`; `__pad_whole` pads without cutting to the precision (std's
+            // `Duration` in the `std::time` prelude).
+            Ty::Formatter if matches!(method, "write_str" | "pad" | "__pad_whole") => {
                 self.arg_count(m.syntax(), "method", 1, args.len());
                 if let Some(a) = args.first() {
                     self.check(a, &Ty::Str);
@@ -266,6 +272,28 @@ impl Checker<'_> {
                     Box::new(Ty::Unit),
                     Box::new(Ty::Extern("fmt::Error".into())),
                 ));
+            }
+            // The spec the value is formatted with (`{:>8.2}`).
+            Ty::Formatter
+                if matches!(
+                    method,
+                    "width"
+                        | "precision"
+                        | "fill"
+                        | "sign_plus"
+                        | "sign_minus"
+                        | "alternate"
+                        | "sign_aware_zero_pad"
+                ) =>
+            {
+                self.arg_count(m.syntax(), "method", 0, args.len());
+                return Some(match method {
+                    "width" | "precision" => {
+                        Ty::Option(Box::new(Ty::Int(crate::ty::IntKind::Usize)))
+                    }
+                    "fill" => Ty::Char,
+                    _ => Ty::Bool,
+                });
             }
             Ty::Str if method == "parse" => {
                 let target = self.turbofish(m);
@@ -740,7 +768,9 @@ impl Checker<'_> {
                     self.error(m.syntax(), msg);
                 }
                 let z = self.zonk(&target);
-                if !(z.is_numeric() || z == Ty::Unknown || self.var_kind(&target).is_some()) {
+                let own = matches!(&z, Ty::Adt(n, _) if self.adts.method(n, method).is_some());
+                if !(own || z.is_numeric() || z == Ty::Unknown || self.var_kind(&target).is_some())
+                {
                     let msg = format!("`{}` can't be summed or multiplied", self.describe(&target));
                     self.error(m.syntax(), msg);
                 }
@@ -778,6 +808,44 @@ impl Checker<'_> {
                 opt(USIZE)
             }
             // `(Vec<T>, Vec<T>)`: the items the closure accepts, then the rest.
+            // `scan(init, |state, x| ..)`: the state is a `&mut`, a cell for numbers and strings.
+            "scan" => {
+                count(self, 2);
+                let state = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
+                let r = fresh(self);
+                self.closure_arg(args.get(1), vec![state.clone(), e], opt(r.clone()));
+                if self.cellable(&state)
+                    && let Some(ast::Expr::ClosureExpr(cl)) = args.get(1)
+                    && let Some(ast::Pat::IdentPat(ip)) = cl
+                        .param_list()
+                        .and_then(|l| l.params().next())
+                        .and_then(|p| p.pat())
+                    && let Some(n) = ip.name()
+                {
+                    let r = self.range(n.syntax());
+                    self.boxed.insert(r);
+                }
+                iter(r)
+            }
+            "map_while" => {
+                count(self, 1);
+                let r = fresh(self);
+                self.closure_arg(a0, vec![e], opt(r.clone()));
+                iter(r)
+            }
+            "unzip" => {
+                count(self, 0);
+                let (x, y) = (fresh(self), fresh(self));
+                let pair = Ty::Tuple(vec![x.clone(), y.clone()]);
+                if !self.unify(&e, &pair) {
+                    let msg = format!(
+                        "`unzip` needs an iterator of pairs, found items of type `{}`",
+                        self.describe(&e)
+                    );
+                    self.error(m.syntax(), msg);
+                }
+                Ty::Tuple(vec![Ty::Vec(Box::new(x)), Ty::Vec(Box::new(y))])
+            }
             "partition" => {
                 count(self, 1);
                 self.closure_arg(a0, vec![e.clone()], Ty::Bool);
@@ -821,6 +889,9 @@ impl Checker<'_> {
                             | Ty::Option(_)
                             | Ty::Coll(..)),
                         ) => t,
+                        Some(t @ Ty::Adt(..)) if matches!(&t, Ty::Adt(n, _) if n == "TokenStream") => {
+                            t
+                        }
                         _ => fresh(self),
                     },
                 };

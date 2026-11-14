@@ -17,6 +17,11 @@ export interface CompileOutput {
   /** Source map v3 JSON, or null if there were errors. */
   sourceMap: string | null;
   diagnostics: Diagnostic[];
+  /**
+   * Files the output depends on besides its `mod` files (which it imports): the proc-macro crates
+   * it used. A host that caches compiled scripts should recompile when one of them changes.
+   */
+  dependencies: string[];
 }
 
 export function initCarciniScript(moduleOrPath?: string | URL | Request | BufferSource | WebAssembly.Module): Promise<void>;

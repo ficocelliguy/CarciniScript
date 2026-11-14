@@ -37,6 +37,8 @@ pub fn parse_error_for(t: &Ty) -> &'static str {
         Ty::Float { .. } => "ParseFloatError",
         Ty::Bool => "ParseBoolError",
         Ty::Char => "ParseCharError",
+        Ty::Str => "Infallible",
+        Ty::Adt(n, _) if n == "TokenStream" => "LexError",
         _ => "ParseIntError",
     }
 }
@@ -321,7 +323,11 @@ impl Checker<'_> {
         for (t, node) in std::mem::take(&mut self.pending_parses) {
             match self.zonk(&t) {
                 Ty::Int(k) if k.is_wide_unsupported() => {}
-                Ty::Int(_) | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Unknown => {}
+                // (`parse::<String>()` can't fail; it's how a proc macro makes a `TokenStream`.)
+                Ty::Int(_) | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str | Ty::Unknown => {}
+                // `format!(..).parse::<TokenStream>()` in a proc-macro crate.
+                Ty::Adt(n, _)
+                    if n == "TokenStream" && self.adts.defs.contains_key("TokenStream") => {}
                 Ty::Var(_) => {
                     if self.var_kind(&t) == Some(VarKind::Int) {
                         self.unify(&t, &Ty::Int(IntKind::I32));

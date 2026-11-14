@@ -350,8 +350,11 @@ impl Checker<'_> {
     /// associated function call, whose impl parameters get fresh variables).
     pub(super) fn method_inst(&mut self, m: &Method, recv_args: Option<&[Ty]>) -> Method {
         let mut map = HashMap::new();
+        // (The method's own type arguments, in order, for `T::make()` in its body.)
+        self.last_type_args.clear();
         for p in &m.type_params {
             let v = self.fresh(VarKind::General);
+            self.last_type_args.push(v.clone());
             map.insert(p.clone(), v);
         }
         for (i, ia) in m.impl_args.iter().enumerate() {
@@ -360,6 +363,10 @@ impl Checker<'_> {
                     Some(args) => args.get(i).cloned().unwrap_or(Ty::Unknown),
                     None => self.fresh(VarKind::General),
                 };
+                // (An associated function takes classes for its `impl`'s parameters too.)
+                if recv_args.is_none() && m.receiver.is_none() && !map.contains_key(u) {
+                    self.last_type_args.push(arg.clone());
+                }
                 map.insert(u.clone(), arg);
             }
         }
@@ -397,8 +404,22 @@ impl Checker<'_> {
                                 _ => None,
                             })
                             .collect();
-                        // An `F: Fn(..)` parameter is a closure type.
-                        let closure = tp.type_bound_list().and_then(|l| self.lower_fn_bounds(&l));
+                        // An `F: Fn(..)` parameter is a closure type; an `I: Iterator<Item = T>`
+                        // one, the runtime's iterator.
+                        let closure = tp.type_bound_list().and_then(|l| {
+                            if let Some(t) = self.lower_fn_bounds(&l) {
+                                return Some(t);
+                            }
+                            let item = super::bounds_iterator_item(&l)?;
+                            let elem = match item {
+                                Some(t) => self.lower_type(&t),
+                                None => self.fresh(super::VarKind::General),
+                            };
+                            Some(Ty::Iter {
+                                elem: Box::new(elem),
+                                mutable: false,
+                            })
+                        });
                         match closure {
                             Some(t) => {
                                 self.generics.insert(n.clone(), t);
@@ -466,10 +487,22 @@ impl Checker<'_> {
                     .fields()
                     .map(|f| {
                         let name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
+                        let ty = f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                        if let Some(t) = f.ty()
+                            && super::is_ptr_type(&t)
+                        {
+                            self.ptrs.fields.insert(name.clone());
+                            if self.cellable(&ty) {
+                                self.error(
+                                    t.syntax(),
+                                    "a raw pointer to a number, string or bool in a struct isn't supported yet (point at a struct holding it)",
+                                );
+                            }
+                        }
                         Field {
                             js: name.clone(),
                             name,
-                            ty: f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
+                            ty,
                         }
                     })
                     .collect(),
@@ -523,7 +556,8 @@ impl Checker<'_> {
             }
         }
         for d in &def.derives {
-            if d == "Default" && def.is_enum {
+            if (d == "Default" && def.is_enum) || matches!(d.as_str(), "Serialize" | "Deserialize")
+            {
                 continue;
             }
             // Derived impls require the trait of the type parameters (`impl<T: Clone> Clone for ..`),
@@ -636,8 +670,10 @@ impl Checker<'_> {
                 }
             }
             Some(t) if crate::adt::op_method(t).is_some() => {}
+            // `impl Sum for T`: its `sum(iter)` is what `iter.sum::<T>()` calls.
+            Some("Sum" | "Product") => {}
             // Marker traits (`unsafe impl Send for T {}`): nothing to do in JS.
-            Some("Iterator" | "Send" | "Sync" | "Unpin") => {}
+            Some("Iterator" | "IntoIterator" | "Send" | "Sync" | "Unpin") => {}
             // `deref` / `deref_mut` are ordinary methods; auto-deref calls them.
             Some("Deref") => {}
             Some("DerefMut") => {
@@ -716,16 +752,26 @@ impl Checker<'_> {
                 None => self.self_ty.clone().unwrap_or(Ty::Unknown),
             }
         });
-        let is_iter = trait_name.as_deref() == Some("Iterator");
+        let into_iter = trait_name.as_deref() == Some("IntoIterator");
+        let is_iter = trait_name.as_deref() == Some("Iterator") || into_iter;
         let output = imp
             .assoc_item_list()
             .into_iter()
             .flat_map(|l| l.assoc_items())
             .find_map(|i| match i {
-                ast::AssocItem::TypeAlias(ta) if op.is_some() || is_iter => ta.ty(),
+                // (`IntoIterator`'s `type IntoIter` isn't needed: `into_iter()` says it.)
+                ast::AssocItem::TypeAlias(ta)
+                    if op.is_some()
+                        || (is_iter && ta.name().is_some_and(|n| n.text() == "Item")) =>
+                {
+                    ta.ty()
+                }
                 _ => None,
             })
             .map(|t| self.lower_type(&t));
+        if into_iter {
+            self.adts.into_iters.insert(type_name.clone());
+        }
         // `type Item = X;`: values of the type iterate over `X`.
         if is_iter {
             let item = output.clone().unwrap_or(Ty::Unknown);
@@ -861,7 +907,8 @@ impl Checker<'_> {
                 pl.params()
                     .zip(params.iter())
                     .map(|(p, t)| {
-                        matches!(p.ty(), Some(ast::Type::RefType(r)) if r.mut_token().is_some())
+                        (matches!(p.ty(), Some(ast::Type::RefType(r)) if r.mut_token().is_some())
+                            || p.ty().is_some_and(|t| super::is_ptr_type(&t)))
                             && self.cellable(t)
                     })
                     .collect()
@@ -976,7 +1023,9 @@ impl Checker<'_> {
                         Some((n, local))
                     });
                 let own = self.enter_method_generics(&f);
+                let saved_fn = self.cur_fn.replace(format!("{type_name}::{key}"));
                 self.check_body(&f, m.params.clone(), m.ret.clone(), m.is_async, self_local);
+                self.cur_fn = saved_fn;
                 for p in own {
                     self.generics.remove(&p);
                     self.param_bounds.remove(&p);
@@ -1039,7 +1088,19 @@ impl Checker<'_> {
             }
             Resolved::Assoc(adt, m) => match self.adts.method(&adt, &m).cloned() {
                 Some(method) => {
+                    let (own_count, dict_count) =
+                        (method.type_params.len(), method.dict_names().len());
+                    let impl_args = method.impl_args.clone();
                     let method = self.method_inst(&method, None);
+                    // As a value (`parse_with(Stack::<T>::make)`): the classes go with it.
+                    if dict_count > 0 {
+                        let own = std::mem::take(&mut self.last_type_args);
+                        self.dict_turbofish(p, &own, own_count, &impl_args);
+                        let r = self.range(p.syntax());
+                        let caller = self.cur_fn.clone().unwrap_or_default();
+                        self.generic_calls
+                            .push((r, caller, format!("{adt}::{m}"), own));
+                    }
                     let mut params = method.params.clone();
                     if method.receiver.is_some() {
                         params.insert(0, Ty::Adt(adt, method.impl_args.clone()));
@@ -1059,6 +1120,44 @@ impl Checker<'_> {
                     Some(Ty::Unknown)
                 }
             },
+        }
+    }
+
+    /// Type arguments written on an associated function's path: `Type::<A>::f::<B>`. `vars`
+    /// holds the function's own type variables, then its `impl`'s (by `impl_args` order).
+    fn dict_turbofish(&mut self, p: &ast::PathExpr, vars: &[Ty], own: usize, impl_args: &[Ty]) {
+        let args_of = |seg: Option<ast::PathSegment>| -> Vec<ast::Type> {
+            seg.and_then(|s| s.generic_arg_list())
+                .map(|l| {
+                    l.generic_args()
+                        .filter_map(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let Some(path) = p.path() else { return };
+        for (v, t) in vars.iter().take(own).zip(args_of(path.segment())) {
+            let t = self.lower_type(&t);
+            self.unify(v, &t);
+        }
+        // `Punctuated::<Ident, Comma>::f`: the type's arguments, for the `impl`'s parameters.
+        let type_args = args_of(path.qualifier().and_then(|q| q.segment()));
+        let mut k = own;
+        let mut seen: Vec<String> = Vec::new();
+        for (i, ia) in impl_args.iter().enumerate() {
+            if let Ty::Param(u) = ia
+                && !seen.contains(u)
+            {
+                seen.push(u.clone());
+                if let (Some(v), Some(t)) = (vars.get(k), type_args.get(i)) {
+                    let t = self.lower_type(t);
+                    self.unify(v, &t);
+                }
+                k += 1;
+            }
         }
     }
 
@@ -1131,7 +1230,28 @@ impl Checker<'_> {
                     }
                     return Some(Ty::Unknown);
                 };
+                let (own_count, dict_count, impl_args) = self
+                    .adts
+                    .method(&adt, &m)
+                    .map(|x| {
+                        (
+                            x.type_params.len(),
+                            x.dict_names().len(),
+                            x.impl_args.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
                 let method = self.method_inst(&method, None);
+                if dict_count > 0 {
+                    let own = std::mem::take(&mut self.last_type_args);
+                    if let Some(ast::Expr::PathExpr(p)) = c.expr() {
+                        self.dict_turbofish(&p, &own, own_count, &impl_args);
+                    }
+                    let r = self.range(c.syntax());
+                    let caller = self.cur_fn.clone().unwrap_or_default();
+                    self.generic_calls
+                        .push((r, caller, format!("{adt}::{m}"), own));
+                }
                 let mut params = method.params.clone();
                 if method.receiver.is_some() {
                     params.insert(0, Ty::Adt(adt.clone(), method.impl_args.clone()));
@@ -1297,7 +1417,29 @@ impl Checker<'_> {
         if let Some(sig) = self.adts.method(adt, method).cloned()
             && sig.receiver.is_some()
         {
+            let own_params = sig.type_params.len();
             let sig = self.method_inst(&sig, Some(targs));
+            if own_params > 0 {
+                let own = std::mem::take(&mut self.last_type_args);
+                // `x.parse_args::<LitStr>()`
+                if let Some(gal) = m.generic_arg_list() {
+                    let given: Vec<ast::Type> = gal
+                        .generic_args()
+                        .filter_map(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .collect();
+                    for (v, t) in own.iter().zip(given) {
+                        let t = self.lower_type(&t);
+                        self.unify(v, &t);
+                    }
+                }
+                let r = self.range(m.syntax());
+                let caller = self.cur_fn.clone().unwrap_or_default();
+                self.generic_calls
+                    .push((r, caller, format!("{adt}::{method}"), own));
+            }
             if sig.receiver == Some(Receiver::MutRef) {
                 self.check_mutable(recv, Mutation::Borrow);
             }

@@ -134,6 +134,19 @@ impl Checker<'_> {
                 self.generics.insert(name, closure);
                 continue;
             }
+            // `I: Iterator<Item = T>`: the runtime's iterator, like `impl Iterator<Item = T>`.
+            if let Some(item) = lists.iter().find_map(super::bounds_iterator_item) {
+                let elem = match item {
+                    Some(t) => self.lower_type(&t),
+                    None => self.fresh(VarKind::General),
+                };
+                let it = Ty::Iter {
+                    elem: Box::new(elem),
+                    mutable: false,
+                };
+                self.generics.insert(name, it);
+                continue;
+            }
             let mut bounds = Vec::new();
             for (b, bnode) in bound_names(&lists) {
                 if KNOWN_BOUNDS.contains(&b.as_str()) || self.adts.traits.contains_key(&b) {

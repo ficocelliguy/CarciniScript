@@ -187,6 +187,19 @@ impl Codegen<'_> {
             Ty::Result(t, _) => (**t).clone(),
             _ => Ty::Unknown,
         };
+        if matches!(&target, Ty::Adt(n, _) if n == "TokenStream")
+            && self.types.adts.defs.contains_key("TokenStream")
+        {
+            let ts = self.construct("TokenStream", 0, vec![rf.clone()]);
+            let mut f = Frag::mapped(name_off, "κσ.Ok(");
+            f.append(ts).push(")");
+            return (f, ty);
+        }
+        if target == Ty::Str {
+            let mut f = Frag::mapped(name_off, "κσ.Ok(");
+            f.append(rf.clone()).push(")");
+            return (f, ty);
+        }
         let (name, extra) = match &target {
             Ty::Float { .. } => ("parseFloat", String::new()),
             Ty::Bool => ("parseBool", String::new()),

@@ -178,12 +178,41 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] Go to definition (also into `mod x;` files), find references and rename (`nav.rs`), in
      Bitburner's Monaco
    - [x] References and rename across files (Bitburner passes the server's `.rs` scripts)
-4. **Later:** wider std, raw pointers, proc macros, performance.
+4. **Later:** wider std, more JS globals (see FEATURES).
    (`macro_rules!` is done.)
    - [x] Optional overflow checks (debug-build semantics), with `test/debug/` against `rustc` without `-O`
-   - [x] `T::assoc()` / `T::CONST` / `T::default()` on generic `T` in free functions (hidden class
+   - [x] `T::assoc()` / `T::CONST` / `T::default()` on generic `T` in free functions and on a
+     method's own type parameters (hidden class
      arguments); default trait functions without `self`
    - [x] NLL-lite borrow warnings (and a strict mode)
+   - [x] Raw pointers as nullable references (cells for numbers), `ptr::null`/`eq`,
+     `Box::into_raw`/`from_raw`, same-size `transmute`; `unsafe { }` bodies are type-checked
+   - [x] Wider std: float bits and math, `div_euclid`/`ilog`/`isqrt`, `scan`/`unzip`/`map_while`,
+     `std::iter` sources, nested `concat`, `BTreeMap::range`, `Weak`, `u64::pow(..)` path calls
+     and `i32::max`-style method values (`ufcs.rs`)
+   - [x] Performance: bounds checks inline when the Vec and index are simple (a DP loop ran 1.6x
+     faster), iterator adapters and ranges as iterator classes instead of generators (2-3x on
+     adapter chains), `x % 7` / `x / 7` without the divide-by-zero helper. Compile time is linear
+     (about 1 ms per KB)
+   - [x] JS globals, first `js::Date` and `js::JSON` (serde_json's format and errors, by the
+     static type; `#[serde(..)]` renames), tested against serde_json through a native shim
+     crate (`test/js/`)
+   - [x] The rest of the JS globals, declared in `bindings/js.rs` (associated and free
+     functions, getters, array-like results): DOM, storage, window, location, navigator,
+     history, screen, console, Math, performance, crypto, URL, fetch, base64, timers,
+     `js::sleep`, `Promise::all` / `race`, `js::global`. Node tests (`test/js-node/`), a
+     browser-check DOM scenario, and a Bitburner RAM test for `document` / `window`
+   - [x] `std::time` (`Duration`, `Instant`, `SystemTime`) as a Rust-source prelude compiled in
+     when used, diff-tested against rustc; `js::structured_clone`; Formatter specs for
+     hand-written `Display` / `Debug` (`f.width()`, `f.precision()`, `f.pad(..)`); `impl Sum` /
+     `impl Product`; `I: Iterator<Item = T>` type parameters
+   - [x] User-written proc macros (function-like, derive, attribute) with `quote!` (nested
+     repetitions), `format_ident!`, token trees and a `syn` subset with `ParseStream` parsers,
+     `Token![..]` and `parse_quote!` (a Rust prelude stands in for
+     `proc_macro`, `proc_macro2`, `quote` and `syn`; `impl IntoIterator` support came with it): the
+     crate compiled to JS and run at compile time with a step limit (`procmacro.rs`); tests build
+     the same files with cargo (`test/procmacro/`); Bitburner recompiles a script when a macro
+     crate it uses changes
 
 ## Testing
 
