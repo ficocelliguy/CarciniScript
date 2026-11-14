@@ -58,6 +58,9 @@ async function runJs(jsPath, args = []) {
     if (e instanceof κσ.CarciniPanic) {
       code = 101;
       panic = `thread 'main' panicked at ${e.location}:\n${e.panicMessage}`;
+    } else if (e.name === "CarciniError") {
+      // `fn main() -> Result<..>` returned `Err`: rustc's process exits with 1.
+      code = 1;
     } else throw e;
   }
   κσ.$flush();
@@ -115,12 +118,19 @@ for (const dir of fs.readdirSync(path.join(here, "modules"))) {
     };
     const outRoot = path.join(outDir, `modules-${dir}`);
     fs.mkdirSync(outRoot, { recursive: true });
-    for (const f of fs.readdirSync(root).filter((f) => f.endsWith(".rs"))) {
+    // Every `.rs` file, also in subdirectories (`geo/mod.rs`), by its path from the root.
+    const files = fs
+      .readdirSync(root, { recursive: true })
+      .map((f) => f.replaceAll("\\", "/"))
+      .filter((f) => f.endsWith(".rs"));
+    for (const f of files) {
       const out = compile(read(f), f, read);
       const errors = out.diagnostics.filter((d) => d.severity === "error");
       if (errors.length) throw new Error(errors.map((d) => `${f}:${d.line}:${d.column}: ${d.message}`).join("\n"));
       // Node can't import `.rs`; the compiled modules are written as `.mjs`.
-      fs.writeFileSync(path.join(outRoot, f.replace(/\.rs$/, ".mjs")), out.code.replace(/\.rs";/g, '.mjs";'));
+      const dest = path.join(outRoot, f.replace(/\.rs$/, ".mjs"));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, out.code.replace(/\.rs";/g, '.mjs";'));
     }
     const js = await runJs(path.join(outRoot, "main.mjs"));
     const native = runNative(path.join(root, "main.rs"));
@@ -394,10 +404,9 @@ const rejected = [
   ["field access on an enum", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let e = E::B(1);\n    let v = e.v;", "10:13 no field `v` on type `E`"],
   ["Copy without Clone", "}\n#[derive(Copy)]\nstruct Q { a: i32 }\nfn f() {", "the trait bound `Q: Clone` is not satisfied"],
   ["Eq on a struct with an f64 field", "}\n#[derive(PartialEq, Eq)]\nstruct Q { a: f64 }\nfn f() {", "the trait `Eq` is not implemented for `f64` (field `a` of `Q`)"],
-  ["generic struct", "}\nstruct W<T> { v: T }\nfn f() {", "3:9 generic structs are not supported yet"],
   ["mutating through &self", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&self) { self.a = 1; } }\nfn f() {", "4:24 cannot borrow `*self` as mutable, as it is behind a `&` reference"],
   ["&mut self method on an immutable binding", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&mut self) { self.a = 1; } }\nfn g() {\n    let q = Q { a: 0 };\n    q.f();", "7:5 cannot borrow `q` as mutable, as it is not declared as mutable"],
-  ["trait impls", "}\nstruct Q;\nimpl Clone for Q { fn clone(&self) -> Q { Q } }\nfn f() {", "4:6 `impl Clone for ..` is not supported yet"],
+  ["trait impls", "}\nstruct Q;\nimpl std::hash::Hash for Q { fn hash<H: std::hash::Hasher>(&self, h: &mut H) {} }\nfn f() {", "4:6 `impl Hash for ..` is not supported yet"],
   ["`<` on a type parameter without PartialOrd", "}\nfn big<T>(a: T, b: T) -> bool {\n    a > b", "4:5 comparing with `<` on type parameter `T` needs a bound: add `T: PartialOrd`"],
   ["generic call with an unsatisfied bound", "}\nfn show<T: std::fmt::Display>(x: T) {}\nfn f() {\n    show(vec![1]);", "5:5 the trait bound `Vec<i32>: Display` is not satisfied"],
   ["division on a type parameter", "}\nfn half<T: Copy>(x: T, y: T) -> T {\n    x / y", "4:5 `/` on type parameter `T` isn't supported"],
@@ -409,13 +418,63 @@ const rejected = [
   ["generic call with an unimplemented user trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn g<X: T>(x: X) -> i32 { x.a() }\nfn f() {\n    g(5);", "7:5 the trait bound `i32: T` is not satisfied"],
   ["unknown method on dyn Trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } }\nfn f() {\n    let d: Box<dyn T> = Box::new(S);\n    d.c();", "8:5 no method named `c` found for `dyn T`"],
   ["Box<dyn Trait> of a type without the impl", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn f() {\n    let d: Box<dyn T> = Box::new(S);", "6:34 the trait bound `S: T` is not satisfied"],
-  ["trait function without self", "}\ntrait M { fn make() -> Self; }\nfn f() {", "3:14 trait functions without `self` are not supported yet"],
+  ["default trait function without self", "}\ntrait M { fn make() -> i32 { 1 } }\nfn f() {", "3:14 default trait functions without `self` are not supported yet"],
+  ["calling a trait function on a type parameter", "}\ntrait M { fn make() -> Self; }\nfn g<T: M>() -> T {\n    T::make()\n}\nfn f() {", "5:5 calling `T::make()` on a type parameter isn't supported"],
   ["non-exhaustive slice match names the missing length", "let v = vec![1];\n    match v.as_slice() { [] => {}, [x] => {} }", "3:11 non-exhaustive patterns: `[_, _, ..]` not covered"],
   ["break with a value from a while loop", "while true { break 5; }", "2:18 `break` with value from a `while` or `for` loop"],
   ["break outside a loop", "break;", "2:5 `break` outside of a loop"],
   ["loop breaking with different types", "let x = loop { if true { break 1; } break \"s\"; };", "2:47 mismatched types: expected `{integer}`, found `String`"],
-  ["`&mut` to a number field passed to a function", "}\nstruct P { x: i32 }\nfn bump(v: &mut i32) { *v += 1; }\nfn f() {\n    let mut p = P { x: 1 };\n    bump(&mut p.x);", "7:15 passing a `&mut` to a number, string or bool inside a struct, tuple or Vec isn't supported yet"],
+  ["`&mut` to a number field of a call's result", "}\nstruct P { x: i32 }\nfn make() -> P { P { x: 1 } }\nfn bump(v: &mut i32) { *v += 1; }\nfn f() {\n    bump(&mut make().x);", "7:15 passing a `&mut` to a number, string or bool inside a struct, tuple or Vec isn't supported yet"],
+  ["keeping a `&mut` to an `Option` field in a variable", "}\nstruct T { root: Option<i32> }\nfn f() {\n    let mut t = T { root: None };\n    let cur = &mut t.root;\n    *cur = Some(1);", "6:15 keeping a `&mut` to a `Option<i32>` inside a struct, tuple or Vec in a variable isn't supported yet"],
   ["two nested functions with the same name", "}\nfn b() { fn h() {} }\nfn c() { fn h() {} }\nfn d() {", "4:13 the name `h` is defined multiple times"],
+  ["wrong type into a Stack<i32>", "}\nstruct Stack<T> { items: Vec<T> }\nimpl<T> Stack<T> { fn new() -> Self { Stack { items: Vec::new() } } fn push(&mut self, x: T) { self.items.push(x); } }\nfn f() {\n    let mut s: Stack<i32> = Stack::new();\n    s.push(\"x\");", "7:12 mismatched types: expected `i32`, found `String`"],
+  ["a generic struct's type inferred from first use", "}\nstruct Stack<T> { items: Vec<T> }\nimpl<T> Stack<T> { fn new() -> Self { Stack { items: Vec::new() } } fn push(&mut self, x: T) { self.items.push(x); } }\nfn f() {\n    let mut s = Stack::new();\n    s.push(1);\n    s.push(2.5);", "8:12 mismatched types: expected `{integer}`, found `{float}`"],
+  ["use after `let b = a`", "let a = vec![1];\n    let b = a;\n    println!(\"{:?} {:?}\", a, b);", "4:27 use of moved value: `a` (moved on line 3:13 by `let`"],
+  ["use after passing to a function", "}\nfn take(v: Vec<i32>) -> usize { v.len() }\nfn f() {\n    let v = vec![1];\n    take(v);\n    v.len();", "7:5 use of moved value: `v` (moved on line 6:10 as an argument"],
+  ["use after a `for` loop", "let v = vec![1, 2];\n    for x in v { println!(\"{x}\"); }\n    v.len();", "4:5 use of moved value: `v` (moved on line 3:14 by a `for` loop"],
+  ["use after `into_iter()`", "let v = vec![1];\n    let it = v.into_iter();\n    v.len();", "4:5 use of moved value: `v` (moved on line 3:14 by a method that takes `self`"],
+  ["a move in a previous loop iteration", "}\nfn take(s: String) {}\nfn f() {\n    let s = String::from(\"a\");\n    for _ in 0..3 {\n        take(s);\n    }", "7:14 use of moved value: `s` (moved here as an argument in the loop's previous iteration"],
+  ["use after a `move` closure", "let v = vec![1];\n    let f = move || v.len();\n    v.len();", "4:5 use of moved value: `v` (moved on line 3:13 into a `move` closure"],
+  ["use after a `self` method", "}\nstruct P { x: i32 }\nimpl P { fn eat(self) -> i32 { self.x } }\nfn f() {\n    let p = P { x: 1 };\n    p.eat();\n    p.x;", "8:5 use of moved value: `p` (moved on line 7:5 by a method that takes `self`"],
+  ["use after `String + &str`", "let s = String::from(\"a\");\n    let t = s + \"b\";\n    println!(\"{s}{t}\");", "4:5 use of moved value: `s` (moved on line 3:13 by `+`"],
+  ["use after a move in one branch", "}\nfn take(v: Vec<i32>) {}\nfn f() {\n    let v = vec![1];\n    if v.len() > 3 { take(v); }\n    v.len();", "7:5 use of moved value: `v` (moved on line 6:27 as an argument"],
+  ["use after a move into a struct", "}\nstruct W { v: Vec<i32> }\nfn f() {\n    let v = vec![1];\n    let w = W { v };\n    v.len();", "7:5 use of moved value: `v` (moved on line 6:17 into a struct"],
+  ["`Y::from` with no matching impl", "}\nstruct V(i64);\nimpl From<i64> for V { fn from(n: i64) -> Self { V(n) } }\nfn f() {\n    let v = V::from(1.5);", "6:13 the trait bound `V: From<{float}>` is not satisfied (`V` implements `From<i64>`)"],
+  ["`.into()` with no matching impl", "}\nstruct V(i64);\nimpl From<i64> for V { fn from(n: i64) -> Self { V(n) } }\nfn f() {\n    let v: V = \"x\".into();", "6:16 the trait bound `V: From<String>` is not satisfied"],
+  ["`.into()` with no target type", "}\nstruct V(i64);\nimpl From<i64> for V { fn from(n: i64) -> Self { V(n) } }\nfn f() {\n    let v = 5i64.into();", "6:13 type annotations needed: say what `.into()` converts to"],
+  ["`?` without a `From` impl for the error", "}\nstruct A;\nstruct B;\nfn g() -> Result<i32, A> { Err(A) }\nfn h() -> Result<i32, B> {\n    let x = g()?;\n    Ok(x)", "7:13 `?` couldn't convert the error to `B` (add `impl From<A> for B`"],
+  ["lossy `.into()`", "let a: i64 = 5;\n    let b: i32 = a.into();", "3:18 the trait bound `i32: From<i64>` is not satisfied"],
+  ["`Vec` method on a `VecDeque`", "let mut q = std::collections::VecDeque::new();\n    q.push(1);", "3:5 no method named `push` found for `VecDeque<_>`"],
+  ["push_back on an immutable `VecDeque`", "let q: std::collections::VecDeque<i32> = std::collections::VecDeque::new();\n    q.push_back(1);", "3:5 cannot borrow `q` as mutable, as it is not declared as mutable"],
+  ["float keys in a `BTreeSet`", "let mut s = std::collections::BTreeSet::new();\n    s.insert(1.5);", "2:13 the trait bound `f64: Ord` is not satisfied"],
+  ["wrong item type in a `BinaryHeap`", "let mut h = std::collections::BinaryHeap::new();\n    h.push(1);\n    h.push(\"x\");", "4:12 mismatched types: expected `{integer}`, found `String`"],
+  ["struct without `Ord` as a `BTreeMap` key", "}\n#[derive(PartialEq, Eq)]\nstruct K(i32);\nfn f() {\n    let mut m = std::collections::BTreeMap::new();\n    m.insert(K(1), 2);", "6:13 the trait bound `K: Ord` is not satisfied"],
+  ["`cmp::max` on floats", "let m = std::cmp::max(1.5, 2.0);", "2:13 the trait bound `{float}: Ord` is not satisfied (floats aren't totally ordered; use `a.max(b)` on `f64`)"],
+  ["operator with no impl for the right operand", "}\n#[derive(Clone, Copy)]\nstruct V(f64);\nimpl std::ops::Add for V { type Output = V; fn add(self, o: V) -> V { V(self.0 + o.0) } }\nfn f() {\n    let v = V(1.0) + 2.0;", "7:13 no implementation for `V + {float}` (`V` implements `Add<V>`)"],
+  ["operator with no impl at all", "}\n#[derive(Clone, Copy)]\nstruct V(f64);\nimpl std::ops::Add for V { type Output = V; fn add(self, o: V) -> V { V(self.0 + o.0) } }\nfn f() {\n    let v = V(1.0) * V(2.0);", "7:13 cannot apply `*` to `V` and `V` (add `impl Mul<V> for V` from `std::ops`)"],
+  ["`+=` without `AddAssign`", "}\n#[derive(Clone, Copy)]\nstruct V(f64);\nimpl std::ops::Add for V { type Output = V; fn add(self, o: V) -> V { V(self.0 + o.0) } }\nfn f() {\n    let mut v = V(1.0);\n    v += V(2.0);", "8:5 cannot apply `+=` to `V` and `V`"],
+  ["unary minus without `Neg`", "}\n#[derive(Clone, Copy)]\nstruct V(f64);\nimpl std::ops::Add for V { type Output = V; fn add(self, o: V) -> V { V(self.0 + o.0) } }\nfn f() {\n    let v = -V(1.0);", "7:13 cannot apply unary operator `-` to type `V`"],
+  ["a type error inside a `From` impl", "}\nstruct A(i32);\nimpl From<i32> for A {\n    fn from(n: i32) -> Self { A(\"x\") }\n}\nfn f() {", "5:33 mismatched types: expected `i32`, found `String`"],
+  ["indexing by a type without an `Index` impl", "}\nstruct G(Vec<i32>);\nimpl std::ops::Index<usize> for G { type Output = i32; fn index(&self, i: usize) -> &i32 { &self.0[i] } }\nfn f() {\n    let g = G(vec![1]);\n    let x = g[\"a\"];", "7:13 the type `G` cannot be indexed by `String`"],
+  ["assigning through `IndexMut`", "}\nstruct G(Vec<i32>);\nimpl std::ops::Index<usize> for G { type Output = i32; fn index(&self, i: usize) -> &i32 { &self.0[i] } }\nfn f() {\n    let mut g = G(vec![1]);\n    g[0] = 2;", "7:5 assigning to an element through `IndexMut` isn't supported yet"],
+  ["use of a `let x;` never assigned", "let x: i32;\n    println!(\"{}\", x);", "3:20 used binding `x` isn't initialized"],
+  ["use of a `let x;` assigned on one path", "}\nfn c() -> bool { true }\nfn f() {\n    let x;\n    if c() { x = 1; }\n    println!(\"{}\", x);", "7:20 used binding `x` is possibly-uninitialized"],
+  ["assigning an immutable `let x;` twice", "let x;\n    x = 1;\n    x = 2;", "4:5 cannot assign twice to immutable variable `x`"],
+  ["assigning an immutable `let x;` in a loop", "let x;\n    for i in 0..3 {\n        x = i;\n    }", "4:9 cannot assign twice to immutable variable `x`"],
+  ["assigning into a range of a Vec", "let mut v = vec![1, 2, 3];\n    v[0..2][1] = 9;", "3:5 writing through a range of a Vec (`v[a..b]`) isn't supported yet"],
+  ["`iter_mut` on a range of a Vec", "let mut v = vec![1, 2, 3];\n    for x in v[1..].iter_mut() {\n        *x += 1;\n    }", "3:14 writing through a range of a Vec (`v[a..b]`) isn't supported yet"],
+  ["a trait const the impl leaves out", "}\ntrait U { const S: f64; }\nstruct M;\nimpl U for M {}\nfn f() {", "5:12 not all trait items implemented, missing: `S`"],
+  ["an associated const of the wrong type", "}\nstruct G;\nimpl G { const W: usize = \"wide\"; }\nfn f() {", "4:27 mismatched types: expected `usize`, found `String`"],
+  ["an associated const that doesn't exist", "}\nstruct G;\nimpl G { const W: usize = 3; }\nfn f() {\n    let h = G::H;", "6:13 no function or associated item named `H` found for struct `G`"],
+  ["`{:x}` on a string", "let s = \"a\";\n    println!(\"{:x}\", s);", "doesn't implement `std::fmt::LowerHex`"],
+  ["a width argument that isn't `usize`", "let w = 2.5;\n    println!(\"{:w$}\", 1);", "a width or precision must be `usize`, found `{float}`"],
+  ["`{}` on a `VecDeque`", "let q: std::collections::VecDeque<i32> = std::collections::VecDeque::new();\n    println!(\"{}\", q);", "`VecDeque<i32>` doesn't implement `std::fmt::Display`"],
+  ["casting to a trait object the type doesn't implement", "}\ntrait T { fn f(&self); }\nstruct S;\nfn g() {\n    let b = Box::new(S) as Box<dyn T>;", "6:22 the trait bound `S: T` is not satisfied"],
+  ["`get_mut` on a Vec of numbers", "let mut v = vec![1, 2];\n    if let Some(x) = v.get_mut(0) {\n        *x += 1;\n    }", "3:22 `Vec::get_mut` on a Vec of `{integer}` isn't supported"],
+  ["`impl PartialOrd` without `PartialEq`", "}\nstruct T(i32);\nimpl PartialOrd for T {\n    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { self.0.partial_cmp(&o.0) }\n}\nfn f() {", "4:1 the trait bound `T: PartialEq` is not satisfied (`PartialOrd` requires it"],
+  ["a macro call no rule matches", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a = twice!();", "7:13 no rules of `macro_rules! twice` matched this invocation"],
+  ["a type error inside a macro expansion", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a: i32 = twice!(\"s\");", "7:18 mismatched types: expected `i32`, found `String`"],
+  ["a type error after a macro expansion keeps its position", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a = twice!(1);\n    let b: String = a;", "8:21 mismatched types: expected `String`, found `{integer}`"],
   ["mixed arithmetic", "let a: i32 = 1;\n    let b: f64 = 2.0;\n    let c = a + b;", "4:13 cannot add `f64` to `i32`"],
 ];
 for (const [label, body, want] of rejected) {
@@ -430,7 +489,7 @@ for (const [label, body, want] of rejected) {
 
 // Modules: each case is a set of files; the first is compiled.
 const rejectedFiles = [
-  ["module file not found", { "main.rs": "mod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `nope.rs`)"],
+  ["module file not found", { "main.rs": "mod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `nope.rs` and `nope/mod.rs`)"],
   [
     "importing a private function",
     { "main.rs": "mod u;\nuse u::secret;\nfn main() {}", "u.rs": "fn secret() {}" },
@@ -491,6 +550,48 @@ for (const [label, files, want] of rejectedFiles) {
       true,
     ],
   ];
+  // `///` doc comments show in hover.
+  const documented = [
+    "/// A server we can hack.",
+    "struct Target {",
+    "    /// Hostname, e.g. `n00dles`.",
+    "    host: String,",
+    "}",
+    "impl Target {",
+    "    /// Seconds until the next hack.",
+    "    fn wait(&self) -> f64 { 1.0 }",
+    "}",
+    "/// Doubles a number.",
+    "fn double(x: i32) -> i32 { x * 2 }",
+    "fn main() {",
+    "    let t = Target { host: String::new() };",
+    "    let w = t.wait();",
+    "    let d = double(2);",
+    "    let h = t.host;",
+    "}",
+  ].join("\n");
+  // Files with `macro_rules!`: the service works on the expansion, positions stay the user's.
+  const withMacro = [
+    "macro_rules! many {",
+    "    ($($x:expr),*) => {{ let mut v = Vec::new(); $( v.push($x); )* v }};",
+    "}",
+    "fn main() {",
+    "    let nums = many!(1, 2, 3, 4, 5, 6, 7, 8, 9);",
+    "    let total: i32 = nums.iter().sum();",
+    "    total.",
+    "}",
+  ].join("\n");
+  checks.push(
+    ["hover on a binding a macro made", () => hover(withMacro, "mac.rs", 5, 10)?.contents, "nums: Vec<i32>"],
+    ["hover after a macro keeps its position", () => { const h = hover(withMacro, "mac.rs", 6, 10); return h && `${h.line}:${h.column}-${h.endColumn} ${h.contents}`; }, "6:9-14 ```rust\ntotal: i32"],
+    ["completions after a macro", () => completions(withMacro, "mac.rs", 7, 11).some((c) => c.label === "checked_add"), true],
+  );
+  checks.push(
+    ["doc comment of a method", () => hover(documented, "doc.rs", 14, 15)?.contents, "Seconds until the next hack."],
+    ["doc comment of a called function", () => hover(documented, "doc.rs", 15, 13)?.contents, "fn double(x: i32) -> i32\n```\n\nDoubles a number."],
+    ["doc comment of a declared function", () => hover(documented, "doc.rs", 11, 4)?.contents, "Doubles a number."],
+    ["doc comment of a field", () => hover(documented, "doc.rs", 16, 15)?.contents, "Hostname, e.g. `n00dles`."],
+  );
   for (const [label, run, want] of checks) {
     const name = `service: ${label}`;
     try {

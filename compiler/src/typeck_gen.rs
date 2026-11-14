@@ -101,11 +101,14 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
         Ty::Vec(e) => Ty::Vec(s(e)),
         Ty::Option(e) => Ty::Option(s(e)),
         Ty::Set(e) => Ty::Set(s(e)),
+        Ty::Coll(k, e) => Ty::Coll(*k, s(e)),
         Ty::Future(e) => Ty::Future(s(e)),
         Ty::Map(k, v) => Ty::Map(s(k), s(v)),
         Ty::Entry(k, v) => Ty::Entry(s(k), s(v)),
         Ty::Result(k, v) => Ty::Result(s(k), s(v)),
         Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst(e, m)).collect()),
+        Ty::Adt(n, args) => Ty::Adt(n.clone(), args.iter().map(|a| subst(a, m)).collect()),
+        Ty::RefCell(x) => Ty::RefCell(s(x)),
         Ty::Iter { elem, mutable } => Ty::Iter {
             elem: s(elem),
             mutable: *mutable,
@@ -225,7 +228,7 @@ impl Checker<'_> {
             "Sized" => true,
             "Display" | "ToString" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
-                Ty::Adt(n) => self.adts.defs.get(n).is_some_and(|d| d.display),
+                Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| d.display),
                 Ty::Extern(n) => super::is_std_error(n),
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
@@ -244,7 +247,7 @@ impl Checker<'_> {
             },
             tr if self.adts.traits.contains_key(tr) => self.implements_user_trait(t, tr),
             "Copy" => match t {
-                Ty::Vec(_) | Ty::Str | Ty::Set(_) | Ty::Map(..) => false,
+                Ty::Vec(_) | Ty::Str | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) => false,
                 other => self.implements(other, "Copy"),
             },
             other => self.implements(t, other),

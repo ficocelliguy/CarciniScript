@@ -15,8 +15,7 @@ use ra_ap_syntax::{
 };
 
 use super::{
-    Codegen, Dest, Frag, Local, PatCode, debug_fn, default_value, escape_ident, is_pure, member,
-    strip_refs,
+    Codegen, Dest, Frag, Local, PatCode, default_value, escape_ident, is_pure, member, strip_refs,
 };
 use crate::adt::{AdtDef, Resolved, Shape, Variant};
 use crate::bindings;
@@ -37,7 +36,7 @@ pub(super) fn prop(name: &str) -> String {
 fn access(v: &Variant, i: usize) -> String {
     match v.shape {
         Shape::Tuple => format!("[{i}]"),
-        _ => member(&prop(&v.fields[i].name)),
+        _ => member(&prop(&v.fields[i].js)),
     }
 }
 
@@ -68,8 +67,8 @@ fn eq_of(ty: &Ty, a: &str, b: &str) -> String {
     }
 }
 
-fn dbg_of(ty: &Ty, e: &str) -> String {
-    match debug_fn(ty) {
+fn dbg_of(ty: &Ty, e: &str, params: &HashMap<String, String>) -> String {
+    match super::debug_fn_in(ty, params) {
         Some(f) => format!("{f}({e})"),
         None => format!("String({e})"),
     }
@@ -158,8 +157,23 @@ impl Codegen<'_> {
                 .into_iter()
                 .flat_map(|l| l.assoc_items())
             {
-                if let ast::AssocItem::Fn(f) = item {
-                    self.emit_class_method(&f, &def);
+                match item {
+                    ast::AssocItem::Fn(f) => self.emit_class_method(&f, &def),
+                    // `static W = 3;`: read as `Grid.W`.
+                    ast::AssocItem::Const(k) => {
+                        let (Some(n), Some(body)) = (k.name(), k.body()) else {
+                            continue;
+                        };
+                        let ty = k.ty().map(|t| self.lower_type(&t));
+                        let (f, _) = self.emit_expr(&body, ty.as_ref());
+                        let mut line = Frag::mapped(
+                            self.off(k.syntax()),
+                            format!("static {} = ", escape_ident(n.text())),
+                        );
+                        line.append(f).push(";");
+                        self.line(line);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -173,20 +187,28 @@ impl Codegen<'_> {
 
     fn emit_class_method(&mut self, f: &ast::Fn, def: &AdtDef) {
         let Some(name) = f.name() else { return };
-        let Some(sig) = self
-            .types
-            .adts
-            .method(&def.name, name.text().to_string().as_str())
-            .cloned()
-        else {
+        let key = self.types.adts.method_key(
+            &def.name,
+            name.text().to_string().as_str(),
+            self.off(name.syntax()),
+        );
+        let Some(sig) = self.types.adts.method(&def.name, &key).cloned() else {
             return;
         };
-        self.emit_method_fn(f, sig, Ty::Adt(def.name.clone()), "}");
+        let js = (key != name.text()).then_some(key);
+        self.emit_method_fn(f, sig, Ty::Adt(def.name.clone(), vec![]), "}", js);
     }
 
     /// A method in JS method syntax (`[static] [async] name(params) { .. }`), for a class body or
     /// an object literal (`close` is then `},`). `self_ty` is the type `self` has.
-    fn emit_method_fn(&mut self, f: &ast::Fn, sig: crate::adt::Method, self_ty: Ty, close: &str) {
+    fn emit_method_fn(
+        &mut self,
+        f: &ast::Fn,
+        sig: crate::adt::Method,
+        self_ty: Ty,
+        close: &str,
+        js_name: Option<String>,
+    ) {
         let Some(name) = f.name() else { return };
         let saved_tmp = self.tmp;
         let saved_names = self.used_names.clone();
@@ -239,7 +261,11 @@ impl Codegen<'_> {
         header
             .append(Frag::mapped(
                 self.off(name.syntax()),
-                prop(name.text().to_string().as_str()),
+                prop(
+                    js_name
+                        .as_deref()
+                        .unwrap_or(name.text().to_string().as_str()),
+                ),
             ))
             .push("(")
             .append(Frag::join(params, ", "))
@@ -254,6 +280,83 @@ impl Codegen<'_> {
         self.scopes.pop();
         self.tmp = saved_tmp;
         self.used_names = saved_names;
+    }
+
+    /// `class $ext$f64 { .. }`: the user trait methods of a built-in type, called as
+    /// `$ext$f64.prototype.money.call(x)`. Inherited default methods are compiled again here with
+    /// the concrete `self` type, so their calls on `self` resolve the same way.
+    pub(super) fn emit_ext_class(&mut self, key: &str, impls: &[ast::Impl]) {
+        let self_ty = match key {
+            "String" => Ty::Str,
+            "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+            "bool" => Ty::Bool,
+            "char" => Ty::Char,
+            k => Ty::from_name(k),
+        };
+        self.line(Frag::text(format!("class $ext${key} {{")));
+        self.out.indent += 1;
+        let mut given: Vec<String> = Vec::new();
+        let mut traits: Vec<String> = Vec::new();
+        for imp in impls {
+            if let (Some(tr), _) = crate::adt::impl_parts(imp) {
+                traits.push(tr);
+            }
+            for item in imp
+                .assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+            {
+                if let ast::AssocItem::Fn(f) = item
+                    && let Some(n) = f.name()
+                    && let Some(sig) = self.types.adts.method(key, n.text()).cloned()
+                {
+                    given.push(n.text().to_string());
+                    self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
+                }
+            }
+        }
+        // Default methods the impls don't override, from the trait declarations in this file.
+        let defaults: Vec<ast::Fn> = self
+            .file_traits
+            .iter()
+            .filter(|t| {
+                t.name()
+                    .is_some_and(|n| traits.contains(&n.text().to_string()))
+            })
+            .flat_map(|t| {
+                t.assoc_item_list()
+                    .into_iter()
+                    .flat_map(|l| l.assoc_items())
+            })
+            .filter_map(|i| match i {
+                ast::AssocItem::Fn(f) if f.body().is_some() => Some(f),
+                _ => None,
+            })
+            .filter(|f| {
+                f.name()
+                    .is_some_and(|n| !given.contains(&n.text().to_string()))
+            })
+            .collect();
+        for f in defaults {
+            let Some(n) = f.name() else { continue };
+            if let Some(sig) = self.types.adts.method(key, n.text()).cloned() {
+                self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
+            }
+        }
+        self.out.indent -= 1;
+        self.line(Frag::text("}"));
+        // Found by `κσ.$dcall` when a generic function calls the method on a built-in value.
+        let (kind, integral) = match key {
+            "String" | "char" => ("string", false),
+            "bool" => ("boolean", false),
+            "Vec" => ("array", false),
+            "f32" | "f64" => ("number", false),
+            _ => ("number", true),
+        };
+        self.line(Frag::text(format!(
+            "κσ.$extReg(\"{kind}\", $ext${key}, {integral});"
+        )));
+        self.line(Frag::default());
     }
 
     /// `export const Trait$defaults = { method() { .. }, .. };`: a trait's default methods, which
@@ -288,7 +391,7 @@ impl Codegen<'_> {
             let Some(tm) = def.methods.iter().find(|m| m.name == n.text()) else {
                 continue;
             };
-            self.emit_method_fn(&f, tm.sig.clone(), Ty::Param("Self".into()), "},");
+            self.emit_method_fn(&f, tm.sig.clone(), Ty::Param("Self".into()), "},", None);
         }
         self.out.indent -= 1;
         self.line(Frag::text("};"));
@@ -331,6 +434,54 @@ impl Codegen<'_> {
                 cg.line(Frag::text(l));
             }
         };
+        // Hand-written `impl Ord` / `PartialOrd` / `PartialEq` / `Clone`: the runtime's
+        // comparisons and copies call `$cmp` / `$eq` / `$clone`, which forward to them.
+        let manual = |t: &str| def.manual.iter().any(|m| m == t);
+        let call = |m: &str| format!("this{}", super::member(&prop(m)));
+        if manual("Ord") {
+            lines(
+                self,
+                vec![format!("$cmp(o) {{ return {}(o); }}", call("cmp"))],
+            );
+        } else if manual("PartialOrd") {
+            // `None` (incomparable) makes every `<`/`>` false, like NaN.
+            lines(
+                self,
+                vec![format!(
+                    "$cmp(o) {{ return {}(o) ?? NaN; }}",
+                    call("partial_cmp")
+                )],
+            );
+        }
+        if manual("PartialEq") {
+            lines(
+                self,
+                vec![format!("$eq(o) {{ return {}(o); }}", call("eq"))],
+            );
+        }
+        if manual("Clone") {
+            lines(
+                self,
+                vec![format!("$clone() {{ return {}(); }}", call("clone"))],
+            );
+        }
+        // `impl Iterator`: `for...of` and the runtime's iterators drive its `next`.
+        if self.types.adts.iter_items.contains_key(&def.name) {
+            lines(
+                self,
+                vec![format!(
+                    "[Symbol.iterator]() {{ return {{ next: () => {{ const v = this{}(); return v == null ? {{ done: true, value: undefined }} : {{ done: false, value: v }}; }} }}; }}",
+                    super::member(&prop("next"))
+                )],
+            );
+        }
+        // `impl fmt::Debug`: `{:?}` writes through its `fmt` (emitted as `fmt$dbg`).
+        if manual("Debug") {
+            lines(
+                self,
+                vec!["$dbg() { const f = { s: \"\" }; this.fmt$dbg(f); return f.s; }".to_string()],
+            );
+        }
         // Per-variant bodies, switched on `$tag` for enums.
         let per_variant = |def: &AdtDef,
                            body: &dyn Fn(usize, &Variant) -> String,
@@ -428,7 +579,14 @@ impl Codegen<'_> {
             lines(self, ls);
         }
         if def.derives("Debug") {
-            let mut ls = vec!["$dbg() {".to_string()];
+            // `$fs[i]` formats type parameter `i` (callers that know the type pass them).
+            let params: HashMap<String, String> = def
+                .type_params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.clone(), format!("($fs[{i}] ?? κσ.$dbgAny)")))
+                .collect();
+            let mut ls = vec!["$dbg(...$fs) {".to_string()];
             ls.extend(per_variant(
                 def,
                 &|_, v| {
@@ -436,7 +594,7 @@ impl Codegen<'_> {
                         .fields
                         .iter()
                         .enumerate()
-                        .map(|(k, f)| dbg_of(&f.ty, &format!("this{}", access(v, k))))
+                        .map(|(k, f)| dbg_of(&f.ty, &format!("this{}", access(v, k)), &params))
                         .collect();
                     match v.shape {
                         Shape::Unit => format!("return {};", super::js_string(&v.name)),
@@ -564,7 +722,10 @@ impl Codegen<'_> {
                     }
                 })
                 .collect();
-            return (self.construct(&adt, v, args).at(start), Ty::Adt(adt));
+            return (
+                self.construct(&adt, v, args).at(start),
+                Ty::Adt(adt, vec![]),
+            );
         }
         // `((a, b, base) => new Point(b, a, base.z))(exprA, exprB, base)`
         let params: Vec<String> = (0..given.len()).map(|k| format!("$f{k}")).collect();
@@ -595,7 +756,7 @@ impl Codegen<'_> {
             .push(")(")
             .append(Frag::join(call_args, ", "))
             .push(")");
-        (f.at(start), Ty::Adt(adt))
+        (f.at(start), Ty::Adt(adt, vec![]))
     }
 
     /// A path naming a unit struct or variant, a tuple constructor, or an associated function
@@ -607,16 +768,34 @@ impl Codegen<'_> {
                 let cls = self.class(&adt);
                 let variant = &def.variants[v];
                 match (variant.shape, def.is_enum) {
-                    (Shape::Unit, true) => {
-                        (Frag::text(format!("{cls}.{}", variant.name)), Ty::Adt(adt))
+                    (Shape::Unit, true) => (
+                        Frag::text(format!("{cls}.{}", variant.name)),
+                        Ty::Adt(adt, vec![]),
+                    ),
+                    (Shape::Unit, false) => {
+                        (Frag::text(format!("new {cls}()")), Ty::Adt(adt, vec![]))
                     }
-                    (Shape::Unit, false) => (Frag::text(format!("new {cls}()")), Ty::Adt(adt)),
                     (_, true) => (Frag::text(format!("{cls}.{}", variant.name)), Ty::Unknown),
                     (_, false) => (
                         Frag::text(format!("((...$a) => new {cls}(...$a))")),
                         Ty::Unknown,
                     ),
                 }
+            }
+            Resolved::Assoc(adt, m)
+                if self.types.adts.method(&adt, &m).is_none()
+                    && self
+                        .types
+                        .adts
+                        .assoc_consts
+                        .get(&adt)
+                        .is_some_and(|c| c.contains_key(&m)) =>
+            {
+                let ty = self.types.adts.assoc_consts[&adt][&m].clone();
+                (
+                    Frag::text(format!("{}.{}", self.class(&adt), escape_ident(&m))),
+                    ty,
+                )
             }
             Resolved::Assoc(adt, m) => {
                 let cls = self.class(&adt);
@@ -648,7 +827,22 @@ impl Codegen<'_> {
                     .map(|f| f.ty.clone())
                     .collect();
                 let args = self.emit_args(c.arg_list(), &tys);
-                (self.construct(&adt, v, args).at(start), Ty::Adt(adt))
+                (
+                    self.construct(&adt, v, args).at(start),
+                    Ty::Adt(adt, vec![]),
+                )
+            }
+            Resolved::Assoc(adt, m)
+                if m == "from" && self.types.adts.method(&adt, &m).is_none() =>
+            {
+                let arg = c.arg_list().and_then(|l| l.args().next())?;
+                let (f, ty) = self.emit_expr(&arg, None);
+                let f = self.by_value(&arg, f, &ty);
+                // Without a conversion the type checker has already reported the call.
+                let conv = self
+                    .conv_of(c.syntax())
+                    .unwrap_or(crate::adt::Conv::Identity);
+                (self.convert(conv, f).at(start), Ty::Adt(adt, vec![]))
             }
             Resolved::Assoc(adt, m) => {
                 let sig = self.types.adts.method(&adt, &m)?.clone();
@@ -748,7 +942,7 @@ impl Codegen<'_> {
             f.append(rf.clone()).push(", ").append(other).push(")");
             f
         };
-        let t = Ty::Adt(adt.to_string());
+        let t = Ty::Adt(adt.to_string(), vec![]);
         Some(match method {
             // Without `#[derive(Clone)]` the value must be an `Rc` (erased): clones share it.
             "clone" if self.adt(adt).is_some_and(|d| !d.derives("Clone")) => (rf.clone(), t),
@@ -879,7 +1073,7 @@ impl Codegen<'_> {
             // A generic value may be a tuple or `Copy` struct; `κσ.$clone` copies those and leaves
             // numbers and strings alone.
             Ty::Tuple(_) | Ty::Param(_) => true,
-            Ty::Adt(n) => self
+            Ty::Adt(n, _) => self
                 .types
                 .adts
                 .defs

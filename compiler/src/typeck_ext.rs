@@ -138,8 +138,13 @@ impl Checker<'_> {
     // ------------------------------------------------------------ helpers
 
     /// The element type of something a `for` loop / `zip` / `extend` / `flat_map` accepts.
-    fn iter_elem(&self, t: &Ty) -> Option<Ty> {
+    pub(super) fn iter_elem(&self, t: &Ty) -> Option<Ty> {
         match self.shallow(t) {
+            Ty::Adt(n, targs) if self.adts.iter_items.contains_key(&n) => {
+                let map = self.adt_subst(&n, &targs);
+                Some(super::generic::subst(&self.adts.iter_items[&n], &map))
+            }
+            Ty::Coll(_, view) => self.iter_elem(&view),
             Ty::Vec(e) | Ty::Set(e) | Ty::Option(e) => Some(*e),
             Ty::Iter { elem, .. } => Some(*elem),
             Ty::Map(k, v) => Some(Ty::Tuple(vec![*k, *v])),
@@ -174,6 +179,22 @@ impl Checker<'_> {
         Some(match self.shallow(target) {
             Ty::Vec(x) | Ty::Set(x) => self.unify(&x, elem),
             Ty::Map(k, v) => self.unify(&Ty::Tuple(vec![*k, *v]), elem),
+            Ty::Coll(_, view) => return self.collect_into(&view, elem),
+            // `Result<C, E>` from `Result<T, E>` items, collecting the `T`s into `C`.
+            Ty::Result(inner, err) => {
+                let item = self.fresh(VarKind::General);
+                if !self.unify(elem, &Ty::Result(Box::new(item.clone()), err)) {
+                    return Some(false);
+                }
+                return self.collect_into(&inner, &item);
+            }
+            Ty::Option(inner) => {
+                let item = self.fresh(VarKind::General);
+                if !self.unify(elem, &Ty::Option(Box::new(item.clone()))) {
+                    return Some(false);
+                }
+                return self.collect_into(&inner, &item);
+            }
             Ty::Str => matches!(
                 self.shallow(elem),
                 Ty::Char | Ty::Str | Ty::Unknown | Ty::Var(_)
@@ -186,7 +207,9 @@ impl Checker<'_> {
 
     /// Resolve `collect()` calls whose target type was only known later in the function.
     pub(super) fn resolve_collects(&mut self) {
-        for (target, elem, node) in std::mem::take(&mut self.pending_collects) {
+        let saved = self.base;
+        for (target, elem, node, base) in std::mem::take(&mut self.pending_collects) {
+            self.base = base;
             match self.collect_into(&target, &elem) {
                 Some(true) => {}
                 Some(false) => {
@@ -203,6 +226,7 @@ impl Checker<'_> {
                 ),
             }
         }
+        self.base = saved;
     }
 
     // ------------------------------------------------------------ methods
@@ -273,7 +297,15 @@ impl Checker<'_> {
                 count(self, 0);
                 iter(Ty::Str)
             }
-            (Ty::Vec(e), "windows" | "chunks") => {
+            // `s.split_at(mid)`: both halves, by byte offset.
+            (Ty::Str, "split_at") => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &USIZE);
+                }
+                Ty::Tuple(vec![Ty::Str, Ty::Str])
+            }
+            (Ty::Vec(e), "windows" | "chunks" | "chunks_exact") => {
                 count(self, 1);
                 if let Some(a) = a0 {
                     self.check(a, &USIZE);
@@ -424,8 +456,25 @@ impl Checker<'_> {
                         }
                         opt(Ty::Tuple(vec![t, u]))
                     }
+                    "inspect" => {
+                        count(self, 1);
+                        self.closure_arg(a0, vec![t.clone()], Ty::Unit);
+                        opt(t)
+                    }
                     _ => unreachable!(),
                 }
+            }
+
+            // ---- bool
+            (Ty::Bool, "then") => {
+                count(self, 1);
+                let r = fresh(self);
+                Ty::Option(Box::new(self.closure_arg(a0, vec![], r)))
+            }
+            (Ty::Bool, "then_some") => {
+                count(self, 1);
+                let r = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
+                Ty::Option(Box::new(r))
             }
 
             // ---- char
@@ -541,7 +590,18 @@ impl Checker<'_> {
             mutable: false,
         };
         let opt = |x: Ty| Ty::Option(Box::new(x));
-        if mutable && !matches!(method, "for_each" | "enumerate") {
+        // Adapters that hand on the same items keep an `iter_mut()` mutable.
+        let keep = |elem: Ty| Ty::Iter {
+            elem: Box::new(elem),
+            mutable,
+        };
+        // `iter_mut()` over JS objects (structs, tuples, ..) yields the objects themselves, so
+        // writes through any adapter reach them; over numbers and strings they'd be copies.
+        let objects = {
+            let z = self.zonk(&e);
+            !z.is_js_primitive() && z != Ty::Unknown
+        };
+        if mutable && !objects && !matches!(method, "for_each" | "enumerate") {
             self.error(
                 m.syntax(),
                 format!("`iter_mut()` followed by `.{method}()` isn't supported yet (only `.for_each(..)`); use a `for` loop"),
@@ -566,7 +626,7 @@ impl Checker<'_> {
             "filter" | "take_while" | "skip_while" => {
                 count(self, 1);
                 self.closure_arg(a0, vec![e.clone()], Ty::Bool);
-                iter(e)
+                keep(e)
             }
             "filter_map" => {
                 count(self, 1);
@@ -624,20 +684,24 @@ impl Checker<'_> {
                     self.error(m.syntax(), msg);
                     Ty::Unknown
                 });
-                iter(Ty::Tuple(vec![e, u]))
+                keep(Ty::Tuple(vec![e, u]))
             }
             "chain" => {
                 count(self, 1);
                 self.extend_arg(a0, &e);
-                iter(e)
+                keep(e)
             }
-            "rev" | "cloned" | "copied" => {
+            "rev" | "cycle" => {
+                count(self, 0);
+                keep(e)
+            }
+            "cloned" | "copied" => {
                 count(self, 0);
                 iter(e)
             }
             "take" | "skip" | "step_by" => {
                 usize_arg(self);
-                iter(e)
+                keep(e)
             }
             "count" => {
                 count(self, 0);
@@ -698,10 +762,16 @@ impl Checker<'_> {
                 self.closure_arg(a0, vec![e.clone()], Ty::Bool);
                 opt(e)
             }
-            "position" => {
+            "position" | "rposition" => {
                 count(self, 1);
                 self.closure_arg(a0, vec![e], Ty::Bool);
                 opt(USIZE)
+            }
+            // `(Vec<T>, Vec<T>)`: the items the closure accepts, then the rest.
+            "partition" => {
+                count(self, 1);
+                self.closure_arg(a0, vec![e.clone()], Ty::Bool);
+                Ty::Tuple(vec![Ty::Vec(Box::new(e.clone())), Ty::Vec(Box::new(e))])
             }
             "find_map" => {
                 count(self, 1);
@@ -732,7 +802,15 @@ impl Checker<'_> {
                 let target = match self.turbofish(m) {
                     Some(t) => t,
                     None => match expected.map(|x| self.shallow(x)) {
-                        Some(t @ (Ty::Vec(_) | Ty::Set(_) | Ty::Map(..) | Ty::Str)) => t,
+                        Some(
+                            t @ (Ty::Vec(_)
+                            | Ty::Set(_)
+                            | Ty::Map(..)
+                            | Ty::Str
+                            | Ty::Result(..)
+                            | Ty::Option(_)
+                            | Ty::Coll(..)),
+                        ) => t,
                         _ => fresh(self),
                     },
                 };
@@ -746,9 +824,12 @@ impl Checker<'_> {
                         );
                         self.error(m.syntax(), msg);
                     }
-                    None => self
-                        .pending_collects
-                        .push((target.clone(), e, m.syntax().clone())),
+                    None => self.pending_collects.push((
+                        target.clone(),
+                        e,
+                        m.syntax().clone(),
+                        self.base,
+                    )),
                 }
                 target
             }
@@ -771,6 +852,7 @@ pub fn is_option_closure_method(m: &str) -> bool {
             | "or"
             | "or_else"
             | "zip"
+            | "inspect"
     )
 }
 

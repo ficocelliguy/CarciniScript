@@ -362,6 +362,19 @@
         yield* items(other);
       });
     }
+    // Repeats what the source yields; the source is read once and remembered.
+    $cycle() {
+      const src = this.it;
+      return Iter.of(function* () {
+        const seen = [];
+        for (const x of iterable(src)) {
+          seen.push(x);
+          yield x;
+        }
+        if (seen.length === 0) return;
+        for (;;) yield* seen;
+      });
+    }
     // Collects first: JS iterators only go forward.
     $rev() {
       const all = Array.from(iterable(this.it));
@@ -503,6 +516,18 @@
       for (const x of iterable(this.it)) if (p(x)) return x;
       return null;
     }
+    $partition(p) {
+      const yes = [];
+      const no = [];
+      for (const x of iterable(this.it)) (p(x) ? yes : no).push(x);
+      return [yes, no];
+    }
+    // From the end; the index counts from the front, as in Rust.
+    $rposition(p) {
+      const all = Array.from(iterable(this.it));
+      for (let i = all.length - 1; i >= 0; i--) if (p(all[i])) return i;
+      return null;
+    }
     $position(p) {
       let i = 0;
       for (const x of iterable(this.it)) {
@@ -542,10 +567,40 @@
     $collectMap() {
       return HashMap.from(iterable(this.it));
     }
+    $collectBTreeSet() {
+      return BTreeSet.from(iterable(this.it));
+    }
+    $collectBTreeMap() {
+      return BTreeMap.from(iterable(this.it));
+    }
+    $collectHeap() {
+      const a = Array.from(iterable(this.it));
+      heapRebuild(a);
+      return a;
+    }
     $collectString() {
       let s = "";
       for (const x of iterable(this.it)) s += x;
       return s;
+    }
+    // `collect::<Result<C, E>>()`: the first `Err` stops it; otherwise `Ok` of the values
+    // collected with `into` (`$collectVec`, ...).
+    $collectResult(into) {
+      const ok = [];
+      for (const x of iterable(this.it)) {
+        if (x.$tag === 1) return x;
+        ok.push(x[0]);
+      }
+      return new Res(0, new Iter(ok[Symbol.iterator]())[into]());
+    }
+    // `collect::<Option<C>>()`: the first `None` stops it.
+    $collectOption(into) {
+      const some = [];
+      for (const x of iterable(this.it)) {
+        if (x == null) return null;
+        some.push(x);
+      }
+      return new Iter(some[Symbol.iterator]())[into]();
     }
   }
 
@@ -600,6 +655,7 @@
     "ParseIntError:InvalidDigit": "invalid digit found in string",
     "ParseIntError:PosOverflow": "number too large to fit in target type",
     "ParseIntError:NegOverflow": "number too small to fit in target type",
+    "Utf8Error:Invalid": "invalid utf-8 sequence",
     "ParseFloatError:Empty": "cannot parse float from empty string",
     "ParseFloatError:Invalid": "invalid float literal",
     "ParseBoolError:": "provided string was not `true` or `false`",
@@ -643,6 +699,243 @@
       location,
     );
   }
+
+
+  // `std::cmp::Reverse(x)`: orders the other way round (a min-heap from a `BinaryHeap`).
+  class Reverse {
+    constructor(v) {
+      this[0] = v;
+    }
+    $eq(o) {
+      return eq(this[0], o[0]);
+    }
+    $cmp(o) {
+      return cmp(o[0], this[0]);
+    }
+    $clone() {
+      return new Reverse(clone(this[0]));
+    }
+    $dbg(f) {
+      return `Reverse(${(f ?? rt.$dbgAny)(this[0])})`;
+    }
+  }
+
+  // Rust's BTreeSet / BTreeMap: the hash classes, re-sorted by key whenever they are read in order.
+  // `n` is the size when the map was last sorted: a new key (from `$insert` or an `entry` slot)
+  // grows the map past it. Removals keep the order, so they sort first and then record the size.
+  function btreeSorting(Base, keyOf) {
+    return class extends Base {
+      constructor() {
+        super();
+        this.n = 0;
+      }
+      $sort() {
+        if (this.m.size === this.n) return;
+        this.m = new Map([...this.m].sort((a, b) => cmp(keyOf(a[1]), keyOf(b[1]))));
+        this.n = this.m.size;
+      }
+      $synced(f) {
+        this.$sort();
+        const r = f();
+        this.n = this.m.size;
+        return r;
+      }
+      $remove(x) {
+        return this.$synced(() => super.$remove(x));
+      }
+      $retain(p) {
+        this.$synced(() => super.$retain(p));
+      }
+      $clear() {
+        this.$synced(() => super.$clear());
+      }
+      $clone() {
+        this.$sort();
+        const c = new this.constructor();
+        c.m = super.$clone().m;
+        c.n = c.m.size;
+        return c;
+      }
+      $append(other) {
+        this.$extend(Array.from(other));
+        other.$clear();
+      }
+      // The first / last entry, as stored (an element, or a `[k, v]` slot).
+      $firstSlot() {
+        this.$sort();
+        for (const x of this.m.values()) return x;
+        return null;
+      }
+      $lastSlot() {
+        this.$sort();
+        let last = null;
+        for (const x of this.m.values()) last = x;
+        return last;
+      }
+      $popSlot(first) {
+        const x = first ? this.$firstSlot() : this.$lastSlot();
+        if (x === null) return null;
+        this.$synced(() => this.m.delete(key(keyOf(x))));
+        return x;
+      }
+    };
+  }
+
+  class BTreeSet extends btreeSorting(HashSet, (x) => x) {
+    static from(items) {
+      const s = new BTreeSet();
+      for (const x of items) s.$insert(x);
+      return s;
+    }
+    [Symbol.iterator]() {
+      this.$sort();
+      return super[Symbol.iterator]();
+    }
+    $first() {
+      return this.$firstSlot();
+    }
+    $last() {
+      return this.$lastSlot();
+    }
+    $popFirst() {
+      return this.$popSlot(true);
+    }
+    $popLast() {
+      return this.$popSlot(false);
+    }
+    // Set operations yield in order, like a merge of the two sorted sets.
+    $union(other) {
+      return sortedIter(super.$union(other));
+    }
+    $intersection(other) {
+      return sortedIter(super.$intersection(other));
+    }
+    $difference(other) {
+      return sortedIter(super.$difference(other));
+    }
+    $symmetricDifference(other) {
+      return sortedIter(super.$symmetricDifference(other));
+    }
+  }
+
+  function sortedIter(it) {
+    const all = Array.from(it).sort(cmp);
+    return new Iter(all[Symbol.iterator]());
+  }
+
+  class BTreeMap extends btreeSorting(HashMap, (slot) => slot[0]) {
+    static from(pairs) {
+      const h = new BTreeMap();
+      for (const [k, v] of pairs) h.$insert(k, v);
+      return h;
+    }
+    $slots() {
+      this.$sort();
+      return super.$slots();
+    }
+    $entries() {
+      this.$sort();
+      return super.$entries();
+    }
+    $keys() {
+      this.$sort();
+      return super.$keys();
+    }
+    $values() {
+      this.$sort();
+      return super.$values();
+    }
+    $append(other) {
+      this.$extend(Array.from(other.$entries()));
+      other.$clear();
+    }
+    $firstKeyValue() {
+      const s = this.$firstSlot();
+      return s && [s[0], s[1]];
+    }
+    $lastKeyValue() {
+      const s = this.$lastSlot();
+      return s && [s[0], s[1]];
+    }
+    $popFirst() {
+      const s = this.$popSlot(true);
+      return s && [s[0], s[1]];
+    }
+    $popLast() {
+      const s = this.$popSlot(false);
+      return s && [s[0], s[1]];
+    }
+  }
+
+  // Rust's BinaryHeap is a JS array kept in std's heap order (same sift algorithms, so `{:?}` and
+  // `iter()` show the same order rustc's does).
+  function siftUp(a, start, pos) {
+    const elem = a[pos];
+    while (pos > start) {
+      const parent = (pos - 1) >> 1;
+      if (cmp(elem, a[parent]) <= 0) break;
+      a[pos] = a[parent];
+      pos = parent;
+    }
+    a[pos] = elem;
+    return pos;
+  }
+  function siftDownRange(a, pos, end) {
+    const elem = a[pos];
+    let child = 2 * pos + 1;
+    while (child <= end - 2) {
+      if (cmp(a[child], a[child + 1]) <= 0) child += 1;
+      if (cmp(elem, a[child]) >= 0) {
+        a[pos] = elem;
+        return;
+      }
+      a[pos] = a[child];
+      pos = child;
+      child = 2 * pos + 1;
+    }
+    if (child === end - 1 && cmp(elem, a[child]) < 0) {
+      a[pos] = a[child];
+      pos = child;
+    }
+    a[pos] = elem;
+  }
+  function siftDownToBottom(a, pos) {
+    const end = a.length;
+    const start = pos;
+    const elem = a[pos];
+    let child = 2 * pos + 1;
+    while (child <= end - 2) {
+      if (cmp(a[child], a[child + 1]) <= 0) child += 1;
+      a[pos] = a[child];
+      pos = child;
+      child = 2 * pos + 1;
+    }
+    if (child === end - 1) {
+      a[pos] = a[child];
+      pos = child;
+    }
+    a[pos] = elem;
+    siftUp(a, start, pos);
+  }
+  function heapRebuild(a) {
+    let n = a.length >> 1;
+    while (n > 0) {
+      n -= 1;
+      siftDownRange(a, n, a.length);
+    }
+  }
+  // std's `rebuild_tail`: after appending items from `start`, rebuild or sift each up.
+  function heapRebuildTail(a, start) {
+    if (start === a.length) return;
+    const tail = a.length - start;
+    const log2 = (x) => 31 - Math.clz32(x);
+    const rebuild =
+      start < tail ? true : a.length <= 2048 ? 2 * a.length < tail * log2(start) : 2 * a.length < tail * 11;
+    if (rebuild) heapRebuild(a);
+    else for (let i = start; i < a.length; i++) siftUp(a, 0, i);
+  }
+
+  const extRegs = {};
 
   const rt = {
     CarciniPanic,
@@ -762,6 +1055,150 @@
     $eq: eq,
     HashSet,
     HashMap,
+    BTreeSet,
+    BTreeMap,
+    Reverse,
+    $heapPush(a, x) {
+      a.push(x);
+      siftUp(a, 0, a.length - 1);
+    },
+    $heapPop(a) {
+      if (a.length === 0) return null;
+      let item = a.pop();
+      if (a.length > 0) {
+        [item, a[0]] = [a[0], item];
+        siftDownToBottom(a, 0);
+      }
+      return item;
+    },
+    $heapFrom(a) {
+      heapRebuild(a);
+      return a;
+    },
+    $heapExtend(a, items) {
+      const start = a.length;
+      for (const x of items) a.push(x);
+      heapRebuildTail(a, start);
+    },
+    $heapAppend(a, other) {
+      // std moves the smaller heap into the larger one.
+      if (a.length < other.length) {
+        const mine = a.splice(0);
+        a.push(...other.splice(0));
+        other.push(...mine);
+      }
+      const start = a.length;
+      a.push(...other.splice(0));
+      heapRebuildTail(a, start);
+    },
+    $heapSorted(a) {
+      return a.slice().sort(cmp);
+    },
+    // `(lo..hi).contains(&x)`; a missing bound is `null`. Compares with Rust's `Ord`.
+    $inRange(x, lo, hi, inclusive) {
+      if (lo != null && cmp(x, lo) < 0) return false;
+      if (hi == null) return true;
+      const c = cmp(x, hi);
+      return inclusive ? c <= 0 : c < 0;
+    },
+    // Bitwise operators on 64-bit integers (`u64`, `i64`, `usize`, `isize`). JS's operators are
+    // 32-bit, so values outside that range go through BigInt; results wrap to 64 bits and are
+    // exact up to 2^53, like every 64-bit value here.
+    $bit64(a, b, op, signed) {
+      if (a >= 0 && b >= 0 && a <= 0x7fffffff && b <= 0x7fffffff) {
+        return op === "&" ? a & b : op === "|" ? a | b : a ^ b;
+      }
+      const x = BigInt(a);
+      const y = BigInt(b);
+      const r = op === "&" ? x & y : op === "|" ? x | y : x ^ y;
+      return Number(signed ? BigInt.asIntN(64, r) : BigInt.asUintN(64, r));
+    },
+    // `<<` masks the shift amount to 6 bits, as Rust does in release builds.
+    $shl64(a, n, signed) {
+      const r = BigInt(a) << BigInt(n & 63);
+      return Number(signed ? BigInt.asIntN(64, r) : BigInt.asUintN(64, r));
+    },
+    $shr64(a, n) {
+      if (a >= 0 && a <= 0x7fffffff) return (n & 63) > 31 ? 0 : a >> (n & 63);
+      return Number(BigInt(a) >> BigInt(n & 63));
+    },
+    $not64(a, signed) {
+      return signed ? -a - 1 : Number(BigInt.asUintN(64, ~BigInt(a)));
+    },
+    // A value of a type with `impl Iterator`, as a runtime iterator (for `take`, `map`, ..).
+    $iterOf(o) {
+      return new Iter(o[Symbol.iterator]());
+    },
+    // `fn main() -> Result<..>` returned `Err(e)`: fail with rustc's `Error: {e:?}`.
+    $mainResult(r, fmt) {
+      if (r != null && r.$tag === 1) {
+        const err = new Error(`Error: ${fmt(r[0])}`);
+        err.name = "CarciniError";
+        throw err;
+      }
+    },
+    // User trait impls for built-in types (`impl Money for f64`), by JS kind, for calls through
+    // a type parameter or `dyn Trait` (`$dcall`).
+    $extReg(kind, cls, integral) {
+      (extRegs[kind] ??= []).push({ cls, integral });
+    },
+    $dcall(x, name, ...args) {
+      if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
+        return x[name](...args);
+      }
+      const kind = Array.isArray(x) ? "array" : typeof x;
+      let pick = null;
+      for (const r of extRegs[kind] ?? []) {
+        if (typeof r.cls.prototype[name] !== "function") continue;
+        pick ??= r;
+        // A number goes to an integer type's impl when it's whole, else to a float type's.
+        if (kind === "number" && r.integral === Number.isInteger(x)) {
+          pick = r;
+          break;
+        }
+      }
+      if (pick) return pick.cls.prototype[name].call(x, ...args);
+      return x[name](...args);
+    },
+    // `i128` / `u128` are BigInts, wrapped to 128 bits like Rust's release builds.
+    $w128(x, signed) {
+      return signed ? BigInt.asIntN(128, x) : BigInt.asUintN(128, x);
+    },
+    $div128(a, b) {
+      if (b === 0n) throw new CarciniPanic("attempt to divide by zero", "<std>");
+      return a / b;
+    },
+    $rem128(a, b) {
+      if (b === 0n) throw new CarciniPanic("attempt to calculate the remainder with a divisor of zero", "<std>");
+      return a % b;
+    },
+    $abs128(x) {
+      return x < 0n ? -x : x;
+    },
+    // `x as i128`: from a number (truncated) or another BigInt.
+    $to128(x, signed) {
+      const b = typeof x === "bigint" ? x : BigInt(Math.trunc(x));
+      return signed ? BigInt.asIntN(128, b) : BigInt.asUintN(128, b);
+    },
+    // `x as u32` from an `i128`: wrapped to the target's bits, as a number.
+    $from128(x, bits, signed) {
+      return Number(signed ? BigInt.asIntN(bits, x) : BigInt.asUintN(bits, x));
+    },
+    $parseInt128(s, signed) {
+      const err = (kind) => new Res(1, new ParseError("ParseIntError", kind));
+      if (s === "") return err("Empty");
+      if (!/^[+-]?[0-9]+$/.test(s) || s === "+" || s === "-") return err("InvalidDigit");
+      if (!signed && s[0] === "-") return err("InvalidDigit");
+      const v = BigInt(s);
+      const max = signed ? (1n << 127n) - 1n : (1n << 128n) - 1n;
+      const min = signed ? -(1n << 127n) : 0n;
+      if (v > max) return err("PosOverflow");
+      if (v < min) return err("NegOverflow");
+      return new Res(0, v);
+    },
+    $dqRemove(a, i) {
+      return i < a.length ? a.splice(i, 1)[0] : null;
+    },
     // `map.entry(k).or_insert(v)`: the `[k, v]` slot for `k`, inserting `v` (or `v()` when `lazy`)
     // if `k` is missing.
     // `modify` is an `and_modify` closure, run on an existing slot. A lazy default gets the key, for
@@ -858,6 +1295,26 @@
     $optZip(x, y) {
       return x == null || y == null ? null : [x, y];
     },
+    $optInspect(x, f) {
+      if (x != null) f(x);
+      return x;
+    },
+    $optTranspose(x) {
+      if (x == null) return new Res(0, null);
+      return x.$tag === 1 ? x : new Res(0, x[0]);
+    },
+    $resInspect(r, f) {
+      if (r.$tag === 0) f(r[0]);
+      return r;
+    },
+    $resInspectErr(r, f) {
+      if (r.$tag === 1) f(r[0]);
+      return r;
+    },
+    $resTranspose(r) {
+      if (r.$tag === 1) return r;
+      return r[0] == null ? null : new Res(0, r[0]);
+    },
     $optIter(x) {
       return new Iter((x == null ? [] : [x])[Symbol.iterator]());
     },
@@ -876,10 +1333,12 @@
           for (let c = a; c < b; c++) if (c < 0xd800 || c > 0xdfff) yield String.fromCodePoint(c);
         });
       }
+      // `i128` / `u128` ranges step in BigInts.
+      const one = typeof lo === "bigint" ? 1n : 1;
       return Iter.of(function* () {
-        if (hi === null) for (let i = lo; ; i++) yield i;
-        const end = inclusive ? hi + 1 : hi;
-        for (let i = lo; i < end; i++) yield i;
+        if (hi === null) for (let i = lo; ; i += one) yield i;
+        const end = inclusive ? hi + one : hi;
+        for (let i = lo; i < end; i += one) yield i;
       });
     },
     $split(s, p) {
@@ -896,6 +1355,16 @@
       return Iter.of(function* () {
         for (let i = 0; i + n <= v.length; i++) yield v.slice(i, i + n);
       });
+    },
+    $chunksExact(v, n) {
+      if (n === 0) throw new CarciniPanic("chunk size must be non-zero", "<std>");
+      return Iter.of(function* () {
+        for (let i = 0; i + n <= v.length; i += n) yield v.slice(i, i + n);
+      });
+    },
+    // `s.split_at(mid)`, with slicing's panics.
+    $splitAt(s, mid, location) {
+      return [rt.$strSlice(s, 0, mid, false, location), rt.$strSlice(s, mid, null, false, location)];
     },
     $chunks(v, n) {
       if (n === 0) throw new CarciniPanic("chunk size must be non-zero", "<std>");
@@ -951,9 +1420,86 @@
     // Formatting.
     $fmtF: fmtF,
     $dbgF: dbgF,
+    // `{:.p}`: like `toFixed`, except that an exact tie rounds to even, as Rust does
+    // (`format!("{:.0}", 2.5)` is "2"; JS's `toFixed` rounds ties up).
     $fixed(x, p) {
       if (!Number.isFinite(x)) return fmtF(x);
-      return expandExponent(x.toFixed(p));
+      const up = x.toFixed(p);
+      if (Math.abs(x) < 1e21) {
+        // Every double this size has an exact decimal expansion within 100 digits.
+        const exact = Math.abs(x).toFixed(100);
+        const [int, frac] = exact.split(".");
+        if (frac[p] === "5" && /^0*$/.test(frac.slice(p + 1))) {
+          const kept = p > 0 ? `${int}.${frac.slice(0, p)}` : int;
+          if (Number(kept[kept.length - 1]) % 2 === 0) {
+            return expandExponent((x < 0 ? "-" : "") + kept);
+          }
+        }
+      }
+      return expandExponent(up);
+    },
+    // `{:x}` / `{:o}` / `{:b}` (`#` adds the prefix): negative values print the two's
+    // complement of their `bits`-wide type, as Rust does.
+    $radix(x, radix, upper, alt, bits) {
+      let n = x;
+      if (n < 0) n = bits > 32 ? BigInt.asUintN(bits, BigInt(n)) : n + 2 ** bits;
+      let digits = n.toString(radix);
+      if (upper) digits = digits.toUpperCase();
+      const prefix = alt ? (radix === 16 ? "0x" : radix === 8 ? "0o" : "0b") : "";
+      return prefix + digits;
+    },
+    // `{:e}` / `{:.2e}` / `{:E}`: `1.2345e3`, Rust's form (no `+` in the exponent).
+    $exp(x, p, upper) {
+      const s = (p == null ? x.toExponential() : x.toExponential(p)).replace("e+", "e");
+      return upper ? s.toUpperCase() : s;
+    },
+    // `{:#?}`: re-lays the one-line `{:?}` text one item per line, indented by four spaces,
+    // with a trailing comma, like Rust's pretty `Debug`. String and char literals are kept.
+    $pretty(s) {
+      s = String(s);
+      let out = "";
+      let depth = 0;
+      const nl = () => "\n" + "    ".repeat(depth);
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === '"' || (ch === "'" && s[i + 2] === "'") || (ch === "'" && s[i + 1] === "\\")) {
+          // A string or char literal, with its escapes.
+          const q = ch;
+          let j = i + 1;
+          while (j < s.length && s[j] !== q) j += s[j] === "\\" ? 2 : 1;
+          out += s.slice(i, j + 1);
+          i = j;
+          continue;
+        }
+        if (ch === "{" || ch === "[" || ch === "(") {
+          const close = ch === "{" ? "}" : ch === "[" ? "]" : ")";
+          if (s[i + 1] === close) {
+            out += ch + close;
+            i += 1;
+            continue;
+          }
+          depth++;
+          out += ch + nl();
+          if (ch === "{" && s[i + 1] === " ") i += 1;
+          continue;
+        }
+        if (ch === "}" || ch === "]" || ch === ")") {
+          depth--;
+          out = out.replace(/ $/, "");
+          // `(1,)` already ends its item with a comma.
+          if (!out.endsWith(",")) out += ",";
+          out += nl() + ch;
+          continue;
+        }
+        if (ch === "," && s[i + 1] === " " && depth > 0) {
+          out += "," + nl();
+          i += 1;
+          continue;
+        }
+        if (ch === " " && s[i + 1] === "}") continue;
+        out += ch;
+      }
+      return out;
     },
     $dbgStr(s) {
       return `"${Array.from(s, (c) => escapeChar(c, '"')).join("")}"`;
@@ -1105,6 +1651,43 @@
       if (v > BigInt(max)) return err("PosOverflow");
       if (v < BigInt(min)) return err("NegOverflow");
       return new Res(0, Number(v));
+    },
+    // `i32::from_str_radix(s, 16)`: digits up to the radix (either case), an optional sign.
+    $fromStrRadix(s, radix, min, max) {
+      const err = (kind) => new Res(1, new ParseError("ParseIntError", kind));
+      if (s === "") return err("Empty");
+      let body = s;
+      let neg = false;
+      if (body[0] === "+" || body[0] === "-") {
+        neg = body[0] === "-";
+        body = body.slice(1);
+        if (neg && min >= 0) return err("InvalidDigit");
+      }
+      if (body === "") return err("InvalidDigit");
+      let v = 0n;
+      for (const c of body) {
+        const d = /^[0-9a-zA-Z]$/.test(c) ? parseInt(c, 36) : 99;
+        if (d >= radix) return err("InvalidDigit");
+        v = v * BigInt(radix) + BigInt(d);
+      }
+      if (neg) v = -v;
+      if (v > BigInt(max)) return err("PosOverflow");
+      if (v < BigInt(min)) return err("NegOverflow");
+      return new Res(0, Number(v));
+    },
+    // `s.as_bytes()`: UTF-8.
+    $utf8(s) {
+      return Array.from(new TextEncoder().encode(s));
+    },
+    $fromUtf8(bytes) {
+      try {
+        return new Res(0, new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)));
+      } catch {
+        return new Res(1, new ParseError("Utf8Error", "Invalid"));
+      }
+    },
+    $fromUtf8Lossy(bytes) {
+      return new TextDecoder("utf-8").decode(Uint8Array.from(bytes));
     },
     $parseFloat(s) {
       const err = (kind) => new Res(1, new ParseError("ParseFloatError", kind));
@@ -1540,6 +2123,15 @@
     $fill(v, x) {
       for (let i = 0; i < v.length; i++) v[i] = clone(x);
     },
+    $copyFromSlice(v, src, location) {
+      if (src.length !== v.length) {
+        throw new CarciniPanic(
+          `source slice length (${src.length}) does not match destination slice length (${v.length})`,
+          location,
+        );
+      }
+      for (let i = 0; i < v.length; i++) v[i] = clone(src[i]);
+    },
     $rotate(v, k, left, location) {
       if (k > v.length) {
         throw new CarciniPanic(left ? "assertion failed: mid <= self.len()" : "assertion failed: k <= self.len()", location);
@@ -1600,7 +2192,8 @@
       if (len >= width) return s;
       const n = width - len;
       if (zero && numeric) {
-        const sign = s[0] === "-" || s[0] === "+" ? s[0] : "";
+        // Zeros go after the sign and any `0x` / `0o` / `0b` prefix.
+        const sign = /^[+-]?(0[xob])?/.exec(s)[0];
         return sign + "0".repeat(n) + s.slice(sign.length);
       }
       const a = align ?? (numeric ? ">" : "<");

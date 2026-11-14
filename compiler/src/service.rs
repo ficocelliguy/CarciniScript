@@ -4,7 +4,7 @@
 
 use ra_ap_syntax::{
     AstNode, SourceFile, SyntaxKind, SyntaxNode, TextSize,
-    ast::{self, HasName},
+    ast::{self, HasAttrs, HasName},
 };
 use serde::Serialize;
 
@@ -54,10 +54,51 @@ fn offset_of(src: &str, line: u32, column: u32) -> usize {
     src.len()
 }
 
-fn analyze(src: &str, filename: &str, resolver: Resolver) -> (SourceFile, Types) {
+/// The parsed file and its types. With `macro_rules!` macros, those of the expansion, and the map
+/// from its offsets back to `src`'s.
+struct Analysis {
+    file: SourceFile,
+    types: Types,
+    map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
+}
+
+impl Analysis {
+    /// An offset in `src` as one in the analyzed text (None inside a macro invocation).
+    fn at(&self, offset: usize) -> Option<usize> {
+        match &self.map {
+            Some(m) => m.cur(offset),
+            None => Some(offset),
+        }
+    }
+
+    /// Line/column lookups for nodes of the analyzed text, in `src`.
+    fn index<'a>(&self, src: &'a str) -> LineIndex<'a> {
+        match &self.map {
+            Some(m) => LineIndex::mapped(src, m.clone()),
+            None => LineIndex::new(src),
+        }
+    }
+}
+
+fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis {
+    if src.contains("macro_rules!")
+        && let Ok(Some(exp)) = crate::mbe::expand(src)
+    {
+        let file = SourceFile::parse(&exp.text, EDITION).tree();
+        let (types, _) = typeck::check(&file, &exp.text, filename, resolver);
+        return Analysis {
+            file,
+            types,
+            map: Some(std::rc::Rc::new(exp.map)),
+        };
+    }
     let file = SourceFile::parse(src, EDITION).tree();
     let (types, _) = typeck::check(&file, src, filename, resolver);
-    (file, types)
+    Analysis {
+        file,
+        types,
+        map: None,
+    }
 }
 
 fn type_at(types: &Types, n: &SyntaxNode) -> Option<Ty> {
@@ -111,8 +152,9 @@ pub fn hover(
     column: u32,
     resolver: Resolver,
 ) -> Option<Hover> {
-    let (file, types) = analyze(src, filename, resolver);
-    let offset = offset_of(src, line, column);
+    let an = analyze(src, filename, resolver);
+    let offset = an.at(offset_of(src, line, column))?;
+    let (file, types) = (&an.file, &an.types);
     let token = file
         .syntax()
         .token_at_offset(TextSize::from(offset as u32))
@@ -124,7 +166,7 @@ pub fn hover(
         return None;
     }
     let node = token.parent()?;
-    let idx = LineIndex::new(src);
+    let idx = an.index(src);
     let make = |contents: String, n: &SyntaxNode| {
         let r = n.text_range();
         let (l0, c0) = idx.line_col(usize::from(r.start()));
@@ -144,7 +186,7 @@ pub fn hover(
         && m.name_ref().is_some_and(|n| n.syntax() == &node)
     {
         let name = token.text().to_string();
-        let rt = m.receiver().and_then(|r| type_at(&types, r.syntax()));
+        let rt = m.receiver().and_then(|r| type_at(types, r.syntax()));
         match &rt {
             Some(Ty::Extern(t)) => {
                 if let Some(method) = b.types.get(t).and_then(|ty| ty.methods.get(&name)) {
@@ -156,7 +198,7 @@ pub fn hover(
                     ));
                 }
             }
-            Some(Ty::Adt(n)) => {
+            Some(Ty::Adt(n, _)) => {
                 if let Some(method) = types.adts.method(n, &name) {
                     let params: Vec<(String, Ty)> = method
                         .params
@@ -165,12 +207,16 @@ pub fn hover(
                         .map(|(i, t)| (format!("_{i}"), t.clone()))
                         .collect();
                     let sig = signature(&name, &params, &method.ret, method.is_async);
-                    return Some(make(format!("{}\n*{n}*", code(&sig)), &node));
+                    let docs = fn_docs(file, Some(n), &name);
+                    return Some(make(
+                        with_docs(format!("{}\n*{n}*", code(&sig)), &docs),
+                        &node,
+                    ));
                 }
             }
             _ => {}
         }
-        let ret = type_at(&types, m.syntax())?;
+        let ret = type_at(types, m.syntax())?;
         return Some(make(
             code(&format!("{name}(..) -> {}", ret.describe())),
             &node,
@@ -181,7 +227,7 @@ pub fn hover(
         && fe.name_ref().is_some_and(|n| n.syntax() == &node)
     {
         let name = token.text().to_string();
-        if let Some(Ty::Extern(t)) = fe.expr().and_then(|r| type_at(&types, r.syntax()))
+        if let Some(Ty::Extern(t)) = fe.expr().and_then(|r| type_at(types, r.syntax()))
             && let Some(field) = b.types.get(&t).and_then(|ty| ty.fields.get(&name))
         {
             return Some(make(
@@ -193,15 +239,74 @@ pub fn hover(
                 &node,
             ));
         }
-        let t = type_at(&types, fe.syntax())?;
-        return Some(make(code(&format!("{name}: {}", t.describe())), &node));
+        let t = type_at(types, fe.syntax())?;
+        let docs = match fe.expr().and_then(|r| type_at(types, r.syntax())) {
+            Some(Ty::Adt(owner, _)) => field_docs(file, &owner, &name),
+            _ => String::new(),
+        };
+        return Some(make(
+            with_docs(code(&format!("{name}: {}", t.describe())), &docs),
+            &node,
+        ));
+    }
+    // A function's name where it's called or declared: its signature and doc comment.
+    let decl = parent
+        .clone()
+        .and_then(ast::Fn::cast)
+        .filter(|_| node.kind() == SyntaxKind::NAME);
+    let called = node
+        .ancestors()
+        .find_map(ast::PathExpr::cast)
+        .filter(|p| {
+            p.path()
+                .and_then(|p| p.as_single_name_ref())
+                .is_some_and(|n| n.syntax() == &node)
+        })
+        .filter(|p| {
+            p.syntax()
+                .parent()
+                .and_then(ast::CallExpr::cast)
+                .and_then(|c| c.expr())
+                .is_some_and(|e| e.syntax() == p.syntax())
+        });
+    let target = decl.or_else(|| {
+        called.as_ref()?;
+        file.syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .find(|f| {
+                f.name().is_some_and(|n| n.text() == token.text())
+                    && !f
+                        .syntax()
+                        .ancestors()
+                        .any(|a| ast::Impl::can_cast(a.kind()) || ast::Trait::can_cast(a.kind()))
+            })
+    });
+    if let Some(f) = target {
+        let sig = match f.body() {
+            Some(b) => {
+                let start = f.syntax().text_range().start();
+                let end = b.syntax().text_range().start();
+                let text = f.syntax().text().to_string();
+                let cut = usize::from(end - start);
+                text[..cut].trim_end().to_string()
+            }
+            None => f.syntax().text().to_string(),
+        };
+        // Leave out the doc comment and attributes, which come first.
+        let sig = sig
+            .lines()
+            .skip_while(|l| l.trim_start().starts_with("///") || l.trim_start().starts_with("#["))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(make(with_docs(code(&sig), &docs_of(&f)), &node));
     }
     // A binding or a path: the name and its type.
     for n in node.ancestors().take(5) {
         if matches!(
             n.kind(),
             SyntaxKind::NAME | SyntaxKind::PATH_EXPR | SyntaxKind::LITERAL
-        ) && let Some(t) = type_at(&types, &n)
+        ) && let Some(t) = type_at(types, &n)
         {
             let text = match &t {
                 Ty::Closure { params, ret } if n.kind() == SyntaxKind::PATH_EXPR => {
@@ -214,7 +319,14 @@ pub fn hover(
                 }
                 _ => format!("{}: {}", token.text(), t.describe()),
             };
-            return Some(make(code(&text), &n));
+            // A free function (called or declared here): its doc comment.
+            let docs = match &t {
+                Ty::Closure { .. } if n.kind() == SyntaxKind::PATH_EXPR => {
+                    fn_docs(file, None, token.text())
+                }
+                _ => String::new(),
+            };
+            return Some(make(with_docs(code(&text), &docs), &n));
         }
     }
     None
@@ -244,11 +356,17 @@ pub fn completions(
         if prefix.is_empty() || before[..word_start].ends_with("::") {
             return vec![];
         }
-        let (file, types) = analyze(src, filename, resolver);
-        return scope_completions(&file, &types, offset, prefix);
+        let an = analyze(src, filename, resolver);
+        let Some(at) = an.at(offset) else {
+            return vec![];
+        };
+        return scope_completions(&an.file, &an.types, at, prefix);
     }
-    let dot = word_start - 1;
-    let (file, types) = analyze(src, filename, resolver);
+    let an = analyze(src, filename, resolver);
+    let Some(dot) = an.at(word_start - 1) else {
+        return vec![];
+    };
+    let (file, types) = (&an.file, &an.types);
     let Some(token) = file
         .syntax()
         .token_at_offset(TextSize::from(dot as u32))
@@ -261,10 +379,10 @@ pub fn completions(
             .and_then(|f| f.expr())
             .or_else(|| ast::MethodCallExpr::cast(p).and_then(|m| m.receiver()))
     });
-    let Some(rt) = receiver.and_then(|r| type_at(&types, r.syntax())) else {
+    let Some(rt) = receiver.and_then(|r| type_at(types, r.syntax())) else {
         return vec![];
     };
-    members(&rt, &types)
+    members(&rt, types)
 }
 
 /// Locals declared before `offset` in the enclosing function, then the file's items.
@@ -394,8 +512,9 @@ pub fn signature_help(
     column: u32,
     resolver: Resolver,
 ) -> Option<SignatureHelp> {
-    let offset = offset_of(src, line, column);
-    let (file, types) = analyze(src, filename, resolver);
+    let an = analyze(src, filename, resolver);
+    let offset = an.at(offset_of(src, line, column))?;
+    let (file, types) = (&an.file, &an.types);
     let at = TextSize::from(offset as u32);
     let token = file.syntax().token_at_offset(at).left_biased()?;
     let args = token
@@ -426,7 +545,7 @@ pub fn signature_help(
     };
     if let Some(m) = ast::MethodCallExpr::cast(parent.clone()) {
         let name = m.name_ref()?.text().to_string();
-        let rt = m.receiver().and_then(|r| type_at(&types, r.syntax()));
+        let rt = m.receiver().and_then(|r| type_at(types, r.syntax()));
         if let Some(Ty::Extern(t)) = &rt {
             let b = bindings::current();
             let method = b.types.get(t)?.methods.get(&name)?;
@@ -482,7 +601,7 @@ fn members(t: &Ty, types: &Types) -> Vec<Completion> {
                 }
             }
         }
-        Ty::Adt(name) => {
+        Ty::Adt(name, _) => {
             if let Some(def) = types.adts.defs.get(name)
                 && !def.is_enum
                 && let Some(v) = def.variants.first()
@@ -563,8 +682,102 @@ fn members(t: &Ty, types: &Types) -> Vec<Completion> {
 }
 
 /// The std methods CarciniScript supports on each built-in type.
-fn std_methods(t: &Ty) -> &'static [&'static str] {
+pub fn std_methods(t: &Ty) -> &'static [&'static str] {
+    use crate::ty::Coll;
     match t {
+        Ty::Coll(Coll::VecDeque, _) => &[
+            "append",
+            "back",
+            "clear",
+            "clone",
+            "contains",
+            "drain",
+            "extend",
+            "front",
+            "get",
+            "insert",
+            "into_iter",
+            "is_empty",
+            "iter",
+            "iter_mut",
+            "len",
+            "make_contiguous",
+            "pop_back",
+            "pop_front",
+            "push_back",
+            "push_front",
+            "remove",
+            "retain",
+            "swap",
+            "truncate",
+        ],
+        Ty::Coll(Coll::BinaryHeap, _) => &[
+            "append",
+            "clear",
+            "clone",
+            "drain",
+            "extend",
+            "into_sorted_vec",
+            "into_vec",
+            "is_empty",
+            "iter",
+            "len",
+            "peek",
+            "pop",
+            "push",
+        ],
+        Ty::Coll(Coll::BTreeMap, _) => &[
+            "append",
+            "clear",
+            "clone",
+            "contains_key",
+            "entry",
+            "extend",
+            "first_key_value",
+            "get",
+            "get_mut",
+            "insert",
+            "into_iter",
+            "into_keys",
+            "into_values",
+            "is_empty",
+            "iter",
+            "iter_mut",
+            "keys",
+            "last_key_value",
+            "len",
+            "pop_first",
+            "pop_last",
+            "remove",
+            "retain",
+            "values",
+            "values_mut",
+        ],
+        Ty::Coll(Coll::BTreeSet, _) => &[
+            "append",
+            "clear",
+            "clone",
+            "contains",
+            "difference",
+            "extend",
+            "first",
+            "insert",
+            "intersection",
+            "into_iter",
+            "is_disjoint",
+            "is_empty",
+            "is_subset",
+            "is_superset",
+            "iter",
+            "last",
+            "len",
+            "pop_first",
+            "pop_last",
+            "remove",
+            "retain",
+            "symmetric_difference",
+            "union",
+        ],
         Ty::Str => &[
             "as_str",
             "bytes",
@@ -861,5 +1074,70 @@ fn std_methods(t: &Ty) -> &'static [&'static str] {
             "to_string",
         ],
         _ => &[],
+    }
+}
+
+/// The `///` doc comment of an item, as markdown (empty when there is none).
+fn docs_of(item: &impl HasAttrs) -> String {
+    item.doc_comments()
+        .filter_map(|c| {
+            let text = c.syntax().text().to_string();
+            let line = text.strip_prefix("///")?.to_string();
+            Some(line.strip_prefix(' ').map(str::to_string).unwrap_or(line))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The doc comment of the function `name`: a free function (`ty` None), or a method of `ty`
+/// (from its impls, else from a trait declaring it, whose docs an impl inherits).
+fn fn_docs(file: &SourceFile, ty: Option<&str>, name: &str) -> String {
+    let fns: Vec<(Option<String>, bool, ast::Fn)> = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .filter(|f| f.name().is_some_and(|n| n.text() == name))
+        .map(|f| {
+            let imp = f.syntax().ancestors().find_map(ast::Impl::cast);
+            let in_trait = f.syntax().ancestors().find_map(ast::Trait::cast).is_some();
+            (imp.and_then(|i| crate::adt::impl_parts(&i).1), in_trait, f)
+        })
+        .collect();
+    let pick = |want: &dyn Fn(&Option<String>, bool) -> bool| {
+        fns.iter()
+            .filter(|(owner, in_trait, _)| want(owner, *in_trait))
+            .map(|(_, _, f)| docs_of(f))
+            .find(|d| !d.is_empty())
+    };
+    match ty {
+        None => pick(&|owner, in_trait| owner.is_none() && !in_trait),
+        Some(t) => {
+            pick(&|owner, _| owner.as_deref() == Some(t)).or_else(|| pick(&|_, in_trait| in_trait))
+        }
+    }
+    .unwrap_or_default()
+}
+
+/// The doc comment of field `name` of the struct `ty`.
+fn field_docs(file: &SourceFile, ty: &str, name: &str) -> String {
+    for s in file.syntax().descendants().filter_map(ast::Struct::cast) {
+        if s.name().is_none_or(|n| n.text() != ty) {
+            continue;
+        }
+        for f in s.syntax().descendants().filter_map(ast::RecordField::cast) {
+            if f.name().is_some_and(|n| n.text() == name) {
+                return docs_of(&f);
+            }
+        }
+    }
+    String::new()
+}
+
+/// `text` followed by `docs` when there are any.
+fn with_docs(text: String, docs: &str) -> String {
+    if docs.is_empty() {
+        text
+    } else {
+        format!("{text}\n\n{docs}")
     }
 }

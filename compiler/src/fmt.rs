@@ -17,6 +17,14 @@ pub struct Spec {
     pub width: Option<usize>,
     pub precision: Option<usize>,
     pub debug: bool,
+    /// `#`: pretty `{:#?}`, or a `0x`/`0o`/`0b` prefix.
+    pub alt: bool,
+    /// `x`, `X`, `o`, `b`, `e` or `E`.
+    pub kind: Option<char>,
+    /// `{:width$}` / `{:1$}`: the width comes from an argument.
+    pub width_arg: Option<ArgRef>,
+    /// `{:.prec$}` / `{:.1$}` / `{:.*}` (`Next`, taken before the value).
+    pub precision_arg: Option<ArgRef>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -109,34 +117,65 @@ fn parse_spec(s: &str) -> Result<Spec, String> {
         i += 1;
     }
     if chars.get(i) == Some(&'#') {
-        return Err("`#` (alternate) formatting is not supported yet".into());
+        spec.alt = true;
+        i += 1;
     }
-    if chars.get(i) == Some(&'0') {
+    // `0` is the zero flag unless it's `0$` (the width from argument 0).
+    if chars.get(i) == Some(&'0') && chars.get(i + 1) != Some(&'$') {
         spec.zero = true;
         i += 1;
     }
-    let read_num = |i: &mut usize| -> Option<usize> {
+    // A count: `8`, or an argument: `8$`, `name$`.
+    let read_count = |i: &mut usize| -> (Option<usize>, Option<ArgRef>) {
         let start = *i;
         while *i < chars.len() && chars[*i].is_ascii_digit() {
             *i += 1;
         }
         if *i > start {
-            chars[start..*i].iter().collect::<String>().parse().ok()
-        } else {
-            None
+            let n: usize = chars[start..*i]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+            if chars.get(*i) == Some(&'$') {
+                *i += 1;
+                return (None, Some(ArgRef::Index(n)));
+            }
+            return (Some(n), None);
         }
+        if chars
+            .get(*i)
+            .is_some_and(|c| c.is_alphabetic() || *c == '_')
+        {
+            let mut j = *i;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'$') {
+                let name: String = chars[*i..j].iter().collect();
+                *i = j + 1;
+                return (None, Some(ArgRef::Name(name)));
+            }
+        }
+        (None, None)
     };
-    spec.width = read_num(&mut i);
+    (spec.width, spec.width_arg) = read_count(&mut i);
     if chars.get(i) == Some(&'.') {
         i += 1;
-        spec.precision = read_num(&mut i);
-        if spec.precision.is_none() {
-            return Err("only literal precision (e.g. `{:.2}`) is supported yet".into());
+        if chars.get(i) == Some(&'*') {
+            i += 1;
+            spec.precision_arg = Some(ArgRef::Next);
+        } else {
+            (spec.precision, spec.precision_arg) = read_count(&mut i);
+            if spec.precision.is_none() && spec.precision_arg.is_none() {
+                return Err("invalid format string: expected a precision after `.`".into());
+            }
         }
     }
     match &chars[i..] {
         [] => {}
         ['?'] => spec.debug = true,
+        [k @ ('x' | 'X' | 'o' | 'b' | 'e' | 'E')] => spec.kind = Some(*k),
         rest => {
             let rest: String = rest.iter().collect();
             return Err(format!("unsupported format spec `{rest}`"));

@@ -9,6 +9,8 @@ mod codegen;
 mod fmt;
 mod lineindex;
 mod macros;
+mod mbe;
+mod moves;
 pub mod service;
 mod sourcemap;
 mod ty;

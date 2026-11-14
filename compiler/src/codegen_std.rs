@@ -310,6 +310,10 @@ impl Codegen<'_> {
             ),
             (Ty::Vec(_), "append") => helper("append", self.arg_frags(m)),
             (Ty::Vec(_), "fill") => helper("fill", self.arg_frags(m)),
+            (Ty::Vec(_), "copy_from_slice" | "clone_from_slice") => helper(
+                "copyFromSlice",
+                [self.arg_frags(m), vec![Frag::text(loc.clone())]].concat(),
+            ),
             (Ty::Vec(_), "rotate_left") => helper(
                 "rotate",
                 [self.arg_frags(m), vec![Frag::text(format!("true, {loc}"))]].concat(),
@@ -369,6 +373,23 @@ impl Codegen<'_> {
             ["String", "with_capacity"] => {
                 let _ = emit(self, 0);
                 Frag::mapped(start, "\"\"")
+            }
+            [t, "from_str_radix"] if matches!(Ty::from_name(t), Ty::Int(_)) => {
+                let (s, r) = (emit(self, 0), emit(self, 1));
+                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I32);
+                let (min, max) = k.min_max();
+                call(
+                    "fromStrRadix",
+                    vec![s, r, Frag::text(format!("{min}, {max}"))],
+                )
+            }
+            ["str" | "String", "from_utf8"] => {
+                let b = emit(self, 0);
+                call("fromUtf8", vec![b])
+            }
+            ["String", "from_utf8_lossy"] => {
+                let b = emit(self, 0);
+                call("fromUtf8Lossy", vec![b])
             }
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(_) | Ty::Float { .. }) => {
                 emit(self, 0)

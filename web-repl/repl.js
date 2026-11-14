@@ -42,37 +42,18 @@ pub async fn main(ns: NS) {
 }
 `;
 
-const UNSUPPORTED = `// Rust outside the spike's subset gets compile errors, never a crash.
-use std::collections::HashMap;
-
-#[derive(Debug, Clone)]
-struct Server {
-    name: String,
-    max_money: f64,
-}
-
-trait Score {
-    fn score(&self) -> f64;
-}
-
-impl Score for Server {
-    fn score(&self) -> f64 {
-        self.max_money / 2.0
+const UNSUPPORTED = `// Rust outside the supported subset gets compile errors, never a crash.
+mod helpers {
+    pub fn double(x: i32) -> i32 {
+        x * 2
     }
-}
-
-fn best<T: Score>(items: &[T]) -> Option<&T> {
-    items.iter().max_by(|a, b| a.score().partial_cmp(&b.score()).unwrap())
 }
 
 fn main() {
-    let servers = vec![Server { name: "a".into(), max_money: 1.0 }];
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    match best(&servers) {
-        Some(s) => println!("{:?}", s),
-        None => println!("none"),
-    }
-    let squares: Vec<i32> = (1..10).map(|x| x * x).collect();
+    let big: u128 = 1 << 100;
+    let doubled = helpers::double(21);
+    let later = async { doubled + 1 };
+    println!("{} {}", big, doubled);
 }
 `;
 

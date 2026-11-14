@@ -308,7 +308,7 @@ impl Checker<'_> {
             (
                 Ty::Vec(e),
                 "drain" | "split_off" | "append" | "fill" | "rotate_left" | "rotate_right"
-                | "swap_remove",
+                | "swap_remove" | "copy_from_slice" | "clone_from_slice",
             ) => {
                 self.check_mutable(recv, Mutation::Borrow);
                 match method {
@@ -350,6 +350,13 @@ impl Checker<'_> {
                         count(self, 1);
                         if let Some(a) = a0 {
                             self.check(a, &e);
+                        }
+                        Ty::Unit
+                    }
+                    "copy_from_slice" | "clone_from_slice" => {
+                        count(self, 1);
+                        if let Some(a) = a0 {
+                            self.check(a, &Ty::Vec(e));
                         }
                         Ty::Unit
                     }
@@ -408,6 +415,35 @@ impl Checker<'_> {
                     self.check(a, &Ty::Int(IntKind::U8));
                 }
                 Ty::Char
+            }
+            // `u32::from_str_radix("ff", 16)`
+            [t, "from_str_radix"] if matches!(Ty::from_name(t), Ty::Int(_)) => {
+                count(self, 2);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Str);
+                }
+                if let Some(a) = a1 {
+                    self.check(a, &U32);
+                }
+                Ty::Result(
+                    Box::new(Ty::from_name(t)),
+                    Box::new(Ty::Extern("ParseIntError".into())),
+                )
+            }
+            // `str::from_utf8(&bytes)`, `String::from_utf8(bytes)`
+            ["str" | "String", "from_utf8"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
+                }
+                Ty::Result(Box::new(Ty::Str), Box::new(Ty::Extern("Utf8Error".into())))
+            }
+            ["String", "from_utf8_lossy"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
+                }
+                Ty::Str
             }
             ["String", "with_capacity"] => {
                 count(self, 1);
@@ -471,7 +507,8 @@ impl Checker<'_> {
                     }
                     None => Ty::Unknown,
                 };
-                if !self.zonk(&t).has_default() && !matches!(self.zonk(&t), Ty::Adt(_) | Ty::Var(_))
+                if !self.zonk(&t).has_default()
+                    && !matches!(self.zonk(&t), Ty::Adt(..) | Ty::Var(_))
                 {
                     let msg = format!(
                         "the trait bound `{}: Default` is not satisfied",

@@ -10,7 +10,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   wrapping), not debug-mode panics. An opt-in checked mode is planned for phase 4.
 - **64-bit integers are JS numbers.** `i64`, `u64`, `isize` and `usize` are exact only up to 2^53.
   They don't wrap at 2^64, and casting a negative value to an unsigned 64-bit type keeps the sign.
-  Literals above 2^53 produce a warning.
+  Literals above 2^53 produce a warning. Their bitwise operators are exact (through BigInt) for
+  values that fit, but a result above 2^53, such as `!0u64`, is rounded like any other.
 - **Unconstrained types aren't errors.** rustc reports "type annotations needed" for a value
   whose type nothing determines (e.g. an empty `Vec::new()` that's never used). CarciniScript
   treats it as untyped instead.
@@ -24,6 +25,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Index panics on underflowed `usize`s show a negative index.** `usize` arithmetic doesn't wrap
   (see 64-bit integers above), so `v[i - 1]` with `i == 0` panics with "the index is -1" instead
   of rustc's 18446744073709551615.
+- **A range of a Vec is a copy.** `v[1..4].sort()` and the other in-place slice methods copy the
+  range, change it and write it back; writing to it any other way (`v[0..2][1] = 9`,
+  `v[1..].iter_mut()`, `&mut v[a..b]`) is a compile error rather than a silent no-op.
 - **String sort order** compares UTF-16 code units; Rust compares UTF-8 bytes. The orders differ
   only between characters above U+FFFF and those in U+E000–U+FFFF.
 
@@ -38,6 +42,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `*map.entry(k).or_insert(..) += ..`. `iter_mut()` / `values_mut()` loops do write through.
 - **`HashSet` and `HashMap` iterate in insertion order.** Rust's order is unspecified (and randomized), so code
   that depended on CarciniScript's order would already be wrong in Rust.
+- **`BTreeMap` and `BTreeSet` re-sort when read after new keys arrive** (they are the hash classes
+  kept in key order), so a loop that alternates inserts and ordered reads costs O(n log n) per
+  read instead of O(log n). `VecDeque::pop_front` / `push_front` shift a JS array: O(n), fast enough
+  for queues of a few thousand servers.
+- **`VecDeque::insert` past the end appends instead of panicking**, and `BTreeMap::range` isn't
+  supported yet.
 
 ## Closures and iterators
 
@@ -60,15 +70,24 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Structs, enums and Result
 
-- **Values of a struct or enum are JS objects shared by reference.** Moves make that invisible,
-  and `Copy` types are copied wherever Rust would copy them. A non-`Copy` value reached through
+- **Values of a struct or enum are JS objects shared by reference.** Moves make that invisible
+  (using a moved local is rejected as in rustc), and `Copy` types are copied wherever Rust would
+  copy them. A non-`Copy` value reached through
   two paths at once (which Rust's borrow checker would reject) would show the aliasing.
+- **A field named like one of its type's methods is stored as `name$f`** in JS (`fn name(&self)`
+  next to a `name` field), so the instance property doesn't hide the method. This only shows when
+  JS code reads the object directly.
+- **A `&mut` to a number, string, bool or `Option` inside a struct, tuple or Vec** works as an
+  argument (`insert(&mut node.left, v)`: the callee gets a cell over that slot), but can't be kept
+  in a local (`let cur = &mut self.root;` walking a tree, `let n = &mut self.count;`): that's a
+  compile error, since writes through it would be lost. Recursion, or assigning through the place
+  itself, does the same job.
 - **`*r = value` for a `&mut` struct replaces the object's contents in place** (`κσ.$replace`),
   since JS can't rebind the caller's variable. The result is the same as Rust's.
-- **Generic structs, enums and impls aren't supported yet**, nor user-defined traits; `Display`
-  and `Default` are the trait impls that work. Derives cover the std ones.
-- **`?` needs the error types to match**: `From` conversions arrive with traits. Use
-  `.map_err(..)?`.
+- **`From` impls must be for a struct or enum declared in your code.** `impl From<MyErr> for
+  String` (a std target) isn't supported; `?` converts error types only into your own types.
+  `Into` bounds on generic parameters (`fn f<T: Into<Meters>>(x: T)`) aren't supported either:
+  a generic function can't pick the `from` method at run time (types are erased).
 - **`{:>10}` on a type with a `Display` impl ignores the width**, which matches Rust for impls
   that use `write!` (rather than `f.pad`).
 - **Exhaustiveness checking gives up on very large matches** (it assumes they're covered).
@@ -92,6 +111,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`RefCell` doesn't track borrows**, so a `borrow_mut` while another borrow is alive doesn't
   panic. `Rc` is erased: `Rc::strong_count` and `Weak` aren't available, and `.clone()` on a
   struct without `#[derive(Clone)]` is taken to be an `Rc` clone (it shares the value).
+- **A generic type's arguments can stay unknown** (`let s = Stack::new();` with no use), which
+  rustc rejects; nothing depends on them at run time.
 - **Slices are copies.** `&v[1..3]` reads like Rust, but writes through a slice wouldn't reach
   `v`, so `&mut v[a..b]` is rejected.
 
@@ -133,11 +154,31 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **No borrow checker.** Borrows and lifetimes are parsed and erased. Programs rustc rejects for
   aliasing or lifetime reasons still run. See the borrow-checking section of [PLAN.md](PLAN.md).
-- **No use-after-move or definite-initialization checks yet** (phase 1). A `let x;` local may be
-  assigned more than once.
+- **Use after move is checked only where the checker is sure a local owns its value** (see
+  FEATURES). It misses moves out of fields (`let v = s.items;` then `s.items`), out of pattern
+  bindings, and into closures without `move`; those run with the JS value still shared.
+  Definite initialization is checked for `let x;` (use before assignment, assigning an immutable
+  one twice); names declared by a `let (a, b);` pattern aren't checked yet.
 - **Type checking covers the supported subset only.** Within it, mismatches and mutability
   errors are reported like rustc's. NS calls are unchecked until typed bindings land, and trait
   bounds don't exist yet (only `sort` on floats is special-cased).
+
+## Traits on built-in types
+
+- **A trait implemented for both an integer type and a float type**, called through a generic
+  `T: Trait` or `dyn Trait`, picks the impl by the value: a whole number (`2.0f64` included) goes
+  to the integer impl. Called on a value of known type (`x.money()` with `x: f64`), the right
+  impl is chosen at compile time.
+
+## Macros
+
+- **`macro_rules!` expansions aren't hygienic.** A `let` inside an expansion is visible to the
+  code after the invocation, and a name the macro uses internally can capture (or be captured by)
+  one at the call site.
+- **Fragments are matched by their tokens**, the way rustc's fragment parsers would split them:
+  an `expr` ends at a top-level `,`, `;` or `=>`, a `ty` or `path` keeps commas inside `<..>`.
+  Rules that rely on finer parsing (an `expr` followed by an operator token) can match differently.
+- **Macros are per file**: `#[macro_export]` and macros from `mod` files aren't available yet.
 
 ## Evaluation order
 

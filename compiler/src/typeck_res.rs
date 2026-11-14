@@ -176,7 +176,7 @@ impl Checker<'_> {
             }
             "unwrap_or_default" => {
                 count(self, 0);
-                if !self.zonk(&t).has_default() && !matches!(self.zonk(&t), Ty::Adt(_)) {
+                if !self.zonk(&t).has_default() && !matches!(self.zonk(&t), Ty::Adt(..)) {
                     let msg = format!(
                         "the trait bound `{}: Default` is not satisfied",
                         self.describe(&t)
@@ -228,6 +228,30 @@ impl Checker<'_> {
             "is_err_and" => {
                 count(self, 1);
                 self.closure_arg(a0, vec![e], Ty::Bool)
+            }
+            "inspect" => {
+                count(self, 1);
+                self.closure_arg(a0, vec![t.clone()], Ty::Unit);
+                res(t, e)
+            }
+            "inspect_err" => {
+                count(self, 1);
+                self.closure_arg(a0, vec![e.clone()], Ty::Unit);
+                res(t, e)
+            }
+            // `Result<Option<T>, E>` -> `Option<Result<T, E>>`.
+            "transpose" => {
+                count(self, 0);
+                let x = self.fresh(VarKind::General);
+                if !self.unify(&t, &Ty::Option(Box::new(x.clone()))) {
+                    let msg = format!(
+                        "no method named `transpose` found for `{}`",
+                        self.describe(&res(t, e))
+                    );
+                    self.error(m.syntax(), msg);
+                    return Some(Ty::Unknown);
+                }
+                Ty::Option(Box::new(res(x, e)))
             }
             "map_or" => {
                 count(self, 2);

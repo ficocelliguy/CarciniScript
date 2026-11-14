@@ -183,7 +183,7 @@ impl Codegen<'_> {
     }
 
     /// An argument that's iterable in JS: maps iterate their entries, options yield 0 or 1 items.
-    fn iterable_arg(&mut self, arg: Option<ast::Expr>) -> Frag {
+    pub(super) fn iterable_arg(&mut self, arg: Option<ast::Expr>) -> Frag {
         let Some(a) = arg else {
             return Frag::text("[]");
         };
@@ -289,7 +289,8 @@ impl Codegen<'_> {
         let args: Vec<ast::Expr> = m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
         let a0 = args.first().cloned();
         let a1 = args.get(1).cloned();
-        let result_ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+        // Raw, so `collect` can build a `VecDeque` / `BTreeMap` / ..
+        let result_ty = self.raw_ty_of(m.syntax()).unwrap_or(Ty::Unknown);
         // `κσ.$name(recv, rest...)`
         let helper = |name: &str, rest: Vec<Frag>| {
             let mut all = vec![rf.clone()];
@@ -306,7 +307,7 @@ impl Codegen<'_> {
             f.append(Frag::join(rest, ", ")).push(")");
             f
         };
-        let out = |f: Frag| Some((f, result_ty.clone()));
+        let out = |f: Frag| Some((f, result_ty.view()));
         if let Some(r) = self.emit_std_method(m, rf, rt, method) {
             return Some(r);
         }
@@ -332,6 +333,19 @@ impl Codegen<'_> {
             (Ty::Str, "split_whitespace") => out(helper("splitWhitespace", vec![])),
             (Ty::Str, "lines") => out(helper("lines", vec![])),
             (Ty::Vec(_) | Ty::Set(_), "iter" | "into_iter") => out(helper("iter", vec![])),
+            // Over JS objects, the items are the objects themselves, so writes reach the Vec.
+            (Ty::Vec(e), "iter_mut") if !e.is_js_primitive() && **e != Ty::Unknown => {
+                out(helper("iter", vec![]))
+            }
+            (Ty::Str, "split_at") => {
+                let n = self.fn_arg(a0);
+                let loc = super::js_string(&self.location_at(name_off));
+                out(helper("splitAt", vec![n, Frag::text(loc)]))
+            }
+            (Ty::Vec(_), "chunks_exact") => {
+                let n = self.fn_arg(a0);
+                out(helper("chunksExact", vec![n]))
+            }
             (Ty::Vec(_), "windows" | "chunks") => {
                 let n = self.fn_arg(a0);
                 out(helper(method, vec![n]))
@@ -421,9 +435,28 @@ impl Codegen<'_> {
                     "is_none_or" => "optIsNoneOr",
                     "or" => "optOr",
                     "zip" => "optZip",
+                    "inspect" => "optInspect",
                     _ => unreachable!(),
                 };
                 out(helper(js, [vec![first], rest].concat()))
+            }
+
+            // ---- bool: `b.then(|| x)` / `b.then_some(x)` (the value is only evaluated when true)
+            (Ty::Bool, "then" | "then_some") => {
+                let v = match (&a0, method) {
+                    (Some(a), "then") => {
+                        let f = self.fn_arg(Some(a.clone()));
+                        f.wrap("(", ")()")
+                    }
+                    (Some(a), _) => {
+                        let (f, ty) = self.emit_expr(a, None);
+                        self.by_value(a, f, &ty)
+                    }
+                    _ => Frag::text("undefined"),
+                };
+                let mut f = rf.clone().wrap("(", " ? ");
+                f.append(v).push(" : null)");
+                out(f)
             }
 
             // ---- char
@@ -508,6 +541,7 @@ impl Codegen<'_> {
                 "filter_map" => "filterMap",
                 "enumerate" => "enumerate",
                 "rev" => "rev",
+                "cycle" => "cycle",
                 "take" => "take",
                 "skip" => "skip",
                 "step_by" => "stepBy",
@@ -528,6 +562,8 @@ impl Codegen<'_> {
                 "all" => "all",
                 "find" => "find",
                 "position" => "position",
+                "rposition" => "rposition",
+                "partition" => "partition",
                 "find_map" => "findMap",
                 "reduce" => "reduce",
                 "for_each" => "forEach",
@@ -579,13 +615,26 @@ impl Codegen<'_> {
                 call(method, vec![Frag::text(op), Frag::text(start)])
             }
             "collect" => {
-                let js = match result_ty {
+                let into = |t: &Ty| match t {
                     Ty::Set(_) => "collectSet",
                     Ty::Map(..) => "collectMap",
                     Ty::Str => "collectString",
+                    Ty::Coll(crate::ty::Coll::BTreeSet, _) => "collectBTreeSet",
+                    Ty::Coll(crate::ty::Coll::BTreeMap, _) => "collectBTreeMap",
+                    Ty::Coll(crate::ty::Coll::BinaryHeap, _) => "collectHeap",
                     _ => "collectVec",
                 };
-                call(js, vec![])
+                match result_ty {
+                    Ty::Result(c, _) => call(
+                        "collectResult",
+                        vec![Frag::text(format!("\"${}\"", into(c)))],
+                    ),
+                    Ty::Option(c) => call(
+                        "collectOption",
+                        vec![Frag::text(format!("\"${}\"", into(c)))],
+                    ),
+                    t => call(into(t), vec![]),
+                }
             }
             m2 if !simple(m2).is_empty() => {
                 let args: Vec<Frag> = [a0, a1]
@@ -614,6 +663,14 @@ fn arith_fold(method: &str, ty: &Ty) -> (String, &'static str) {
         None => e.to_string(),
     };
     match (method, ty) {
+        ("sum", Ty::Int(k @ (IntKind::I128 | IntKind::U128))) => (
+            format!("(a, b) => κσ.$w128(a + b, {})", k.is_signed()),
+            "0n",
+        ),
+        ("product", Ty::Int(k @ (IntKind::I128 | IntKind::U128))) => (
+            format!("(a, b) => κσ.$w128(a * b, {})", k.is_signed()),
+            "1n",
+        ),
         ("sum", Ty::Float { .. }) => ("(a, b) => a + b".into(), "-0"),
         ("sum", _) => (format!("(a, b) => {}", wrap("a + b")), "0"),
         ("product", Ty::Float { .. }) => ("(a, b) => a * b".into(), "1"),

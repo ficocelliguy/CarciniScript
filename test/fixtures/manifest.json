@@ -12,8 +12,44 @@
     "panic": "thread 'main' panicked at assert_msg.rs:13:5:\nassertion `left == right` failed: tri(4) should be eleven\n  left: 10\n right: 11"
   },
   {
+    "file": "assoc_consts.rs",
+    "stdout": "4 3 12\n....\n.#..\n....\n1 m 3.048 ft\n[Low, High] 20\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "bits64.rs",
+    "stdout": "1099511627776 35184372088831 1099511627783 1099511627781\n34084860461055 4 255\n141845589917698 4 4\n-20000000000 -2500000000 19999999999 14336\n7 3000000000\n[\"\", \"a\", \"b\", \"ab\", \"c\", \"ac\", \"bc\", \"abc\"]\nOk(1099511627775) Ok(-1295) Err(ParseIntError { kind: PosOverflow })\n[104, 195, 169] Ok(\"hi\")\n144 16 -64\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "cache_program.rs",
+    "stdout": "Some(1) None\nNone [(\"a\", 1), (\"c\", 3)]\n11/13 hits (84.6%) | 0/0 hits\n12586269025 9 1.50\nSome((\"x\", 5))\nNone\nSome((\"y\", -3))\nNone\n[[0, 1, 2], [3, 4, 0], [0, 0, 0]]\nshadow\n10\n3 2 20 10 1 \n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "cards_traits.rs",
+    "stdout": "[Card { rank: 5, suit: Hearts }, Card { rank: 5, suit: Spades }, Card { rank: 9, suit: Hearts }]\nSome(Card { rank: 9, suit: Hearts }) true\n238\n[Hearts, Spades] [5, 9]\ntrue Less\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "closures.rs",
     "stdout": "15\n11\n49\n14\n6 1\n10\n42\ncount 22\nnegative zero positive\n('x', 1)\nSome(4) None\n[\"A\", \"B\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "collect_result.rs",
+    "stdout": "Ok([1, 2, 3])\nErr(\"bad number: x\")\nOk(9) Err(\"bad number: five\")\nSome([1, 2, 3]) None\nErr(\"stop at 3\") after 3\n3\n2\nSome(\"hi\")\nOk([])\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "combinators.rs",
+    "stdout": "None -> Ok(None)\nNone\nSome(Ok(12)) -> Ok(Some(12))\nSome(Ok(12))\nSome(Err(\"invalid digit found in string\")) -> Err(\"invalid digit found in string\")\nSome(Err(\"invalid digit found in string\"))\nOk(3) Err(\"bad\") Some(5) None [\"ok 3\", \"err bad\", \"some 5\"]\n[Some(0), None, Some(20), None] calls=2\n[0, 1, 2]\nmany\n[\"r\", \"g\", \"b\", \"r\", \"g\", \"b\", \"r\"]\n[(1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a')]\n[]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -24,8 +60,38 @@
     "panic": null
   },
   {
+    "file": "contracts.rs",
+    "stdout": "6857 97\n6 41\n[1, 2, 3, 4, 8, 12, 11, 10, 9, 5, 6, 7]\n[[1, 6], [8, 12]]\n9a3a2b1c EBIIL TLOIA\n2\n\"DRRDDR\"\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "contracts2.rs",
+    "stdout": "[\"255.255.11.135\", \"255.255.111.35\"]\n[\"193.87.180.66\"]\nLXFOPVEFRNHR\n[\"(())()\", \"()()()\"] [\"(a())()\", \"(a)()()\"]\naaabbaaababababaabb\n[0, 1, 0, 1] []\n7 4\n11\n10 2\nabcdefxy true false true false\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "contracts3.rs",
+    "stdout": "[\"1+2+3\", \"1*2*3\"]\n[\"1*0+5\", \"10-5\"]\n11110000 1001101011\n[\"000\", \"001\", \"011\", \"010\", \"110\", \"111\", \"101\", \"100\"] 2 3\n255 -5 0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "control.rs",
     "stdout": "negative zero positive\n832040\n8\n111\nshadowed\n10\n3-4-5\n0 1 2 \n2 1 0 \n1 2 3 \n4 3 2 1 \n6 7\n3\nbig\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "custom_iter.rs",
+    "stdout": "[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\n44\n3 2 1 \nSome(2) Some(1) None\n[(3, 5), (2, 8), (1, 13)] 40\n[\"ab\", \"ab\", \"ab\"] 28\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "definite_init.rs",
+    "stdout": "10 zero small big\nSome(8) None\n10 [\"a\", \"b\"]\n1..10\n",
     "exitCode": 0,
     "panic": null
   },
@@ -36,14 +102,56 @@
     "panic": null
   },
   {
+    "file": "dyn_error.rs",
+    "stdout": "ok 8\nerror: invalid digit found in string\nerror: bad value \"0\" for threads\nerror: missing key threads\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "enums.rs",
     "stdout": "Circle(1.0) 3 true\nRect { w: 2.0, h: 3.0 } 6 false\nEmpty 0 false\nRect { w: 4.0, h: 6.0 } true\n27\nw 4\n5 11 Low\ntrue Some(High)\nEast 1 true\nsay hi\nwait 5\nwait 1 for coffee\n(-5, 3)\nMove { dir: North, steps: 3 }\n[(North, 2), (East, 1), (West, 1)]\nwest\nNorth\nSouth\nSome(High) None\n",
     "exitCode": 0,
     "panic": null
   },
   {
+    "file": "ext_dyn_dispatch.rs",
+    "stdout": "float 2.50 | int 7 | text \"hi\" | 3 ints | point Point(1, 2)\n[\"point Point(3, 4)\", \"point Point(0, 0)\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "ext_traits.rs",
+    "stdout": "$1.23m $950.50 income: $12.35k\n144 true false\nGROW! HACK! 4\n[1, 2, 6, 6] 3.75 0\nyes no\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "field_method_names.rs",
+    "stdout": "n00dles 8 n00dles 8 Server { name: \"n00dles\", ram: 1 } true\nServer { name: \"\", ram: 0 }\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "format.rs",
     "stdout": "crab has 10 legs\na b a\ncrab!\n[    crab] [crab    ] [  crab  ] [**crab***]\n[   10] [10   ] [-0010] [+10]\n3.14 3    3.142|\n\"crab\" 'c' \"tab\\there \\\"quoted\\\"\"\n1 1.0 0.30000000000000004 1e21\ninf -inf\n0.0000001 1e-7\n{literal} braces\n10-crab has len 7\n6\ntru\nCRAB\npadded\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "format_specs.rs",
+    "stdout": "ff FF 10 101\n0xff 0xFF 0o10 0b101\n00000101 0x000000ff     ff| 0xa   |\nff ffffffff 1111111111111110 ffffffffffffffff\n1.2345e3 1.2E-4 6.02e23 1.5e3 0e0\n[ab      ] [     6] [3.14] [2.718] [   1.414]\n[   mid   ]\n0 2 2 0.2 1.00 -0.3\nServer {\n    name: \"n00dles\",\n    ports: [\n        22,\n        80,\n    ],\n    root: Some(\n        true,\n    ),\n    tag: (\n        'x',\n        -1,\n    ),\n}\n[\n    Hack {\n        target: \"a, b\",\n        threads: 3,\n    },\n    Idle,\n    Wait(\n        1.5,\n    ),\n]\n{\n    \"e\": [],\n    \"k\": [\n        (\n            1,\n            \"one\",\n        ),\n    ],\n}\n(\n    1,\n) true []\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "from_into.rs",
+    "stdout": "Fahrenheit(212.0)\nFahrenheit(98.6) false\nnum 42\ntext \"hi\"\nflag true\nlist [num 1, text \"two\", flag false]\noven Fahrenheit(392.0)\nowned 10 5 200\nsum = 6\nerror: parse error on line 2 (Parse(ParseErr { line: 2 }))\nerror: missing input (Missing(\"input\"))\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_types.rs",
+    "stdout": "Some(9) Some(3) 1 Stack { items: [3] }\nStack { items: [\"a\", \"b\"] } Stack { items: [\"a\"] } false\nStack { items: [1.5, 1.5] } ab 3\n(1, two) (two, 1) Pair { first: \"two\", second: 1 }\n3.5\n3 Node([Leaf('a'), Node([Leaf('b'), Leaf('c')])])\nyes: got 3\nno\nNo true\n",
     "exitCode": 0,
     "panic": null
   },
@@ -66,6 +174,30 @@
     "panic": null
   },
   {
+    "file": "impl_iter_fns.rs",
+    "stdout": "[2, 4, 6] [1, 4, 9, 16]\n[3, 6, 9, 12]\n7\n20 60\n1 [\"a\"]\n2 [\"hi\", \"yo\"]\n3 [\"hey\"]\n165\n14 [1, 3, 5, 7, 9] [0, 2]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "index_op.rs",
+    "stdout": "a f h\n['d', 'e', 'f'] 3\naei\nServer { ram: 4 } 16\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "int128.rs",
+    "stdout": "340282366920938463463374607431768211455 -170141183460469231731687303715884105728\n48611766702991209066196372490252601636 -56713727820156410577229101238628035242\n65536 0\n265252859812191058636308480000000 440732388\n12246913469124691346913 12444444333344444433333 37037036703703703670369 19\n12056327051986882705 9816 98765432109876543209\n98765432109876543210 1267650600228229401496703205376 12345678901234567890123\nffffffffffffffffffffffffffffffff 0xff                  12345678901234567890123|\nOk(123456789012345678901234567890) true\n6 true true\n203 450461974 -1\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iterator_idioms.rs",
+    "stdout": "[5, 3, 8, 1, 9, 2] [9, 8, 5, 3, 2, 1]\n[80, 20] [3, 1, 2] [5, 8, 9]\n[-2, 5, -7, 8, -7] [[5, 3, 8, 1], [9, 2]]\n[5, 8, 16, 17, 26, 28] 28\n6 2160\n(4, 9) [2, 9]\n[1, 2, 3] true\n[1, 2, 3, 1]\n3.75\na-b-c [(1, 'x'), (2, 'y'), (3, 'z')] [4, 3, 2, 1]\n4\n[11, 12, 13]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "iterators.rs",
     "stdout": "[6, 2, 8, 2, 10, 18, 4, 12]\nevens 3\n31 6480\nSome(9) Some(1)\nSome(4)\nSome(5) None\ntrue true\n31415926\nSome(9)\n[4, 5, 2]\n[3, 1, 4, 1]\n[5, 9, 2, 6]\nSome(6) Some(1)\n[6, 2, 9]\n[3, 6] [1, 2, 3, 4, 5, 6]\n-0.0 7.5\n165\n0h 2l 4o \nabcde\nfedcba\ndesserts\nSHOUT\n[\"the\", \"quick\", \"brown\", \"fox\"]\n[\"a\", \"b\", \"\", \"c\"]\n[\"line one\", \"line two\", \"\", \"last\"]\n[8, 8, 0, 4]\n[3, 5, 7, 9]\n[1, 2] [3, 4] [5] \n[(1, 'a'), (2, 'b'), (3, 'c')]\n[1, 2, 3, 4, 5, 10, 20]\n[1, 2, 3]\n[1, 2, 2, 3, 3, 3]\nSome(300)\n[1, 3]\n[0, 1, 2]\n[('a', 0), ('b', 1), ('c', 2)]\nSome(\"banana\") Some(\"fig\")\n10\n12 23 34 45 \n",
     "exitCode": 0,
@@ -84,14 +216,44 @@
     "panic": null
   },
   {
+    "file": "macro_rules.rs",
+    "stdout": "49 9 6.25\n3 9\n{\"a\": 1, \"b\": 2, \"c\": 3}\n{}\nn00dles 4\n[warn] low ram\n[info] n00dles has 4GB\n2 1\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "main_result.rs",
+    "stdout": "got 12\n",
+    "exitCode": 1,
+    "panic": null
+  },
+  {
     "file": "mandelbrot.rs",
     "stdout": "\n                                        +.\n                                       .....#\n                                      ...++...\n                                   ....+####+..\n                               ........+####+......+\n                             ....+#++##########+.++++\n                           ....+.##################+..\n                  .............+###################+.+\n                 ...++.+++....+#####################+..\n                ....+#######++######################+.\n          .......+++#########+######################..\n    ##############################################....\n          .......+++#########+######################..\n                ....+#######++######################+.\n                 ...++.+++....+#####################+..\n                  .............+###################+.+\n                           ....+.##################+..\n                             ....+#++##########+.++++\n                               ........+####+......+\n                                   ....+####+..\n                                      ...++...\n                                       .....+\n                                        +.\ntotal iterations: 24818\n",
     "exitCode": 0,
     "panic": null
   },
   {
+    "file": "manual_debug.rs",
+    "stdout": "$123.45 Money(12345 cents)\nWallet { owner: \"me\", cash: Money(500 cents), history: [Money(1 cents), Money(250 cents)] }\nSome(Money(7 cents)) (Money(1 cents), 2)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "manual_ord.rs",
+    "stdout": "5:a 5:z 2:b 1:c \n-10 Neg(Num(1.0))\ngo clicked 3x\n[(\"a\", 2.0), (\"b\", 1.5)]\nGreater true false\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "matching.rs",
     "stdout": "negative zero small digit big even big odd \nABCF\nvowel consonant digit smiley other \nSome(4) None None\non\ngreen\ntotal 206 after 7\nsum 1023\nnot found\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "moves.rs",
+    "stdout": "Some(\"a\")\nSome(\"a\") Some(\"a\")\n2 2\n\"a\" \"a\"\nPt { x: 1 } Pt { x: 1 }\n6\n1\n[2]\n4\ntrue [3, 4]\n3 3\n1\n[1] [1]\nBag { items: [] } Bag { items: [] }\n3 [1, 2]\n9\nxxx\n",
     "exitCode": 0,
     "panic": null
   },
@@ -110,6 +272,12 @@
   {
     "file": "numbers.rs",
     "stdout": "1229 primes below 10000, largest 9973\ngcd(1071, 462) = 21\nsum of squares = 333833500\n1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz \n723471715 2497366906 2064144800 2008045182 3532304609 \n         609|76          |    3368    |\nhash = 1294555236\n1.4142 0.0000 2.7183\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "operators.rs",
+    "stdout": "Vec2 { x: 4.0, y: 1.0 } Vec2 { x: -2.0, y: 3.0 } a unchanged: Vec2 { x: 1.0, y: 2.0 }\nVec2 { x: 2.0, y: 4.0 } 1 Vec2 { x: -1.0, y: -2.0 }\nVec2 { x: 3.5, y: 3.5 }\nVec2 { x: 2.5, y: 5.5 } a still Vec2 { x: 1.0, y: 2.0 }\nVec2 { x: 8.0, y: 2.0 } [Vec2 { x: 10.0, y: 20.0 }, Vec2 { x: 30.0, y: -10.0 }, Vec2 { x: 40.0, y: 10.0 }]\nOff On true\nMoney(42)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -174,8 +342,26 @@
     "panic": "thread 'main' panicked at results.rs:96:20:\ndividing went wrong: DivByZero"
   },
   {
+    "file": "reverse_heap.rs",
+    "stdout": "[Reverse(1), Reverse(2), Reverse(8), Reverse(5), Reverse(3)] peek=Some(Reverse(1))\n[1, 2, 3, 5, 8]\ntrue true 3\n[Reverse(\"pear\"), Reverse(\"fig\"), Reverse(\"apple\")]\n[(1, 0), (2, 7), (3, 9), (4, 20), (5, 20), (6, 11)]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "shared.rs",
     "stdout": "[1, 2, 3, 4] 4\n20\n120 [\"+25\", \"+-5\"] 2\n120 [\"+25\", \"+-5\"] Account { balance: RefCell { value: 0 }, log: RefCell { value: [] }, visits: Cell { value: 2 } }\n14\nroot [\"leaf\", \"leaf\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "simulation.rs",
+    "stdout": "[403, 657, 551, 36, 712]\n0 hackers; [(5, Grow), (4, Weaken), (2, Grow), (1, Weaken)]\n50\n  5 Grow      50\n  4 Weaken    40\n  2 Grow      20\n  1 Weaken    10\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "slice_range_mut.rs",
+    "stdout": "[3, 1, 2, 9, 5, 8]\n[1, 3, 2, 9, 5, 8]\n[1, 3, 2, 9, 0, 0]\n[1, 2, 3, 9, 0, 0]\n[3, 1, 2, 0, 0, 9]\n[3, 2, 1, 0, 0, 9]\n[3, 2, 1, 0, 0, 9]\n[0, 0, 1, 7, 7, 9]\nabcdefgh\n[\"pear\", \"fig\", \"kiwi\", \"apple\"]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -186,8 +372,32 @@
     "panic": null
   },
   {
+    "file": "slot_args.rs",
+    "stdout": "[1, 3, 4, 5, 8, 9]\n[6, 12, 3] [[0, 0, 0], [0, 0, 7]] P { x: 42, name: \"N00DLES!\" } (1, 102)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "sorting.rs",
     "stdout": "less equal greater\nGreater Greater\nGreater\nSome(Greater) None\ntrue\n[(\"ada\", 36), (\"bob\", 30), (\"cy\", 30), (\"dee\", 25)]\n[(\"cy\", 30), (\"ada\", 36), (\"bob\", 30), (\"dee\", 25)]\n[-1.0, 0.5, 2.5, 9.75]\n9.75 Some(9.75)\n[1, 2, 3, 4, 1]\n[1, 2, 4, 1]\n[\"apple\", \"avocado\", \"banana\", \"blueberry\", \"cherry\"]\n[50, 31, 82]\nSome(8) None\nNone Some(3)\n99 5\n-1 true\ntrue Some(7) Some((4, 'z'))\n[1, 2, 3, 4, 5, 6, 7, 8]\n[4, 5]\n[1, 2, 3]\n[1, 2, 3, 6, 7, 8]\n[1, 3, 5, 10, 11]\n[(\"apple\", 3), (\"fig\", 13), (\"kiwi\", 99), (\"lime\", 3), (\"plum\", 5)]\n123 [\"apple\", \"fig\", \"kiwi\", \"lime\", \"plum\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_breadth.rs",
+    "stdout": "[1, 1, 2, 3, 4, 5, 5, 5, 6, 9] Ok(4) Err(9)\n[1, 2, 3, 4, 5, 6, 9] Some(3)\n[\"apple\", \"bob\", \"dove\", \"egg\"]\n[6, 15] 2\n[(0, 'T'), (4, 'Q')] fox brown Quick The\n(\"The\", \" Quick brown fox\") Some((\"The Quick brown\", \"fox\"))\n27 111\n[('l', 3), ('o', 2)]\n....\n..#.\n....\n[\"...\", \"...\", \".#.\", \"...\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_collections.rs",
+    "stdout": "[0, 1, 2, 3] len=4 front=Some(0) back=Some(3)\nSome(0) Some(3) 2\n[9, 2] remove=Some(1) remove_oob=None\n[9, 2, 7] [] contains9=true sum=18\n[2, 7, 9] [4, 14, 18] eq=true\nNone None true\n[9, 6, 5, 4, 1, 3, 2, 1] peek=Some(9) len=8\nafter 3 pops: [4, 2, 3, 1, 1]\n[9, 6, 5, 4, 3, 2, 1, 1]\n[9, 5, 8, 1, 3, 2]\n[9, 6, 8, 5, 3, 2, 7, 1, 4]\n[13, 11, 12, 5, 9, 10, 7, 1, 4, 3, 6, 2, 8] []\n[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]\n[\"apple\", \"fig\", \"pear\"]\n{\"amy\": 16, \"kim\": 5, \"zed\": 3}\nSome((\"amy\", 16)) Some((\"zed\", 3)) 5\n[\"amy\", \"bob\", \"kim\"] [16, 1, 5]\namy=16 bob=1 kim=5 \nSome((\"amy\", 16)) {\"bob\": 1, \"kim\": 5}\n{1: 1, 2: 4, 3: 9, 4: 16} true\n{1: 'a', 2: 'b', 3: 'c'} Some('b')\n{1, 3, 4, 5, 9} first=Some(1) last=Some(9)\n[0, 1, 3, 4, 5, 9, 10]\n[3, 4]\n[1, 5, 9]\nSome(9) Some(1) {3, 4, 5}\n{'a', 'b', 'n'} abn\nInventory { counts: {\"ore\": 2}, tags: {'a', 'z'}, queue: [1] }\n[\"home\", \"n00dles\", \"foodnstuff\", \"sigma\", \"zer0\", \"max-hardware\", \"silver-helix\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_imports.rs",
+    "stdout": "10 0 4\npear\n[9] [] [2, 3] [1]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -206,6 +416,12 @@
   {
     "file": "structs_mut.rs",
     "stdout": "P { x: 1, y: 2 } P { x: 101, y: 2 }\nP { x: 1, y: 2 } P { x: 0, y: -1 }\nOuter { inner: P { x: 50, y: 2 }, tag: \"t\", list: [P { x: -5, y: 2 }, P { x: 101, y: 7 }] } P { x: 1, y: 2 } P { x: 1, y: 2 }\nt t! 2\nCircle(3.0) Rect { w: 2.0, h: 3.0 }\n[Circle(2.25), Rect { w: 1.5, h: 1.5 }]\n[P { x: 3, y: 2 }, P { x: 303, y: 2 }] 310\n[[P { x: 0, y: 0 }, P { x: 0, y: 0 }], [P { x: 9, y: 0 }, P { x: 0, y: 0 }]]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "trait_static_fns.rs",
+    "stdout": "canis lupus / strigiformes\nWolf { name: \"AKELA\" } Owl(\"hedwig\")\nAKELA (canis lupus) the animal | hedwig hoots\n",
     "exitCode": 0,
     "panic": null
   },

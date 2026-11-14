@@ -71,6 +71,14 @@ fn main() {
             out
         });
         slowest.push((t0.elapsed(), f.clone(), src.len()));
+        // `SWEEP_GREP=text` lists every diagnostic containing `text` (in code rustc accepts, any
+        // such diagnostic for a borrow-check-style error is a false positive).
+        if let (Ok(out), Some(pat)) = (&result, std::env::var_os("SWEEP_GREP")) {
+            let pat = pat.to_string_lossy();
+            for d in out.diagnostics.iter().filter(|d| d.message.contains(&*pat)) {
+                eprintln!("{}:{}:{} {}", f.display(), d.line, d.column, d.message);
+            }
+        }
         match result {
             Ok(out) if out.code.is_some() => ok += 1,
             Ok(_) => rejected += 1,

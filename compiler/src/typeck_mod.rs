@@ -55,6 +55,78 @@ pub fn module_path(current: &str, name: &str) -> String {
     }
 }
 
+/// The leaves of a `use` tree: (path, `as` name, whether it's `path::*`).
+pub fn use_leaves(u: &ast::Use) -> Vec<(Vec<String>, Option<String>, bool)> {
+    fn walk(
+        t: &ast::UseTree,
+        prefix: &[String],
+        out: &mut Vec<(Vec<String>, Option<String>, bool)>,
+    ) {
+        let mut path = prefix.to_vec();
+        if let Some(p) = t.path() {
+            path.extend(
+                p.segments()
+                    .filter_map(|s| s.name_ref())
+                    .map(|n| n.text().to_string()),
+            );
+        }
+        if let Some(list) = t.use_tree_list() {
+            for c in list.use_trees() {
+                walk(&c, &path, out);
+            }
+            return;
+        }
+        let rename = t
+            .rename()
+            .and_then(|r| r.name())
+            .map(|n| n.text().to_string());
+        out.push((path, rename, t.star_token().is_some()));
+    }
+    let mut out = Vec::new();
+    if let Some(t) = u.use_tree() {
+        walk(&t, &[], &mut out);
+    }
+    out
+}
+
+/// Export `name` (a function, type, trait or constant the module can see) as `as_name`.
+fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
+    if let Some(sig) = c.fns.get(name) {
+        out.fns.insert(as_name.to_string(), sig.clone());
+    }
+    if let Some(t) = c.consts.get(name) {
+        out.consts.insert(as_name.to_string(), t.clone());
+    }
+    // Types and traits keep their names (renaming them isn't supported).
+    if name == as_name {
+        if let Some(def) = c.adts.defs.get(name) {
+            let mut def = def.clone();
+            def.module = None;
+            out.adts.defs.insert(name.to_string(), def);
+        }
+        if let Some(ms) = c.adts.methods.get(name) {
+            out.adts.methods.insert(name.to_string(), ms.clone());
+        }
+        if let Some(ts) = c.adts.trait_impls.get(name) {
+            out.adts.trait_impls.insert(name.to_string(), ts.clone());
+        }
+        if let Some(fs) = c.adts.from_impls.get(name) {
+            out.adts.from_impls.insert(name.to_string(), fs.clone());
+        }
+        if let Some(os) = c.adts.op_impls.get(name) {
+            out.adts.op_impls.insert(name.to_string(), os.clone());
+        }
+        if let Some(ks) = c.adts.assoc_consts.get(name) {
+            out.adts.assoc_consts.insert(name.to_string(), ks.clone());
+        }
+        if let Some(t) = c.adts.traits.get(name) {
+            let mut t = t.clone();
+            t.module = None;
+            out.adts.traits.insert(name.to_string(), t);
+        }
+    }
+}
+
 /// The public signatures of the module in `text`.
 fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String>) -> Exports {
     let parse = SourceFile::parse(text, EDITION);
@@ -69,7 +141,7 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
             .map(|d| d.message.clone()),
         ..Exports::default()
     };
-    for item in file.items() {
+    for item in file.items().filter(|i| !crate::adt::test_only(i.syntax())) {
         let public = |v: Option<ast::Visibility>| v.is_some();
         match &item {
             ast::Item::Fn(f) if public(f.visibility()) => {
@@ -99,6 +171,15 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
                 if let Some(ts) = c.adts.trait_impls.get(&n) {
                     out.adts.trait_impls.insert(n.clone(), ts.clone());
                 }
+                if let Some(fs) = c.adts.from_impls.get(&n) {
+                    out.adts.from_impls.insert(n.clone(), fs.clone());
+                }
+                if let Some(os) = c.adts.op_impls.get(&n) {
+                    out.adts.op_impls.insert(n.clone(), os.clone());
+                }
+                if let Some(ks) = c.adts.assoc_consts.get(&n) {
+                    out.adts.assoc_consts.insert(n.clone(), ks.clone());
+                }
             }
             ast::Item::Trait(t) if public(t.visibility()) => {
                 if let Some(n) = t.name()
@@ -121,6 +202,28 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
                     out.consts.insert(n.text().to_string(), t.clone());
                 }
             }
+            // `pub use circle::Circle;`: what this module imported is part of its exports too.
+            ast::Item::Use(u) if public(u.visibility()) => {
+                for (path, rename, star) in use_leaves(u) {
+                    let rel: Vec<&str> = path
+                        .iter()
+                        .map(String::as_str)
+                        .skip_while(|s| matches!(*s, "crate" | "self"))
+                        .collect();
+                    match (rel.as_slice(), star) {
+                        ([module], true) => {
+                            for n in c.module_exports.get(*module).cloned().unwrap_or_default() {
+                                reexport(&c, &mut out, &n, &n);
+                            }
+                        }
+                        ([_, .., item], false) => {
+                            let as_name = rename.clone().unwrap_or_else(|| item.to_string());
+                            reexport(&c, &mut out, item, &as_name);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -135,6 +238,16 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
             for f in &mut v.fields {
                 f.ty = freeze(&f.ty);
             }
+        }
+    }
+    for fs in out.adts.from_impls.values_mut() {
+        for f in fs.iter_mut() {
+            f.src = freeze(&f.src);
+        }
+    }
+    for os in out.adts.op_impls.values_mut() {
+        for o in os.iter_mut() {
+            o.rhs = freeze(&o.rhs);
         }
     }
     for ms in out.adts.methods.values_mut() {
@@ -163,11 +276,14 @@ fn erase_vars(t: &Ty) -> Ty {
         Ty::Vec(x) => Ty::Vec(e(x)),
         Ty::Option(x) => Ty::Option(e(x)),
         Ty::Set(x) => Ty::Set(e(x)),
+        Ty::Coll(k, x) => Ty::Coll(*k, e(x)),
         Ty::Future(x) => Ty::Future(e(x)),
         Ty::Map(k, v) => Ty::Map(e(k), e(v)),
         Ty::Entry(k, v) => Ty::Entry(e(k), e(v)),
         Ty::Result(k, v) => Ty::Result(e(k), e(v)),
         Ty::Tuple(xs) => Ty::Tuple(xs.iter().map(erase_vars).collect()),
+        Ty::Adt(n, args) => Ty::Adt(n.clone(), args.iter().map(erase_vars).collect()),
+        Ty::RefCell(x) => Ty::RefCell(e(x)),
         Ty::Iter { elem, mutable } => Ty::Iter {
             elem: e(elem),
             mutable: *mutable,
@@ -202,7 +318,16 @@ impl Checker<'_> {
                 );
                 continue;
             }
-            let path = module_path(filename, &n);
+            // `name.rs` next to this file, else `name/mod.rs`.
+            let flat = module_path(filename, &n);
+            let nested = module_path(filename, &format!("{n}/mod"));
+            let (path, text, specifier) = match resolver(&flat) {
+                Some(t) => (flat, Some(t), format!("./{n}.rs")),
+                None => match resolver(&nested) {
+                    Some(t) => (nested.clone(), Some(t), format!("./{n}/mod.rs")),
+                    None => (flat, None, String::new()),
+                },
+            };
             if stack.contains(&path) {
                 self.error(
                     m.syntax(),
@@ -210,10 +335,10 @@ impl Checker<'_> {
                 );
                 continue;
             }
-            let Some(text) = resolver(&path) else {
+            let Some(text) = text else {
                 self.error(
                     m.syntax(),
-                    format!("file not found for module `{n}` (looked for `{path}`)"),
+                    format!("file not found for module `{n}` (looked for `{path}` and `{nested}`)"),
                 );
                 continue;
             };
@@ -225,10 +350,7 @@ impl Checker<'_> {
             }
             self.merge_module(&n, exports);
             self.adts.modules.insert(n.clone());
-            self.modules.push(ModuleRef {
-                specifier: format!("./{n}.rs"),
-                name: n,
-            });
+            self.modules.push(ModuleRef { specifier, name: n });
         }
         for item in crate::adt::all_items(file) {
             if let ast::Item::Use(u) = &item
@@ -259,6 +381,9 @@ impl Checker<'_> {
         }
         self.adts.methods.extend(ex.adts.methods);
         self.adts.trait_impls.extend(ex.adts.trait_impls);
+        self.adts.from_impls.extend(ex.adts.from_impls);
+        self.adts.op_impls.extend(ex.adts.op_impls);
+        self.adts.assoc_consts.extend(ex.adts.assoc_consts);
         for (n, mut def) in ex.adts.traits {
             def.module = Some(module.to_string());
             names.insert(n.clone());
@@ -300,6 +425,19 @@ impl Checker<'_> {
             .skip_while(|s| matches!(*s, "crate" | "self"))
             .collect();
         match rel.as_slice() {
+            // `use std::cmp::max;` / `use std::mem::{swap, take as grab};`: calls of the name are
+            // calls of `cmp::max` etc.
+            ["std" | "core" | "alloc", module, f]
+                if f.starts_with(|ch: char| ch.is_ascii_lowercase()) =>
+            {
+                let alias = tree
+                    .rename()
+                    .and_then(|r| r.name())
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_else(|| f.to_string());
+                self.std_fns
+                    .insert(alias, vec![module.to_string(), f.to_string()]);
+            }
             ["std" | "core" | "alloc", ..] | [] => {}
             [module, rest @ ..] if self.module_exports.contains_key(*module) => {
                 let exports = self.module_exports[*module].clone();

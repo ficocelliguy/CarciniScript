@@ -3,6 +3,8 @@
 pub struct LineIndex<'a> {
     text: &'a str,
     line_starts: Vec<usize>,
+    /// When the compiled text is a macro expansion of `text`: expanded offsets → `text`'s.
+    map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
 }
 
 impl<'a> LineIndex<'a> {
@@ -13,10 +15,26 @@ impl<'a> LineIndex<'a> {
                 line_starts.push(i + 1);
             }
         }
-        LineIndex { text, line_starts }
+        LineIndex {
+            text,
+            line_starts,
+            map: None,
+        }
+    }
+
+    /// Positions of an expansion of `original`, reported in `original`.
+    pub fn mapped(original: &'a str, map: std::rc::Rc<crate::mbe::OffsetMap>) -> Self {
+        LineIndex {
+            map: Some(map),
+            ..LineIndex::new(original)
+        }
     }
 
     pub fn line_col(&self, offset: usize) -> (u32, u32) {
+        let offset = match &self.map {
+            Some(m) => m.orig(offset, false),
+            None => offset,
+        };
         let offset = offset.min(self.text.len());
         let line = match self.line_starts.binary_search(&offset) {
             Ok(l) => l,

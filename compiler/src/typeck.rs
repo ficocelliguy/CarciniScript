@@ -14,6 +14,10 @@ use std::rc::Rc;
 
 #[path = "typeck_adt.rs"]
 mod adt_check;
+#[path = "typeck_coll.rs"]
+mod coll;
+#[path = "typeck_conv.rs"]
+mod conv;
 #[path = "typeck_ext.rs"]
 mod ext;
 #[path = "typeck_gen.rs"]
@@ -27,7 +31,7 @@ mod std_lib;
 #[path = "typeck_trait.rs"]
 mod traits;
 pub use ext::{char_predicate, is_option_closure_method};
-pub use modules::{Imported, ModuleRef, Resolver};
+pub use modules::{Imported, ModuleRef, Resolver, use_leaves};
 pub use res::{is_std_error, result_ctor_call, result_variant};
 
 use ra_ap_syntax::{
@@ -65,10 +69,18 @@ pub struct Types {
     /// Path expressions that pass a cell itself rather than its value (`&mut n`, or a `&mut`
     /// parameter handed on), by range.
     pub cell_args: std::collections::HashSet<(usize, usize)>,
+    /// `&mut obj.field` / `&mut v[i]` arguments for `&mut i32`-style parameters: passed as a cell
+    /// that reads and writes the slot (by the `&mut` expression's range).
+    pub slot_args: std::collections::HashSet<(usize, usize)>,
     /// `mod name;` modules, in order.
     pub modules: Vec<ModuleRef>,
     /// Functions and constants from other modules.
     pub imported: Vec<Imported>,
+    /// The `From` impl (or identity) each `Y::from(x)`, `x.into()` and converting `?` uses, by
+    /// the expression's range.
+    pub conversions: HashMap<(usize, usize), crate::adt::Conv>,
+    /// std functions imported by name: name -> path after `std` (`max` -> `cmp::max`).
+    pub std_fns: HashMap<String, Vec<String>>,
 }
 
 impl Types {
@@ -149,9 +161,14 @@ impl<'a> Checker<'a> {
             loops: Vec::new(),
             boxed: Default::default(),
             cell_args: Default::default(),
+            slot_args: Default::default(),
             modules: Vec::new(),
             module_exports: HashMap::new(),
             imported: Vec::new(),
+            pending_intos: Vec::new(),
+            std_fns: HashMap::new(),
+            assoc_output: None,
+            conversions: HashMap::new(),
         }
     }
 
@@ -302,12 +319,35 @@ pub fn check(
             severity: "error",
         });
     }
+    // Moves are only checked in programs that type-check: they rely on the types.
+    if c.diags.iter().all(|d| d.severity != "error") {
+        let moves = crate::moves::check(file, src, &map, &c.adts);
+        c.diags.extend(moves);
+    }
+    if let Some((&(start, end), ty)) = map
+        .iter()
+        .filter_map(|(k, t)| Some((k, c.unordered_coll(t)?)))
+        .min_by_key(|(k, _)| **k)
+    {
+        let message = format!(
+            "the trait bound `{ty}: Ord` is not satisfied (B-tree keys and heap items must be totally ordered: no floats; structs and enums need `#[derive(PartialEq, Eq, PartialOrd, Ord)]`)"
+        );
+        c.diags.push(RawDiag {
+            start,
+            end,
+            message,
+            severity: "error",
+        });
+    }
     let adts = std::mem::take(&mut c.adts);
     let mut_bindings = std::mem::take(&mut c.mut_bindings);
     let boxed = std::mem::take(&mut c.boxed);
     let cell_args = std::mem::take(&mut c.cell_args);
+    let slot_args = std::mem::take(&mut c.slot_args);
     let modules = std::mem::take(&mut c.modules);
     let imported = std::mem::take(&mut c.imported);
+    let conversions = std::mem::take(&mut c.conversions);
+    let std_fns = std::mem::take(&mut c.std_fns);
     (
         Types {
             map,
@@ -315,8 +355,11 @@ pub fn check(
             mut_bindings,
             boxed,
             cell_args,
+            slot_args,
             modules,
             imported,
+            conversions,
+            std_fns,
         },
         c.diags,
     )
@@ -336,7 +379,7 @@ struct Checker<'a> {
     in_async: bool,
     bindings: Rc<Bindings>,
     /// `collect()` calls whose target type wasn't known yet: (target, item type, call node).
-    pending_collects: Vec<(Ty, Ty, SyntaxNode)>,
+    pending_collects: Vec<(Ty, Ty, SyntaxNode, usize)>,
     /// The current signature's `F: Fn(..)` type parameters, as closure types.
     generics: HashMap<String, Ty>,
     /// Structs, enums and their `impl` signatures.
@@ -356,6 +399,7 @@ struct Checker<'a> {
     pending_bounds: Vec<(Ty, String, SyntaxNode)>,
     boxed: std::collections::HashSet<(usize, usize)>,
     cell_args: std::collections::HashSet<(usize, usize)>,
+    slot_args: std::collections::HashSet<(usize, usize)>,
     /// Enclosing loops, innermost last: (label, the value type for a `loop`; None for
     /// `while`/`for`, which can't break with a value), and whether some `break` targets it.
     loops: Vec<(Option<String>, Option<Ty>, bool, bool)>,
@@ -363,6 +407,13 @@ struct Checker<'a> {
     modules: Vec<ModuleRef>,
     module_exports: HashMap<String, std::collections::HashSet<String>>,
     imported: Vec<Imported>,
+    /// `.into()` calls, settled at the end of the function: (source, target, call node).
+    pending_intos: Vec<(Ty, Ty, SyntaxNode, usize)>,
+    /// std functions imported by name (`use std::cmp::max;`): name -> path after `std`.
+    std_fns: HashMap<String, Vec<String>>,
+    /// `type Output = ..;` of the operator impl being declared.
+    assoc_output: Option<Ty>,
+    conversions: HashMap<(usize, usize), crate::adt::Conv>,
 }
 
 const USIZE: Ty = Ty::Int(IntKind::Usize);
@@ -450,12 +501,14 @@ impl<'a> Checker<'a> {
             Ty::Map(k, v) => Ty::Map(Box::new(self.zonk(&k)), Box::new(self.zonk(&v))),
             Ty::Entry(k, v) => Ty::Entry(Box::new(self.zonk(&k)), Box::new(self.zonk(&v))),
             Ty::RefCell(t) => Ty::RefCell(Box::new(self.zonk(&t))),
+            Ty::Adt(n, args) => Ty::Adt(n, args.iter().map(|a| self.zonk(a)).collect()),
             Ty::Result(t, e) => Ty::Result(Box::new(self.zonk(&t)), Box::new(self.zonk(&e))),
             Ty::Closure { params, ret } => Ty::Closure {
                 params: params.iter().map(|p| self.zonk(p)).collect(),
                 ret: Box::new(self.zonk(&ret)),
             },
             Ty::Set(e) => Ty::Set(Box::new(self.zonk(&e))),
+            Ty::Coll(k, v) => Ty::Coll(k, Box::new(self.zonk(&v))),
             Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| self.zonk(e)).collect()),
             Ty::Future(e) => Ty::Future(Box::new(self.zonk(&e))),
             Ty::Iter { elem, mutable } => Ty::Iter {
@@ -476,9 +529,17 @@ impl<'a> Checker<'a> {
             Ty::Vec(e) => format!("Vec<{}>", self.describe(&e)),
             Ty::Option(e) => format!("Option<{}>", self.describe(&e)),
             Ty::Set(e) => format!("HashSet<{}>", self.describe(&e)),
+            Ty::Coll(k, v) => k.describe(&self.describe(&v)),
             Ty::Map(k, v) => format!("HashMap<{}, {}>", self.describe(&k), self.describe(&v)),
             Ty::Entry(k, v) => format!("Entry<'_, {}, {}>", self.describe(&k), self.describe(&v)),
             Ty::RefCell(t) => format!("RefCell<{}>", self.describe(&t)),
+            Ty::Adt(n, args) if !args.is_empty() => format!(
+                "{n}<{}>",
+                args.iter()
+                    .map(|a| self.describe(a))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Ty::Result(t, e) => format!("Result<{}, {}>", self.describe(&t), self.describe(&e)),
             Ty::Closure { params, ret } => crate::ty::describe_closure(
                 params.iter().map(|p| self.describe(p)).collect(),
@@ -530,9 +591,14 @@ impl<'a> Checker<'a> {
             | (Ty::Option(x), Ty::Option(y))
             | (Ty::RefCell(x), Ty::RefCell(y))
             | (Ty::Set(x), Ty::Set(y)) => self.unify(x, y),
+            (Ty::Coll(a, x), Ty::Coll(b, y)) if a == b => self.unify(x, y),
+            (Ty::Adt(a, xs), Ty::Adt(b, ys)) if a == b && xs.len() == ys.len() => {
+                let (xs, ys) = (xs.clone(), ys.clone());
+                xs.iter().zip(ys.iter()).all(|(x, y)| self.unify(x, y))
+            }
             // A struct or enum coerces to a `dyn Trait` it implements.
-            (Ty::Dyn(tr), Ty::Adt(_)) | (Ty::Adt(_), Ty::Dyn(tr)) => {
-                let adt = if matches!(a, Ty::Adt(_)) {
+            (Ty::Dyn(tr), Ty::Adt(..)) | (Ty::Adt(..), Ty::Dyn(tr)) => {
+                let adt = if matches!(a, Ty::Adt(..)) {
                     a.clone()
                 } else {
                     b.clone()
@@ -585,7 +651,7 @@ impl<'a> Checker<'a> {
 
     /// Unify `found` with `expected`, reporting rustc's "mismatched types" on failure.
     fn expect(&mut self, n: &SyntaxNode, found: &Ty, expected: &Ty) {
-        if let (Ty::Dyn(tr), Ty::Adt(adt)) = (self.shallow(expected), self.shallow(found))
+        if let (Ty::Dyn(tr), Ty::Adt(adt, _)) = (self.shallow(expected), self.shallow(found))
             && !self.unify(found, expected)
         {
             let msg = format!(
@@ -652,10 +718,27 @@ impl<'a> Checker<'a> {
             {
                 self.lower_fn_type(t).unwrap()
             }
+            // `impl Iterator<Item = T>` / `Box<dyn Iterator<Item = T>>`: the runtime's iterator.
+            ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_)
+                if iterator_item(t).is_some() =>
+            {
+                let elem = match iterator_item(t).unwrap() {
+                    Some(item) => self.lower_type(&item),
+                    None => self.fresh(VarKind::General),
+                };
+                Ty::Iter {
+                    elem: Box::new(elem),
+                    mutable: false,
+                }
+            }
             ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_)
                 if self.user_trait_type(t).is_some() =>
             {
                 Ty::Dyn(self.user_trait_type(t).unwrap())
+            }
+            // `Box<dyn Error>`: any error value (they all display themselves).
+            ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_) if names_std_error(t) => {
+                Ty::Dyn("Error".into())
             }
             ast::Type::SliceType(s) => Ty::Vec(Box::new(
                 s.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
@@ -670,6 +753,22 @@ impl<'a> Checker<'a> {
                     .and_then(|s| s.name_ref())
                     .map(|n| n.text().to_string())
                     .unwrap_or_default();
+                if let Some(kind) = crate::ty::Coll::from_name(&name) {
+                    let args: Vec<Ty> = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .map(|l| l.generic_args().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => {
+                                ta.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown)
+                            }
+                            _ => self.fresh(VarKind::General),
+                        })
+                        .collect();
+                    return self.coll_type(kind, args);
+                }
                 if name == "HashMap" {
                     let mut args = seg
                         .clone()
@@ -699,6 +798,10 @@ impl<'a> Checker<'a> {
                     return Ty::Set(Box::new(
                         elem.unwrap_or_else(|| self.fresh(VarKind::General)),
                     ));
+                }
+                // `std::cmp::Ordering` (in `fn cmp(&self, o: &Self) -> Ordering`)
+                if name == "Ordering" && !self.adts.defs.contains_key("Ordering") {
+                    return Ty::Ordering;
                 }
                 if name == "Result" {
                     let args: Vec<ast::GenericArg> = seg
@@ -791,29 +894,51 @@ impl<'a> Checker<'a> {
                     return g.clone();
                 }
                 if self.adts.defs.contains_key(&name) {
-                    return Ty::Adt(name);
+                    // `Stack<i32>`; missing arguments are inferred.
+                    let given: Vec<Ty> = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .map(|l| {
+                            l.generic_args()
+                                .filter_map(|g| match g {
+                                    ast::GenericArg::TypeArg(ta) => ta.ty(),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|t| self.lower_type(t))
+                        .collect();
+                    let mut args = self.fresh_args(&name);
+                    for (a, g) in args.iter_mut().zip(given) {
+                        *a = g;
+                    }
+                    return Ty::Adt(name, args);
                 }
                 if name == "Self"
                     && let Some(t) = &self.self_ty
                 {
                     return t.clone();
                 }
+                // `Self::Output` in an operator impl, `Self::Item` in an iterator.
+                if (name == "Output" || name == "Item")
+                    && let Some(t) = &self.assoc_output
+                    && p.path()
+                        .and_then(|p| p.qualifier())
+                        .is_some_and(|q| q.syntax().text() == "Self")
+                {
+                    return t.clone();
+                }
                 let ty = Ty::from_name(&name);
-                match ty {
-                    Ty::Int(k) if k.is_wide_unsupported() => {
-                        self.error(
-                            t.syntax(),
-                            "128-bit integers are not supported yet (planned for phase 4)",
-                        );
-                    }
-                    Ty::Unknown => self.error(
+                if ty == Ty::Unknown {
+                    self.error(
                         t.syntax(),
                         format!(
                             "type `{}` is not supported yet (planned for phase 1)",
                             t.syntax().text()
                         ),
-                    ),
-                    _ => {}
+                    );
                 }
                 ty
             }
@@ -901,6 +1026,7 @@ impl<'a> Checker<'a> {
             );
             self.error(&node, msg);
         }
+        self.resolve_intos();
         self.resolve_collects();
         self.resolve_parses();
         self.resolve_bounds();
@@ -1025,8 +1151,13 @@ impl<'a> Checker<'a> {
             self.declare(&name, local);
             return;
         }
-        // A pattern: `let Some(x) = opt else { ... };`, `let x @ 1..=5 = ...`.
-        let ty = declared.or(init_ty).unwrap_or(Ty::Unknown);
+        // A pattern: `let Some(x) = opt else { ... };`, `let x @ 1..=5 = ...`, `let (a, b);`.
+        let deferred = l.initializer().is_none();
+        let ty = match declared.or(init_ty) {
+            Some(t) => t,
+            None if deferred => self.fresh_for_pat(&pat),
+            None => Ty::Unknown,
+        };
         // The `else` block runs without the pattern's bindings, so check it first.
         if let Some(le) = l.let_else() {
             if let Some(block) = le.block_expr() {
@@ -1045,9 +1176,31 @@ impl<'a> Checker<'a> {
             );
         }
         self.pat(&pat, &ty);
+        // `let (a, b);`: each name is assigned later, once.
+        if deferred && let Some(scope) = self.scopes.last_mut() {
+            for ip in pat.syntax().descendants().filter_map(ast::IdentPat::cast) {
+                if let Some(local) = ip.name().and_then(|n| scope.get_mut(n.text())) {
+                    local.deferred = true;
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ patterns
+
+    /// A fresh type shaped like `p`: tuple patterns get tuples of fresh variables.
+    fn fresh_for_pat(&mut self, p: &ast::Pat) -> Ty {
+        match p {
+            ast::Pat::TuplePat(t) => {
+                Ty::Tuple(t.fields().map(|f| self.fresh_for_pat(&f)).collect())
+            }
+            ast::Pat::ParenPat(pp) => match pp.pat() {
+                Some(inner) => self.fresh_for_pat(&inner),
+                None => self.fresh(VarKind::General),
+            },
+            _ => self.fresh(VarKind::General),
+        }
+    }
 
     /// Bindings from a pattern matched against `map.get_mut(..)`, `v.last_mut()`, `&mut x` and
     /// the like hold `&mut` references, so they can be mutated through without `mut`.
@@ -1553,7 +1706,7 @@ impl<'a> Checker<'a> {
             (Ty::Unknown, Some(Ap::None | Ap::Some(_))) => Family::Option(Ty::Unknown),
             (Ty::Tuple(es), _) => Family::Tuple(es),
             (Ty::Unknown, Some(Ap::Tuple(ps))) => Family::Tuple(vec![Ty::Unknown; ps.len()]),
-            (Ty::Adt(n), _) if self.adts.defs.contains_key(&n) => Family::Adt(n),
+            (Ty::Adt(n, targs), _) if self.adts.defs.contains_key(&n) => Family::Adt(n, targs),
             (Ty::Result(t, e), _) => Family::Result(*t, *e),
             (Ty::Vec(e), Some(Ap::Slice(..))) => Family::Slice(*e),
             _ => Family::Infinite,
@@ -1597,8 +1750,10 @@ impl<'a> Checker<'a> {
                 let head = crate::ty::describe_tuple(w[..n].to_vec());
                 Some([vec![head], w[n..].to_vec()].concat())
             }
-            Family::Adt(n) => {
-                let variants = self.adts.defs[&n].variants.clone();
+            Family::Adt(n, targs) => {
+                let variants: Vec<crate::adt::Variant> = (0..self.adts.defs[&n].variants.len())
+                    .map(|v| self.variant_inst(&n, v, &targs))
+                    .collect();
                 // No constructor in this column: use the default matrix rather than expanding
                 // (which wouldn't terminate for recursive types).
                 if rows.iter().all(|r| matches!(r[0], Ap::Wild)) {
@@ -1731,15 +1886,47 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                self.infer(&inner, expected)
+                let t = self.infer(&inner, expected);
+                // `let r = &mut self.root;` with a number, string, bool or `Option` in that slot:
+                // a JS variable can't point into the struct, so `*r = ..` would only change `r`.
+                if r.mut_token().is_some()
+                    && matches!(
+                        strip_parens(&inner),
+                        ast::Expr::FieldExpr(_) | ast::Expr::IndexExpr(_)
+                    )
+                    && let Some(p) = r.syntax().parent()
+                    && (ast::LetStmt::can_cast(p.kind())
+                        || ast::BinExpr::cast(p.clone()).is_some_and(|b| {
+                            matches!(b.op_kind(), Some(BinaryOp::Assignment { op: None }))
+                                && b.rhs().is_some_and(|x| x.syntax() == r.syntax())
+                        }))
+                {
+                    let z = self.zonk(&t);
+                    if z.is_js_primitive() || matches!(z, Ty::Option(_)) {
+                        let msg = format!(
+                            "keeping a `&mut` to a `{}` inside a struct, tuple or Vec in a variable isn't supported yet (JS can't reference that slot, so writes through it would be lost); assign through the place itself (`{} = ..`)",
+                            self.describe(&t),
+                            inner.syntax().text()
+                        );
+                        self.error(r.syntax(), msg);
+                    }
+                }
+                t
             }
             ast::Expr::PrefixExpr(p) => self.prefix(p, expected),
             ast::Expr::BinExpr(b) => self.bin(b, expected),
             ast::Expr::CastExpr(c) => {
+                let to = c.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                // `x as Box<dyn Trait>`: a coercion, checked like one.
+                let coerce = matches!(self.shallow(&to), Ty::Dyn(_) | Ty::Closure { .. });
                 if let Some(inner) = c.expr() {
-                    self.infer(&inner, None);
+                    if coerce {
+                        self.check(&inner, &to);
+                    } else {
+                        self.infer(&inner, None);
+                    }
                 }
-                c.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown)
+                to
             }
             ast::Expr::CallExpr(c)
                 if result_ctor_call(c).is_some()
@@ -1787,7 +1974,7 @@ impl<'a> Checker<'a> {
                 match expected {
                     Some(t) if !matches!(self.shallow(t), Ty::Var(_) | Ty::Unknown) => {
                         let ok = match self.shallow(t) {
-                            Ty::Adt(_) => self.implements(t, "Default"),
+                            Ty::Adt(..) => self.implements(t, "Default"),
                             other => other.has_default(),
                         };
                         if !ok {
@@ -1817,7 +2004,7 @@ impl<'a> Checker<'a> {
                 let rt = self.infer(&recv, None);
                 match self.shallow(&rt) {
                     Ty::Extern(name) => self.extern_field(f, &name),
-                    Ty::Adt(name) => self.adt_field(f, &name),
+                    Ty::Adt(name, targs) => self.adt_field(f, &name, &targs),
                     Ty::Unknown | Ty::Var(_) => Ty::Unknown,
                     Ty::Tuple(es) if f.name_ref().is_some_and(|n| n.as_tuple_field().is_some()) => {
                         let i = f.name_ref().and_then(|n| n.as_tuple_field()).unwrap_or(0);
@@ -2052,6 +2239,19 @@ impl<'a> Checker<'a> {
             if name.text() == "None" {
                 return Ty::Option(Box::new(self.fresh(VarKind::General)));
             }
+            // `Some`, `Ok` and `Err` as functions: `.map(Some)`, `.map(Ok)`.
+            if matches!(name.text(), "Some" | "Ok" | "Err") {
+                let (t, e) = (self.fresh(VarKind::General), self.fresh(VarKind::General));
+                let (param, ret) = match name.text() {
+                    "Some" => (t.clone(), Ty::Option(Box::new(t))),
+                    "Ok" => (t.clone(), Ty::Result(Box::new(t), Box::new(e))),
+                    _ => (e.clone(), Ty::Result(Box::new(t), Box::new(e))),
+                };
+                return Ty::Closure {
+                    params: vec![param],
+                    ret: Box::new(ret),
+                };
+            }
             if let Some(sig) = self.fns.get(name.text()) {
                 let (is_async, tps) = (sig.is_async, sig.type_params.clone());
                 let (params, ret) = (sig.params.clone(), sig.ret.clone());
@@ -2135,6 +2335,10 @@ impl<'a> Checker<'a> {
         };
         let t = self.infer(&inner, expected);
         let resolved = self.shallow(&t);
+        if let (Ty::Adt(n, _), Some(op @ (UnaryOp::Neg | UnaryOp::Not))) = (&resolved, p.op_kind())
+        {
+            return self.unary_overload(p.syntax(), op == UnaryOp::Neg, n, &t);
+        }
         match p.op_kind() {
             Some(UnaryOp::Deref) | None => t,
             Some(UnaryOp::Neg) => {
@@ -2167,6 +2371,23 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The `v[a..b]` a place goes through (`v[a..b]`, `v[a..b][i]`, `v[a..b][i].x`), if any.
+    fn range_slice_in(e: &ast::Expr) -> Option<ast::IndexExpr> {
+        let mut cur = strip_parens(e);
+        loop {
+            match cur {
+                ast::Expr::IndexExpr(ix) => {
+                    if matches!(ix.index(), Some(ast::Expr::RangeExpr(_))) {
+                        return Some(ix);
+                    }
+                    cur = strip_parens(&ix.base()?);
+                }
+                ast::Expr::FieldExpr(f) => cur = strip_parens(&f.expr()?),
+                _ => return None,
+            }
+        }
+    }
+
     /// Root local of a place expression (`v`, `v[i]`, `v[i][j]`, `*r`), plus whether the place is
     /// reached through indexing or a deref (a mutation *through* the binding, not of it).
     fn place_root(e: &ast::Expr) -> Option<(ast::NameRef, bool)> {
@@ -2195,6 +2416,33 @@ impl<'a> Checker<'a> {
 
     /// rustc's mutability rules for assigning to or mutably borrowing a place.
     fn check_mutable(&mut self, e: &ast::Expr, how: Mutation) {
+        // A write through `v[a..b]` would only change a copy, except for the in-place slice
+        // methods, which codegen writes back.
+        if let Some(range) = Self::range_slice_in(e) {
+            let in_place = strip_parens(e).syntax() == range.syntax()
+                && e.syntax()
+                    .parent()
+                    .and_then(ast::MethodCallExpr::cast)
+                    .is_some_and(|m| {
+                        m.receiver().is_some_and(|r| r.syntax() == e.syntax())
+                            && m.name_ref()
+                                .is_some_and(|n| crate::ty::slice_mut_method(n.text()))
+                    });
+            // `&mut v[a..b]` has its own error.
+            let borrowed = e
+                .syntax()
+                .ancestors()
+                .take(3)
+                .filter_map(ast::RefExpr::cast)
+                .any(|r| r.mut_token().is_some());
+            if !in_place && !borrowed {
+                self.error(
+                    e.syntax(),
+                    "writing through a range of a Vec (`v[a..b]`) isn't supported yet: ranges are copies, so the write wouldn't reach `v` (index `v` directly; `sort`, `reverse`, `fill`, `swap` and `rotate_*` on a range do work)",
+                );
+                return;
+            }
+        }
         let Some((name, through)) = Self::place_root(e) else {
             return;
         };
@@ -2344,6 +2592,10 @@ impl<'a> Checker<'a> {
 
     /// Check the right operand of `lhs op rhs` (or `lhs op= rhs`) and the operator's validity.
     fn arith_operands(&mut self, b: &ast::BinExpr, op: ArithOp, lt: &Ty, rhs: &ast::Expr) -> Ty {
+        if let Ty::Adt(n, _) = self.shallow(lt) {
+            let assign = matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }));
+            return self.op_overload(b.syntax(), op, assign, &n, lt, rhs);
+        }
         if self.shallow(lt) == Ty::Str && op == ArithOp::Add {
             self.check(rhs, &Ty::Str);
             return Ty::Str;
@@ -2413,7 +2665,16 @@ impl<'a> Checker<'a> {
         let Some(path) = callee.path() else {
             return Ty::Unknown;
         };
-        if let Some(name) = path.as_single_name_ref() {
+        // A std function imported by name (`use std::cmp::max;`) is resolved like its full path.
+        let std_alias = path.as_single_name_ref().and_then(|n| {
+            let n = n.text().to_string();
+            (self.lookup(&n).is_none() && !self.fns.contains_key(&n))
+                .then(|| self.std_fns.get(&n).cloned())
+                .flatten()
+        });
+        if let Some(name) = path.as_single_name_ref()
+            && std_alias.is_none()
+        {
             if name.text() == "Some"
                 && self.lookup("Some").is_none()
                 && !self.fns.contains_key("Some")
@@ -2450,11 +2711,12 @@ impl<'a> Checker<'a> {
         }
 
         let segs: Vec<ast::PathSegment> = path.segments().collect();
-        let names: Vec<String> = segs
-            .iter()
-            .filter_map(|s| s.name_ref())
-            .map(|n| n.text().to_string())
-            .collect();
+        let names: Vec<String> = std_alias.unwrap_or_else(|| {
+            segs.iter()
+                .filter_map(|s| s.name_ref())
+                .map(|n| n.text().to_string())
+                .collect()
+        });
         let stripped = self.strip_modules(&names);
         if let [single] = stripped.as_slice()
             && self.fns.contains_key(single)
@@ -2479,6 +2741,9 @@ impl<'a> Checker<'a> {
         }
         {
             let ns: Vec<&str> = names.iter().map(String::as_str).collect();
+            if let Some(t) = self.coll_call(c, &ns, &args) {
+                return t;
+            }
             if let Some(t) = self.std_call(c, &ns, &args) {
                 return t;
             }
@@ -2574,6 +2839,14 @@ impl<'a> Checker<'a> {
                 if let Some(b) = args.get(1) {
                     self.check(b, &t);
                 }
+                let what = names.last().copied().unwrap_or("max");
+                if self.zonk(&t).contains_float() || self.var_kind(&t) == Some(VarKind::Float) {
+                    let msg = format!(
+                        "the trait bound `{}: Ord` is not satisfied (floats aren't totally ordered; use `a.{what}(b)` on `f64`)",
+                        self.describe(&t)
+                    );
+                    self.error(c.syntax(), msg);
+                }
                 t
             }
             [ty_name, "from"] if Ty::from_name(ty_name).is_numeric() => {
@@ -2581,6 +2854,17 @@ impl<'a> Checker<'a> {
                     self.infer(a, None);
                 }
                 Ty::from_name(ty_name)
+            }
+            // `T::make()` on a type parameter.
+            [param, f] if self.param_bounds.contains_key(*param) => {
+                let msg = format!(
+                    "calling `{param}::{f}()` on a type parameter isn't supported (generics are erased, so there's no type to call it on); pass a value or a closure that makes one instead"
+                );
+                self.error(callee.syntax(), msg);
+                for a in &args {
+                    self.infer(a, None);
+                }
+                Ty::Unknown
             }
             _ => {
                 self.error(
@@ -2712,9 +2996,11 @@ impl<'a> Checker<'a> {
         if let Ty::Result(x, e) = self.shallow(&it) {
             match self.shallow(&ret) {
                 Ty::Result(_, re) => {
-                    if !self.unify(&e, &re) {
+                    if !self.try_convert(t, &e, &re) && !self.unify(&e, &re) {
                         let msg = format!(
-                            "`?` couldn't convert the error to `{}` (the error types must match: `From` conversions aren't supported yet; use `.map_err(..)?`)",
+                            "`?` couldn't convert the error to `{}` (add `impl From<{}> for {}`, or convert with `.map_err(..)?`)",
+                            self.describe(&re),
+                            self.describe(&e),
                             self.describe(&re)
                         );
                         self.error(t.syntax(), msg);
@@ -2878,6 +3164,12 @@ impl<'a> Checker<'a> {
                             self.cell_args.insert(r);
                         }
                     }
+                    // `&mut node.left` / `&mut v[i]`: the slot itself, read and written through a
+                    // getter/setter cell, when the place is simple enough to evaluate again.
+                    other @ (ast::Expr::FieldExpr(_) | ast::Expr::IndexExpr(_)) if simple_place(&other) => {
+                        let rr = self.range(r.syntax());
+                        self.slot_args.insert(rr);
+                    }
                     other => self.error(
                         other.syntax(),
                         "passing a `&mut` to a number, string or bool inside a struct, tuple or Vec isn't supported yet (copy it into a local, pass `&mut local`, and write it back)",
@@ -2957,8 +3249,70 @@ impl<'a> Checker<'a> {
         };
         let method = name.text().to_string();
         let args: Vec<ast::Expr> = m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+        // `(lo..hi).contains(&x)`
+        if method == "contains"
+            && let ast::Expr::RangeExpr(r) = strip_parens(&recv)
+        {
+            // Any ordered bounds work here, floats too (only iterating needs integers).
+            use ra_ap_syntax::ast::RangeItem;
+            let elem = self.fresh(VarKind::General);
+            for b in [r.start(), r.end()].into_iter().flatten() {
+                self.check(&b, &elem);
+            }
+            self.record(recv.syntax(), Ty::Unknown);
+            self.arg_count(m.syntax(), "method", 1, args.len());
+            if let Some(a) = args.first() {
+                self.check(a, &elem);
+            }
+            return Ty::Bool;
+        }
         let rt = self.infer(&recv, None);
-        let resolved = self.shallow(&rt);
+        // A user trait method on a built-in type (`x.money()` with `impl Money for f64`); std's own
+        // methods come first, as inherent methods do in Rust.
+        if let Some(key) = crate::adt::ext_key_of(&self.shallow(&rt))
+            && self.adts.ext_types.contains(key)
+            && let Some(sig) = self.adts.method(key, &method).cloned()
+            && sig.receiver.is_some()
+            && !crate::service::std_methods(&self.shallow(&rt)).contains(&method.as_str())
+        {
+            if sig.receiver == Some(crate::adt::Receiver::MutRef) {
+                self.check_mutable(&recv, Mutation::Borrow);
+            }
+            let sig = self.method_inst(&sig, None);
+            self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
+            for (a, p) in args.iter().zip(&sig.params) {
+                self.check(a, p);
+            }
+            self.record_ext(m.syntax(), key);
+            return if sig.is_async {
+                Ty::Future(Box::new(sig.ret))
+            } else {
+                sig.ret
+            };
+        }
+        let resolved = match self.shallow(&rt) {
+            // A custom iterator (`impl Iterator for Fib`): adapters and consumers work on it.
+            Ty::Adt(n, targs)
+                if self.adts.iter_items.contains_key(&n)
+                    && self.adts.method(&n, &method).is_none()
+                    && !crate::adt::own_method(&method) =>
+            {
+                let item = self.adts.iter_items[&n].clone();
+                let map = self.adt_subst(&n, &targs);
+                Ty::Iter {
+                    elem: Box::new(crate::typeck::generic::subst(&item, &map)),
+                    mutable: false,
+                }
+            }
+            // A `VecDeque`, `BTreeMap`, ..: its own methods, else its view's.
+            Ty::Coll(kind, view) => {
+                if let Some(t) = self.coll_method(m, &recv, kind, &view, &method, &args) {
+                    return t;
+                }
+                *view
+            }
+            other => other,
+        };
 
         // Infer remaining arguments without constraints, for paths that don't type them.
         let loose = |c: &mut Self| {
@@ -2975,11 +3329,30 @@ impl<'a> Checker<'a> {
             Ty::Unknown
         };
 
+        if method == "into"
+            && args.is_empty()
+            && !matches!(&resolved, Ty::Adt(n, _) if self.adts.method(n, "into").is_some())
+        {
+            return self.conv_into_call(m, rt);
+        }
         if matches!(method.as_str(), "cmp" | "partial_cmp")
             && matches!(resolved, Ty::Var(_))
             && let Some(t) = self.method_ext(m, &recv, &resolved, &method, &args, expected)
         {
             return t;
+        }
+        // `Ord` methods on an integer whose type isn't settled yet (`let mut b = 0; b.max(u)`):
+        // the arguments decide it, as in rustc; only with none does the literal fallback apply.
+        if self.var_kind(&rt) == Some(VarKind::Int)
+            && matches!(method.as_str(), "max" | "min" | "clamp" | "cmp")
+            && !args.is_empty()
+        {
+            let want = if method == "clamp" { 2 } else { 1 };
+            self.arg_count(m.syntax(), "method", want, args.len());
+            for a in &args {
+                self.check(a, &rt);
+            }
+            return if method == "cmp" { Ty::Ordering } else { rt };
         }
         // Trait methods on an unsuffixed literal use the literal's fallback type, as in rustc.
         let trait_method = matches!(
@@ -3032,7 +3405,9 @@ impl<'a> Checker<'a> {
         let receiver_ty = match resolved {
             Ty::Unknown | Ty::Var(_) if is_float_method(&method) => Ty::Float { f32: false },
             Ty::Extern(name) => return self.extern_method(m, &name, &method, &args),
-            Ty::Adt(name) => return self.adt_method(m, &recv, &name, &method, &args),
+            Ty::Adt(name, targs) => {
+                return self.adt_method(m, &recv, &name, &targs, &method, &args);
+            }
             Ty::Param(name) => return self.param_method(m, &recv, &name, &method, &args),
             Ty::Dyn(tr) => return self.dyn_method(m, &recv, &tr, &method, &args),
             Ty::RefCell(inner) => {
@@ -3111,6 +3486,9 @@ impl<'a> Checker<'a> {
                 }
                 "replace" => sig(self, &[Ty::Str, Ty::Str], Ty::Str),
                 "repeat" => sig(self, &[USIZE], Ty::Str),
+                "as_bytes" | "into_bytes" => {
+                    sig(self, &[], Ty::Vec(Box::new(Ty::Int(IntKind::U8))))
+                }
                 "push_str" => {
                     self.check_mutable(&recv, Mutation::Borrow);
                     sig(self, &[Ty::Str], Ty::Unit)
@@ -3118,6 +3496,28 @@ impl<'a> Checker<'a> {
                 "push" => {
                     self.check_mutable(&recv, Mutation::Borrow);
                     sig(self, &[Ty::Char], Ty::Unit)
+                }
+                // `s.extend(chars)` / `s.extend(strs)`
+                "extend" => {
+                    self.check_mutable(&recv, Mutation::Borrow);
+                    self.arg_count(m.syntax(), "method", 1, args.len());
+                    if let Some(a) = args.first() {
+                        let at = self.infer(a, None);
+                        let ok = self
+                            .iter_elem(&at)
+                            .map(|e| self.shallow(&e))
+                            .is_some_and(|e| {
+                                matches!(e, Ty::Char | Ty::Str | Ty::Unknown | Ty::Var(_))
+                            });
+                        if !ok {
+                            let msg = format!(
+                                "a `String` can be extended with chars or strings, not `{}`",
+                                self.describe(&at)
+                            );
+                            self.error(a.syntax(), msg);
+                        }
+                    }
+                    Ty::Unit
                 }
                 _ => no_method(self, &t),
             },
@@ -3194,15 +3594,22 @@ impl<'a> Checker<'a> {
                     ),
                     "pop" | "first" | "last" => sig(self, &[], Ty::Option(Box::new(elem))),
                     "get" => sig(self, &[USIZE], Ty::Option(Box::new(elem))),
+                    // The element itself, which writes go through when it's a JS object (a struct,
+                    // tuple, array or collection); numbers, strings and bools would be copies.
                     "get_mut" | "first_mut" | "last_mut" => {
-                        self.error(
-                            m.syntax(),
-                            format!(
-                                "`Vec::{m2}` is not supported yet (it hands out a reference into the Vec); index with `v[i]` instead"
-                            ),
-                        );
-                        loose(self);
-                        Ty::Unknown
+                        self.check_mutable(&recv, Mutation::Borrow);
+                        let resolved = self.zonk(&elem);
+                        if resolved.is_js_primitive() || resolved == Ty::Unknown {
+                            self.error(
+                                m.syntax(),
+                                format!(
+                                    "`Vec::{m2}` on a Vec of `{}` isn't supported (the element would be copied, so changes wouldn't stick); index with `v[i]` instead",
+                                    self.describe(&elem)
+                                ),
+                            );
+                        }
+                        let params = if m2 == "get_mut" { vec![USIZE] } else { vec![] };
+                        sig(self, &params, Ty::Option(Box::new(elem)))
                     }
                     _ => no_method(self, &t),
                 }
@@ -3234,16 +3641,20 @@ impl<'a> Checker<'a> {
                         sig(self, &[inner], t)
                     }
                     "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" => sig(self, &[], t),
-                    "map" | "and_then" | "filter" | "unwrap_or_else" | "map_or" | "map_or_else"
-                    | "is_some_and" | "ok_or_else" | "or_else" => {
-                        self.error(
-                            m.syntax(),
-                            format!(
-                                "`Option::{m2}` takes a closure, and closures are not supported yet (next on the roadmap); use `match` or `if let`"
-                            ),
-                        );
-                        loose(self);
-                        Ty::Unknown
+                    // `Option<Result<T, E>>` -> `Result<Option<T>, E>`.
+                    "transpose" => {
+                        let (x, e) = (self.fresh(VarKind::General), self.fresh(VarKind::General));
+                        if !self.unify(
+                            &inner,
+                            &Ty::Result(Box::new(x.clone()), Box::new(e.clone())),
+                        ) {
+                            return no_method(self, &t);
+                        }
+                        sig(
+                            self,
+                            &[],
+                            Ty::Result(Box::new(Ty::Option(Box::new(x))), Box::new(e)),
+                        )
                     }
                     _ => no_method(self, &t),
                 }
@@ -3436,6 +3847,15 @@ impl<'a> Checker<'a> {
             return Ty::Unknown;
         };
         let bt = self.infer(&base, None);
+        // `grid[i]` with an `impl Index<I> for Grid`.
+        if let Ty::Adt(n, _) = self.shallow(&bt) {
+            return self.index_overload(ix, &n, &bt, &index);
+        }
+        // `deque[i]`, `btree_map[&k]`
+        let bt = match self.shallow(&bt) {
+            Ty::Coll(crate::ty::Coll::VecDeque | crate::ty::Coll::BTreeMap, view) => *view,
+            other => other,
+        };
         if let Ty::Map(k, v) = self.shallow(&bt) {
             self.check(&index, &k);
             return *v;
@@ -3566,6 +3986,21 @@ impl<'a> Checker<'a> {
                 let by_ref = match other {
                     ast::Expr::RefExpr(r) => Some(r.mut_token().is_some()),
                     _ => None,
+                };
+                let t = match self.shallow(&t) {
+                    Ty::Coll(_, view) => *view,
+                    // `for x in Fib { .. }`
+                    Ty::Adt(n, targs) if self.adts.iter_items.contains_key(&n) => {
+                        let map = self.adt_subst(&n, &targs);
+                        Ty::Iter {
+                            elem: Box::new(crate::typeck::generic::subst(
+                                &self.adts.iter_items[&n],
+                                &map,
+                            )),
+                            mutable: false,
+                        }
+                    }
+                    other => other,
                 };
                 match self.shallow(&t) {
                     Ty::Vec(e) | Ty::Set(e) => (*e, by_ref),
@@ -3750,6 +4185,44 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The type of the format argument `arg` refers to (`{}` takes the next positional one).
+    fn format_arg_ty(
+        &mut self,
+        arg: &ArgRef,
+        next: &mut usize,
+        tys: &[Ty],
+        args: &[MacroArg],
+    ) -> Option<Ty> {
+        match arg {
+            ArgRef::Next => {
+                *next += 1;
+                tys.get(*next - 1).cloned()
+            }
+            ArgRef::Index(i) => tys.get(*i).cloned(),
+            ArgRef::Name(n) => match args[1..]
+                .iter()
+                .position(|a| a.name.as_deref() == Some(n.as_str()))
+            {
+                Some(i) => tys.get(i).cloned(),
+                // `{name}` with no `name = ...` argument captures a local.
+                None => match self.lookup(n) {
+                    Some(l) => Some(l.ty.clone()),
+                    None => {
+                        let (start, end) = (args[0].start, args[0].end());
+                        let message = format!("cannot find value `{n}` in this scope");
+                        self.diags.push(RawDiag {
+                            start,
+                            end,
+                            message,
+                            severity: "error",
+                        });
+                        None
+                    }
+                },
+            },
+        }
+    }
+
     /// Type the arguments of a format macro and check each placeholder can format its value.
     fn format_args(&mut self, args: &[MacroArg]) {
         let tys: Vec<Ty> = args[1..].iter().map(|a| self.macro_arg(a, None)).collect();
@@ -3764,51 +4237,88 @@ impl<'a> Checker<'a> {
             let Piece::Arg { arg, spec } = p else {
                 continue;
             };
-            let ty = match arg {
-                ArgRef::Next => {
-                    next += 1;
-                    tys.get(next - 1).cloned()
-                }
-                ArgRef::Index(i) => tys.get(i).cloned(),
-                ArgRef::Name(n) => match args[1..]
-                    .iter()
-                    .position(|a| a.name.as_deref() == Some(n.as_str()))
+            // `{:.*}` takes the precision before the value; `width$` / `prec$` name a `usize`.
+            let counts: Vec<ArgRef> = spec
+                .precision_arg
+                .iter()
+                .chain(spec.width_arg.iter())
+                .cloned()
+                .collect();
+            for count in counts {
+                if let Some(t) = self.format_arg_ty(&count, &mut next, &tys, args)
+                    && !self.unify(&t, &USIZE)
                 {
-                    Some(i) => tys.get(i).cloned(),
-                    // `{name}` with no `name = ...` argument captures a local.
-                    None => match self.lookup(&n) {
-                        Some(l) => Some(l.ty.clone()),
-                        None => {
-                            let (start, end) = (args[0].start, args[0].end());
-                            let message = format!("cannot find value `{n}` in this scope");
-                            self.diags.push(RawDiag {
-                                start,
-                                end,
-                                message,
-                                severity: "error",
-                            });
-                            None
-                        }
-                    },
-                },
-            };
+                    let (start, end) = (args[0].start, args[0].end());
+                    let message = format!(
+                        "mismatched types: a width or precision must be `usize`, found `{}`",
+                        self.describe(&t)
+                    );
+                    self.diags.push(RawDiag {
+                        start,
+                        end,
+                        message,
+                        severity: "error",
+                    });
+                }
+            }
+            let ty = self.format_arg_ty(&arg, &mut next, &tys, args);
             let Some(ty) = ty else { continue };
             let resolved = self.shallow(&ty);
-            let bad = match &resolved {
-                Ty::Vec(_) | Ty::Option(_) | Ty::Unit | Ty::Tuple(_) | Ty::Set(_) | Ty::Map(..) => {
-                    !spec.debug
+            // `{:x}` / `{:b}` / `{:o}` need an integer, `{:e}` a number.
+            if let Some(k) = spec.kind {
+                let ok = match k {
+                    'e' | 'E' => {
+                        matches!(resolved, Ty::Int(_) | Ty::Float { .. } | Ty::Unknown)
+                            || self.var_kind(&ty).is_some_and(|k| k != VarKind::General)
+                    }
+                    _ => {
+                        matches!(resolved, Ty::Int(_) | Ty::Unknown)
+                            || self.var_kind(&ty) == Some(VarKind::Int)
+                    }
+                };
+                if !ok {
+                    let tr = match k {
+                        'x' => "LowerHex",
+                        'X' => "UpperHex",
+                        'o' => "Octal",
+                        'b' => "Binary",
+                        'e' => "LowerExp",
+                        _ => "UpperExp",
+                    };
+                    let (start, end) = (args[0].start, args[0].end());
+                    let message = format!(
+                        "`{}` doesn't implement `std::fmt::{tr}`",
+                        self.describe(&ty)
+                    );
+                    self.diags.push(RawDiag {
+                        start,
+                        end,
+                        message,
+                        severity: "error",
+                    });
                 }
+                continue;
+            }
+            let bad = match &resolved {
+                Ty::Vec(_)
+                | Ty::Option(_)
+                | Ty::Unit
+                | Ty::Tuple(_)
+                | Ty::Set(_)
+                | Ty::Map(..)
+                | Ty::Coll(..) => !spec.debug,
                 Ty::Entry(..) | Ty::Closure { .. } => true,
                 Ty::Ordering | Ty::Result(..) => !spec.debug,
                 Ty::Formatter => true,
                 Ty::RefCell(_) => !spec.debug,
                 Ty::Param(n) => !self.param_has(n, if spec.debug { "Debug" } else { "Display" }),
+                Ty::Dyn(tr) if tr == "Error" => false,
                 Ty::Dyn(tr) => {
                     !self.trait_includes(tr, if spec.debug { "Debug" } else { "Display" })
                 }
                 Ty::Extern(n) if is_std_error(n) => false,
-                Ty::Adt(n) => match self.adts.defs.get(n) {
-                    Some(d) if spec.debug => !d.derives("Debug"),
+                Ty::Adt(n, _) => match self.adts.defs.get(n) {
+                    Some(d) if spec.debug => !d.implements("Debug"),
                     Some(d) => !d.display,
                     None => false,
                 },
@@ -3883,7 +4393,7 @@ enum Ap {
 }
 
 enum Family {
-    Adt(String),
+    Adt(String, Vec<Ty>),
     Slice(Ty),
     Result(Ty, Ty),
     Bool,
@@ -4053,6 +4563,80 @@ pub fn irrefutable(p: &ast::Pat) -> bool {
 
 pub fn is_none_binding(ip: &ast::IdentPat) -> bool {
     is_none_pat(ip)
+}
+
+/// `dyn Error` / `dyn std::error::Error` (plus `Send + Sync` and the like).
+fn names_std_error(t: &ast::Type) -> bool {
+    let list = match t {
+        ast::Type::ImplTraitType(i) => i.type_bound_list(),
+        ast::Type::DynTraitType(d) => d.type_bound_list(),
+        _ => None,
+    };
+    list.is_some_and(|l| {
+        l.bounds().any(|b| match b.ty() {
+            Some(ast::Type::PathType(p)) => p
+                .path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "Error"),
+            _ => false,
+        })
+    })
+}
+
+/// For `impl Iterator<Item = T>` / `dyn Iterator<..>`: `Some(Some(T))`, or `Some(None)` without an
+/// `Item`; `None` for other types.
+fn iterator_item(t: &ast::Type) -> Option<Option<ast::Type>> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let list = match t {
+        ast::Type::ImplTraitType(i) => i.type_bound_list()?,
+        ast::Type::DynTraitType(d) => d.type_bound_list()?,
+        _ => return None,
+    };
+    list.bounds().find_map(|b| match b.ty()? {
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            let n = seg.name_ref()?.text().to_string();
+            if !matches!(
+                n.as_str(),
+                "Iterator" | "DoubleEndedIterator" | "ExactSizeIterator"
+            ) {
+                return None;
+            }
+            let item = seg.generic_arg_list().and_then(|l| {
+                l.generic_args().find_map(|g| match g {
+                    ast::GenericArg::AssocTypeArg(a)
+                        if a.name_ref().is_some_and(|n| n.text() == "Item") =>
+                    {
+                        a.ty()
+                    }
+                    _ => None,
+                })
+            });
+            Some(item)
+        }
+        _ => None,
+    })
+}
+
+/// A place made of names, fields and simple indexes (`n.left`, `v[i]`, `self.grid[r][c]`), which
+/// can be evaluated again without side effects.
+fn simple_place(e: &ast::Expr) -> bool {
+    match strip_parens(e) {
+        ast::Expr::PathExpr(_) => true,
+        ast::Expr::FieldExpr(f) => f.expr().is_some_and(|x| simple_place(&x)),
+        ast::Expr::IndexExpr(ix) => {
+            ix.base().is_some_and(|b| simple_place(&b))
+                && matches!(
+                    ix.index().map(|i| strip_parens(&i)),
+                    Some(ast::Expr::PathExpr(_) | ast::Expr::Literal(_) | ast::Expr::FieldExpr(_))
+                )
+        }
+        ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => {
+            p.expr().is_some_and(|x| simple_place(&x))
+        }
+        _ => false,
+    }
 }
 
 fn strip_parens(e: &ast::Expr) -> ast::Expr {

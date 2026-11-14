@@ -54,6 +54,7 @@ impl Checker<'_> {
                 TraitDef {
                     supers: supertraits(t),
                     methods: Vec::new(),
+                    consts: Vec::new(),
                     module: None,
                 },
             );
@@ -64,24 +65,36 @@ impl Checker<'_> {
             let n = name.text().to_string();
             let saved = self.self_ty.replace(Ty::Param("Self".into()));
             let mut methods = Vec::new();
+            let mut consts = Vec::new();
             for it in t
                 .assoc_item_list()
                 .into_iter()
                 .flat_map(|l| l.assoc_items())
             {
                 let ast::AssocItem::Fn(f) = it else {
+                    // `const X: T;`: each impl gives the value.
+                    if let ast::AssocItem::Const(k) = &it
+                        && k.body().is_none()
+                    {
+                        if let Some(n) = k.name() {
+                            consts.push(n.text().to_string());
+                        }
+                        continue;
+                    }
                     self.error(
                         it.syntax(),
-                        "only methods are supported in traits so far (associated types and consts are planned for phase 4)",
+                        "only methods and `const X: T;` declarations are supported in traits so far (associated types and default consts are planned for phase 4)",
                     );
                     continue;
                 };
                 let Some(fname) = f.name() else { continue };
                 let sig = self.lower_method(&f);
-                if sig.receiver.is_none() {
+                // Required ones are each impl's static method (`A::name()`); a default one would
+                // have to be copied onto every implementing class.
+                if sig.receiver.is_none() && f.body().is_some() {
                     self.error(
                         fname.syntax(),
-                        "trait functions without `self` are not supported yet (generics are erased, so `T::new()` has no type to call it on)",
+                        "default trait functions without `self` are not supported yet (declare it without a body and implement it in each impl)",
                     );
                 }
                 methods.push(TraitMethod {
@@ -93,7 +106,22 @@ impl Checker<'_> {
             self.self_ty = saved;
             if let Some(def) = self.adts.traits.get_mut(&n) {
                 def.methods = methods;
+                def.consts = consts;
             }
+        }
+    }
+
+    /// The type an impl's `Self` names: a struct or enum, or a built-in type's `ext_key`.
+    pub(super) fn self_ty_named(&self, type_name: &str) -> Ty {
+        match type_name {
+            "String" => Ty::Str,
+            "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+            "bool" => Ty::Bool,
+            "char" => Ty::Char,
+            "f64" => Ty::Float { f32: false },
+            "f32" => Ty::Float { f32: true },
+            n if self.adts.ext_types.contains(n) => Ty::from_name(n),
+            n => Ty::Adt(n.to_string(), vec![]),
         }
     }
 
@@ -107,7 +135,7 @@ impl Checker<'_> {
                 .unwrap_or_else(|| imp.syntax().clone());
             self.error(
                 &node,
-                format!("cannot find trait `{tr}` in this scope (std traits other than `Display` and `Default` are derived, not implemented)"),
+                format!("cannot find trait `{tr}` in this scope (std traits other than `Display`, `Default`, `From`, the comparisons, `Clone` and the operators are derived, not implemented)"),
             );
             return;
         };
@@ -132,11 +160,26 @@ impl Checker<'_> {
                 );
             }
         }
+        let given_consts: Vec<String> = imp
+            .assoc_item_list()
+            .into_iter()
+            .flat_map(|l| l.assoc_items())
+            .filter_map(|i| match i {
+                ast::AssocItem::Const(k) => Some(k.name()?.text().to_string()),
+                _ => None,
+            })
+            .collect();
         let missing: Vec<String> = def
             .methods
             .iter()
             .filter(|m| !m.has_default && !given.iter().any(|(n, _)| *n == m.name))
             .map(|m| format!("`{}`", m.name))
+            .chain(
+                def.consts
+                    .iter()
+                    .filter(|k| !given_consts.contains(k))
+                    .map(|k| format!("`{k}`")),
+            )
             .collect();
         if !missing.is_empty() {
             let node = imp
@@ -151,7 +194,7 @@ impl Checker<'_> {
                 ),
             );
         }
-        let m: HashMap<String, Ty> = [("Self".to_string(), Ty::Adt(type_name.to_string()))].into();
+        let m: HashMap<String, Ty> = [("Self".to_string(), self.self_ty_named(type_name))].into();
         for tm in def
             .methods
             .iter()
@@ -276,13 +319,31 @@ impl Checker<'_> {
 
     /// Whether a type implements a user trait.
     pub(super) fn implements_user_trait(&self, ty: &Ty, tr: &str) -> bool {
+        // `impl std::error::Error for MyError {}`
+        if tr == "Error"
+            && let Ty::Adt(n, _) = self.zonk(ty)
+        {
+            return self
+                .adts
+                .defs
+                .get(&n)
+                .is_some_and(|d| d.implements("Error"));
+        }
         match self.zonk(ty) {
-            Ty::Adt(n) => self
+            Ty::Adt(n, _) => self
                 .adts
                 .trait_impls
                 .get(&n)
                 .is_some_and(|ts| ts.iter().any(|t| self.trait_includes(t, tr))),
             Ty::Dyn(t) => self.trait_includes(&t, tr),
+            // `impl Money for f64`
+            t if crate::adt::ext_key_of(&t).is_some_and(|k| self.adts.ext_types.contains(k)) => {
+                let k = crate::adt::ext_key_of(&t).unwrap_or_default();
+                self.adts
+                    .trait_impls
+                    .get(k)
+                    .is_some_and(|ts| ts.iter().any(|t| self.trait_includes(t, tr)))
+            }
             Ty::Param(n) => self
                 .param_bounds
                 .get(&n)
@@ -375,5 +436,7 @@ pub fn subst_method(m: &Method, sub: &HashMap<String, Ty>) -> Method {
         is_async: m.is_async,
         receiver: m.receiver,
         cell_params: m.cell_params.clone(),
+        impl_args: m.impl_args.clone(),
+        type_params: m.type_params.clone(),
     }
 }

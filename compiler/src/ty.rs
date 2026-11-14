@@ -89,6 +89,46 @@ impl IntKind {
     }
 }
 
+/// The std collections that are a `Ty::Coll` over the type they behave like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coll {
+    /// A JS array; the view is `Vec<T>`.
+    VecDeque,
+    /// A JS array in std's heap order; the view is `Vec<T>`.
+    BinaryHeap,
+    /// `κσ.BTreeMap` (a `HashMap` kept in key order); the view is `HashMap<K, V>`.
+    BTreeMap,
+    /// `κσ.BTreeSet`; the view is `HashSet<T>`.
+    BTreeSet,
+}
+
+impl Coll {
+    pub fn from_name(name: &str) -> Option<Coll> {
+        Some(match name {
+            "VecDeque" => Coll::VecDeque,
+            "BinaryHeap" => Coll::BinaryHeap,
+            "BTreeMap" => Coll::BTreeMap,
+            "BTreeSet" => Coll::BTreeSet,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Coll::VecDeque => "VecDeque",
+            Coll::BinaryHeap => "BinaryHeap",
+            Coll::BTreeMap => "BTreeMap",
+            Coll::BTreeSet => "BTreeSet",
+        }
+    }
+
+    /// `VecDeque<i32>` from the view's description `Vec<i32>`.
+    pub fn describe(self, view: &str) -> String {
+        let args = view.find('<').map(|i| &view[i..]).unwrap_or("");
+        format!("{}{args}", self.name())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ty {
     Int(IntKind),
@@ -129,8 +169,9 @@ pub enum Ty {
     },
     /// `std::cmp::Ordering`: -1 (`Less`), 0 (`Equal`), 1 (`Greater`).
     Ordering,
-    /// A struct or enum declared in the file: an instance of its JS class.
-    Adt(String),
+    /// A struct or enum declared in the file, with its type arguments (`Stack<i32>`): an
+    /// instance of its JS class.
+    Adt(String, Vec<Ty>),
     /// `Result<T, E>`: the runtime's `κσ.Ok(v)` / `κσ.Err(e)` (`$tag` 0 / 1, value at `[0]`).
     Result(Box<Ty>, Box<Ty>),
     /// `fmt::Formatter`: the buffer a `Display` impl writes into.
@@ -147,6 +188,9 @@ pub enum Ty {
         elem: Box<Ty>,
         mutable: bool,
     },
+    /// `VecDeque<T>`, `BinaryHeap<T>`, `BTreeMap<K, V>`, `BTreeSet<T>`: the collection over the
+    /// type it behaves like at run time (`Vec<T>`, `HashMap<K, V>`, `HashSet<T>`).
+    Coll(Coll, Box<Ty>),
     /// A type-inference variable. Only exists inside the type checker; never reaches codegen.
     Var(u32),
     /// No type information (e.g. NS return values until phase 2 bindings). Lowered with plain JS
@@ -155,6 +199,34 @@ pub enum Ty {
 }
 
 impl Ty {
+    /// The type with every `VecDeque` / `BTreeMap` / .. replaced by the type it behaves like at
+    /// run time, which is all codegen needs outside constructors and kind-specific methods.
+    pub fn view(&self) -> Ty {
+        let b = |t: &Ty| Box::new(t.view());
+        match self {
+            Ty::Coll(_, v) => v.view(),
+            Ty::Vec(e) => Ty::Vec(b(e)),
+            Ty::Option(e) => Ty::Option(b(e)),
+            Ty::Set(e) => Ty::Set(b(e)),
+            Ty::Future(e) => Ty::Future(b(e)),
+            Ty::RefCell(e) => Ty::RefCell(b(e)),
+            Ty::Map(k, v) => Ty::Map(b(k), b(v)),
+            Ty::Entry(k, v) => Ty::Entry(b(k), b(v)),
+            Ty::Result(k, v) => Ty::Result(b(k), b(v)),
+            Ty::Tuple(es) => Ty::Tuple(es.iter().map(Ty::view).collect()),
+            Ty::Adt(n, args) => Ty::Adt(n.clone(), args.iter().map(Ty::view).collect()),
+            Ty::Closure { params, ret } => Ty::Closure {
+                params: params.iter().map(Ty::view).collect(),
+                ret: b(ret),
+            },
+            Ty::Iter { elem, mutable } => Ty::Iter {
+                elem: b(elem),
+                mutable: *mutable,
+            },
+            other => other.clone(),
+        }
+    }
+
     pub fn from_name(name: &str) -> Ty {
         if let Some(k) = IntKind::from_name(name) {
             return Ty::Int(k);
@@ -195,6 +267,7 @@ impl Ty {
     /// JS expression for `T::default()`, for `unwrap_or_default`.
     pub fn default_js(&self) -> Option<&'static str> {
         Some(match self {
+            Ty::Int(IntKind::I128 | IntKind::U128) => "0n",
             Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => "0",
             Ty::Bool => "false",
             Ty::Str => "\"\"",
@@ -211,7 +284,7 @@ impl Ty {
             Ty::Option(inner) => {
                 matches!(**inner, Ty::Option(_) | Ty::Unit) || inner.has_ambiguous_option()
             }
-            Ty::Vec(e) | Ty::Future(e) | Ty::Set(e) => e.has_ambiguous_option(),
+            Ty::Vec(e) | Ty::Future(e) | Ty::Set(e) | Ty::Coll(_, e) => e.has_ambiguous_option(),
             Ty::Tuple(es) => es.iter().any(Ty::has_ambiguous_option),
             Ty::Map(k, v) => k.has_ambiguous_option() || v.has_ambiguous_option(),
             Ty::Iter { elem, .. } => elem.has_ambiguous_option(),
@@ -232,6 +305,9 @@ impl Ty {
                 vec![(**k).clone(), (**v).clone()]
             }
             Ty::Closure { params, ret } => [params.clone(), vec![(**ret).clone()]].concat(),
+            Ty::Adt(_, args) => args.clone(),
+            // The elements, not the view: a `BTreeMap`'s keys need `Ord`, not `Hash`.
+            Ty::Coll(_, view) => view.inner_types(),
             _ => vec![],
         }
     }
@@ -247,7 +323,9 @@ impl Ty {
     pub fn contains_float(&self) -> bool {
         match self {
             Ty::Float { .. } => true,
-            Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) => e.contains_float(),
+            Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) | Ty::Coll(_, e) => {
+                e.contains_float()
+            }
             Ty::Tuple(es) => es.iter().any(Ty::contains_float),
             Ty::Map(k, v) | Ty::Result(k, v) => k.contains_float() || v.contains_float(),
             _ => false,
@@ -264,7 +342,9 @@ impl Ty {
             | Ty::Char
             | Ty::Str
             | Ty::Unit => true,
-            Ty::Vec(_) | Ty::Option(_) | Ty::Set(_) | Ty::Map(..) | Ty::Unknown => true,
+            Ty::Vec(_) | Ty::Option(_) | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) | Ty::Unknown => {
+                true
+            }
             Ty::Tuple(es) => es.iter().all(Ty::has_default),
             _ => false,
         }
@@ -307,13 +387,18 @@ impl Ty {
             Ty::Option(t) => format!("Option<{}>", t.describe()),
             Ty::Tuple(es) => describe_tuple(es.iter().map(Ty::describe).collect()),
             Ty::Set(t) => format!("HashSet<{}>", t.describe()),
+            Ty::Coll(k, view) => k.describe(&view.describe()),
             Ty::Map(k, v) => format!("HashMap<{}, {}>", k.describe(), v.describe()),
             Ty::Entry(k, v) => format!("Entry<'_, {}, {}>", k.describe(), v.describe()),
             Ty::Closure { params, ret } => {
                 describe_closure(params.iter().map(Ty::describe).collect(), ret.describe())
             }
             Ty::Ordering => "Ordering".into(),
-            Ty::Adt(n) => n.clone(),
+            Ty::Adt(n, args) if args.is_empty() => n.clone(),
+            Ty::Adt(n, args) => format!(
+                "{n}<{}>",
+                args.iter().map(Ty::describe).collect::<Vec<_>>().join(", ")
+            ),
             Ty::Result(t, e) => format!("Result<{}, {}>", t.describe(), e.describe()),
             Ty::Formatter => "Formatter<'_>".into(),
             Ty::Param(n) => n.clone(),
@@ -430,5 +515,26 @@ pub fn is_float_method(m: &str) -> bool {
             | "is_nan"
             | "is_finite"
             | "to_string"
+    )
+}
+
+/// Slice methods that change the slice in place, which work on a range of a `Vec`
+/// (`v[1..4].sort()`): the range is copied out, changed and written back.
+pub fn slice_mut_method(m: &str) -> bool {
+    matches!(
+        m,
+        "sort"
+            | "sort_unstable"
+            | "sort_by"
+            | "sort_by_key"
+            | "sort_unstable_by"
+            | "sort_unstable_by_key"
+            | "reverse"
+            | "fill"
+            | "swap"
+            | "rotate_left"
+            | "rotate_right"
+            | "copy_from_slice"
+            | "clone_from_slice"
     )
 }

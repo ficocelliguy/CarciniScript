@@ -7,7 +7,7 @@ use ra_ap_syntax::{
 };
 
 use super::{Codegen, Frag, PatCode, debug_fn, default_value, js_string};
-use crate::ty::Ty;
+use crate::ty::{IntKind, Ty};
 
 /// A formatter function for `{:?}` of `ty`.
 fn fmt_of(ty: &Ty) -> String {
@@ -131,6 +131,15 @@ impl Codegen<'_> {
                 let f = arg(self, 0);
                 helper("resIsErrAnd", vec![f])
             }
+            "inspect" => {
+                let f = arg(self, 0);
+                helper("resInspect", vec![f])
+            }
+            "inspect_err" => {
+                let f = arg(self, 0);
+                helper("resInspectErr", vec![f])
+            }
+            "transpose" => helper("resTranspose", vec![]),
             "map_or" => {
                 let d = arg(self, 0);
                 let f = arg(self, 1);
@@ -182,6 +191,9 @@ impl Codegen<'_> {
             Ty::Float { .. } => ("parseFloat", String::new()),
             Ty::Bool => ("parseBool", String::new()),
             Ty::Char => ("parseChar", String::new()),
+            Ty::Int(k @ (IntKind::I128 | IntKind::U128)) => {
+                ("parseInt128", format!(", {}", k.is_signed()))
+            }
             Ty::Int(k) => {
                 let (min, max) = k.min_max();
                 ("parseInt", format!(", {min}, {max}"))
