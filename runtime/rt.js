@@ -979,6 +979,63 @@
       if (eq(a, b)) assertFailed("!=", a, b, location, debug, message);
     },
 
+    // Integer arithmetic with debug-build overflow checks (`min`/`max` are BigInts).
+    $ckArith(a, b, op, min, max, location) {
+      let r;
+      if (typeof a === "bigint") r = op === "+" ? a + b : op === "-" ? a - b : a * b;
+      else {
+        r = op === "+" ? a + b : op === "-" ? a - b : a * b;
+        // Past 2^53 a JS number is inexact: redo it in BigInt.
+        if (!Number.isSafeInteger(r)) {
+          const x = BigInt(a);
+          const y = BigInt(b);
+          const e = op === "+" ? x + y : op === "-" ? x - y : x * y;
+          if (e < min || e > max) r = e;
+          else return Number(e);
+        }
+      }
+      if (r < min || r > max) {
+        const what = op === "+" ? "add" : op === "-" ? "subtract" : "multiply";
+        throw new CarciniPanic(`attempt to ${what} with overflow`, location);
+      }
+      return r;
+    },
+    $ckDiv(a, b, rem, min, max, location) {
+      const big = typeof a === "bigint";
+      if (big ? b === 0n : b === 0) {
+        throw new CarciniPanic(
+          rem ? "attempt to calculate the remainder with a divisor of zero" : "attempt to divide by zero",
+          location,
+        );
+      }
+      if (min < 0 && a == min && b == -1) {
+        throw new CarciniPanic(
+          rem ? "attempt to calculate the remainder with overflow" : "attempt to divide with overflow",
+          location,
+        );
+      }
+      if (big) return rem ? a % b : a / b;
+      return rem ? a % b : Math.trunc(a / b);
+    },
+    $ckNeg(v, min, location) {
+      // `v` is already negated: `-min` came out past `max`.
+      if (v != 0 && -v == min) throw new CarciniPanic("attempt to negate with overflow", location);
+      return v;
+    },
+    $ckAbs(v, min, location) {
+      if (v == min && min < 0) throw new CarciniPanic("attempt to negate with overflow", location);
+      return v < 0 ? -v : v;
+    },
+    $ckPow(x, n, min, max, location) {
+      const big = typeof x === "bigint";
+      const r = BigInt(x) ** BigInt(n);
+      if (r < min || r > max) throw new CarciniPanic("attempt to exponentiate with overflow", location);
+      return big ? r : Number(r);
+    },
+    $ckShift(n, bits, what, location) {
+      if (n < 0 || n >= bits) throw new CarciniPanic(`attempt to ${what} with overflow`, location);
+      return n;
+    },
     // Integer arithmetic.
     $idiv(a, b) {
       if (b === 0) throw new CarciniPanic("attempt to divide by zero", "<arith>");
@@ -2255,12 +2312,33 @@
       return old;
     },
     // A trait's default methods, added to an implementing class unless it defines its own.
-    $mixin(cls, defaults) {
-      for (const k of Object.getOwnPropertyNames(defaults)) {
-        if (!Object.prototype.hasOwnProperty.call(cls.prototype, k)) {
-          Object.defineProperty(cls.prototype, k, Object.getOwnPropertyDescriptor(defaults, k));
+    // A trait's default methods, unless the class defines its own; also as `Trait$name`, for
+    // `Trait::name(&x)` calls.
+    $mixin(cls, defaults, tr, statics) {
+      const into = (target, from) => {
+        for (const k of Object.getOwnPropertyNames(from)) {
+          for (const name of tr ? [k, `${tr}$${k}`] : [k]) {
+            // (A class's own `name` and `length` aren't methods: those may be replaced.)
+            const own = Object.getOwnPropertyDescriptor(target, name);
+            if (!own || (target === cls && typeof own.value !== "function")) {
+              Object.defineProperty(target, name, Object.getOwnPropertyDescriptor(from, k));
+            }
+          }
         }
-      }
+      };
+      into(cls.prototype, defaults);
+      // Default functions without `self`: on the class itself.
+      if (statics) into(cls, statics);
+    },
+    // Stand-ins for a built-in type's class, passed for `T::default()` and friends.
+    $prims: {
+      num: { default: () => 0 },
+      big: { default: () => 0n },
+      str: { default: () => "" },
+      bool: { default: () => false },
+      char: { default: () => "\0" },
+      vec: { default: () => [] },
+      option: { default: () => null },
     },
     // `Ord::max` / `Ord::min`: on ties `max` returns the second argument and `min` the first.
     $max(a, b) {

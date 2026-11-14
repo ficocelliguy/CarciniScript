@@ -399,6 +399,7 @@ impl Codegen<'_> {
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(_) | Ty::Float { .. }) => {
                 emit(self, 0)
             }
+            ["hint", "black_box"] => emit(self, 0),
             ["mem", "swap"] => {
                 let (a, b) = (args.first()?.clone(), args.get(1)?.clone());
                 let (af, _) = self.emit_expr(&strip_refs(&a), None);

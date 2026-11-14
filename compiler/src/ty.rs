@@ -63,6 +63,17 @@ impl IntKind {
     /// Prefix/suffix that wrap a JS integer-valued number into this kind, or None for wide kinds,
     /// which are plain JS numbers. The inner expression is always parenthesized: JS's `>>>` and
     /// `&` bind tighter than `^`/`|`, so `x ^ y >>> 0` would wrap only `y`.
+    /// The width in bits.
+    pub fn bits(self) -> u32 {
+        match self {
+            IntKind::I8 | IntKind::U8 => 8,
+            IntKind::I16 | IntKind::U16 => 16,
+            IntKind::I32 | IntKind::U32 => 32,
+            IntKind::I64 | IntKind::U64 | IntKind::Isize | IntKind::Usize => 64,
+            IntKind::I128 | IntKind::U128 => 128,
+        }
+    }
+
     pub fn wrap_parts(self) -> Option<(&'static str, &'static str)> {
         Some(match self {
             IntKind::I8 => ("((", ") << 24 >> 24)"),
@@ -294,6 +305,17 @@ impl Ty {
 
     /// Whether a float appears anywhere in the type: such types aren't `Ord` or `Hash`.
     /// The types directly inside this one (`Vec<T>` → `[T]`).
+    /// Whether the type parameter `name` appears in this type.
+    pub fn mentions_param(&self, name: &str) -> bool {
+        match self {
+            Ty::Param(p) => p == name,
+            Ty::Closure { params, ret } => {
+                params.iter().any(|p| p.mentions_param(name)) || ret.mentions_param(name)
+            }
+            t => t.inner_types().iter().any(|i| i.mentions_param(name)),
+        }
+    }
+
     pub fn inner_types(&self) -> Vec<Ty> {
         match self {
             Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) | Ty::RefCell(e) => {
@@ -449,7 +471,15 @@ pub fn std_tail<'a>(segs: &'a [&'a str]) -> &'a [&'a str] {
 pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
     if let [ty_name, konst] = tail {
         if let Ty::Int(k) = Ty::from_name(ty_name) {
-            let (min, max) = k.min_max();
+            // `i128` / `u128` are BigInts.
+            let (min, max) = match k {
+                IntKind::I128 => (
+                    "-170141183460469231731687303715884105728n",
+                    "170141183460469231731687303715884105727n",
+                ),
+                IntKind::U128 => ("0n", "340282366920938463463374607431768211455n"),
+                _ => k.min_max(),
+            };
             match *konst {
                 "MAX" => return Some((max, Ty::Int(k))),
                 "MIN" => return Some((min, Ty::Int(k))),

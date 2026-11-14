@@ -86,9 +86,10 @@ Erasing them only means programs rustc would reject still run. Tiers:
 
 1. **Move checking** (phase 1, done): use-after-move via init/move dataflow. Needs only
    `Copy`-ness.
-2. **NLL-lite** (after the language service): per-function CFG, borrow liveness, conflict
-   reporting; elided/annotated signatures across calls. Shown as warnings; a "strict" setting
-   makes them errors.
+2. **NLL-lite** (done, `borrows.rs`): borrows bound by `let` and borrowing `for` loops, live to
+   the holder's last use, conflicts reported with rustc's messages. Shown as warnings; strict
+   borrows make them errors. Not yet: borrows through calls (elided/annotated signatures) and
+   fields.
 3. **Polonius** (not planned): would need MIR-like lowering and region inference.
 
 Optional debug mode: RefCell-style runtime guards on collections (e.g. mutate-while-iterating
@@ -161,9 +162,8 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] `get_mut` of numbers/strings/bools, integer and `char` range exhaustiveness (and no false
      alarms on unknown types), `char::to_uppercase`, `IndexMut` writes, destructured parameters,
      block-scoped `type` aliases, `vis`/`meta` macro fragments, macros from `mod` files,
-     `&mut v[a..b]` views and `split_at_mut`, `unsafe` blocks and `static mut`, `Deref`/`DerefMut`
-   - [ ] Open (the ⚠️/⬜ rows of `FEATURES.md`): `pub(crate)`/`pub(super)` treated as `pub`;
-     `macro_rules!` hygiene; `<T as Trait>::method`; `pub(crate)`/`pub(super)` as `pub`
+     `&mut v[a..b]` views and `split_at_mut`, `unsafe` blocks and `static mut`, `Deref`/`DerefMut`, `<T as Trait>::method`, `pub(super)`/`pub(in ..)`
+   - [x] `macro_rules!` hygiene for local bindings
 2. **Multi-file:** `use` across files, virtual files, `dts2rs`, Monaco diagnostics.
    - [x] `mod name;` + `use` through a host resolver; Bitburner passes the server's scripts (runtime,
      RAM calculation and editor markers)
@@ -177,9 +177,13 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] Signature help (`signature_help`) and live error markers
    - [x] Go to definition (also into `mod x;` files), find references and rename (`nav.rs`), in
      Bitburner's Monaco
-   - [ ] References and rename across files
-4. **Later:** generic trait dispatch (`T::assoc()`), wider std, optional overflow-checking mode,
-   NLL-lite borrow warnings, raw pointers, proc macros, performance. (`macro_rules!` is done.)
+   - [x] References and rename across files (Bitburner passes the server's `.rs` scripts)
+4. **Later:** wider std, raw pointers, proc macros, performance.
+   (`macro_rules!` is done.)
+   - [x] Optional overflow checks (debug-build semantics), with `test/debug/` against `rustc` without `-O`
+   - [x] `T::assoc()` / `T::CONST` / `T::default()` on generic `T` in free functions (hidden class
+     arguments); default trait functions without `self`
+   - [x] NLL-lite borrow warnings (and a strict mode)
 
 ## Testing
 

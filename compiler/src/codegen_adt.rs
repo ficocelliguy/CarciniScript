@@ -160,6 +160,31 @@ impl Codegen<'_> {
         // `impl` blocks.
         let saved = self.self_adt.replace(def.name.clone());
         for imp in impls {
+            // Called as `Trait::method(..)` somewhere: also as `Trait$method`, which stays apart when
+            // two traits name a method alike.
+            if let (Some(tr), _) = crate::adt::impl_parts(imp)
+                && self.qualified_traits().contains(&tr)
+            {
+                for item in imp
+                    .assoc_item_list()
+                    .into_iter()
+                    .flat_map(|l| l.assoc_items())
+                {
+                    if let ast::AssocItem::Fn(f) = item
+                        && let Some(n) = f.name()
+                        && let Some(sig) = self.types.adts.method(&def.name, n.text()).cloned()
+                    {
+                        let js = format!("{tr}${}", n.text());
+                        self.emit_method_fn(
+                            &f,
+                            sig,
+                            Ty::Adt(def.name.clone(), vec![]),
+                            "}",
+                            Some(js),
+                        );
+                    }
+                }
+            }
             for item in imp
                 .assoc_item_list()
                 .into_iter()
@@ -265,7 +290,8 @@ impl Codegen<'_> {
             }
         }
         let mut header = Frag::mapped(self.item_start(f.syntax()), "");
-        if sig.receiver.is_none() {
+        // (In an object literal, `close` is `},`: no `static` there.)
+        if sig.receiver.is_none() && close == "}" {
             header.push("static ");
         }
         if sig.is_async {
@@ -395,26 +421,52 @@ impl Codegen<'_> {
             .push(" = {");
         self.line(header);
         self.out.indent += 1;
-        for item in t
-            .assoc_item_list()
-            .into_iter()
-            .flat_map(|l| l.assoc_items())
-        {
-            let ast::AssocItem::Fn(f) = item else {
-                continue;
-            };
-            if f.body().is_none() {
-                continue;
+        self.in_trait_default = true;
+        // Methods here; functions without `self` in `Trait$statics`, mixed onto the class.
+        let defaults = |statics: bool| {
+            let mut out = Vec::new();
+            for item in t
+                .assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+            {
+                if let ast::AssocItem::Fn(f) = item
+                    && f.body().is_some()
+                    && let Some(n) = f.name()
+                    && let Some(tm) = def.methods.iter().find(|m| m.name == n.text())
+                    && tm.sig.receiver.is_none() == statics
+                {
+                    out.push((f, tm.sig.clone()));
+                }
             }
-            let Some(n) = f.name() else { continue };
-            let Some(tm) = def.methods.iter().find(|m| m.name == n.text()) else {
-                continue;
-            };
-            self.emit_method_fn(&f, tm.sig.clone(), Ty::Param("Self".into()), "},", None);
+            out
+        };
+        for (f, sig) in defaults(false) {
+            self.emit_method_fn(&f, sig, Ty::Param("Self".into()), "},", None);
         }
         self.out.indent -= 1;
         self.line(Frag::text("};"));
+        self.line(Frag::text(format!(
+            "export const {}$statics = {{",
+            escape_ident(&tr)
+        )));
+        self.out.indent += 1;
+        for (f, sig) in defaults(true) {
+            self.emit_method_fn(&f, sig, Ty::Param("Self".into()), "},", None);
+        }
+        self.out.indent -= 1;
+        self.in_trait_default = false;
+        self.line(Frag::text("};"));
         self.line(Frag::default());
+    }
+
+    /// Traits named by a qualified call in this file (`Trait::m(..)`, `<T as Trait>::m(..)`).
+    fn qualified_traits(&self) -> std::collections::HashSet<String> {
+        self.types
+            .qualified_calls
+            .values()
+            .map(|q| q.trait_name.clone())
+            .collect()
     }
 
     /// `κσ.$mixin(Class, Trait$defaults)` for each user trait a local type implements.
@@ -430,18 +482,21 @@ impl Codegen<'_> {
         impls.sort();
         for (adt, traits) in impls {
             for tr in traits {
-                let defaults = match self
+                let prefix = match self
                     .types
                     .adts
                     .traits
                     .get(&tr)
                     .and_then(|d| d.module.clone())
                 {
-                    Some(m) => format!("{m}.{}$defaults", escape_ident(&tr)),
-                    None => format!("{}$defaults", escape_ident(&tr)),
+                    Some(m) => format!("{m}.{}", escape_ident(&tr)),
+                    None => escape_ident(&tr),
                 };
                 let cls = self.class(&adt);
-                self.line(Frag::text(format!("κσ.$mixin({cls}, {defaults});")));
+                self.line(Frag::text(format!(
+                    "κσ.$mixin({cls}, {prefix}$defaults, {}, {prefix}$statics);",
+                    super::js_string(&tr)
+                )));
             }
         }
     }

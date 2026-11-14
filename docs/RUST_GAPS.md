@@ -6,8 +6,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Integers
 
-- **Overflow wraps.** Arithmetic follows rustc's release-mode semantics (two's-complement
-  wrapping), not debug-mode panics. An opt-in checked mode is planned for phase 4.
+- **Overflow wraps by default.** Arithmetic follows rustc's release-mode semantics (two's-complement
+  wrapping). With overflow checks on (`setOverflowChecks(true)`, or Bitburner's "Rust: panic on
+  integer overflow" option) it panics like a debug build; `i64`/`u64` overflow past 2^53 is
+  detected, though the values themselves are inexact there (see below).
 - **64-bit integers are JS numbers.** `i64`, `u64`, `isize` and `usize` are exact only up to 2^53.
   They don't wrap at 2^64, and casting a negative value to an unsigned 64-bit type keeps the sign.
   Literals above 2^53 produce a warning. Their bitwise operators are exact (through BigInt) for
@@ -105,9 +107,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `util.rs` when there is one, since each Bitburner script is compiled on its own (and may be run
   directly); otherwise `x/mod.rs`, then `util/x.rs` like rustc. For the same reason `super::` works only inside inline `mod x { .. }` blocks, not at the top of a
   module file, and `crate::` names this file.
-- **Traits are for structs and enums declared in the file**, or imported from a module. `impl Trait for i32` and other
-  built-in types, trait functions without `self` (`T::new()`), associated types and consts, and
-  generic traits need type information at run time that erasure removes (phase 4).
+- **Generics are erased, so a few things need help at run time.** `T::new()`, `T::CONST` and
+  `T::default()` work in free functions, which get `T`'s class as a hidden argument, but not yet
+  on a method's own type parameters. Generic traits (`trait Convert<T>`) and associated types
+  declared in your traits aren't supported.
 - **`&mut` to a number, string or bool inside a struct, tuple or Vec can't be passed to a
   function** (the value would be copied). Pass the struct, or a `&mut` to a local and write it back.
 - **`RefCell` doesn't track borrows**, so a `borrow_mut` while another borrow is alive doesn't
@@ -154,8 +157,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Checking
 
-- **No borrow checker.** Borrows and lifetimes are parsed and erased. Programs rustc rejects for
-  aliasing or lifetime reasons still run. See the borrow-checking section of [PLAN.md](PLAN.md).
+- **A partial borrow checker.** Lifetimes are erased. The common conflicts (changing a Vec while a
+  reference into it is used later, or inside a `for` over it) are reported, as warnings unless
+  strict borrows are on; borrows that flow through function calls, struct fields or closures
+  aren't tracked, so other programs rustc rejects still run.
 - **Use after move is checked only where the checker is sure a local owns its value** (see
   FEATURES). It misses moves out of fields (`let v = s.items;` then `s.items`), out of pattern
   bindings, and into closures without `move`; those run with the JS value still shared.
@@ -174,9 +179,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Macros
 
-- **`macro_rules!` expansions aren't hygienic.** A `let` inside an expansion is visible to the
-  code after the invocation, and a name the macro uses internally can capture (or be captured by)
-  one at the call site.
+- **`macro_rules!` hygiene covers local bindings.** Names a macro's body binds (`let`, `for`,
+  closure parameters) are renamed per expansion, so they don't clash with the caller's; other
+  names (functions, types, a `static` the body names) resolve at the call site, as in a textual
+  expansion.
 - **Fragments are matched by their tokens**, the way rustc's fragment parsers would split them:
   an `expr` ends at a top-level `,`, `;` or `=>`, a `ty` or `path` keeps commas inside `<..>`.
   Rules that rely on finer parsing (an `expr` followed by an operator token) can match differently.

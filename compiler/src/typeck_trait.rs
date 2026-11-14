@@ -55,6 +55,7 @@ impl Checker<'_> {
                     supers: supertraits(t),
                     methods: Vec::new(),
                     consts: Vec::new(),
+                    const_tys: HashMap::new(),
                     module: None,
                 },
             );
@@ -66,6 +67,7 @@ impl Checker<'_> {
             let saved = self.self_ty.replace(Ty::Param("Self".into()));
             let mut methods = Vec::new();
             let mut consts = Vec::new();
+            let mut const_tys = HashMap::new();
             for it in t
                 .assoc_item_list()
                 .into_iter()
@@ -78,6 +80,8 @@ impl Checker<'_> {
                     {
                         if let Some(n) = k.name() {
                             consts.push(n.text().to_string());
+                            let t = k.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                            const_tys.insert(n.text().to_string(), t);
                         }
                         continue;
                     }
@@ -89,14 +93,7 @@ impl Checker<'_> {
                 };
                 let Some(fname) = f.name() else { continue };
                 let sig = self.lower_method(&f);
-                // Required ones are each impl's static method (`A::name()`); a default one would
-                // have to be copied onto every implementing class.
-                if sig.receiver.is_none() && f.body().is_some() {
-                    self.error(
-                        fname.syntax(),
-                        "default trait functions without `self` are not supported yet (declare it without a body and implement it in each impl)",
-                    );
-                }
+                // (A default one without `self` is copied onto each implementing class.)
                 methods.push(TraitMethod {
                     name: fname.text().to_string(),
                     sig,
@@ -107,6 +104,7 @@ impl Checker<'_> {
             if let Some(def) = self.adts.traits.get_mut(&n) {
                 def.methods = methods;
                 def.consts = consts;
+                def.const_tys = const_tys;
             }
         }
     }

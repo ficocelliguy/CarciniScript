@@ -623,7 +623,17 @@ impl Codegen<'_> {
                 call("fold", vec![init, f])
             }
             "sum" | "product" => {
-                let (op, start) = arith_fold(method, result_ty);
+                let (mut op, start) = arith_fold(method, result_ty);
+                // Debug builds: a sum or product past the type's range panics.
+                if super::overflow_checks()
+                    && let Ty::Int(k) = result_ty
+                {
+                    let (min, max) = super::int_bounds(*k);
+                    let sign = if method == "sum" { "+" } else { "*" };
+                    // (rustc reports it inside core's iterator code.)
+                    let loc = super::js_string("<std>");
+                    op = format!("(a, b) => κσ.$ckArith(a, b, \"{sign}\", {min}, {max}, {loc})");
+                }
                 call(method, vec![Frag::text(op), Frag::text(start)])
             }
             "collect" => {

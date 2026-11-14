@@ -463,6 +463,14 @@ impl Checker<'_> {
                 }
                 Ty::from_name(t)
             }
+            // `std::hint::black_box(x)`: `x`, opaque to the optimizer (there's none here).
+            ["hint", "black_box"] => {
+                count(self, 1);
+                match a0 {
+                    Some(a) => self.infer(a, None),
+                    None => Ty::Unknown,
+                }
+            }
             ["mem", "swap"] => {
                 count(self, 2);
                 let t = self.fresh(VarKind::General);

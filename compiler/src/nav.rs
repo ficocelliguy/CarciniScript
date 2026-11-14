@@ -399,9 +399,16 @@ impl Ctx<'_> {
             if prev.is_some_and(|t| matches!(t.text(), "::" | ":")) {
                 return None;
             }
-            return local_at(&node, token.text_range(), token.text())
+            if let Some(r) = local_at(&node, token.text_range(), token.text())
                 .or_else(|| item_named(self.root(), token.text()))
-                .map(Def::Here);
+            {
+                return Some(Def::Here(r));
+            }
+            // A name a `use` brings from a module file.
+            let segs = imported(&self.an.file, token.text())?;
+            let (path, text) =
+                file_module(&self.an.file, self.filename, segs.first()?, self.resolver)?;
+            return in_file(path, &text, &segs[1..]);
         }
         if node.kind() != SyntaxKind::NAME_REF {
             return None;
@@ -500,13 +507,56 @@ fn raw_item(src: &str, filename: &str, line: u32, column: u32) -> Option<Locatio
     Some(location(src, filename, r.start().into(), r.end().into()))
 }
 
-/// Every use of the name at (line, column) in this file, its definition included (when here).
+/// A definition as (file, start, end) in that file's own text, so files can be compared.
+fn norm(an: &Analysis, src: &str, filename: &str, d: &Def) -> (String, usize, usize) {
+    match d {
+        Def::Here(r) => {
+            let (a, b) = src_range(an, src, *r);
+            (filename.to_string(), a, b)
+        }
+        Def::File(path, r) => (path.clone(), r.start().into(), r.end().into()),
+    }
+}
+
+/// The identifiers named `name` in `src` (the file `filename`) whose definition is `target`.
+fn uses_in(
+    src: &str,
+    filename: &str,
+    name: &str,
+    target: &(String, usize, usize),
+    resolver: Resolver,
+) -> Vec<Location> {
+    let an = analyze(src, filename, resolver);
+    let cx = Ctx {
+        an: &an,
+        filename,
+        resolver,
+    };
+    let mut out: Vec<Location> = an
+        .file
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::IDENT && t.text() == name)
+        .filter(|t| {
+            cx.def(t)
+                .is_some_and(|d| &norm(&an, src, filename, &d) == target)
+        })
+        .map(|t| here(&an, src, filename, t.text_range()))
+        .collect();
+    out.dedup();
+    out
+}
+
+/// Every use of the name at (line, column), its definition included: in this file, and in
+/// `others` (paths the resolver reads, like the other scripts of a project).
 pub fn references(
     src: &str,
     filename: &str,
     line: u32,
     column: u32,
     resolver: Resolver,
+    others: &[String],
 ) -> Vec<Location> {
     let an = analyze(src, filename, resolver);
     let Some(token) = token_at(&an, src, line, column) else {
@@ -517,24 +567,22 @@ pub fn references(
         filename,
         resolver,
     };
-    let Some(target) = cx.def(&token) else {
+    let Some(def) = cx.def(&token) else {
         return Vec::new();
     };
-    let mut out: Vec<Location> = an
-        .file
-        .syntax()
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| t.kind() == SyntaxKind::IDENT && t.text() == token.text())
-        .filter(|t| cx.def(t).as_ref() == Some(&target))
-        .map(|t| here(&an, src, filename, t.text_range()))
-        .collect();
-    out.dedup();
+    let target = norm(&an, src, filename, &def);
+    let name = token.text().to_string();
+    let mut out = uses_in(src, filename, &name, &target, resolver);
+    for path in others.iter().filter(|p| p.as_str() != filename) {
+        if let Some(text) = resolver(path) {
+            out.extend(uses_in(&text, path, &name, &target, resolver));
+        }
+    }
     out
 }
 
-/// The ranges to replace to rename the name at (line, column) in this file; empty when it's
-/// not renamable here (not an identifier, or defined in another file).
+/// The ranges to replace to rename the name at (line, column), across this file and `others`;
+/// empty when it's not renamable (not an identifier, or `new_name` isn't one).
 pub fn rename(
     src: &str,
     filename: &str,
@@ -542,6 +590,7 @@ pub fn rename(
     column: u32,
     new_name: &str,
     resolver: Resolver,
+    others: &[String],
 ) -> Vec<Location> {
     let valid = new_name
         .chars()
@@ -551,17 +600,5 @@ pub fn rename(
     if !valid {
         return Vec::new();
     }
-    let an = analyze(src, filename, resolver);
-    let Some(token) = token_at(&an, src, line, column) else {
-        return Vec::new();
-    };
-    let cx = Ctx {
-        an: &an,
-        filename,
-        resolver,
-    };
-    if !matches!(cx.def(&token), Some(Def::Here(_))) {
-        return Vec::new();
-    }
-    references(src, filename, line, column, resolver)
+    references(src, filename, line, column, resolver, others)
 }

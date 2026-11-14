@@ -6,6 +6,7 @@
 mod adt;
 mod alias;
 mod bindings;
+mod borrows;
 mod codegen;
 mod fmt;
 mod lineindex;
@@ -45,6 +46,20 @@ pub fn compile_json(source: &str, filename: &str, resolver: Option<js_sys::Funct
 #[wasm_bindgen(js_name = setNsBindings)]
 pub fn set_ns_bindings(text: &str) -> String {
     serde_json::to_string(&bindings::set(text)).unwrap()
+}
+
+/// Debug-build overflow checks for the compiles that follow: integer arithmetic that overflows
+/// panics (`attempt to add with overflow`) instead of wrapping like a release build.
+#[wasm_bindgen(js_name = setOverflowChecks)]
+pub fn set_overflow_checks(on: bool) {
+    codegen::set_overflow_checks(on);
+}
+
+/// Borrow conflicts rustc rejects (a `push` while a reference into the Vec is still used, ..) as
+/// errors for the compiles that follow; they're warnings by default.
+#[wasm_bindgen(js_name = setStrictBorrows)]
+pub fn set_strict_borrows(on: bool) {
+    borrows::set_strict(on);
 }
 
 /// Native counterpart of `setNsBindings`.
@@ -135,8 +150,8 @@ pub fn definition_json(
     serde_json::to_string(&nav::definition(source, filename, line, column, &resolve)).unwrap()
 }
 
-/// Every use in this file of the name at a 1-based line and UTF-16 column, its declaration
-/// included: JSON array of locations.
+/// Every use of the name at a 1-based line and UTF-16 column, its declaration included, in this
+/// file and in `others` (newline-separated paths for the resolver): JSON array of locations.
 #[wasm_bindgen(js_name = referencesJson)]
 pub fn references_json(
     source: &str,
@@ -144,6 +159,7 @@ pub fn references_json(
     line: u32,
     column: u32,
     resolver: Option<js_sys::Function>,
+    others: &str,
 ) -> String {
     let resolve = |path: &str| -> Option<String> {
         let f = resolver.as_ref()?;
@@ -151,11 +167,20 @@ pub fn references_json(
             .ok()?
             .as_string()
     };
-    serde_json::to_string(&nav::references(source, filename, line, column, &resolve)).unwrap()
+    let others: Vec<String> = others
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    serde_json::to_string(&nav::references(
+        source, filename, line, column, &resolve, &others,
+    ))
+    .unwrap()
 }
 
 /// The ranges to replace with `new_name` to rename the name at a 1-based line and UTF-16
-/// column: JSON array of locations; empty when it can't be renamed in this file.
+/// column, in this file and `others` (newline-separated paths): JSON array of locations; empty
+/// when it can't be renamed.
 #[wasm_bindgen(js_name = renameJson)]
 pub fn rename_json(
     source: &str,
@@ -164,6 +189,7 @@ pub fn rename_json(
     column: u32,
     new_name: &str,
     resolver: Option<js_sys::Function>,
+    others: &str,
 ) -> String {
     let resolve = |path: &str| -> Option<String> {
         let f = resolver.as_ref()?;
@@ -171,8 +197,13 @@ pub fn rename_json(
             .ok()?
             .as_string()
     };
+    let others: Vec<String> = others
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
     serde_json::to_string(&nav::rename(
-        source, filename, line, column, new_name, &resolve,
+        source, filename, line, column, new_name, &resolve, &others,
     ))
     .unwrap()
 }

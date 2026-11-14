@@ -133,6 +133,8 @@ pub struct TraitDef {
     pub methods: Vec<TraitMethod>,
     /// Required associated constants (`const SCALE: f64;`).
     pub consts: Vec<String>,
+    /// Their types.
+    pub const_tys: HashMap<String, Ty>,
     /// The module it was imported from; None when declared in this file.
     pub module: Option<String>,
 }

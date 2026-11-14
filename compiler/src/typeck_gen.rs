@@ -169,8 +169,10 @@ impl Checker<'_> {
         turbofish: &[Ty],
     ) -> (Vec<Ty>, Ty) {
         let mut m = HashMap::new();
+        self.last_type_args.clear();
         for (i, (name, bounds)) in type_params.iter().enumerate() {
             let v = self.fresh(VarKind::General);
+            self.last_type_args.push(v.clone());
             if let Some(t) = turbofish.get(i) {
                 self.unify(&v, t);
             }

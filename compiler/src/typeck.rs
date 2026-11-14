@@ -86,6 +86,13 @@ pub struct Types {
     /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
     /// the `bool`), with the target type.
     pub derefs: HashMap<(usize, usize), (bool, Ty)>,
+    /// `Trait::m(&x)` / `<T as Trait>::m(..)` calls, by the call's range.
+    pub qualified_calls: HashMap<(usize, usize), QualifiedCall>,
+    /// Generic functions that call `T::f()` / read `T::CONST` (directly or through another such
+    /// function): the type parameters they take a class for, as trailing `$T` arguments.
+    pub dict_params: HashMap<String, Vec<String>>,
+    /// Calls of those functions: the types to pass a class for, in order, by the call's range.
+    pub dict_args: HashMap<(usize, usize), Vec<Ty>>,
     /// `mod name;` modules, in order.
     pub modules: Vec<ModuleRef>,
     /// Functions and constants from other modules.
@@ -182,6 +189,13 @@ impl<'a> Checker<'a> {
             index_places: Default::default(),
             slice_views: Default::default(),
             derefs: Default::default(),
+            qualified_calls: Default::default(),
+            pending_qualified: Vec::new(),
+            cur_fn: None,
+            dict_uses: Default::default(),
+            generic_calls: Vec::new(),
+            last_type_args: Vec::new(),
+            borrow_events: Default::default(),
             opaque_index_mut: Default::default(),
             static_muts: Default::default(),
             statics: Default::default(),
@@ -347,6 +361,8 @@ pub fn check(
     if c.diags.iter().all(|d| d.severity != "error") {
         let moves = crate::moves::check(file, src, &map, &c.adts);
         c.diags.extend(moves);
+        let borrows = crate::borrows::check(file, src, 0, &c.borrow_events);
+        c.diags.extend(borrows);
     }
     if let Some((&(start, end), ty)) = map
         .iter()
@@ -374,6 +390,8 @@ pub fn check(
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
     let derefs = std::mem::take(&mut c.derefs);
+    let qualified_calls = std::mem::take(&mut c.qualified_calls);
+    let (dict_params, dict_args) = c.finish_dicts();
     let modules = std::mem::take(&mut c.modules);
     let imported = std::mem::take(&mut c.imported);
     let conversions = std::mem::take(&mut c.conversions);
@@ -392,6 +410,9 @@ pub fn check(
             index_places,
             slice_views,
             derefs,
+            qualified_calls,
+            dict_params,
+            dict_args,
             modules,
             imported,
             conversions,
@@ -442,6 +463,20 @@ struct Checker<'a> {
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
     derefs: HashMap<(usize, usize), (bool, Ty)>,
+    qualified_calls: HashMap<(usize, usize), QualifiedCall>,
+    /// Qualified calls whose `Self` is settled at the end of the function: (call, `Self`,
+    /// whether the trait is local, node).
+    pending_qualified: Vec<((usize, usize), Ty, bool, SyntaxNode)>,
+    /// The free function being checked.
+    cur_fn: Option<String>,
+    /// (function, type parameter) pairs where the body calls `T::f()` or reads `T::CONST`.
+    dict_uses: std::collections::HashSet<(String, String)>,
+    /// Generic calls: (call, caller, callee, the callee's type arguments).
+    generic_calls: Vec<GenericCall>,
+    /// The type variables the last `instantiate` made, in order.
+    last_type_args: Vec<Ty>,
+    /// Borrows, uses and changes of locals, for the borrow-conflict warnings.
+    borrow_events: crate::borrows::Events,
     /// Types whose `index_mut` doesn't end in `&mut <place>`: assigning through them can't work.
     opaque_index_mut: std::collections::HashSet<String>,
     /// `static mut` items, by name: using one takes an `unsafe` block or function.
@@ -1020,7 +1055,9 @@ impl<'a> Checker<'a> {
         };
         let (params, ret, is_async) = (sig.params.clone(), sig.ret.clone(), sig.is_async);
         self.enter_generics(f, false);
+        self.cur_fn = Some(name.text().to_string());
         self.check_body(f, params, ret, is_async, None);
+        self.cur_fn = None;
         self.leave_generics();
     }
 
@@ -1081,6 +1118,61 @@ impl<'a> Checker<'a> {
         self.resolve_collects();
         self.resolve_parses();
         self.resolve_bounds();
+        self.resolve_qualified();
+        let mut calls = std::mem::take(&mut self.generic_calls);
+        for call in &mut calls {
+            call.3 = call.3.iter().map(|t| self.zonk(t)).collect();
+        }
+        self.generic_calls = calls;
+    }
+
+    /// Settle each qualified call's `Self`: a local struct or enum gets its `Trait$method`.
+    fn resolve_qualified(&mut self) {
+        for (r, self_ty, local_trait, node) in std::mem::take(&mut self.pending_qualified) {
+            let t = self.zonk(&self_ty);
+            let Some(q) = self.qualified_calls.get(&r).cloned() else {
+                continue;
+            };
+            let adt = match &t {
+                Ty::Adt(n, _) if self.adts.defs.get(n).is_some_and(|d| d.module.is_none()) => {
+                    Some(n.clone())
+                }
+                _ => None,
+            };
+            let alias = adt.is_some() || (local_trait && matches!(t, Ty::Param(_) | Ty::Dyn(_)));
+            let on_self = !q.receiver && t == Ty::Param("Self".into());
+            let unconstrained = matches!(self.shallow(&self_ty), Ty::Var(_));
+            if adt.is_none()
+                && !q.receiver
+                && !on_self
+                && local_trait
+                && (unconstrained || matches!(t, Ty::Param(_)))
+            {
+                if let Ty::Param(p) = &t {
+                    self.error(
+                        &node,
+                        format!("`<{p} as {}>::{}(..)` on a type parameter isn't supported yet (planned for phase 4)", q.trait_name, q.method),
+                    );
+                    continue;
+                }
+                self.error(
+                    &node,
+                    format!(
+                        "cannot call associated function on trait without specifying the corresponding `impl` type (write `<Type as {}>::{}(..)`)",
+                        q.trait_name, q.method
+                    ),
+                );
+            }
+            self.qualified_calls.insert(
+                r,
+                QualifiedCall {
+                    adt,
+                    alias,
+                    on_self,
+                    ..q
+                },
+            );
+        }
     }
 
     fn block(&mut self, b: &ast::BlockExpr, expected: Option<&Ty>) -> Ty {
@@ -1204,6 +1296,14 @@ impl<'a> Checker<'a> {
                 decl: None,
             };
             self.declare(&name, local);
+            // `let r = &v;` / `let r = v.first();`: `r` borrows `v` while it's used.
+            if let Some(init) = l.initializer()
+                && let Some((of, mutable)) = self.borrowed_local(&init)
+            {
+                let holder = self.range(name.syntax());
+                let from = self.range(l.syntax()).1;
+                self.borrow_events.borrows.push((holder, of, mutable, from));
+            }
             return;
         }
         // A pattern: `let Some(x) = opt else { ... };`, `let x @ 1..=5 = ...`, `let (a, b);`.
@@ -2479,8 +2579,12 @@ impl<'a> Checker<'a> {
             return Ty::Unknown;
         };
         if let Some(name) = path.as_single_name_ref() {
-            if let Some(local) = self.lookup(name.text()) {
-                return local.ty.clone();
+            if let Some(local) = self.lookup(name.text()).cloned() {
+                if let Some(d) = local.decl {
+                    let r = self.range(p.syntax());
+                    self.borrow_events.uses.push((d, r));
+                }
+                return local.ty;
             }
             if let Some(t) = self.consts.get(name.text().to_string().as_str()).cloned() {
                 if self.static_muts.contains(name.text()) && !in_unsafe(p.syntax()) {
@@ -2577,6 +2681,12 @@ impl<'a> Checker<'a> {
             };
         }
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        // `T::SIDES`: an associated const of a bound of `T`.
+        if let [param, konst] = segs.as_slice()
+            && let Some(t) = self.param_const(param, konst, p.syntax())
+        {
+            return t;
+        }
         if let [.., "Ordering", "Less" | "Equal" | "Greater"] = segs.as_slice() {
             return Ty::Ordering;
         }
@@ -2724,6 +2834,12 @@ impl<'a> Checker<'a> {
         let Some((name, through)) = Self::place_root(e) else {
             return;
         };
+        if let Some(d) = self.lookup(name.text()).and_then(|l| l.decl) {
+            let r = self.range(e.syntax());
+            self.borrow_events
+                .changes
+                .push((d, r, how == Mutation::Assign && !through));
+        }
         let Some(local) = self.lookup(name.text()).cloned() else {
             // A `static` or `const` item.
             let n = name.text().to_string();
@@ -2956,6 +3072,9 @@ impl<'a> Checker<'a> {
             }
             return Ty::Unknown;
         };
+        if let Some(t) = self.qualified_call(c, &callee, &args) {
+            return t;
+        }
         let Some(path) = callee.path() else {
             return Ty::Unknown;
         };
@@ -3149,10 +3268,16 @@ impl<'a> Checker<'a> {
                 }
                 Ty::from_name(ty_name)
             }
-            // `T::make()` on a type parameter.
+            // `T::make()` / `T::default()` on a type parameter: the function takes `T`'s class.
+            [param, f]
+                if self.param_bounds.contains_key(*param)
+                    && let Some(t) = self.param_static_call(c, param, f, &args) =>
+            {
+                t
+            }
             [param, f] if self.param_bounds.contains_key(*param) => {
                 let msg = format!(
-                    "calling `{param}::{f}()` on a type parameter isn't supported (generics are erased, so there's no type to call it on); pass a value or a closure that makes one instead"
+                    "no function or associated item named `{f}` found for type parameter `{param}` in the current scope (its bounds don't declare one)"
                 );
                 self.error(callee.syntax(), msg);
                 for a in &args {
@@ -3380,7 +3505,14 @@ impl<'a> Checker<'a> {
                 .iter()
                 .map(|t| self.lower_type(t))
                 .collect();
-            self.instantiate(c.syntax(), &type_params, &params, &ret, &turbofish)
+            let inst = self.instantiate(c.syntax(), &type_params, &params, &ret, &turbofish);
+            if let Some(caller) = self.cur_fn.clone() {
+                let r = self.range(c.syntax());
+                let targs = std::mem::take(&mut self.last_type_args);
+                self.generic_calls
+                    .push((r, caller, name.to_string(), targs));
+            }
+            inst
         };
         self.arg_count(c.syntax(), "function", params.len(), args.len());
         let cell_params = self
@@ -4312,6 +4444,13 @@ impl<'a> Checker<'a> {
 
     fn for_expr(&mut self, f: &ast::ForExpr) {
         let Some(iterable) = f.iterable() else { return };
+        // `for x in &v` / `v.iter()`: the loop borrows `v` for its whole body.
+        if let Some(body) = f.loop_body()
+            && let Some((of, mutable)) = self.borrowed_local(&iterable)
+        {
+            let r = self.range(body.syntax());
+            self.borrow_events.loops.push((of, mutable, r));
+        }
         // (element type, reference kind of the loop variable)
         let (elem, reference) = match &iterable {
             ast::Expr::RangeExpr(r) => (self.range_elem(r), None),
@@ -5181,4 +5320,289 @@ fn in_unsafe(n: &SyntaxNode) -> bool {
             .is_some_and(|b| matches!(b.modifier(), Some(ast::BlockModifier::Unsafe(_))))
             || ast::Fn::cast(a).is_some_and(|f| f.unsafe_token().is_some())
     })
+}
+
+/// Each function's `$T` parameters, and each call's classes for them.
+type Dicts = (
+    HashMap<String, Vec<String>>,
+    HashMap<(usize, usize), Vec<Ty>>,
+);
+
+/// A generic call: (call, caller, callee, the callee's type arguments).
+type GenericCall = ((usize, usize), String, String, Vec<Ty>);
+
+/// A call naming its trait: `Pilot::fly(&h)`, `<Human as Wizard>::name()`.
+#[derive(Clone, Debug)]
+pub struct QualifiedCall {
+    pub trait_name: String,
+    pub method: String,
+    /// The implementing struct or enum, when known (else the call goes by the plain name).
+    pub adt: Option<String>,
+    /// The first argument is `self`.
+    pub receiver: bool,
+    /// Call it as `Trait$method` (the type is local, or a generic / `dyn` of a local trait).
+    pub alias: bool,
+    /// `<Self as Trait>::f()` in a trait's default method: on `this` (or its class).
+    pub on_self: bool,
+}
+
+impl Checker<'_> {
+    /// `Trait::method(x, ..)` and `<T as Trait>::method(..)` for a trait of this file.
+    fn qualified_call(
+        &mut self,
+        c: &ast::CallExpr,
+        callee: &ast::PathExpr,
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        let path = callee.path()?;
+        let method = path.segment()?.name_ref()?.text().to_string();
+        let q = path.qualifier()?;
+        if q.qualifier().is_some() {
+            return None;
+        }
+        let seg = q.segment()?;
+        // `<T as Trait>` or `Trait`.
+        let (trait_name, anchor_ty) = match seg.type_anchor() {
+            // (Both are `PATH_TYPE`s: the type, then the trait.)
+            Some(a) if a.as_token().is_some() => {
+                let mut tys = a.syntax().children().filter_map(ast::Type::cast);
+                let ty = tys.next();
+                let Some(ast::Type::PathType(tp)) = tys.next() else {
+                    return None;
+                };
+                let tr = tp.path()?.segment()?.name_ref()?.text().to_string();
+                (tr, ty)
+            }
+            Some(_) => return None,
+            None => (seg.name_ref()?.text().to_string(), None),
+        };
+        let def = self.adts.traits.get(&trait_name).cloned()?;
+        let tm = def.methods.iter().find(|m| m.name == method)?.clone();
+        // (`self: Arc<Self>` and the like count too: the first parameter is about `Self`.)
+        let receiver = tm.sig.receiver.is_some()
+            || tm
+                .sig
+                .params
+                .first()
+                .is_some_and(|p| p.mentions_param("Self"));
+        let self_ty = match (&anchor_ty, receiver, args.first()) {
+            (Some(t), _, _) => self.lower_type(t),
+            (None, true, Some(a)) => {
+                let t = self.infer(a, None);
+                self.shallow(&t)
+            }
+            _ => self.fresh(VarKind::General),
+        };
+        let sub: HashMap<String, Ty> = [("Self".to_string(), self_ty.clone())].into();
+        let sig = traits::subst_method(&tm.sig, &sub);
+        let rest = if receiver {
+            args.get(1..).unwrap_or(&[])
+        } else {
+            args
+        };
+        if receiver
+            && anchor_ty.is_some()
+            && let Some(a) = args.first()
+        {
+            self.check(a, &self_ty);
+        }
+        self.arg_count(
+            c.syntax(),
+            "function",
+            sig.params.len() + usize::from(receiver),
+            args.len(),
+        );
+        for (a, p) in rest.iter().zip(sig.params.iter()) {
+            self.check(a, p);
+        }
+        let local_trait = def.module.is_none();
+        let r = self.range(c.syntax());
+        self.qualified_calls.insert(
+            r,
+            QualifiedCall {
+                trait_name,
+                method,
+                adt: None,
+                receiver,
+                alias: false,
+                on_self: false,
+            },
+        );
+        // `Self` may only be known later (`let x: Point = Default::default();`).
+        self.pending_qualified
+            .push((r, self_ty, local_trait, c.syntax().clone()));
+        Some(sig.ret)
+    }
+}
+
+impl Checker<'_> {
+    /// `T`'s bounds and their supertraits, of this file.
+    fn bound_traits(&self, param: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut todo: Vec<String> = self.param_bounds.get(param).cloned().unwrap_or_default();
+        while let Some(t) = todo.pop() {
+            if out.contains(&t) {
+                continue;
+            }
+            if let Some(d) = self.adts.traits.get(&t) {
+                todo.extend(d.supers.iter().cloned());
+            }
+            out.push(t);
+        }
+        out
+    }
+
+    /// Note that the function being checked needs `param`'s class (not for `Self` in a trait's
+    /// default method, which is `this`).
+    fn note_dict(&mut self, param: &str, node: &SyntaxNode) {
+        if param == "Self" {
+            return;
+        }
+        match self.cur_fn.clone() {
+            Some(f) => {
+                self.dict_uses.insert((f, param.to_string()));
+            }
+            None => self.error(
+                node,
+                format!("`{param}::..` on a type parameter of a method isn't supported yet (it works in free functions)"),
+            ),
+        }
+    }
+
+    /// `T::make(..)` for a static function of a bound of `T`, or `T::default()`.
+    fn param_static_call(
+        &mut self,
+        c: &ast::CallExpr,
+        param: &str,
+        f: &str,
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        let pty = Ty::Param(param.to_string());
+        let bounds = self.bound_traits(param);
+        if f == "default" && bounds.iter().any(|b| b == "Default") {
+            self.arg_count(c.syntax(), "function", 0, args.len());
+            self.note_dict(param, c.syntax());
+            return Some(pty);
+        }
+        let sig = bounds.iter().find_map(|b| {
+            let d = self.adts.traits.get(b)?;
+            let tm = d
+                .methods
+                .iter()
+                .find(|m| m.name == f && m.sig.receiver.is_none())?;
+            Some(tm.sig.clone())
+        })?;
+        let sub: HashMap<String, Ty> = [("Self".to_string(), pty)].into();
+        let sig = traits::subst_method(&sig, &sub);
+        self.arg_count(c.syntax(), "function", sig.params.len(), args.len());
+        for (a, p) in args.iter().zip(sig.params.iter()) {
+            self.check(a, p);
+        }
+        self.note_dict(param, c.syntax());
+        Some(sig.ret)
+    }
+
+    /// `T::SIDES`: an associated const declared by a bound of `T`.
+    fn param_const(&mut self, param: &str, konst: &str, node: &SyntaxNode) -> Option<Ty> {
+        if !self.param_bounds.contains_key(param) {
+            return None;
+        }
+        let t = self
+            .bound_traits(param)
+            .iter()
+            .find_map(|b| self.adts.traits.get(b)?.const_tys.get(konst).cloned())?;
+        self.note_dict(param, node);
+        Some(t)
+    }
+
+    /// Which type parameters each function takes a class for: those its body uses statically,
+    /// and those it hands to a function that does (to a fixpoint). Then each call's classes.
+    fn finish_dicts(&mut self) -> Dicts {
+        let mut needs: std::collections::HashSet<(String, String)> =
+            std::mem::take(&mut self.dict_uses);
+        let param_names = |c: &Self, f: &str| -> Vec<String> {
+            c.fns
+                .get(f)
+                .map(|s| s.type_params.iter().map(|(n, _)| n.clone()).collect())
+                .unwrap_or_default()
+        };
+        loop {
+            let mut grew = false;
+            for (_, caller, callee, targs) in &self.generic_calls {
+                let names = param_names(self, callee);
+                for (i, n) in names.iter().enumerate() {
+                    if needs.contains(&(callee.clone(), n.clone()))
+                        && let Some(Ty::Param(p)) = targs.get(i)
+                        && param_names(self, caller).contains(p)
+                        && needs.insert((caller.clone(), p.clone()))
+                    {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let mut params: HashMap<String, Vec<String>> = HashMap::new();
+        for f in needs
+            .iter()
+            .map(|(f, _)| f.clone())
+            .collect::<std::collections::HashSet<_>>()
+        {
+            let list: Vec<String> = param_names(self, &f)
+                .into_iter()
+                .filter(|n| needs.contains(&(f.clone(), n.clone())))
+                .collect();
+            params.insert(f, list);
+        }
+        let mut args = HashMap::new();
+        for (r, _, callee, targs) in &self.generic_calls {
+            let Some(list) = params.get(callee) else {
+                continue;
+            };
+            let names = param_names(self, callee);
+            let tys: Vec<Ty> = list
+                .iter()
+                .map(|n| {
+                    names
+                        .iter()
+                        .position(|x| x == n)
+                        .and_then(|i| targs.get(i).cloned())
+                        .unwrap_or(Ty::Unknown)
+                })
+                .collect();
+            args.insert(*r, tys);
+        }
+        (params, args)
+    }
+}
+
+impl Checker<'_> {
+    /// The local `e` borrows (and whether mutably): `&v`, `&mut v.field`, `&v[i]`, and the
+    /// methods that hand out references into their receiver (`v.iter()`, `v.first()`,
+    /// `map.get(k)`, ..).
+    fn borrowed_local(&self, e: &ast::Expr) -> Option<(crate::borrows::Decl, bool)> {
+        let (place, mutable) = match strip_parens(e) {
+            ast::Expr::RefExpr(r) => (r.expr()?, r.mut_token().is_some()),
+            ast::Expr::MethodCallExpr(m) => {
+                let mutable = match m.name_ref()?.text() {
+                    "iter" | "first" | "last" | "get" | "keys" | "values" | "as_slice"
+                    | "windows" | "chunks" => false,
+                    "iter_mut" | "first_mut" | "last_mut" | "get_mut" | "values_mut"
+                    | "as_mut_slice" => true,
+                    _ => return None,
+                };
+                (m.receiver()?, mutable)
+            }
+            _ => return None,
+        };
+        let (name, through) = Self::place_root(&strip_parens(&place))?;
+        let local = self.lookup(name.text())?;
+        // A reference held in a local (`r` in `&r[0]`) isn't the owner being borrowed.
+        if through && local.reference.is_some() {
+            return None;
+        }
+        Some((local.decl?, mutable))
+    }
 }

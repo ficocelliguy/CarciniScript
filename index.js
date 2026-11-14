@@ -8,6 +8,8 @@ import init, {
   referencesJson,
   renameJson,
   setNsBindings as setNsBindingsJson,
+  setOverflowChecks as setOverflowChecksWasm,
+  setStrictBorrows as setStrictBorrowsWasm,
   version,
 } from "./pkg/carciniscript.js";
 
@@ -63,16 +65,19 @@ export function definition(source, filename, line, column, resolve) {
   return JSON.parse(definitionJson(source, filename, line, column, resolve));
 }
 
-/** Every use in this file of the name at a 1-based line and UTF-16 column, its declaration included. */
-export function references(source, filename, line, column, resolve) {
+/**
+ * Every use of the name at a 1-based line and UTF-16 column, its declaration included, in this file
+ * and in `others` (paths `resolve` reads, like the project's other `.rs` files).
+ */
+export function references(source, filename, line, column, resolve, others = []) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
-  return JSON.parse(referencesJson(source, filename, line, column, resolve));
+  return JSON.parse(referencesJson(source, filename, line, column, resolve, others.join("\n")));
 }
 
-/** The ranges to replace with `newName` to rename the name at a 1-based line and UTF-16 column (empty: can't). */
-export function rename(source, filename, line, column, newName, resolve) {
+/** The ranges to replace with `newName` to rename the name there, also in `others` (empty: can't). */
+export function rename(source, filename, line, column, newName, resolve, others = []) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
-  return JSON.parse(renameJson(source, filename, line, column, newName, resolve));
+  return JSON.parse(renameJson(source, filename, line, column, newName, resolve, others.join("\n")));
 }
 
 /**
@@ -85,3 +90,21 @@ export function setNsBindings(text) {
 }
 
 export { version };
+
+/**
+ * Debug-build overflow checks for the compiles that follow: integer arithmetic that overflows
+ * panics (`attempt to add with overflow`) instead of wrapping, as `rustc` without `-O` does.
+ */
+export function setOverflowChecks(on) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  setOverflowChecksWasm(on);
+}
+
+/**
+ * Borrow conflicts rustc rejects (a `push` while a reference into the Vec is still used, ..) as
+ * errors for the compiles that follow, instead of warnings.
+ */
+export function setStrictBorrows(on) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  setStrictBorrowsWasm(on);
+}

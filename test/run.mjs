@@ -7,7 +7,19 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { initCarciniScriptSync, compile, setNsBindings, hover, completions, signatureHelp, definition, references, rename } from "../index.js";
+import {
+  initCarciniScriptSync,
+  compile,
+  setNsBindings,
+  setOverflowChecks,
+  setStrictBorrows,
+  hover,
+  completions,
+  signatureHelp,
+  definition,
+  references,
+  rename,
+} from "../index.js";
 import "../runtime/rt.js";
 import { nativePanic } from "../tools/native-panic.mjs";
 
@@ -140,6 +152,44 @@ for (const dir of fs.readdirSync(path.join(here, "modules"))) {
   } catch (e) {
     fail(name, e.message);
   }
+}
+
+// --- debug-build overflow checks: test/debug/*.rs with `setOverflowChecks(true)` against
+// `rustc` without `-O`; stdout, exit code and the panic (message and location) must match.
+{
+  setOverflowChecks(true);
+  for (const file of fs.readdirSync(path.join(here, "debug")).filter((f) => f.endsWith(".rs"))) {
+    const name = `debug ${file}`;
+    try {
+      const src = fs.readFileSync(path.join(here, "debug", file), "utf8");
+      const out = compile(src, file);
+      if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+      const jsPath = path.join(outDir, `debug-${file.replace(/\.rs$/, ".mjs")}`);
+      fs.writeFileSync(jsPath, out.code);
+      const js = await runJs(jsPath);
+      const exe = path.join(outDir, `debug-${path.basename(file, ".rs")}${process.platform === "win32" ? ".exe" : ""}`);
+      execFileSync("rustc", ["--edition", "2024", "-A", "warnings", "-o", exe, path.join(here, "debug", file)], { stdio: "pipe" });
+      const r = spawnSync(exe, { encoding: "utf8" });
+      const nativeStdout = r.stdout.replace(/\r\n/g, "\n");
+      const at = (s) => {
+        if (!s) return undefined;
+        const m = /panicked at [^\n]*?([^\\/\n]+\.rs:\d+:\d+):\r?\n([^\r\n]*)/.exec(s);
+        return m ? m.slice(1) : ["", s.split("\n").at(-1).trim()];
+      };
+      // The location counts when it's in the program (rustc may report one inside std).
+      const show = (p, other) => p && (p[0].startsWith(file) && other?.[0].startsWith(file) ? p.join(" ") : p[1]);
+      const n = at(r.stderr);
+      const j = at(js.panic);
+      const nativePanic = show(n, j ?? n);
+      const jsPanic = show(j, n);
+      if (js.stdout !== nativeStdout || js.code !== r.status || nativePanic !== jsPanic) {
+        fail(name, `rustc: ${nativeStdout}exit ${r.status} ${nativePanic}\njs:    ${js.stdout}exit ${js.code} ${jsPanic}`);
+      } else pass(name);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+  setOverflowChecks(false);
 }
 
 // --- NS scripts against a mock
@@ -418,8 +468,8 @@ const rejected = [
   ["generic call with an unimplemented user trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn g<X: T>(x: X) -> i32 { x.a() }\nfn f() {\n    g(5);", "7:5 the trait bound `i32: T` is not satisfied"],
   ["unknown method on dyn Trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } }\nfn f() {\n    let d: Box<dyn T> = Box::new(S);\n    d.c();", "8:5 no method named `c` found for `dyn T`"],
   ["Box<dyn Trait> of a type without the impl", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn f() {\n    let d: Box<dyn T> = Box::new(S);", "6:34 the trait bound `S: T` is not satisfied"],
-  ["default trait function without self", "}\ntrait M { fn make() -> i32 { 1 } }\nfn f() {", "3:14 default trait functions without `self` are not supported yet"],
-  ["calling a trait function on a type parameter", "}\ntrait M { fn make() -> Self; }\nfn g<T: M>() -> T {\n    T::make()\n}\nfn f() {", "5:5 calling `T::make()` on a type parameter isn't supported"],
+  ["`T::make()` on a method's type parameter", "}\ntrait M { fn make() -> Self; }\nstruct S;\nimpl S {\n    fn g<T: M>(&self) -> T {\n        T::make()\n    }\n}\nfn f() {", "7:9 `T::..` on a type parameter of a method isn't supported yet"],
+  ["calling a function the bound doesn't have", "}\ntrait M { fn make() -> Self; }\nfn g<T: M>() -> T {\n    T::build()\n}\nfn f() {", "5:5 no function or associated item named `build` found for type parameter `T`"],
   ["non-exhaustive slice match names the missing length", "let v = vec![1];\n    match v.as_slice() { [] => {}, [x] => {} }", "3:11 non-exhaustive patterns: `[_, _, ..]` not covered"],
   ["break with a value from a while loop", "while true { break 5; }", "2:18 `break` with value from a `while` or `for` loop"],
   ["break outside a loop", "break;", "2:5 `break` outside of a loop"],
@@ -482,6 +532,9 @@ const rejected = [
   ["a char left out of a match", "}\nfn f(c: char) -> u8 {\n    match c {\n        '\\0'..='a' => 1,\n        'c'..=char::MAX => 2,\n    }", "4:11 non-exhaustive patterns: `'b'` not covered"],
   ["a `static mut` used outside `unsafe`", "}\nstatic mut COUNT: u32 = 0;\nfn f() -> u32 {\n    COUNT", "5:5 use of mutable static is unsafe and requires unsafe block"],
   ["assigning to an immutable static", "}\nstatic LIMIT: u32 = 3;\nfn f() {\n    LIMIT = 4;", "5:5 cannot assign to immutable static item `LIMIT`"],
+  ["a trait's static function without its type", "}\ntrait Named {\n    fn name() -> String;\n}\nfn f() {\n    let n = Named::name();", "7:13 cannot call associated function on trait without specifying the corresponding `impl` type"],
+  ["a `pub(super)` function used from further away", "}\nmod a {\n    pub mod b {\n        pub(super) fn f() {}\n    }\n}\nfn g() {\n    a::b::f();", "9:5 `f` is private to module `a::b`"],
+  ["a macro's own `let` isn't the caller's", "}\nmacro_rules! def {\n    () => {\n        let hidden = 1;\n    };\n}\nfn f() {\n    def!();\n    let y = hidden;", "10:13 cannot find value `hidden` in this scope"],
   ["calling a private function of an inline module", "}\nmod geo {\n    fn secret() {}\n}\nfn f() {\n    geo::secret();", "7:5 `secret` is private to module `geo`"],
   ["importing a private item of an inline module", "}\nmod geo {\n    struct Hidden;\n}\nuse geo::Hidden;\nfn f() {", "6:1 `Hidden` is private to module `geo`"],
   ["a missing item of an inline module", "}\nmod geo {\n    pub fn area() {}\n}\nfn f() {\n    geo::volume();", "7:5 cannot find `volume` in module `geo`"],
@@ -689,6 +742,15 @@ for (const [label, files, want] of rejectedFiles) {
     ["references of a function", () => refs(11, "twice"), `11:${col(11, "twice")} 13:${col(13, "twice")} 19:${col(19, "twice")}`],
     ["rename a function", () => rename(src, "nav.rs", 13, col(13, "twice"), "double").length, 3],
     ["rename refuses a bad name", () => rename(src, "nav.rs", 13, col(13, "twice"), "1x").length, 0],
+    ["references across files, from a use", () => {
+      const rs = references(files["main.rs"], "main.rs", 4, 5, (p) => files[p], ["main.rs", "util.rs"]);
+      return rs.map((l) => `${l.file} ${l.line}:${l.column}`).join(", ");
+    }, "main.rs 2:11, main.rs 4:5, util.rs 1:8"],
+    ["references across files, from the definition", () => {
+      const rs = references(files["util.rs"], "util.rs", 1, 8, (p) => files[p], ["main.rs", "util.rs"]);
+      return rs.map((l) => `${l.file} ${l.line}:${l.column}`).join(", ");
+    }, "util.rs 1:8, main.rs 2:11, main.rs 4:5"],
+    ["rename across files", () => rename(files["util.rs"], "util.rs", 1, 8, "assist", (p) => files[p], ["main.rs"]).length, 3],
   ];
   for (const [label, run, want] of checks) {
     const name = `service: ${label}`;
@@ -707,6 +769,12 @@ for (const [label, files, want] of rejectedFiles) {
 const warned = [
   ["loop that never awaits", "let mut n = 0;\n    loop {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
   ["while true that never awaits", "let mut n = 0;\n    while true {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
+  // Borrow conflicts rustc rejects (the JS still runs): rustc's message and position.
+  ["a push while a reference into the Vec is used later", "let mut v = vec![1, 2, 3];\n    let first = &v[0];\n    v.push(4);\n    println!(\"{}\", first);", "4:5 cannot borrow `v` as mutable because it is also borrowed as immutable"],
+  ["assigning to a borrowed String", "let mut s = String::from(\"a\");\n    let r = &s;\n    s = String::from(\"b\");\n    println!(\"{} {}\", r, s);", "4:5 cannot assign to `s` because it is borrowed"],
+  ["changing a Vec inside a `for` over it", "let mut v = vec![1, 2, 3];\n    for x in v.iter() {\n        v.push(*x);\n    }", "4:9 cannot borrow `v` as mutable because it is also borrowed as immutable"],
+  ["two `&mut` borrows at once", "let mut v = vec![1];\n    let a = &mut v;\n    let b = &mut v;\n    b.push(2);\n    a.push(3);", "4:13 cannot borrow `v` as mutable more than once at a time"],
+  ["a map changed while `get`'s result is held", "let mut m = std::collections::HashMap::new();\n    m.insert(1, 2);\n    let g = m.get(&1);\n    m.insert(2, 3);\n    println!(\"{:?}\", g);", "5:5 cannot borrow `m` as mutable because it is also borrowed as immutable"],
 ];
 for (const [label, body, want] of warned) {
   const name = `warns: ${label}`;
@@ -716,9 +784,24 @@ for (const [label, body, want] of warned) {
     fail(name, `want: ${want}\ngot:\n${out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n") || "(no diagnostics)"}`);
   } else pass(name);
 }
+// `setStrictBorrows(true)`: the same conflict is an error, and nothing is emitted.
+{
+  setStrictBorrows(true);
+  const out = compile("fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}\n", "strict.rs");
+  setStrictBorrows(false);
+  const d = out.diagnostics.find((x) => x.severity === "error");
+  if (out.code === null && d?.message === "cannot borrow `v` as mutable because it is also borrowed as immutable") {
+    pass("strict borrows: a conflict is an error");
+  } else fail("strict borrows: a conflict is an error", JSON.stringify(out.diagnostics));
+}
 const quiet = [
   ["loop that awaits", "pub async fn main(ns: NS) {\n    loop {\n        ns.sleep(10.0).await;\n    }\n}\n"],
   ["loop that breaks", "fn main() {\n    let mut n = 0;\n    loop {\n        n += 1;\n        if n > 3 {\n            break;\n        }\n    }\n}\n"],
+  // Borrows rustc accepts: one that ends before the change, a copy, other branches, indexing.
+  ["a borrow that ends before the push", "fn main() {\n    let mut v = vec![1, 2, 3];\n    let first = &v[0];\n    println!(\"{}\", first);\n    v.push(4);\n    println!(\"{:?}\", v);\n}\n"],
+  ["a copied element", "fn main() {\n    let mut v = vec![1, 2, 3];\n    let first = v[0];\n    v.push(4);\n    println!(\"{} {:?}\", first, v);\n}\n"],
+  ["a borrow used only in the other branch", "fn main() {\n    let mut v = vec![1, 2];\n    let r = &v;\n    if v.len() > 5 {\n        v.push(1);\n    } else {\n        println!(\"{:?}\", r);\n    }\n}\n"],
+  ["a loop over indices that pushes", "fn main() {\n    let mut v = vec![1, 2, 3];\n    for i in 0..v.len() {\n        let x = v[i];\n        v.push(x);\n    }\n    println!(\"{}\", v.len());\n}\n"],
 ];
 for (const [label, src] of quiet) {
   const name = `no warning: ${label}`;

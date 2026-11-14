@@ -622,6 +622,126 @@ fn tpl_names(t: &[Tpl], out: &mut Vec<String>) {
     }
 }
 
+/// Hygiene for the names a macro's own body binds (`let x`, `let (a, b)`, `for x in`,
+/// `|x|`): each expansion renames them (`x__h3`), so they neither capture nor shadow the
+/// caller's variables. Names that come in through `$fragments` are the caller's and stay.
+fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
+    fn is_ident(s: &str) -> bool {
+        s.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !matches!(
+                s,
+                "mut"
+                    | "ref"
+                    | "in"
+                    | "let"
+                    | "for"
+                    | "self"
+                    | "Self"
+                    | "true"
+                    | "false"
+                    | "_"
+                    | "move"
+            )
+    }
+    fn text(t: &Tpl) -> Option<&str> {
+        match t {
+            Tpl::Tok(s, _) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    // The names bound in `t` (and its groups and repetitions).
+    fn bound(t: &[Tpl], out: &mut Vec<String>) {
+        let mut i = 0;
+        while i < t.len() {
+            match &t[i] {
+                Tpl::Group(o, _, inner, _) => {
+                    // `|a, b|` parses as tokens; a closure's group body is searched like others.
+                    bound(inner, out);
+                    let _ = o;
+                }
+                Tpl::Rep(inner, _, _) => bound(inner, out),
+                Tpl::Tok(k, _) if k == "let" || k == "for" => {
+                    let mut j = i + 1;
+                    if t.get(j).and_then(text) == Some("mut") {
+                        j += 1;
+                    }
+                    match t.get(j) {
+                        Some(Tpl::Tok(name, _)) if is_ident(name) => out.push(name.clone()),
+                        // `let (a, b) = ..`
+                        Some(Tpl::Group(o, _, inner, _)) if o == "(" => {
+                            for x in inner {
+                                if let Tpl::Tok(name, _) = x
+                                    && is_ident(name)
+                                {
+                                    out.push(name.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // `|x|` / `|a, b|`
+                Tpl::Tok(k, _) if k == "|" => {
+                    let mut j = i + 1;
+                    let mut names = Vec::new();
+                    while let Some(Tpl::Tok(name, _)) = t.get(j) {
+                        if is_ident(name) {
+                            names.push(name.clone());
+                            j += 1;
+                            if t.get(j).and_then(text) == Some(",") {
+                                j += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if t.get(j).and_then(text) == Some("|") {
+                        out.extend(names);
+                        i = j;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    fn rename(t: &[Tpl], names: &[String], n: usize, braces: bool) -> Vec<Tpl> {
+        let mut out = Vec::with_capacity(t.len());
+        for (i, x) in t.iter().enumerate() {
+            let prev = i.checked_sub(1).and_then(|j| text(&t[j]));
+            let next = t.get(i + 1).and_then(text);
+            out.push(match x {
+                // (Not a field: `.x`, `Point { x: 1 }`, `a::x`.)
+                Tpl::Tok(s, sp)
+                    if names.contains(s)
+                        && !matches!(prev, Some("." | "::"))
+                        && !(braces && next == Some(":") && matches!(prev, None | Some(",")))
+                        && !(prev == Some(":") && i >= 2 && text(&t[i - 2]) == Some(":")) =>
+                {
+                    Tpl::Tok(format!("{s}__h{n}"), *sp)
+                }
+                Tpl::Group(o, c, inner, sp) => {
+                    Tpl::Group(o.clone(), c.clone(), rename(inner, names, n, o == "{"), *sp)
+                }
+                Tpl::Rep(inner, sep, op) => {
+                    Tpl::Rep(rename(inner, names, n, braces), sep.clone(), *op)
+                }
+                other => other.clone(),
+            });
+        }
+        out
+    }
+    let mut names = Vec::new();
+    bound(t, &mut names);
+    if names.is_empty() {
+        return t.to_vec();
+    }
+    rename(t, &names, n, false)
+}
+
 fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
     for x in t {
         match x {
@@ -826,6 +946,7 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
 /// Expand every `macro_rules!` macro in `src`. Errors are (start, end, message) at original
 /// offsets.
 pub fn expand(src: &str) -> Result<Option<Expansion>, Vec<(usize, usize, String)>> {
+    let mut expansions = 0usize;
     let mut text = src.to_string();
     let mut map = OffsetMap::identity(src.len());
     let mut rounds = 0;
@@ -886,7 +1007,9 @@ pub fn expand(src: &str) -> Result<Option<Expansion>, Vec<(usize, usize, String)
                 let mut bind = Bindings::new();
                 if m.seq(&rule.matcher, &toks, 0, &[], &mut bind) == Some(toks.len()) {
                     let mut s = String::new();
-                    transcribe(&rule.transcriber, &bind, &mut s)
+                    expansions += 1;
+                    let tpl = hygienic(&rule.transcriber, expansions);
+                    transcribe(&tpl, &bind, &mut s)
                         .map_err(|e| err(format!("in `{name}!`: {e}")))?;
                     out = Some(s);
                     break;

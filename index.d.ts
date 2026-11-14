@@ -107,16 +107,20 @@ export function definition(
   resolve?: (path: string) => string | undefined,
 ): Location | null;
 
-/** Every use in this file of the name at a 1-based line and UTF-16 column, its declaration included. */
+/**
+ * Every use of the name at a 1-based line and UTF-16 column, its declaration included, in this file
+ * and in `others` (paths `resolve` reads).
+ */
 export function references(
   source: string,
   filename: string,
   line: number,
   column: number,
   resolve?: (path: string) => string | undefined,
+  others?: string[],
 ): Location[];
 
-/** The ranges to replace with `newName` to rename the name there; empty when it can't be renamed in this file. */
+/** The ranges to replace with `newName` to rename the name there, also in `others`; empty when it can't be renamed. */
 export function rename(
   source: string,
   filename: string,
@@ -124,4 +128,16 @@ export function rename(
   column: number,
   newName: string,
   resolve?: (path: string) => string | undefined,
+  others?: string[],
 ): Location[];
+
+/**
+ * Debug-build overflow checks for the compiles that follow: integer arithmetic that overflows
+ * panics (`attempt to add with overflow`) instead of wrapping, as `rustc` without `-O` does.
+ */
+export function setOverflowChecks(on: boolean): void;
+
+/**
+ * Borrow conflicts rustc rejects as errors for the compiles that follow, instead of warnings.
+ */
+export function setStrictBorrows(on: boolean): void;

@@ -33,7 +33,9 @@ struct Module {
     uses: HashMap<String, Target>,
     globs: Vec<Vec<String>>,
     /// Items and child modules without `pub`.
-    private: HashSet<String>,
+    /// Items and child modules that aren't `pub`, by the module path they're visible from (and
+    /// below): their own module, its parent for `pub(super)`, the one `pub(in ..)` names.
+    private: HashMap<String, Vec<String>>,
     /// Names other `use`s bring in (`use std::fmt;`), and whether one is a `*`.
     external: HashSet<String>,
     external_glob: bool,
@@ -51,8 +53,37 @@ enum Res {
     Error(String),
 }
 
-fn has_pub(n: &SyntaxNode) -> bool {
-    n.children().any(|c| c.kind() == SyntaxKind::VISIBILITY)
+/// Where an item of module `path` can be used from (that module path and below), or None when
+/// it's `pub` / `pub(crate)` (the file is the crate).
+fn visible_from(n: &SyntaxNode, path: &[String]) -> Option<Vec<String>> {
+    let Some(v) = n.children().find_map(ast::Visibility::cast) else {
+        return Some(path.to_vec());
+    };
+    let text: String = v.syntax().text().to_string().split_whitespace().collect();
+    match text.as_str() {
+        "pub" | "pub(crate)" => None,
+        "pub(self)" => Some(path.to_vec()),
+        "pub(super)" => Some(path[..path.len().saturating_sub(1)].to_vec()),
+        t => {
+            // `pub(in crate::a::b)`, `pub(in super)`, `pub(in self::x)`.
+            let inner = t.strip_prefix("pub(in")?.strip_suffix(')')?;
+            // (`crate::` may be a bigger crate than this file: not checked, like `crate::` paths.)
+            if inner.starts_with("crate") {
+                return None;
+            }
+            let mut out = path.to_vec();
+            for (i, seg) in inner.split("::").enumerate() {
+                match seg {
+                    "self" if i == 0 => {}
+                    "super" => {
+                        out.pop();
+                    }
+                    s => out.push(s.to_string()),
+                }
+            }
+            Some(out)
+        }
+    }
 }
 
 fn has_cfg(n: &SyntaxNode) -> bool {
@@ -119,8 +150,8 @@ impl Flattener {
                 if !module.children.insert(n.text().to_string()) || has_cfg(m.syntax()) {
                     module.open = true;
                 }
-                if !has_pub(m.syntax()) {
-                    module.private.insert(n.text().to_string());
+                if let Some(scope) = visible_from(m.syntax(), &path) {
+                    module.private.insert(n.text().to_string(), scope);
                 }
                 let mut p = path.clone();
                 p.push(n.text().to_string());
@@ -129,8 +160,8 @@ impl Flattener {
             }
             if let Some(n) = item_name(&item) {
                 module.items.insert(n.text().to_string());
-                if !has_pub(item.syntax()) {
-                    module.private.insert(n.text().to_string());
+                if let Some(scope) = visible_from(item.syntax(), &path) {
+                    module.private.insert(n.text().to_string(), scope);
                 }
             } else if !matches!(item, ast::Item::Impl(_) | ast::Item::Use(_)) {
                 module.open = true;
@@ -228,7 +259,12 @@ impl Flattener {
                 break;
             };
             if m.children.contains(seg) {
-                if checked && m.private.contains(seg) && !m.open && !from.starts_with(&cur) {
+                if checked
+                    && m.private
+                        .get(seg)
+                        .is_some_and(|scope| !from.starts_with(scope))
+                    && !m.open
+                {
                     return Res::Error(format!("module `{seg}` is private"));
                 }
                 cur.push(seg.clone());
@@ -267,10 +303,11 @@ impl Flattener {
         };
         if let Some(m) = self.modules.get(&module)
             && m.items.contains(name)
-            && m.private.contains(name)
+            && m.private
+                .get(name)
+                .is_some_and(|scope| !from.starts_with(scope))
             && checked
             && !m.open
-            && !from.starts_with(&module)
         {
             return Res::Error(format!(
                 "`{name}` is private to module `{}`",
