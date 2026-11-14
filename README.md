@@ -110,8 +110,12 @@ passes the server's scripts.
 `hover(source, filename, line, column, resolve?)` returns markdown for the symbol under the cursor
 (types, function signatures, NS docs with RAM costs), and `completions(...)` lists the members of
 the value before a `.` (or the names in scope for a plain identifier), and `signatureHelp(...)`
-gives parameter hints inside a call. They work on code with syntax errors. Bitburner registers them as Monaco
-hover and completion providers for `.rs` files.
+gives parameter hints inside a call. `definition(...)` finds where the name under the cursor is
+defined (locals by scope; functions, types, methods, fields, variants and aliases; items of
+`mod x;` files through `resolve`), `references(...)` lists its uses in the file and
+`rename(..., newName, ...)` the ranges to replace. They work on code with syntax errors.
+Bitburner registers them as Monaco hover, completion, signature help, definition, reference and
+rename providers for `.rs` files; a definition in another script opens it in a tab.
 
 ### Typed NS bindings
 

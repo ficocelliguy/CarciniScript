@@ -31,7 +31,7 @@ mod std_lib;
 #[path = "typeck_trait.rs"]
 mod traits;
 pub use ext::{char_predicate, is_option_closure_method};
-pub use modules::{Imported, ModuleRef, Resolver, use_leaves};
+pub use modules::{Imported, ModuleRef, Resolver, module_path, use_leaves};
 pub use res::{is_std_error, result_ctor_call, result_variant};
 
 use ra_ap_syntax::{
@@ -72,6 +72,20 @@ pub struct Types {
     /// `&mut obj.field` / `&mut v[i]` arguments for `&mut i32`-style parameters: passed as a cell
     /// that reads and writes the slot (by the `&mut` expression's range).
     pub slot_args: std::collections::HashSet<(usize, usize)>,
+    /// `get_mut` / `first_mut` / `last_mut` calls on numbers, strings or bools, where the result
+    /// is matched or unwrapped: they yield the element's slot (value at `[1]`), so writes stick.
+    pub slot_calls: std::collections::HashSet<(usize, usize)>,
+    /// Bindings of such a slot (`Some(x)` in `if let`/`match`): `x` reads and writes `x[1]`.
+    pub slot_bindings: std::collections::HashSet<(usize, usize)>,
+    /// `&mut place` results of `index_mut` bodies: a cell over the place (`κσ.$cell`).
+    pub cell_returns: std::collections::HashSet<(usize, usize)>,
+    /// `grid[i] = v` / `grid[i] += v` through `impl IndexMut`: written as `cell[0]`.
+    pub index_places: std::collections::HashSet<(usize, usize)>,
+    /// `&mut v[a..b]` of a Vec: a view whose writes reach `v` (`κσ.$sliceMut`), by the `&mut`.
+    pub slice_views: std::collections::HashSet<(usize, usize)>,
+    /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
+    /// the `bool`), with the target type.
+    pub derefs: HashMap<(usize, usize), (bool, Ty)>,
     /// `mod name;` modules, in order.
     pub modules: Vec<ModuleRef>,
     /// Functions and constants from other modules.
@@ -162,6 +176,15 @@ impl<'a> Checker<'a> {
             boxed: Default::default(),
             cell_args: Default::default(),
             slot_args: Default::default(),
+            slot_calls: Default::default(),
+            slot_bindings: Default::default(),
+            cell_returns: Default::default(),
+            index_places: Default::default(),
+            slice_views: Default::default(),
+            derefs: Default::default(),
+            opaque_index_mut: Default::default(),
+            static_muts: Default::default(),
+            statics: Default::default(),
             modules: Vec::new(),
             module_exports: HashMap::new(),
             imported: Vec::new(),
@@ -252,6 +275,7 @@ pub fn check(
 ) -> (Types, Vec<RawDiag>) {
     let mut c = Checker::new(src);
     c.declare_items(file, filename, resolver, &mut vec![filename.to_string()]);
+    c.scan_index_mut(file);
     for item in crate::adt::all_items(file) {
         if let ast::Item::Fn(f) = &item {
             c.check_fn(f);
@@ -344,6 +368,12 @@ pub fn check(
     let boxed = std::mem::take(&mut c.boxed);
     let cell_args = std::mem::take(&mut c.cell_args);
     let slot_args = std::mem::take(&mut c.slot_args);
+    let slot_calls = std::mem::take(&mut c.slot_calls);
+    let slot_bindings = std::mem::take(&mut c.slot_bindings);
+    let cell_returns = std::mem::take(&mut c.cell_returns);
+    let index_places = std::mem::take(&mut c.index_places);
+    let slice_views = std::mem::take(&mut c.slice_views);
+    let derefs = std::mem::take(&mut c.derefs);
     let modules = std::mem::take(&mut c.modules);
     let imported = std::mem::take(&mut c.imported);
     let conversions = std::mem::take(&mut c.conversions);
@@ -356,6 +386,12 @@ pub fn check(
             boxed,
             cell_args,
             slot_args,
+            slot_calls,
+            slot_bindings,
+            cell_returns,
+            index_places,
+            slice_views,
+            derefs,
             modules,
             imported,
             conversions,
@@ -400,6 +436,18 @@ struct Checker<'a> {
     boxed: std::collections::HashSet<(usize, usize)>,
     cell_args: std::collections::HashSet<(usize, usize)>,
     slot_args: std::collections::HashSet<(usize, usize)>,
+    slot_calls: std::collections::HashSet<(usize, usize)>,
+    slot_bindings: std::collections::HashSet<(usize, usize)>,
+    cell_returns: std::collections::HashSet<(usize, usize)>,
+    index_places: std::collections::HashSet<(usize, usize)>,
+    slice_views: std::collections::HashSet<(usize, usize)>,
+    derefs: HashMap<(usize, usize), (bool, Ty)>,
+    /// Types whose `index_mut` doesn't end in `&mut <place>`: assigning through them can't work.
+    opaque_index_mut: std::collections::HashSet<String>,
+    /// `static mut` items, by name: using one takes an `unsafe` block or function.
+    static_muts: std::collections::HashSet<String>,
+    /// The other `static` items, which can't be assigned to.
+    statics: std::collections::HashSet<String>,
     /// Enclosing loops, innermost last: (label, the value type for a `loop`; None for
     /// `while`/`for`, which can't break with a value), and whether some `break` targets it.
     loops: Vec<(Option<String>, Option<Ty>, bool, bool)>,
@@ -1009,6 +1057,9 @@ impl<'a> Checker<'a> {
                         decl: None,
                     };
                     self.declare(&n, local);
+                } else if let Some(pat) = p.pat() {
+                    // `(r, c): (usize, usize)`, `Point { x, y }: Point`, `&(a, b): &(i32, i32)`.
+                    self.pat(&pat, &ty);
                 }
             }
         }
@@ -1145,7 +1196,11 @@ impl<'a> Checker<'a> {
                 ty,
                 mutable: ip.mut_token().is_some(),
                 deferred,
-                reference: declared_ref.or(init_ref),
+                reference: declared_ref.or(init_ref).or_else(|| {
+                    // `let r = map.get_mut(k).unwrap();`: a `&mut` to the slot's value.
+                    let r = self.range(name.syntax());
+                    self.slot_bindings.contains(&r).then_some(true)
+                }),
                 decl: None,
             };
             self.declare(&name, local);
@@ -1176,6 +1231,17 @@ impl<'a> Checker<'a> {
             );
         }
         self.pat(&pat, &ty);
+        // `let (left, right) = v.split_at_mut(mid);`: both are `&mut` views.
+        if let Some(ast::Expr::MethodCallExpr(m)) = l.initializer().as_ref().map(strip_parens)
+            && m.name_ref().is_some_and(|n| n.text() == "split_at_mut")
+            && let Some(scope) = self.scopes.last_mut()
+        {
+            for ip in pat.syntax().descendants().filter_map(ast::IdentPat::cast) {
+                if let Some(local) = ip.name().and_then(|n| scope.get_mut(n.text())) {
+                    local.reference = Some(true);
+                }
+            }
+        }
         // `let (a, b);`: each name is assigned later, once.
         if deferred && let Some(scope) = self.scopes.last_mut() {
             for ip in pat.syntax().descendants().filter_map(ast::IdentPat::cast) {
@@ -1235,11 +1301,27 @@ impl<'a> Checker<'a> {
                 Some(ast::Expr::MethodCallExpr(m)) => m.name_ref().is_some_and(|n| {
                     matches!(
                         n.text(),
-                        "get_mut" | "first_mut" | "last_mut" | "as_mut" | "values_mut" | "iter_mut"
+                        "get_mut"
+                            | "first_mut"
+                            | "last_mut"
+                            | "as_mut"
+                            | "values_mut"
+                            | "iter_mut"
+                            | "split_at_mut"
                     )
                 }),
                 _ => false,
             };
+        // `Some(x)` against a slot (`map.get_mut(..)` of numbers): `x` aliases the slot's value.
+        if let Some(ast::Expr::MethodCallExpr(m)) = scrutinee.map(strip_parens)
+            && self.slot_calls.contains(&self.range(m.syntax()))
+            && let ast::Pat::TupleStructPat(tp) = pat
+            && let Some(ast::Pat::IdentPat(ip)) = tp.fields().next()
+            && let Some(n) = ip.name()
+        {
+            let r = self.range(n.syntax());
+            self.slot_bindings.insert(r);
+        }
         if mut_source && let Some(scope) = self.scopes.last_mut() {
             for local in scope.values_mut() {
                 local.reference = Some(true);
@@ -1571,7 +1653,7 @@ impl<'a> Checker<'a> {
             ast::Pat::IdentPat(ip) if is_none_pat(&ip) => vec![Ap::None],
             ast::Pat::IdentPat(ip) if self.unit_struct_pat(&ip).is_some() => self
                 .adt_abstract(&ast::Pat::IdentPat(ip))
-                .unwrap_or(vec![Ap::Other]),
+                .unwrap_or(vec![Ap::Opaque]),
             ast::Pat::IdentPat(ip) if self.const_pat(&ip).is_some() => vec![Ap::Other],
             ast::Pat::IdentPat(ip) => ip
                 .pat()
@@ -1604,8 +1686,58 @@ impl<'a> Checker<'a> {
             }
             ast::Pat::LiteralPat(lp) => match lp.literal().map(|l| l.kind()) {
                 Some(LiteralKind::Bool(b)) => vec![Ap::Bool(b)],
+                Some(LiteralKind::IntNumber(_)) => match int_lit_value(&lp) {
+                    Some(v) => vec![Ap::Int(v, v)],
+                    None => vec![Ap::Other],
+                },
+                Some(LiteralKind::Char(_)) => match char_lit_value(&lp) {
+                    Some(v) => vec![Ap::Int(v, v)],
+                    None => vec![Ap::Other],
+                },
                 _ => vec![Ap::Other],
             },
+            // `1..=5`, `..10`, `200..` (bounds left out are the type's own, filled in later).
+            ast::Pat::RangePat(rp) => {
+                let bound = |p: Option<ast::Pat>| match p {
+                    Some(ast::Pat::LiteralPat(lp)) => {
+                        int_lit_value(&lp).or_else(|| char_lit_value(&lp)).map(Some)
+                    }
+                    // `u8::MAX`, `i32::MIN`
+                    Some(ast::Pat::PathPat(pp)) => {
+                        let path = pp.path()?;
+                        let ty = path.qualifier()?.segment()?.name_ref()?.text().to_string();
+                        let (min, max) = match IntKind::from_name(&ty) {
+                            Some(k) => int_domain(k),
+                            None if ty == "char" => (0, 0x10FFFF),
+                            None => return None,
+                        };
+                        match path.segment()?.name_ref()?.text() {
+                            "MIN" => Some(Some(min)),
+                            "MAX" => Some(Some(max)),
+                            _ => None,
+                        }
+                    }
+                    None => Some(None),
+                    _ => None,
+                };
+                let inclusive = rp.op_token().is_some_and(|t| t.text() == "..=");
+                match (bound(rp.start()), bound(rp.end())) {
+                    (Some(lo), Some(hi)) => {
+                        let lo = lo.unwrap_or(i128::MIN);
+                        let hi = match hi {
+                            Some(h) if inclusive => h,
+                            Some(h) => h - 1,
+                            None => i128::MAX,
+                        };
+                        if lo <= hi {
+                            vec![Ap::Int(lo, hi)]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    _ => vec![Ap::Other],
+                }
+            }
             ast::Pat::OrPat(op) => op.pats().flat_map(|alt| self.abstract_pat(&alt)).collect(),
             ast::Pat::TuplePat(tp) => {
                 let fields: Vec<ast::Pat> = tp.fields().collect();
@@ -1676,7 +1808,7 @@ impl<'a> Checker<'a> {
                     })
                     .collect()
             }
-            other => self.adt_abstract(&other).unwrap_or(vec![Ap::Other]),
+            other => self.adt_abstract(&other).unwrap_or(vec![Ap::Opaque]),
         }
     }
 
@@ -1699,8 +1831,16 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|r| &r[0])
             .find(|a| !matches!(a, Ap::Wild | Ap::Other));
-        let family = match (self.zonk(ty), head_kind) {
+        // An unsolved type is as good as unknown.
+        let zt = match self.zonk(ty) {
+            Ty::Var(_) => Ty::Unknown,
+            t => t,
+        };
+        let family = match (zt, head_kind) {
+            (Ty::Unit, None | Some(Ap::Tuple(_))) => Family::Tuple(vec![]),
             (Ty::Bool, _) | (Ty::Unknown, Some(Ap::Bool(_))) => Family::Bool,
+            (Ty::Int(k), Some(Ap::Int(..))) => Family::Int(k),
+            (Ty::Char, Some(Ap::Int(..))) => Family::Char,
             (Ty::Ordering, _) | (Ty::Unknown, Some(Ap::Ord(_))) => Family::Ordering,
             (Ty::Option(inner), _) => Family::Option(*inner),
             (Ty::Unknown, Some(Ap::None | Ap::Some(_))) => Family::Option(Ty::Unknown),
@@ -1709,8 +1849,28 @@ impl<'a> Checker<'a> {
             (Ty::Adt(n, targs), _) if self.adts.defs.contains_key(&n) => Family::Adt(n, targs),
             (Ty::Result(t, e), _) => Family::Result(*t, *e),
             (Ty::Vec(e), Some(Ap::Slice(..))) => Family::Slice(*e),
-            _ => Family::Infinite,
+            // Values without end: a catch-all must cover what the patterns leave.
+            (Ty::Int(_) | Ty::Float { .. } | Ty::Char | Ty::Str, _) => Family::Infinite,
+            (Ty::Unknown, Some(Ap::Int(..))) => Family::Infinite,
+            // A type this checker doesn't know the values of (another crate's enum, an unsolved
+            // type): assume the patterns cover it, as rustc accepted them.
+            _ => return None,
         };
+        // Patterns of another kind than the type (it was mistyped, say a field declared twice
+        // under `#[cfg]`s), or of a type unknown here: nothing to say.
+        let fits = |a: &Ap| match (&family, a) {
+            (_, Ap::Wild) => true,
+            (_, Ap::Opaque) => false,
+            (Family::Bool, Ap::Bool(_)) | (Family::Ordering, Ap::Ord(_)) => true,
+            (Family::Option(_), Ap::None | Ap::Some(_)) => true,
+            (Family::Tuple(_), Ap::Tuple(_)) | (Family::Slice(_), Ap::Slice(..)) => true,
+            (Family::Adt(..) | Family::Result(..), Ap::Ctor(..)) => true,
+            (Family::Int(_) | Family::Char | Family::Infinite, Ap::Int(..) | Ap::Other) => true,
+            _ => false,
+        };
+        if !rows.iter().all(|r| fits(&r[0])) {
+            return None;
+        }
         let specialize = |ctor: &Ap, arity: usize| -> Vec<Vec<Ap>> {
             rows.iter()
                 .filter_map(|r| {
@@ -1768,6 +1928,9 @@ impl<'a> Checker<'a> {
                     return Some([vec![head], w].concat());
                 }
                 variants.iter().enumerate().find_map(|(v, variant)| {
+                    if self.adts.cfg_variants.contains(&(n.clone(), v)) {
+                        return None;
+                    }
                     let k = variant.fields.len();
                     let tys: Vec<Ty> = variant.fields.iter().map(|f| f.ty.clone()).collect();
                     let w = self.missing(
@@ -1837,6 +2000,52 @@ impl<'a> Checker<'a> {
                 )?;
                 Some([vec![format!("Some({})", w[0])], w[1..].to_vec()].concat())
             }
+            Family::Int(_) | Family::Char => {
+                // Split the type's values where some pattern starts or ends; each piece is covered
+                // by a row as a whole or not at all.
+                let (min, max) = match family {
+                    Family::Int(k) => int_domain(k),
+                    _ => (0, 0x10FFFF),
+                };
+                let is_char = matches!(family, Family::Char);
+                let mut cuts = vec![min];
+                if is_char {
+                    cuts.extend([0xD800, 0xE000]);
+                }
+                for r in rows {
+                    if let Ap::Int(a, b) = r[0] {
+                        cuts.push(a.clamp(min, max));
+                        if b < max {
+                            cuts.push((b + 1).clamp(min, max));
+                        }
+                    }
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                for (i, &lo) in cuts.iter().enumerate() {
+                    let hi = cuts.get(i + 1).map(|&c| c - 1).unwrap_or(max);
+                    if is_char && (0xD800..0xE000).contains(&lo) {
+                        continue;
+                    }
+                    let sub: Vec<Vec<Ap>> = rows
+                        .iter()
+                        .filter(|r| match r[0] {
+                            Ap::Wild => true,
+                            Ap::Int(a, b) => a <= lo && hi <= b,
+                            _ => false,
+                        })
+                        .map(|r| r[1..].to_vec())
+                        .collect();
+                    if let Some(w) = self.missing(&sub, rest) {
+                        let head = match family {
+                            Family::Int(k) => describe_int_range(k, lo, hi),
+                            _ => describe_char_range(lo, hi),
+                        };
+                        return Some([vec![head], w].concat());
+                    }
+                }
+                None
+            }
             Family::Infinite => {
                 let defaults: Vec<Vec<Ap>> = rows
                     .iter()
@@ -1859,8 +2068,40 @@ impl<'a> Checker<'a> {
     /// Infer `e` and require it to have type `expected`.
     fn check(&mut self, e: &ast::Expr, expected: &Ty) -> Ty {
         let t = self.infer(e, Some(expected));
+        // `&stack` where `&Vec<i32>` is expected, with `impl Deref<Target = Vec<i32>> for Stack`.
+        if let Ty::Adt(n, _) = self.shallow(&t)
+            && !matches!(
+                self.shallow(expected),
+                Ty::Adt(..) | Ty::Var(_) | Ty::Unknown
+            )
+            && let Some(target) = self.adts.deref_targets.get(&n).cloned()
+            && self.could_be(&target, expected)
+        {
+            self.unify(&target, expected);
+            self.auto_deref(e, &n, &target);
+            return target;
+        }
         self.expect(e.syntax(), &t, expected);
         t
+    }
+
+    /// Mark `e` (of type `adt`) as auto-dereferenced to `target`.
+    fn auto_deref(&mut self, e: &ast::Expr, adt: &str, target: &Ty) {
+        let r = self.range(e.syntax());
+        let mutable = self.adts.deref_mut.contains(adt);
+        self.derefs.insert(r, (mutable, target.clone()));
+    }
+
+    /// `x`'s type through `impl Deref`, when `x` is such a struct or enum.
+    fn deref_target(&self, t: &Ty) -> Option<(String, Ty)> {
+        match self.shallow(t) {
+            Ty::Adt(n, _) => self
+                .adts
+                .deref_targets
+                .get(&n)
+                .map(|t| (n.clone(), t.clone())),
+            _ => None,
+        }
     }
 
     fn infer_inner(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> Ty {
@@ -1877,16 +2118,27 @@ impl<'a> Checker<'a> {
                 };
                 if r.mut_token().is_some() {
                     self.check_mutable(&inner, Mutation::Borrow);
-                    if let ast::Expr::IndexExpr(ix) = strip_parens(&inner)
-                        && matches!(ix.index(), Some(ast::Expr::RangeExpr(_)))
-                    {
-                        self.error(
-                            r.syntax(),
-                            "mutable slices (`&mut v[a..b]`) are not supported yet: slices are copies, so writes wouldn't reach `v` (index `v` directly)",
-                        );
-                    }
                 }
                 let t = self.infer(&inner, expected);
+                // `&mut v[a..b]`: a view of that part of `v`.
+                if r.mut_token().is_some()
+                    && let ast::Expr::IndexExpr(ix) = strip_parens(&inner)
+                    && matches!(ix.index(), Some(ast::Expr::RangeExpr(_)))
+                {
+                    let base = ix
+                        .base()
+                        .and_then(|b| self.raw.get(&self.range(b.syntax())).cloned());
+                    match base.map(|b| self.zonk(&b)) {
+                        Some(Ty::Str) => self.error(
+                            r.syntax(),
+                            "mutable string slices (`&mut s[a..b]`) are not supported (strings are values in JS); work on `s` itself",
+                        ),
+                        _ => {
+                            let rr = self.range(r.syntax());
+                            self.slice_views.insert(rr);
+                        }
+                    }
+                }
                 // `let r = &mut self.root;` with a number, string, bool or `Option` in that slot:
                 // a JS variable can't point into the struct, so `*r = ..` would only change `r`.
                 if r.mut_token().is_some()
@@ -2230,8 +2482,14 @@ impl<'a> Checker<'a> {
             if let Some(local) = self.lookup(name.text()) {
                 return local.ty.clone();
             }
-            if let Some(t) = self.consts.get(name.text().to_string().as_str()) {
-                return t.clone();
+            if let Some(t) = self.consts.get(name.text().to_string().as_str()).cloned() {
+                if self.static_muts.contains(name.text()) && !in_unsafe(p.syntax()) {
+                    self.error(
+                        p.syntax(),
+                        "use of mutable static is unsafe and requires unsafe block",
+                    );
+                }
+                return t;
             }
             if let Some(t) = self.adt_path(p, &[name.text().to_string()]) {
                 return t;
@@ -2278,8 +2536,14 @@ impl<'a> Checker<'a> {
             .map(|n| n.text().to_string())
             .collect();
         if let [single] = self.strip_modules(&segs).as_slice() {
-            if let Some(t) = self.consts.get(single) {
-                return t.clone();
+            if let Some(t) = self.consts.get(single).cloned() {
+                if self.static_muts.contains(single) && !in_unsafe(p.syntax()) {
+                    self.error(
+                        p.syntax(),
+                        "use of mutable static is unsafe and requires unsafe block",
+                    );
+                }
+                return t;
             }
             if let Some(sig) = self.fns.get(single) {
                 let (is_async, tps) = (sig.is_async, sig.type_params.clone());
@@ -2338,6 +2602,12 @@ impl<'a> Checker<'a> {
         if let (Ty::Adt(n, _), Some(op @ (UnaryOp::Neg | UnaryOp::Not))) = (&resolved, p.op_kind())
         {
             return self.unary_overload(p.syntax(), op == UnaryOp::Neg, n, &t);
+        }
+        if p.op_kind() == Some(UnaryOp::Deref)
+            && let Some((n, target)) = self.deref_target(&t)
+        {
+            self.auto_deref(&inner, &n, &target);
+            return target;
         }
         match p.op_kind() {
             Some(UnaryOp::Deref) | None => t,
@@ -2436,17 +2706,41 @@ impl<'a> Checker<'a> {
                 .filter_map(ast::RefExpr::cast)
                 .any(|r| r.mut_token().is_some());
             if !in_place && !borrowed {
-                self.error(
-                    e.syntax(),
-                    "writing through a range of a Vec (`v[a..b]`) isn't supported yet: ranges are copies, so the write wouldn't reach `v` (index `v` directly; `sort`, `reverse`, `fill`, `swap` and `rotate_*` on a range do work)",
-                );
-                return;
+                // `v[1..].iter_mut()`, `v[0..2][1] = 9`: the range is a view of `v` instead.
+                let base = range
+                    .base()
+                    .and_then(|b| self.raw.get(&self.range(b.syntax())).cloned());
+                if base.is_some_and(|b| self.zonk(&b) == Ty::Str) {
+                    self.error(
+                        e.syntax(),
+                        "writing through a range of a string isn't supported (strings are values in JS); work on the string itself",
+                    );
+                    return;
+                }
+                let r = self.range(range.syntax());
+                self.slice_views.insert(r);
             }
         }
         let Some((name, through)) = Self::place_root(e) else {
             return;
         };
         let Some(local) = self.lookup(name.text()).cloned() else {
+            // A `static` or `const` item.
+            let n = name.text().to_string();
+            if how != Mutation::Assign {
+                return;
+            }
+            if self.statics.contains(&n) {
+                self.error(
+                    e.syntax(),
+                    format!("cannot assign to immutable static item `{n}`"),
+                );
+            } else if self.consts.contains_key(&n) && !self.static_muts.contains(&n) {
+                self.error(
+                    e.syntax(),
+                    "invalid left-hand side of assignment (a `const` can't change)",
+                );
+            }
             return;
         };
         let n = name.text();
@@ -3266,7 +3560,31 @@ impl<'a> Checker<'a> {
             }
             return Ty::Bool;
         }
-        let rt = self.infer(&recv, None);
+        let mut rt = self.infer(&recv, None);
+        // `stack.push(1)` through `impl Deref`: a method the type itself doesn't have.
+        if let Some((n, target)) = self.deref_target(&rt)
+            && self.adts.method(&n, &method).is_none()
+            && !matches!(
+                method.as_str(),
+                "clone"
+                    | "to_owned"
+                    | "eq"
+                    | "ne"
+                    | "cmp"
+                    | "partial_cmp"
+                    | "lt"
+                    | "le"
+                    | "gt"
+                    | "ge"
+                    | "deref"
+                    | "deref_mut"
+            )
+            && !(method == "to_string" && self.adts.defs.get(&n).is_some_and(|d| d.display))
+        {
+            self.auto_deref(&recv, &n, &target);
+            self.record(recv.syntax(), target.clone());
+            rt = target;
+        }
         // A user trait method on a built-in type (`x.money()` with `impl Money for f64`); std's own
         // methods come first, as inherent methods do in Rust.
         if let Some(key) = crate::adt::ext_key_of(&self.shallow(&rt))
@@ -3599,11 +3917,22 @@ impl<'a> Checker<'a> {
                     "get_mut" | "first_mut" | "last_mut" => {
                         self.check_mutable(&recv, Mutation::Borrow);
                         let resolved = self.zonk(&elem);
-                        if resolved.is_js_primitive() || resolved == Ty::Unknown {
+                        if (resolved.is_js_primitive() || resolved == Ty::Unknown)
+                            && slot_position(m)
+                        {
+                            let r = self.range(m.syntax());
+                            self.slot_calls.insert(r);
+                            if let Some(n) = slot_let_binding(m) {
+                                let r = self.range(n.syntax());
+                                self.slot_bindings.insert(r);
+                            }
+                        } else if !only_tested(m) && resolved.is_js_primitive()
+                            || resolved == Ty::Unknown
+                        {
                             self.error(
                                 m.syntax(),
                                 format!(
-                                    "`Vec::{m2}` on a Vec of `{}` isn't supported (the element would be copied, so changes wouldn't stick); index with `v[i]` instead",
+                                    "`Vec::{m2}` on a Vec of `{}` isn't supported here (the element would be copied, so changes wouldn't stick); use it in `if let Some(x) = ..` / `match`, as `*v.{m2}(..).unwrap()`, or index with `v[i]`",
                                     self.describe(&elem)
                                 ),
                             );
@@ -3678,9 +4007,16 @@ impl<'a> Checker<'a> {
                     "contains_key" => sig(self, &[k], Ty::Bool),
                     "get_mut" => {
                         let resolved = self.zonk(&v);
-                        if resolved.is_js_primitive() {
+                        if resolved.is_js_primitive() && slot_position(m) {
+                            let r = self.range(m.syntax());
+                            self.slot_calls.insert(r);
+                            if let Some(n) = slot_let_binding(m) {
+                                let r = self.range(n.syntax());
+                                self.slot_bindings.insert(r);
+                            }
+                        } else if !only_tested(m) && resolved.is_js_primitive() {
                             let msg = format!(
-                                "`HashMap::get_mut` on a map of `{}` values isn't supported (the value would be copied, so changes wouldn't stick); use `*map.entry(k).or_insert(..) += ..` or `map.insert(k, v)`",
+                                "`HashMap::get_mut` on a map of `{}` values isn't supported here (the value would be copied, so changes wouldn't stick); use it in `if let Some(x) = ..` / `match`, as `*map.get_mut(..).unwrap()`, or `*map.entry(k).or_insert(..) += ..`",
                                 self.describe(&v)
                             );
                             self.error(m.syntax(), msg);
@@ -3846,7 +4182,19 @@ impl<'a> Checker<'a> {
         let (Some(base), Some(index)) = (ix.base(), ix.index()) else {
             return Ty::Unknown;
         };
-        let bt = self.infer(&base, None);
+        let mut bt = self.infer(&base, None);
+        // `stack[i]` through `impl Deref` (when the type has no `Index` of its own).
+        if let Some((n, target)) = self.deref_target(&bt)
+            && !self
+                .adts
+                .op_impls
+                .get(&n)
+                .is_some_and(|v| v.iter().any(|i| i.trait_name == "Index"))
+        {
+            self.auto_deref(&base, &n, &target);
+            self.record(base.syntax(), target.clone());
+            bt = target;
+        }
         // `grid[i]` with an `impl Index<I> for Grid`.
         if let Ty::Adt(n, _) = self.shallow(&bt) {
             return self.index_overload(ix, &n, &bt, &index);
@@ -4322,6 +4670,8 @@ impl<'a> Checker<'a> {
                     Some(d) => !d.display,
                     None => false,
                 },
+                // `{}` of `c.to_uppercase()`: its chars.
+                Ty::Iter { elem, .. } if !spec.debug && self.shallow(elem) == Ty::Char => false,
                 Ty::Iter { .. } | Ty::Future(_) | Ty::Fn => true,
                 Ty::Extern(_) => !spec.debug,
                 _ => false,
@@ -4388,8 +4738,12 @@ enum Ap {
     Ctor(usize, Vec<Ap>),
     /// A slice pattern: elements before `..`, elements after it, and whether there is a `..`.
     Slice(Vec<Ap>, Vec<Ap>, bool),
+    /// An integer literal or range pattern, as an inclusive range.
+    Int(i128, i128),
     /// A refutable pattern over an effectively infinite domain (an integer, char or string).
     Other,
+    /// A constructor pattern of a type this checker doesn't know (another crate's enum).
+    Opaque,
 }
 
 enum Family {
@@ -4400,7 +4754,78 @@ enum Family {
     Ordering,
     Option(Ty),
     Tuple(Vec<Ty>),
+    /// An integer type, by its range.
+    Int(IntKind),
+    /// `char`: code points, without the surrogates.
+    Char,
     Infinite,
+}
+
+/// The values of an integer type. (`u128`'s top half doesn't fit; patterns don't reach it.)
+fn int_domain(k: IntKind) -> (i128, i128) {
+    match k {
+        IntKind::I8 => (i8::MIN as i128, i8::MAX as i128),
+        IntKind::I16 => (i16::MIN as i128, i16::MAX as i128),
+        IntKind::I32 => (i32::MIN as i128, i32::MAX as i128),
+        IntKind::I64 | IntKind::Isize => (i64::MIN as i128, i64::MAX as i128),
+        IntKind::I128 => (i128::MIN, i128::MAX),
+        IntKind::U8 => (0, u8::MAX as i128),
+        IntKind::U16 => (0, u16::MAX as i128),
+        IntKind::U32 => (0, u32::MAX as i128),
+        IntKind::U64 | IntKind::Usize => (0, u64::MAX as i128),
+        IntKind::U128 => (0, i128::MAX),
+    }
+}
+
+/// A missing integer range the way rustc names it: `5_u8`, `i32::MIN..=-1_i32`, `128_u8..=u8::MAX`.
+fn describe_int_range(k: IntKind, lo: i128, hi: i128) -> String {
+    let (min, max) = int_domain(k);
+    let ty = Ty::Int(k).describe();
+    let end = |v: i128| {
+        if v == min {
+            format!("{ty}::MIN")
+        } else if v == max {
+            format!("{ty}::MAX")
+        } else {
+            format!("{v}_{ty}")
+        }
+    };
+    if lo == hi {
+        end(lo)
+    } else {
+        format!("{}..={}", end(lo), end(hi))
+    }
+}
+
+/// A `char` literal pattern's code point.
+fn char_lit_value(lp: &ast::LiteralPat) -> Option<i128> {
+    let LiteralKind::Char(ch) = lp.literal()?.kind() else {
+        return None;
+    };
+    ch.value().ok().map(|c| c as i128)
+}
+
+/// A missing `char` range the way rustc names it: `'a'`, `'\u{80}'..='\u{10ffff}'`.
+fn describe_char_range(lo: i128, hi: i128) -> String {
+    let one = |v: i128| match char::from_u32(v as u32) {
+        Some(c) if !c.is_control() && (v as u32) < 0x80 => format!("{c:?}"),
+        _ => format!("'\\u{{{v:x}}}'"),
+    };
+    if lo == hi {
+        one(lo)
+    } else {
+        format!("{}..={}", one(lo), one(hi))
+    }
+}
+
+/// An integer literal pattern's value (`5`, `-3`, `0xff`, `1_000u32`).
+fn int_lit_value(lp: &ast::LiteralPat) -> Option<i128> {
+    let lit = lp.literal()?;
+    let LiteralKind::IntNumber(n) = lit.kind() else {
+        return None;
+    };
+    let v = n.value().ok()? as i128;
+    Some(if lp.minus_token().is_some() { -v } else { v })
 }
 
 /// `None` in a pattern parses as an identifier binding; it's really the variant.
@@ -4647,4 +5072,113 @@ fn strip_parens(e: &ast::Expr) -> ast::Expr {
             .unwrap_or_else(|| e.clone()),
         _ => e.clone(),
     }
+}
+
+/// `r` in `let r = v.get_mut(..).unwrap();`.
+fn slot_let_binding(m: &ast::MethodCallExpr) -> Option<ast::Name> {
+    let u = ast::MethodCallExpr::cast(m.syntax().parent()?)?;
+    let l = ast::LetStmt::cast(u.syntax().parent()?)?;
+    match l.pat()? {
+        ast::Pat::IdentPat(ip) => ip.name(),
+        _ => None,
+    }
+}
+
+/// Whether a `get_mut`-style call's result is used where a slot can stand in for it: matched
+/// (`if let` / `while let` / `match`), or unwrapped right into a deref or a `let`.
+fn slot_position(m: &ast::MethodCallExpr) -> bool {
+    let mut n = m.syntax().clone();
+    while let Some(p) = n
+        .parent()
+        .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+    {
+        n = p;
+    }
+    let Some(p) = n.parent() else { return false };
+    if ast::LetExpr::can_cast(p.kind()) {
+        return true;
+    }
+    if let Some(me) = ast::MatchExpr::cast(p.clone()) {
+        return me.expr().is_some_and(|e| e.syntax() == &n);
+    }
+    if let Some(u) = ast::MethodCallExpr::cast(p)
+        && u.receiver().is_some_and(|r| r.syntax() == &n)
+        && u.name_ref()
+            .is_some_and(|x| matches!(x.text(), "unwrap" | "expect"))
+        && let Some(q) = u.syntax().parent()
+    {
+        return ast::LetStmt::can_cast(q.kind())
+            || ast::PrefixExpr::cast(q)
+                .is_some_and(|pe| pe.op_kind() == Some(ast::UnaryOp::Deref));
+    }
+    false
+}
+
+/// `v.get_mut(i).is_some()` and the like: the result is only looked at, so a copy is fine.
+fn only_tested(m: &ast::MethodCallExpr) -> bool {
+    m.syntax()
+        .parent()
+        .and_then(ast::MethodCallExpr::cast)
+        .filter(|u| u.receiver().is_some_and(|r| r.syntax() == m.syntax()))
+        .and_then(|u| u.name_ref())
+        .is_some_and(|n| matches!(n.text(), "is_some" | "is_none"))
+}
+
+impl Checker<'_> {
+    /// The `&mut place` results of each `impl IndexMut`'s `index_mut` become cells (`grid[i] = v`
+    /// writes through them); a type whose `index_mut` ends some other way is noted, and
+    /// assigning through it is an error.
+    fn scan_index_mut(&mut self, file: &ast::SourceFile) {
+        for imp in file.syntax().descendants().filter_map(ast::Impl::cast) {
+            let (tr, ty) = crate::adt::impl_parts(&imp);
+            if tr.as_deref() != Some("IndexMut") {
+                continue;
+            }
+            let Some(f) = imp
+                .assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+                .find_map(|a| match a {
+                    ast::AssocItem::Fn(f) if f.name().is_some_and(|n| n.text() == "index_mut") => {
+                        Some(f)
+                    }
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            let Some(body) = f.body() else { continue };
+            let mut results: Vec<ast::Expr> = body
+                .syntax()
+                .descendants()
+                .filter_map(ast::ReturnExpr::cast)
+                .filter_map(|r| r.expr())
+                .collect();
+            if let Some(t) = body.stmt_list().and_then(|l| l.tail_expr()) {
+                results.push(t);
+            }
+            for e in results {
+                match strip_parens(&e) {
+                    ast::Expr::RefExpr(r) if r.mut_token().is_some() => {
+                        let rr = self.range(r.syntax());
+                        self.cell_returns.insert(rr);
+                    }
+                    _ => {
+                        if let Some(t) = &ty {
+                            self.opaque_index_mut.insert(t.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether `n` is inside an `unsafe { .. }` block or an `unsafe fn`.
+fn in_unsafe(n: &SyntaxNode) -> bool {
+    n.ancestors().any(|a| {
+        ast::BlockExpr::cast(a.clone())
+            .is_some_and(|b| matches!(b.modifier(), Some(ast::BlockModifier::Unsafe(_))))
+            || ast::Fn::cast(a).is_some_and(|f| f.unsafe_token().is_some())
+    })
 }

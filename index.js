@@ -4,6 +4,9 @@ import init, {
   hoverJson,
   completionsJson,
   signatureHelpJson,
+  definitionJson,
+  referencesJson,
+  renameJson,
   setNsBindings as setNsBindingsJson,
   version,
 } from "./pkg/carciniscript.js";
@@ -49,6 +52,27 @@ export function completions(source, filename, line, column, resolve) {
 export function signatureHelp(source, filename, line, column, resolve) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
   return JSON.parse(signatureHelpJson(source, filename, line, column, resolve));
+}
+
+/**
+ * Where the name at a 1-based line and UTF-16 column is defined: `{ file, line, column, endLine,
+ * endColumn }` (`file` is `filename`, or another file's path as passed to `resolve`) or null.
+ */
+export function definition(source, filename, line, column, resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(definitionJson(source, filename, line, column, resolve));
+}
+
+/** Every use in this file of the name at a 1-based line and UTF-16 column, its declaration included. */
+export function references(source, filename, line, column, resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(referencesJson(source, filename, line, column, resolve));
+}
+
+/** The ranges to replace with `newName` to rename the name at a 1-based line and UTF-16 column (empty: can't). */
+export function rename(source, filename, line, column, newName, resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(renameJson(source, filename, line, column, newName, resolve));
 }
 
 /**

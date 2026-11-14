@@ -25,9 +25,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Index panics on underflowed `usize`s show a negative index.** `usize` arithmetic doesn't wrap
   (see 64-bit integers above), so `v[i - 1]` with `i == 0` panics with "the index is -1" instead
   of rustc's 18446744073709551615.
-- **A range of a Vec is a copy.** `v[1..4].sort()` and the other in-place slice methods copy the
-  range, change it and write it back; writing to it any other way (`v[0..2][1] = 9`,
-  `v[1..].iter_mut()`, `&mut v[a..b]`) is a compile error rather than a silent no-op.
+- **A range of a Vec is a copy, unless borrowed `&mut`.** `v[1..4].sort()` and the other in-place
+  slice methods copy the range, change it and write it back; `&mut v[a..b]` is a view (a JS
+  `Proxy`, slower than the Vec itself) whose writes reach `v`, as are other writes through a range
+  (`v[0..2][1] = 9`, `v[1..].iter_mut()`) and `split_at_mut`.
 - **String sort order** compares UTF-16 code units; Rust compares UTF-8 bytes. The orders differ
   only between characters above U+FFFF and those in U+E000–U+FFFF.
 
@@ -101,8 +102,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`{:?}` of a generic value prints whole-number floats without `.0`**, and one-character
   strings and chars the same way, since the type is gone at run time.
 - **Every file is its own crate root for `mod`.** `mod x;` in `util.rs` loads `x.rs` next to
-  `util.rs` (rustc would look in `util/x.rs`), since each Bitburner script is compiled on its own.
-  Inline `mod x { .. }` blocks and `foo/mod.rs` aren't supported yet.
+  `util.rs` when there is one, since each Bitburner script is compiled on its own (and may be run
+  directly); otherwise `x/mod.rs`, then `util/x.rs` like rustc. For the same reason `super::` works only inside inline `mod x { .. }` blocks, not at the top of a
+  module file, and `crate::` names this file.
 - **Traits are for structs and enums declared in the file**, or imported from a module. `impl Trait for i32` and other
   built-in types, trait functions without `self` (`T::new()`), associated types and consts, and
   generic traits need type information at run time that erasure removes (phase 4).
@@ -113,8 +115,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   struct without `#[derive(Clone)]` is taken to be an `Rc` clone (it shares the value).
 - **A generic type's arguments can stay unknown** (`let s = Stack::new();` with no use), which
   rustc rejects; nothing depends on them at run time.
-- **Slices are copies.** `&v[1..3]` reads like Rust, but writes through a slice wouldn't reach
-  `v`, so `&mut v[a..b]` is rejected.
+- **Shared slices are copies.** `&v[1..3]` reads like Rust; `&mut v[a..b]` is a view instead (see
+  above), and `&mut s[a..b]` of a string is rejected.
 
 ## Option and patterns
 
@@ -178,7 +180,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Fragments are matched by their tokens**, the way rustc's fragment parsers would split them:
   an `expr` ends at a top-level `,`, `;` or `=>`, a `ty` or `path` keeps commas inside `<..>`.
   Rules that rely on finer parsing (an `expr` followed by an operator token) can match differently.
-- **Macros are per file**: `#[macro_export]` and macros from `mod` files aren't available yet.
+- **Macros from other files come through `mod`**: a file sees the `#[macro_export]` macros of the
+  files it loads with `mod x;` (and all of them with `#[macro_use]`), not those of files further away.
 
 ## Evaluation order
 

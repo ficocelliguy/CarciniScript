@@ -83,6 +83,14 @@ impl Codegen<'_> {
         self.types.adts.resolve(self.self_adt.as_deref(), segs)
     }
 
+    /// How `{:?}` names a type: as written, also when inline-module flattening renamed it.
+    fn display_name<'n>(&'n self, name: &'n str) -> &'n str {
+        self.display_names
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+
     /// The JS class for a struct or enum (`module.Name` when imported).
     pub(super) fn class(&self, adt: &str) -> String {
         match self.types.adts.defs.get(adt).and_then(|d| d.module.clone()) {
@@ -227,6 +235,7 @@ impl Codegen<'_> {
             );
         }
         let mut params = Vec::new();
+        let mut destructured: Vec<(ast::Pat, String)> = Vec::new();
         if let Some(pl) = f.param_list() {
             for (p, ty) in pl.params().zip(sig.params.clone()) {
                 match p.pat() {
@@ -246,7 +255,11 @@ impl Codegen<'_> {
                         params.push(Frag::mapped(self.off(n.syntax()), js));
                     }
                     Some(ast::Pat::WildcardPat(_)) => params.push(Frag::text(self.temp())),
-                    Some(other) => self.unsupported(other.syntax(), "destructuring parameters", 1),
+                    Some(other) => {
+                        let t = self.temp();
+                        params.push(Frag::mapped(self.off(other.syntax()), t.clone()));
+                        destructured.push((other, t));
+                    }
                     None => {}
                 }
             }
@@ -272,6 +285,12 @@ impl Codegen<'_> {
             .push(") {");
         self.line(header);
         self.out.indent += 1;
+        // Destructured parameters (`(r, c): (usize, usize)`): bound from their temps first.
+        for (pat, t) in destructured {
+            let mut pc = PatCode::default();
+            self.lower_pat(&pat, &t, &mut pc);
+            self.emit_binds(pc.binds);
+        }
         if let Some(body) = f.body() {
             self.emit_block_body(&body, &Dest::Return, None);
         }
@@ -597,10 +616,12 @@ impl Codegen<'_> {
                         .map(|(k, f)| dbg_of(&f.ty, &format!("this{}", access(v, k)), &params))
                         .collect();
                     match v.shape {
-                        Shape::Unit => format!("return {};", super::js_string(&v.name)),
+                        Shape::Unit => {
+                            format!("return {};", super::js_string(self.display_name(&v.name)))
+                        }
                         Shape::Tuple => format!(
                             "return κσ.$dbgStruct({}, null, [{}]);",
-                            super::js_string(&v.name),
+                            super::js_string(self.display_name(&v.name)),
                             vals.join(", ")
                         ),
                         Shape::Named => {
@@ -608,7 +629,7 @@ impl Codegen<'_> {
                                 v.fields.iter().map(|f| super::js_string(&f.name)).collect();
                             format!(
                                 "return κσ.$dbgStruct({}, [{}], [{}]);",
-                                super::js_string(&v.name),
+                                super::js_string(self.display_name(&v.name)),
                                 names.join(", "),
                                 vals.join(", ")
                             )

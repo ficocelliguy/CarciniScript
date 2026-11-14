@@ -36,7 +36,7 @@ pub struct Completion {
 }
 
 /// Byte offset of a 1-based line and UTF-16 column.
-fn offset_of(src: &str, line: u32, column: u32) -> usize {
+pub(crate) fn offset_of(src: &str, line: u32, column: u32) -> usize {
     let mut offset = 0;
     for (i, l) in src.split_inclusive('\n').enumerate() {
         if i + 1 == line as usize {
@@ -56,15 +56,15 @@ fn offset_of(src: &str, line: u32, column: u32) -> usize {
 
 /// The parsed file and its types. With `macro_rules!` macros, those of the expansion, and the map
 /// from its offsets back to `src`'s.
-struct Analysis {
-    file: SourceFile,
-    types: Types,
-    map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
+pub(crate) struct Analysis {
+    pub(crate) file: SourceFile,
+    pub(crate) types: Types,
+    pub(crate) map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
 }
 
 impl Analysis {
     /// An offset in `src` as one in the analyzed text (None inside a macro invocation).
-    fn at(&self, offset: usize) -> Option<usize> {
+    pub(crate) fn at(&self, offset: usize) -> Option<usize> {
         match &self.map {
             Some(m) => m.cur(offset),
             None => Some(offset),
@@ -80,10 +80,9 @@ impl Analysis {
     }
 }
 
-fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis {
-    if src.contains("macro_rules!")
-        && let Ok(Some(exp)) = crate::mbe::expand(src)
-    {
+pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis {
+    let macros = crate::mbe::imported_macros(src, filename, resolver);
+    if let Ok(Some(exp)) = crate::mbe::preprocess_with(src, &macros) {
         let file = SourceFile::parse(&exp.text, EDITION).tree();
         let (types, _) = typeck::check(&file, &exp.text, filename, resolver);
         return Analysis {
@@ -101,7 +100,7 @@ fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis {
     }
 }
 
-fn type_at(types: &Types, n: &SyntaxNode) -> Option<Ty> {
+pub(crate) fn type_at(types: &Types, n: &SyntaxNode) -> Option<Ty> {
     let r = n.text_range();
     types
         .get(usize::from(r.start()), usize::from(r.end()))

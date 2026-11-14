@@ -460,12 +460,20 @@ pub fn compile(src: &str, filename: &str) -> CompileOutput {
 /// Compile `src`; `resolver` reads the files of its `mod` declarations (paths relative to the
 /// project root, like `lib/util.rs`).
 pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
-    // `macro_rules!` macros are expanded first; positions are reported in `src`.
-    if src.contains("macro_rules!") {
-        match crate::mbe::expand(src) {
-            Ok(Some(exp)) => {
-                let map = std::rc::Rc::new(exp.map);
-                return compile_text(&exp.text, src, Some(map), filename, resolver);
+    // `macro_rules!` macros are expanded and inline modules flattened first; positions are
+    // reported in `src`.
+    if src.contains("macro_rules!")
+        || src.contains("mod ")
+        || src.contains("self::")
+        || src.contains("super::")
+        || src.contains("type ")
+        || src.contains("use ")
+    {
+        let macros = crate::mbe::imported_macros(src, filename, resolver);
+        match crate::mbe::preprocess_with(src, &macros) {
+            Ok(Some(pre)) => {
+                let map = std::rc::Rc::new(pre.map);
+                return compile_text(&pre.text, src, Some(map), pre.names, filename, resolver);
             }
             Ok(None) => {}
             Err(errs) => {
@@ -495,7 +503,7 @@ pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> Co
             }
         }
     }
-    compile_text(src, src, None, filename, resolver)
+    compile_text(src, src, None, HashMap::new(), filename, resolver)
 }
 
 /// Compile `src`, which is `original` with its macros expanded when `map` is set.
@@ -503,6 +511,7 @@ fn compile_text(
     src: &str,
     original: &str,
     map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
+    display_names: HashMap<String, String>,
     filename: &str,
     resolver: typeck::Resolver,
 ) -> CompileOutput {
@@ -536,6 +545,8 @@ fn compile_text(
         consts: HashMap::new(),
         local_adts: Default::default(),
         file_traits: Vec::new(),
+        display_names,
+        slice_view: false,
         loop_dests: Vec::new(),
     };
     for e in parse.errors() {
@@ -627,6 +638,10 @@ struct Codegen<'a> {
     /// The file's trait declarations (their default methods are compiled again for built-in
     /// types that implement them).
     file_traits: Vec<ast::Trait>,
+    /// Types renamed when inline modules were flattened (`util__Point`), by their written name.
+    display_names: HashMap<String, String>,
+    /// The range index being emitted is `&mut v[a..b]`'s: a view, not a copy.
+    slice_view: bool,
     /// Enclosing loops, innermost last: (label, where a `loop`'s `break value` goes; None for
     /// `while`/`for`).
     loop_dests: Vec<(Option<String>, Option<Dest>, bool)>,
@@ -731,6 +746,12 @@ impl<'a> Codegen<'a> {
     fn declare(&mut self, rust_name: &str, name_node: Option<&SyntaxNode>, mut local: Local) {
         if let Some(ty) = name_node.and_then(|n| self.ty_of(n)) {
             local.ty = ty;
+        }
+        // A binding of a `get_mut` slot reads and writes the slot's value.
+        if let Some(n) = name_node
+            && self.types.slot_bindings.contains(&self.range_of(n))
+        {
+            local.js = format!("{}[1]", local.js);
         }
         self.scopes
             .last_mut()
@@ -1052,6 +1073,13 @@ impl<'a> Codegen<'a> {
                         ))
                         .push(format!(" from {};", js_string(&module.specifier)));
                         self.line(line);
+                        // `pub mod util;`: `parent::util::item` reaches it from other files.
+                        if module.public {
+                            self.line(Frag::text(format!(
+                                "export {{ {} }};",
+                                escape_ident(&module.name)
+                            )));
+                        }
                         self.line(Frag::default());
                     }
                 }
@@ -1142,7 +1170,12 @@ impl<'a> Codegen<'a> {
                 }
                 None => Frag::text("undefined"),
             };
-            let mut line = Frag::mapped(self.item_start(&node), "export const ");
+            // `static mut`: assigned later, so a `let`.
+            let keyword = match ast::Static::cast(node.clone()) {
+                Some(st) if st.mut_token().is_some() => "export let ",
+                _ => "export const ",
+            };
+            let mut line = Frag::mapped(self.item_start(&node), keyword);
             line.append(Frag::mapped(self.off(name.syntax()), js))
                 .push(" = ")
                 .append(value)
@@ -1175,6 +1208,7 @@ impl<'a> Codegen<'a> {
         self.scopes.push(HashMap::new());
 
         let mut params = Vec::new();
+        let mut destructured: Vec<(ast::Pat, String)> = Vec::new();
         if let Some(pl) = f.param_list() {
             if let Some(sp) = pl.self_param() {
                 self.unsupported(sp.syntax(), "methods (`self` parameters)", 1);
@@ -1194,7 +1228,11 @@ impl<'a> Codegen<'a> {
                         params.push(Frag::mapped(self.off(n.syntax()), js));
                     }
                     Some(ast::Pat::WildcardPat(_)) => params.push(Frag::text(self.temp())),
-                    Some(other) => self.unsupported(other.syntax(), "destructuring parameters", 1),
+                    Some(other) => {
+                        let t = self.temp();
+                        params.push(Frag::mapped(self.off(other.syntax()), t.clone()));
+                        destructured.push((other, t));
+                    }
                     None => {}
                 }
             }
@@ -1212,6 +1250,12 @@ impl<'a> Codegen<'a> {
             .push(") {");
         self.line(header);
         self.out.indent += 1;
+        // Destructured parameters (`(r, c): (usize, usize)`): bound from their temps first.
+        for (pat, t) in destructured {
+            let mut pc = PatCode::default();
+            self.lower_pat(&pat, &t, &mut pc);
+            self.emit_binds(pc.binds);
+        }
         // `fn main() -> Result<(), E>`: an `Err` ends the script like rustc's `Termination`
         // (`Error: {e:?}`, a failure).
         let returns_result = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| {
@@ -1257,8 +1301,12 @@ impl<'a> Codegen<'a> {
         dest: &Dest,
         expected: Option<&Ty>,
     ) -> Ty {
+        // (`unsafe { .. }` is an ordinary block in JS.)
         if let Some(m) = block.modifier()
-            && !matches!(m, ast::BlockModifier::Label(_))
+            && !matches!(
+                m,
+                ast::BlockModifier::Label(_) | ast::BlockModifier::Unsafe(_)
+            )
         {
             let what = match m {
                 ast::BlockModifier::Async(_) => "`async` blocks",
@@ -2170,6 +2218,12 @@ impl<'a> Codegen<'a> {
         let start = self.off(e.syntax());
         let (frag, ty) = self.emit_expr_inner(e, expected);
         let ty = self.ty_of(e.syntax()).unwrap_or(ty);
+        // Auto-deref through `impl Deref`: `(stack).deref()`.
+        if let Some((mutable, target)) = self.types.derefs.get(&self.range_of(e.syntax())).cloned()
+        {
+            let m = if mutable { "deref_mut" } else { "deref" };
+            return (frag.wrap("(", &format!(").{m}()")).at(start), target);
+        }
         (frag.at(start), ty)
     }
 
@@ -2218,6 +2272,34 @@ impl<'a> Codegen<'a> {
                     .append(pf)
                     .push(" = $v; } })");
                 (f, t)
+            }
+            // `index_mut`'s `&mut self.cells[i]`: a cell reading and writing that place. (Arrow
+            // functions, so `this` stays the receiver.)
+            ast::Expr::RefExpr(r)
+                if self.types.cell_returns.contains(&self.range_of(r.syntax())) =>
+            {
+                let Some(inner) = r.expr() else {
+                    return (Frag::text("undefined"), Ty::Unknown);
+                };
+                let (pf, t) = self.emit_expr(&inner, expected);
+                let mut f = Frag::text("κσ.$cell(() => ");
+                f.append(pf.clone())
+                    .push(", ($v) => { ")
+                    .append(pf)
+                    .push(" = $v; })");
+                (f, t)
+            }
+            // `&mut v[a..b]`: a view of that part of `v` (`κσ.$sliceMut`).
+            ast::Expr::RefExpr(r)
+                if self.types.slice_views.contains(&self.range_of(r.syntax())) =>
+            {
+                let Some(inner) = r.expr() else {
+                    return (Frag::text("undefined"), Ty::Unknown);
+                };
+                self.slice_view = true;
+                let out = self.emit_expr(&inner, expected);
+                self.slice_view = false;
+                out
             }
             ast::Expr::RefExpr(r) => match r.expr() {
                 Some(inner) => self.emit_expr(&inner, expected),
@@ -2663,7 +2745,14 @@ impl<'a> Codegen<'a> {
                         true
                     }
                     // `v[i] = x` lowers to `v[κσ.$ix(v, i)] = x`, which evaluates `v` twice.
-                    ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| is_pure(&b)),
+                    // (A view `v[a..b]` may be evaluated twice too: both write to `v`.)
+                    ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| {
+                        is_pure(&b)
+                            || self
+                                .types
+                                .slice_views
+                                .contains(&self.range_of(strip_parens_expr(&b).syntax()))
+                    }),
                     // `(a, b) = (b, a)` is JS destructuring: `[a, b] = [b, a]`.
                     ast::Expr::TupleExpr(_) => op.is_none(),
                     _ => false,
@@ -4229,6 +4318,30 @@ impl<'a> Codegen<'a> {
                 .push("][0]");
             f
         };
+        // `*map.get_mut(k).unwrap()`: the slot's value, a place writes go to.
+        let slot = self
+            .types
+            .slot_calls
+            .contains(&self.range_of(strip_parens_expr(recv).syntax()));
+        // (`let r = map.get_mut(k).unwrap();` keeps the slot: `r` is bound to it.)
+        let into_let = m
+            .syntax()
+            .parent()
+            .is_some_and(|p| ast::LetStmt::can_cast(p.kind()));
+        if slot && matches!(method, "unwrap" | "expect") && !into_let {
+            let f = match method {
+                "unwrap" => helper("unwrap", vec![], Some(&loc)),
+                _ => {
+                    let msg = self
+                        .emit_args(m.arg_list(), &[])
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| Frag::text("\"\""));
+                    helper("expect", vec![msg], Some(&loc))
+                }
+            };
+            return (f.wrap("", "[1]"), inner.clone());
+        }
         match method {
             "is_some" => (rf.clone().wrap("(", " != null)"), Ty::Bool),
             "is_none" => (rf.clone().wrap("(", " == null)"), Ty::Bool),
@@ -4425,6 +4538,11 @@ impl<'a> Codegen<'a> {
         let map_ty = Ty::Map(Box::new(k.clone()), Box::new(v.clone()));
         match method {
             "insert" => (call("insert", vec![a(0), a(1)]), opt),
+            "get_mut" if self.types.slot_calls.contains(&self.range_of(m.syntax())) => {
+                let mut f = Frag::mapped(name_off, "κσ.$slotOf(");
+                f.append(rf.clone()).push(", ").append(a(0)).push(")");
+                (f, opt)
+            }
             "get" | "get_mut" => (call("get", vec![a(0)]), opt),
             "remove" => (call("remove", vec![a(0)]), opt),
             "contains_key" => (call("containsKey", vec![a(0)]), Ty::Bool),
@@ -4628,6 +4746,14 @@ impl<'a> Codegen<'a> {
             let ty = self.ty_of(ix.syntax()).unwrap_or(Ty::Unknown);
             let mut out = bf.wrap("(", ")");
             out.push(format!(".{key}(")).append(f).push(")");
+            // Assigned through `IndexMut`: the place is the cell's `[0]`.
+            if self
+                .types
+                .index_places
+                .contains(&self.range_of(ix.syntax()))
+            {
+                out.push("[0]");
+            }
             return (out.at(self.off(ix.syntax())), ty);
         }
         if let ast::Expr::RangeExpr(r) = &index {
@@ -4651,7 +4777,15 @@ impl<'a> Codegen<'a> {
                     .map(|o| self.location_at(o))
                     .unwrap_or_else(|| self.location(ix.syntax())),
             );
-            let name = if bt == Ty::Str { "strSlice" } else { "slice" };
+            let name = if bt == Ty::Str {
+                "strSlice"
+            } else if std::mem::take(&mut self.slice_view)
+                || self.types.slice_views.contains(&self.range_of(ix.syntax()))
+            {
+                "sliceMut"
+            } else {
+                "slice"
+            };
             let mut f = Frag::mapped(self.off(ix.syntax()), format!("κσ.${name}("));
             f.append(bf)
                 .push(", ")
@@ -4695,7 +4829,12 @@ impl<'a> Codegen<'a> {
                 .map(|o| self.location_at(o))
                 .unwrap_or_else(|| self.location(ix.syntax())),
         );
-        let f = if is_pure(&base) {
+        // (A view `v[a..b]` is fine to build twice: both write to `v`.)
+        let view = self
+            .types
+            .slice_views
+            .contains(&self.range_of(strip_parens_expr(&base).syntax()));
+        let f = if is_pure(&base) || view {
             let mut f = bf.clone();
             f.push("[κσ.$ix(")
                 .append(bf)
@@ -4745,6 +4884,15 @@ impl<'a> Codegen<'a> {
         };
         let vec_ty = Ty::Vec(Box::new(elem.clone()));
         let usize = Ty::Int(IntKind::Usize);
+        if self.types.slot_calls.contains(&self.range_of(m.syntax())) {
+            // A slot over the element (`{ get 1(), set 1() }`), or null when there's none.
+            let f = match method {
+                "first_mut" => helper("vecSlot", vec![Frag::text("0")]),
+                "last_mut" => helper("vecSlot", vec![Frag::text("-1")]),
+                _ => helper("vecSlot", vec![a(0)]),
+            };
+            return (f, Ty::Option(Box::new(elem.clone())));
+        }
         match method {
             "len" => (rf.clone().push(".length").clone(), usize),
             "pop" => (helper("pop", vec![]), Ty::Option(Box::new(elem.clone()))),
@@ -4957,11 +5105,14 @@ impl<'a> Codegen<'a> {
                     return (Frag::text("false"), Ty::Bool);
                 };
                 // An arrow function called in place, so the `match` stays an expression.
+                // (Its arms return a `bool` whatever the enclosing function returns.)
                 let saved = std::mem::replace(&mut self.base, arg.start);
+                let saved_ret = std::mem::replace(&mut self.ret_ty, Ty::Bool);
                 let body = self.capture(|cg| {
                     cg.emit_into(&expr, &Dest::Return, Some(&Ty::Bool));
                 });
                 self.base = saved;
+                self.ret_ty = saved_ret;
                 let mut f = Frag::mapped(
                     start,
                     "(() => {

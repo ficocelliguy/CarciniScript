@@ -25,6 +25,8 @@ pub struct ModuleRef {
     pub name: String,
     /// The import specifier, relative to the importing file: `./util.rs`.
     pub specifier: String,
+    /// `pub mod`: re-exported, so `parent::util::item` reaches it.
+    pub public: bool,
 }
 
 /// A function or constant that lives in another module: `name` here is `module.js` in JS.
@@ -45,6 +47,8 @@ struct Exports {
     consts: HashMap<String, Ty>,
     /// A module this one loads (directly or not) loads it back.
     circular: Option<String>,
+    /// Its `pub mod`s, by name.
+    nested: Vec<(String, Exports)>,
 }
 
 /// `dir/of/current.rs` + `name` → `dir/of/name.rs`.
@@ -227,6 +231,37 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
             _ => {}
         }
     }
+    // `pub mod shapes;`: its exports, reachable as `this::shapes::item`.
+    for m in c.modules.iter().filter(|m| m.public) {
+        let mut sub = Exports::default();
+        let mut names: Vec<String> = c
+            .module_exports
+            .get(&m.name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        names.sort();
+        for n in names {
+            reexport(&c, &mut sub, &n, &n);
+        }
+        // (Its own `pub mod`s were merged as `shapes.inner`.)
+        let prefix = format!("{}.", m.name);
+        let mut deeper: Vec<&String> = c
+            .module_exports
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+        deeper.sort();
+        for k in deeper {
+            let mut inner = Exports::default();
+            for n in &c.module_exports[k] {
+                reexport(&c, &mut inner, n, n);
+            }
+            sub.nested.push((k[prefix.len()..].to_string(), inner));
+        }
+        out.nested.push((m.name.clone(), sub));
+    }
     // Types leave this module's checker: resolve its variables, and forget any still open.
     let freeze = |t: &Ty| -> Ty { erase_vars(&c.zonk(t)) };
     for sig in out.fns.values_mut() {
@@ -265,6 +300,19 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
     for t in out.consts.values_mut() {
         *t = freeze(t);
     }
+    fn freeze_all(ex: &mut Exports, freeze: &dyn Fn(&Ty) -> Ty) {
+        for (_, sub) in &mut ex.nested {
+            for sig in sub.fns.values_mut() {
+                sig.params = sig.params.iter().map(freeze).collect();
+                sig.ret = freeze(&sig.ret);
+            }
+            for t in sub.consts.values_mut() {
+                *t = freeze(t);
+            }
+            freeze_all(sub, freeze);
+        }
+    }
+    freeze_all(&mut out, &freeze);
     out
 }
 
@@ -321,11 +369,31 @@ impl Checker<'_> {
             // `name.rs` next to this file, else `name/mod.rs`.
             let flat = module_path(filename, &n);
             let nested = module_path(filename, &format!("{n}/mod"));
+            // (A module file's children live in a folder named after it, `geo/shapes.rs`.)
+            let stem = filename
+                .rsplit('/')
+                .next()
+                .and_then(|f| f.strip_suffix(".rs"))
+                .filter(|s| !matches!(*s, "mod" | "main" | "lib"))
+                .map(|s| s.to_string());
+            let under = stem
+                .as_ref()
+                .map(|st| module_path(filename, &format!("{st}/{n}")));
             let (path, text, specifier) = match resolver(&flat) {
                 Some(t) => (flat, Some(t), format!("./{n}.rs")),
                 None => match resolver(&nested) {
                     Some(t) => (nested.clone(), Some(t), format!("./{n}/mod.rs")),
-                    None => (flat, None, String::new()),
+                    None => match under
+                        .as_ref()
+                        .and_then(|u| resolver(u).map(|t| (u.clone(), t)))
+                    {
+                        Some((u, t)) => (
+                            u,
+                            Some(t),
+                            format!("./{}/{n}.rs", stem.clone().unwrap_or_default()),
+                        ),
+                        None => (flat, None, String::new()),
+                    },
                 },
             };
             if stack.contains(&path) {
@@ -350,7 +418,11 @@ impl Checker<'_> {
             }
             self.merge_module(&n, exports);
             self.adts.modules.insert(n.clone());
-            self.modules.push(ModuleRef { specifier, name: n });
+            self.modules.push(ModuleRef {
+                specifier,
+                name: n,
+                public: m.visibility().is_some(),
+            });
         }
         for item in crate::adt::all_items(file) {
             if let ast::Item::Use(u) = &item
@@ -362,6 +434,13 @@ impl Checker<'_> {
     }
 
     fn merge_module(&mut self, module: &str, ex: Exports) {
+        // `pub mod`s of the module: their items are `module.child.item` in JS.
+        for (child, sub) in ex.nested {
+            self.adts
+                .modules
+                .insert(child.rsplit('.').next().unwrap_or(&child).to_string());
+            self.merge_module(&format!("{module}.{child}"), sub);
+        }
         let mut names = HashSet::new();
         for (n, mut sig) in ex.fns {
             sig.module = Some(module.to_string());
@@ -439,8 +518,30 @@ impl Checker<'_> {
                     .insert(alias, vec![module.to_string(), f.to_string()]);
             }
             ["std" | "core" | "alloc", ..] | [] => {}
-            [module, rest @ ..] if self.module_exports.contains_key(*module) => {
-                let exports = self.module_exports[*module].clone();
+            [first, rest @ ..] if self.module_exports.contains_key(*first) => {
+                // `use geo::shapes::area`: down through `pub mod`s first.
+                let mut module = first.to_string();
+                let mut rest = rest;
+                while let [child, more @ ..] = rest
+                    && !more.is_empty()
+                    && self
+                        .module_exports
+                        .contains_key(&format!("{module}.{child}"))
+                {
+                    module = format!("{module}.{child}");
+                    rest = more;
+                }
+                if let [child] = rest
+                    && tree.star_token().is_none()
+                    && self
+                        .module_exports
+                        .contains_key(&format!("{module}.{child}"))
+                {
+                    // `use geo::shapes;`: the module, usable as `shapes::item`.
+                    return;
+                }
+                let module = module.as_str();
+                let exports = self.module_exports[module].clone();
                 match rest {
                     [] if tree.star_token().is_some() => {}
                     [] => {}
@@ -473,7 +574,8 @@ impl Checker<'_> {
                     }
                     [item] => {
                         let msg = format!(
-                            "unresolved import `{module}::{item}` (it doesn't exist or isn't `pub`)"
+                            "unresolved import `{}::{item}` (it doesn't exist or isn't `pub`)",
+                            module.replace('.', "::")
                         );
                         self.error(tree.syntax(), msg);
                     }

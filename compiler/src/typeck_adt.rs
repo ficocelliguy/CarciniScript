@@ -152,6 +152,12 @@ impl Checker<'_> {
                         if v.attrs().any(|a| a.syntax().text() == "#[default]") {
                             default_variant = Some(variants.len());
                         }
+                        if v.attrs()
+                            .any(|a| a.syntax().text().to_string().starts_with("#[cfg"))
+                        {
+                            let en = e.name().map(|n| n.text().to_string()).unwrap_or_default();
+                            self.adts.cfg_variants.insert((en, variants.len()));
+                        }
                         if let Some(d) = v.const_arg().and_then(|c| c.expr()) {
                             let text: String = d
                                 .syntax()
@@ -630,7 +636,13 @@ impl Checker<'_> {
                 }
             }
             Some(t) if crate::adt::op_method(t).is_some() => {}
-            Some("Iterator") => {}
+            // Marker traits (`unsafe impl Send for T {}`): nothing to do in JS.
+            Some("Iterator" | "Send" | "Sync" | "Unpin") => {}
+            // `deref` / `deref_mut` are ordinary methods; auto-deref calls them.
+            Some("Deref") => {}
+            Some("DerefMut") => {
+                self.adts.deref_mut.insert(type_name.clone());
+            }
             Some(t) if self.adts.traits.contains_key(t) => {
                 self.register_trait_impl(imp, t, &type_name);
             }
@@ -649,6 +661,24 @@ impl Checker<'_> {
             _ => vec![],
         };
         let saved = self.self_ty.replace(self_ty);
+        // `type Target = Vec<i32>;`
+        if trait_name.as_deref() == Some("Deref")
+            && let Some(target) = imp
+                .assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+                .find_map(|a| match a {
+                    ast::AssocItem::TypeAlias(t)
+                        if t.name().is_some_and(|n| n.text() == "Target") =>
+                    {
+                        t.ty()
+                    }
+                    _ => None,
+                })
+        {
+            let t = self.lower_type(&target);
+            self.adts.deref_targets.insert(type_name.clone(), t);
+        }
         // `impl From<X> for Y`: the source type.
         let from_src = (trait_name.as_deref() == Some("From")).then(|| {
             let arg = match imp.trait_() {
@@ -708,7 +738,10 @@ impl Checker<'_> {
             .flat_map(|l| l.assoc_items())
         {
             let ast::AssocItem::Fn(f) = item else {
-                if (op.is_some() || is_iter) && matches!(item, ast::AssocItem::TypeAlias(_)) {
+                let is_deref = trait_name.as_deref() == Some("Deref");
+                if (op.is_some() || is_iter || is_deref)
+                    && matches!(item, ast::AssocItem::TypeAlias(_))
+                {
                     continue;
                 }
                 // `const W: usize = 3;`
@@ -1490,11 +1523,12 @@ impl Checker<'_> {
             let (name, ty, body, node) = match &item {
                 ast::Item::Const(k) => (k.name(), k.ty(), k.body(), k.syntax().clone()),
                 ast::Item::Static(s) => {
-                    if s.mut_token().is_some() {
-                        self.error(
-                            s.syntax(),
-                            "`static mut` is not supported yet (keep mutable state in a `let mut` and pass it around)",
-                        );
+                    if let Some(n) = s.name() {
+                        if s.mut_token().is_some() {
+                            self.static_muts.insert(n.text().to_string());
+                        } else {
+                            self.statics.insert(n.text().to_string());
+                        }
                     }
                     (s.name(), s.ty(), s.body(), s.syntax().clone())
                 }

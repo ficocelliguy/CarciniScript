@@ -283,6 +283,11 @@ impl Codegen<'_> {
                 "splitAt",
                 [self.arg_frags(m), vec![Frag::text(loc.clone())]].concat(),
             ),
+            // Two views of `v`, so writes through either reach it.
+            (Ty::Vec(_), "split_at_mut") => helper(
+                "splitAtMut",
+                [self.arg_frags(m), vec![Frag::text(loc.clone())]].concat(),
+            ),
             (Ty::Vec(_), "starts_with") => helper("vecStartsWith", self.arg_frags(m)),
             (Ty::Vec(_), "ends_with") => helper("vecEndsWith", self.arg_frags(m)),
             (Ty::Vec(_), "repeat") => helper("vecRepeatAll", self.arg_frags(m)),

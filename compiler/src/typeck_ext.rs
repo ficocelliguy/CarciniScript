@@ -486,6 +486,11 @@ impl Checker<'_> {
                 count(self, 0);
                 Ty::Char
             }
+            // An iterator of chars (`'ß'.to_uppercase()` is "SS").
+            (Ty::Char, "to_uppercase" | "to_lowercase") => {
+                count(self, 0);
+                iter(Ty::Char)
+            }
             (Ty::Char, "to_digit" | "is_digit") => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -706,6 +711,11 @@ impl Checker<'_> {
             "count" => {
                 count(self, 0);
                 USIZE
+            }
+            // `chars.as_str()` (the rest), `c.to_uppercase().to_string()`.
+            "as_str" | "to_string" if self.shallow(&e) == Ty::Char => {
+                count(self, 0);
+                Ty::Str
             }
             "last" => {
                 count(self, 0);

@@ -442,6 +442,19 @@
       const r = this.it.next();
       return r.done ? null : r.value;
     }
+    // `chars.as_str()`: the chars left, as a string (the iterator goes on over them).
+    $asStr() {
+      const s = [...iterable(this.it)].join("");
+      this.it = s[Symbol.iterator]();
+      return s;
+    }
+    // `c.to_uppercase().to_string()`, and `{}` of it.
+    $toString() {
+      return this.$asStr();
+    }
+    toString() {
+      return this.$asStr();
+    }
     $count() {
       let n = 0;
       for (const _ of iterable(this.it)) n++;
@@ -1214,6 +1227,35 @@
       }
       return slot;
     },
+    // A place handed out by `index_mut`: `[0]` reads and writes it.
+    $cell(get, set) {
+      return {
+        get 0() {
+          return get();
+        },
+        set 0(v) {
+          set(v);
+        },
+      };
+    },
+    // `map.get_mut(k)` of numbers, strings or bools: the `[k, v]` slot, or null.
+    $slotOf(map, k) {
+      return map.m.get(key(k)) ?? null;
+    },
+    // `v.get_mut(i)` / `first_mut` (0) / `last_mut` (-1) of numbers, strings or bools: a slot whose
+    // `[1]` reads and writes the element, or null.
+    $vecSlot(a, i) {
+      const j = i < 0 ? a.length + i : i;
+      if (j < 0 || j >= a.length) return null;
+      return {
+        get 1() {
+          return a[j];
+        },
+        set 1(v) {
+          a[j] = v;
+        },
+      };
+    },
     $andModify(map, k, modify) {
       const slot = map.m.get(key(k));
       if (slot) modify(slot);
@@ -1721,6 +1763,51 @@
       if (lo > end) throw new CarciniPanic(`slice index starts at ${lo} but ends at ${end}`, location);
       if (end > n) throw new CarciniPanic(`range end index ${hi} out of range for slice of length ${n}`, location);
       return v.slice(lo, end);
+    },
+    // `&mut v[lo..hi]`: a view of that part of `v` (a Proxy), so writes, sorts and swaps through it
+    // reach `v`. Bounds checks as `$slice`.
+    $sliceMut(v, lo, hi, inclusive, location) {
+      const n = v.length;
+      const end = hi === null ? n : inclusive ? hi + 1 : hi;
+      if (hi === null && lo > n) throw new CarciniPanic(`range start index ${lo} out of range for slice of length ${n}`, location);
+      if (lo > end) throw new CarciniPanic(`slice index starts at ${lo} but ends at ${end}`, location);
+      if (end > n) throw new CarciniPanic(`range end index ${hi} out of range for slice of length ${n}`, location);
+      const len = end - lo;
+      const index = (k) => (typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) ? +k : -1);
+      return new Proxy([], {
+        get(_, k) {
+          if (k === "length") return len;
+          const i = index(k);
+          if (i !== -1) return i < len ? v[lo + i] : undefined;
+          return Array.prototype[k];
+        },
+        set(_, k, x) {
+          const i = index(k);
+          if (i !== -1 && i < len) v[lo + i] = x;
+          return true;
+        },
+        has(_, k) {
+          const i = index(k);
+          return i !== -1 ? i < len : k in Array.prototype;
+        },
+        deleteProperty() {
+          return true;
+        },
+        ownKeys() {
+          return [...Array(len).keys()].map(String).concat("length");
+        },
+        getOwnPropertyDescriptor(_, k) {
+          if (k === "length") return { value: len, writable: true, enumerable: false, configurable: false };
+          const i = index(k);
+          if (i !== -1 && i < len) return { value: v[lo + i], writable: true, enumerable: true, configurable: true };
+          return undefined;
+        },
+      });
+    },
+    // `v.split_at_mut(mid)`: views of both halves.
+    $splitAtMut(v, mid, location) {
+      if (mid > v.length) throw new CarciniPanic("mid > len", location);
+      return [this.$sliceMut(v, 0, mid, false, location), this.$sliceMut(v, mid, null, false, location)];
     },
     // `&s[lo..hi]` with UTF-8 byte offsets, panicking like `str` indexing does.
     $strSlice(s, lo, hi, inclusive, location) {

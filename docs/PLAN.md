@@ -84,7 +84,8 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 Borrowing and lifetimes are compile-time concepts; the emitted JS is identical either way.
 Erasing them only means programs rustc would reject still run. Tiers:
 
-1. **Move checking** (phase 1): use-after-move via init/move dataflow. Needs only `Copy`-ness.
+1. **Move checking** (phase 1, done): use-after-move via init/move dataflow. Needs only
+   `Copy`-ness.
 2. **NLL-lite** (after the language service): per-function CFG, borrow liveness, conflict
    reporting; elided/annotated signatures across calls. Shown as warnings; a "strict" setting
    makes them errors.
@@ -121,7 +122,7 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
 
 ## Phases
 
-0. **Spike** (compiler done; Bitburner wiring next):
+0. **Spike** (done):
    - [x] ra_ap_syntax → wasm (~700 KB). Needs `--cfg no_salsa_async_drops`, see
      `compiler/.cargo/config.toml`.
    - [x] Codegen for `fn`, `let`, `if`/`loop`/`while`/`for`-over-range, labeled loops, typed
@@ -132,8 +133,8 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      diagnostics checks.
    - [x] Web REPL with in-browser self-test; crash sweep over 8.7k real-world `.rs` files
      (cargo registry + std) with 0 panics.
-   - [ ] Wire `.rs` into Bitburner. Done when `ns.hack(&t).await` runs, devtools breakpoints land on
-     Rust lines, and RAM cost is right.
+   - [x] Wire `.rs` into Bitburner: `ns.hack(&t).await` runs, devtools breakpoints land on Rust
+     lines, RAM cost is right (`test/jest/Netscript/RustScripts.test.ts`).
 1. **Core language:**
    - [x] Type checker (`typeck.rs`): inference across a function body, rustc-style type and
      mutability errors. Codegen reads its type table.
@@ -153,14 +154,32 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      `impl Display`, `str::parse`, `matches!`)
    - [x] Warn on `loop`/`while` with no `.await`
    - [x] `const` / `static` items, generic functions (erased, with bounds), range slicing
-   - [ ] Move checking
+   - [x] Move checking (`moves.rs`: use after move, definite initialization)
+   - [x] Since: operator overloading, `From`/`Into`, `impl Trait for i32`, custom iterators,
+     `i128`/`u128`, std collections (`VecDeque`, `BinaryHeap`, `BTreeMap`, `BTreeSet`), `Error` /
+     `Box<dyn Error>`, `type` aliases, `use Enum::*`, `macro_rules!` (pulled in from phase 4)
+   - [x] `get_mut` of numbers/strings/bools, integer and `char` range exhaustiveness (and no false
+     alarms on unknown types), `char::to_uppercase`, `IndexMut` writes, destructured parameters,
+     block-scoped `type` aliases, `vis`/`meta` macro fragments, macros from `mod` files,
+     `&mut v[a..b]` views and `split_at_mut`, `unsafe` blocks and `static mut`, `Deref`/`DerefMut`
+   - [ ] Open (the ⚠️/⬜ rows of `FEATURES.md`): `pub(crate)`/`pub(super)` treated as `pub`;
+     `macro_rules!` hygiene; `<T as Trait>::method`; `pub(crate)`/`pub(super)` as `pub`
 2. **Multi-file:** `use` across files, virtual files, `dts2rs`, Monaco diagnostics.
    - [x] `mod name;` + `use` through a host resolver; Bitburner passes the server's scripts (runtime,
      RAM calculation and editor markers)
+   - [x] `foo/mod.rs`, `pub use` re-exports (renamed and `*`), privacy across files
+   - [x] Inline `mod x { .. }` with `self::` / `super::` / `crate::` paths (`modflat.rs`)
+   - [x] Nested module paths through loaded files (`a::b::item` where `a.rs` has `pub mod b;`)
+   - Not planned: `super::` at the top of a module file (each file compiles on its own)
 3. **Language service:** completion, hover, signature help from the checker's symbol tables.
-   - [x] Hover and member completion (`hover`, `completions`), wired into Bitburner's Monaco
-4. **Later:** generic trait dispatch (`T::assoc()`), `macro_rules!`, wider std, optional
-   overflow-checking mode, NLL-lite borrow warnings, performance.
+   - [x] Hover (with doc comments) and member completion (`hover`, `completions`), wired into
+     Bitburner's Monaco
+   - [x] Signature help (`signature_help`) and live error markers
+   - [x] Go to definition (also into `mod x;` files), find references and rename (`nav.rs`), in
+     Bitburner's Monaco
+   - [ ] References and rename across files
+4. **Later:** generic trait dispatch (`T::assoc()`), wider std, optional overflow-checking mode,
+   NLL-lite borrow warnings, raw pointers, proc macros, performance. (`macro_rules!` is done.)
 
 ## Testing
 

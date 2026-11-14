@@ -37,7 +37,7 @@ pub struct OffsetMap {
 }
 
 impl OffsetMap {
-    fn identity(len: usize) -> Self {
+    pub(crate) fn identity(len: usize) -> Self {
         OffsetMap {
             segs: vec![Seg {
                 cur: (0, len),
@@ -76,8 +76,22 @@ impl OffsetMap {
             .map(|s| s.cur.0 + (orig - s.orig.0))
     }
 
+    /// `cur`, or for an offset inside a short rewritten span (a flattened path `geo::Point` →
+    /// `geo__Point`, an imported variant `Up` → `Dir::Up`), the last byte of what replaced it.
+    pub fn cur_near(&self, orig: usize) -> Option<usize> {
+        self.cur(orig).or_else(|| {
+            self.segs
+                .iter()
+                .find(|s| {
+                    s.synthetic && s.orig.0 <= orig && orig < s.orig.1 && s.cur.1 - s.cur.0 < 64
+                })
+                .filter(|s| s.cur.1 > s.cur.0)
+                .map(|s| s.cur.1 - 1)
+        })
+    }
+
     /// Record that `cur[a..b)` was replaced by `len` bytes of new text.
-    fn replace(&mut self, a: usize, b: usize, len: usize) {
+    pub(crate) fn replace(&mut self, a: usize, b: usize, len: usize) {
         let (oa, ob) = (self.orig(a, false), self.orig(b, true));
         let mut out = Vec::new();
         let delta = len as isize - (b - a) as isize;
@@ -427,8 +441,13 @@ impl Matcher<'_> {
                         stop = follow.to_vec();
                     }
                     let end = self.fragment(kind, toks, pos, &stop)?;
-                    let (s, e) = (toks[pos].range().0, toks[end - 1].range().1);
-                    let text = self.src[s..e].to_string();
+                    // (An empty `vis` binds nothing.)
+                    let text = if end == pos {
+                        String::new()
+                    } else {
+                        let (s, e) = (toks[pos].range().0, toks[end - 1].range().1);
+                        self.src[s..e].to_string()
+                    };
                     b.insert(name.clone(), Bound::One(text, kind == "expr"));
                     pos = end;
                 }
@@ -493,6 +512,9 @@ impl Matcher<'_> {
 
     /// The end of a fragment of `kind` starting at `pos`.
     fn fragment(&self, kind: &str, toks: &[Tok], pos: usize, stop: &[String]) -> Option<usize> {
+        if kind == "vis" && pos >= toks.len() {
+            return Some(pos);
+        }
         let t = toks.get(pos)?;
         match kind {
             "ident" => match t {
@@ -523,6 +545,14 @@ impl Matcher<'_> {
                 _ => None,
             },
             "tt" => Some(pos + 1),
+            // `pub`, `pub(crate)`, .., or nothing at all.
+            "vis" => match t {
+                Tok::Leaf { text, .. } if text == "pub" => match toks.get(pos + 1) {
+                    Some(Tok::Group { open, .. }) if open == "(" => Some(pos + 2),
+                    _ => Some(pos + 1),
+                },
+                _ => Some(pos),
+            },
             "block" => match t {
                 Tok::Group { open, .. } if open == "{" => Some(pos + 1),
                 _ => None,
@@ -883,4 +913,117 @@ pub fn expand(src: &str) -> Result<Option<Expansion>, Vec<(usize, usize, String)
         changed = true;
     }
     Ok(changed.then_some(Expansion { text, map }))
+}
+
+/// The source the compiler actually sees: macros expanded and inline modules flattened, with
+/// the map back to `src` and the original names of the types that were renamed.
+pub struct Preprocessed {
+    pub text: String,
+    pub map: OffsetMap,
+    pub names: HashMap<String, String>,
+}
+
+/// `None` when `src` needs neither step.
+pub fn preprocess(src: &str) -> Result<Option<Preprocessed>, Vec<(usize, usize, String)>> {
+    preprocess_with(src, "")
+}
+
+/// `preprocess`, with `macros` (definitions from other files, see `imported_macros`) usable too.
+/// They go after `src`, so offsets in `src` stay put, and are dropped once expanded.
+pub fn preprocess_with(
+    src: &str,
+    macros: &str,
+) -> Result<Option<Preprocessed>, Vec<(usize, usize, String)>> {
+    let full = if macros.is_empty() {
+        src.to_string()
+    } else {
+        format!("{src}\n{macros}")
+    };
+    let mut text = full.clone();
+    let mut map = OffsetMap::identity(full.len());
+    let mut changed = false;
+    if full.contains("macro_rules!")
+        && let Some(e) = expand(&full)?
+    {
+        text = e.text;
+        map = e.map;
+        changed = true;
+    }
+    let mut names = HashMap::new();
+    if crate::modflat::has_inline_modules(&text) {
+        let before = map.clone();
+        let flat = crate::modflat::flatten(&mut text, &mut map);
+        if !flat.errors.is_empty() {
+            return Err(flat
+                .errors
+                .into_iter()
+                .map(|(a, b, e)| (before.orig(a, false), before.orig(b, true), e))
+                .collect());
+        }
+        names = flat.names;
+        changed = true;
+    }
+    if crate::variants::has_variant_imports(&text) {
+        crate::variants::expand(&mut text, &mut map);
+        changed = true;
+    }
+    if crate::alias::has_aliases(&text) {
+        crate::alias::expand(&mut text, &mut map);
+        changed = true;
+    }
+    Ok(changed.then_some(Preprocessed { text, map, names }))
+}
+
+/// The `macro_rules!` definitions this file can use from its `mod x;` files: those marked
+/// `#[macro_export]`, and all of a module's when its `mod` has `#[macro_use]`.
+pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resolver) -> String {
+    use ra_ap_syntax::ast::{HasAttrs, HasModuleItem};
+    if !src.contains("mod ") {
+        return String::new();
+    }
+    let file = SourceFile::parse(src, EDITION).tree();
+    let mut out = String::new();
+    for item in file.items() {
+        let ast::Item::Module(m) = item else { continue };
+        if m.item_list().is_some() {
+            continue;
+        }
+        let Some(name) = m.name() else { continue };
+        let n = name.text().to_string();
+        let macro_use = m
+            .attrs()
+            .any(|a| a.syntax().text().to_string().contains("macro_use"));
+        let stem = filename
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".rs"))
+            .filter(|s| !matches!(*s, "mod" | "main" | "lib"));
+        let mut candidates = vec![
+            crate::typeck::module_path(filename, &n),
+            crate::typeck::module_path(filename, &format!("{n}/mod")),
+        ];
+        if let Some(st) = stem {
+            candidates.push(crate::typeck::module_path(filename, &format!("{st}/{n}")));
+        }
+        let Some(text) = candidates.iter().find_map(|p| resolver(p)) else {
+            continue;
+        };
+        if !text.contains("macro_rules!") {
+            continue;
+        }
+        let module = SourceFile::parse(&text, EDITION).tree();
+        for d in module.items().filter_map(|i| match i {
+            ast::Item::MacroRules(d) => Some(d),
+            _ => None,
+        }) {
+            let exported = d
+                .attrs()
+                .any(|a| a.syntax().text().to_string().contains("macro_export"));
+            if exported || macro_use {
+                out.push_str(&d.syntax().text().to_string());
+                out.push('\n');
+            }
+        }
+    }
+    out
 }

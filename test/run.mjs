@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { initCarciniScriptSync, compile, setNsBindings, hover, completions, signatureHelp } from "../index.js";
+import { initCarciniScriptSync, compile, setNsBindings, hover, completions, signatureHelp, definition, references, rename } from "../index.js";
 import "../runtime/rt.js";
 import { nativePanic } from "../tools/native-panic.mjs";
 
@@ -327,7 +327,7 @@ const rejected = [
     "let x: Option<i32> = None;\n    match x {\n        Some(v) => {}\n    }",
     "3:11 non-exhaustive patterns: `None` not covered",
   ],
-  ["non-exhaustive integer match", "match 5 {\n        1 => {}\n    }", "2:11 non-exhaustive patterns: `_` not covered"],
+  ["non-exhaustive integer match", "match 5 {\n        1 => {}\n    }", "2:11 non-exhaustive patterns: `i32::MIN..=0_i32`"],
   [
     "guarded arms don't count toward exhaustiveness",
     "match true {\n        true if 1 > 2 => {}\n        false => {}\n    }",
@@ -367,8 +367,8 @@ const rejected = [
   ],
   [
     "get_mut on number values",
-    'let mut m = std::collections::HashMap::new();\n    m.insert("a", 1);\n    if let Some(v) = m.get_mut("a") {\n        *v += 1;\n    }',
-    "4:22 `HashMap::get_mut` on a map of `{integer}` values isn't supported",
+    'let mut m = std::collections::HashMap::new();\n    m.insert("a", 1);\n    let o = m.get_mut("a");\n    if let Some(v) = o {\n        *v += 1;\n    }',
+    "4:13 `HashMap::get_mut` on a map of `{integer}` values isn't supported here",
   ],
   ["Display of a HashMap", 'let m: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();\n    println!("{}", m);', "3:14 `HashMap<i32, i32>` doesn't implement `std::fmt::Display`"],
   [
@@ -412,7 +412,7 @@ const rejected = [
   ["division on a type parameter", "}\nfn half<T: Copy>(x: T, y: T) -> T {\n    x / y", "4:5 `/` on type parameter `T` isn't supported"],
   ["unsupported trait bound", "}\nfn f<T: Into<f64>>(x: T) {", "3:9 the trait bound `Into` is not supported yet on type parameters"],
   ["method outside a type parameter's bounds", "}\nfn f<T>(x: T) -> usize {\n    x.len()", "4:5 no method named `len` found for type parameter `T`"],
-  ["mutable slice", "let mut v = vec![1, 2, 3];\n    let s = &mut v[1..];", "3:13 mutable slices (`&mut v[a..b]`) are not supported yet"],
+  ["mutable string slice", "let mut s = String::from(\"abc\");\n    let t = &mut s[1..];", "3:13 mutable string slices (`&mut s[a..b]`) are not supported"],
   ["trait impl missing a method", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S {}\nfn f() {", "5:12 not all trait items implemented, missing: `a`"],
   ["method that isn't in the trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } fn z(&self) {} }\nfn f() {", "5:44 method `z` is not a member of trait `T`"],
   ["generic call with an unimplemented user trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn g<X: T>(x: X) -> i32 { x.a() }\nfn f() {\n    g(5);", "7:5 the trait bound `i32: T` is not satisfied"],
@@ -456,13 +456,12 @@ const rejected = [
   ["unary minus without `Neg`", "}\n#[derive(Clone, Copy)]\nstruct V(f64);\nimpl std::ops::Add for V { type Output = V; fn add(self, o: V) -> V { V(self.0 + o.0) } }\nfn f() {\n    let v = -V(1.0);", "7:13 cannot apply unary operator `-` to type `V`"],
   ["a type error inside a `From` impl", "}\nstruct A(i32);\nimpl From<i32> for A {\n    fn from(n: i32) -> Self { A(\"x\") }\n}\nfn f() {", "5:33 mismatched types: expected `i32`, found `String`"],
   ["indexing by a type without an `Index` impl", "}\nstruct G(Vec<i32>);\nimpl std::ops::Index<usize> for G { type Output = i32; fn index(&self, i: usize) -> &i32 { &self.0[i] } }\nfn f() {\n    let g = G(vec![1]);\n    let x = g[\"a\"];", "7:13 the type `G` cannot be indexed by `String`"],
-  ["assigning through `IndexMut`", "}\nstruct G(Vec<i32>);\nimpl std::ops::Index<usize> for G { type Output = i32; fn index(&self, i: usize) -> &i32 { &self.0[i] } }\nfn f() {\n    let mut g = G(vec![1]);\n    g[0] = 2;", "7:5 assigning to an element through `IndexMut` isn't supported yet"],
+  ["assigning through an index without `IndexMut`", "}\nstruct G(Vec<i32>);\nimpl std::ops::Index<usize> for G { type Output = i32; fn index(&self, i: usize) -> &i32 { &self.0[i] } }\nfn f() {\n    let mut g = G(vec![1]);\n    g[0] = 2;", "7:5 cannot assign to data in an index of `G` (add `impl IndexMut<usize> for G`"],
+  ["an `index_mut` that doesn't hand out a place", "}\nstruct G(Vec<i32>);\nimpl std::ops::Index<usize> for G { type Output = i32; fn index(&self, i: usize) -> &i32 { &self.0[i] } }\nimpl std::ops::IndexMut<usize> for G { fn index_mut(&mut self, i: usize) -> &mut i32 { self.0.get_mut(i).unwrap() } }\nfn f() {\n    let mut g = G(vec![1]);\n    g[0] = 2;", "8:5 assigning through `G`'s `index_mut` needs it to end in `&mut <place>`"],
   ["use of a `let x;` never assigned", "let x: i32;\n    println!(\"{}\", x);", "3:20 used binding `x` isn't initialized"],
   ["use of a `let x;` assigned on one path", "}\nfn c() -> bool { true }\nfn f() {\n    let x;\n    if c() { x = 1; }\n    println!(\"{}\", x);", "7:20 used binding `x` is possibly-uninitialized"],
   ["assigning an immutable `let x;` twice", "let x;\n    x = 1;\n    x = 2;", "4:5 cannot assign twice to immutable variable `x`"],
   ["assigning an immutable `let x;` in a loop", "let x;\n    for i in 0..3 {\n        x = i;\n    }", "4:9 cannot assign twice to immutable variable `x`"],
-  ["assigning into a range of a Vec", "let mut v = vec![1, 2, 3];\n    v[0..2][1] = 9;", "3:5 writing through a range of a Vec (`v[a..b]`) isn't supported yet"],
-  ["`iter_mut` on a range of a Vec", "let mut v = vec![1, 2, 3];\n    for x in v[1..].iter_mut() {\n        *x += 1;\n    }", "3:14 writing through a range of a Vec (`v[a..b]`) isn't supported yet"],
   ["a trait const the impl leaves out", "}\ntrait U { const S: f64; }\nstruct M;\nimpl U for M {}\nfn f() {", "5:12 not all trait items implemented, missing: `S`"],
   ["an associated const of the wrong type", "}\nstruct G;\nimpl G { const W: usize = \"wide\"; }\nfn f() {", "4:27 mismatched types: expected `usize`, found `String`"],
   ["an associated const that doesn't exist", "}\nstruct G;\nimpl G { const W: usize = 3; }\nfn f() {\n    let h = G::H;", "6:13 no function or associated item named `H` found for struct `G`"],
@@ -470,12 +469,25 @@ const rejected = [
   ["a width argument that isn't `usize`", "let w = 2.5;\n    println!(\"{:w$}\", 1);", "a width or precision must be `usize`, found `{float}`"],
   ["`{}` on a `VecDeque`", "let q: std::collections::VecDeque<i32> = std::collections::VecDeque::new();\n    println!(\"{}\", q);", "`VecDeque<i32>` doesn't implement `std::fmt::Display`"],
   ["casting to a trait object the type doesn't implement", "}\ntrait T { fn f(&self); }\nstruct S;\nfn g() {\n    let b = Box::new(S) as Box<dyn T>;", "6:22 the trait bound `S: T` is not satisfied"],
-  ["`get_mut` on a Vec of numbers", "let mut v = vec![1, 2];\n    if let Some(x) = v.get_mut(0) {\n        *x += 1;\n    }", "3:22 `Vec::get_mut` on a Vec of `{integer}` isn't supported"],
+  ["`get_mut` on a Vec of numbers, not matched or unwrapped", "let mut v = vec![1, 2];\n    let o = v.get_mut(0);\n    if let Some(x) = o {\n        *x += 1;\n    }", "3:13 `Vec::get_mut` on a Vec of `{integer}` isn't supported here"],
   ["`impl PartialOrd` without `PartialEq`", "}\nstruct T(i32);\nimpl PartialOrd for T {\n    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { self.0.partial_cmp(&o.0) }\n}\nfn f() {", "4:1 the trait bound `T: PartialEq` is not satisfied (`PartialOrd` requires it"],
   ["a macro call no rule matches", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a = twice!();", "7:13 no rules of `macro_rules! twice` matched this invocation"],
   ["a type error inside a macro expansion", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a: i32 = twice!(\"s\");", "7:18 mismatched types: expected `i32`, found `String`"],
   ["a type error after a macro expansion keeps its position", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a = twice!(1);\n    let b: String = a;", "8:21 mismatched types: expected `String`, found `{integer}`"],
   ["mixed arithmetic", "let a: i32 = 1;\n    let b: f64 = 2.0;\n    let c = a + b;", "4:13 cannot add `f64` to `i32`"],
+  ["a type error through a type alias", "}\ntype Score = u64;\nfn f() {\n    let s: Score = \"x\";", "5:20 mismatched types: expected `u64`, found `String`"],
+  ["a generic alias given a wrong element", "}\ntype Grid<T> = Vec<Vec<T>>;\nfn f() {\n    let g: Grid<i32> = vec![vec![\"a\"]];", "5:34 mismatched types: expected `i32`, found `String`"],
+  ["a variant import misused as a function", "}\nenum K {\n    A,\n    B(u32),\n}\nuse K::*;\nfn f() {\n    let k = A(1);", "9:13 expected function, found unit variant `K::A`"],
+  ["an integer range left out of a match", "}\nfn f(b: u8) -> u8 {\n    match b {\n        0..=100 => 1,\n        102..=255 => 2,\n    }", "4:11 non-exhaustive patterns: `101_u8` not covered"],
+  ["a char left out of a match", "}\nfn f(c: char) -> u8 {\n    match c {\n        '\\0'..='a' => 1,\n        'c'..=char::MAX => 2,\n    }", "4:11 non-exhaustive patterns: `'b'` not covered"],
+  ["a `static mut` used outside `unsafe`", "}\nstatic mut COUNT: u32 = 0;\nfn f() -> u32 {\n    COUNT", "5:5 use of mutable static is unsafe and requires unsafe block"],
+  ["assigning to an immutable static", "}\nstatic LIMIT: u32 = 3;\nfn f() {\n    LIMIT = 4;", "5:5 cannot assign to immutable static item `LIMIT`"],
+  ["calling a private function of an inline module", "}\nmod geo {\n    fn secret() {}\n}\nfn f() {\n    geo::secret();", "7:5 `secret` is private to module `geo`"],
+  ["importing a private item of an inline module", "}\nmod geo {\n    struct Hidden;\n}\nuse geo::Hidden;\nfn f() {", "6:1 `Hidden` is private to module `geo`"],
+  ["a missing item of an inline module", "}\nmod geo {\n    pub fn area() {}\n}\nfn f() {\n    geo::volume();", "7:5 cannot find `volume` in module `geo`"],
+  ["a missing item named inside a macro", "}\nmod geo {\n    pub const UNIT: &str = \"m\";\n}\nfn f() {\n    println!(\"{}\", geo::UNITS);", "7:20 cannot find `UNITS` in module `geo`"],
+  ["reaching into a private nested module", "}\nmod a {\n    mod b {\n        pub fn f() {}\n    }\n}\nfn g() {\n    a::b::f();", "9:5 module `b` is private"],
+  ["a `super::` path to a missing item", "}\nmod a {\n    pub mod b {\n        pub fn f() -> i32 {\n            super::missing()\n        }\n    }\n}\nfn g() {", "6:13 cannot find `missing` in module `a`"],
 ];
 for (const [label, body, want] of rejected) {
   const name = `rejects: ${label}`;
@@ -489,6 +501,11 @@ for (const [label, body, want] of rejected) {
 
 // Modules: each case is a set of files; the first is compiled.
 const rejectedFiles = [
+  [
+    "importing a missing item through a nested module file",
+    { "main.rs": "mod geo;\nuse geo::shapes::nope;\nfn main() {}", "geo.rs": "pub mod shapes;", "geo/shapes.rs": "pub fn area() {}" },
+    "2:5 unresolved import `geo::shapes::nope` (it doesn't exist or isn't `pub`)",
+  ],
   ["module file not found", { "main.rs": "mod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `nope.rs` and `nope/mod.rs`)"],
   [
     "importing a private function",
@@ -598,6 +615,86 @@ for (const [label, files, want] of rejectedFiles) {
       const got = run();
       const ok = typeof want === "string" && typeof got === "string" ? got.includes(want) : got === want;
       if (ok) pass(name);
+      else fail(name, `want ${JSON.stringify(want)}\ngot  ${JSON.stringify(got)}`);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+}
+
+// --- language service: go to definition, references, rename
+{
+  const src = [
+    "mod geo {",
+    "    pub struct Point { pub x: f64 }",
+    "    impl Point {",
+    "        pub fn new(x: f64) -> Self { Point { x } }",
+    "        pub fn len(&self) -> f64 { self.x }",
+    "    }",
+    "}",
+    "#[derive(Debug)]",
+    "enum Dir { Up, Down }",
+    "type Num = i32;",
+    "fn twice(n: Num) -> i32 { n * 2 }",
+    "fn main() {",
+    "    let total = twice(3);",
+    "    let p = geo::Point::new(1.0);",
+    "    let total = total + 1;",
+    '    println!("{} {}", total, p.len());',
+    "    let d = Dir::Down;",
+    "    let x = p.x;",
+    "    let y = twice(total);",
+    "}",
+  ].join("\n");
+  const lines = src.split("\n");
+  // 1-based column of the `nth` occurrence of `needle` on 1-based `line`.
+  const col = (line, needle, nth = 0) => {
+    const re = new RegExp(`\\b${needle}\\b`, "g");
+    let m;
+    for (let k = 0; k <= nth; k++) m = re.exec(lines[line - 1]);
+    return m.index + 1;
+  };
+  const def = (line, needle, nth) => {
+    const d = definition(src, "nav.rs", line, col(line, needle, nth));
+    return d && `${d.file} ${d.line}:${d.column}-${d.endColumn}`;
+  };
+  const at = (line, needle, nth = 0) => `nav.rs ${line}:${col(line, needle, nth)}-${col(line, needle, nth) + needle.length}`;
+  const refs = (line, needle, nth) =>
+    references(src, "nav.rs", line, col(line, needle, nth)).map((l) => `${l.line}:${l.column}`).join(" ");
+  const files = {
+    "main.rs": "mod util;\nuse util::helper;\nfn main() {\n    helper();\n    util::Tool::make();\n}\n",
+    "util.rs": "pub fn helper() {}\npub struct Tool;\nimpl Tool {\n    pub fn make() {}\n}\n",
+  };
+  const checks = [
+    ["definition of a function", () => def(13, "twice"), at(11, "twice")],
+    ["definition of a local", () => def(15, "total", 1), at(13, "total")],
+    ["definition of a shadowing local in a macro", () => def(16, "total"), at(15, "total")],
+    ["definition of a type in an inline module", () => def(14, "Point"), at(2, "Point")],
+    ["definition of an associated function", () => def(14, "new"), at(4, "new")],
+    ["definition of a method", () => def(16, "len"), at(5, "len")],
+    ["definition of a field", () => def(18, "x", 1), at(2, "x")],
+    ["definition of a variant", () => def(17, "Down"), at(9, "Down")],
+    ["definition of a type alias", () => def(11, "Num"), at(10, "Num")],
+    ["definition of a parameter", () => def(11, "n", 1), at(11, "n", 0)],
+    ["definition of a struct literal's type", () => def(4, "Point"), at(2, "Point")],
+    ["definition in another file", () => {
+      const d = definition(files["main.rs"], "main.rs", 4, 5, (p) => files[p]);
+      return d && `${d.file} ${d.line}:${d.column}-${d.endColumn}`;
+    }, "util.rs 1:8-14"],
+    ["definition of an associated function in another file", () => {
+      const d = definition(files["main.rs"], "main.rs", 5, 17, (p) => files[p]);
+      return d && `${d.file} ${d.line}:${d.column}`;
+    }, "util.rs 4:12"],
+    ["references of a local", () => refs(15, "total"), `15:${col(15, "total")} 16:${col(16, "total")} 19:${col(19, "total")}`],
+    ["references of a function", () => refs(11, "twice"), `11:${col(11, "twice")} 13:${col(13, "twice")} 19:${col(19, "twice")}`],
+    ["rename a function", () => rename(src, "nav.rs", 13, col(13, "twice"), "double").length, 3],
+    ["rename refuses a bad name", () => rename(src, "nav.rs", 13, col(13, "twice"), "1x").length, 0],
+  ];
+  for (const [label, run, want] of checks) {
+    const name = `service: ${label}`;
+    try {
+      const got = run();
+      if (got === want) pass(name);
       else fail(name, `want ${JSON.stringify(want)}\ngot  ${JSON.stringify(got)}`);
     } catch (e) {
       fail(name, e.message);

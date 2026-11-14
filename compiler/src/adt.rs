@@ -140,6 +140,13 @@ pub struct TraitDef {
 #[derive(Default, Clone, Debug)]
 pub struct Adts {
     pub defs: HashMap<String, AdtDef>,
+    /// Enum variants under a `#[cfg(..)]` (by enum, then variant index): they may not exist, so
+    /// exhaustiveness checking never asks for them.
+    pub cfg_variants: std::collections::HashSet<(String, usize)>,
+    /// `impl Deref for T { type Target = X; .. }`: `X`, by `T`.
+    pub deref_targets: HashMap<String, Ty>,
+    /// Types with an `impl DerefMut`.
+    pub deref_mut: std::collections::HashSet<String>,
     /// Methods and associated functions (inherent, from trait impls, and inherited trait
     /// defaults), by type then method name.
     pub methods: HashMap<String, HashMap<String, Method>>,

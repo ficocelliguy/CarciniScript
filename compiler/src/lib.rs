@@ -4,17 +4,21 @@
 #![allow(clippy::cloned_ref_to_slice_refs)]
 
 mod adt;
+mod alias;
 mod bindings;
 mod codegen;
 mod fmt;
 mod lineindex;
 mod macros;
 mod mbe;
+mod modflat;
 mod moves;
+mod nav;
 pub mod service;
 mod sourcemap;
 mod ty;
 mod typeck;
+mod variants;
 
 pub use codegen::{CompileOutput, Diagnostic, compile, compile_with};
 
@@ -111,7 +115,78 @@ pub fn signature_help_json(
     .unwrap()
 }
 
+/// Where the name at a 1-based line and UTF-16 column is defined: JSON
+/// `{ file, line, column, endLine, endColumn }` (`file` is `filename`, or a module's path as
+/// passed to the resolver), or `null`.
+#[wasm_bindgen(js_name = definitionJson)]
+pub fn definition_json(
+    source: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    resolver: Option<js_sys::Function>,
+) -> String {
+    let resolve = |path: &str| -> Option<String> {
+        let f = resolver.as_ref()?;
+        f.call1(&JsValue::NULL, &JsValue::from_str(path))
+            .ok()?
+            .as_string()
+    };
+    serde_json::to_string(&nav::definition(source, filename, line, column, &resolve)).unwrap()
+}
+
+/// Every use in this file of the name at a 1-based line and UTF-16 column, its declaration
+/// included: JSON array of locations.
+#[wasm_bindgen(js_name = referencesJson)]
+pub fn references_json(
+    source: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    resolver: Option<js_sys::Function>,
+) -> String {
+    let resolve = |path: &str| -> Option<String> {
+        let f = resolver.as_ref()?;
+        f.call1(&JsValue::NULL, &JsValue::from_str(path))
+            .ok()?
+            .as_string()
+    };
+    serde_json::to_string(&nav::references(source, filename, line, column, &resolve)).unwrap()
+}
+
+/// The ranges to replace with `new_name` to rename the name at a 1-based line and UTF-16
+/// column: JSON array of locations; empty when it can't be renamed in this file.
+#[wasm_bindgen(js_name = renameJson)]
+pub fn rename_json(
+    source: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    new_name: &str,
+    resolver: Option<js_sys::Function>,
+) -> String {
+    let resolve = |path: &str| -> Option<String> {
+        let f = resolver.as_ref()?;
+        f.call1(&JsValue::NULL, &JsValue::from_str(path))
+            .ok()?
+            .as_string()
+    };
+    serde_json::to_string(&nav::rename(
+        source, filename, line, column, new_name, &resolve,
+    ))
+    .unwrap()
+}
+
 #[wasm_bindgen]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// The text the compiler sees after macro expansion and module flattening (for debugging).
+pub fn preprocessed_text(src: &str) -> String {
+    match mbe::preprocess(src) {
+        Ok(Some(p)) => p.text,
+        Ok(None) => src.to_string(),
+        Err(e) => format!("{e:?}"),
+    }
 }

@@ -279,7 +279,7 @@ impl Checker<'_> {
                 count(self, 0);
                 Ty::Vec(e)
             }
-            (Ty::Vec(e), "split_at") => {
+            (Ty::Vec(e), "split_at" | "split_at_mut") => {
                 count(self, 1);
                 if let Some(a) = a0 {
                     self.check(a, &USIZE);

@@ -43,17 +43,13 @@ pub async fn main(ns: NS) {
 `;
 
 const UNSUPPORTED = `// Rust outside the supported subset gets compile errors, never a crash.
-mod helpers {
-    pub fn double(x: i32) -> i32 {
-        x * 2
-    }
-}
+use std::sync::Mutex;
 
 fn main() {
-    let big: u128 = 1 << 100;
-    let doubled = helpers::double(21);
-    let later = async { doubled + 1 };
-    println!("{} {}", big, doubled);
+    let total = Mutex::new(0);
+    let later = async { 41 + 1 };
+    let p = &total as *const Mutex<i32>;
+    println!("{:?}", total);
 }
 `;
 

@@ -11,7 +11,7 @@ use crate::ty::{IntKind, Ty};
 
 impl Checker<'_> {
     /// Whether `a` and `b` could be the same type once inference finishes (no side effects).
-    fn could_be(&self, a: &Ty, b: &Ty) -> bool {
+    pub(super) fn could_be(&self, a: &Ty, b: &Ty) -> bool {
         let (a, b) = (self.shallow(a), self.shallow(b));
         match (&a, &b) {
             (Ty::Unknown, _) | (_, Ty::Unknown) | (Ty::Never, _) | (_, Ty::Never) => true,
@@ -313,11 +313,61 @@ impl Checker<'_> {
                 matches!(b.op_kind(), Some(ast::BinaryOp::Assignment { .. }))
                     && b.lhs().is_some_and(|l| l.syntax() == ix.syntax())
             });
+        // `names[i].push('!')`: a string element is a JS value, so a method on it needs the place.
+        let elem_is_str = self
+            .adts
+            .method(adt, &key)
+            .is_some_and(|m| self.shallow(&m.ret) == Ty::Str);
+        let receiver = elem_is_str
+            && ix
+                .syntax()
+                .parent()
+                .and_then(ast::MethodCallExpr::cast)
+                .is_some_and(|m| m.receiver().is_some_and(|r| r.syntax() == ix.syntax()));
+        let has_index_mut = self
+            .adts
+            .op_impls
+            .get(adt)
+            .is_some_and(|v| v.iter().any(|i| i.trait_name == "IndexMut"));
+        let assigned = assigned || (receiver && has_index_mut);
         if assigned {
-            self.error(
-                ix.syntax(),
-                "assigning to an element through `IndexMut` isn't supported yet (call a method that sets it, or index the field holding the data)",
-            );
+            // `grid[i] = v`: `impl IndexMut<I>` for the same index type hands out the place.
+            let index_mut = self.adts.op_impls.get(adt).and_then(|v| {
+                v.iter()
+                    .find(|i| i.trait_name == "IndexMut" && self.could_be(&i.rhs, &it))
+                    .cloned()
+            });
+            match index_mut {
+                Some(_) if self.opaque_index_mut.contains(adt) => {
+                    let msg = format!(
+                        "assigning through `{adt}`'s `index_mut` needs it to end in `&mut <place>` (like `&mut self.cells[i]`), so the write reaches the place"
+                    );
+                    self.error(ix.syntax(), msg);
+                }
+                Some(im) => {
+                    let r = self.range(ix.syntax());
+                    self.index_places.insert(r);
+                    self.record_conv(
+                        ix.syntax(),
+                        Conv::Method {
+                            key: im.key.clone(),
+                        },
+                    );
+                    return self
+                        .adts
+                        .method(adt, &key)
+                        .map(|m| m.ret.clone())
+                        .unwrap_or(Ty::Unknown);
+                }
+                None => {
+                    let msg = format!(
+                        "cannot assign to data in an index of `{}` (add `impl IndexMut<{}> for {adt}` from `std::ops`)",
+                        self.describe(bt),
+                        self.describe(&it)
+                    );
+                    self.error(ix.syntax(), msg);
+                }
+            }
         }
         self.record_conv(ix.syntax(), Conv::Method { key: key.clone() });
         self.adts

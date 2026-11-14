@@ -473,6 +473,16 @@ impl Codegen<'_> {
                     vec![],
                 ))
             }
+            (Ty::Char, "to_uppercase" | "to_lowercase") => {
+                let js = if method == "to_uppercase" {
+                    "toUpperCase"
+                } else {
+                    "toLowerCase"
+                };
+                let mut f = Frag::mapped(name_off, "κσ.$iter(");
+                f.append(rf.clone()).push(format!(".{js}())"));
+                out(f)
+            }
             (Ty::Char, "to_digit" | "is_digit") => {
                 let radix = self.fn_arg(a0);
                 let f = helper("toDigit", vec![radix]);
@@ -549,6 +559,8 @@ impl Codegen<'_> {
                 "skip_while" => "skipWhile",
                 "inspect" => "inspect",
                 "count" => "count",
+                "as_str" => "asStr",
+                "to_string" => "toString",
                 "last" => "last",
                 "nth" => "nth",
                 "next" => "next",
