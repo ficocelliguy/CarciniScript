@@ -566,10 +566,6 @@ const rejected = [
     "3:9 mismatched types: expected `{integer}`, found `Option<_>`",
   ],
   ["incompatible match arms", 'let x = match 1 {\n        1 => 2,\n        _ => "s",\n    };', "4:14 `match` arms have incompatible types"],
-  // No fixed column: reported at the first expression whose type is ambiguous.
-  ["nested Option", "let x: Option<Option<i32>> = None;", "`Option<Option<i32>>` is not supported yet"],
-  // (Only one read through `.flatten()` is.)
-  ["nested Option kept", "let v = vec![Some(1), None];\n    let x = v.first().copied();\n    println!(\"{:?}\", x);", "`Option<Option<i32>>` is not supported yet"],
   ["floats in a HashSet", "let mut s = std::collections::HashSet::new();\n    s.insert(1.5);", "the trait bound `f64: Hash` is not satisfied"],
   ["tuple field out of range", "let t = (1, 2);\n    let x = t.2;", "3:13 no field `2` on type `({integer}, {integer})`"],
   [
@@ -800,6 +796,17 @@ const rejected = [
   ["a mismatch inside `u32::pow(..)`", "let x = u32::pow(2, \"a\");", "2:25 mismatched types: expected `u32`, found `String`"],
   ["unzip of non-pairs","let v: (Vec<i32>, Vec<i32>) = vec![1, 2].into_iter().unzip();", "2:35 `unzip` needs an iterator of pairs"],
   ["returning a pointer to a number", "}\nfn g(p: *mut i32) -> *mut i32 {\n    p", "3:22 returning a raw pointer to a number, string or bool isn't supported yet"],
+  // Std gaps (PLAN "Std-library gaps").
+  ["`env!` of a variable the build doesn't have", 'let v = env!("CARCINI_NOPE");', "2:13 environment variable `CARCINI_NOPE` not defined at compile time"],
+  ["`compile_error!` that's reached", 'compile_error!("boom");', "2:5 boom"],
+  ["`compile_error!` item not under a `cfg`", '}\ncompile_error!("unsupported");\nfn g() {', "3:1 unsupported"],
+  [
+    "`x.fmt(f)` with both `Display` and `Debug` in scope",
+    "}\nuse std::fmt::{self, Debug, Display};\nstruct S(u32);\nimpl Display for S {\n    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {\n        self.0.fmt(f)\n    }\n}\nfn g() {",
+    "7:9 multiple applicable items in scope",
+  ],
+  ["`resize` with the wrong fill value", 'let mut v = vec![1u8];\n    v.resize(3, "x");', "3:17 mismatched types: expected `u8`, found `String`"],
+  ["`next_power_of_two` on a signed integer", "let x = 5i32.next_power_of_two();", "2:13 no method named `next_power_of_two`"],
 ];
 for (const [label, body, want] of rejected) {
   const name = `rejects: ${label}`;
@@ -1153,6 +1160,22 @@ for (const [label, src] of quiet) {
   const out = compile(src, "quiet.rs");
   if (out.diagnostics.length) fail(name, out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n"));
   else pass(name);
+}
+
+// Cargo's build variables get placeholders (a script is crate `script`, version 0.1.0).
+{
+  const name = "`env!` / `option_env!` of Cargo's variables";
+  const src = 'fn main() {\n    let v: &str = env!("CARGO_PKG_VERSION");\n    println!("{} {} {:?} {:?}", env!("CARGO_PKG_NAME"), v, option_env!("CARGO_MANIFEST_DIR"), option_env!("CARGO_NOPE"));\n}\n';
+  const out = compile(src, "cargo_env.rs");
+  if (out.code === null) fail(name, out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+  else {
+    const jsPath = path.join(outDir, "cargo_env.mjs");
+    fs.writeFileSync(jsPath, out.code);
+    const js = await runJs(jsPath);
+    const want = 'script 0.1.0 Some(".") None\n';
+    if (js.stdout !== want) fail(name, `want ${want}got ${js.stdout}${js.panic ?? ""}`);
+    else pass(name);
+  }
 }
 
 const rejectedNs = [

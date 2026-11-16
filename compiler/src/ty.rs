@@ -419,6 +419,7 @@ impl Ty {
             // (An empty one: `m.get_many::<String>("x").unwrap_or_default()`.)
             Ty::Iter { .. } => true,
             Ty::RefCell(inner) => inner.has_default(),
+            Ty::Extern(n) => n == "JsValue",
             _ => false,
         }
     }

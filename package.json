@@ -31,6 +31,7 @@
     "test": "node tools/build.mjs && cd compiler && cargo test && cd .. && node test/run.mjs",
     "repl": "node tools/serve.mjs",
     "test:browser": "node tools/browser-check.mjs",
+    "test:react": "node test/react/run.mjs",
     "record-native": "node tools/record-native.mjs",
     "sweep": "cd compiler && cargo run --release --example sweep --",
     "bindings": "node tools/dts2rs.mjs ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts bindings/ns.rs"

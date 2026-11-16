@@ -1195,11 +1195,12 @@ fn include_strs(
             from = a + pat.len();
             // (Not the tail of a longer name, nor in a line comment.)
             let before = text[..a].chars().next_back();
+            // (Nor in an attribute: `#[doc = include_str!("../README.md")]` isn't read.)
+            let line = text[..a].rsplit('\n').next().unwrap_or("");
             if before.is_some_and(|c| c.is_alphanumeric() || c == '_')
-                || text[..a]
-                    .rsplit('\n')
-                    .next()
-                    .is_some_and(|l| l.contains("//"))
+                || line.contains("//")
+                || line.trim_start().starts_with("#[")
+                || line.trim_start().starts_with("#![")
             {
                 continue;
             }
@@ -1266,6 +1267,10 @@ pub fn preprocess_with(
     let mut changed = false;
     // Proc macros first: their output may define or use `macro_rules!` macros.
     if let Some((filename, resolver)) = procs {
+        // (`jsx!` components can be `pub fn`s of the `mod` files.)
+        if text.contains("jsx!") {
+            crate::jsx::set_mod_sources(&text, resolver);
+        }
         // `include_str!("words.txt")`: the file next to this one, as a string literal.
         if text.contains("include_str!") {
             changed |= include_strs(&mut text, &mut map, resolver)?;
@@ -1307,6 +1312,10 @@ pub fn preprocess_with(
     }
     if crate::ufcs::has_prim_paths(&text) {
         changed |= crate::ufcs::expand(&mut text, &mut map);
+    }
+    // `std::path` / `OsStr` / `fmt::Arguments` names, `format_args!`, `env!`, `include!`.
+    if crate::stdgaps::has_rewrites(&text) {
+        changed |= crate::stdgaps::expand(&mut text, &mut map, procs.map(|p| p.1))?;
     }
     Ok(changed.then_some(Preprocessed { text, map, names }))
 }

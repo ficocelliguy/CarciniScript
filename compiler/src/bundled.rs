@@ -24,6 +24,7 @@ pub fn uses_bundled(text: &str) -> bool {
         || text.contains("serde_json")
         || text.contains("regex")
         || text.contains("clap")
+        || text.contains("jsx!")
         || uses_renamed(text)
 }
 
@@ -97,6 +98,27 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
         }
         if thiserror && let Some(adt) = ast::Adt::cast(node.clone()) {
             derive_error(&adt, &mut edits, &mut errors);
+            continue;
+        }
+        // `jsx!` (the bundled `react`): its markup as calls of the react prelude.
+        if let Some(mc) = ast::MacroCall::cast(node.clone())
+            && crate::jsx::is_jsx_call(&mc)
+            && let Some(tt) = mc.token_tree()
+            && !mc
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .any(|a| ast::MacroCall::cast(a).is_some_and(|m| crate::jsx::is_jsx_call(&m)))
+        {
+            match crate::jsx::rewrite(&tt, text) {
+                // (Around the embedded expressions, which stay where they are written.)
+                Ok(code) => edits.extend(crate::jsx::edits(
+                    mc.syntax().text_range(),
+                    &format!("({code})"),
+                    text,
+                )),
+                Err((r, msg)) => errors.push((r, msg)),
+            }
             continue;
         }
         if json_used {
@@ -1368,7 +1390,7 @@ fn rayon_tokens(tt: &ast::TokenTree, edits: &mut Vec<(TextRange, String)>) {
 // ---------------------------------------------------------------- serde_json's json!
 
 /// The tokens and token trees of `tt` without its delimiters, whitespace and comments.
-fn tt_items(tt: &ast::TokenTree) -> Vec<ra_ap_syntax::SyntaxElement> {
+pub(crate) fn tt_items(tt: &ast::TokenTree) -> Vec<ra_ap_syntax::SyntaxElement> {
     use ra_ap_syntax::SyntaxKind::{COMMENT, R_BRACK, R_CURLY, R_PAREN, WHITESPACE};
     let mut items: Vec<_> = tt
         .syntax()
@@ -1932,6 +1954,30 @@ const CLAP_RENAMES: Renames = Renames {
 };
 
 /// `std::collections::hash_map::Entry` (and `btree_map`'s): the map entry prelude's.
+/// The bundled `react` crate (the react prelude; `jsx!` is rewritten on its own).
+const REACT_RENAMES: Renames = Renames {
+    roots: &["react"],
+    names: &[
+        ("Node", "ReactNode"),
+        ("SetState", "ReactSetState"),
+        ("Ref", "ReactRef"),
+        ("h", "__rx_h"),
+        ("use_state", "__rx_use_state"),
+        ("use_effect", "__rx_use_effect"),
+        ("use_ref", "__rx_use_ref"),
+    ],
+    star: &[
+        "Node",
+        "SetState",
+        "Ref",
+        "h",
+        "use_state",
+        "use_effect",
+        "use_ref",
+    ],
+    result_err: None,
+};
+
 const ENTRY_RENAMES: Renames = Renames {
     roots: &[
         "std::collections::hash_map",
@@ -2029,6 +2075,7 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
         &CLAP_RENAMES,
         &ENTRY_RENAMES,
         &CHRONO_TZ_RENAMES,
+        &REACT_RENAMES,
     ] {
         if r.roots.iter().any(|root| has(root)) {
             out.push(r);

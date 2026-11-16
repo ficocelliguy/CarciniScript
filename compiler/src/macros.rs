@@ -424,6 +424,38 @@ pub fn eval_cfg(mc: &ast::MacroCall, debug: bool) -> Result<bool, String> {
     Ok(v)
 }
 
+/// Whether `node` sits under a `#[cfg(..)]` (on it or an enclosing item, statement or
+/// expression) that's off. A predicate about the platform counts as off: rustc's target isn't
+/// the script's (`#[cfg(not(any(unix, windows)))] compile_error!(..)` must not fire).
+pub fn under_false_cfg(node: &ra_ap_syntax::SyntaxNode) -> bool {
+    node.ancestors().any(|a| {
+        a.children()
+            .filter_map(ast::Attr::cast)
+            .any(|attr| match attr_cfg_tokens(&attr) {
+                Some(toks) => {
+                    let mut i = 0;
+                    !matches!(cfg_pred(&toks, &mut i, false), Ok(true) if i == toks.len())
+                }
+                None => false,
+            })
+    })
+}
+
+/// The predicate tokens of a `#[cfg(..)]` attribute.
+fn attr_cfg_tokens(attr: &ast::Attr) -> Option<Vec<String>> {
+    let toks: Vec<String> = attr
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != SyntaxKind::WHITESPACE && t.kind() != SyntaxKind::COMMENT)
+        .map(|t| t.text().to_string())
+        .filter(|t| t != "!")
+        .collect();
+    let n = toks.len();
+    (n >= 6 && toks[..4] == ["#", "[", "cfg", "("] && toks[n - 2..] == [")", "]"])
+        .then(|| toks[4..n - 2].to_vec())
+}
+
 fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String> {
     let name = toks.get(*i).ok_or("`cfg!` needs a predicate")?.clone();
     *i += 1;

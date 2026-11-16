@@ -537,9 +537,9 @@ impl Codegen<'_> {
         self.used_names = saved_names;
     }
 
-    /// Whether a method taking `self` by value drops it at its end: its type has a value to drop,
-    /// and no field is moved out of it first. (A type with its own `Drop` can't have fields moved
-    /// out; otherwise any `self.field` outside a `&` or a macro might move it, so it's left.)
+    /// Whether a method taking `self` by value drops it at its end: its type has a value to drop.
+    /// (Fields moved out with `self.field` are skipped by the drop; a pattern taking `self`
+    /// apart, `let S { a, .. } = self;`, moves fields without one, so then it's left.)
     fn self_drops(&self, f: &ast::Fn, self_ty: &Ty) -> bool {
         if !self.needs_drop(self_ty) {
             return false;
@@ -550,17 +550,15 @@ impl Codegen<'_> {
             return true;
         }
         let Some(body) = f.body() else { return false };
-        !body
-            .syntax()
-            .descendants()
-            .filter_map(ast::FieldExpr::cast)
-            .any(|fe| {
-                matches!(fe.expr(), Some(ast::Expr::PathExpr(p)) if p.syntax().text() == "self")
-                    && !fe
-                        .syntax()
-                        .parent()
-                        .is_some_and(|p| ast::RefExpr::can_cast(p.kind()))
-            })
+        let destructures = |e: Option<ast::Expr>| {
+            e.is_some_and(|e| matches!(crate::typeck::strip_parens(&e), ast::Expr::PathExpr(p) if p.syntax().text() == "self"))
+        };
+        !body.syntax().descendants().any(|n| {
+            ast::LetStmt::cast(n.clone()).is_some_and(|l| {
+                !matches!(l.pat(), Some(ast::Pat::IdentPat(_))) && destructures(l.initializer())
+            }) || ast::MatchExpr::cast(n.clone()).is_some_and(|m| destructures(m.expr()))
+                || ast::LetExpr::cast(n).is_some_and(|l| destructures(l.expr()))
+        })
     }
 
     /// `class $ext$f64 { .. }`: the user trait methods of a built-in type, called as

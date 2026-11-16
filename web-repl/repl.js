@@ -135,12 +135,103 @@ function runInWorker(code, sourceMap, filename, { mock = "generic", onEvent = ()
   return { promise, stop: () => worker.terminate() || null, worker };
 }
 
+/**
+ * Run a program that draws with `jsx!` on the page itself: React elements hold functions, so they
+ * can't leave a worker. `ns.printRaw` / `ns.tprintRaw` mount what they get into the output pane,
+ * live; other `ns` calls are logged. Stop unmounts them (running their effects' cleanups) and makes
+ * later `ns` calls throw. Same shape as `runInWorker`'s result.
+ */
+function runOnPage(code, sourceMap, filename, { onEvent = () => {} } = {}) {
+  const roots = [];
+  let stopped = false;
+  let finish;
+  const promise = new Promise((resolve) => (finish = resolve));
+  const done = (exitCode) => finish({ exitCode, events: [] });
+  const worker = {
+    onmessage: null,
+    terminate() {
+      stopped = true;
+      for (const el of roots) globalThis.ReactDOM?.unmountComponentAtNode(el);
+    },
+  };
+  const emit = (ev) => {
+    onEvent(ev);
+    if (ev.type === "done") done(ev.exitCode);
+  };
+  const mount = (node) => {
+    const el = document.createElement("div");
+    el.className = "react-root";
+    $("output-log").append(el);
+    roots.push(el);
+    globalThis.ReactDOM.render(node, el);
+  };
+  const asyncFns = new Set(["hack", "grow", "weaken", "sleep", "asleep", "share", "prompt", "nextWrite"]);
+  const make = (path) =>
+    new Proxy(function () {}, {
+      get(_, prop) {
+        if (typeof prop === "symbol" || prop === "then") return undefined;
+        if (prop === "args" && path === "") return [];
+        return make(path ? `${path}.${prop}` : prop);
+      },
+      apply(_, __, args) {
+        if (stopped) throw new Error("stopped");
+        const name = path.split(".").pop();
+        if (name === "printRaw" || name === "tprintRaw") return mount(args[0]);
+        if (name === "print" || name === "tprint") {
+          emit({ type: "ns", text: args.join("") });
+          return undefined;
+        }
+        emit({ type: "call", text: `ns.${path}(${args.map((a) => JSON.stringify(a)).join(", ")})` });
+        if (!asyncFns.has(name)) return undefined;
+        const ms = name === "sleep" ? Number(args[0]) || 0 : 50;
+        return new Promise((r) => setTimeout(r, ms));
+      },
+    });
+  (async () => {
+    if (!globalThis.React || !globalThis.ReactDOM) {
+      emit({ type: "error", message: "React didn't load (the page gets React 17 from cdn.jsdelivr.net)" });
+      emit({ type: "done", exitCode: 1 });
+      return;
+    }
+    try {
+      await import(runtimeUrl);
+      κσ.$setOutput(
+        (text) => emit({ type: "out", text }),
+        (text) => emit({ type: "err", text }),
+      );
+      const src = `${code}\n//# sourceURL=carciniscript:///${filename}.js\n`;
+      const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+      const mod = await import(url);
+      URL.revokeObjectURL(url);
+      await mod.main(make(""));
+      κσ.$flush();
+      // (The program has returned; what it drew stays live until Stop or the next run.)
+      emit({ type: "done", exitCode: 0 });
+    } catch (e) {
+      globalThis.κσ?.$flush();
+      if (e?.name === "CarciniPanic") {
+        emit({ type: "panic", message: e.panicMessage, location: e.location });
+        emit({ type: "done", exitCode: 101 });
+      } else if (!stopped) {
+        emit({ type: "error", message: String(e?.message ?? e), stack: String(e?.stack ?? "") });
+        emit({ type: "done", exitCode: 1 });
+      }
+    }
+  })();
+  return { promise, stop: () => worker.terminate(), worker };
+}
+
+/** Whether compiled code draws with `jsx!` (and so runs on the page). */
+const usesReact = (code) => code.includes("κσ.$react");
+
 // ---------------------------------------------------------------- UI
 
 let rustEditor;
 let jsEditor;
 let current = { maps: [], code: "", filename: "main.rs" };
 let running = null;
+// Unmounts what the last React program drew (it stays live after the program returns).
+let previousRoots = null;
 let rustDecorations = [];
 let jsDecorations = [];
 
@@ -279,7 +370,10 @@ async function run() {
   $("run").disabled = true;
   $("stop").disabled = false;
   const t0 = performance.now();
-  running = runInWorker(current.code, current.sourceMap, current.filename, {
+  // (A program drawing with `jsx!` runs on the page; React elements can't leave a worker.)
+  const runner = usesReact(current.code) ? runOnPage : runInWorker;
+  if (runner === runOnPage) previousRoots?.();
+  running = runner(current.code, current.sourceMap, current.filename, {
     onEvent: (ev) => {
       if (ev.type === "out") log(ev.text);
       else if (ev.type === "err") log(ev.text, "line-err");
@@ -294,6 +388,11 @@ async function run() {
     },
   });
   const { exitCode } = await running.promise;
+  // (What a React program drew stays live until the next run.)
+  if (runner === runOnPage) {
+    const r = running;
+    previousRoots = () => r.worker.terminate();
+  }
   log(`exited with ${exitCode} after ${(performance.now() - t0).toFixed(0)} ms`, "line-meta");
   running = null;
   $("stop").disabled = true;
@@ -332,6 +431,7 @@ async function populateExamples() {
     ["fixtures/rust_tour.rs", "Rust tour for JS devs"],
     ["unsupported", "Unsupported features (diagnostics)"],
     ["ns/hack.rs", "ns/hack.rs"],
+    ["react/hack_monitor.rs", "React: a tail-window dashboard (jsx!)"],
     ...manifest.map((m) => [`fixtures/${m.file}`, `fixtures/${m.file}`]),
   ];
   $("examples").replaceChildren(
@@ -341,7 +441,10 @@ async function populateExamples() {
 
 // ---------------------------------------------------------------- self-test
 
-async function selfTest() {
+// `opts.fullPrefixes`: compile every prefix of every fixture (about 40 minutes); otherwise about
+// 200 evenly spaced prefixes of each.
+async function selfTest(opts) {
+  const fullPrefixes = opts?.fullPrefixes === true;
   showTab("selftest-panel");
   $("selftest").disabled = true;
   const results = [];
@@ -451,7 +554,8 @@ ${p.message}` : null;
     const pStart = performance.now();
     for (const m of [...manifest.map((m) => `fixtures/${m.file}`), "ns/hack.rs"]) {
       const src = await (await fetch(`../test/${m}`)).text();
-      for (let i = 0; i <= src.length && !crash; i++) {
+      const step = fullPrefixes ? 1 : Math.max(1, Math.floor(src.length / 200));
+      for (let i = 0; i <= src.length && !crash; i += step) {
         try {
           compile(src.slice(0, i), "prefix.rs");
           prefixes++;
@@ -460,7 +564,7 @@ ${p.message}` : null;
         }
       }
     }
-    add({ ok: !crash, name: "every prefix of every fixture", detail: crash ?? `${prefixes} truncated programs in ${(performance.now() - pStart).toFixed(0)} ms, no traps` });
+    add({ ok: !crash, name: fullPrefixes ? "every prefix of every fixture" : "sampled prefixes of every fixture (--full-prefixes for all)", detail: crash ?? `${prefixes} truncated programs in ${(performance.now() - pStart).toFixed(0)} ms, no traps` });
 
     let fuzz = 0;
     crash = undefined;

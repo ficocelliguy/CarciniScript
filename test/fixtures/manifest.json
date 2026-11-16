@@ -324,6 +324,12 @@
     "panic": null
   },
   {
+    "file": "drop_moves_more.rs",
+    "stdout": "moved a\nend of block\ndrop a\ndrop b\n--\nkept d\ndrop d\nafter drop\ndrop c\n--\ntaking left\ndrop f\ngot e\ndrop g\ndrop h\ng+h\n--\n[8, 9]\nstill in block\ndrop closure\ndrop whole\n[5, 10]\nstill in second block\nend\ndrop e\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "drop_order.rs",
     "stdout": "inner\ndrop b\ndrop c\nmoved d into e: d\ndrop r1\nreassigned r2\ndrop temp\ndrop statement\nconsume arg\ndrop arg\npass through\nkept through\ndrop early-a\nearly 1\ndrop early-b\ndrop early-a\nearly 2\ndrop try\nOk(5)\ndrop try\nErr(\"bad\")\niter 0\ndrop loop0\ndrop loop1\ndrop v1\ndrop v2\nend of main p1 true\ndrop opt\ndrop through\ndrop pair (p1 p2)\ndrop p1\ndrop p2\ndrop r2\ndrop d\ndrop a\n",
     "exitCode": 0,
@@ -702,6 +708,12 @@
     "panic": null
   },
   {
+    "file": "option_nested.rs",
+    "stdout": "Some(None) Some(Some(2)) None\nsome(none) some(some(2)) none\ntrue true\nNone Some(2)\nNone Some(2)\nSome(7)\nNone Some(40)\ntrue\ntrue true\n[None, Some(None), Some(Some(2))]\n[None][Some(2)][None]\nSome(None) Some(Some(2))\nSome(None)\nNone\nSome(None)\nSome(Some(1)) None\nSome(None) None\nSome(None) Some(Some('x'))\nSome(None) Some(Some('x')) None\nSome(None)\nSome(Some(5))\nNone Some(None)\nNone Some(None) Some(Some(None)) Some(Some(Some(3))) \nSome(None) None\n[Cell { seen: None }, Cell { seen: Some(None) }, Cell { seen: Some(Some(\"x\")) }]\ntrue\n2\ninner is_none: true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "option_ordering.rs",
     "stdout": "true\ntrue true true false\ntrue true\n[None, None, Some(-1), Some(2), Some(3)] true\ntrue\n",
     "exitCode": 0,
@@ -878,6 +890,24 @@
   {
     "file": "std_collections.rs",
     "stdout": "[0, 1, 2, 3] len=4 front=Some(0) back=Some(3)\nSome(0) Some(3) 2\n[9, 2] remove=Some(1) remove_oob=None\n[9, 2, 7] [] contains9=true sum=18\n[2, 7, 9] [4, 14, 18] eq=true\nNone None true\n[9, 6, 5, 4, 1, 3, 2, 1] peek=Some(9) len=8\nafter 3 pops: [4, 2, 3, 1, 1]\n[9, 6, 5, 4, 3, 2, 1, 1]\n[9, 5, 8, 1, 3, 2]\n[9, 6, 8, 5, 3, 2, 7, 1, 4]\n[13, 11, 12, 5, 9, 10, 7, 1, 4, 3, 6, 2, 8] []\n[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]\n[\"apple\", \"fig\", \"pear\"]\n{\"amy\": 16, \"kim\": 5, \"zed\": 3}\nSome((\"amy\", 16)) Some((\"zed\", 3)) 5\n[\"amy\", \"bob\", \"kim\"] [16, 1, 5]\namy=16 bob=1 kim=5 \nSome((\"amy\", 16)) {\"bob\": 1, \"kim\": 5}\n{1: 1, 2: 4, 3: 9, 4: 16} true\n{1: 'a', 2: 'b', 3: 'c'} Some('b')\n{1, 3, 4, 5, 9} first=Some(1) last=Some(9)\n[0, 1, 3, 4, 5, 9, 10]\n[3, 4]\n[1, 5, 9]\nSome(9) Some(1) {3, 4, 5}\n{'a', 'b', 'n'} abn\nInventory { counts: {\"ore\": 2}, tags: {'a', 'z'}, queue: [1] }\n[\"home\", \"n00dles\", \"foodnstuff\", \"sigma\", \"zer0\", \"max-hardware\", \"silver-helix\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_gaps_methods.rs",
+    "stdout": "[1, 2, 3] 3\n[1, 2, 3, 0, 0]\n[1, 2]\n[\"x!\", \"x\"]\n[10, 20, 30]\ntrue [1]\n[10, 2, 3, 40, 5, 6, 70]\n[2, 10, 40, 3, 6, 5, 70]\n[1, 2, 3, 2, 3]\n[2, 4, 4]\n[1, 7, 8, 9, 4] [2, 3]\n[2, 4, 6] [\"A\", \"B\"]\nSome([2, 3]) Some([1]) None\ntrue true\n[3] [   ab] [c   ] [ 42  ]\n[+7] [00009] [2.2]\nInner { a: 1 } / [1, 2] / 2.0 / \"n\\\"q\"\n[$1.5] [$2.00] [$     3.2]\n- a\n- b\n1-x!\n1 2 3 4\n1 2\né 2 [195, 169, 0, 0]\n\\n \\\" é\n\\u{e9} \\u{61}\n\"\\\\t\"\n[2, 1] [0, 0, 1, 2]\n[254, 255, 255, 255] [0, 0, 0, 0, 0, 0, 0, 1]\n[8, 7, 6, 5, 4, 3, 2, 1]\n258 258\n-2 256\n5 2147483648 7\n8 1 64\nNone Some(128)\nSome(\"h\") Some(\"é\") None\nSome(\"llo\") None\nboxed\nNone\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_gaps_traits.rs",
+    "stdout": "5 (5, Some(5))\n  next_back -> 3\n  next_back -> 2\n  next_back -> 1\n  next_back -> 0\n[3, 2, 1, 0]\n  next_back -> 3\nSome(0) Some(3) 2\n  next_back -> 2\n2\n  next_back -> 1\n1\n  next_back -> 9\n  next_back -> 8\n[9, 8]\n(3, Some(3)) (10, Some(10))\n2\n14\nHI 5 THERE\n3 [104, 101, 108]\n\"lo world\"\n\"abcde\"\n\"one\\n\"\n[116, 119]\n\"o\"\n\"three\"\n3\n16654208175385433931\n13284934038211560503\n1000385178204227360 18165309246051714780\nSome(1)\nSome(2)\n[7] [    42] [ab***] [xy]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_gaps_types.rs",
+    "stdout": "2.5 true\n0\n4\ntrue\n/home/user/scripts/hack.js\nSome(\"hack.js\") Some(\"js\") Some(\"hack\")\nSome(\"/home/user/scripts\")\nSome(\"/home/user/scripts/hack.js\") false\n\"a/b/c.rs\"\na/b/c.rs (Some(\"rs\"))\nSome(\"rs\")\n[\"a\", \"b\", \"c.rs\"]\ntrue true false\ntrue true\na/b/c.js\nOk(\"b/c.rs\")\ntrue \"a/b\"\n\"a/b.txt\"\nNone Some(\".bashrc\")\nSome(\"\") Some(\"dir\")\ntrue\nSome(\"y\")\n\"hello\" hello\n\"rs\" Some(\"rs\")\nSome(\"x.y\")\nOk(\"hello\")\n[1, 2] 2\n1 [1, 2, 3]\n\"line one\"\n\"line two\"\n\"three\"\n4 \"abc\\n\" 4\n[100, 101, 102]\n[9, 8]\ntrue\n5 None Some(3)\n[None, Some(2)]\n7 8\nbob\nOk(3)\n[\"[1 + 2 = 3]\", \"[   x]\"]\n007\na-b\n",
     "exitCode": 0,
     "panic": null
   },

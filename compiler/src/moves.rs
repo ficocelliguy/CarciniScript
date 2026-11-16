@@ -346,30 +346,9 @@ impl Walker<'_> {
             return;
         };
         let at = self.range(p.syntax());
-        // A closure given to a std method (`it.map(f)`) isn't followed: its binding keeps
-        // dropping it, as the adapter that owns it in Rust isn't dropped explicitly here.
-        let mode = match self.lookup(name.text().to_string().as_str()) {
-            Some(d) if self.soft.contains(&d) && self.std_method_arg(p) => Mode::Use,
-            _ => mode,
-        };
+        // (A closure given to a std method, `it.map(f)`, is a move too: codegen drops it at the
+        // end of that statement, where Rust drops the adapter that owns it.)
         self.touch(name.text(), at, st, mode);
-    }
-
-    /// Whether `p` is an argument of a method that isn't one of the file's own types'.
-    fn std_method_arg(&self, p: &ast::PathExpr) -> bool {
-        let Some(m) = p
-            .syntax()
-            .parent()
-            .filter(|x| ast::ArgList::can_cast(x.kind()))
-            .and_then(|l| l.parent())
-            .and_then(ast::MethodCallExpr::cast)
-        else {
-            return false;
-        };
-        !matches!(
-            m.receiver().and_then(|r| self.ty(r.syntax()).cloned()),
-            Some(Ty::Adt(n, _)) if self.adts.defs.contains_key(&n)
-        )
     }
 
     /// A read of the binding `name` at `at`.
@@ -677,6 +656,11 @@ impl Walker<'_> {
             ast::Expr::FieldExpr(f) => {
                 if let Some(x) = f.expr() {
                     self.expr(&x, st, Mode::Use);
+                }
+                // A field moved out of its struct (`let x = s.inner;`): the struct no longer
+                // drops it (codegen marks it, when its type has something to drop).
+                if matches!(mode, Mode::Move(_)) && !st.unreachable {
+                    self.move_sites.insert(self.range(f.syntax()));
                 }
             }
             ast::Expr::IndexExpr(ix) => {

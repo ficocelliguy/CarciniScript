@@ -391,6 +391,9 @@ impl Checker<'_> {
         if let Some(t) = self.std_method(m, recv, rt, method, args) {
             return Some(t);
         }
+        if let Some(t) = self.gaps_method(m, recv, rt, method, args) {
+            return Some(t);
+        }
         match self.shallow(rt) {
             Ty::Result(t, e) => return self.result_method(m, *t, *e, method, args),
             Ty::Option(inner) if matches!(method, "ok_or" | "ok_or_else") => {
@@ -770,7 +773,7 @@ impl Checker<'_> {
     }
 
     /// `v.extend(iter)`: anything iterable whose elements match.
-    fn extend_arg(&mut self, arg: Option<&ast::Expr>, elem: &Ty) {
+    pub(super) fn extend_arg(&mut self, arg: Option<&ast::Expr>, elem: &Ty) {
         let Some(a) = arg else { return };
         let t = self.infer(a, None);
         match self.iter_elem(&t) {
@@ -945,6 +948,11 @@ impl Checker<'_> {
             "len" => {
                 count(self, 0);
                 USIZE
+            }
+            // (Exact here: what's left is counted.)
+            "size_hint" => {
+                count(self, 0);
+                Ty::Tuple(vec![USIZE, Ty::Option(Box::new(USIZE))])
             }
             "rfind" => {
                 count(self, 1);

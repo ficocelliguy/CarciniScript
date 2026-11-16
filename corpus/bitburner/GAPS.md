@@ -62,7 +62,7 @@ Workaround today: `format!("{a}")`.
 | C3 ✅ | **`entry(k).or_default()` with a struct value** fails: "`B: Default` is not satisfied" even with `#[derive(Default)]` | `dashboard.rs`, `stocks.rs` | `HashMap<i32, B>` then `m.entry(1).or_default().n += 1`. Works for numbers. Per-target stats maps are everywhere. |
 | C4 ✅ | **Format strings can't capture `const`s**: `"{CYAN}text{RESET}"` gives "cannot find value `CYAN`" | `dashboard.rs` | ANSI color consts in tail output are standard Bitburner style. Locals work. |
 | C5 ✅ | **Irrefutable array patterns are rejected**: `let [w, x, y, z] = arr;` gives "refutable pattern" | `stocks.rs`, `contracts.rs` | Also `let [r, c] = <[i64; 2]>::try_from(v).ok()?` (`try_from` is missing too) |
-| C6 ✅ (idioms) | **`Option<()>` and `Option<Option<T>>`** are rejected (documented representation limit) | `servers.rs` (`.then_some(()).with_context(..)?`), `stocks.rs` (`.then(\|\| opt).flatten()`) | Both are idioms that never store the nested value. Could be special-cased: `then_some(())` with an immediate combinator, and `flatten()` on a temporary. |
+| C6 ✅ | **`Option<()>` and `Option<Option<T>>`** are rejected (documented representation limit) | `servers.rs` (`.then_some(()).with_context(..)?`), `stocks.rs` (`.then(\|\| opt).flatten()`) | Both are idioms that never store the nested value. Could be special-cased: `then_some(())` with an immediate combinator, and `flatten()` on a temporary. |
 | C7 ✅ | **`Option<T>` comparisons** (`a > b`, `None < Some(1)`) | `batcher.rs` | Rust orders `None` below `Some`. Comes up with optional `Server` fields. |
 | C8 ✅ | **Two `From` impls on one type are mis-registered**: `From<&str>` + `From<String>` gives "implements `From<String>`, `From<String>`" | `net.rs` `Host` | Separate from the documented `impl Into<X>` parameter gap, which `Crawl::from(ns, "home")` also hit |
 | C9 ✅ | `impl AsRef<str>` for your types | `net.rs` `Host` | (`impl Drop` landed in the working tree during this survey and now works) |
@@ -270,10 +270,15 @@ module test (`test/modules/include`):
 - `Some(NaN)` ordering (re-check) fixed: NaN makes every partial comparison false, through
   `Option`, tuples, `Vec`s and derived `PartialOrd` (`option_nan_cmp.rs`).
 
-Every item in the tables above is fixed, except that a *stored* `Option<Option<T>>` (a
-parameter, a value kept and read later) is still rejected: `None` is `null`, so `Some(None)`
-can't be told apart. The corpus's uses (`Option<()>`, a temporary that `.flatten()` reads,
-`.map(Some)`) work.
+Every item in the tables above is fixed. C6 in full since: `Some(None)` is a marker of its
+own, so an `Option<Option<T>>` can be stored, passed and read back (`test/fixtures/option_nested.rs`).
+
+### React scripts (2026-11-16, evening)
+
+`cat.rs` (a port of `cat.jsx`) and `monitor.rs` (a live table of rooted servers) draw their tail
+windows with `jsx!` and the bundled `react` hooks; both compile as written, and `monitor.rs` was
+run with React 17 in jsdom against a mock network (refresh, sort and filter buttons). The
+corpus' rustc stub needs `jsx!` as a `macro_rules!` taking any tokens (see PLAN.md).
 
 ## Suggested order
 

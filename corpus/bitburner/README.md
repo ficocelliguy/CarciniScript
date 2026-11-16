@@ -16,6 +16,8 @@ no threads. Modeled on the scripts in `BitburnerScripts` and on bitburner-src's 
 | `stocks.rs` | Stock trader with or without 4S data | const generics, `Into<f64>` bound, `Display` table |
 | `go.rs` | IPvGO player | `Not`, `Index<Point>`, `TryFrom<char>`, flood fill |
 | `deploy.rs` + `early_hack.rs` | Roots everything and fills it with the early-game loop | `Box<dyn Fn>` strategy map, ports |
+| `cat.rs` | A cat that walks along the bottom of the screen in its tail window (port of `cat.jsx`) | `jsx!`, `use_state` / `use_effect` / `use_ref`, a closure component capturing `ns`, `Box<dyn Fn()>` in a ref, raw-string art |
+| `monitor.rs` | Live tail-window table of rooted servers: money bars, security, hack chance, sort and filter buttons, refreshed every second | `jsx!` components with props (`<Meter fraction={..} />`, `<Line row={..} />`), `use_state` / `use_effect` with an interval calling `ns`, keyed list from an iterator |
 | `dashboard.rs` | Tail-window stats from a port | `TryFrom<&'a str>` borrowed parse, `fmt::Write`, `Instant` |
 
 Each top-level script is a Bitburner script (`pub async fn main(ns: NS)`). `mod x;` loads a

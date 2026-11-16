@@ -24,6 +24,8 @@ mod conv;
 pub(crate) mod crates;
 #[path = "typeck_ext.rs"]
 mod ext;
+#[path = "typeck_gaps.rs"]
+mod gaps;
 #[path = "typeck_gen.rs"]
 mod generic;
 #[path = "typeck_iface.rs"]
@@ -47,6 +49,7 @@ mod traits;
 pub use arrays::array_try_from_len;
 pub use crates::CrateCall;
 pub use ext::{char_predicate, is_option_closure_method};
+pub use gaps::delegated_fmt_is_debug;
 pub use jsval::swb_imports;
 pub use modules::{Imported, ModuleRef, Resolver, module_path, qualified_key, use_leaves};
 pub use ptr::{Ptrs, cellable as ptr_cellable, is_ptr_type, transmute_name};
@@ -442,27 +445,8 @@ pub fn check(
             severity: "error",
         });
     }
-    if let Some((&(start, end), ty)) = map
-        .iter()
-        .filter(|(k, t)| {
-            t.has_ambiguous_option()
-                && !c.nested_ok.contains(*k)
-                // (`opt.map(Some)` is never `Some(None)`.)
-                && !c.src.get(k.0..k.1).is_some_and(|s| s.trim_end().ends_with(".map(Some)"))
-        })
-        .min_by_key(|(k, _)| **k)
-    {
-        let message = format!(
-            "`{}` is not supported yet: `None` and `Some(None)`/`Some(())` would be indistinguishable",
-            ty.describe()
-        );
-        c.diags.push(RawDiag {
-            start,
-            end,
-            message,
-            severity: "error",
-        });
-    }
+    // (`Option<Option<T>>` and `Option<()>` are representable: `Some(None)` and `Some(())` are
+    // markers.)
     if let Some((&(start, end), n)) = map
         .iter()
         .filter_map(|(k, t)| Some((k, c.unhashable_adt(t)?)))
@@ -1477,6 +1461,12 @@ impl<'a> Checker<'a> {
                     && let Some(t) = self.impl_assoc.get(&name)
                 {
                     return t.clone();
+                }
+                // `Self::Item` in an `impl DoubleEndedIterator` (its `Iterator` impl's).
+                if name == "Item"
+                    && let Some(t) = self.gaps_self_item(p)
+                {
+                    return t;
                 }
                 // `T::Err` of a `T: FromStr`: unchecked.
                 if name == "Err"
@@ -4199,6 +4189,9 @@ impl<'a> Checker<'a> {
             if let Some(t) = self.std_call(c, &ns, &args) {
                 return t;
             }
+            if let Some(t) = self.gaps_call(c, &ns, &args) {
+                return t;
+            }
             // `i32::zero()`: an associated function of a trait you implemented for a built-in
             // type.
             if let [t, f] = ns.as_slice()
@@ -5971,6 +5964,10 @@ impl<'a> Checker<'a> {
         }
         // `compile_error!("..")` (a proc macro's `Error::to_compile_error()`): the message.
         if name == "compile_error" {
+            // (Only when it's compiled: not under a `#[cfg(..)]` that's off.)
+            if macros::under_false_cfg(mc.syntax()) {
+                return Ty::Never;
+            }
             let args = macros::split_args(self.src, self.base, mc);
             let msg = args
                 .first()

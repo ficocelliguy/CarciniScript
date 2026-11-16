@@ -103,9 +103,10 @@ impl Codegen<'_> {
         };
         let f = match (kind, js) {
             (Coll::VecDeque, "push" | "unshift") => method_call(js, vec![arg(0)]),
-            (Coll::VecDeque, "pop" | "shift") => method_call(js, vec![]).wrap("(", " ?? null)"),
-            (Coll::VecDeque, "front") => rf.clone().wrap("(", "[0] ?? null)"),
-            (Coll::VecDeque, "back") => rf.clone().wrap("(", ".at(-1) ?? null)"),
+            (Coll::VecDeque, "pop") => call("pop", vec![]),
+            (Coll::VecDeque, "shift") => call("dqShift", vec![]),
+            (Coll::VecDeque, "front") => call("first", vec![]),
+            (Coll::VecDeque, "back") => call("last", vec![]),
             (Coll::VecDeque, "insert") => {
                 method_call("splice", vec![arg(0), Frag::text("0"), arg(1)])
             }

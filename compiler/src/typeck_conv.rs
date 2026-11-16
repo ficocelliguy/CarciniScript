@@ -305,6 +305,24 @@ impl Checker<'_> {
                     let adt = adt.clone();
                     self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
                 }
+                // `"x".into()` / `2.5.into()` / `true.into()` as a `JsValue`: the JS value itself.
+                (
+                    Ty::Str
+                    | Ty::Int(_)
+                    | Ty::IntLit
+                    | Ty::Float { .. }
+                    | Ty::Bool
+                    | Ty::Char
+                    | Ty::Var(_),
+                    Ty::Extern(n),
+                ) if n == "JsValue" => {
+                    if matches!(s, Ty::Var(_)) && self.var_kind(&s) == Some(VarKind::Float) {
+                        self.unify(&s, &Ty::Float { f32: false });
+                    } else if matches!(s, Ty::Var(_)) && self.var_kind(&s) == Some(VarKind::Int) {
+                        self.unify(&s, &Ty::Int(IntKind::I32));
+                    }
+                    Some(Conv::Identity)
+                }
                 // `vec.into()` as a `VecDeque` (or another collection made from a `Vec`), and
                 // back.
                 (Ty::Vec(e), Ty::Coll(kind, view)) => {

@@ -931,6 +931,7 @@ pub(crate) const BUNDLED: &[&str] = &[
     "chrono",
     "chrono_tz",
     "clap",
+    "react",
 ];
 
 /// `serde_json::Error`: the bundled `serde_json`'s (the runtime's `SerdeJsonError`).

@@ -434,6 +434,9 @@ impl Codegen<'_> {
         if let Some(r) = self.emit_std_method(m, rf, rt, method) {
             return Some(r);
         }
+        if let Some(r) = self.emit_gaps_method(m, rf, rt, method) {
+            return Some(r);
+        }
         match (rt, method) {
             // (Already the runtime's iterator: see `enter_consts`.)
             (Ty::IntoIter(_), "into_iter") => return Some((rf.clone(), result_ty.clone())),
@@ -608,7 +611,9 @@ impl Codegen<'_> {
                     .map(|a| vec![self.emit_expr(&a, None).0])
                     .unwrap_or_default();
                 let js = match m2 {
-                    "map" | "and_then" => "optMap",
+                    // (`map` makes a `Some` of the result: a marker when it's an `Option` or `()`.)
+                    "map" => "optMapSome",
+                    "and_then" => "optMap",
                     "filter" => "optFilter",
                     "unwrap_or_else" | "or_else" => "optOrElse",
                     "map_or" => "optMapOr",
@@ -788,6 +793,7 @@ impl Codegen<'_> {
                 "next_back" => "nextBack",
                 "nth_back" => "nthBack",
                 "len" => "len",
+                "size_hint" => "sizeHint",
                 "rfind" => "rfind",
                 "is_sorted" => "isSorted",
                 "is_sorted_by_key" => "isSortedByKey",

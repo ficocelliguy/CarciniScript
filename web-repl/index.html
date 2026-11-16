@@ -39,6 +39,10 @@
         <div id="selftest-panel" class="tab-panel"><div id="selftest-results" class="muted">Run the self-test to verify the compiler in this browser.</div></div>
       </section>
     </main>
+    <!-- React 17, as Bitburner has it, for programs using `jsx!` (they run on the page). Before
+         Monaco's AMD loader, or React's UMD build registers with it instead of setting globals. -->
+    <script src="https://cdn.jsdelivr.net/npm/react@17.0.2/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@17.0.2/umd/react-dom.development.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
     <script type="module" src="repl.js"></script>
   </body>

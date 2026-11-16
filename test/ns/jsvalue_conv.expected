@@ -1,0 +1,2 @@
+Some("x") Some("y") Some(2.5) Some(true) Some(7.0)
+true true 0 true

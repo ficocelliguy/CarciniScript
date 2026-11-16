@@ -19,6 +19,7 @@ const RAND_DISTR: &str = include_str!("rand_distr_prelude.rs");
 const CHRONO: &str = include_str!("chrono_prelude.rs");
 const CLAP: &str = include_str!("clap_prelude.rs");
 const ENTRY: &str = include_str!("entry_prelude.rs");
+const REACT: &str = include_str!("react_prelude.rs");
 
 /// `text` with the preludes it needs after it, when it names their types and doesn't declare
 /// them itself.
@@ -103,7 +104,9 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         out.push_str(COW);
     }
     // (After the rewrite: `io::Error` is `IoError`, `io::stdout()` `__io_stdout()`, ..)
-    let io_names = ["IoError", "IoWrite", "__io_std", "IoStd", "IoBuf"];
+    let io_names = [
+        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor",
+    ];
     if io_names.iter().any(|n| text.contains(n))
         && !text.contains("// (io prelude)")
         && !declares("IoError")
@@ -170,6 +173,13 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         out.push('\n');
         out.push_str(CHRONO);
     }
+    // (After the rewrites: `jsx!` makes `__rx_h(..)` calls, `react::Node` is `ReactNode`, ..)
+    if (text.contains("__rx_") || text.contains("ReactSetState") || text.contains("ReactRef"))
+        && !text.contains("// (react prelude)")
+    {
+        out.push('\n');
+        out.push_str(REACT);
+    }
     // (After the rewrite: `hash_map::Entry` is `StdMapEntry`.)
     if text.contains("StdMapEntry") && !text.contains("// (map entry prelude)") {
         out.push('\n');
@@ -192,5 +202,7 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         out.push('\n');
         out.push_str(CLAP);
     }
+    // (`PhantomData`, `std::path`.)
+    out.push_str(&crate::stdgaps::preludes(text));
     (!out.is_empty()).then(|| format!("{text}{out}"))
 }

@@ -1,0 +1,5 @@
+const LIMIT: u32 = 100;
+
+fn double(x: u32) -> u32 {
+    x * 2
+}

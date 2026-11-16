@@ -791,6 +791,10 @@ impl Checker<'_> {
                 need(self, "Ord");
                 sig(self, &[t.clone()], t)
             }
+            // `self.0.fmt(f)`: `Display::fmt` / `Debug::fmt` delegation.
+            "fmt" if self.param_has(name, "Display") || self.param_has(name, "Debug") => {
+                sig(self, &[Ty::Formatter], super::gaps::fmt_result())
+            }
             _ => {
                 for a in args {
                     self.infer(a, None);

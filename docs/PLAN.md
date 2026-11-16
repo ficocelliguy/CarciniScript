@@ -64,7 +64,7 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 - **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). `usize`/`isize` are JS numbers
   (exact to 2^53). `i64`/`u64` and `i128`/`u128` are BigInt, wrapped to their width. Integer `/` truncates and panics on zero;
   JS `%` already matches Rust's truncated remainder.
-- **Option:** `None` is `null`, `Some(x)` is `x`. `Option<()>`'s `Some(())` is a marker; `Option<Option<T>>` is rejected except as a temporary `.flatten()` reads.
+- **Option:** `None` is `null`, `Some(x)` is `x`; `Some(None)` (per depth) and `Some(())` are markers (`κσ.$some` / `$unsome`).
   The NS boundary is free: `undefined` results read as `None`.
 - **Result:** tagged object; `?` is an early return.
 - **Panics** throw `CarciniPanic` with `file:line:col` baked in at compile time.
@@ -265,6 +265,9 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      end of the function); closures owning their by-value captures (`κσ.$own`, dropped with the
      closure, whose moves the move checker records without reporting them) and by-value `self`
      dropped at the end of its method; NaN-aware partial comparisons (`$cmp` gives NaN)
+   - [x] `Some(None)` as a marker (C6 in full), `JsValue` from Rust values and its `Default`,
+     fields moved out of a struct (`κσ.$moveOut`), closures given to std methods dropped at the
+     end of their statement, Rust 2021 field captures of `move` closures
    - [x] The Bitburner corpus's section D, C6 and C10 (GAPS.md): std methods and paths as values
      (the UFCS pass), a `hash_map::Entry` prelude over the map's slots, `Option<()>` markers and
      `.flatten()` temporaries, `Into<f64>` bounds kept generic, `T: DeserializeOwned` through a
@@ -330,7 +333,8 @@ Counts are files that hit the gap, then files where it's the only language gap.
   - `#[cfg(..)]`-gated alternative definitions of one macro
   - `pub(crate) use my_macro;` re-exports
 - [ ] **Generic bounds on std traits** (82): `R: io::Read`, `R: BufRead`, `W: io::Write` /
-  `fmt::Write`, `F: Future`, `S: BuildHasher`, `A: Allocator`.
+  `fmt::Write`, `F: Future`, `S: BuildHasher`, `A: Allocator`. (`R: io::Read`, `R: BufRead` and
+  `W: io::Write` work now: see Std-library gaps.)
 - [ ] **Blanket impls on references** (65): `impl<T: Tr + ?Sized> Tr for &T`, `impl<I> Tr for &mut I`.
   `impl<T: Debug> Tr for T` works.
 - [ ] **Target `cfg`** (62 / 35): `cfg!(target_os = ..)`, `windows`, `unix`, `target_arch`,
@@ -353,31 +357,148 @@ Counts are files that hit the gap, then files where it's the only language gap.
 Files hitting each, among files that compile apart from external names. In all, 888 files miss a std
 type, 760 a std method, 357 a std trait impl, and 142 a std macro.
 
-- [ ] **Types:** `PhantomData` (232 files), `std::path::{Path, PathBuf}` (146 / 66), `OsStr` /
-  `OsString` (34 / 29), `fs::File` / `Metadata` (41 / 16), hand-written futures (`Pin` 39,
-  `task::Context` 37, `Poll` 20, `Waker` 14), `cell::Ref` / `RefMut` named as types (37),
-  `io::Cursor` (36), `process::Command` (25), `TypeId` (16), `fmt::Arguments` (16), `NonZeroUsize`
-  (15), `Infallible` (14), `IoSlice` (12), `SocketAddr` (16).
-- [ ] **Implementing std traits:** `ExactSizeIterator` (87), `FusedIterator` (84),
-  `DoubleEndedIterator` (65), `io::Read` (72), `io::Write` (39), `Future` (51), `Hasher` (17),
-  `BuildHasher` / `BufRead` (11 each), and the markers `UnwindSafe` / `RefUnwindSafe` (20 / 17),
-  which could be accepted and ignored.
-- [ ] **Methods:**
+- [x] **Types:** `PhantomData` (232 files), `std::path::{Path, PathBuf}` (146 / 66), `OsStr` /
+  `OsString` (34 / 29), `cell::Ref` / `RefMut` named as types (37), `io::Cursor` (36),
+  `fmt::Arguments` (16), `NonZeroUsize` (15), `Infallible` (14). Done: `PhantomData` and
+  `Infallible` are a Rust-source prelude (`marker_prelude.rs`); `Path` / `PathBuf` are the path
+  prelude's `PathBuf` (`path_prelude.rs`: Unix-style, `exists()` is `false`), and `OsStr` /
+  `OsString` are `String`, by a pre-pass (`stdgaps.rs`) that also writes `Ref<'_, T>` as `T`,
+  `NonZeroU32` as `u32` (`NonZeroU32::new` gives an `Option<u32>`) and `fmt::Arguments` as
+  `String`; `Cursor` is in the io prelude. Still open: `fs::File` / `Metadata` (41 / 16),
+  hand-written futures (`Pin` 39, `task::Context` 37, `Poll` 20, `Waker` 14), `process::Command`
+  (25), `TypeId` (16), `IoSlice` (12), `SocketAddr` (16): none of them means much in a script.
+- [x] **Implementing std traits:** `ExactSizeIterator` (87), `FusedIterator` (84),
+  `DoubleEndedIterator` (65), `io::Read` (72), `io::Write` (39), `Hasher` (17), `BuildHasher` /
+  `BufRead` (11 each), and the markers `UnwindSafe` / `RefUnwindSafe` (20 / 17), accepted and
+  ignored. `len()` comes from `size_hint`, `.rev()` runs `next_back`; `Read` / `BufRead` are
+  traits of the io prelude with std's provided methods (`read_to_end`, `read_to_string`,
+  `read_exact`, `bytes`, `read_line`, `read_until`, `lines`, `split`), which `BufReader` and
+  `Cursor` implement; a `Hasher` gets `write_u8` .. `write_i128`, a `BuildHasher` `hash_one`, and
+  `HashMap::with_hasher` / `default` take one (keys still compare by value). Still open: `Future`
+  (51).
+- [x] **Methods:**
   - `Vec`: `into_boxed_slice` (43), `resize` (32), `capacity` / `reserve` / `reserve_exact` /
-    `shrink_to_fit` (24 / 18 / 7 / 13, could be no-ops), `chunks_mut` / `chunks_exact_mut`
-    (18 / 9), `copy_within` (9), `retain_mut` (9), `splice` (7)
+    `shrink_to_fit` (24 / 18 / 7 / 13, no-ops), `chunks_mut` / `chunks_exact_mut` (18 / 9, views),
+    `copy_within` (9), `retain_mut` (9), `splice` (7)
   - arrays and slices: `[T; N]::map` (17), `eq_ignore_ascii_case` (8), `strip_prefix` (8)
-  - `Display::fmt` called on an inner field to delegate (`self.0.fmt(f)`, 32)
+  - `Display::fmt` called on an inner field to delegate (`self.0.fmt(f)`, 32), with the
+    caller's width, precision and flags; also `fmt::Display::fmt(&x, f)`
   - `char`: `len_utf8` (30), `encode_utf8` (12), `escape_debug` (10)
   - integers: `to_le_bytes` / `to_be_bytes` / `to_ne_bytes` (about 40 combined), `unsigned_abs`
     (18), `next_power_of_two` (9)
-  - `str::get(range)` (11), `String::into_boxed_str` (12), `Option::get_or_insert_with` (11)
-  - `Iterator::size_hint` (53), and `for` over some iterator types (20)
-- [ ] **Macros:** `format_args!` (29), `compile_error!` (30, usually under a `cfg` that's false),
-  `include!` / `include_bytes!` (17 / 14), `env!` / `option_env!` (15).
+  - `str::get(range)` (11), `String::into_boxed_str` (12)
+  - `Iterator::size_hint` (53), and `for` over a type's own `iter()` (20)
+  - Not done: `Option::get_or_insert_with` (11), left to the `Option` representation work.
+- [x] **Macros:** `format_args!` (29, a `String` here), `compile_error!` (30: an error unless
+  it's under a `#[cfg]` that's off, platform predicates counting as off), `include!` /
+  `include_bytes!` (17 / 14), `env!` / `option_env!` (15: a script has no build environment, so
+  `env!` is an error and `option_env!` is `None`, except Cargo's `CARGO_*` variables, which get
+  placeholders).
 
 The raw-pointer methods (`as_ptr` 112, `as_mut_ptr` 82, `get_unchecked` 24, `set_len` 21), `asm!`
 and `is_x86_feature_detected!` fall under "not planned", above.
+
+### Crates for Bitburner scripts
+
+Of the crates that two or more registry crates import, the useful ones are already bundled (serde,
+rand, log, anyhow, rayon, itertools, hashbrown, once_cell, either, num-traits, clap). Most import
+errors in the survey were library files reaching into their own crate. What's left worth adding,
+cheapest first:
+
+- [ ] **`rustc_hash`** (4 crates): `FxHashMap` / `FxHashSet` as aliases of `HashMap` / `HashSet`.
+  It's the usual "fast map" import in puzzle-style code (BFS, memoized contract DP).
+- [ ] **`smallvec`** (3): `SmallVec<[T; N]>` and `smallvec![..]` as `Vec`.
+- [ ] **`indexmap`** (4): `IndexMap` / `IndexSet`, which keep insertion order, so server lists and
+  stats tables print the same way every run. A JS `Map` already keeps insertion order.
+
+Not in the corpus (it's library internals), but likely to matter more to players:
+
+- [ ] **`ordered-float`**: `OrderedFloat<f64>` / `NotNan` make `f64` scores usable as `BinaryHeap` and
+  `BTreeMap` keys, for ranking targets by money/sec without a hand-written `Ord`.
+- [ ] **`petgraph`**: `Graph` / `DiGraph` with its algorithms (shortest paths, components, toposort).
+
+Marginal: `static_assertions`, `tap`, `strsim`, a `base64` alias over `js::btoa` / `js::atob`, and a
+`js_sys` alias over the `js` crate. Not useful in a script: proc-macro, test and bench tooling
+(criterion, quickcheck, proptest, insta), system and FFI crates, zero-copy and binary serialization,
+thread crates, and networking.
+
+## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
+
+Bitburner scripts draw tail windows and terminal widgets with React: `ns.printRaw(<Dash />)` from a
+`.jsx` / `.tsx` script, with `React` and `ReactDOM` as globals (React 17). RapydScript got JSX by
+extending its own parser (`from __python__ import jsx`, `src/output/jsx.pyj`, and a `react` module of
+hooks). CarciniScript can't do that: it parses with rust-analyzer's parser, so a bare `<div>` would
+break the IDE features and the rustc checks of the corpus. A macro's token tree takes JSX-shaped
+tokens as they are, though, which is how Yew (`html!`) and Leptos (`view!`) write markup in Rust.
+Today there's no way to make a React element: `print_raw` takes a `JsValue`, and a parsed JSON
+object isn't an element (no `$$typeof`).
+
+```rust
+use react::{jsx, use_state, use_effect, Node};
+
+let cat = move || -> Node {
+    let (frame, set_frame) = use_state(|| 0u32);
+    use_effect(move || {
+        let id = js::set_interval(move || set_frame.update(|f| f + 1), 50.0);
+        move || js::clear_interval(id)
+    }, ());
+    jsx! { <div style="font-family: monospace"><pre>{pose(frame)}</pre> "frame " {frame}</div> }
+};
+ns.print_raw(jsx! { <cat /> });
+```
+
+Design:
+
+- **A bundled `react` crate** (a Rust prelude over runtime helpers, like `regex`): an opaque `Node`
+  (`From` strings and numbers, `Option<Node>` → `null`, `Vec<Node>` → an array); hooks with Rust
+  signatures: `use_state(|| init) -> (T, SetState<T>)` with `set(v)` and `update(|old| new)` (the
+  updater form avoids stale closures), `use_effect(f, deps)` (`f` may return a cleanup closure; deps
+  a tuple), `use_ref`, `use_memo`, `use_callback`; `react::h(tag, props, children)` underneath.
+- **`jsx!`, a source rewrite** (like `json!`) into calls of that crate, so the embedded
+  expressions are type-checked, borrow-checked and compiled as ordinary Rust:
+  - Tags: a name bound in scope to a fn or closure is a component; anything else is an HTML tag
+    (Babel can only go by capitalization). `<>..</>` fragments, `key=`.
+  - Attributes: `name="lit"` or `name={expr}`; `class` → `className`, `on_click` / `onClick` →
+    `onClick` (closures become JS functions), `aria-label` / `data-x` joined from their tokens.
+    `style="color: red; font-size: 12px"` becomes `{color: "red", fontSize: "12px"}` at compile time.
+  - Children: string literals (Rust's lexer drops whitespace and breaks on `don't` in bare text,
+    so text is quoted, as in Leptos) and `{expr}` (`impl Into<Node>`, `Option`, `Vec` / iterators).
+  - Components with props: `<Gauge label="hp" value={x} />` calls `fn Gauge(label: &str, value: f64)
+    -> Node`; the props object is keyed by parameter name. `κσ.$component(f, names)` wraps it, cached
+    per function so React keeps its identity (closure components capturing `ns` and local state,
+    like a tail-window dashboard's, are the common case).
+- **Bindings:** `dts2rs` maps `ReactNode` / `ReactElement` to `react::Node`, so `print_raw` /
+  `tprint_raw` take `impl Into<Node>` (`ns.print_raw("text")` still works).
+- **rustc checks:** the corpus' stub crate has `jsx!` as a `macro_rules!` taking any tokens.
+
+Steps (the prototype from branch `jsx-prototype` / worktree `../carciniscript-jsx` is merged
+into the main tree):
+
+- [x] Runtime helpers (`κσ.$react`: `h`, `component`, `static`, style parsing) on
+  `globalThis.React`, and the `react` prelude (`compiler/src/react_prelude.rs`: `Node`, `h`,
+  `use_state`, `use_effect`, `use_ref`) over private `js::__react_*` bindings.
+- [x] `jsx!` rewrite (`compiler/src/jsx.rs`): tags, quoted text, `{expr}` children, attributes,
+  closure and fn components (a `let` of a closure or of a block ending in one), `children`,
+  fragments, `key`, `jsx!` inside `{..}`; errors for unquoted text, unknown components, missing or
+  unknown props, mismatched closing tags.
+- [ ] Bindings: `print_raw` / `tprint_raw` take a `Node` (they take a `JsValue` today, which
+  already accepts one).
+- [x] Tests (`test/react/run.mjs`, `npm run test:react`): each fixture has a `.jsx` twin compiled by
+  TypeScript; both run against a mock `ns` and what they print is rendered with React 17: static
+  markup, mounted in jsdom with 60 ms of a fake clock, then each button clicked; the transcripts must
+  match. Plus 10 diagnostics, error positions, and a component from a `mod` file.
+- [x] Examples: the web REPL's "React: a tail-window dashboard" (`test/react/hack_monitor.rs`, run
+  on the page with React 17 from jsdelivr, checked by `tools/browser-check.mjs`), and the corpus'
+  `cat.rs` and `monitor.rs` (a live table of rooted servers).
+- [x] Error positions inside embedded expressions: the rewrite leaves each `{expr}` where it was
+  written and edits the markup around it (`jsx::edits`).
+- [x] Components from `mod` files (`pub fn` components, found through the module resolver).
+- [x] `React` missing outside Bitburner: a panic that says how to load it.
+- [ ] Still open: typed children (`IntoNode` needs trait impls for `&str` / `Option<T>` / `Vec<T>`,
+  which the compiler only allows for the file's own types today), hover and completions inside
+  `jsx!`.
+- [ ] Later: typed intrinsic attributes and DOM events, `use_context` / `use_reducer` / `use_memo`,
+  `{..spread}` props, class components (not planned).
 
 ## Testing
 

@@ -2,7 +2,10 @@
 // runs the in-page self-test, compiles and runs a fresh program, and saves screenshots.
 //
 //   node tools/serve.mjs &   (in another terminal)
-//   node tools/browser-check.mjs [url]
+//   node tools/browser-check.mjs [url] [--full-prefixes]
+//
+// The self-test compiles about 200 prefixes of each fixture; `--full-prefixes` compiles every
+// prefix (a crash fuzz that takes about 40 minutes: run it when asked, not on every change).
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const url = process.argv[2] ?? "http://127.0.0.1:8765/web-repl/";
+const url = process.argv.slice(2).find((a) => !a.startsWith("--")) ?? "http://127.0.0.1:8765/web-repl/";
 const outDir = path.join(root, "test/out");
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -119,7 +122,8 @@ try {
   await screenshot("repl-playground.png");
 
   // 2. The in-page self-test (differential vs rustc, NS, source maps, robustness).
-  const results = await evaluate("carcini.selfTest().then(r => r.map(x => ({ ok: x.ok, name: x.name, detail: x.detail, pre: x.pre })))");
+  const full = process.argv.includes("--full-prefixes");
+  const results = await evaluate(`carcini.selfTest({ fullPrefixes: ${full} }).then(r => r.map(x => ({ ok: x.ok, name: x.name, detail: x.detail, pre: x.pre })))`);
   for (const r of results) report(r.ok, `self-test: ${r.name}`, r.ok ? r.detail : `${r.detail}\n${r.pre ?? ""}`);
   await screenshot("repl-selftest.png");
 
@@ -241,9 +245,34 @@ try {
   ].join("\n");
   report(domOut === domWant, "js crate: DOM, storage, window", domOut === domWant ? "" : `\n${domOut}\n--- want\n${domWant}`);
 
+  // 6. A `jsx!` program (the React example) runs on the page: what it prints with `ns.printRaw` is
+  // mounted live in the output pane, its interval updates it, and its buttons work.
+  await evaluate("document.getElementById('examples').value = 'react/hack_monitor.rs'; document.getElementById('examples').dispatchEvent(new Event('change'))");
+  await waitFor("carcini.editor.getValue().includes('use react::')");
+  await sleep(500);
+  await evaluate("carcini.run()");
+  await waitFor("document.querySelector('#output-log .react-root h4')?.textContent === 'hacking n00dles'");
+  await waitFor("Number(document.querySelector('#output-log .react-root p')?.textContent.split(': ')[1]) >= 3");
+  const reactOut = await evaluate(`(async () => {
+    const root = document.querySelector('#output-log .react-root');
+    const [pause, reset] = root.querySelectorAll('button');
+    pause.click();
+    await new Promise((r) => setTimeout(r, 50));
+    const paused = root.querySelector('p').textContent;
+    await new Promise((r) => setTimeout(r, 100));
+    const still = root.querySelector('p').textContent === paused;
+    const label = pause.textContent;
+    reset.click();
+    await new Promise((r) => setTimeout(r, 50));
+    return [label, still, root.querySelector('p').textContent, document.getElementById('output-log').textContent.includes('exited with 0')].join(' | ');
+  })()`);
+  report(reactOut === "resume | true | hacks: 0 | true", "React example (jsx!) renders live on the page", reactOut);
+  await screenshot("repl-react.png");
+
   report(consoleErrors.length === 0, "no uncaught page errors", consoleErrors.join("\n"));
 } catch (e) {
-  report(false, "browser check", e.message);
+  const pane = await evaluate("document.getElementById('output-log')?.textContent ?? ''").catch(() => "");
+  report(false, "browser check", `${e.message}${pane ? ` (output: ${pane.slice(0, 600)})` : ""}`);
 } finally {
   ws.close();
   browser.kill();

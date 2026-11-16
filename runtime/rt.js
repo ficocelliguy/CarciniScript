@@ -119,8 +119,34 @@
     return c;
   }
 
+  // `Some(x)` is `x` itself, except when `x` is itself "nothing": `Some(None)` is a marker
+  // (`Some(Some(None))` the next one, ..), and `Some(())` is `true` (`()` is `undefined`).
+  class SomeNone {
+    constructor(k) {
+      this.k = k;
+    }
+  }
+  const someNones = [null];
+  const someNone = (k) => {
+    while (someNones.length <= k) someNones.push(new SomeNone(someNones.length));
+    return someNones[k];
+  };
+  // `Some(x)`.
+  function some(x) {
+    if (x === null) return someNone(1);
+    if (x === undefined) return true;
+    if (x instanceof SomeNone) return someNone(x.k + 1);
+    return x;
+  }
+  // What a `Some` holds (an inner `Option`'s own representation).
+  function unsome(x) {
+    if (x instanceof SomeNone) return x.k === 1 ? null : someNone(x.k - 1);
+    return x;
+  }
+
   // Rust's `==` for the values CarciniScript represents: structural for Vecs (JS arrays).
   function eq(a, b) {
+    if (a instanceof SomeNone || b instanceof SomeNone) return a === b;
     // `None` is null, but values from JS (NS results) may use undefined.
     if (a == null || b == null) return a == b;
     // Structs and enums: their derived `$eq`.
@@ -146,6 +172,7 @@
   function cmp(a, b) {
     // `None` sorts before every `Some`.
     if (a == null || b == null) return a == null ? (b == null ? 0 : -1) : 1;
+    if (a instanceof SomeNone || b instanceof SomeNone) return cmp(unsome(a), unsome(b));
     if (typeof a.$cmp === "function") return a.$cmp(b);
     if (Array.isArray(a) && Array.isArray(b)) {
       const n = Math.min(a.length, b.length);
@@ -342,14 +369,14 @@
       if (slot) {
         const old = slot[1];
         slot[1] = v;
-        return old;
+        return some(old);
       }
       this.m.set(kk, [k, v]);
       return null;
     }
     $get(k) {
       const slot = this.m.get(key(k));
-      return slot ? slot[1] : null;
+      return slot ? some(slot[1]) : null;
     }
     $containsKey(k) {
       return this.m.has(key(k));
@@ -359,7 +386,7 @@
       const slot = this.m.get(kk);
       if (!slot) return null;
       this.m.delete(kk);
-      return slot[1];
+      return some(slot[1]);
     }
     $len() {
       return this.m.size;
@@ -675,8 +702,20 @@
         for (;;) yield* seen;
       });
     }
-    // Collects first: JS iterators only go forward.
+    // Collects first: JS iterators only go forward. (A custom iterator with its own
+    // `next_back` runs backwards through it.)
     $rev() {
+      const back = ownMethod(this.src, "next_back");
+      if (back !== null) {
+        this.src = null;
+        return Iter.of(function* () {
+          for (;;) {
+            const v = back();
+            if (v == null) return;
+            yield v;
+          }
+        });
+      }
       const all = Array.from(iterable(this.it));
       return Iter.of(function* () {
         for (let i = all.length - 1; i >= 0; i--) yield all[i];
@@ -752,7 +791,7 @@
     }
     $nextIf(p) {
       const x = this.$peek();
-      if (x === null || !p(x)) return null;
+      if (x === null || !p(unsome(x))) return null;
       return this.$next();
     }
     // Double-ended steps collect what's left first: JS iterators only go forward.
@@ -761,7 +800,7 @@
       if (all.length === 0) return null;
       const x = all.pop();
       this.it = all[Symbol.iterator]();
-      return x;
+      return some(x);
     }
     $nthBack(n) {
       const all = Array.from(iterable(this.it));
@@ -771,10 +810,22 @@
       }
       const x = all[all.length - 1 - n];
       this.it = all.slice(0, all.length - 1 - n)[Symbol.iterator]();
-      return x;
+      return some(x);
     }
-    // `len()`: how many are left, without using them up.
+    // `size_hint()`: exact here (what's left is counted), or a custom iterator's own (`(0,
+    // None)` when it has none).
+    $sizeHint() {
+      if (this.src != null) {
+        const hint = ownMethod(this.src, "size_hint");
+        return hint !== null ? hint() : [0, null];
+      }
+      const n = this.$len();
+      return [n, n];
+    }
+    // `len()`: how many are left, without using them up (a custom iterator's `size_hint`).
     $len() {
+      const hint = ownMethod(this.src, "size_hint");
+      if (hint !== null) return hint()[0];
       const all = Array.from(iterable(this.it));
       this.it = all[Symbol.iterator]();
       return all.length;
@@ -791,7 +842,7 @@
     // ---- consumers
     $next() {
       const r = this.it.next();
-      return r.done ? null : r.value;
+      return r.done ? null : some(r.value);
     }
     // `chars.as_str()`: the chars left, as a string (the iterator goes on over them).
     $asStr() {
@@ -808,7 +859,7 @@
     }
     $rfind(p) {
       const all = Array.from(iterable(this.it));
-      for (let i = all.length - 1; i >= 0; i--) if (p(all[i])) return all[i];
+      for (let i = all.length - 1; i >= 0; i--) if (p(all[i])) return some(all[i]);
       return null;
     }
     $rfold(acc, f) {
@@ -856,12 +907,16 @@
     }
     $last() {
       let last = null;
-      for (const x of iterable(this.it)) last = x;
-      return last;
+      let any = false;
+      for (const x of iterable(this.it)) {
+        last = x;
+        any = true;
+      }
+      return any ? some(last) : null;
     }
     $nth(n) {
       let i = 0;
-      for (const x of iterable(this.it)) if (i++ === n) return x;
+      for (const x of iterable(this.it)) if (i++ === n) return some(x);
       return null;
     }
     $sum(op, start) {
@@ -883,7 +938,7 @@
         if (first || f(x, best) < 0) best = x;
         first = false;
       }
-      return best;
+      return first ? null : some(best);
     }
     $maxBy(f) {
       let best = null, first = true;
@@ -891,7 +946,7 @@
         if (first || f(x, best) >= 0) best = x;
         first = false;
       }
-      return best;
+      return first ? null : some(best);
     }
     $minByKey(f) {
       let best = null, bestKey, first = true;
@@ -900,7 +955,7 @@
         if (first || cmp(k, bestKey) < 0) [best, bestKey] = [x, k];
         first = false;
       }
-      return best;
+      return first ? null : some(best);
     }
     $maxByKey(f) {
       let best = null, bestKey, first = true;
@@ -909,7 +964,7 @@
         if (first || cmp(k, bestKey) >= 0) [best, bestKey] = [x, k];
         first = false;
       }
-      return best;
+      return first ? null : some(best);
     }
     $any(p) {
       for (const x of iterable(this.it)) if (p(x)) return true;
@@ -920,7 +975,7 @@
       return true;
     }
     $find(p) {
-      for (const x of iterable(this.it)) if (p(x)) return x;
+      for (const x of iterable(this.it)) if (p(x)) return some(x);
       return null;
     }
     // `unzip()`: pairs into two Vecs.
@@ -970,7 +1025,7 @@
       if (first.done) return null;
       let acc = first.value;
       for (const x of iterable(it)) acc = f(acc, x);
-      return acc;
+      return some(acc);
     }
     $forEach(f) {
       for (const x of iterable(this.it)) f(x);
@@ -1045,7 +1100,7 @@
         this.has = true;
         this.v = r.value;
       }
-      return this.v;
+      return some(this.v);
     }
   }
 
@@ -1097,6 +1152,14 @@
   // A JS iterator as something `for...of` accepts without restarting it.
   function iterable(it) {
     return { [Symbol.iterator]: () => it };
+  }
+
+  // A struct's own method by its Rust name (`write`, or `write$` where Bitburner charges RAM for
+  // the name), bound; null if it has none.
+  function ownMethod(o, name) {
+    if (o == null || typeof o !== "object") return null;
+    const f = typeof o[name] === "function" ? o[name] : o[name + "$"];
+    return typeof f === "function" ? f.bind(o) : null;
   }
 
   // What Rust's `IntoIterator` gives for a value: maps yield `(k, v)` pairs, strings their chars,
@@ -1489,6 +1552,8 @@
       }
       // (The tz database's numeric names: `+04`, `+0530`.)
       const off = rt.$tzOffset(zone, ms);
+      // (At offset 0 the tz database's name is GMT: London in winter, Reykjavik, Accra.)
+      if (off === 0) return "GMT";
       const a = Math.abs(off);
       const h = String(Math.floor(a / 3600)).padStart(2, "0");
       const m = Math.floor(a / 60) % 60;
@@ -1725,16 +1790,22 @@
       for (const x of other) v.push(x);
     },
     $pop(v) {
-      return v.length ? v.pop() : null;
+      return v.length ? some(v.pop()) : null;
     },
     $first(v) {
-      return v.length ? v[0] : null;
+      return v.length ? some(v[0]) : null;
     },
     $last(v) {
-      return v.length ? v[v.length - 1] : null;
+      return v.length ? some(v[v.length - 1]) : null;
     },
     $vget(v, i) {
-      return i >= 0 && i < v.length ? v[i] : null;
+      return i >= 0 && i < v.length ? some(v[i]) : null;
+    },
+    $some: some,
+    $unsome: unsome,
+    // `opt.unwrap_or(d)` of an `Option<Option<T>>`.
+    $unwrapOr(x, d) {
+      return x == null ? d : unsome(x);
     },
     $eq: eq,
     HashSet,
@@ -1811,7 +1882,154 @@
     },
     // A value of a type with `impl Iterator`, as a runtime iterator (for `take`, `map`, ..).
     $iterOf(o) {
-      return new Iter(o[Symbol.iterator]());
+      const it = new Iter(o[Symbol.iterator]());
+      it.src = o;
+      return it;
+    },
+    // ---- std gaps (`typeck_gaps` / `codegen_gaps`)
+    // `x.fmt(f)` / `fmt::Display::fmt(&x, f)`: `x` with `f`'s spec (`base` renders it plainly).
+    $fmtDelegate(f, x, base, kind, debug) {
+      if (x !== null && typeof x === "object") {
+        if (!debug && typeof x.fmt === "function") return x.fmt(f);
+        if (debug && typeof x.fmt$dbg === "function") return x.fmt$dbg(f);
+      }
+      // (A generic value: its kind by what it is now; a whole float counts as an integer.)
+      if (kind === "other") {
+        if (typeof x === "bigint" || (typeof x === "number" && Number.isInteger(x))) kind = "int";
+        else if (typeof x === "number") kind = "float";
+        else if (typeof x === "string") kind = "str";
+      }
+      const o = f.o;
+      let s;
+      if (o != null && o.p != null && kind === "float") s = rt.$fixed(x, o.p);
+      else if (o != null && o.p != null && kind === "str" && !debug) s = rt.$truncChars(x, o.p);
+      else s = base(x);
+      if (o != null) {
+        const numeric = kind === "float" || kind === "int";
+        if (debug && o.alt) s = rt.$pretty(s);
+        if (o.plus && numeric) s = rt.$plus(s);
+        if (o.w != null) s = rt.$pad(s, o.w, o.align, o.fill, o.zero, numeric);
+      }
+      return rt.$write(f, s, false);
+    },
+    $okOf(x) {
+      return new Res(0, x);
+    },
+    // `s.get(lo..hi)`: `None` out of bounds or off a char boundary.
+    $strGet(s, lo, hi, inclusive) {
+      try {
+        return rt.$strSlice(s, lo, hi, inclusive, "");
+      } catch {
+        return null;
+      }
+    },
+    $resize(v, n, x) {
+      if (n < v.length) v.length = n;
+      while (v.length < n) v.push(clone(x));
+    },
+    $resizeWith(v, n, f) {
+      if (n < v.length) v.length = n;
+      while (v.length < n) v.push(f());
+    },
+    // `chunks_mut(n)` / `chunks_exact_mut(n)` / `rchunks_mut(n)`: views, so writes reach `v`.
+    $chunksMut(v, n, exact, rev, location) {
+      if (n === 0) throw new CarciniPanic("chunk size must be non-zero", location);
+      const out = [];
+      if (rev) {
+        for (let hi = v.length; hi > 0; hi -= n) out.push(rt.$sliceMut(v, Math.max(0, hi - n), hi, false, location));
+      } else {
+        for (let lo = 0; lo < v.length; lo += n) {
+          if (exact && lo + n > v.length) break;
+          out.push(rt.$sliceMut(v, lo, Math.min(v.length, lo + n), false, location));
+        }
+      }
+      return new Iter(out[Symbol.iterator]());
+    },
+    $copyWithin(v, lo, hi, inclusive, dest, location) {
+      const part = rt.$slice(v, lo, hi, inclusive, location);
+      if (dest + part.length > v.length) throw new CarciniPanic("dest is out of bounds", location);
+      for (let i = 0; i < part.length; i++) v[dest + i] = part[i];
+    },
+    // `retain_mut(f)`: `f` gets a cell holding each item.
+    $retainMut(v, f) {
+      let j = 0;
+      for (let i = 0; i < v.length; i++) {
+        const cell = [v[i]];
+        if (f(cell)) v[j++] = cell[0];
+      }
+      v.length = j;
+    },
+    $splice(v, lo, hi, inclusive, src, location) {
+      const out = rt.$slice(v, lo, hi, inclusive, location);
+      v.splice(lo, out.length, ...Array.from(items(src)));
+      return new Iter(out[Symbol.iterator]());
+    },
+    // `[1, 2].strip_prefix(&[1])` (`suffix`: `strip_suffix`).
+    $vecStrip(v, p, suffix) {
+      if (p.length > v.length) return null;
+      const at = suffix ? v.length - p.length : 0;
+      for (let i = 0; i < p.length; i++) if (!eq(v[at + i], p[i])) return null;
+      return suffix ? v.slice(0, at) : v.slice(p.length);
+    },
+    $bytesEqIgnoreCase(a, b) {
+      if (a.length !== b.length) return false;
+      const low = (x) => (x >= 65 && x <= 90 ? x + 32 : x);
+      for (let i = 0; i < a.length; i++) if (low(a[i]) !== low(b[i])) return false;
+      return true;
+    },
+    // `c.encode_utf8(&mut buf)`: the bytes go to the front of `buf`; the char as a `&str`.
+    $encodeUtf8(c, buf) {
+      const bytes = new TextEncoder().encode(c);
+      if (bytes.length > buf.length) {
+        throw new CarciniPanic(`encode_utf8: need ${bytes.length} bytes to encode U+${c.codePointAt(0).toString(16).toUpperCase()}, but the buffer has ${buf.length}`, "<std>");
+      }
+      for (let i = 0; i < bytes.length; i++) buf[i] = bytes[i];
+      return c;
+    },
+    // `c.escape_debug()` / `escape_default()` / `escape_unicode()`.
+    $escapeChar(c, how) {
+      const cp = c.codePointAt(0);
+      const uni = "\\u{" + cp.toString(16) + "}";
+      if (how === "unicode") return uni;
+      switch (c) {
+        case "\t": return "\\t";
+        case "\r": return "\\r";
+        case "\n": return "\\n";
+        case "\\": return "\\\\";
+        case "'": return "\\'";
+        case '"': return '\\"';
+      }
+      if (how === "default") return cp >= 0x20 && cp <= 0x7e ? c : uni;
+      if (c === "\0") return "\\0";
+      return cp < 0x20 || cp === 0x7f || (cp >= 0x80 && cp < 0xa0) ? uni : c;
+    },
+    // `x.to_le_bytes()` / `to_be_bytes()`: the two's complement bytes of a `bits`-wide integer.
+    $toBytes(x, bits, little) {
+      let v = BigInt.asUintN(bits, BigInt(x));
+      const out = [];
+      for (let i = 0; i < bits / 8; i++) {
+        out.push(Number(v & 0xffn));
+        v >>= 8n;
+      }
+      return little ? out : out.reverse();
+    },
+    $fromBytes(bytes, bits, little, signed, big) {
+      const bs = little ? bytes.slice().reverse() : bytes;
+      let v = 0n;
+      for (const b of bs) v = (v << 8n) | BigInt(b);
+      if (signed) v = BigInt.asIntN(bits, v);
+      return big ? v : Number(v);
+    },
+    $uabs(x) {
+      return x < 0 ? -x : x;
+    },
+    // `x.next_power_of_two()` (`checked`: `None` past the type's range).
+    $nextPow2(x, bits, checked) {
+      const big = typeof x === "bigint";
+      let p = big ? 1n : 1;
+      while (p < x) p *= big ? 2n : 2;
+      if (checked) return BigInt(p) >= 1n << BigInt(bits) ? null : p;
+      return p;
     },
     // `fn main() -> Result<..>` returned `Err(e)`: fail with rustc's `Error: {e:?}`.
     $mainResult(r, fmt) {
@@ -2077,7 +2295,10 @@
       return new Res(0, v);
     },
     $dqRemove(a, i) {
-      return i < a.length ? a.splice(i, 1)[0] : null;
+      return i < a.length ? some(a.splice(i, 1)[0]) : null;
+    },
+    $dqShift(a) {
+      return a.length ? some(a.shift()) : null;
     },
     // `map.entry(k).or_insert(v)`: the `[k, v]` slot for `k`, inserting `v` (or `v()` when `lazy`)
     // if `k` is missing.
@@ -2143,11 +2364,11 @@
     // Option: `None` is null (or undefined), `Some(x)` is x.
     $unwrap(x, location) {
       if (x == null) throw new CarciniPanic("called `Option::unwrap()` on a `None` value", location);
-      return x;
+      return unsome(x);
     },
     $expect(x, message, location) {
       if (x == null) throw new CarciniPanic(message, location);
-      return x;
+      return unsome(x);
     },
     $cmp: cmp,
     $clone: clone,
@@ -2189,34 +2410,37 @@
 
     // Option methods taking closures.
     $optMap(x, f) {
-      return x == null ? null : f(x);
+      return x == null ? null : f(unsome(x));
+    },
+    $optMapSome(x, f) {
+      return x == null ? null : some(f(unsome(x)));
     },
     $optFilter(x, p) {
-      return x != null && p(x) ? x : null;
+      return x != null && p(unsome(x)) ? x : null;
     },
     $optOrElse(x, f) {
       return x == null ? f() : x;
     },
     $optMapOr(x, d, f) {
-      return x == null ? d : f(x);
+      return x == null ? d : f(unsome(x));
     },
     $optMapOrElse(x, d, f) {
-      return x == null ? d() : f(x);
+      return x == null ? d() : f(unsome(x));
     },
     $optIsSomeAnd(x, p) {
-      return x != null && p(x);
+      return x != null && p(unsome(x));
     },
     $optIsNoneOr(x, p) {
-      return x == null || p(x);
+      return x == null || p(unsome(x));
     },
     $optOr(x, y) {
       return x == null ? y : x;
     },
     $optZip(x, y) {
-      return x == null || y == null ? null : [x, y];
+      return x == null || y == null ? null : [unsome(x), unsome(y)];
     },
     $optInspect(x, f) {
-      if (x != null) f(x);
+      if (x != null) f(unsome(x));
       return x;
     },
     $optTranspose(x) {
@@ -2236,7 +2460,7 @@
       return r[0] == null ? null : new Res(0, r[0]);
     },
     $optIter(x) {
-      return new Iter((x == null ? [] : [x])[Symbol.iterator]());
+      return new Iter((x == null ? [] : [unsome(x)])[Symbol.iterator]());
     },
 
     // Iterator sources.
@@ -2248,7 +2472,22 @@
     // `x.hash(state)`: a type's own `hash`, else the value's key.
     $hashInto(v, h) {
       if (v !== null && typeof v === "object" && typeof v.hash === "function") v.hash(h);
-      else h.$write(v);
+      else if (typeof h.$write === "function") h.$write(v);
+      else ownMethod(h, "write")(rt.$hashBytes(v));
+    },
+    // The bytes std's `Hash` gives your own `Hasher` for a value: integers as 8 bytes
+    // (`usize` / `u64`'s), a string's UTF-8 then `0xff`, a Vec's length then its items.
+    $hashBytes(v) {
+      if (typeof v === "string") return rt.$utf8(v).concat([0xff]);
+      if (typeof v === "boolean") return [v ? 1 : 0];
+      if (typeof v === "number" || typeof v === "bigint") return rt.$toBytes(Math.trunc(Number(v)) === Number(v) ? v : 0, 64, true);
+      if (Array.isArray(v)) return rt.$toBytes(v.length, 64, true).concat(...v.map((x) => rt.$hashBytes(x)));
+      if (v == null) return [0];
+      return rt.$utf8(key(v)).concat([0xff]);
+    },
+    // A provided `Hasher::write_u32(x)` of your own hasher.
+    $hasherWrite(h, x, bits) {
+      return ownMethod(h, "write")(rt.$toBytes(x, bits, true));
     },
     // `u8::try_from(x)` / `x.try_into()` between integer types: `Err` when out of range.
     $tryInt(x, bits, signed, big) {
@@ -2546,7 +2785,7 @@
       return `{${Array.from(s, (x) => fmt(x)).join(", ")}}`;
     },
     $dbgOpt(x, fmt) {
-      return x == null ? "None" : `Some(${fmt(x)})`;
+      return x == null ? "None" : `Some(${fmt(unsome(x))})`;
     },
     $dbgVec(v, fmt) {
       return `[${v.map((x) => fmt(x)).join(", ")}]`;
@@ -3570,6 +3809,17 @@
   // ---- `Drop`: a value going out of scope runs its type's `drop`, then its fields' (in
   // declaration order) and its elements'. Each object is dropped once, however it's reached.
   const dropped = new WeakSet();
+  // Fields moved out of a struct (`let x = s.inner;`), by struct: dropping it skips them.
+  const movedOut = new WeakMap();
+  rt.$moveOut = (o, k) => {
+    const v = o[k];
+    if (v !== null && typeof v === "object") {
+      let s = movedOut.get(o);
+      if (!s) movedOut.set(o, (s = new Set()));
+      s.add(k);
+    }
+    return v;
+  };
   rt.$drop = (v) => {
     // A closure drops the values it owns (`move` captures, see `$own`).
     if (typeof v === "function" && v.$caps && !dropped.has(v)) {
@@ -3594,7 +3844,8 @@
     } else if (v instanceof rt.RefCell) {
       rt.$drop(v.v);
     } else if (!(v instanceof Iter)) {
-      for (const k of Object.keys(v)) if (k !== "$tag") rt.$drop(v[k]);
+      const gone = movedOut.get(v);
+      for (const k of Object.keys(v)) if (k !== "$tag" && !gone?.has(k)) rt.$drop(v[k]);
     }
   };
   // A closure that owns captured values with a `Drop` impl: they drop when it does.
@@ -3605,6 +3856,17 @@
   // The end of a block: its values, last declared first.
   rt.$dropAll = (list) => {
     for (let i = list.length - 1; i >= 0; i--) list[i]();
+  };
+  // A `Cursor`'s data as bytes: a string's UTF-8 (kept for the next read), or the array itself.
+  let ioBytesOf = null;
+  let ioBytes = null;
+  rt.$ioBytes = (x) => {
+    if (typeof x !== "string") return x;
+    if (ioBytesOf !== x) {
+      ioBytes = rt.$utf8(x);
+      ioBytesOf = x;
+    }
+    return ioBytes;
   };
   // `Cow::to_mut`: a borrowed cow (tag 0) becomes owned (tag 1) by a copy, in place.
   rt.$cowToMut = (c) => {
@@ -3644,7 +3906,7 @@
       case "unit":
         return "null";
       case "opt":
-        return v == null ? "null" : jsonOut(v, s.s, pretty, ind);
+        return v == null ? "null" : jsonOut(unsome(v), s.s, pretty, ind);
       case "vec":
       case "set":
         return arr(Array.from(v, (x) => sub(x, s.s)));
@@ -4780,7 +5042,7 @@
         if (n.k !== "null") throw jsonInvalid(n, s);
         return undefined;
       case "opt":
-        return n.k === "null" ? null : jsonIn(n, s.s);
+        return n.k === "null" ? null : some(jsonIn(n, s.s));
       case "vec": {
         if (n.k !== "arr") throw jsonInvalid(n, s);
         return n.v.map((x) => jsonIn(x, s.s));
@@ -5142,6 +5404,94 @@
     }
     return k;
   }
+  // The bundled `react` crate and `jsx!`, over the page's React (`globalThis.React`, which
+  // Bitburner provides).
+  const reactOf = () => {
+    const R = globalThis.React;
+    if (!R) {
+      throw new CarciniPanic(
+        "`jsx!` needs React as `globalThis.React`: Bitburner provides it; elsewhere load React 17 (a <script> of its UMD build) before running the script",
+        "<react>",
+      );
+    }
+    return R;
+  };
+  // A child as React takes it: Rust's numbers as text (`i64`s are BigInts), `None` as nothing,
+  // `Vec`s as arrays.
+  const reactChild = (v) => {
+    if (v == null || typeof v === "string") return v ?? null;
+    if (typeof v === "number" || typeof v === "bigint") return String(v);
+    if (Array.isArray(v)) return v.map(reactChild);
+    if (typeof v === "object" && v.$$typeof) return v;
+    throw new CarciniPanic(
+      `a \`jsx!\` child must be a node, text, a number, or an Option / Vec of them, not ${typeof v === "object" ? (v.constructor?.name ?? "an object") : typeof v}`,
+      "<react>",
+    );
+  };
+  // `"color: red; font-size: 12px"` as `{color: "red", fontSize: "12px"}`.
+  const reactStyle = (css) => {
+    const out = {};
+    for (const decl of String(css).split(";")) {
+      const at = decl.indexOf(":");
+      if (at < 0) continue;
+      const name = decl.slice(0, at).trim();
+      if (!name) continue;
+      const key = name.startsWith("--") ? name : name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      out[key] = decl.slice(at + 1).trim();
+    }
+    return out;
+  };
+  const reactComponents = new WeakMap();
+  rt.$react = {
+    // `React.createElement(tag, props, ...children)`; `props` is a list of `[name, value]`
+    // (a `None` value leaves the prop out).
+    h(tag, props, children) {
+      const p = {};
+      for (const [k, v] of props ?? []) {
+        if (v == null) continue;
+        p[k] = k === "style" && typeof v === "string" ? reactStyle(v) : v;
+      }
+      const R = reactOf();
+      return R.createElement(tag === "" ? R.Fragment : tag, p, ...(children ?? []).map(reactChild));
+    },
+    node: reactChild,
+    // (Like the children of a JSX element: written out, not a list, so they need no keys.)
+    static(nodes) {
+      for (const n of nodes) if (n && typeof n === "object" && n._store) n._store.validated = true;
+      return nodes;
+    },
+    any: (v) => v,
+    style: reactStyle,
+    // A Rust fn or closure as a component: called with its props' values in `names` order. One
+    // wrapper per function, so React keeps the component's identity (and state) across renders.
+    component(f, names) {
+      let w = reactComponents.get(f);
+      if (!w) {
+        w = (props) => {
+          const r = f(...names.map((n) => props[n]));
+          return reactChild(r);
+        };
+        w.displayName = f.name || "component";
+        reactComponents.set(f, w);
+      }
+      return w;
+    },
+    useState: (init) => reactOf().useState(init),
+    // `()` deps: once, after the first render. A cleanup closure is returned as is.
+    useEffect(f, deps) {
+      const list = deps === undefined || deps === null ? [] : Array.isArray(deps) ? deps : [deps];
+      reactOf().useEffect(() => {
+        const r = f();
+        return typeof r === "function" ? r : undefined;
+      }, list);
+    },
+    useRef: (init) => reactOf().useRef(init),
+    call: (f, a) => f(a),
+    get: (r) => r.current,
+    set(r, v) {
+      r.current = v;
+    },
+  };
   rt.$regex = {
     // "" for a pattern that compiles, else the error.
     check(pat) {

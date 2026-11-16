@@ -172,10 +172,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Option and patterns
 
-- **`None` is `null`.** `Option<Option<T>>` can't be represented (`Some(None)` would equal
-  `None`), so it's rejected at compile time unless it's a temporary that `.flatten()` reads or
-  `.map(Some)` made. `Option<()>` works: a call giving one turns `()` (`undefined`) into a
-  non-null marker. `undefined` from JS reads as `None`.
+- **`None` is `null`, and `Some(x)` is `x`**, except where `x` is itself "nothing":
+  `Some(None)` is a marker object (one per depth: `Some(Some(None))` is the next), and
+  `Some(())` is `true`. So `Option<Option<T>>` and `Option<()>` work everywhere, but a value
+  handed to JS code as an `Option<Option<T>>` shows the marker, and serde_json writes `Some(None)`
+  as `null` (as serde does) and reads `null` as `None`. `undefined` from JS reads as `None`.
 - **A kept `hash_map::Entry` holds the map**: `btree_map::Entry`'s `get_mut` / `insert` assume a
   `HashMap`'s storage, and `let v = e.get_mut(); *v += 1;` (a binding of the `&mut`) is
   rejected as a borrow of an immutable `v`; write `*e.get_mut() += 1`.
@@ -296,15 +297,16 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 ## Drop, ranges, `Cow` and `std::io`
 
 - **`Drop` follows moves the move checker sees**: by `let`, assignment, argument, method that
-  takes `self`, struct / tuple / `vec!` literal, `return`, `break`, `?` and a closure capturing
-  it by value. A value moved out of a struct field is still dropped with the struct. A closure
-  given to a std method (`it.map(f)`) drops what it captured when its binding ends, where Rust
-  drops it with the adapter. A method taking `self` by value drops `self` at its end only when
-  the type has its own `Drop` or the body reads no field outside a `&` (it might move one out).
-  `Rc` is erased, so an `Rc<T>` holding a `Drop` value drops it with the first `Rc`, not
-  the last; `v.clear()`,
-  `truncate` and assigning a new value to a field don't drop the old elements. On a panic the
-  values in scope are dropped before the panic message is printed (Rust prints it first).
+  takes `self`, struct / tuple / `vec!` literal, `return`, `break`, `?`, a closure capturing it
+  by value, and a field moved out of a struct (`let x = s.inner;`: the struct drops the rest).
+  A closure given to a std method (`it.map(f)`) drops what it captured at the end of that
+  statement, with the adapter. A `move` closure that reads only a field with nothing to drop
+  (`tag.0`) leaves the value with its scope, as Rust 2021 captures the field. A method taking
+  `self` by value drops what's left of `self` at its end, unless it takes `self` apart with a
+  pattern. `Rc` is erased, so an `Rc<T>` holding a `Drop` value drops it with the first `Rc`,
+  not the last; `v.clear()`, `truncate` and assigning a new value to a field don't drop the old
+  elements. On a panic the values in scope are dropped before the panic message is printed
+  (Rust prints it first).
 - **A range made by `a..b` is an iterator until something asks for a `Range`** (a `let r =
   a..b`, a `Range<T>` field, parameter or return type), so `(0..5).start` isn't there.
 - **`Cow::to_mut()` can't change a string in place** (strings are immutable in JS): use it on
@@ -312,7 +314,40 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   and a `&str` are one type here), and `is_borrowed` / `is_owned` (unstable in Rust) aren't
   there.
 - **`stdin()` is always at its end**, as a script has no input stream: read input from
-  `ns.args`, a file or `ns.prompt` instead. `impl Read for T`, `Cursor` and files aren't there.
+  `ns.args`, a file or `ns.prompt` instead. Files aren't there.
+- **`Read` / `BufRead` are the io prelude's traits.** `BufRead::fill_buf` gives a copy of the
+  buffer (a `Vec<u8>`), and `lines()` / `split()` / `bytes()` read everything up front rather
+  than lazily. `Seek` isn't there. `Cursor::new(Vec::new())` is a `Cursor<Vec<u8>>` (as its
+  `Write` impl would say in Rust); another untyped `Vec` inside a `Cursor` needs an annotation. A
+  `Cursor` over a `String` accepts writes (Rust has no such impl), which don't change the string.
+
+## Std types and traits filled in
+
+- **`PhantomData`'s `{:?}` is `PhantomData<_>`**: Rust names the type (`PhantomData<i32>`), whose
+  name isn't known at run time.
+- **`Path` and `PathBuf` are one type**, a path's text, so a `&Path` and a `PathBuf` convert
+  freely, and paths are Unix-style on every host (`join` uses `/`; native Windows uses `\`). A
+  script has no file system: `exists()`, `is_file()` and `is_dir()` are always `false`.
+  Comparing and hashing paths goes by their text, not their components (`a//b` != `a/b`).
+- **`OsStr` / `OsString` are `String`**, so string methods work on them too and `into_string()`
+  never fails.
+- **`NonZeroU32` (and the other widths) is a `u32`**: arithmetic on it type-checks and nothing
+  stops a 0 that isn't made through `new`. `NonZeroU32::MIN` is `u32::MIN`.
+- **`fmt::Arguments` is a `String`**: `format_args!(..)` formats when it's made, and
+  `Arguments::as_str()` isn't there.
+- **`size_hint()` on std's iterators is exact** (what's left is counted, through a copy): Rust
+  gives `(0, Some(n))` after a `filter`. A custom iterator's comes from its own `size_hint`, or
+  `(0, None)`; its `len()` (with `impl ExactSizeIterator`) is that hint's lower bound, where Rust
+  also asserts the bounds agree.
+- **`x.hash(&mut your_hasher)` writes 8 bytes for every integer** (a `usize` / `u64`'s; Rust
+  writes 4 for an `i32`), and a struct's derived `Hash` writes its runtime key (a string), so the
+  `finish()` values match Rust's for `usize` / `u64` / `String` / `&str` keys and their `write_*`
+  calls only. `HashMap::with_hasher(..)` ignores the hasher: keys compare by value.
+- **`[T; N]::map` and slice `strip_prefix` also work on a `Vec`** (arrays and Vecs are one type
+  here).
+- **`self.0.fmt(f)` on a generic value** picks `Display` or `Debug` by the impl it's in when both
+  could apply, and a whole-number float in it takes no precision (`{:.2}` of `Wrap(2.0)` prints
+  `2`).
 
 ## Formatting
 
@@ -443,6 +478,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Fragments are matched by their tokens**, the way rustc's fragment parsers would split them:
   an `expr` ends at a top-level `,`, `;` or `=>`, a `ty` or `path` keeps commas inside `<..>`.
   Rules that rely on finer parsing (an `expr` followed by an operator token) can match differently.
+- **`compile_error!` under a platform `#[cfg]` never fires**: a predicate about the target
+  (`unix`, `target_os = ..`) counts as off, so `#[cfg(not(any(unix, windows)))]
+  compile_error!(..)` passes but so would `#[cfg(unix)] compile_error!(..)`.
+- **`env!` is an error and `option_env!` `None`**, except for Cargo's own variables, which get
+  placeholders (`CARGO_PKG_NAME` `"script"`, `CARGO_PKG_VERSION` `"0.1.0"`, `CARGO_MANIFEST_DIR`
+  `"."`, the rest empty): a script isn't built by cargo.
 - **Macros from other files come through `mod`**: a file sees the `#[macro_export]` macros of the
   files it loads with `mod x;` (and all of them with `#[macro_use]`), not those of files further away.
 

@@ -25,6 +25,10 @@ impl Checker<'_> {
     /// Whether `Default::default()` makes a `name`: an interface whose fields are all optional
     /// (an empty JS object).
     pub(super) fn iface_has_default(&self, name: &str) -> bool {
+        // (`JsValue::default()` is `undefined`.)
+        if name == "JsValue" {
+            return true;
+        }
         self.iface_buildable(name)
             && self.bindings.types[name]
                 .fields

@@ -24,6 +24,8 @@ mod coll_gen;
 mod consts_gen;
 #[path = "codegen_ext.rs"]
 mod ext;
+#[path = "codegen_gaps.rs"]
+mod gaps_gen;
 #[path = "codegen_iface.rs"]
 mod iface_gen;
 #[path = "codegen_json.rs"]
@@ -559,6 +561,7 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
         || crate::ufcs::has_prim_paths(src)
         || src.contains("include_str!")
         || src.contains("include_bytes!")
+        || crate::stdgaps::has_rewrites(src)
         // (`mac::show!(..)`, `#[derive(mac::Show)]`: a proc-macro crate, maybe)
         || src.contains("::")
     {
@@ -621,6 +624,7 @@ fn compile_text(
     let mut cg = Codegen {
         serde: None,
         drop_flags: HashMap::new(),
+        stmt_drops: Vec::new(),
         param_drops: Vec::new(),
         async_body: false,
         src,
@@ -730,6 +734,9 @@ struct Codegen<'a> {
     /// Locals whose value has a `Drop` impl somewhere in it: JS name -> the flag that says it
     /// still owns the value (cleared where it's moved).
     drop_flags: HashMap<String, String>,
+    /// Closures given to std methods in the statement being emitted: (flag, JS name), dropped
+    /// after it.
+    stmt_drops: Vec<(String, String)>,
     /// A function's by-value parameters to drop when its body ends: (JS access, type).
     param_drops: Vec<(String, Ty)>,
     /// The next block body is an `async` block's (emitted as a function body).
@@ -927,6 +934,52 @@ impl<'a> Codegen<'a> {
             self.base + usize::from(r.end()),
         );
         self.types.conversions.get(&key).cloned()
+    }
+
+    /// Whether `p` is an argument of a method that isn't one of the file's own types' (a std
+    /// method: `it.map(f)`).
+    fn std_method_arg(&self, p: &ast::PathExpr) -> bool {
+        let Some(m) = p
+            .syntax()
+            .parent()
+            .filter(|x| ast::ArgList::can_cast(x.kind()))
+            .and_then(|l| l.parent())
+            .and_then(ast::MethodCallExpr::cast)
+        else {
+            return false;
+        };
+        let Some(r) = m.receiver() else { return false };
+        !matches!(self.ty_of(r.syntax()), Some(Ty::Adt(n, _)) if self.types.adts.defs.contains_key(&n))
+    }
+
+    /// `s.inner` moved out of its struct, with something to drop: `κσ.$moveOut(s, "inner")`, so
+    /// dropping `s` later skips it (its new owner drops it).
+    fn field_move_out(&mut self, fe: &ast::FieldExpr, (f, t): (Frag, Ty)) -> (Frag, Ty) {
+        if !self.types.move_sites.contains(&self.range_of(fe.syntax())) || !self.needs_drop(&t) {
+            return (f, t);
+        }
+        let Some(recv) = fe.expr() else { return (f, t) };
+        if !matches!(self.ty_of(recv.syntax()), Some(Ty::Adt(..))) {
+            return (f, t);
+        }
+        let text = f.plain();
+        // (`<receiver>.<prop>`: split at the last `.`, when the property is a plain name.)
+        let Some(dot) = text.rfind('.') else {
+            return (f, t);
+        };
+        let (base, prop) = (&text[..dot], &text[dot + 1..]);
+        if base.is_empty()
+            || !prop
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            return (f, t);
+        }
+        let out = Frag::mapped(
+            self.off(fe.syntax()),
+            format!("κσ.$moveOut({base}, {})", js_string(prop)),
+        );
+        (out, t)
     }
 
     /// A call giving an `Option<()>`: `Some(())` as a non-null marker (`()` is `undefined`, which
@@ -1264,6 +1317,13 @@ impl<'a> Codegen<'a> {
                         self.line(Frag::default());
                     }
                 }
+                // `compile_error!("..");` as an item: an error unless it's under a `#[cfg]` that's
+                // off.
+                ast::Item::MacroCall(mc)
+                    if crate::macros::macro_name(mc).as_deref() == Some("compile_error") =>
+                {
+                    self.item_compile_error(mc);
+                }
                 other => {
                     let kind = match other {
                         ast::Item::MacroRules(_) => "`macro_rules!`",
@@ -1595,7 +1655,14 @@ impl<'a> Codegen<'a> {
         });
         let mut diverged = false;
         for stmt in list.statements() {
+            let saved_stmt_drops = std::mem::take(&mut self.stmt_drops);
             diverged |= self.emit_stmt(&stmt);
+            // (Closures handed to std methods in it: dropped now, as Rust drops the adapters.)
+            for (flag, js) in std::mem::replace(&mut self.stmt_drops, saved_stmt_drops) {
+                self.line(Frag::text(format!(
+                    "if ({flag}) {{ {flag} = false; κσ.$drop({js}); }}"
+                )));
+            }
             if let (Some(dk), ast::Stmt::LetStmt(l)) = (&list_js, &stmt)
                 && let Some(name) = self.let_drops(l)
                 && let Some(local) = self.lookup(name.text()).cloned()
@@ -1655,6 +1722,42 @@ impl<'a> Codegen<'a> {
     }
 
     /// The drop-tracked locals (JS name, drop flag) that closure `c` takes ownership of.
+    /// Whether the field `fe` reads is `Copy`: a number, `bool`, `char`, or declared as a
+    /// reference (`&'static str`, which is a `String` once references are erased).
+    fn copy_field(&self, fe: &ast::FieldExpr) -> bool {
+        use ra_ap_syntax::ast::HasName;
+        match self.ty_of(fe.syntax()) {
+            Some(Ty::Int(_) | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Unit) => return true,
+            Some(Ty::Str) => {}
+            _ => return false,
+        }
+        let (Some(base), Some(name)) = (fe.expr(), fe.name_ref()) else {
+            return false;
+        };
+        let Some(Ty::Adt(adt, _)) = self.ty_of(base.syntax()) else {
+            return false;
+        };
+        let field = name.text().to_string();
+        let Some(root) = fe.syntax().ancestors().last() else {
+            return false;
+        };
+        root.descendants()
+            .filter_map(ast::Struct::cast)
+            .filter(|st| st.name().is_some_and(|n| n.text() == adt.as_str()))
+            .any(|st| match st.field_list() {
+                Some(ast::FieldList::RecordFieldList(l)) => l.fields().any(|f| {
+                    f.name().is_some_and(|n| n.text() == field.as_str())
+                        && matches!(f.ty(), Some(ast::Type::RefType(_)))
+                }),
+                Some(ast::FieldList::TupleFieldList(l)) => field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| l.fields().nth(i))
+                    .is_some_and(|f| matches!(f.ty(), Some(ast::Type::RefType(_)))),
+                None => false,
+            })
+    }
+
     fn owned_captures(&self, c: &ast::ClosureExpr) -> Vec<(String, String)> {
         let Some(body) = c.body() else {
             return Vec::new();
@@ -1672,7 +1775,21 @@ impl<'a> Codegen<'a> {
         for p in body.syntax().descendants().filter_map(ast::PathExpr::cast) {
             if let Some(n) = p.path().and_then(|p| p.as_single_name_ref()) {
                 let moved = self.types.move_sites.contains(&self.range_of(p.syntax()));
-                names.push((n.text().to_string(), by_move || moved));
+                // (Rust 2021 captures `tag.0` itself: a field with nothing to drop is copied
+                // or borrowed, and `tag` stays with its scope.)
+                // (A type with its own `Drop` can't lose a field, so then all of it is captured.)
+                let own_drop = matches!(self.ty_of(p.syntax()), Some(Ty::Adt(n, _))
+                    if self.types.adts.defs.get(&n).is_some_and(|d| d.implements("Drop")));
+                // (A `Copy` field is copied out even then.)
+                let field_only = p
+                    .syntax()
+                    .parent()
+                    .and_then(ast::FieldExpr::cast)
+                    .is_some_and(|fe| {
+                        !self.ty_of(fe.syntax()).is_some_and(|t| self.needs_drop(&t))
+                            && (!own_drop || self.copy_field(&fe))
+                    });
+                names.push((n.text().to_string(), (by_move && !field_only) || moved));
             }
         }
         // (Macro arguments are tokens: `println!("{}", g.name)`, `"{g:?}"`.)
@@ -2668,7 +2785,7 @@ impl<'a> Codegen<'a> {
         let Some(inner) = inner else { return };
         let (source, mut by_mut_ref) = match &inner {
             ast::Expr::RefExpr(r) => (r.expr(), r.mut_token().is_some()),
-            e if is_call(e, &["iter", "iter_mut", "into_iter"]) => {
+            e if is_call(e, &["iter", "iter_mut", "into_iter"]) && !self.own_iter_call(e) => {
                 let mutable = matches!(e, ast::Expr::MethodCallExpr(m) if m.name_ref().is_some_and(|n| n.text() == "iter_mut"));
                 (receiver(e), mutable)
             }
@@ -2969,7 +3086,10 @@ impl<'a> Codegen<'a> {
                 let out = self.emit_method(m);
                 self.some_unit(m.syntax(), out)
             }
-            ast::Expr::FieldExpr(fe) => self.emit_field(fe),
+            ast::Expr::FieldExpr(fe) => {
+                let out = self.emit_field(fe);
+                self.field_move_out(fe, out)
+            }
             ast::Expr::AwaitExpr(a) => {
                 let Some(inner) = a.expr() else {
                     return (Frag::text("undefined"), Ty::Unknown);
@@ -3061,6 +3181,9 @@ impl<'a> Codegen<'a> {
                     Ty::Option(x) => *x,
                     _ => Ty::Unknown,
                 };
+                if nullable_payload(&value) {
+                    return (Frag::text(format!("κσ.$unsome({tmp})")), value);
+                }
                 (Frag::text(tmp), value)
             }
             ast::Expr::ArrayExpr(a) => self.emit_array(a),
@@ -3235,6 +3358,19 @@ impl<'a> Codegen<'a> {
                 {
                     return (Frag::text(cell.to_string()), local.ty.clone());
                 }
+                // A closure given to a std method (`it.map(f)`): dropped at the end of the
+                // statement, with the adapter that owns it in Rust.
+                if let Some(flag) = self.drop_flags.get(&local.js).cloned()
+                    && self.types.move_sites.contains(&self.range_of(p.syntax()))
+                    && matches!(local.ty, Ty::Closure { .. })
+                    && self.std_method_arg(p)
+                {
+                    let (js, ty) = (local.js.clone(), local.ty.clone());
+                    if !self.stmt_drops.iter().any(|(_, j)| *j == js) {
+                        self.stmt_drops.push((flag, js.clone()));
+                    }
+                    return (Frag::text(js), ty);
+                }
                 // A move of a value that would be dropped here: its new owner drops it.
                 if let Some(flag) = self.drop_flags.get(&local.js)
                     && self.types.move_sites.contains(&self.range_of(p.syntax()))
@@ -3264,7 +3400,7 @@ impl<'a> Codegen<'a> {
             }
             // `Some(x)` is `x` itself; `Ok`/`Err` are the runtime's constructors.
             let ctor = match name.text() {
-                "Some" => Some("((x) => x)"),
+                "Some" => Some("κσ.$some"),
                 "Ok" => Some("κσ.Ok"),
                 "Err" => Some("κσ.Err"),
                 _ => None,
@@ -4462,12 +4598,23 @@ impl<'a> Codegen<'a> {
             None => path_is(Some(path.clone()), "Some"),
         };
         if is_some {
-            // `Some(x)` is `x` itself.
+            // `Some(x)` is `x` itself, or a marker when `x` is an `Option` or `()`.
+            let first = c.arg_list().and_then(|l| l.args().next());
+            let nullable = first
+                .as_ref()
+                .and_then(|a| self.ty_of(a.syntax()))
+                .is_some_and(|t| nullable_payload(&t));
             let arg = self
                 .emit_args(c.arg_list(), &[])
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| Frag::text("undefined"));
+            if nullable {
+                return (
+                    arg.wrap("κσ.$some(", ")"),
+                    Ty::Option(Box::new(Ty::Unknown)),
+                );
+            }
             return (arg.wrap("(", ")"), Ty::Option(Box::new(Ty::Unknown)));
         }
         let std_alias = path.as_single_name_ref().and_then(|n| {
@@ -4564,6 +4711,9 @@ impl<'a> Codegen<'a> {
                 return r;
             }
             if let Some(r) = self.emit_std_call(c, &ss) {
+                return r;
+            }
+            if let Some(r) = self.emit_gaps_call(c, &ss) {
                 return r;
             }
         }
@@ -5204,6 +5354,11 @@ impl<'a> Codegen<'a> {
                 "cmp" | "partial_cmp" => helper("cmp", true),
                 "max" => helper("max", true),
                 "min" => helper("min", true),
+                // `self.0.fmt(f)`: `Display::fmt` / `Debug::fmt` delegation.
+                "fmt" if args_len(m) == 1 => {
+                    let debug = crate::typeck::delegated_fmt_is_debug(m.syntax(), true, true);
+                    self.fmt_delegate(rf.clone(), &rt, arg.clone(), debug)
+                }
                 // A method from a trait bound: dynamic dispatch.
                 _ => self.dyn_call(m, &rf, &method, name_off),
             };
@@ -5524,10 +5679,15 @@ impl<'a> Codegen<'a> {
                 self.lower_result_pat(tp, v, subject, out);
             }
             ast::Pat::TupleStructPat(tp) if path_is(tp.path(), "Some") => {
-                // `Some(x)` is represented by `x` itself.
+                // `Some(x)` is represented by `x` itself (a marker for `Some(None)`).
                 out.conds.push(Frag::text(format!("{subject} != null")));
                 if let Some(f) = tp.fields().next() {
-                    self.lower_pat(&f, subject, out);
+                    let nested = self.ty_of(f.syntax()).is_some_and(|t| nullable_payload(&t));
+                    if nested {
+                        self.lower_pat(&f, &format!("κσ.$unsome({subject})"), out);
+                    } else {
+                        self.lower_pat(&f, subject, out);
+                    }
                 }
             }
             ast::Pat::LiteralPat(lp) => {
@@ -5963,9 +6123,20 @@ impl<'a> Codegen<'a> {
             };
             return (f.wrap("", "[1]"), inner.clone());
         }
+        let nested = nullable_payload(inner);
         match method {
             "is_some" => (rf.clone().wrap("(", " != null)"), Ty::Bool),
             "is_none" => (rf.clone().wrap("(", " == null)"), Ty::Bool),
+            // (`Option<Option<T>>`: what the `Some` holds.)
+            "unwrap_or" if nested => (helper("unwrapOr", vec![a(0)], None), inner.clone()),
+            "unwrap_or_default" if nested => (
+                helper("unwrapOr", vec![Frag::text("null")], None),
+                inner.clone(),
+            ),
+            "replace" if nested => {
+                let v = a(0).wrap("κσ.$some(", ")");
+                (swap(self, v), opt)
+            }
             "unwrap" => (helper("unwrap", vec![], Some(&loc)), inner.clone()),
             "expect" => (helper("expect", vec![a(0)], Some(&loc)), inner.clone()),
             "unwrap_or" => {
@@ -5980,7 +6151,10 @@ impl<'a> Codegen<'a> {
             "take" => (swap(self, Frag::text("null")), opt),
             "replace" => (swap(self, a(0)), opt),
             "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" | "upgrade" => (rf, opt),
-            "flatten" => (rf, self.ty_of(m.syntax()).unwrap_or(Ty::Unknown)),
+            "flatten" => (
+                rf.wrap("κσ.$unsome(", ")"),
+                self.ty_of(m.syntax()).unwrap_or(Ty::Unknown),
+            ),
             "iter" | "into_iter" | "iter_mut" => (
                 rf.wrap("κσ.$optIter(", ")"),
                 self.ty_of(m.syntax()).unwrap_or(Ty::Unknown),
@@ -7097,6 +7271,7 @@ fn default_value(ty: &Ty) -> Option<String> {
         Ty::Iter { .. } => "κσ.$iterEmpty()".into(),
         Ty::RefCell(inner) => format!("new κσ.RefCell({}, \"RefCell\")", default_value(inner)?),
         // (An NS interface whose fields are all optional: the type checker made sure.)
+        Ty::Extern(n) if n == "JsValue" => "undefined".into(),
         Ty::Extern(_) => "{}".into(),
         Ty::Adt(n, args) => format!("{}.default()", class_view(escape_ident(n), args, &[])),
         other => other.default_js()?.into(),
@@ -7534,4 +7709,10 @@ fn macro_arg_names(node: &SyntaxNode) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether a `Some` of a `t` needs a marker: `t` is an `Option` or `()`, whose own values
+/// include `null` / `undefined`.
+fn nullable_payload(t: &Ty) -> bool {
+    matches!(t, Ty::Option(_) | Ty::Unit)
 }

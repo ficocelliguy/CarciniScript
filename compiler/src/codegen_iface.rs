@@ -74,8 +74,14 @@ impl Codegen<'_> {
         if !b.is_interface(name) || self.types.adts.defs.contains_key(*name) {
             return None;
         }
+        // (`JsValue::default()` is `undefined`.)
+        let value = if *name == "JsValue" {
+            "undefined"
+        } else {
+            "{}"
+        };
         Some((
-            Frag::mapped(self.off(c.syntax()), "{}"),
+            Frag::mapped(self.off(c.syntax()), value),
             Ty::Extern(name.to_string()),
         ))
     }

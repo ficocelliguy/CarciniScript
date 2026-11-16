@@ -291,10 +291,54 @@ pub fn __regex_char_len(hay: &str, at: usize) -> usize;
 #[js = "κσ.$cowToMut"]
 pub fn __cow_to_mut(cow: JsAny) -> JsAny;
 
+/// (A `std::io::Cursor`'s data as bytes: a string's UTF-8, or the `Vec<u8>` itself, so writes
+/// reach it.)
+#[js = "κσ.$ioBytes"]
+pub fn __io_bytes(data: JsAny) -> Vec<u8>;
+
 /// Print `text` (to stdout or stderr) and end the program with `code`; a Netscript script shows
 /// the text in the terminal (for the bundled `clap`'s `Error::exit`).
 #[js = "κσ.$exitWith"]
 pub fn __exit_with(code: i32, text: &str, to_stdout: bool) -> !;
+
+// ---- React (for the bundled `react` crate and `jsx!`)
+
+/// A React node: what `jsx!` and `react::h` make, and what `ns.print_raw` shows.
+pub struct ReactNode {}
+
+/// (`React.createElement(tag, props, ...children)`: `tag` a string or a component.)
+#[js = "κσ.$react.h"]
+pub fn __react_h(tag: JsAny, props: JsAny, children: JsAny) -> ReactNode;
+/// (Text, a number, `null` or an array as a node.)
+#[js = "κσ.$react.node"]
+pub fn __react_node(value: JsAny) -> ReactNode;
+/// (A component: `f` called with its props' values in `names` order, kept per function.)
+#[js = "κσ.$react.component"]
+pub fn __react_component(f: JsAny, names: JsAny) -> JsAny;
+/// (`React.useState(init)`: `[value, setter]`.)
+#[js = "κσ.$react.useState"]
+pub fn __react_use_state(init: JsAny) -> JsAny;
+/// (`React.useEffect(f, deps)`.)
+#[js = "κσ.$react.useEffect"]
+pub fn __react_use_effect(f: JsAny, deps: JsAny);
+/// (`React.useRef(init)`.)
+#[js = "κσ.$react.useRef"]
+pub fn __react_use_ref(init: JsAny) -> JsAny;
+/// (Any value, as a typed `JsValue`.)
+#[js = "κσ.$react.any"]
+pub fn __react_any(value: JsAny) -> JsValue;
+/// (Children written out in `jsx!`, marked so React doesn't ask them for keys.)
+#[js = "κσ.$react.static"]
+pub fn __react_static(nodes: Vec<ReactNode>) -> Vec<ReactNode>;
+/// (`f(arg)` for a JS function value.)
+#[js = "κσ.$react.call"]
+pub fn __react_call(f: JsAny, arg: JsAny) -> JsAny;
+/// (`r.current`.)
+#[js = "κσ.$react.get"]
+pub fn __react_get(r: JsAny) -> JsAny;
+/// (`r.current = v`.)
+#[js = "κσ.$react.set"]
+pub fn __react_set(r: JsAny, v: JsAny);
 
 /// An IANA zone's offset from UTC, in seconds, at `ms` (for the bundled `chrono-tz`).
 #[js = "κσ.$tzOffset"]

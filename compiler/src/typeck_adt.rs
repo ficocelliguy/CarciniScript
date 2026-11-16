@@ -883,6 +883,19 @@ impl Checker<'_> {
             Some("Sum" | "Product") => {}
             // Marker traits (`unsafe impl Send for T {}`): nothing to do in JS.
             Some("Iterator" | "IntoIterator" | "Send" | "Sync" | "Unpin") => {}
+            // More markers: `len()` comes from `size_hint`, `next_back` is an ordinary method
+            // (`.rev()` calls it), unwinding isn't a thing in JS, and a hasher's `write` /
+            // `finish` (a builder's `build_hasher`) are ordinary methods too.
+            Some(
+                "ExactSizeIterator"
+                | "FusedIterator"
+                | "DoubleEndedIterator"
+                | "TrustedLen"
+                | "UnwindSafe"
+                | "RefUnwindSafe"
+                | "Hasher"
+                | "BuildHasher",
+            ) => {}
             // `deref` / `deref_mut` are ordinary methods; auto-deref calls them.
             Some("Deref") => {}
             // `as_ref()` / `as_mut()` / `borrow()`: ordinary methods too (`impl AsRef<str> for Host`).
@@ -1034,8 +1047,11 @@ impl Checker<'_> {
         {
             let ast::AssocItem::Fn(f) = item else {
                 let is_deref = trait_name.as_deref() == Some("Deref");
-                // (`type Err` / `type Error`.)
-                let from_str = matches!(trait_name.as_deref(), Some("FromStr" | "TryFrom"));
+                // (`type Err` / `type Error`; a `BuildHasher`'s `type Hasher`.)
+                let from_str = matches!(
+                    trait_name.as_deref(),
+                    Some("FromStr" | "TryFrom" | "BuildHasher")
+                );
                 let user_trait = trait_name
                     .as_deref()
                     .is_some_and(|t| self.adts.traits.contains_key(t));
@@ -1841,6 +1857,10 @@ impl Checker<'_> {
             }
             ret
         };
+        // `self.inner.fmt(f)` of a derived `Debug`, your own `Hasher`'s `write_u32`, ..
+        if let Some(r) = self.gaps_method(m, recv, &t, method, args) {
+            return r;
+        }
         match method {
             // `Rc<T>` is erased, so `rc.clone()` on a type without `Clone` is an `Rc` clone.
             "clone" if !self.implements(&t, "Clone") => {
