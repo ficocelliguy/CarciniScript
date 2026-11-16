@@ -132,6 +132,12 @@
     "panic": null
   },
   {
+    "file": "cow.rs",
+    "stdout": "a_b_c abc \"a_b_c\" \"abc\"\n5 ABC true true\ntrue\na_b_c\nfrom true\nstatic n=3\n[2, 4, 6] [2, 4] true 2\n[2, 4, 6, 8] true\nhi\n[\"x_y\", \"z\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "crate_anyhow.rs",
     "stdout": "a -> 8080\nb failed: reading b\nreading b\n\nCaused by:\n    0: port \"nope\" isn't a number\n    1: invalid digit found in string\n  0: reading b\n  1: port \"nope\" isn't a number\n  2: invalid digit found in string\n  root: invalid digit found in string\nc failed: reading c\nreading c\n\nCaused by:\n    port 70000 out of range\n  0: reading c\n  1: port 70000 out of range\n  root: port 70000 out of range\nd failed: reading d\nreading d\n\nCaused by:\n    port must be positive, got 0\n  0: reading d\n  1: port must be positive, got 0\n  root: port must be positive, got 0\ne failed: missing key\nmissing key\n  0: missing key\n  root: missing key\nSome(1)\ny not found / y not found\nCondition failed: `n % 2 == 0 && n > 0`\nouter\nz not found\ntop\n\nCaused by:\n    0: mid\n    1: deep\n",
     "exitCode": 1,
@@ -152,6 +158,18 @@
   {
     "file": "crate_itertools.rs",
     "stdout": "3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5\n[1, 1, 2, 3, 3, 4, 5, 5, 5, 6, 9]\n[9, 6, 5, 5, 5, 4, 3, 3, 2, 1, 1]\n[3, 3, 6, 9, 1, 1, 4, 2, 5, 5, 5]\n[3, 1, 4, 5, 9, 2, 6]\n[3, 1, 4, 2]\n[1, 2, 3, 1]\n[1, 5, 3]\n[-2, 3, -3, 4, 4, -7, 4, -1, -2, 2]\n123 234 345 \n[(1, 2), (3, 4), (5, 6)]\n[[1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]]\n[[1, 2], [1, 3], [2, 1], [2, 3], [3, 1], [3, 2]]\n[[1, 1], [1, 2], [1, 3], [2, 2], [2, 3], [3, 3]]\n[[], [1], [2], [3], [1, 2], [1, 3], [2, 3], [1, 2, 3]]\n[(1, 'a'), (1, 'b'), (2, 'a'), (2, 'b')]\n[[1, 3], [1, 4], [2, 3], [2, 4]]\n[1, 10, 2, 11, 3, 12, 13, 14]\n[1, 0, 2, 0, 3]\n[1, 2, 3, 4, 7, 9]\n[1, 2, 3, 4]\n[4, 8, 10]\n[(1, 2), (2, 1), (3, 2), (4, 1), (5, 3), (6, 1), (9, 1)]\ntrue false true\ntrue Some((4, 5))\n[1, 1, 2] [9, 6]\na [1, 2]\nb [3]\na [4]\na [1, 2, 4]\nb [3]\n[2, 4]\nx 5\nNone\n[8, 9]\n[\"ab\", \"ab\", \"ab\"]\n1-4-9\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_log.rs",
+    "stdout": "enabled before: false\ninfo true debug false\nmax INFO\nWarn INFO Debug true\nDEBUG\ntotal 30\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_num.rs",
+    "stdout": "6 0.75\n42 3\ntrue false true\n0 1\ntrue -1 true\n255 -32768\nNone None Some(2)\nSome(255) None Some(3)\nSome(42.0)\n81 2.25\n10 0\n9\n0 1\n",
     "exitCode": 0,
     "panic": null
   },
@@ -212,6 +230,12 @@
   {
     "file": "display.rs",
     "stdout": "$1234.56 Money(123456) [$0.05]\n8 $1234.56\nidle / Idle\nhacking n00dles with 8 threads / Hacking { target: \"n00dles\", threads: 8 }\nfailed: no root / Failed(\"no root\")\n== income ==\nhack      $0.99\ngrow      $2500.75\n2 rows\n$0.01, $10.00\ntotal: $0.42\n4 home 16 home\n\"1-2!\\n$0.07\"\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "drop_order.rs",
+    "stdout": "inner\ndrop b\ndrop c\nmoved d into e: d\ndrop r1\nreassigned r2\ndrop temp\ndrop statement\nconsume arg\ndrop arg\npass through\nkept through\ndrop early-a\nearly 1\ndrop early-b\ndrop early-a\nearly 2\ndrop try\nOk(5)\ndrop try\nErr(\"bad\")\niter 0\ndrop loop0\ndrop loop1\ndrop v1\ndrop v2\nend of main p1 true\ndrop opt\ndrop through\ndrop pair (p1 p2)\ndrop p1\ndrop p2\ndrop r2\ndrop d\ndrop a\n",
     "exitCode": 0,
     "panic": null
   },
@@ -404,6 +428,12 @@
   {
     "file": "int_exhaustive.rs",
     "stdout": "zero low high\n-1 0 1\n1 2 3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "io_std.rs",
+    "stdout": "\"x=5!\\nraw\" true\nx=5!\nraw1. a\n2. b\n\nto stdout 1\nbuffered 2\nno newline, \npartial line\nOk(8)\nnegative: -1 | Custom { kind: InvalidInput, error: \"negative: -1\" } | InvalidInput\ncustom true\nentity not found | Kind(NotFound)\nboxed: negative: -3\nread 0 \"\"\nlines 0\n",
     "exitCode": 0,
     "panic": null
   },
@@ -608,6 +638,12 @@
   {
     "file": "qualified_calls.rs",
     "stdout": "captain 7 up 7\npilot wizard\nup 7\nhello cat HELLO\ncat [\"hello cat\", \"hello cat\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "range_values.rs",
+    "stdout": "0..5 0 5 5 false\n[30, 40] true false\nSpan { name: \"mid\", r: 2..4 }\n2 3 \n1..=3 1 3 true\n4..=6 sum 15\nworld\n[0..2, 5..7, 3..3]\n[false, false, true]\n12\ntrue false\n1..4 true\n[0, 1, 4, 9]\n",
     "exitCode": 0,
     "panic": null
   },

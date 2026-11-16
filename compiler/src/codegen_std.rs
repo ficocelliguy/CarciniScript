@@ -622,6 +622,7 @@ impl Codegen<'_> {
                     )
                 }
             }
+            ["drop"] | ["mem", "drop"] => call("drop", vec![emit(self, 0)]),
             ["mem", "swap"] => {
                 let (a, b) = (args.first()?.clone(), args.get(1)?.clone());
                 let (af, _) = self.emit_expr(&strip_refs(&a), None);

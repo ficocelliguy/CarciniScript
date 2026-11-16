@@ -888,8 +888,71 @@ fn bundled_macros(src: &str) -> String {
     if src.contains("anyhow") {
         out.push_str(ANYHOW_MACROS);
     }
+    if uses_log(src) {
+        out.push_str(&own_macros_left_out(LOG_MACROS, src));
+    }
+    if src.contains("tokio::") || src.contains("use tokio") {
+        out.push_str(&own_macros_left_out(TOKIO_MACROS, src));
+    }
     out
 }
+
+/// `macros` without the ones `src` defines itself (`macro_rules! debug { .. }` of its own).
+fn own_macros_left_out(macros: &str, src: &str) -> String {
+    let mut out = String::new();
+    for block in macros.split("macro_rules! ").skip(1) {
+        let name: String = block
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !src.contains(&format!("macro_rules! {name}")) {
+            out.push_str("macro_rules! ");
+            out.push_str(block);
+        }
+    }
+    out
+}
+
+/// Whether `src` uses the bundled `log` (or sets up a logger).
+pub(crate) fn uses_log(src: &str) -> bool {
+    src.contains("log::")
+        || src.contains("use log")
+        || src.contains("env_logger")
+        || src.contains("simple_logger")
+}
+
+/// The bundled `log`'s macros: `info!(..)` and the other levels (also with `target: ..`),
+/// `log!(level, ..)` and `log_enabled!(level)`.
+const LOG_MACROS: &str = r#"
+macro_rules! log {
+    (target: $t:expr, $lvl:expr, $($arg:tt)+) => { __log_emit($lvl, &format!($($arg)+)) };
+    ($lvl:expr, $($arg:tt)+) => { __log_emit($lvl, &format!($($arg)+)) };
+}
+macro_rules! log_enabled {
+    (target: $t:expr, $lvl:expr) => { __log_enabled($lvl) };
+    ($lvl:expr) => { __log_enabled($lvl) };
+}
+macro_rules! error {
+    (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Error, &format!($($arg)+)) };
+    ($($arg:tt)+) => { __log_emit(LogLevel::Error, &format!($($arg)+)) };
+}
+macro_rules! warn {
+    (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Warn, &format!($($arg)+)) };
+    ($($arg:tt)+) => { __log_emit(LogLevel::Warn, &format!($($arg)+)) };
+}
+macro_rules! info {
+    (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Info, &format!($($arg)+)) };
+    ($($arg:tt)+) => { __log_emit(LogLevel::Info, &format!($($arg)+)) };
+}
+macro_rules! debug {
+    (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Debug, &format!($($arg)+)) };
+    ($($arg:tt)+) => { __log_emit(LogLevel::Debug, &format!($($arg)+)) };
+}
+macro_rules! trace {
+    (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Trace, &format!($($arg)+)) };
+    ($($arg:tt)+) => { __log_emit(LogLevel::Trace, &format!($($arg)+)) };
+}
+"#;
 
 /// `anyhow!("{x}")` / `anyhow!(err)`, `bail!(..)` and `ensure!(cond, ..)`, as anyhow defines them.
 const ANYHOW_MACROS: &str = r#"
@@ -1224,3 +1287,24 @@ pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resol
     }
     out
 }
+
+/// The bundled tokio's `join!` (every future is started, then each awaited, so they run
+/// together) and `try_join!` (the first error ends it), for up to six futures.
+const TOKIO_MACROS: &str = r#"
+macro_rules! join {
+    ($a:expr $(,)?) => {{ let __ja = $a; (__ja.await,) }};
+    ($a:expr, $b:expr $(,)?) => {{ let __ja = $a; let __jb = $b; (__ja.await, __jb.await,) }};
+    ($a:expr, $b:expr, $c:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; (__ja.await, __jb.await, __jc.await,) }};
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; let __jd = $d; (__ja.await, __jb.await, __jc.await, __jd.await,) }};
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; let __jd = $d; let __je = $e; (__ja.await, __jb.await, __jc.await, __jd.await, __je.await,) }};
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $g:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; let __jd = $d; let __je = $e; let __jg = $g; (__ja.await, __jb.await, __jc.await, __jd.await, __je.await, __jg.await,) }};
+}
+macro_rules! try_join {
+    ($a:expr $(,)?) => {{ let __ja = $a; async { Ok((__ja.await?,)) }.await }};
+    ($a:expr, $b:expr $(,)?) => {{ let __ja = $a; let __jb = $b; async { Ok((__ja.await?, __jb.await?,)) }.await }};
+    ($a:expr, $b:expr, $c:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; async { Ok((__ja.await?, __jb.await?, __jc.await?,)) }.await }};
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; let __jd = $d; async { Ok((__ja.await?, __jb.await?, __jc.await?, __jd.await?,)) }.await }};
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; let __jd = $d; let __je = $e; async { Ok((__ja.await?, __jb.await?, __jc.await?, __jd.await?, __je.await?,)) }.await }};
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $g:expr $(,)?) => {{ let __ja = $a; let __jb = $b; let __jc = $c; let __jd = $d; let __je = $e; let __jg = $g; async { Ok((__ja.await?, __jb.await?, __jc.await?, __jd.await?, __je.await?, __jg.await?,)) }.await }};
+}
+"#;

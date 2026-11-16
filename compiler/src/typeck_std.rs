@@ -145,7 +145,9 @@ impl Checker<'_> {
                 self.str_pattern(a1);
                 iter(Ty::Str)
             }
-            (Ty::Str, "to_ascii_uppercase" | "to_ascii_lowercase" | "to_owned") => {
+            // (`into_owned()`: what a `Cow<str>` gives; `replace` and `from_utf8_lossy` give a
+            // `String` here.)
+            (Ty::Str, "to_ascii_uppercase" | "to_ascii_lowercase" | "to_owned" | "into_owned") => {
                 count(self, 0);
                 Ty::Str
             }
@@ -650,6 +652,14 @@ impl Checker<'_> {
                     Some(a) => self.infer(a, None),
                     None => Ty::Unknown,
                 }
+            }
+            // `drop(x)`: `x` is dropped now.
+            ["drop"] | ["mem", "drop"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.infer(a, None);
+                }
+                Ty::Unit
             }
             ["mem", "swap"] => {
                 count(self, 2);

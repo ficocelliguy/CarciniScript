@@ -10,6 +10,11 @@ const SYNC: &str = include_str!("sync_prelude.rs");
 const EITHER: &str = include_str!("either_prelude.rs");
 const SERDE_JSON: &str = include_str!("serde_json_prelude.rs");
 const REGEX: &str = include_str!("regex_prelude.rs");
+const COW: &str = include_str!("cow_prelude.rs");
+const IO: &str = include_str!("io_prelude.rs");
+const LOG: &str = include_str!("log_prelude.rs");
+const NUM: &str = include_str!("num_prelude.rs");
+const TOKIO: &str = include_str!("tokio_prelude.rs");
 
 /// `text` with the preludes it needs after it, when it names their types and doesn't declare
 /// them itself.
@@ -63,6 +68,43 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
     {
         out.push('\n');
         out.push_str(REGEX);
+    }
+    if text.contains("Cow") && !text.contains("// (cow prelude)") && !declares("Cow") {
+        out.push('\n');
+        out.push_str(COW);
+    }
+    // (After the rewrite: `io::Error` is `IoError`, `io::stdout()` `__io_stdout()`, ..)
+    let io_names = ["IoError", "IoWrite", "__io_std", "IoStd", "IoBuf"];
+    if io_names.iter().any(|n| text.contains(n))
+        && !text.contains("// (io prelude)")
+        && !declares("IoError")
+    {
+        out.push('\n');
+        out.push_str(IO);
+    }
+    if crate::mbe::uses_log(text) && !text.contains("// (log prelude)") && !declares("LogLevel") {
+        out.push('\n');
+        out.push_str(LOG);
+    }
+    // (After the rewrite: `num::Integer` is `NumInteger`, `num::integer::gcd` `__num_gcd`, ..)
+    let num_names = [
+        "NumInteger",
+        "NumZero",
+        "NumOne",
+        "NumSigned",
+        "NumBounded",
+        "NumToPrimitive",
+        "NumFromPrimitive",
+        "__num_",
+    ];
+    if num_names.iter().any(|n| text.contains(n)) && !text.contains("// (num prelude)") {
+        out.push('\n');
+        out.push_str(NUM);
+    }
+    let tokio_names = ["__tokio_", "TokioJoin"];
+    if tokio_names.iter().any(|n| text.contains(n)) && !text.contains("// (tokio prelude)") {
+        out.push('\n');
+        out.push_str(TOKIO);
     }
     (!out.is_empty()).then(|| format!("{text}{out}"))
 }

@@ -147,6 +147,7 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
             mutable: *mutable,
         },
         Ty::IntoIter(e) => Ty::IntoIter(s(e)),
+        Ty::Range(e, incl) => Ty::Range(s(e), *incl),
         Ty::Closure { params, ret } => Ty::Closure {
             params: params.iter().map(|p| subst(p, m)).collect(),
             ret: s(ret),

@@ -129,7 +129,9 @@ A few popular crates are built in and need no `Cargo.toml`: `rand` (`rng.gen_ran
 `OnceLock`), `either`, `cfg_if!`, `hashbrown`, `serde` + `serde_json`
 (`serde_json::to_string(&state)?`, `from_str::<Config>(&text)?`, `json!`, `Value`), `regex`
 (`Regex::new(r"(\d+)GB")`, `captures`, `replace_all`) and `rayon` (`par_iter()`, run on one
-thread). `extern crate x;` works for these. See [FEATURES.md](docs/FEATURES.md) for what each
+thread), `log` (`info!`, with `env_logger`), `num` (`Zero`, `gcd`, ..) and `tokio`
+(`tokio::spawn`, `sleep`, `join!`, on the script's event loop). `extern crate x;` works for
+these. See [FEATURES.md](docs/FEATURES.md) for what each
 covers and [RUST_GAPS.md](docs/RUST_GAPS.md) for what differs (rand's seeded sequences, for one).
 
 ### JS globals

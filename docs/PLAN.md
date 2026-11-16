@@ -244,6 +244,12 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      small runtime engine that translates Rust's syntax to `RegExp`, byte offsets), `rayon`
      (sequential, a rewrite) and `extern crate`; `?` checks an error type that `parse()` settles
      later; JSON schemas use the class's property names (`ram$`)
+   - [x] The remaining std gaps real programs hit: `impl Drop` (try/finally per block, a flag
+     per binding cleared where the move checker sees a move), ranges as values (`Ty::Range`, the
+     same iterator at run time), `Cow` and `std::io` (Rust-source preludes, `std::io` names
+     renamed into them), `b"..."`, `async` blocks; and the crates `log` / `env_logger`, `num`
+     (`num-traits`, `num-integer`) and `tokio` / `futures` (preludes, bundled macros and renames
+     of their paths)
    - [x] `std::time` (`Duration`, `Instant`, `SystemTime`) as a Rust-source prelude compiled in
      when used, diff-tested against rustc; `js::structured_clone`; Formatter specs for
      hand-written `Display` / `Debug` (`f.width()`, `f.precision()`, `f.pad(..)`); `impl Sum` /

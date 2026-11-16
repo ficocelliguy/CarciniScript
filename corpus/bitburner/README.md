@@ -1,0 +1,22 @@
+# Bitburner corpus
+
+Bitburner scripts written as idiomatic Rust, not trimmed to what CarciniScript supports today. They
+use the typed NS bindings (`bindings/ns.rs`) as a Rust programmer would expect them to work, and
+no threads. Modeled on the scripts in `BitburnerScripts` and on bitburner-src's darknet code.
+[GAPS.md](GAPS.md) lists what CarciniScript is missing to compile and run them.
+
+| Script | What it does | Leans on |
+|---|---|---|
+| `net.rs` | Shared module: BFS crawler, rooting, RAM pool, top-k | `Deref` newtype, `impl Iterator` with a lifetime, `BinaryHeap` + `Reverse` + hand-written `Ord`, `#[macro_export]` |
+| `batcher.rs` + `hwgw.rs` | HWGW batcher: target scoring, prep, formulas-based thread math, timed launches, port reports | `Index<Step>`, thiserror with `#[source]`, `TryFrom<&[JsValue]>`, `Duration` math, bisection over a closure, `Rc<RefCell>` + `at_exit`, labeled loops, serde |
+| `darknet.rs` + `dn_models.rs` + `dn_tasks.rs` | Darknet crawler: cracks each server model, shares a password vault, spreads itself, runs chores | `FromStr` model enum, generic `async fn`, `let`-`else`, iterative maze DFS, recursive-descent parser, itertools, `LazyLock<Regex>`, `#[cfg(test)]` tests |
+| `contracts.rs` | Coding contract solver for 23 contract types | `fn` pointer table, `#[serde(untagged)]`, DP, BFS, `scan`/`try_fold`/`chunk_by` |
+| `hacknet.rs` | Hacknet upgrades by payback time, hash spending | enum with data, `min_by`, `clamp` |
+| `servers.rs` | Buys and upgrades cloud servers | anyhow, `successors`, slice patterns |
+| `stocks.rs` | Stock trader with or without 4S data | const generics, `Into<f64>` bound, `Display` table |
+| `go.rs` | IPvGO player | `Not`, `Index<Point>`, `TryFrom<char>`, flood fill |
+| `deploy.rs` + `early_hack.rs` | Roots everything and fills it with the early-game loop | `Box<dyn Fn>` strategy map, ports |
+| `dashboard.rs` | Tail-window stats from a port | `TryFrom<&'a str>` borrowed parse, `fmt::Write`, `Instant` |
+
+Each top-level script is a Bitburner script (`pub async fn main(ns: NS)`). `mod x;` loads a
+sibling as a shared module, so `batcher.rs` and `hwgw.rs` share the `Op` and `Report` types.

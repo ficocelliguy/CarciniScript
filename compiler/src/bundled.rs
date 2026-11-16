@@ -8,7 +8,7 @@
 
 use ra_ap_syntax::{
     AstNode, SourceFile, TextRange,
-    ast::{self, HasArgList, HasAttrs, HasGenericParams, HasName},
+    ast::{self, HasArgList, HasAttrs, HasGenericArgs, HasGenericParams, HasName},
 };
 
 use crate::macros::EDITION;
@@ -23,6 +23,7 @@ pub fn uses_bundled(text: &str) -> bool {
         || text.contains("rayon")
         || text.contains("serde_json")
         || text.contains("regex")
+        || uses_renamed(text)
 }
 
 /// An error in the original text: (start, end, message).
@@ -34,6 +35,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     let thiserror = text.contains("thiserror");
     let rayon_used = text.contains("rayon");
     let json_used = text.contains("serde_json");
+    let tokio_used = text.contains("tokio::");
     // (Not where `regex` is the file's own module.)
     let regex_used =
         (text.contains("regex::") || text.contains("use regex")) && !text.contains("mod regex");
@@ -43,6 +45,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
             .is_some_and(|(k, i)| k == "serde_json" && i == "Map");
     let mut edits: Vec<(TextRange, String)> = Vec::new();
     let mut errors: Vec<(TextRange, String)> = Vec::new();
+    rename_crate_items(&file, text, &mut edits);
     for node in file.syntax().descendants() {
         if thiserror && let Some(adt) = ast::Adt::cast(node.clone()) {
             derive_error(&adt, &mut edits, &mut errors);
@@ -106,6 +109,9 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
             if let Some(r) = r {
                 edits.push((r, "std::collections::BTreeMap".into()));
             }
+        }
+        if tokio_used {
+            tokio_rewrite(&node, &mut edits);
         }
         if regex_used {
             regex(&node, &mut edits);
@@ -1575,4 +1581,355 @@ fn regex_tokens(tt: &ast::TokenTree, edits: &mut Vec<(TextRange, String)>) {
         };
         edits.push((toks[i].text_range().cover(toks[j].text_range()), to.into()));
     }
+}
+
+// ---------------------------------------------------------------- crate items as prelude items
+
+/// A crate (or std module) whose items are a prelude's under other names (so they can't collide
+/// with yours): the paths that reach it, its names, what `use krate::*` brings in, and the error
+/// its own `Result<T>` alias adds.
+struct Renames {
+    roots: &'static [&'static str],
+    names: &'static [(&'static str, &'static str)],
+    star: &'static [&'static str],
+    result_err: Option<&'static str>,
+}
+
+const IO_RENAMES: Renames = Renames {
+    roots: &[
+        "io",
+        "std::io",
+        "::std::io",
+        "io::prelude",
+        "std::io::prelude",
+    ],
+    names: &[
+        ("Error", "IoError"),
+        ("ErrorKind", "IoErrorKind"),
+        ("Write", "IoWrite"),
+        ("stdout", "__io_stdout"),
+        ("stderr", "__io_stderr"),
+        ("stdin", "__io_stdin"),
+        ("Stdout", "IoStdout"),
+        ("StdoutLock", "IoStdout"),
+        ("Stderr", "IoStderr"),
+        ("StderrLock", "IoStderr"),
+        ("Stdin", "IoStdin"),
+        ("StdinLock", "IoStdin"),
+        ("BufWriter", "IoBufWriter"),
+        ("BufReader", "IoBufReader"),
+    ],
+    star: &["Write", "Error", "ErrorKind", "stdout", "stderr", "stdin"],
+    result_err: Some("IoError"),
+};
+
+const LOG_RENAMES: Renames = Renames {
+    roots: &["log"],
+    names: &[
+        ("Level", "LogLevel"),
+        ("LevelFilter", "LogLevelFilter"),
+        ("set_max_level", "__log_set_max_level"),
+        ("max_level", "__log_max_level"),
+    ],
+    star: &["Level", "LevelFilter"],
+    result_err: None,
+};
+
+const ENV_LOGGER_RENAMES: Renames = Renames {
+    roots: &["env_logger", "simple_logger"],
+    names: &[
+        ("init", "__log_env_init"),
+        ("try_init", "__log_env_try_init"),
+        ("Builder", "LogBuilder"),
+        ("builder", "__log_builder"),
+        ("Env", "LogEnv"),
+        ("init_with_level", "__log_init_with_level"),
+        ("SimpleLogger", "LogBuilder"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
+const NUM_RENAMES: Renames = Renames {
+    roots: &[
+        "num",
+        "num::integer",
+        "num::traits",
+        "num_integer",
+        "num_traits",
+        "num_traits::identities",
+        "num_traits::cast",
+        "num_traits::sign",
+        "num_traits::bounds",
+    ],
+    names: &[
+        ("Integer", "NumInteger"),
+        ("gcd", "__num_gcd"),
+        ("lcm", "__num_lcm"),
+        ("Zero", "NumZero"),
+        ("One", "NumOne"),
+        ("zero", "__num_zero"),
+        ("one", "__num_one"),
+        ("Signed", "NumSigned"),
+        ("abs", "__num_abs"),
+        ("signum", "__num_signum"),
+        ("pow", "__num_pow"),
+        ("clamp", "__num_clamp"),
+        ("ToPrimitive", "NumToPrimitive"),
+        ("FromPrimitive", "NumFromPrimitive"),
+        ("Bounded", "NumBounded"),
+    ],
+    star: &[
+        "Integer",
+        "Zero",
+        "One",
+        "Signed",
+        "ToPrimitive",
+        "FromPrimitive",
+        "Bounded",
+    ],
+    result_err: None,
+};
+
+const TOKIO_RENAMES: Renames = Renames {
+    roots: &[
+        "tokio",
+        "tokio::time",
+        "tokio::task",
+        "futures",
+        "futures::future",
+        "futures_util::future",
+    ],
+    names: &[
+        ("sleep", "__tokio_sleep"),
+        ("yield_now", "__tokio_yield_now"),
+        ("JoinHandle", "TokioJoinHandle"),
+        ("JoinError", "TokioJoinError"),
+        ("join_all", "js::Promise::all"),
+        ("Duration", "Duration"),
+        ("Instant", "Instant"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
+/// The crates of `text` that are renamed, and the names its `use`s bring in from each.
+fn renamed_crates(text: &str) -> Vec<&'static Renames> {
+    let mut out: Vec<&'static Renames> = Vec::new();
+    let has = |root: &str| {
+        let first = root
+            .trim_start_matches("::")
+            .split("::")
+            .next()
+            .unwrap_or(root);
+        (text.contains(&format!("{first}::")) || text.contains(&format!("use {first}")))
+            && !text.contains(&format!("mod {first}"))
+    };
+    for r in [
+        &IO_RENAMES,
+        &LOG_RENAMES,
+        &ENV_LOGGER_RENAMES,
+        &NUM_RENAMES,
+        &TOKIO_RENAMES,
+    ] {
+        if r.roots.iter().any(|root| has(root)) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Whether `text` uses a renamed crate.
+pub(crate) fn uses_renamed(text: &str) -> bool {
+    !renamed_crates(text).is_empty()
+}
+
+/// The names `use krate::{..}` brings in: alias -> the crate's name.
+fn renamed_imports(file: &SourceFile, r: &Renames) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        for (path, rename, star) in crate::typeck::use_leaves(&u) {
+            let joined = path.join("::");
+            for root in r.roots {
+                let root = root.trim_start_matches("::");
+                if star && joined == root {
+                    for n in r.star {
+                        out.entry(n.to_string()).or_insert_with(|| n.to_string());
+                    }
+                } else if !star
+                    && let Some(item) = joined.strip_prefix(root).and_then(|x| x.strip_prefix("::"))
+                    && !item.contains("::")
+                {
+                    let alias = rename.clone().unwrap_or_else(|| item.to_string());
+                    out.insert(alias, item.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The crates' names as the preludes': `io::Error` / `std::io::Error` (and `Error` after `use
+/// std::io::Error;`) is `IoError`, `impl Write for W` is `impl IoWrite for W`, `io::Result<T>` is
+/// `Result<T, IoError>`, `log::Level` is `LogLevel`, ..
+fn rename_crate_items(file: &SourceFile, text: &str, edits: &mut Vec<(TextRange, String)>) {
+    for r in renamed_crates(text) {
+        let imports = renamed_imports(file, r);
+        // (In other macros' tokens too: `println!("{:?}", ErrorKind::Other)`.)
+        for tt in file.syntax().descendants().filter_map(ast::TokenTree::cast) {
+            if tt
+                .syntax()
+                .parent()
+                .is_some_and(|p| ast::TokenTree::can_cast(p.kind()))
+            {
+                continue;
+            }
+            rename_tokens(&tt, r, &imports, edits);
+        }
+        for path in file.syntax().descendants().filter_map(ast::Path::cast) {
+            if path
+                .syntax()
+                .ancestors()
+                .any(|a| ast::Use::can_cast(a.kind()))
+            {
+                continue;
+            }
+            let Some(seg) = path.segment() else { continue };
+            let Some(name) = seg.name_ref() else { continue };
+            let item = match path.qualifier() {
+                Some(q) => {
+                    let qt = q.syntax().text().to_string();
+                    if !r.roots.contains(&qt.as_str()) {
+                        continue;
+                    }
+                    name.text().to_string()
+                }
+                None => match imports.get(name.text()) {
+                    Some(item) => item.clone(),
+                    None => continue,
+                },
+            };
+            // (From the path's start to its name: generic arguments stay.)
+            let r2 = TextRange::new(
+                path.syntax().text_range().start(),
+                name.syntax().text_range().end(),
+            );
+            if item == "Result"
+                && let Some(err) = r.result_err
+            {
+                edits.push((r2, "Result".into()));
+                if let Some(gl) = seg.generic_arg_list()
+                    && let Some(close) = gl.r_angle_token()
+                {
+                    edits.push((
+                        TextRange::empty(close.text_range().start()),
+                        format!(", {err}"),
+                    ));
+                }
+                continue;
+            }
+            if let Some((_, to)) = r.names.iter().find(|(n, _)| *n == item) {
+                edits.push((r2, to.to_string()));
+            }
+        }
+    }
+}
+
+/// `krate::X` and the names `use krate::{..}` brought in, among a macro's tokens.
+fn rename_tokens(
+    tt: &ast::TokenTree,
+    r: &Renames,
+    imports: &std::collections::HashMap<String, String>,
+    edits: &mut Vec<(TextRange, String)>,
+) {
+    use ra_ap_syntax::SyntaxKind::{COLON, COLON2, DOT, IDENT, WHITESPACE};
+    let toks: Vec<_> = tt
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != WHITESPACE)
+        .collect();
+    let is_sep = |k| matches!(k, COLON | COLON2);
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        let after_path = i > 0 && (is_sep(toks[i - 1].kind()) || toks[i - 1].kind() == DOT);
+        if t.kind() != IDENT || after_path {
+            i += 1;
+            continue;
+        }
+        // The longest `a::b::X` whose `a::b` is a root.
+        let mut segs = vec![(t.text().to_string(), i)];
+        let mut k = i + 1;
+        loop {
+            let mut s = k;
+            while toks.get(s).is_some_and(|c| is_sep(c.kind())) {
+                s += 1;
+            }
+            if s == k || !toks.get(s).is_some_and(|c| c.kind() == IDENT) {
+                break;
+            }
+            segs.push((toks[s].text().to_string(), s));
+            k = s + 1;
+        }
+        let mut done = false;
+        for n in (2..=segs.len()).rev() {
+            let root: Vec<&str> = segs[..n - 1].iter().map(|(s, _)| s.as_str()).collect();
+            let (item, at) = &segs[n - 1];
+            if r.roots.contains(&root.join("::").as_str())
+                && let Some((_, to)) = r.names.iter().find(|(x, _)| x == item)
+            {
+                edits.push((t.text_range().cover(toks[*at].text_range()), to.to_string()));
+                i = at + 1;
+                done = true;
+                break;
+            }
+        }
+        if done {
+            continue;
+        }
+        if let Some(item) = imports.get(&t.text().to_string())
+            && let Some((_, to)) = r.names.iter().find(|(n, _)| n == item)
+        {
+            edits.push((t.text_range(), to.to_string()));
+        }
+        i += 1;
+    }
+}
+
+/// `tokio::spawn(fut)` (after the rename, `__tokio_spawn(fut)`): an `async` block that awaits it,
+/// so the task starts at once and its handle gives `Ok(value)`. `#[tokio::main]` goes away.
+fn tokio_rewrite(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, String)>) {
+    if let Some(a) = ast::Attr::cast(node.clone())
+        && a.path().is_some_and(|p| {
+            let t = p.syntax().text().to_string();
+            t == "tokio::main" || t == "tokio::test"
+        })
+    {
+        edits.push((a.syntax().text_range(), String::new()));
+        return;
+    }
+    let Some(call) = ast::CallExpr::cast(node.clone()) else {
+        return;
+    };
+    let Some(ast::Expr::PathExpr(p)) = call.expr() else {
+        return;
+    };
+    let pt = p.syntax().text().to_string();
+    if !matches!(pt.as_str(), "tokio::spawn" | "tokio::task::spawn") {
+        return;
+    }
+    let Some(arg) = call.arg_list().and_then(|l| l.args().next()) else {
+        return;
+    };
+    // (Its argument may hold its own rewrites: inserts around it keep them.)
+    let r = arg.syntax().text_range();
+    edits.push((
+        TextRange::new(call.syntax().text_range().start(), r.start()),
+        "async { Ok::<_, TokioJoinError>((".into(),
+    ));
+    edits.push((
+        TextRange::new(r.end(), call.syntax().text_range().end()),
+        ").await) }".into(),
+    ));
 }

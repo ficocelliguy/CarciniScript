@@ -879,6 +879,12 @@ impl Checker<'_> {
             Some("FromStr") => {}
             // `x.try_into()` / `T::try_from(x)`, `collect()` into the type, `t.extend(..)`.
             Some("TryFrom" | "FromIterator" | "Extend") => {}
+            // `impl Drop for T`: its `drop` runs when a value goes out of scope (codegen).
+            Some("Drop") => {
+                if let Some(d) = self.adts.defs.get_mut(&type_name) {
+                    d.manual.push("Drop".into());
+                }
+            }
             // `impl Copy for P {}`: as `#[derive(Copy)]`.
             Some("Copy") => {
                 if let Some(d) = self.adts.defs.get_mut(&type_name)
@@ -903,7 +909,7 @@ impl Checker<'_> {
                 let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
                 self.error(
                     &node,
-                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Iterator` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
+                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
                 );
                 return;
             }

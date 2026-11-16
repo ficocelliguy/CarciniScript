@@ -809,6 +809,14 @@ pub(crate) const BUNDLED: &[&str] = &[
     "hashbrown",
     "rayon",
     "regex",
+    "log",
+    "env_logger",
+    "simple_logger",
+    "num",
+    "num_traits",
+    "num_integer",
+    "tokio",
+    "futures",
 ];
 
 /// `serde_json::Error`: the bundled `serde_json`'s (the runtime's `SerdeJsonError`).

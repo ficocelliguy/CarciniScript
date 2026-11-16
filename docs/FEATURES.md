@@ -10,6 +10,8 @@ Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?`, t
 |---|---|---|---|
 | `fn` items, params, return types | 0 | ✅ | `function`; all top-level fns exported (like RapydScript `export_all`). Parameters may be patterns (`(r, c): (usize, usize)`, `Point { x, y }: Point`, `&(a, _)`), also in methods |
 | `async fn`, `.await` | 0 | ✅ | `async function`, `await` |
+| `async { .. }` / `async move { .. }` blocks | 1 | ✅ | A future of the block's value (`.await` inside, `?` and `return` leave the block): an async arrow function called at once, so it starts running where it's written (a Rust future waits to be polled) |
+| `impl Drop for T` | 1 | ✅ | `drop` runs when a value goes out of scope (block end, `return`, `break`, `?`, a panic), in reverse declaration order; a moved value is dropped by its new owner (a flag per binding); `drop(x)` / `mem::drop(x)` drop at once, reassigning drops the old value, `let _ = make()` and `make();` drop the temporary, by-value parameters drop at the end of the function; fields drop after their owner's `drop`, in order, and `Vec` / `Option` / map elements too. Diff-tested against rustc |
 | `pub async fn main(ns: NS)` | 0 | ✅ | `export async function main(ns)` |
 | `const`, `static` | 1 | ✅ | Module-level `export const`s, emitted after the classes in dependency order (any declaration order works); usable in patterns. `static mut` is a module-level `let`; using it outside `unsafe` is an error like rustc's, as is assigning to a plain `static` |
 | `struct` (named, tuple, unit) | 1 | ✅ | A JS `class` whose constructor takes the fields in order; tuple fields are `this[0]`. Literals with shorthand and `..base`, field access and assignment, struct patterns. Generic structs: see below |
@@ -55,6 +57,9 @@ Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?`, t
 | Bundled `regex` | 4 | ✅ | `Regex::new` (`regex::Error`), `is_match`, `find` / `find_at`, `find_iter`, `captures` / `captures_at` / `captures_iter` (`caps[1]`, `caps["name"]`, `get`, `name`, `len`, `iter`, `expand`), `replace` / `replace_all` / `replacen` with `$1` / `${name}` templates, `NoExpand` or a closure, `split`, `splitn`, `shortest_match`, `capture_names`, `as_str`, `regex::escape`, `{}` / `{:?}` of regexes, matches and captures. Rust's syntax on JS regular expressions: `(?P<name>..)`, leading `(?i)` / `(?m)` / `(?s)`, Unicode `\d` / `\w` / `\p{Greek}`, `[[:alpha:]]`, `\A` / `\z`; offsets are bytes. Diff-tested against the real crate |
 | Bundled `rayon` | 4 | ✅ | Runs sequentially, which gives one thread's results: `par_iter` / `par_iter_mut` / `into_par_iter`, `par_chunks`, `par_windows`, the `par_sort*` methods, `par_extend`, `par_lines` / `par_split_whitespace` and the other string ones, `par_bridge`, rayon's `reduce(\|\| id, op)` and `fold(\|\| init, op)`, `reduce_with`, `find_any` / `find_first`, `position_any`, `flat_map_iter`, `with_min_len`, `rayon::join`, `current_num_threads()` (1), `ParallelIterator` bounds. Diff-tested against the real crate |
 | `extern crate` | 4 | ✅ | `extern crate rand;` / `#[macro_use] extern crate lazy_static;` for std, `core`, `alloc` and the bundled crates; any other crate is an error, as its `use` is |
+| Bundled `log` (+ `env_logger`, `simple_logger`) | 4 | ✅ | `error!` .. `trace!` (also `target: ..`), `log!(level, ..)`, `log_enabled!`, `Level` / `LevelFilter`, `max_level` / `set_max_level`; nothing prints until a logger is set up (`env_logger::init()` (errors), `Builder::new().filter_level(..).init()`, `Builder::from_env(Env::default().default_filter_or("info"))`, `simple_logger::init_with_level(..)`), then `[LEVEL] message` goes to stderr. Diff-tested against the real crates |
+| Bundled `num` / `num-traits` / `num-integer` | 4 | ✅ | `Zero` / `One` (`T::zero()`, `x.is_zero()`, as bounds on your generic functions), `Signed`, `Bounded`, `ToPrimitive` (`to_u8` .. `to_f64`) / `FromPrimitive`, `pow`, `clamp`, `abs`, `zero()` / `one()`; `Integer` (`gcd`, `lcm`, `div_floor`, `mod_floor`, `is_even`, `is_odd`, `div_rem`, `is_multiple_of`) and `integer::gcd` / `lcm`, for the integer and float types up to 64 bits. num-traits diff-tested against the real crate |
+| Bundled `tokio` / `futures` | 4 | ✅ | On the script's event loop: `#[tokio::main] async fn main`, `tokio::spawn(fut)` (the task starts at once; awaiting its `JoinHandle<T>` gives `Ok(value)`), `tokio::time::sleep(d).await`, `tokio::task::yield_now()`, `tokio::join!` / `try_join!` (up to six futures, started together), `futures::future::join_all(vec)`. `tokio::sync`, channels, `select!` and timers beyond `sleep` aren't there |
 | Other external crates (including `syn`/`quote`-based proc macros) | — | ❌ | Error |
 
 ## Expressions and statements
@@ -103,6 +108,10 @@ Status reflects phase 1 progress (type checker, `Vec`, `Option`, `match`, `?`, t
 | `Copy` structs by value | 1 | ✅ | Cloned when read from a place into a `let`, assignment, argument, return, struct field or `vec!` element; `&x` / `&mut x` pass the object itself |
 | `return` | 0 | ✅ | `return` |
 | Indexing `v[i]` (read, assign, compound assign) | 1 | ✅ | `v[κσ.$ix(v, i, loc)]`; rustc's out-of-bounds panic message and location |
+| Ranges as values: `Range<T>` / `RangeInclusive<T>` fields, returns and `let r = a..b` | 1 | ✅ | `r.start` / `r.end` (`start()` / `end()` for `..=`), `contains`, `is_empty`, `len`, `{:?}` (`0..5`), `clone`, `==`, slicing with one (`&v[r]`, `&s[r]`), and every iterator method; at run time the range's iterator, so iterating one uses it up as in Rust. Diff-tested against rustc |
+| `std::borrow::Cow` | 1 | ✅ | `Cow::Borrowed` / `Cow::Owned` (strings and slices), matching, deref to the data (`len()`, `to_uppercase()`), `into_owned`, `to_mut` (slices), `{}` / `{:?}`, `==`, `"x".into()`; `into_owned()` also on what `String::from_utf8_lossy` and regex's `replace` give. Diff-tested against rustc |
+| `std::io` | 1 | ✅ | `io::Error` (`new`, `other`, `kind`, from an `ErrorKind`, `{}` / `{:?}` as std writes them), `io::ErrorKind`, `io::Result<T>`, `?` into `Box<dyn Error>`; `impl Write for T` and `write!` / `writeln!` / `write_all` / `flush` into it; `stdout()` / `stderr()` and their `lock()`, `BufWriter`; `stdin()` (and its lock, `BufReader`) is at its end: `read_line` gives `Ok(0)`, `lines()` nothing. Diff-tested against rustc |
+| Byte strings `b"raw"` | 1 | ✅ | An array of the bytes (`&[u8; N]`) |
 | Array literals `[a, b]`, `[x; n]` | 1 | ✅ | JS arrays, like `vec!`. A fixed-size array of `Copy` values (`[i32; 3]`, `[[u8; 8]; 8]`, `["a", "b"]`, also as a struct field or parameter) is `Copy`: `let b = a`, passing, returning and reading a row or field copy it, and `#[derive(Copy)]` accepts it as a field. Arrays of `String`s move. The length isn't fixed by the type |
 
 ## Macros
@@ -229,7 +238,7 @@ so the work can be prioritized against real interest. The **Status** column repe
 Out of scope, even though they came up: threads and `mpsc` channels, pointer arithmetic and layout `transmute`,
 crates.io proc macros (user-written ones are phase 4, above), external crates other than the
 bundled ones (`rand`, `itertools`, `anyhow`, `thiserror`, `bitflags`, `once_cell`, `lazy_static`,
-`either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex`, `rayon`) (`wasm_bindgen`), and generic code over numeric types that Rust itself can't express (SFINAE).
+`either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex`, `rayon`, `log`, `num`, `tokio`) (`wasm_bindgen`), and generic code over numeric types that Rust itself can't express (SFINAE).
 
 ## JS globals (from RapydScript)
 

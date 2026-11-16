@@ -241,7 +241,7 @@ impl Checker<'_> {
             }
             Ty::Coll(_, view) => self.iter_elem(&view),
             Ty::Vec(e) | Ty::Set(e) | Ty::Option(e) => Some(*e),
-            Ty::Iter { elem, .. } | Ty::IntoIter(elem) => Some(*elem),
+            Ty::Iter { elem, .. } | Ty::IntoIter(elem) | Ty::Range(elem, _) => Some(*elem),
             Ty::Map(k, v) => Some(Ty::Tuple(vec![*k, *v])),
             Ty::Unknown => Some(Ty::Unknown),
             _ => None,

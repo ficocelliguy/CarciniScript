@@ -21,6 +21,9 @@ const VERSIONS = {
   serde: "1",
   serde_json: "1",
   regex: "1",
+  log: "0.4",
+  env_logger: "0.11",
+  num_traits: "0.2",
 };
 const CRATES = Object.keys(VERSIONS).concat(["lazy_static", "hashbrown"]).join("|");
 const uses = (src, c) => new RegExp(`\\b${c}(::|!)|\\buse ${c}\\b`).test(src);
@@ -39,7 +42,9 @@ export function buildNative(file, exe, { debug = false } = {}) {
   const deps = Object.entries(VERSIONS)
     .filter(([c]) => uses(src, c))
     .map(([c, v]) =>
-      c === "serde" ? `serde = { version = "${v}", features = ["derive"] }` : `${c === "cfg_if" ? "cfg-if" : c} = "${v}"`,
+      c === "serde"
+        ? `serde = { version = "${v}", features = ["derive"] }`
+        : `${c === "cfg_if" ? "cfg-if" : c === "num_traits" ? "num-traits" : c === "env_logger" ? "env_logger" : c} = "${v}"`,
     );
   const toml = ["[package]", 'name = "prog"', 'version = "0.1.0"', 'edition = "2024"', "", "[dependencies]", ...deps, ""];
   fs.writeFileSync(path.join(proj, "Cargo.toml"), toml.join("\n"));

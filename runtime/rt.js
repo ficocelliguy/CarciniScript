@@ -567,11 +567,14 @@
   }
   // An integer range (`lo..hi`, `lo..=hi`, `lo..`: `end` is Infinity); BigInts for `i128`.
   class RangeIt extends AdapterIt {
-    constructor(i, end, one) {
+    // (`hi` and `incl`: the bounds as written, for a range used as a value.)
+    constructor(i, end, one, hi, incl) {
       super();
       this.i = i;
       this.end = end;
       this.one = one;
+      this.hi = hi;
+      this.incl = incl;
     }
     next() {
       if (this.i < this.end) {
@@ -677,8 +680,23 @@
     $skipWhile(p) {
       return new Iter(new SkipWhileIt(this.it, p));
     }
+    // A range value: `{:?}` (`0..5`, `1..=3`) and `==`.
+    $dbg(f = rt.$dbg) {
+      const r = this.it;
+      if (!(r instanceof RangeIt)) return "Iter { .. }";
+      return `${f(r.i)}${r.incl ? "..=" : ".."}${r.hi === null ? "" : f(r.hi)}`;
+    }
+    $eq(o) {
+      const a = this.it;
+      const b = o?.it;
+      return a instanceof RangeIt && b instanceof RangeIt && a.i === b.i && a.hi === b.hi && a.incl === b.incl;
+    }
     // `it.clone()`: an iterator over what's left, independent of this one.
     $clone() {
+      if (this.it instanceof RangeIt) {
+        const r = this.it;
+        return new Iter(new RangeIt(r.i, r.end, r.one, r.hi, r.incl));
+      }
       const all = Array.from(iterable(this.it));
       this.it = all[Symbol.iterator]();
       return new Iter(all.slice()[Symbol.iterator]());
@@ -2162,6 +2180,30 @@
         for (let x = first; x != null; x = f(x)) yield x;
       });
     },
+    // A range value's bounds (`r.start`, `r.end`, `r.start()`), where it has got to.
+    $rangeOf(r) {
+      const it = r.it;
+      return { start: it.i, end: it.hi };
+    },
+    $rangeHas(r, x) {
+      const it = r.it;
+      return x >= it.i && (it.hi === null || (it.incl ? x <= it.hi : x < it.hi));
+    },
+    // `len()` without using the range up.
+    $rangeLen(r) {
+      const it = r.it;
+      const n = it.end - it.i;
+      return n > 0 ? n : typeof n === "bigint" ? 0n : 0;
+    },
+    $rangeEmpty(r) {
+      const it = r.it;
+      return it.hi !== null && (it.incl ? !(it.i <= it.hi) : !(it.i < it.hi));
+    },
+    // `v[r]` / `&s[r]` with a range value: `slice` / `strSlice` with its bounds.
+    $sliceBy(name, v, r, loc) {
+      const it = r.it;
+      return rt[name](v, it.i, it.hi, it.incl, loc);
+    },
     // `lo..hi`, `lo..=hi` and `lo..` (hi null); chars when `isChar`, skipping surrogates.
     $range(lo, hi, inclusive, isChar) {
       if (isChar) {
@@ -2174,7 +2216,7 @@
       // `i128` / `u128` ranges step in BigInts.
       const one = typeof lo === "bigint" ? 1n : 1;
       const end = hi === null ? Infinity : inclusive ? hi + one : hi;
-      return new Iter(new RangeIt(lo, end, one));
+      return new Iter(new RangeIt(lo, end, one, hi, inclusive));
     },
     $split(s, p) {
       return new Iter(s.split(p)[Symbol.iterator]());
@@ -3169,7 +3211,20 @@
     },
     // A number type as a type parameter's class (`T = u8`): its `default()` and kind, for
     // generic arithmetic.
-    $numT(kind) {
+    // With `ext` (the class of your trait impls for the type: `impl Zero for i32`), also its
+    // associated functions, for `T::zero()`.
+    $numT(kind, ext) {
+      if (ext) {
+        const key = `${kind}+`;
+        let d = NUM_TYPES[key];
+        if (d === undefined) {
+          d = NUM_TYPES[key] = Object.create(rt.$numT(kind));
+          for (const k of Object.getOwnPropertyNames(ext)) {
+            if (typeof ext[k] === "function" && !["length", "name", "prototype"].includes(k)) d[k] = ext[k].bind(ext);
+          }
+        }
+        return d;
+      }
       let t = NUM_TYPES[kind];
       if (t === undefined) {
         const float = kind[0] === "f";
@@ -3359,6 +3414,43 @@
   }
 
   rt.$ryu = (x) => ryu(x, false);
+
+  // ---- `Drop`: a value going out of scope runs its type's `drop`, then its fields' (in
+  // declaration order) and its elements'. Each object is dropped once, however it's reached.
+  const dropped = new WeakSet();
+  rt.$drop = (v) => {
+    if (v === null || typeof v !== "object" || dropped.has(v)) return;
+    dropped.add(v);
+    if (v.constructor?.$dropImpl) v.drop();
+    if (Array.isArray(v)) {
+      for (const x of v) rt.$drop(x);
+    } else if (v instanceof Map) {
+      for (const x of v.values()) rt.$drop(x);
+    } else if (typeof v.$entries === "function") {
+      for (const [k, x] of v.$entries()) {
+        rt.$drop(k);
+        rt.$drop(x);
+      }
+    } else if (typeof v[Symbol.iterator] === "function" && !(v instanceof Iter)) {
+      for (const x of v) rt.$drop(x);
+    } else if (v instanceof rt.RefCell) {
+      rt.$drop(v.v);
+    } else if (!(v instanceof Iter)) {
+      for (const k of Object.keys(v)) if (k !== "$tag") rt.$drop(v[k]);
+    }
+  };
+  // The end of a block: its values, last declared first.
+  rt.$dropAll = (list) => {
+    for (let i = list.length - 1; i >= 0; i--) list[i]();
+  };
+  // `Cow::to_mut`: a borrowed cow (tag 0) becomes owned (tag 1) by a copy, in place.
+  rt.$cowToMut = (c) => {
+    if (c.$tag === 0) {
+      c.$tag = 1;
+      c[0] = rt.$clone(c[0]);
+    }
+    return c[0];
+  };
 
   function jsonOut(v, s, pretty, ind) {
     s = jsonSchema(s);

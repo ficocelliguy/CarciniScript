@@ -219,6 +219,10 @@ pub enum Ty {
         elem: Box<Ty>,
         mutable: bool,
     },
+    /// A range as a value (`Range<T>`, `RangeInclusive<T>` when `.1`): a `let r = a..b`, a field
+    /// or a return type. At run time the same iterator a range expression makes, so codegen sees
+    /// it as an iterator (`view`); `start` / `end`, `contains`, `{:?}` and slicing are its own.
+    Range(Box<Ty>, bool),
     /// `VecDeque<T>`, `BinaryHeap<T>`, `BTreeMap<K, V>`, `BTreeSet<T>`: the collection over the
     /// type it behaves like at run time (`Vec<T>`, `HashMap<K, V>`, `HashSet<T>`).
     Coll(Coll, Box<Ty>),
@@ -255,6 +259,10 @@ impl Ty {
                 mutable: *mutable,
             },
             Ty::IntoIter(e) => Ty::IntoIter(b(e)),
+            Ty::Range(e, _) => Ty::Iter {
+                elem: b(e),
+                mutable: false,
+            },
             other => other.clone(),
         }
     }
@@ -347,7 +355,7 @@ impl Ty {
             | Ty::IntoIter(e) => {
                 vec![(**e).clone()]
             }
-            Ty::Iter { elem, .. } => vec![(**elem).clone()],
+            Ty::Iter { elem, .. } | Ty::Range(elem, _) => vec![(**elem).clone()],
             Ty::Tuple(es) => es.clone(),
             Ty::Map(k, v) | Ty::Entry(k, v) | Ty::Result(k, v) => {
                 vec![(**k).clone(), (**v).clone()]
@@ -465,6 +473,8 @@ impl Ty {
                 mutable: true,
             } => format!("std::slice::IterMut<'_, {}>", elem.describe()),
             Ty::IntoIter(e) => format!("impl IntoIterator<Item = {}>", e.describe()),
+            Ty::Range(e, false) => format!("Range<{}>", e.describe()),
+            Ty::Range(e, true) => format!("RangeInclusive<{}>", e.describe()),
             Ty::Var(_) => "_".into(),
             Ty::Unknown => "{unknown}".into(),
         }

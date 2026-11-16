@@ -582,7 +582,7 @@ const rejected = [
   ["Eq on a struct with an f64 field", "}\n#[derive(PartialEq, Eq)]\nstruct Q { a: f64 }\nfn f() {", "the trait `Eq` is not implemented for `f64` (field `a` of `Q`)"],
   ["mutating through &self", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&self) { self.a = 1; } }\nfn f() {", "4:24 cannot borrow `*self` as mutable, as it is behind a `&` reference"],
   ["&mut self method on an immutable binding", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&mut self) { self.a = 1; } }\nfn g() {\n    let q = Q { a: 0 };\n    q.f();", "7:5 cannot borrow `q` as mutable, as it is not declared as mutable"],
-  ["trait impls", "}\nstruct Q;\nimpl Drop for Q { fn drop(&mut self) {} }\nfn f() {", "4:6 `impl Drop for ..` is not supported yet"],
+  ["trait impls", "}\nstruct Q;\nimpl std::ops::Fn<()> for Q {}\nfn f() {", "4:6 `impl Fn for ..` is not supported yet"],
   ["peek on an iterator not declared mut", "let v = vec![1, 2];\n    let it = v.iter().peekable();\n    let p = it.peek();", "4:13 cannot borrow `it` as mutable"],
   ["try_fold with a closure returning a plain value", "let s = (1..4).try_fold(0, |a, x| a + x);", "2:13 `try_fold` needs a closure returning `Result<{integer}, E>` or `Option<{integer}>`"],
   ["an or-pattern binding a name in one alternative only","let p = (Some(1), 2);\n    match p {\n        (Some(x), _) | (None, _) => {}\n    }", "4:24 variable `x` is not bound in all patterns"],
@@ -616,9 +616,13 @@ const rejected = [
   ["an unknown bitflags flag", "}\nbitflags::bitflags! {\n    struct F: u8 {\n        const A = 1;\n    }\n}\nfn g() {\n    let f = F::B;", "9:13 no function or associated item named `B` found for struct `F`"],
   ["serde_json::from_str with nothing to parse into", "let v = serde_json::from_str(\"1\");", "2:13 type annotations needed: say what to parse into, e.g. `serde_json::from_str::<Config>(..)`"],
   ["serde_json::to_string of a closure", "let f = |x: i32| x;\n    let s = serde_json::to_string(&f);", "3:35 the trait bound"],
-  ["an extern crate that isn't bundled", "}\nextern crate tokio;\nfn g() {", "3:1 unresolved import `tokio`"],
+  ["an extern crate that isn't bundled", "}\nextern crate reqwest;\nfn g() {", "3:1 unresolved import `reqwest`"],
   ["a regex::Error of the wrong kind", "}\nfn g() -> Result<(), regex::Error> {\n    let x: i32 = \"a\".parse()?;\n    Ok(())", "4:18 `?` couldn't convert the error to `RegexError`"],
   ["parse()? into an error without From, beside a FromStr impl", "}\nstruct E;\nstruct P;\nimpl std::str::FromStr for P {\n    type Err = E;\n    fn from_str(s: &str) -> Result<P, E> { Ok(P) }\n}\nfn g() -> Result<(), E> {\n    let x: i32 = \"a\".parse()?;\n    Ok(())", "10:18 `?` couldn't convert the error to `E` (add `impl From<ParseIntError> for E`"],
+  ["the start field of an inclusive range", "let r = 1..=3;\n    let s = r.start;", "3:13 no field `start` on type `RangeInclusive<"],
+  ["a value used after drop()", "}\nstruct G { n: i32 }\nimpl Drop for G { fn drop(&mut self) {} }\nfn g() {\n    let a = G { n: 1 };\n    drop(a);\n    let b = a;", "8:13 use of moved value: `a`"],
+  ["await on an async block outside async", "let f = async { 1 };\n    let x = f.await;", "3:13 `await` is only allowed inside `async` functions and blocks"],
+  ["a JoinHandle of the wrong type", "}\nasync fn g() {\n    let h: tokio::task::JoinHandle<String> = tokio::spawn(async { 1u8 });", "4:46 mismatched types"],
   ["bail! in a function that doesn't return a Result", "}\nuse anyhow::bail;\nfn g() -> i32 {\n    bail!(\"no\");", "5:5 mismatched types"],
   ["parse into a type parameter without FromStr", "}\nfn p<T: Copy>(s: &str) -> T {\n    s.parse::<T>().unwrap()", "4:5 the trait bound `T: FromStr` is not satisfied"],
   ["a user type without the operator a bound needs","}\n#[derive(Clone, Copy)]\nstruct M(i32);\nfn dbl<T: std::ops::Add<Output = T> + Copy>(x: T) -> T {\n    x + x\n}\nfn g() {\n    let m = dbl(M(1));", "9:13 the trait bound `M: Add` is not satisfied"],
@@ -866,7 +870,7 @@ const rejectedFiles = [
     { "main.rs": "mod a;\nfn main() {}", "a.rs": "mod main;\npub fn f() {}" },
     "1:1 circular modules",
   ],
-  ["crates other than std", { "main.rs": "use tokio::time;\nfn main() {}" }, "1:5 unresolved import `tokio`"],
+  ["crates other than std", { "main.rs": "use reqwest::blocking;\nfn main() {}" }, "1:5 unresolved import `reqwest`"],
 ];
 for (const [label, files, want] of rejectedFiles) {
   const name = `rejects: ${label}`;

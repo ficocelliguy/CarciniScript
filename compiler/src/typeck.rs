@@ -74,6 +74,10 @@ pub struct Types {
     pub adts: crate::adt::Adts,
     /// Pattern bindings that are `&mut` references into the matched place (by name range).
     pub mut_bindings: std::collections::HashSet<(usize, usize)>,
+    /// Uses that move a binding's value (from the move checker), for `Drop`.
+    pub move_sites: std::collections::HashSet<(usize, usize)>,
+    /// `write!` / `writeln!` destinations (by their start) that are `io::Write`rs.
+    pub io_writes: std::collections::HashSet<usize>,
     /// Bindings of numbers, strings, bools or Options that live in a one-element array (a cell),
     /// because a `&mut` to them is taken or they are `&mut` parameters (by name range).
     pub boxed: std::collections::HashSet<(usize, usize)>,
@@ -227,6 +231,8 @@ impl<'a> Checker<'a> {
             slot_calls: Default::default(),
             slot_bindings: Default::default(),
             copy_arrays: Default::default(),
+            move_sites: Default::default(),
+            io_writes: Default::default(),
             array_fields: Default::default(),
             array_reads: Default::default(),
             cell_returns: Default::default(),
@@ -437,8 +443,9 @@ pub fn check(
     }
     // Moves are only checked in programs that type-check: they rely on the types.
     if c.diags.iter().all(|d| d.severity != "error") {
-        let moves = crate::moves::check(file, src, &map, &c.adts, &c.copy_arrays);
+        let (moves, sites) = crate::moves::check(file, src, &map, &c.adts, &c.copy_arrays);
         c.diags.extend(moves);
+        c.move_sites = sites;
         let borrows = crate::borrows::check(file, src, 0, &c.borrow_events);
         c.diags.extend(borrows);
     }
@@ -501,6 +508,8 @@ pub fn check(
             map,
             adts,
             mut_bindings,
+            move_sites: std::mem::take(&mut c.move_sites),
+            io_writes: std::mem::take(&mut c.io_writes),
             boxed,
             cell_args,
             slot_args,
@@ -572,6 +581,10 @@ struct Checker<'a> {
     slot_bindings: std::collections::HashSet<(usize, usize)>,
     /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
     copy_arrays: std::collections::HashSet<(usize, usize)>,
+    /// Uses that move a binding (filled by the move checker).
+    move_sites: std::collections::HashSet<(usize, usize)>,
+    /// `write!` destinations that are `io::Write`rs (by their start).
+    io_writes: std::collections::HashSet<usize>,
     /// Struct fields declared as fixed-size arrays of `Copy` values: (struct, field).
     pub(super) array_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
@@ -790,6 +803,7 @@ impl<'a> Checker<'a> {
                 mutable,
             },
             Ty::IntoIter(e) => Ty::IntoIter(Box::new(self.zonk(&e))),
+            Ty::Range(e, incl) => Ty::Range(Box::new(self.zonk(&e)), incl),
             other => other,
         }
     }
@@ -949,6 +963,25 @@ impl<'a> Checker<'a> {
                     mutable: m2,
                 },
             ) => m1 == m2 && self.unify(x, y),
+            (Ty::Range(x, i1), Ty::Range(y, i2)) => i1 == i2 && self.unify(x, y),
+            // A range expression is an iterator until something asks for a `Range`.
+            (
+                Ty::Range(x, _),
+                Ty::Iter {
+                    elem: y,
+                    mutable: false,
+                },
+            )
+            | (
+                Ty::Iter {
+                    elem: y,
+                    mutable: false,
+                },
+                Ty::Range(x, _),
+            ) => {
+                let (x, y) = (x.clone(), y.clone());
+                self.unify(&x, &y)
+            }
             _ => a == b,
         }
     }
@@ -1136,6 +1169,39 @@ impl<'a> Checker<'a> {
                     let k = next(self);
                     let v = next(self);
                     return Ty::Map(Box::new(k), Box::new(v));
+                }
+                // `tokio::task::JoinHandle<T>`: a future of `Result<T, JoinError>`.
+                if name == "TokioJoinHandle" {
+                    let t = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .and_then(|l| l.generic_args().next())
+                        .and_then(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .map(|t| self.lower_type(&t))
+                        .unwrap_or_else(|| self.fresh(VarKind::General));
+                    return Ty::Future(Box::new(Ty::Result(
+                        Box::new(t),
+                        Box::new(Ty::Adt("TokioJoinError".into(), vec![])),
+                    )));
+                }
+                // `Range<usize>` / `RangeInclusive<i32>` (`std::ops::..`).
+                if (name == "Range" || name == "RangeInclusive")
+                    && !self.adts.defs.contains_key(&name)
+                {
+                    let elem = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .and_then(|l| l.generic_args().next())
+                        .and_then(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .map(|t| self.lower_type(&t))
+                        .unwrap_or_else(|| self.fresh(VarKind::General));
+                    return Ty::Range(Box::new(elem), name == "RangeInclusive");
                 }
                 if name == "HashSet" {
                     let arg = seg
@@ -2989,6 +3055,13 @@ impl<'a> Checker<'a> {
                         self.adt_field(f, &name, &targs)
                     }
                     Ty::Unknown | Ty::Var(_) => Ty::Unknown,
+                    // `r.start` / `r.end` (an inclusive range's are methods).
+                    Ty::Range(e, false)
+                        if f.name_ref()
+                            .is_some_and(|n| matches!(n.text(), "start" | "end")) =>
+                    {
+                        *e
+                    }
                     Ty::Tuple(es) if f.name_ref().is_some_and(|n| n.as_tuple_field().is_some()) => {
                         let i = f.name_ref().and_then(|n| n.as_tuple_field()).unwrap_or(0);
                         match es.get(i) {
@@ -3044,6 +3117,27 @@ impl<'a> Checker<'a> {
             ast::Expr::ClosureExpr(c) => self.closure(c, expected),
             ast::Expr::RecordExpr(r) => self.record_expr(r),
             ast::Expr::RangeExpr(r) => {
+                use ra_ap_syntax::ast::RangeItem;
+                let inclusive = r.op_kind() == Some(ast::RangeOp::Inclusive);
+                let wanted = matches!(expected.map(|t| self.shallow(t)), Some(Ty::Range(..)));
+                // (`let r = 0..n;`: a value, whose `start` / `contains` / `{:?}` work.)
+                let bound = r.start().is_some()
+                    && r.syntax()
+                        .parent()
+                        .and_then(ast::LetStmt::cast)
+                        .is_some_and(|l| {
+                            l.ty().is_none()
+                                && l.initializer().is_some_and(|i| i.syntax() == r.syntax())
+                                && matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
+                        });
+                if wanted || bound {
+                    // (Any ordered bounds: floats too, for `contains`.)
+                    let elem = self.fresh(VarKind::General);
+                    for b in [r.start(), r.end()].into_iter().flatten() {
+                        self.check(&b, &elem);
+                    }
+                    return Ty::Range(Box::new(elem), inclusive);
+                }
                 let elem = self.range_elem(r);
                 Ty::Iter {
                     elem: Box::new(elem),
@@ -3060,6 +3154,28 @@ impl<'a> Checker<'a> {
                     self.infer(&e, None);
                 }
                 Ty::Bool
+            }
+            // `async { .. }` / `async move { .. }`: a future of the block's value (`.await` works
+            // inside; `return` and `?` leave the block).
+            ast::Expr::BlockExpr(b)
+                if matches!(b.modifier(), Some(ast::BlockModifier::Async(_))) =>
+            {
+                let inner = match expected.map(|e| self.shallow(e)) {
+                    Some(Ty::Future(t)) => Some(*t),
+                    _ => None,
+                };
+                let ret = inner
+                    .clone()
+                    .unwrap_or_else(|| self.fresh(VarKind::General));
+                let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
+                let saved_async = std::mem::replace(&mut self.in_async, true);
+                let t = self.block_body(b, inner.as_ref());
+                if t != Ty::Never {
+                    self.unify(&t, &ret);
+                }
+                self.ret_ty = saved_ret;
+                self.in_async = saved_async;
+                Ty::Future(Box::new(ret))
             }
             ast::Expr::BlockExpr(b) => self.block(b, expected),
             ast::Expr::LoopExpr(l) => {
@@ -3214,6 +3330,8 @@ impl<'a> Checker<'a> {
             LiteralKind::String(_) => Ty::Str,
             LiteralKind::Char(_) => Ty::Char,
             LiteralKind::Byte(_) => Ty::Int(IntKind::U8),
+            // `b"raw"`: its bytes (a `&[u8; N]`, an array here).
+            LiteralKind::ByteString(_) => Ty::Vec(Box::new(Ty::Int(IntKind::U8))),
             _ => Ty::Unknown,
         }
     }
@@ -3899,6 +4017,22 @@ impl<'a> Checker<'a> {
             if let Some(t) = self.std_call(c, &ns, &args) {
                 return t;
             }
+            // `i32::zero()`: an associated function of a trait you implemented for a built-in
+            // type.
+            if let [t, f] = ns.as_slice()
+                && let Some(key) = crate::adt::ext_key(t)
+                && self.adts.ext_types.contains(key)
+                && let Some(sig) = self.adts.method(key, f).cloned()
+                && sig.receiver.is_none()
+            {
+                let sig = self.method_inst(&sig, None);
+                self.arg_count(c.syntax(), "function", sig.params.len(), args.len());
+                for (a, p) in args.iter().zip(&sig.params) {
+                    self.check(a, p);
+                }
+                self.record_ext(c.syntax(), key);
+                return sig.ret;
+            }
         }
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         match std_tail(&names) {
@@ -4261,6 +4395,14 @@ impl<'a> Checker<'a> {
         args: &[ast::Expr],
     ) -> Ty {
         let Some(sig) = self.fns.get(name) else {
+            // `drop(x)` (the prelude's `std::mem::drop`).
+            if name == "drop" {
+                self.arg_count(c.syntax(), "function", 1, args.len());
+                for a in args {
+                    self.infer(a, None);
+                }
+                return Ty::Unit;
+            }
             let callee = c
                 .expr()
                 .map(|e| e.syntax().clone())
@@ -4567,6 +4709,36 @@ impl<'a> Checker<'a> {
                 let map = self.adt_subst(&n, &targs);
                 Ty::Iter {
                     elem: Box::new(crate::typeck::generic::subst(&item, &map)),
+                    mutable: false,
+                }
+            }
+            // A range value: `contains`, `start()` / `end()`, `is_empty`, `len`, `clone`, else
+            // what an iterator does.
+            Ty::Range(e, incl) => {
+                match method.as_str() {
+                    "contains" => {
+                        self.arg_count(m.syntax(), "method", 1, args.len());
+                        if let Some(a) = args.first() {
+                            self.check(a, &e);
+                        }
+                        return Ty::Bool;
+                    }
+                    "start" | "end" if incl => {
+                        self.arg_count(m.syntax(), "method", 0, args.len());
+                        return *e;
+                    }
+                    "is_empty" => {
+                        self.arg_count(m.syntax(), "method", 0, args.len());
+                        return Ty::Bool;
+                    }
+                    "clone" => {
+                        self.arg_count(m.syntax(), "method", 0, args.len());
+                        return Ty::Range(e, incl);
+                    }
+                    _ => {}
+                }
+                Ty::Iter {
+                    elem: e,
                     mutable: false,
                 }
             }
@@ -5258,6 +5430,20 @@ impl<'a> Checker<'a> {
             };
         }
         let it = self.infer(&index, Some(&USIZE));
+        // `v[r]` / `&s[r]` with a `Range<usize>` value.
+        if let Ty::Range(e, _) = self.shallow(&it) {
+            self.unify(&e, &USIZE);
+            return match self.shallow(&bt) {
+                Ty::Vec(e) => Ty::Vec(e),
+                Ty::Str => Ty::Str,
+                Ty::Unknown | Ty::Var(_) => Ty::Unknown,
+                other => {
+                    let msg = format!("cannot slice a value of type `{}`", self.describe(&other));
+                    self.error(ix.syntax(), msg);
+                    Ty::Unknown
+                }
+            };
+        }
         let resolved = self.shallow(&bt);
         if !self.unify(&it, &USIZE) {
             let container = match &resolved {
@@ -5393,6 +5579,7 @@ impl<'a> Checker<'a> {
                     Ty::Vec(e) | Ty::Set(e) => (*e, by_ref),
                     Ty::Map(k, v) => (Ty::Tuple(vec![*k, *v]), by_ref),
                     Ty::Iter { elem, mutable } => (*elem, Some(mutable)),
+                    Ty::Range(e, _) => (*e, Some(false)),
                     Ty::IntoIter(e) => (*e, None),
                     Ty::Unknown | Ty::Var(_) => (Ty::Unknown, None),
                     other_ty => {
@@ -5560,6 +5747,20 @@ impl<'a> Checker<'a> {
                     return fmt_result;
                 };
                 let tt = self.macro_arg(target, None);
+                // Into an `io::Write` (`stdout()`, a `BufWriter`, your own writer): its
+                // `write_all` of the text, an `io::Result<()>`.
+                if self.adts.traits.contains_key("IoWrite")
+                    && self.implements_user_trait(&tt, "IoWrite")
+                {
+                    if args.len() > 1 {
+                        self.format_args(&args[1..]);
+                    }
+                    self.io_writes.insert(target.start);
+                    return Ty::Result(
+                        Box::new(Ty::Unit),
+                        Box::new(Ty::Adt("IoError".into(), vec![])),
+                    );
+                }
                 match self.shallow(&tt) {
                     Ty::Formatter | Ty::Unknown => {}
                     Ty::Str => {
@@ -5796,6 +5997,7 @@ impl Checker<'_> {
             // `{}` of `c.to_uppercase()`: its chars.
             Ty::Iter { elem, .. } if !debug && self.shallow(elem) == Ty::Char => false,
             Ty::Iter { .. } | Ty::Future(_) | Ty::Fn => true,
+            Ty::Range(..) => !debug,
             Ty::Extern(_) => !debug,
             _ => false,
         }

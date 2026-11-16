@@ -286,6 +286,10 @@ pub fn __regex_find(pattern: &str, hay: &str, start: usize) -> Vec<i32>;
 #[js = "κσ.$regex.charLen"]
 pub fn __regex_char_len(hay: &str, at: usize) -> usize;
 
+/// (`Cow::to_mut`: the cow made `Owned` in place, and its data.)
+#[js = "κσ.$cowToMut"]
+pub fn __cow_to_mut(cow: JsValue) -> JsValue;
+
 /// A float as serde_json writes it (for the bundled `serde_json`).
 #[js = "κσ.$ryu"]
 pub fn __json_float(x: f64) -> String;

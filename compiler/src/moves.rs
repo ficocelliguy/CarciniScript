@@ -93,6 +93,8 @@ struct Walker<'a> {
     diags: Vec<RawDiag>,
     /// Enclosing loops and labeled blocks, innermost last.
     targets: Vec<Target>,
+    /// Every use that moves a tracked binding.
+    move_sites: HashSet<(usize, usize)>,
 }
 
 /// Where `break`/`continue` go: the states they leave with.
@@ -104,13 +106,15 @@ struct Target {
 }
 
 /// Check every function and method body in `file`.
+/// Also returns where bindings are moved (each use that moves its value), which codegen needs
+/// for `Drop`: a moved value is dropped by its new owner, not at the end of its old scope.
 pub fn check(
     file: &ast::SourceFile,
     src: &str,
     types: &HashMap<(usize, usize), Ty>,
     adts: &Adts,
     copy_arrays: &HashSet<Decl>,
-) -> Vec<RawDiag> {
+) -> (Vec<RawDiag>, HashSet<(usize, usize)>) {
     let mut fns = HashMap::new();
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         let Some(n) = f.name() else { continue };
@@ -137,13 +141,14 @@ pub fn check(
         reported: HashSet::new(),
         diags: Vec::new(),
         targets: Vec::new(),
+        move_sites: HashSet::new(),
     };
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         if !crate::adt::test_only(f.syntax()) {
             w.function(&f);
         }
     }
-    w.diags
+    (w.diags, w.move_sites)
 }
 
 impl Walker<'_> {
@@ -197,7 +202,8 @@ impl Walker<'_> {
             }
         }
         let mut st = State::default();
-        self.block(&body, &mut st, Mode::Use);
+        // (The body's value is moved out to the caller.)
+        self.block(&body, &mut st, Mode::Move("by being returned"));
     }
 
     fn declare(&mut self, n: &ast::Name, decl: Decl, owned: bool) {
@@ -360,6 +366,7 @@ impl Walker<'_> {
             && self.tracked.contains(&decl)
         {
             st.moved.insert(decl, (at.0, how));
+            self.move_sites.insert(at);
         }
     }
 

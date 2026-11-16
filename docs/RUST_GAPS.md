@@ -201,8 +201,19 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 ## Bundled crates
 
 - **The bundled crates are `rand`, `itertools`, `anyhow`, `thiserror`, `bitflags`, `once_cell`,
-  `lazy_static`, `either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex` and `rayon`**;
-  any other crate is an error.
+  `lazy_static`, `either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex`, `rayon`, `log`
+  (with `env_logger` / `simple_logger`), `num` (`num-traits`, `num-integer`), `tokio` and
+  `futures`**; any other crate is an error.
+- **`log` writes `[LEVEL] message`** to stderr, without env_logger's timestamp and target, and
+  there's no `RUST_LOG`: `env_logger::init()` logs errors only; set a level with
+  `Builder::filter_level` or `Env::default().default_filter_or("info")`.
+- **`num` covers the integer and float types up to 64 bits** (not `i128` / `u128`, and no
+  `BigInt`, `Rational` or `Complex`). `Signed::abs(&x)` written as a trait path doesn't work on
+  a built-in type; `x.abs()` does.
+- **tokio runs on the script's event loop.** `join!` awaits its futures in turn after starting
+  them all (they run together, as in tokio); a spawned task starts when `spawn` is called; there's
+  no `tokio::sync` (`Mutex`, channels), `select!`, `interval` or `timeout`, and a panicking task
+  ends the script instead of giving `Err(JoinError)`.
 - **rayon runs on one thread.** Results are what one thread gives, so they match rayon's except
   where rayon's own order isn't fixed (`par_bridge`, `for_each` side effects). There's no
   `ThreadPoolBuilder`, `rayon::scope` or `par_iter().update(..)`, and rayon's method names
@@ -219,7 +230,7 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   (`(?i)abc`, not `a(?i:b)c`), `x` (verbose) mode, class set operations (`[a&&b]`) and negated
   POSIX classes are errors, `\b` is an ASCII word boundary, and `regex::Error`'s text isn't
   regex's exact report (no caret line). `replace` and friends give a `String` where regex gives
-  a `Cow<str>` (`into_owned()` isn't there; `to_string()` is), `Match::range()` is missing, and
+  a `Cow<str>` (`into_owned()` and `to_string()` both work), `Match::range()` is missing, and
   there's no `RegexBuilder`, `RegexSet` or `regex::bytes`.
 - **A lazy value is computed when it's created**, so a `LazyLock` / `Lazy` / `lazy_static!`
   static is initialized when the script loads, not on first use (only the order of side effects
@@ -236,6 +247,24 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   differently for the same seed.
 - **`tuple_windows()` / `collect_tuple()` sizes are read from the code nearby** (a turbofish,
   `|(a, b)|`, `for (a, b, c) in`, `let (a, b) = ..`); anywhere else they are pairs.
+
+## Drop, ranges, `Cow` and `std::io`
+
+- **`Drop` follows moves the move checker sees**: by `let`, assignment, argument, method that
+  takes `self`, struct / tuple / `vec!` literal, `return`, `break` and `?`. A value moved some
+  other way (into a closure, out of a struct field) is still dropped at the end of its old
+  scope. `Rc` is erased, so an `Rc<T>` holding a `Drop` value drops it with the first `Rc`, not
+  the last; a method taking `self` by value doesn't drop `self` at its end; `v.clear()`,
+  `truncate` and assigning a new value to a field don't drop the old elements. On a panic the
+  values in scope are dropped before the panic message is printed (Rust prints it first).
+- **A range made by `a..b` is an iterator until something asks for a `Range`** (a `let r =
+  a..b`, a `Range<T>` field, parameter or return type), so `(0..5).start` isn't there.
+- **`Cow::to_mut()` can't change a string in place** (strings are immutable in JS): use it on
+  slices, or `into_owned()` and change the `String`. `Cow::from(String)` is borrowed (a `String`
+  and a `&str` are one type here), and `is_borrowed` / `is_owned` (unstable in Rust) aren't
+  there.
+- **`stdin()` is always at its end**, as a script has no input stream: read input from
+  `ns.args`, a file or `ns.prompt` instead. `impl Read for T`, `Cursor` and files aren't there.
 
 ## Formatting
 

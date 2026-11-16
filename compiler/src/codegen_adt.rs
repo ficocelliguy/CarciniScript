@@ -141,6 +141,10 @@ impl Codegen<'_> {
             .push(" {");
         self.line(header);
         self.out.indent += 1;
+        // (`impl Drop`: the runtime calls its `drop` when a value of it is dropped.)
+        if def.implements("Drop") {
+            self.line(Frag::text("static $dropImpl = true;"));
+        }
 
         // Constructor and variant factories.
         if def.is_enum {
@@ -331,6 +335,9 @@ impl Codegen<'_> {
                         } else {
                             js.clone()
                         };
+                        if self.owned_param(&p, &ty) {
+                            self.param_drops.push((access.clone(), ty.clone()));
+                        }
                         self.declare(
                             n.text().to_string().as_str(),
                             Some(n.syntax()),
