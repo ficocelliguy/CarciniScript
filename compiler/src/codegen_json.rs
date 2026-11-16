@@ -194,7 +194,7 @@ impl Codegen<'_> {
 
     /// The schema of `t` as a JS expression: definitions of structs and enums are lazy and
     /// shared through `$d`, so recursive types (`struct Tree { kids: Vec<Tree> }`) work.
-    fn json_schema_expr(&mut self, t: &Ty) -> String {
+    pub(super) fn json_schema_expr(&mut self, t: &Ty) -> String {
         if self.serde.is_none() {
             self.serde = Some(std::rc::Rc::new(crate::json::collect(self.src)));
         }
@@ -239,6 +239,8 @@ impl Codegen<'_> {
             Ty::Char => "{t:\"char\"}".into(),
             Ty::Str => "{t:\"str\"}".into(),
             Ty::Unit => "{t:\"unit\"}".into(),
+            // `T: DeserializeOwned`: the schema of the class the caller passed for `T`.
+            Ty::Param(_) => format!("κσ.$schemaOf({})", self.dict_of(t)),
             Ty::Option(e) => format!("{{t:\"opt\",s:{}}}", self.json_schema(e, stack)),
             Ty::Vec(e) => format!("{{t:\"vec\",s:{}}}", self.json_schema(e, stack)),
             Ty::Set(e) => format!(
@@ -371,9 +373,10 @@ impl Codegen<'_> {
                         })
                         .collect();
                     format!(
-                        "{{t:\"enum\",name:{},cls:{cls},variants:[{}]}}",
+                        "{{t:\"enum\",name:{},cls:{cls},variants:[{}]{}}}",
                         js_string(n),
-                        vs.join(",")
+                        vs.join(","),
+                        if info.untagged { ",untagged:true" } else { "" }
                     )
                 } else {
                     let v = &def.variants[0];

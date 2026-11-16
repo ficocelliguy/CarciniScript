@@ -319,11 +319,25 @@ impl Ty {
     }
 
     /// Option types the null representation can't express.
+    /// The type parameters it names (`T` in `Vec<T>`).
+    pub fn collect_params(&self, out: &mut Vec<String>) {
+        match self {
+            Ty::Param(p) => {
+                if !out.contains(p) {
+                    out.push(p.clone());
+                }
+            }
+            t => {
+                for i in t.inner_types() {
+                    i.collect_params(out);
+                }
+            }
+        }
+    }
+
     pub fn has_ambiguous_option(&self) -> bool {
         match self {
-            Ty::Option(inner) => {
-                matches!(**inner, Ty::Option(_) | Ty::Unit) || inner.has_ambiguous_option()
-            }
+            Ty::Option(inner) => matches!(**inner, Ty::Option(_)) || inner.has_ambiguous_option(),
             Ty::Vec(e) | Ty::Future(e) | Ty::Set(e) | Ty::Coll(_, e) => e.has_ambiguous_option(),
             Ty::Tuple(es) => es.iter().any(Ty::has_ambiguous_option),
             Ty::Map(k, v) => k.has_ambiguous_option() || v.has_ambiguous_option(),
@@ -402,6 +416,9 @@ impl Ty {
                 true
             }
             Ty::Tuple(es) => es.iter().all(Ty::has_default),
+            // (An empty one: `m.get_many::<String>("x").unwrap_or_default()`.)
+            Ty::Iter { .. } => true,
+            Ty::RefCell(inner) => inner.has_default(),
             _ => false,
         }
     }

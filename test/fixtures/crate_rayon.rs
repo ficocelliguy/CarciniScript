@@ -39,7 +39,7 @@ fn main() {
     w.par_iter_mut().for_each(|x| *x *= 10);
     println!("{:?}", w);
     let words = vec!["apple", "bob", "kayak", "rust"];
-    let found = words.par_iter().find_any(|w| w.len() == 5);
+    let found = words.par_iter().find_any(|w| w.len() == 5 && w.ends_with('k'));
     println!("{:?}", found);
     let pos = words.par_iter().position_first(|w| w.starts_with('k'));
     println!("{:?}", pos);

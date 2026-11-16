@@ -36,8 +36,12 @@ try {
   const mod = await import(pathToFileURL(jsPath).href);
   await mod.main();
 } catch (e) {
-  jsExit = 101;
-  lines.push(`[panic] ${e.message}`);
+  if (e.name === "CarciniExit") {
+    jsExit = e.exitCode;
+  } else {
+    jsExit = 101;
+    lines.push(`[panic] ${e.message}`);
+  }
 }
 κσ.$flush();
 

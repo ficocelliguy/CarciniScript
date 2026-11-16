@@ -65,6 +65,12 @@ pub struct Field {
 pub struct ExternType {
     pub fields: HashMap<String, Field>,
     pub methods: HashMap<String, Method>,
+    /// `#[extends = "Person"]`: the interfaces it extends (TS `interface Player extends Person`),
+    /// where a value of it is accepted too.
+    pub extends: Vec<String>,
+    /// Whether it's declared as a struct (an interface a script can name and build), not only
+    /// through an `impl`.
+    pub is_struct: bool,
 }
 
 #[derive(Default)]
@@ -75,6 +81,31 @@ pub struct Bindings {
     /// JS names Bitburner's RAM calculator charges for wherever they appear as identifiers (NS
     /// functions and namespaces). User identifiers with these names get a `$` suffix.
     pub ram_names: HashSet<String>,
+}
+
+impl Bindings {
+    /// Whether interface `sub` is `sup` or extends it (`Player` extends `Person`).
+    pub fn extends(&self, sub: &str, sup: &str) -> bool {
+        let mut stack = vec![sub.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if t == sup {
+                return true;
+            }
+            if seen.insert(t.clone())
+                && let Some(et) = self.types.get(&t)
+            {
+                stack.extend(et.extends.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Whether `name` is an interface of the NS bindings a script can name and build
+    /// (`RunOptions`, `Server`): a struct the bindings declare.
+    pub fn is_interface(&self, name: &str) -> bool {
+        self.types.get(name).is_some_and(|t| t.is_struct)
+    }
 }
 
 /// The JS globals scripts reach through the `js` crate (`js::Date`): always there, next to
@@ -173,6 +204,11 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
             s.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
         )),
         ast::Type::TupleType(tt) if tt.fields().next().is_none() => Ty::Unit,
+        // `(f64, String)`; `[f64; 2]` is a `Vec` (arrays are).
+        ast::Type::TupleType(tt) => Ty::Tuple(tt.fields().map(|t| lower(&t, structs)).collect()),
+        ast::Type::ArrayType(a) => Ty::Vec(Box::new(
+            a.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
+        )),
         // `impl Fn(f64) -> bool`: a callback.
         ast::Type::ImplTraitType(i) => {
             let Some(seg) = i
@@ -221,8 +257,30 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
             };
             match name.as_str() {
                 "Vec" => Ty::Vec(Box::new(arg().unwrap_or(Ty::Unknown))),
+                // (A JS `Map` or object, made a `HashMap` where it's read: `$mapOfJs`.)
+                "HashMap" => {
+                    let args: Vec<Ty> = seg
+                        .generic_arg_list()
+                        .map(|l| {
+                            l.generic_args()
+                                .filter_map(|a| match a {
+                                    ast::GenericArg::TypeArg(ta) => {
+                                        ta.ty().map(|t| lower(&t, structs))
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match args.as_slice() {
+                        [k, v] => Ty::Map(Box::new(k.clone()), Box::new(v.clone())),
+                        _ => Ty::Unknown,
+                    }
+                }
                 "Option" => Ty::Option(Box::new(arg().unwrap_or(Ty::Unknown))),
-                "JsValue" => Ty::Unknown,
+                // (A parameter of this type takes any value: see `loosen`.)
+                "JsValue" => Ty::Extern("JsValue".into()),
+                "JsAny" => Ty::Unknown,
                 n if structs.contains(n) => Ty::Extern(n.to_string()),
                 n => Ty::from_name(n),
             }
@@ -253,6 +311,14 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
             ast::Item::Struct(s) => {
                 let Some(name) = s.name() else { continue };
                 let ty = bindings.types.entry(name.text().to_string()).or_default();
+                ty.is_struct = true;
+                if let Some(bases) = attr_value(&s, "extends") {
+                    ty.extends = bases
+                        .split(',')
+                        .map(|b| b.trim().to_string())
+                        .filter(|b| !b.is_empty())
+                        .collect();
+                }
                 let Some(ast::FieldList::RecordFieldList(list)) = s.field_list() else {
                     continue;
                 };
@@ -316,6 +382,16 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
     (bindings, errors)
 }
 
+/// A parameter's type: `JsValue` (anywhere in it) takes any value, as JS does.
+fn loosen(t: Ty) -> Ty {
+    match t {
+        Ty::Extern(n) if n == "JsValue" => Ty::Unknown,
+        Ty::Vec(e) => Ty::Vec(Box::new(loosen(*e))),
+        Ty::Option(e) => Ty::Option(Box::new(loosen(*e))),
+        other => other,
+    }
+}
+
 /// A declared function or method's signature.
 fn method_of(f: &ast::Fn, structs: &HashSet<String>) -> Method {
     let fname = f.name().map(|n| n.text().to_string()).unwrap_or_default();
@@ -326,7 +402,7 @@ fn method_of(f: &ast::Fn, structs: &HashSet<String>) -> Method {
         .map(|l| l.params().collect::<Vec<_>>())
         .unwrap_or_default()
     {
-        let pty = p.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown);
+        let pty = loosen(p.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown));
         if attr_value(&p, "variadic").is_some() {
             variadic = Some(pty);
             continue;

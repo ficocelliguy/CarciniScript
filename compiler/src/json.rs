@@ -27,6 +27,9 @@ pub struct SerdeInfo {
     pub fields: HashMap<(String, String), FieldAttrs>,
     /// A variant's `rename`, and its own `rename_all` (for a struct variant's fields).
     pub variants: HashMap<String, (Option<String>, Option<String>)>,
+    /// `#[serde(untagged)]` on an enum: a variant is written as its content alone and read as
+    /// the first variant whose content matches.
+    pub untagged: bool,
 }
 
 /// `key = "value"` and bare `key` items of the `#[serde(..)]` attributes.
@@ -150,6 +153,8 @@ pub fn collect(src: &str) -> HashMap<String, SerdeInfo> {
                     && let Some(v) = v
                 {
                     info.rename_all = Some(v);
+                } else if k == "untagged" && v.is_none() {
+                    info.untagged = true;
                 }
             }
         }

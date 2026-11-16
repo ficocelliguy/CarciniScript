@@ -256,6 +256,16 @@ impl Checker<'_> {
             self.note_crate(m.syntax(), "err.toString", vec![]);
             return Some(Ty::Str);
         }
+        // Your `impl Error for T` without its own `source`: the trait's default, `None`.
+        if method == "source"
+            && let Ty::Adt(n, _) = resolved
+            && self.adts.defs.get(n).is_some_and(|d| d.implements("Error"))
+            && self.adts.method(n, "source").is_none()
+        {
+            self.arg_count(m.syntax(), "method", 0, args.len());
+            self.note_crate(m.syntax(), "err.source", vec![]);
+            return Some(Ty::Option(Box::new(Ty::Dyn("Error".into()))));
+        }
         // `serde_json::Error`: where it failed, and what kind of failure.
         if matches!(resolved, Ty::Extern(n) if n == "serde_json::Error") {
             let (js, ret) = match method {
@@ -276,6 +286,9 @@ impl Checker<'_> {
             && self.uses_crate("itertools")
             && let Some(t) = self.itertools_method(m, elem, method, args)
         {
+            return Some(t);
+        }
+        if let Some(t) = self.distribution_method(m, recv, resolved, method, args) {
             return Some(t);
         }
         match resolved {
@@ -429,7 +442,104 @@ impl Checker<'_> {
     }
 }
 
+/// The distributions whose output type is the caller's (`let z: f64 = StandardNormal.sample(..)`):
+/// the prelude's struct, and the runtime helper that samples it.
+const UNIT_DISTS: &[(&str, &str)] = &[
+    ("RandStandard", "standard"),
+    ("RandStandardNormal", "standardNormal"),
+    ("RandExp1", "exp1"),
+    ("RandOpen01", "open01"),
+    ("RandOpenClosed01", "openClosed01"),
+];
+
 impl Checker<'_> {
+    /// `rng.sample(d)` / `rng.sample_iter(d)` (`d.sample(rng)` at run time), and `sample` /
+    /// `sample_iter` on the distributions whose output is the caller's type.
+    fn distribution_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        recv: &ast::Expr,
+        resolved: &Ty,
+        method: &str,
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        if !matches!(method, "sample" | "sample_iter") {
+            return None;
+        }
+        let iter = method == "sample_iter";
+        let wrap = |t: Ty| {
+            if iter {
+                Ty::Iter {
+                    elem: Box::new(t),
+                    mutable: false,
+                }
+            } else {
+                t
+            }
+        };
+        let suffix = if iter { "Iter" } else { "" };
+        match resolved {
+            Ty::Rng => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if !iter {
+                    self.check_mutable(recv, Mutation::Borrow);
+                }
+                let a = args.first()?;
+                let dt = self.infer(a, None);
+                let dt = self.shallow(&dt);
+                if let Some(t) = self.unit_dist(m, &dt, suffix) {
+                    return Some(wrap(t));
+                }
+                let out = match &dt {
+                    Ty::Adt(name, targs) => self
+                        .adts
+                        .method(name, "sample")
+                        .cloned()
+                        .filter(|s| s.receiver.is_some())
+                        .map(|sig| {
+                            let sig = self.method_inst(&sig, Some(targs));
+                            self.last_type_args.clear();
+                            sig.ret
+                        }),
+                    _ => None,
+                };
+                let Some(out) = out else {
+                    self.error(
+                        a.syntax(),
+                        format!("`{}` isn't a distribution", dt.describe()),
+                    );
+                    return Some(Ty::Unknown);
+                };
+                self.note_crate(m.syntax(), &format!("rand.sampleDist{suffix}"), vec![]);
+                Some(wrap(out))
+            }
+            // `Standard.sample(&mut rng)`, unless you implement `Distribution<T> for Standard`.
+            Ty::Adt(..) => {
+                let t = self.unit_dist(m, resolved, suffix)?;
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let Some(a) = args.first() {
+                    self.check(a, &Ty::Rng);
+                }
+                Some(wrap(t))
+            }
+            _ => None,
+        }
+    }
+
+    /// The value one of `UNIT_DISTS` samples: a float, or (`Standard`) any type `rng.gen()` makes.
+    fn unit_dist(&mut self, m: &ast::MethodCallExpr, dt: &Ty, suffix: &str) -> Option<Ty> {
+        let Ty::Adt(name, _) = dt else { return None };
+        // (With your `impl Distribution<Dir> for Standard`, the run time picks it for a `Dir`.)
+        let (_, js) = UNIT_DISTS.iter().find(|(n, _)| n == name)?;
+        let t = if *js == "standard" {
+            self.fresh(VarKind::General)
+        } else {
+            self.fresh(VarKind::Float)
+        };
+        self.note_crate(m.syntax(), &format!("rand.{js}{suffix}"), vec![t.clone()]);
+        Some(t)
+    }
+
     /// `itertools::repeat_n(x, n)`.
     pub(super) fn itertools_call(
         &mut self,
@@ -817,6 +927,10 @@ pub(crate) const BUNDLED: &[&str] = &[
     "num_integer",
     "tokio",
     "futures",
+    "rand_distr",
+    "chrono",
+    "chrono_tz",
+    "clap",
 ];
 
 /// `serde_json::Error`: the bundled `serde_json`'s (the runtime's `SerdeJsonError`).

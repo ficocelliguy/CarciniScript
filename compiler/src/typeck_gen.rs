@@ -56,6 +56,11 @@ const KNOWN_BOUNDS: &[&str] = &[
     "Unpin",
     "Sized",
     "ToString",
+    // (`T: Into<f64>`: its target is recorded; serde's bounds are checked where JSON is read.)
+    "Into",
+    "Serialize",
+    "Deserialize",
+    "DeserializeOwned",
 ];
 
 /// A type parameter with the names of its bounds (`T: PartialOrd + Copy` → `["PartialOrd", "Copy"]`).
@@ -176,7 +181,22 @@ impl Checker<'_> {
                     || super::bounds_iterator_item(l).is_some()
             })
         });
+        // (`Fut: Future<Output = T>` first: an `F: Fn() -> Fut` names it.)
+        tps.sort_by_key(|(_, lists, _)| {
+            !lists
+                .iter()
+                .any(|l| super::bounds_future_output(l).is_some())
+        });
         for (name, lists, node) in tps {
+            // `Fut: Future<Output = T>`: a future of `T`, like `impl Future<Output = T>`.
+            if let Some(out) = lists.iter().find_map(super::bounds_future_output) {
+                let out = match out {
+                    Some(t) => self.lower_type(&t),
+                    None => Ty::Unit,
+                };
+                self.generics.insert(name, Ty::Future(Box::new(out)));
+                continue;
+            }
             if let Some(closure) = lists.iter().find_map(|l| self.lower_fn_bounds(l)) {
                 self.generics.insert(name, closure);
                 continue;
@@ -184,8 +204,14 @@ impl Checker<'_> {
             // `S: Into<String>` / `S: AsRef<str>`: the target type, like `impl Into<String>`.
             if let Some(target) = lists.iter().find_map(super::conversion_target) {
                 let t = self.lower_type(&target);
-                self.generics.insert(name, t);
-                continue;
+                // `T: Into<f64>` stays a parameter (any number type converts); `.into()` makes
+                // the target.
+                if matches!(t, Ty::Int(_) | Ty::Float { .. }) {
+                    self.into_targets.insert(name.clone(), t);
+                } else {
+                    self.generics.insert(name, t);
+                    continue;
+                }
             }
             // `H: Hasher` in an `impl Hash`.
             if lists.iter().any(super::bounds_hasher) {
@@ -290,6 +316,13 @@ impl Checker<'_> {
                 && let Some(l) = pred.type_bound_list()
             {
                 lists.push(l);
+            }
+        }
+        // `where I::Item: Into<f64>`.
+        if let Some(target) = lists.iter().find_map(super::conversion_target) {
+            let t = self.lower_type(&target);
+            if matches!(t, Ty::Int(_) | Ty::Float { .. }) {
+                self.into_targets.insert(item.clone(), t);
             }
         }
         let mut bounds = Vec::new();
@@ -571,8 +604,9 @@ impl Checker<'_> {
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
-            // (`From<X>`'s `X` is checked at `T::from(x)`.)
-            "From" => true,
+            // (`From<X>`'s `X` is checked at `T::from(x)`, `Into<Y>`'s at `.into()`; JSON's
+            // traits where it's read or written.)
+            "From" | "Into" | "Serialize" | "Deserialize" | "DeserializeOwned" => true,
             "Display" | "ToString" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| d.display),

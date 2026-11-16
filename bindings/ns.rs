@@ -65,7 +65,7 @@ pub struct NS {
     #[js = "pid"]
     pub pid: f64,
     #[js = "heart"]
-    pub heart: JsValue,
+    pub heart: NSHeart,
     #[js = "enums"]
     pub enums: NSEnums,
 }
@@ -265,7 +265,7 @@ impl NS {
     /// Returns data of a server.
     /// RAM cost: 2 GB
     #[js = "getServer"]
-    pub fn get_server(&self, #[optional] host: String) -> Server;
+    pub fn get_server(&self, #[optional] host: String) -> ServerWithIsOnline;
     /// Get money available on a server.
     /// RAM cost: 0.1 GB
     #[js = "getServerMoneyAvailable"]
@@ -417,7 +417,7 @@ impl NS {
     /// Get the income of all scripts.
     /// RAM cost: 0.1 GB
     #[js = "getTotalScriptIncome"]
-    pub fn get_total_script_income(&self) -> JsValue;
+    pub fn get_total_script_income(&self) -> [f64; 2];
     /// Get the income of a script.
     /// RAM cost: 0.1 GB
     #[js = "getScriptIncome"]
@@ -504,6 +504,7 @@ impl NS {
     pub async fn dynamic_import(&self, path: String) -> JsValue;
 }
 
+#[extends = "Fragment"]
 pub struct ActiveFragment {
     /// A unique integer ID assigned to the combination of a fragment's shape, effect, and power.
     #[js = "id"]
@@ -793,6 +794,7 @@ pub struct BitNodeMultipliers {
 }
 
 /// Default value:
+#[extends = "BitNodeBooleanOptions"]
 pub struct BitNodeOptions {
     #[js = "restrictHomePCUpgrade"]
     pub restrict_home_pc_upgrade: bool,
@@ -809,7 +811,7 @@ pub struct BitNodeOptions {
     #[js = "disableSleeveExpAndAugmentation"]
     pub disable_sleeve_exp_and_augmentation: bool,
     #[js = "sourceFileOverrides"]
-    pub source_file_overrides: JsValue,
+    pub source_file_overrides: HashMap<i32, f64>,
     #[js = "intelligenceOverride"]
     pub intelligence_override: Option<f64>,
 }
@@ -841,7 +843,7 @@ impl Bladeburner {
     /// Get an object with the name and rank requirement of the next BlackOp that can be completed.
     /// RAM cost: 2 GB
     #[js = "getNextBlackOp"]
-    pub fn get_next_black_op(&self) -> JsValue;
+    pub fn get_next_black_op(&self) -> Option<BladeburnerGetNextBlackOpResult>;
     /// List all general actions.
     /// RAM cost: 0 GB
     #[js = "getGeneralActionNames"]
@@ -873,7 +875,7 @@ impl Bladeburner {
     /// Get estimate success chance of an action.
     /// RAM cost: 4 GB
     #[js = "getActionEstimatedSuccessChance"]
-    pub fn get_action_estimated_success_chance(&self, r#type: String, name: String, #[optional] sleeve_number: f64) -> JsValue;
+    pub fn get_action_estimated_success_chance(&self, r#type: String, name: String, #[optional] sleeve_number: f64) -> [f64; 2];
     /// Get the reputation gain of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRepGain"]
@@ -969,7 +971,7 @@ impl Bladeburner {
     /// Get Bladeburner stamina.
     /// RAM cost: 4 GB
     #[js = "getStamina"]
-    pub fn get_stamina(&self) -> JsValue;
+    pub fn get_stamina(&self) -> [f64; 2];
     /// Join the Bladeburner faction.
     /// RAM cost: 4 GB
     #[js = "joinBladeburnerFaction"]
@@ -1145,6 +1147,36 @@ pub struct BladeburnerSkillNameEnumType {
     pub hands_of_midas: String,
     #[js = "Hyperdrive"]
     pub hyperdrive: String,
+}
+
+#[extends = "CacheReward"]
+pub struct CacheResult {
+    #[js = "success"]
+    pub success: bool,
+    #[js = "message"]
+    pub message: String,
+    #[js = "karmaLoss"]
+    pub karma_loss: f64,
+    #[js = "wseAccount"]
+    pub wse_account: bool,
+    #[js = "tixApiAccess"]
+    pub tix_api_access: bool,
+    #[js = "fourSigmaData"]
+    pub four_sigma_data: bool,
+    #[js = "money"]
+    pub money: Option<f64>,
+    #[js = "programName"]
+    pub program_name: Option<String>,
+    #[js = "stockSymbol"]
+    pub stock_symbol: Option<String>,
+    #[js = "stockShares"]
+    pub stock_shares: Option<f64>,
+    #[js = "dataFilePaths"]
+    pub data_file_paths: Option<Vec<String>>,
+    #[js = "contractFilePaths"]
+    pub contract_file_paths: Option<Vec<String>>,
+    #[js = "augmentationName"]
+    pub augmentation_name: Option<String>,
 }
 
 pub struct CacheReward {
@@ -1342,65 +1374,65 @@ pub struct CodingContractNameEnumType {
 /// This is a map of contract types to their input and answer data types. The key is the contract type. The value is a tuple containing the input and answer data types.
 pub struct CodingContractSignatures {
     #[js = "Find Largest Prime Factor"]
-    pub find_largest_prime_factor: JsValue,
+    pub find_largest_prime_factor: [f64; 2],
     #[js = "Subarray with Maximum Sum"]
-    pub subarray_with_maximum_sum: JsValue,
+    pub subarray_with_maximum_sum: (Vec<f64>, f64),
     #[js = "Total Ways to Sum"]
-    pub total_ways_to_sum: JsValue,
+    pub total_ways_to_sum: [f64; 2],
     #[js = "Total Ways to Sum II"]
-    pub total_ways_to_sum_ii: JsValue,
+    pub total_ways_to_sum_ii: ((f64, Vec<f64>), f64),
     #[js = "Spiralize Matrix"]
-    pub spiralize_matrix: JsValue,
+    pub spiralize_matrix: (Vec<Vec<f64>>, Vec<f64>),
     #[js = "Array Jumping Game"]
-    pub array_jumping_game: JsValue,
+    pub array_jumping_game: (Vec<f64>, f64),
     #[js = "Array Jumping Game II"]
-    pub array_jumping_game_ii: JsValue,
+    pub array_jumping_game_ii: (Vec<f64>, f64),
     #[js = "Merge Overlapping Intervals"]
-    pub merge_overlapping_intervals: JsValue,
+    pub merge_overlapping_intervals: [Vec<[f64; 2]>; 2],
     #[js = "Generate IP Addresses"]
-    pub generate_ip_addresses: JsValue,
+    pub generate_ip_addresses: (String, Vec<String>),
     #[js = "Algorithmic Stock Trader I"]
-    pub algorithmic_stock_trader_i: JsValue,
+    pub algorithmic_stock_trader_i: (Vec<f64>, f64),
     #[js = "Algorithmic Stock Trader II"]
-    pub algorithmic_stock_trader_ii: JsValue,
+    pub algorithmic_stock_trader_ii: (Vec<f64>, f64),
     #[js = "Algorithmic Stock Trader III"]
-    pub algorithmic_stock_trader_iii: JsValue,
+    pub algorithmic_stock_trader_iii: (Vec<f64>, f64),
     #[js = "Algorithmic Stock Trader IV"]
-    pub algorithmic_stock_trader_iv: JsValue,
+    pub algorithmic_stock_trader_iv: ((f64, Vec<f64>), f64),
     #[js = "Minimum Path Sum in a Triangle"]
-    pub minimum_path_sum_in_a_triangle: JsValue,
+    pub minimum_path_sum_in_a_triangle: (Vec<Vec<f64>>, f64),
     #[js = "Unique Paths in a Grid I"]
-    pub unique_paths_in_a_grid_i: JsValue,
+    pub unique_paths_in_a_grid_i: ([f64; 2], f64),
     #[js = "Unique Paths in a Grid II"]
-    pub unique_paths_in_a_grid_ii: JsValue,
+    pub unique_paths_in_a_grid_ii: (Vec<Vec<f64>>, f64),
     #[js = "Shortest Path in a Grid"]
-    pub shortest_path_in_a_grid: JsValue,
+    pub shortest_path_in_a_grid: (Vec<Vec<f64>>, String),
     #[js = "Sanitize Parentheses in Expression"]
-    pub sanitize_parentheses_in_expression: JsValue,
+    pub sanitize_parentheses_in_expression: (String, Vec<String>),
     #[js = "Find All Valid Math Expressions"]
-    pub find_all_valid_math_expressions: JsValue,
+    pub find_all_valid_math_expressions: ((String, f64), Vec<String>),
     #[js = "HammingCodes: Integer to Encoded Binary"]
-    pub hamming_codes_integer_to_encoded_binary: JsValue,
+    pub hamming_codes_integer_to_encoded_binary: (f64, String),
     #[js = "HammingCodes: Encoded Binary to Integer"]
-    pub hamming_codes_encoded_binary_to_integer: JsValue,
+    pub hamming_codes_encoded_binary_to_integer: (String, f64),
     #[js = "Proper 2-Coloring of a Graph"]
-    pub proper_2_coloring_of_a_graph: JsValue,
+    pub proper_2_coloring_of_a_graph: ((f64, Vec<[f64; 2]>), Vec<f64>),
     #[js = "Compression I: RLE Compression"]
-    pub compression_i_rle_compression: JsValue,
+    pub compression_i_rle_compression: [String; 2],
     #[js = "Compression II: LZ Decompression"]
-    pub compression_ii_lz_decompression: JsValue,
+    pub compression_ii_lz_decompression: [String; 2],
     #[js = "Compression III: LZ Compression"]
-    pub compression_iii_lz_compression: JsValue,
+    pub compression_iii_lz_compression: [String; 2],
     #[js = "Encryption I: Caesar Cipher"]
-    pub encryption_i_caesar_cipher: JsValue,
+    pub encryption_i_caesar_cipher: ((String, f64), String),
     #[js = "Encryption II: Vigenère Cipher"]
-    pub encryption_ii_vigen_re_cipher: JsValue,
+    pub encryption_ii_vigen_re_cipher: ([String; 2], String),
     #[js = "Square Root"]
     pub square_root: JsValue,
     #[js = "Total Number of Primes"]
-    pub total_number_of_primes: JsValue,
+    pub total_number_of_primes: ([f64; 2], f64),
     #[js = "Largest Rectangle in a Matrix"]
-    pub largest_rectangle_in_a_matrix: JsValue,
+    pub largest_rectangle_in_a_matrix: (Vec<Vec<f64>>, [[f64; 2]; 2]),
 }
 
 /// Names of all companies
@@ -1510,6 +1542,7 @@ pub struct CompanyReputationRequirement {
 }
 
 /// Company Work
+#[extends = "PlayerBaseTask"]
 pub struct CompanyWorkTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -1619,7 +1652,7 @@ pub struct CorpIndustryData {
     #[js = "recommendStarting"]
     pub recommend_starting: bool,
     #[js = "requiredMaterials"]
-    pub required_materials: JsValue,
+    pub required_materials: HashMap<String, f64>,
     /// Real estate factor
     #[js = "realEstateFactor"]
     pub real_estate_factor: Option<f64>,
@@ -1661,11 +1694,11 @@ pub struct CorpMaterialConstantData {
     pub demand_base: f64,
     /// Min and max demand
     #[js = "demandRange"]
-    pub demand_range: JsValue,
+    pub demand_range: [f64; 2],
     #[js = "competitionBase"]
     pub competition_base: f64,
     #[js = "competitionRange"]
-    pub competition_range: JsValue,
+    pub competition_range: [f64; 2],
     #[js = "baseCost"]
     pub base_cost: f64,
     #[js = "maxVolatility"]
@@ -1675,6 +1708,7 @@ pub struct CorpMaterialConstantData {
 }
 
 /// Corporation API
+#[extends = "WarehouseAPI, OfficeAPI"]
 pub struct Corporation {
 }
 impl Corporation {
@@ -2006,10 +2040,11 @@ pub struct CorpProductData {
     pub desc: String,
     /// Weighting factors for product
     #[js = "ratingWeights"]
-    pub rating_weights: JsValue,
+    pub rating_weights: CorpProductDataRatingWeights,
 }
 
 /// Create Program
+#[extends = "PlayerBaseTask"]
 pub struct CreateProgramWorkTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -2125,6 +2160,7 @@ pub struct CrimeStats {
 }
 
 /// Crime
+#[extends = "PlayerBaseTask"]
 pub struct CrimeTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -2145,7 +2181,7 @@ impl Darknet {
     /// Sends a network request to try to authenticate on a darknet server. The target server must be directly connected to the server that the script is running on. The speed of authentication scales with...
     /// RAM cost: 0.4 GB
     #[js = "authenticate"]
-    pub async fn authenticate(&self, host: String, password: String, #[optional] additional_msec: f64) -> DarknetResult;
+    pub async fn authenticate(&self, host: String, password: String, #[optional] additional_msec: f64) -> DarknetResultWithData;
     /// Attempts to connect to a target darknet server that you have previously authenticated on. Unlike authenticate(), connectToSession can be used to get a session on serv...
     /// RAM cost: 0.05 GB
     #[js = "connectToSession"]
@@ -2157,11 +2193,11 @@ impl Darknet {
     /// Uses an exploit to extract log data from a server by sending a malformed heartbeat request. Retrieves the most recent logs on the server. This can be used to get more feedback on authentication att...
     /// RAM cost: 0.6 GB
     #[js = "heartbleed"]
-    pub async fn heartbleed(&self, host: String, #[optional] options: HeartbleedOptions) -> DarknetResult;
+    pub async fn heartbleed(&self, host: String, #[optional] options: HeartbleedOptions) -> DarknetResultWithLogs;
     /// Opens a .cache file on the current server to acquire its valuable contents.
     /// RAM cost: 2 GB
     #[js = "openCache"]
-    pub fn open_cache(&self, filename: String, #[optional] suppress_toast: bool) -> CacheReward;
+    pub fn open_cache(&self, filename: String, #[optional] suppress_toast: bool) -> CacheResult;
     /// Returns a list of all darknet servers connected to the script's current server. For example, if called from a script running on `home`, it will return `["darkweb"]`. It will return an empty list if...
     /// RAM cost: 0.2 GB
     #[js = "probe"]
@@ -2181,11 +2217,11 @@ impl Darknet {
     /// Returns the darknet-specific details of the server.
     /// RAM cost: 0.1 GB
     #[js = "getServerDetails"]
-    pub fn get_server_details(&self, #[optional] host: String) -> DarknetServerDetails;
+    pub fn get_server_details(&self, #[optional] host: String) -> DarknetServerDetailsWithIsOnline;
     /// Attempts to move a target server to other parts of the darknet, by overloading the connections between it and the current server. Continued attempts accrue charge on the target server, which causes...
     /// RAM cost: 4 GB
     #[js = "induceServerMigration"]
-    pub async fn induce_server_migration(&self, host: String) -> DarknetResult;
+    pub async fn induce_server_migration(&self, host: String) -> DarknetResultWithProgress;
     /// Executes STORM_SEED.exe, if it is present on the server the script is running on.
     /// RAM cost: 0.1 GB
     #[js = "unleashStormSeed"]
@@ -2530,6 +2566,7 @@ pub struct FactionWorkEnumType {
 }
 
 /// Faction Work
+#[extends = "PlayerBaseTask"]
 pub struct FactionWorkTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -2737,7 +2774,7 @@ impl Gang {
     /// Get information about all gangs.
     /// RAM cost: 2 GB
     #[js = "getAllGangInformation"]
-    pub fn get_all_gang_information(&self) -> JsValue;
+    pub fn get_all_gang_information(&self) -> HashMap<String, GangOtherInfoObject>;
     /// Get information about a specific gang member.
     /// RAM cost: 2 GB
     #[js = "getMemberInformation"]
@@ -3280,15 +3317,15 @@ impl Go {
     /// Make a move on the IPvGO subnet game board, and await the opponent's response. \{"x":0,"y":0\} represents the bottom-left corner of the board in the UI.
     /// RAM cost: 4 GB
     #[js = "makeMove"]
-    pub async fn make_move(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> JsValue;
+    pub async fn make_move(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Pass the player's turn rather than making a move, and await the opponent's response. This ends the game if the opponent passed on the previous turn, or if the opponent passes on their following turn.
     /// RAM cost: 0 GB
     #[js = "passTurn"]
-    pub async fn pass_turn(&self, #[optional] pass_as_white: bool) -> JsValue;
+    pub async fn pass_turn(&self, #[optional] pass_as_white: bool) -> GoMakeMoveResult;
     /// Returns a promise that resolves with the success or failure state of your last move, and the AI's response, if applicable. \{"x":0,"y":0\} represents the bottom-left corner of the board in the UI.
     /// RAM cost: 0 GB
     #[js = "opponentNextTurn"]
-    pub async fn opponent_next_turn(&self, #[optional] log_opponent_move: bool, #[optional] play_as_white: bool) -> JsValue;
+    pub async fn opponent_next_turn(&self, #[optional] log_opponent_move: bool, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Retrieves a simplified version of the board state. "X" represents black pieces, "O" white, and "." empty points. "#" are dead nodes that are not part of the subnet. (They are not territory nor open...
     /// RAM cost: 4 GB
     #[js = "getBoardState"]
@@ -3304,7 +3341,7 @@ impl Go {
     /// Gets the status of the current game. Shows the current player, current score, and the previous move coordinates. Previous move will be null for a pass, or if there are no prior moves.
     /// RAM cost: 0 GB
     #[js = "getGameState"]
-    pub fn get_game_state(&self) -> JsValue;
+    pub fn get_game_state(&self) -> GoGetGameStateResult;
     /// Returns the name of the opponent faction in the current subnet.
     /// RAM cost: 0 GB
     #[js = "getOpponent"]
@@ -3338,7 +3375,7 @@ impl GoAnalysis {
     /// Displays the game history, captured nodes, and gained bonuses for each opponent you have played against.
     /// RAM cost: 0 GB
     #[js = "getStats"]
-    pub fn get_stats(&self) -> JsValue;
+    pub fn get_stats(&self) -> HashMap<String, SimpleOpponentStats>;
     /// Reset all win/loss and winstreak records for the No AI opponent.
     /// RAM cost: 0 GB
     #[js = "resetStats"]
@@ -3376,19 +3413,19 @@ impl GoCheat {
     /// Attempts to remove an existing router, leaving an empty node behind.
     /// RAM cost: 8 GB
     #[js = "removeRouter"]
-    pub async fn remove_router(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> JsValue;
+    pub async fn remove_router(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Attempts to place two routers at once on empty nodes. Note that this ignores other move restrictions, so you can suicide your own routers if they have no access to empty ports and do not capture an...
     /// RAM cost: 8 GB
     #[js = "playTwoMoves"]
-    pub async fn play_two_moves(&self, x1: f64, y1: f64, x2: f64, y2: f64, #[optional] play_as_white: bool) -> JsValue;
+    pub async fn play_two_moves(&self, x1: f64, y1: f64, x2: f64, y2: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Attempts to repair an offline node, leaving an empty playable node behind.
     /// RAM cost: 8 GB
     #[js = "repairOfflineNode"]
-    pub async fn repair_offline_node(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> JsValue;
+    pub async fn repair_offline_node(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Attempts to destroy an empty node, leaving an offline dead space that does not count as territory or provide open node access to adjacent routers.
     /// RAM cost: 8 GB
     #[js = "destroyNode"]
-    pub async fn destroy_node(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> JsValue;
+    pub async fn destroy_node(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
 }
 
 /// Grafting API
@@ -3418,6 +3455,7 @@ impl Grafting {
 }
 
 /// Grafting Work
+#[extends = "PlayerBaseTask"]
 pub struct GraftingTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -3853,7 +3891,7 @@ pub struct IndustryData {
     pub cost: f64,
     /// Materials required for production and their amounts
     #[js = "requiredMaterials"]
-    pub required_materials: JsValue,
+    pub required_materials: HashMap<String, f64>,
     /// Materials produced
     #[js = "producedMaterials"]
     pub produced_materials: Option<Vec<String>>,
@@ -4546,10 +4584,10 @@ pub struct Office {
     pub total_experience: f64,
     /// Production of the employees
     #[js = "employeeProductionByJob"]
-    pub employee_production_by_job: JsValue,
+    pub employee_production_by_job: HashMap<String, f64>,
     /// Positions of the employees
     #[js = "employeeJobs"]
-    pub employee_jobs: JsValue,
+    pub employee_jobs: HashMap<String, f64>,
 }
 
 /// Corporation Office API
@@ -4642,6 +4680,7 @@ pub struct Person {
     pub city: String,
 }
 
+#[extends = "Person"]
 pub struct Player {
     #[js = "hp"]
     pub hp: HP,
@@ -4660,7 +4699,7 @@ pub struct Player {
     #[js = "entropy"]
     pub entropy: f64,
     #[js = "jobs"]
-    pub jobs: JsValue,
+    pub jobs: HashMap<String, String>,
     #[js = "factions"]
     pub factions: Vec<String>,
     #[js = "totalPlaytime"]
@@ -4672,6 +4711,7 @@ pub struct Player {
 }
 
 /// Base interface of all player tasks.
+#[extends = "BaseTask"]
 pub struct PlayerBaseTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -4768,7 +4808,7 @@ pub struct Product {
     pub effective_rating: f64,
     /// Product stats
     #[js = "stats"]
-    pub stats: JsValue,
+    pub stats: ProductStats,
     /// Production cost
     #[js = "productionCost"]
     pub production_cost: f64,
@@ -4843,9 +4883,10 @@ pub struct ReactElement {
     #[js = "props"]
     pub props: JsValue,
     #[js = "key"]
-    pub key: JsValue,
+    pub key: Option<JsValue>,
 }
 
+#[extends = "RunningScript"]
 pub struct RecentScript {
     /// Arguments the script was called with
     #[js = "args"]
@@ -4940,10 +4981,10 @@ pub struct ResetInfo {
     pub current_node: f64,
     /// A map of owned augmentations to their levels. Keyed by the augmentation name. Map values are the augmentation level (e.g. for NeuroFlux governor).
     #[js = "ownedAugs"]
-    pub owned_augs: JsValue,
+    pub owned_augs: HashMap<String, f64>,
     /// A map of owned source files. Its keys are the SF numbers. Its values are the active SF levels. This map takes BitNode options into account.
     #[js = "ownedSF"]
-    pub owned_sf: JsValue,
+    pub owned_sf: HashMap<i32, f64>,
     /// Current BitNode options
     #[js = "bitNodeOptions"]
     pub bit_node_options: BitNodeOptions,
@@ -5380,7 +5421,7 @@ impl Singularity {
     /// Get the current work the player is doing.
     /// RAM cost: 0.5 GB * 16/4/1
     #[js = "getCurrentWork"]
-    pub fn get_current_work(&self) -> JsValue;
+    pub fn get_current_work(&self) -> Option<JsValue>;
     /// Get a list of all unlocked achievements.
     #[js = "getUnlockedAchievements"]
     pub fn get_unlocked_achievements(&self) -> Vec<String>;
@@ -5438,7 +5479,7 @@ impl Sleeve {
     /// Get task of a sleeve.
     /// RAM cost: 4 GB
     #[js = "getTask"]
-    pub fn get_task(&self, sleeve_number: f64) -> JsValue;
+    pub fn get_task(&self, sleeve_number: f64) -> Option<JsValue>;
     /// Set a sleeve to idle.
     /// RAM cost: 4 GB
     #[js = "setToIdle"]
@@ -5517,6 +5558,7 @@ impl Sleeve {
     pub fn get_memory_upgrade_cost(&self, sleeve_number: f64, amount: f64) -> f64;
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveBladeburnerTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5535,6 +5577,7 @@ pub struct SleeveBladeburnerTask {
     pub tasks_completed: f64,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveClassTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5547,6 +5590,7 @@ pub struct SleeveClassTask {
     pub location: String,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveCompanyTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5557,6 +5601,7 @@ pub struct SleeveCompanyTask {
     pub company_name: String,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveCrimeTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5573,6 +5618,7 @@ pub struct SleeveCrimeTask {
     pub tasks_completed: f64,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveFactionTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5585,6 +5631,7 @@ pub struct SleeveFactionTask {
     pub faction_name: String,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveInfiltrateTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5597,6 +5644,7 @@ pub struct SleeveInfiltrateTask {
     pub cycles_needed: f64,
 }
 
+#[extends = "Person"]
 pub struct SleevePerson {
     #[js = "hp"]
     pub hp: HP,
@@ -5622,6 +5670,7 @@ pub struct SleevePerson {
     pub stored_cycles: f64,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveRecoveryTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5630,6 +5679,7 @@ pub struct SleeveRecoveryTask {
     pub r#type: String,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveSupportTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5638,6 +5688,7 @@ pub struct SleeveSupportTask {
     pub r#type: String,
 }
 
+#[extends = "BaseTask"]
 pub struct SleeveSynchroTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -5671,6 +5722,7 @@ pub struct SourceFileRequirement {
     pub source_file: f64,
 }
 
+#[extends = "RunOptions"]
 pub struct SpawnOptions {
     /// Number of threads that the script will run with, defaults to 1
     #[js = "threads"]
@@ -5796,7 +5848,7 @@ impl Stock {
     /// Returns the player’s position in a stock.
     /// RAM cost: 2 GB
     #[js = "getPosition"]
-    pub fn get_position(&self, sym: String) -> JsValue;
+    pub fn get_position(&self, sym: String) -> [f64; 4];
     /// Returns the maximum number of shares of a stock.
     /// RAM cost: 2 GB
     #[js = "getMaxShares"]
@@ -5836,7 +5888,7 @@ impl Stock {
     /// Returns your order book for the stock market.
     /// RAM cost: 2.5 GB
     #[js = "getOrders"]
-    pub fn get_orders(&self) -> JsValue;
+    pub fn get_orders(&self) -> HashMap<String, Vec<StockOrder>>;
     /// Returns the volatility of the specified stock.
     /// RAM cost: 2.5 GB
     #[js = "getVolatility"]
@@ -5915,6 +5967,7 @@ pub struct StockOrder {
 }
 
 /// Study
+#[extends = "PlayerBaseTask"]
 pub struct StudyTask {
     /// This promise resolves when the task completes or is canceled.
     #[js = "nextCompletion"]
@@ -6026,7 +6079,7 @@ impl UserInterface {
     /// Get the current window size
     /// RAM cost: 0 GB
     #[js = "windowSize"]
-    pub fn window_size(&self) -> JsValue;
+    pub fn window_size(&self) -> [f64; 2];
     /// Get the current theme
     /// RAM cost: 0 GB
     #[js = "getTheme"]
@@ -6074,7 +6127,7 @@ impl UserInterface {
     /// Returns a list of every alias that's been set.
     /// RAM cost: 0 GB
     #[js = "getAllAliases"]
-    pub fn get_all_aliases(&self) -> JsValue;
+    pub fn get_all_aliases(&self) -> HashMap<String, UserInterfaceGetAllAliasesResult>;
     /// Renders a ReactNode in the main content area.
     /// RAM cost: 0 GB
     #[js = "renderPage"]
@@ -6319,4 +6372,240 @@ pub struct WorkStats {
     pub cha_exp: f64,
     #[js = "intExp"]
     pub int_exp: f64,
+}
+
+pub struct BladeburnerGetNextBlackOpResult {
+    #[js = "name"]
+    pub name: String,
+    #[js = "rank"]
+    pub rank: f64,
+}
+
+pub struct CorpProductDataRatingWeights {
+    #[js = "aesthetics"]
+    pub aesthetics: Option<f64>,
+    #[js = "durability"]
+    pub durability: Option<f64>,
+    #[js = "features"]
+    pub features: Option<f64>,
+    #[js = "quality"]
+    pub quality: Option<f64>,
+    #[js = "performance"]
+    pub performance: Option<f64>,
+    #[js = "reliability"]
+    pub reliability: Option<f64>,
+}
+
+#[extends = "DarknetResult"]
+pub struct DarknetResultWithData {
+    #[js = "success"]
+    pub success: bool,
+    #[js = "code"]
+    pub code: f64,
+    #[js = "message"]
+    pub message: String,
+    #[js = "data"]
+    pub data: Option<JsValue>,
+}
+
+#[extends = "DarknetResult"]
+pub struct DarknetResultWithLogs {
+    #[js = "success"]
+    pub success: bool,
+    #[js = "code"]
+    pub code: f64,
+    #[js = "message"]
+    pub message: String,
+    #[js = "logs"]
+    pub logs: Vec<String>,
+}
+
+#[extends = "DarknetResult"]
+pub struct DarknetResultWithProgress {
+    #[js = "success"]
+    pub success: bool,
+    #[js = "code"]
+    pub code: f64,
+    #[js = "message"]
+    pub message: String,
+    #[js = "progress"]
+    pub progress: f64,
+}
+
+#[extends = "DarknetServerDetails"]
+pub struct DarknetServerDetailsWithIsOnline {
+    /// True if the server is directly connected to the current server
+    #[js = "isConnectedToCurrentServer"]
+    pub is_connected_to_current_server: bool,
+    /// True if the current script has authenticated to this server with the right password using authenticate() or connectToSesssion()
+    #[js = "hasSession"]
+    pub has_session: bool,
+    /// The model of the server. Similar models have similar vulnerabilities. The model list is intentionally undocumented. You are supposed to experiment and discover the models.
+    #[js = "modelId"]
+    pub model_id: String,
+    /// Static password reminder text set for this server.
+    #[js = "passwordHint"]
+    pub password_hint: String,
+    /// Data from the passwordHint, if any.
+    #[js = "data"]
+    pub data: String,
+    /// The frequency (in seconds) of the server adding its own messages to its logs, visible with heartbleed().
+    #[js = "logTrafficInterval"]
+    pub log_traffic_interval: f64,
+    /// The number of characters in the password
+    #[js = "passwordLength"]
+    pub password_length: f64,
+    /// The character set used in the password
+    #[js = "passwordFormat"]
+    pub password_format: String,
+    /// The amount of ram blocked by the server owner
+    #[js = "blockedRam"]
+    pub blocked_ram: f64,
+    /// The difficulty rating of the server, associated with its original depth in the net
+    #[js = "difficulty"]
+    pub difficulty: f64,
+    /// The current depth in the darknet of the server
+    #[js = "depth"]
+    pub depth: f64,
+    /// The charisma skill required to authenticate on the server
+    #[js = "requiredCharismaSkill"]
+    pub required_charisma_skill: f64,
+    /// If this darknet server cannot be moved. True for fixed/story servers.
+    #[js = "isStationary"]
+    pub is_stationary: bool,
+    #[js = "isOnline"]
+    pub is_online: bool,
+}
+
+pub struct GoGetGameStateResult {
+    #[js = "currentPlayer"]
+    pub current_player: String,
+    #[js = "whiteScore"]
+    pub white_score: f64,
+    #[js = "blackScore"]
+    pub black_score: f64,
+    #[js = "previousMove"]
+    pub previous_move: Option<[f64; 2]>,
+    #[js = "komi"]
+    pub komi: f64,
+    #[js = "bonusCycles"]
+    pub bonus_cycles: f64,
+}
+
+pub struct GoMakeMoveResult {
+    #[js = "type"]
+    pub r#type: String,
+    #[js = "x"]
+    pub x: Option<f64>,
+    #[js = "y"]
+    pub y: Option<f64>,
+}
+
+pub struct NSHeart {
+}
+impl NSHeart {
+    /// Get your current karma.
+    /// RAM cost: 0 GB
+    #[js = "break"]
+    pub fn r#break(&self) -> f64;
+}
+
+pub struct ProductStats {
+    #[js = "quality"]
+    pub quality: f64,
+    #[js = "performance"]
+    pub performance: f64,
+    #[js = "durability"]
+    pub durability: f64,
+    #[js = "reliability"]
+    pub reliability: f64,
+    #[js = "aesthetics"]
+    pub aesthetics: f64,
+    #[js = "features"]
+    pub features: f64,
+}
+
+#[extends = "Server"]
+pub struct ServerWithIsOnline {
+    /// Hostname. Must be unique
+    #[js = "hostname"]
+    pub hostname: String,
+    /// IP Address. Must be unique
+    #[js = "ip"]
+    pub ip: String,
+    /// Whether or not the SSH Port is open
+    #[js = "sshPortOpen"]
+    pub ssh_port_open: bool,
+    /// Whether or not the FTP port is open
+    #[js = "ftpPortOpen"]
+    pub ftp_port_open: bool,
+    /// Whether or not the SMTP Port is open
+    #[js = "smtpPortOpen"]
+    pub smtp_port_open: bool,
+    /// Whether or not the HTTP Port is open
+    #[js = "httpPortOpen"]
+    pub http_port_open: bool,
+    /// Whether or not the SQL Port is open
+    #[js = "sqlPortOpen"]
+    pub sql_port_open: bool,
+    /// Flag indicating whether player has admin/root access to this server
+    #[js = "hasAdminRights"]
+    pub has_admin_rights: bool,
+    /// How many CPU cores this server has. Affects magnitude of grow and weaken ran from this server.
+    #[js = "cpuCores"]
+    pub cpu_cores: f64,
+    /// Flag indicating whether player is currently connected to this server
+    #[js = "isConnectedTo"]
+    pub is_connected_to: bool,
+    /// RAM (GB) used. i.e. unavailable RAM
+    #[js = "ramUsed"]
+    pub ram_used: f64,
+    /// RAM (GB) available on this server
+    #[js = "maxRam"]
+    pub max_ram: f64,
+    /// Name of company/faction/etc. that this server belongs to, not applicable to all Servers
+    #[js = "organizationName"]
+    pub organization_name: String,
+    /// Flag indicating whether this is a server owned by the player (e.g., home, cloud servers, hacknet servers)
+    #[js = "purchasedByPlayer"]
+    pub purchased_by_player: bool,
+    /// Flag indicating whether this server has a backdoor installed by a player
+    #[js = "backdoorInstalled"]
+    pub backdoor_installed: Option<bool>,
+    /// Server's initial server security level at creation.
+    #[js = "baseDifficulty"]
+    pub base_difficulty: Option<f64>,
+    /// Server Security Level
+    #[js = "hackDifficulty"]
+    pub hack_difficulty: Option<f64>,
+    /// Minimum server security level that this server can be weakened to
+    #[js = "minDifficulty"]
+    pub min_difficulty: Option<f64>,
+    /// How much money currently resides on the server and can be hacked
+    #[js = "moneyAvailable"]
+    pub money_available: Option<f64>,
+    /// Maximum amount of money that this server can hold
+    #[js = "moneyMax"]
+    pub money_max: Option<f64>,
+    /// Number of open ports required in order to gain admin/root access
+    #[js = "numOpenPortsRequired"]
+    pub num_open_ports_required: Option<f64>,
+    /// How many ports are currently opened on the server
+    #[js = "openPortCount"]
+    pub open_port_count: Option<f64>,
+    /// Hacking level required to hack this server
+    #[js = "requiredHackingSkill"]
+    pub required_hacking_skill: Option<f64>,
+    /// Growth effectiveness statistic. Higher values produce more growth with ns.grow()
+    #[js = "serverGrowth"]
+    pub server_growth: Option<f64>,
+    #[js = "isOnline"]
+    pub is_online: Option<bool>,
+}
+
+pub struct UserInterfaceGetAllAliasesResult {
+    #[js = "substitution"]
+    pub substitution: String,
+    #[js = "isGlobal"]
+    pub is_global: bool,
 }

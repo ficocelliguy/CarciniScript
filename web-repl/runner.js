@@ -108,7 +108,9 @@ self.onmessage = async ({ data }) => {
     post("done", { exitCode: 0, ms: performance.now() - start });
   } catch (e) {
     globalThis.κσ?.$flush();
-    if (e?.name === "CarciniPanic") {
+    if (e?.name === "CarciniExit") {
+      post("done", { exitCode: e.exitCode });
+    } else if (e?.name === "CarciniPanic") {
       post("panic", { message: e.panicMessage, location: e.location });
       post("done", { exitCode: 101 });
     } else {

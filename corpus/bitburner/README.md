@@ -9,7 +9,7 @@ no threads. Modeled on the scripts in `BitburnerScripts` and on bitburner-src's 
 |---|---|---|
 | `net.rs` | Shared module: BFS crawler, rooting, RAM pool, top-k | `Deref` newtype, `impl Iterator` with a lifetime, `BinaryHeap` + `Reverse` + hand-written `Ord`, `#[macro_export]` |
 | `batcher.rs` + `hwgw.rs` | HWGW batcher: target scoring, prep, formulas-based thread math, timed launches, port reports | `Index<Step>`, thiserror with `#[source]`, `TryFrom<&[JsValue]>`, `Duration` math, bisection over a closure, `Rc<RefCell>` + `at_exit`, labeled loops, serde |
-| `darknet.rs` + `dn_models.rs` + `dn_tasks.rs` | Darknet crawler: cracks each server model, shares a password vault, spreads itself, runs chores | `FromStr` model enum, generic `async fn`, `let`-`else`, iterative maze DFS, recursive-descent parser, itertools, `LazyLock<Regex>`, `#[cfg(test)]` tests |
+| `darknet.rs` + `dn_models.rs` + `dn_tasks.rs` | Darknet crawler: cracks all 25 server models, shares a password vault, spreads itself, runs chores | `FromStr` model enum, generic `async fn`, nested `async fn` items, `let`-`else`, iterative maze DFS, recursive-descent parser, `i128` CRT, Gaussian peak inversion, `include_str!` word list (`common_passwords.txt`), itertools, `LazyLock<Regex>`, `#[cfg(test)]` tests |
 | `contracts.rs` | Coding contract solver for 23 contract types | `fn` pointer table, `#[serde(untagged)]`, DP, BFS, `scan`/`try_fold`/`chunk_by` |
 | `hacknet.rs` | Hacknet upgrades by payback time, hash spending | enum with data, `min_by`, `clamp` |
 | `servers.rs` | Buys and upgrades cloud servers | anyhow, `successors`, slice patterns |

@@ -12,6 +12,24 @@
     "panic": null
   },
   {
+    "file": "array_default.rs",
+    "stdout": "Threads([0, 0, 7, 0]) 4\nBoard { grid: [[0, 0], [9, 0], [0, 0]], cells: [Tile { hits: 1, name: \"\" }, Tile { hits: 0, name: \"\" }], slots: [None, None, None], flags: [], total: 0.0 }\ntrue\n[0, 0] [[0, 0], [0, 0]] [\"\", \"\", \"\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "array_len_asref.rs",
+    "stdout": "1 2 3 3 4 1.5 2.5\nHI YO 6\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "array_patterns.rs",
+    "stdout": "10 1.5 0 0\n1 5 [1, 2] [3, 4]\na ['b', 'c']\n1 x\nSome(12) None\nOk([7, 8])\nErr([1])\nOk([2, 3]) Err(TryFromSliceError(()))\ncould not convert slice to array\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "assert_msg.rs",
     "stdout": "tri(10) = 55\n",
     "exitCode": 101,
@@ -26,6 +44,12 @@
   {
     "file": "assoc_generic.rs",
     "stdout": "1.5 13\n4.5 48\n(\"square\", 2.25) (\"grid\", 12)\n22.5 square 2.25 grid 12\n3C 1.5\n16\nsquare 4.0 <square 9.0> (\"square\", 9.0)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "async_closures.rs",
+    "stdout": "15\nhi x3\nhi x4\nroot\n  a\n    a1\n  b\n4 4\n15\n[0, 2, 4]\nboxed\n28\nn=7\nOk(40)\ntrue\n55\n99\n9\n",
     "exitCode": 0,
     "panic": null
   },
@@ -60,6 +84,12 @@
     "panic": null
   },
   {
+    "file": "closure_try_infer.rs",
+    "stdout": "Some(5.5) Some(255.0) None\nOk(42) true\n[Some('A'), None, Some('C')]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "closures.rs",
     "stdout": "15\n11\n49\n14\n6 1\n10\n42\ncount 22\nnegative zero positive\n('x', 1)\nSome(4) None\n[\"A\", \"B\"]\n",
     "exitCode": 0,
@@ -80,6 +110,12 @@
   {
     "file": "combinators.rs",
     "stdout": "None -> Ok(None)\nNone\nSome(Ok(12)) -> Ok(Some(12))\nSome(Ok(12))\nSome(Err(\"invalid digit found in string\")) -> Err(\"invalid digit found in string\")\nSome(Err(\"invalid digit found in string\"))\nOk(3) Err(\"bad\") Some(5) None [\"ok 3\", \"err bad\", \"some 5\"]\n[Some(0), None, Some(20), None] calls=2\n[0, 1, 2]\nmany\n[\"r\", \"g\", \"b\", \"r\", \"g\", \"b\", \"r\"]\n[(1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a')]\n[]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "const_generic_named.rs",
+    "stdout": "History { values: [1.0, 2.0, 3.0] } true [0.0, 2.0, 4.0, 6.0] false\n",
     "exitCode": 0,
     "panic": null
   },
@@ -132,6 +168,18 @@
     "panic": null
   },
   {
+    "file": "copy_array_struct.rs",
+    "stdout": "Threads([9, 2, 3, 4]) Threads([1, 2, 3, 4]) false\nBatch { threads: Threads([1, 2, 3, 4]), delays: [0.5, 1.5] }\nBatch { threads: Threads([1, 2, 3, 0]), delays: [0.5, 7.0] }\n10\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "corpus_idioms.rs",
+    "stdout": "4 7\nhello joe hello x\nHost(\"a\") Host(\"b\")\n[Host(\"home\"), Host(\"zer0\")] [(Host(\"n00dles\"), \"n00dles is long\")]\n[\"321\"]\n[Some(10), Some(2), Some(30)]\n[11, 22, 3]\n4 Some(1000000000000)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "cow.rs",
     "stdout": "a_b_c abc \"a_b_c\" \"abc\"\n5 ABC true true\ntrue\na_b_c\nfrom true\nstatic n=3\n[2, 4, 6] [2, 4] true 2\n[2, 4, 6, 8] true\nhi\n[\"x_y\", \"z\"]\n",
     "exitCode": 0,
@@ -152,6 +200,36 @@
   {
     "file": "crate_cells.rs",
     "stdout": "[2, 3, 5, 7, 11, 13, 17, 19, 23, 29] 10\n2 None\nNone\nOk(()) Err(\"slow\")\nSome(\"fast\") fast\n7 7\nother\n42 true Some(42) None\nLeft(84)\n42\nHI false None Some(\"HI\")\nRight(2)\nHI!\nLeft('x') x\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_chrono.rs",
+    "stdout": "2024-02-28 2024-02-28 Wed\n2024-02-29 2024-03-01 leap true\nNone\ny=2024 m=2 d=28 ord=59 ce=738944\n2025-04-03 2023-12-20\n2025-02-28\n2023-02-28 2022-12-31\n308 days, TimeDelta { secs: 26611200, nanos: 0 }, PT26611200S\nage 33\n2024-W09 53\n[\"Wed 28\", \"Thu 29\", \"Fri 01\", \"Sat 02\"]\n2024-12-01\nNone\n2024-11-28\n09:05:07.250 09:05:07.250 h=9 m=5 s=7 ns=250000000\n05:05:07.250\n09:05 AM|9| 9|.250|250000000\n2024-02-28 23:59:30 2024-02-28T23:59:30\n2024-02-29 00:00:16.500 PT46.5S\n2024-02-28 23:59:30 | Wednesday February 28 | 059 | 02/28/24 | 2024-02-28 23:59:30 | 24 20 | 08 09 09 2024 | %\nWed Feb 28 23:59:30 2024 | 11:59:30 PM | 23:59 | 28-Feb-2024 | 3 3\n1709164770\n2024-06-01 12:00:00 UTC | 2024-06-01T12:00:00Z | 2024-06-01T12:00:00+00:00\nSat, 1 Jun 2024 12:00:00 +0000\n2024-06-01T12:00:00.000Z\n2024-06-01 21:00:00 +09:00 | 2024-06-01T21:00:00+09:00 | 21 +09:00\n2024-06-01T21:00:00+09:00 +0900 +09:00\nsame instant true\n172800\n2024-01-01 00:00:00 -05:00 -> 2024-01-01 05:00:00 UTC\n2023-11-14 22:13:20 UTC\nSome(1969-12-31T23:59:59.999Z)\n2024-03-10 08:15:30.125 +02:00 1710051330125\n2024-03-10T08:15:30Z\n2024-03-10 08:15:30 +00:00\nErr(ParseError(OutOfRange))\nErr(ParseError(OutOfRange))\nErr(ParseError(TooShort))\nErr(ParseError(TooLong))\nErr(ParseError(Invalid))\nOk(2024-03-05T19:04:00)\nOk(10:30:00)\nErr(ParseError(NotEnough))\nOk(2020-01-05)\nerror: input contains invalid characters\nOk(2024-01-02T03:04:05+05:30)\nDec 2023 1\nJan 2024 1\nMar 2024 2\n[2023-01-31, 2024-02-28, 2024-02-29] max 2024-02-29\nSat Sun 6 6 Fri\nFebruary November\n-PT5399.75S -89 -5399 TimeDelta { secs: -5400, nanos: 250000000 }\nP0D 1\nOk(5s) true\n330\ntrue 2024-01-15 09:30:00 9\ntrue\ntrue 2024-07-15 18:30:00 18\ntrue\nnow ok: true\nlocal ok: true\nlocal format: 4\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_chrono_tz.rs",
+    "stdout": "2024-07-01 13:00:00 BST | 2024-07-01T13:00:00BST | BST +0100 | Europe/London Europe/London Europe/London\n2024-07-01 08:00:00 EDT | 2024-07-01T08:00:00EDT | EDT -0400 | America/New_York America/New_York America/New_York\n2024-07-01 14:00:00 CEST | 2024-07-01T14:00:00CEST | CEST +0200 | Europe/Berlin Europe/Berlin Europe/Berlin\n2024-07-01 21:00:00 JST | 2024-07-01T21:00:00JST | JST +0900 | Asia/Tokyo Asia/Tokyo Asia/Tokyo\n2024-07-01 17:30:00 IST | 2024-07-01T17:30:00IST | IST +0530 | Asia/Kolkata Asia/Kolkata Asia/Kolkata\n2024-07-01 22:00:00 AEST | 2024-07-01T22:00:00AEST | AEST +1000 | Australia/Sydney Australia/Sydney Australia/Sydney\n2024-07-01 12:00:00 UTC | 2024-07-01T12:00:00UTC | UTC +0000 | UTC UTC UTC\n2024-01-01 12:00:00 GMT GMT\nOk(America/New_York)\nfailed to parse timezone / ParseError(())\ntrue\nAmbiguous(2024-11-03T01:30:00EDT, 2024-11-03T01:30:00EST)\n+00:00\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_clap.rs",
+    "stdout": "OK Args { name: \"Bob\", count: 3, verbose: false, mode: Fast, files: [\"a.txt\", \"b.txt\"], limit: None }\nOK Args { name: \"Al\", count: 5, verbose: true, mode: ReallySlow, files: [], limit: Some(4) }\nERR MissingRequiredArgument\nerror: the following required arguments were not provided:\n  --name <NAME>\n\nUsage: prog --name <NAME> [FILES]...\n\nFor more information, try '--help'.\n----\nERR ValueValidation\nerror: invalid value 'abc' for '--count <COUNT>': invalid digit found in string\n\nFor more information, try '--help'.\n----\nERR UnknownArgument\nerror: unexpected argument '--bogus' found\n\n  tip: to pass '--bogus' as a value, use '-- --bogus'\n\nUsage: prog --name <NAME> [FILES]...\n\nFor more information, try '--help'.\n----\nERR InvalidValue\nerror: invalid value 'medium' for '--mode <MODE>'\n  [possible values: fast, slow, really-slow]\n\nFor more information, try '--help'.\n----\nERR InvalidValue\nerror: a value is required for '--name <NAME>' but none was supplied\n\nFor more information, try '--help'.\n----\nERR DisplayHelp\nSimple program to greet a person\n\nUsage: prog [OPTIONS] --name <NAME> [FILES]...\n\nArguments:\n  [FILES]...\n          Input files\n\nOptions:\n  -n, --name <NAME>\n          Name of the person to greet\n\n  -c, --count <COUNT>\n          Number of times to greet\n          \n          [default: 1]\n\n  -v, --verbose\n          Be loud\n\n      --mode <MODE>\n          Possible values:\n          - fast:        Go fast\n          - slow\n          - really-slow\n          \n          [default: fast]\n\n      --limit <LIMIT>\n          \n\n  -h, --help\n          Print help (see a summary with '-h')\n\n  -V, --version\n          Print version\n----\nERR DisplayVersion\nprog 0.1.0\n----\nERR DisplayHelp\nSimple program to greet a person\n\nUsage: prog [OPTIONS] --name <NAME> [FILES]...\n\nArguments:\n  [FILES]...  Input files\n\nOptions:\n  -n, --name <NAME>    Name of the person to greet\n  -c, --count <COUNT>  Number of times to greet [default: 1]\n  -v, --verbose        Be loud\n      --mode <MODE>    [default: fast] [possible values: fast, slow, really-slow]\n      --limit <LIMIT>  \n  -h, --help           Print help (see more with '--help')\n  -V, --version        Print version\n----\nOK Git { cmd: Add { path: \"x.rs\" } }\nOK Git { cmd: Commit { message: Some(\"hi\"), all: true } }\nERR DisplayHelpOnMissingArgumentOrSubcommand\nUsage: git2 <COMMAND>\n\nCommands:\n  add     Add a file\n  commit  Commit things\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n----\nERR DisplayHelp\nUsage: git2 <COMMAND>\n\nCommands:\n  add     Add a file\n  commit  Commit things\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n----\nERR InvalidSubcommand\nerror: unrecognized subcommand 'push'\n\nUsage: git2 <COMMAND>\n\nFor more information, try '--help'.\n----\nERR DisplayHelp\nCommit things\n\nUsage: git2 commit [OPTIONS]\n\nOptions:\n  -m, --message <MESSAGE>  \n  -a, --all                \n  -h, --help               Print help\n----\n",
+    "exitCode": 2,
+    "panic": null
+  },
+  {
+    "file": "crate_clap_builder.rs",
+    "stdout": "input=in.txt count=3 v=0 dry=false tags=[]\nno subcommand\ninput=in.txt count=7 v=2 dry=true tags=[\"x\", \"y\"]\nlist all=true\nERR UnknownArgument\nerror: unexpected argument '-5' found\n\n  tip: to pass '-5' as a value, use '-- -5'\n\nUsage: tool [OPTIONS] <input> [COMMAND]\n\nFor more information, try '--help'.\n----\nERR ValueValidation\nerror: invalid value 'many' for '--count <count>': invalid digit found in string\n\nFor more information, try '--help'.\n----\nERR DisplayHelp\nA builder-style tool\n\nUsage: tool [OPTIONS] <input> [COMMAND]\n\nCommands:\n  list  List things\n  help  Print this message or the help of the given subcommand(s)\n\nArguments:\n  <input>  File to read\n\nOptions:\n  -c, --count <count>  How many [default: 3]\n  -v, --verbose...     \n      --dry-run        Do nothing\n  -t, --tag <tag>      \n  -h, --help           Print help\n  -V, --version        Print version\n----\nERR DisplayVersion\ntool 1.2.3\n----\na\nUsage: tool [OPTIONS] <input> [COMMAND]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_clap_errors.rs",
+    "stdout": "ERR UnknownArgument\nerror: unexpected argument '--nmae' found\n\n  tip: a similar argument exists: '--name'\n\nUsage: a --name <NAME>\n\nFor more information, try '--help'.\n----\nERR UnknownArgument\nerror: unexpected argument '--zzz' found\n\nUsage: a [OPTIONS] --name <NAME>\n\nFor more information, try '--help'.\n----\nERR UnknownArgument\nerror: unexpected argument '-q' found\n\nUsage: a [OPTIONS] --name <NAME>\n\nFor more information, try '--help'.\n----\nERR ArgumentConflict\nerror: the argument '--name <NAME>' cannot be used multiple times\n\nUsage: a [OPTIONS] --name <NAME>\n\nFor more information, try '--help'.\n----\nERR InvalidValue\nerror: invalid value 'slw' for '--mode <MODE>'\n  [possible values: fast, slow]\n\n  tip: a similar value exists: 'slow'\n\nFor more information, try '--help'.\n----\nOK A { name: \"x\", mode: None, verbose: 3, tags: [\"a\", \"b\", \"c\"] }\nERR UnknownArgument\nerror: unexpected argument 'extra' found\n\nUsage: a [OPTIONS] --name <NAME>\n\nFor more information, try '--help'.\n----\nERR DisplayHelp\nUsage: a [OPTIONS] --name <NAME>\n\nOptions:\n  -n, --name <NAME>  \n      --mode <MODE>  [possible values: fast, slow]\n  -v, --verbose...   \n  -t, --tag <TAGS>   \n  -h, --help         Print help\n----\nOK B { input: \"in\", output: Some(\"out\"), cmd: Some(Run) }\nOK B { input: \"in\", output: None, cmd: None }\nOK B { input: \"in\", output: Some(\"out\"), cmd: Some(Stop { force: true }) }\nERR DisplayHelp\nDoes things\n\nUsage: tool <INPUT> [OUTPUT] [COMMAND]\n\nCommands:\n  run   \n  stop  \n  help  Print this message or the help of the given subcommand(s)\n\nArguments:\n  <INPUT>   The input\n  [OUTPUT]  The output\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n----\nERR DisplayVersion\ntool 2.3\n----\nERR MissingRequiredArgument\nerror: the following required arguments were not provided:\n  <INPUT>\n\nUsage: tool <INPUT> [OUTPUT]\n\nFor more information, try '--help'.\n----\nERR UnknownArgument\nerror: unexpected argument 'c' found\n\nUsage: tool <INPUT> [OUTPUT] [COMMAND]\n\nFor more information, try '--help'.\n----\nERR MissingSubcommand\nerror: 'g' requires a subcommand but one was not provided\n  [subcommands: run, stop, help]\n\nUsage: g [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n----\nERR InvalidSubcommand\nerror: unrecognized subcommand 'rn'\n\nUsage: g [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n----\nERR DisplayHelp\nUsage: g [OPTIONS] <COMMAND>\n\nCommands:\n  run   \n  stop  \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n      --dry   \n  -h, --help  Print help\n----\nERR DisplayHelp\nUsage: g stop [OPTIONS]\n\nOptions:\n      --force  \n  -h, --help   Print help\n----\nERR DisplayHelp\nUsage: g stop [OPTIONS]\n\nOptions:\n      --force  \n  -h, --help   Print help\n----\nERR DisplayHelp\nUsage: g [OPTIONS] <COMMAND>\n\nCommands:\n  run   \n  stop  \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n      --dry   \n  -h, --help  Print help\n----\n",
     "exitCode": 0,
     "panic": null
   },
@@ -180,8 +258,14 @@
     "panic": null
   },
   {
+    "file": "crate_rand_distr.rs",
+    "stdout": "dice in range: true\nall faces: true\nunit floats: 100 true\ni64: true\nweighted: true\nweighted name: true\nSome(NoItem)\nSome(AllWeightsZero)\nerror: A weight is invalid in distribution\nnever: true\nalways: true\nErr(InvalidProbability)\nalnum: 16 true\nalnum byte: true\nstandard: true true 3\ndirs: true true\nnormal mean ~10: true\nnormal params: 10 2\nzscore: 13\nnoisy finite: true\nstandard normal: true\nErr(BadVariance)\nvariation parameter is non-finite in (log)normal distribution\nlognormal positive: true\nlognormal cv 0: 3.000000\nexp mean ~0.5: true\nSome(LambdaTooSmall)\npoisson 3: whole true mean ok true\npoisson 50: whole true mean ok true\nlambda is not positive in Poisson distribution\nbinomial 10 0.3: true true\nbinomial 1000 0.5: true true\nbinomial 500 0.9: true true\nSome(ProbabilityTooLarge)\ngamma mean ~6: true\ngamma small shape positive: true\ntriangular: true\nmode is outside [min, max] in triangular distribution\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "crate_rayon.rs",
-    "stdout": "[1, 4, 9, 16, 25, 36, 49, 64, 81, 100]\nsum 55\nevens 50\nreduce 55\nfold 55\nmax Some(10)\n[1, 3, 5, 7, 9]\n[9, 7, 5, 3, 1]\n[90, 70, 50, 30, 10]\nSome(\"apple\")\nSome(2)\n[5, 3, 5, 4]\n[6, 15, 24, 10]\n[1, 1, 2, 2, 3, 3]\n3 words, any long: true\n[8, 9, 10]\n9\nfib 610\ntotal 55\nthreads true\n",
+    "stdout": "[1, 4, 9, 16, 25, 36, 49, 64, 81, 100]\nsum 55\nevens 50\nreduce 55\nfold 55\nmax Some(10)\n[1, 3, 5, 7, 9]\n[9, 7, 5, 3, 1]\n[90, 70, 50, 30, 10]\nSome(\"kayak\")\nSome(2)\n[5, 3, 5, 4]\n[6, 15, 24, 10]\n[1, 1, 2, 2, 3, 3]\n3 words, any long: true\n[8, 9, 10]\n9\nfib 610\ntotal 55\nthreads true\n",
     "exitCode": 0,
     "panic": null
   },
@@ -234,6 +318,12 @@
     "panic": null
   },
   {
+    "file": "drop_closures.rs",
+    "stdout": "before call\nclosure sees a\nclosure sees a\nend of block\ndrop a\n--\ninner block ends\nouter sees b\n--\nbefore once\nonce took c\ndrop c\nafter once\n--\nbefore by_value\ndrop d\nafter by_value\n--\nunused closure ends\ndrop e\n--\nmade 16\ndrop returned-capture\n--\nboxed sees boxed-capture\nboxed block ends\ndrop boxed-capture\n--\nfinish method\ndrop method\nfinished 6\nrenamed new\ninto_name named\ndrop named\ngot named\nconsume handoff\ndrop handoff\nhanded off\nend\ndrop new\n--\nboxed sees boxed-capture\nboxed sees boxed-capture\ndrop boxed-capture\ndrop boxed-capture\n==\nunwrapping one\ngot w1\ndrop w1\n--\ntwo\nshowing w2\ndrop w2\nafter show\n--\nimpl sees impl\ncall_impl ends\ndrop impl\nafter call_impl\n--\ncall_gen ends\ndrop gen\n3\nafter call_gen\n--\nref sees ref\nref sees ref\nafter call_ref\ndrop ref\n--\nheld 4\nholder ends\ndrop held\n--\nf2 5\nboxed 5\nblock ends\ndrop moved\n--\nmade 9\ndrop let-bound\n--\nloop sees loop0\ndrop loop0\nloop sees loop1\ndrop loop1\n--\nin vec vec\nplain\nvec block ends\ndrop vec\ndone\ndrop b\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "drop_order.rs",
     "stdout": "inner\ndrop b\ndrop c\nmoved d into e: d\ndrop r1\nreassigned r2\ndrop temp\ndrop statement\nconsume arg\ndrop arg\npass through\nkept through\ndrop early-a\nearly 1\ndrop early-b\ndrop early-a\nearly 2\ndrop try\nOk(5)\ndrop try\nErr(\"bad\")\niter 0\ndrop loop0\ndrop loop1\ndrop v1\ndrop v2\nend of main p1 true\ndrop opt\ndrop through\ndrop pair (p1 p2)\ndrop p1\ndrop p2\ndrop r2\ndrop d\ndrop a\n",
     "exitCode": 0,
@@ -242,6 +332,12 @@
   {
     "file": "dyn_error.rs",
     "stdout": "ok 8\nerror: invalid digit found in string\nerror: bad value \"0\" for threads\nerror: missing key threads\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "entry_default_struct.rs",
+    "stdout": "joes: Stats { hits: 1, money: 2.0, hosts: [\"joes-1\"] }\nn00dles: Stats { hits: 2, money: 4.5, hosts: [\"n00dles-1\", \"n00dles-2\"] }\n{1: Limit(15), 2: Limit(10)}\nBusy Idle 2\n",
     "exitCode": 0,
     "panic": null
   },
@@ -290,6 +386,12 @@
   {
     "file": "format.rs",
     "stdout": "crab has 10 legs\na b a\ncrab!\n[    crab] [crab    ] [  crab  ] [**crab***]\n[   10] [10   ] [-0010] [+10]\n3.14 3    3.142|\n\"crab\" 'c' \"tab\\there \\\"quoted\\\"\"\n1 1.0 0.30000000000000004 1e21\ninf -inf\n0.0000001 1e-7\n{literal} braces\n10-crab has len 7\n6\ntru\nCRAB\npadded\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "format_consts.rs",
+    "stdout": "\u001b[36mtext\u001b[0m\n[   hello] [2.500] [     2.5] (7, 'x')\n\"\\u{1b}[36m42\\u{1b}[0m\" 11\n[hello]\n0008        x\n",
     "exitCode": 0,
     "panic": null
   },
@@ -450,6 +552,12 @@
     "panic": null
   },
   {
+    "file": "iter_mut_element.rs",
+    "stdout": "Some(\"b\") Some(\"a\") None\n[Slot { host: \"a\", free: 5.5 }, Slot { host: \"b\", free: 1.0 }, Slot { host: \"c!\", free: 16.0 }]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "iterator_idioms.rs",
     "stdout": "[5, 3, 8, 1, 9, 2] [9, 8, 5, 3, 2, 1]\n[80, 20] [3, 1, 2] [5, 8, 9]\n[-2, 5, -7, 8, -7] [[5, 3, 8, 1], [9, 2]]\n[5, 8, 16, 17, 26, 28] 28\n6 2160\n(4, 9) [2, 9]\n[1, 2, 3] true\n[1, 2, 3, 1]\n3.75\na-b-c [(1, 'x'), (2, 'y'), (3, 'z')] [4, 3, 2, 1]\n4\n[11, 12, 13]\n",
     "exitCode": 0,
@@ -458,6 +566,12 @@
   {
     "file": "iterators.rs",
     "stdout": "[6, 2, 8, 2, 10, 18, 4, 12]\nevens 3\n31 6480\nSome(9) Some(1)\nSome(4)\nSome(5) None\ntrue true\n31415926\nSome(9)\n[4, 5, 2]\n[3, 1, 4, 1]\n[5, 9, 2, 6]\nSome(6) Some(1)\n[6, 2, 9]\n[3, 6] [1, 2, 3, 4, 5, 6]\n-0.0 7.5\n165\n0h 2l 4o \nabcde\nfedcba\ndesserts\nSHOUT\n[\"the\", \"quick\", \"brown\", \"fox\"]\n[\"a\", \"b\", \"\", \"c\"]\n[\"line one\", \"line two\", \"\", \"last\"]\n[8, 8, 0, 4]\n[3, 5, 7, 9]\n[1, 2] [3, 4] [5] \n[(1, 'a'), (2, 'b'), (3, 'c')]\n[1, 2, 3, 4, 5, 10, 20]\n[1, 2, 3]\n[1, 2, 2, 3, 3, 3]\nSome(300)\n[1, 3]\n[0, 1, 2]\n[('a', 0), ('b', 1), ('c', 2)]\nSome(\"banana\") Some(\"fig\")\n10\n12 23 34 45 \n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "labeled_break_infer.rs",
+    "stdout": "84\n5\n5\n\"\" \"x\"\n1\nSome(2.5)\nSome(6.0) None\n1\n\"\" 0 None\n\"s\" 3 Some(0)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -476,6 +590,12 @@
   {
     "file": "loops_slices.rs",
     "stdout": "64 4\nSome((2, 6)) None\n400 4\ndone\nempty | 0\none: 7 | 7\nbookends 3 | 12\n1 then 2 then 3 more | 9\n4 then 6 then 0 more | 10\ngo [\"north\", \"fast\"]\n1 a\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "macro_closure_args.rs",
+    "stdout": "[7, 12, 4]\n2 5\ntrue\n",
     "exitCode": 0,
     "panic": null
   },
@@ -546,6 +666,12 @@
     "panic": null
   },
   {
+    "file": "newtype_conversions.rs",
+    "stdout": "<home> <n00dles> <joes> <home-2> true\n7\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "numbers.rs",
     "stdout": "1229 primes below 10000, largest 9973\ngcd(1071, 462) = 21\nsum of squares = 333833500\n1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz \n723471715 2497366906 2064144800 2008045182 3532304609 \n         609|76          |    3368    |\nhash = 1294555236\n1.4142 0.0000 2.7183\n",
     "exitCode": 0,
@@ -568,6 +694,24 @@
     "stdout": "Some(1) None\ntrue false false true\n4 -1 0\nSome(4) None Some(\"text\")\ntrue true\nSome(10) None\nNone Some(20)\nholds 9 | empty\ndigits: 113\nSome(1) Some(3) Some(2) None\n[30, 20, 10] None None\nlast word bb has 2 bytes\n[Some(\"x\"), None]\n",
     "exitCode": 101,
     "panic": "thread 'main' panicked at option.rs:76:23:\nthe reading should exist"
+  },
+  {
+    "file": "option_nan_cmp.rs",
+    "stdout": "false false false false\nfalse false false false\nfalse true false\nNone None None\nSome(Less) Some(Greater)\ntrue true true true\nSome(Less) Some(Equal)\nfalse true false\nfalse false None\nSome(Greater)\nfalse true None\nNone\nSome(Less)\nfalse\nfalse false None Some(Less)\nfalse true\nfalse true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "option_ordering.rs",
+    "stdout": "true\ntrue true true false\ntrue true\n[None, None, Some(-1), Some(2), Some(3)] true\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "option_unit_bounds.rs",
+    "stdout": "Some(()) None\nSome(1)\nNone\nNone\nSome(3)\nSome(()) None\nunit some true\nNone\nSome(())\nSome(()) None\n[Some(()), None] 1\nSome(5)\n2\n2\n6\nSome(Msg { n: 5, tags: [\"x\"] })\nNone\n[1, 7]\n[\"a\"]\nOk(Some(2.5))\n[1.0, 2.0] 1\n",
+    "exitCode": 0,
+    "panic": null
   },
   {
     "file": "or_pattern_bindings.rs",
@@ -678,6 +822,12 @@
     "panic": null
   },
   {
+    "file": "serde_untagged.rs",
+    "stdout": "6 -> Int(6) true\n\"()()\" -> Text(\"()()\") true\n[1,-2,3] -> Ints([1, -2, 3]) true\n[[1,3],[5,9]] -> Pairs([[1, 3], [5, 9]]) true\n{\"x\":1.5,\"y\":-2.0} -> Point { x: 1.5, y: -2.0 } true\nnull -> Nothing true\n{\n  \"id\": 3,\n  \"answer\": 42,\n  \"alternatives\": [\n    6,\n    \"()()\",\n    [\n      1,\n      -2,\n      3\n    ],\n    [\n      [\n        1,\n        3\n      ],\n      [\n        5,\n        9\n      ]\n    ],\n    {\n      \"x\": 1.5,\n      \"y\": -2.0\n    },\n    null\n  ]\n}\nAttempt { id: 3, answer: Int(42), alternatives: [Int(6), Text(\"()()\"), Ints([1, -2, 3]), Pairs([[1, 3], [5, 9]]), Point { x: 1.5, y: -2.0 }, Nothing] }\nPairs([[1, 2]])\nInts([1, 2])\nErr(\"data did not match any variant of untagged enum Answer\")\n\"x\"\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "shared.rs",
     "stdout": "[1, 2, 3, 4] 4\n20\n120 [\"+25\", \"+-5\"] 2\n120 [\"+25\", \"+-5\"] Account { balance: RefCell { value: 0 }, log: RefCell { value: [] }, visits: Cell { value: 2 } }\n14\nroot [\"leaf\", \"leaf\"]\n",
     "exitCode": 0,
@@ -740,6 +890,12 @@
   {
     "file": "std_more.rs",
     "stdout": "1022 1.5\n1075838976 2.5\n2 -3\n1 3\n5 0.7853981633974483\n26 3 2\n-1 1.5707963267948966\n4o 7o 13o 14o \n[\"foo\", \"world\", \"hello\"]\n[(5, 3), (3, 8), (8, 1), (1, 9), (9, 2)]\n8 11 9 10 11 \n[5, 3, 8, 1] [9, 2] \n[9, 8, 5, 3, 2, 1]\n[1, 2, 3, 1]\nOk(2) Err(2)\n28 [5, 8, 16, 17, 26, 28]\n[5, 3, 8] [1, 9, 2]\n['a', 'b', 'c', 'd']\n[0, 5, 10, 15] ababab\n[8, 2] [5, 3, 1, 9]\n[1, 2] ['a', 'b']\n[5, 3, 8, 1, 9, 2, 1, 3, 5, 7]\n[1, 2, 1, 2, 1]\n[7, 7, 7] [1, 2] [1, 3, 9, 27, 81, 243] [1, 2, 3]\nSome(9) Some(1)\nSome(8) Some(2) Some(2)\n1-2!\n[4, 9, 9] [1, 3] [2]\n3 a/b\nSome('A') Some(7)\nA mixed\n[1, 2] true\n{\"a\": 1, \"b\": 2} [(\"a\", 1)]\n[2, 3]\nSome([1])\n[1, 2] true\n6\n    3.14|ab   |  mid  |+5|-002.500|1.2345e3\ntrue\n[(\"a\", \"1\"), (\"b\", \"2\")]\ncba\nSome(\"trim me\")\n1099511627776\n[\"x\", \"y\", \"z\"]\n[0, 3, 0, 0] 4\n3\n30\nSome(9)\ntrue\n[4]\n[0, 9, 2, 24, 12, 25]\n[9, 8, 5, 3]\n[2, 4, 6] []\n[\"a\", \"abb\"] [10, 20]\n3 10 9 true\n0.75 -1 0.250 1.7183\ntrue true 3\n0.5 -4 -3\n57.2958 0.4621\n[3, 5, 7] [1, 3]\n20=y 30=z \nNone\n[\"a\", \"b\", \"c\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_surface_gaps.rs",
+    "stdout": "3 [1, 2]\n1 [2, 3]\n[1, 2, 3]\n[1, 2] [3, 4]\n[(\"a\", 11), (\"b\", 5), (\"c\", 7)]\n[1]\nSome(3) None\ntrue false\n[7, 7, 7]\n[1, 2]\nhi\n[1.0, 2.0]\ntrue\ntrue true\n",
     "exitCode": 0,
     "panic": null
   },
@@ -830,6 +986,12 @@
   {
     "file": "use_variants.rs",
     "stdout": "a\nb2\na\n[A, B(2), A] true\nfalse true\n3\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "user_cell_type.rs",
+    "stdout": "bad symbol '?'\nBlack Empty true\n4 stones\n",
     "exitCode": 0,
     "panic": null
   },

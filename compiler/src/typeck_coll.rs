@@ -228,7 +228,7 @@ impl Checker<'_> {
             }
             (Coll::BinaryHeap, "pop" | "peek") => sig(self, &[], opt(elem)),
             (Coll::BinaryHeap, "into_sorted_vec" | "into_vec") => sig(self, &[], view.clone()),
-            (Coll::BinaryHeap, "drain") => sig(
+            (Coll::BinaryHeap, "drain" | "into_iter") => sig(
                 self,
                 &[],
                 Ty::Iter {

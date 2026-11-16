@@ -88,6 +88,9 @@ struct Walker<'a> {
     tracked: HashSet<Decl>,
     /// `let x;` bindings (declared without a value), and whether they're `mut`.
     deferred: HashMap<Decl, bool>,
+    /// Closures in bindings: their moves are recorded (a closure may own values with a `Drop`
+    /// impl) but never reported, as many closures are `Copy`.
+    soft: HashSet<Decl>,
     names: HashMap<Decl, String>,
     reported: HashSet<(Decl, usize)>,
     diags: Vec<RawDiag>,
@@ -137,6 +140,7 @@ pub fn check(
         scopes: Vec::new(),
         tracked: HashSet::new(),
         deferred: HashMap::new(),
+        soft: HashSet::new(),
         names: HashMap::new(),
         reported: HashSet::new(),
         diags: Vec::new(),
@@ -187,6 +191,7 @@ impl Walker<'_> {
         self.cur_impl = impl_of(f);
         self.scopes = vec![HashMap::new()];
         if let Some(pl) = f.param_list() {
+            self.self_param(&pl);
             for p in pl.params() {
                 let (Some(ast::Pat::IdentPat(ip)), Some(t)) = (p.pat(), p.ty()) else {
                     continue;
@@ -199,11 +204,34 @@ impl Walker<'_> {
                     && !matches!(t, ast::Type::ImplTraitType(_))
                     && (self.ty(n.syntax()).is_some_and(|ty| self.moves(ty)) || text == "String");
                 self.declare(&n, decl, owned);
+                self.soft_closure(&n, decl, owned);
             }
         }
         let mut st = State::default();
         // (The body's value is moved out to the caller.)
         self.block(&body, &mut st, Mode::Move("by being returned"));
+    }
+
+    /// A method's by-value `self` (not `self: Box<Self>`) owns its value, like a parameter.
+    fn self_param(&mut self, pl: &ast::ParamList) {
+        let Some(sp) = pl.self_param() else { return };
+        if sp.amp_token().is_some() || sp.ty().is_some() {
+            return;
+        }
+        let Some(n) = sp.name() else { return };
+        let owned = self
+            .cur_impl
+            .as_ref()
+            .is_some_and(|i| self.moves(&Ty::Adt(i.clone(), Vec::new())));
+        let decl = self.range(n.syntax());
+        self.declare(&n, decl, owned);
+    }
+
+    /// A binding holding a closure: its moves are recorded, not checked (see `soft`).
+    fn soft_closure(&mut self, n: &ast::Name, decl: Decl, owned: bool) {
+        if !owned && matches!(self.ty(n.syntax()), Some(Ty::Closure { .. })) {
+            self.soft.insert(decl);
+        }
     }
 
     fn declare(&mut self, n: &ast::Name, decl: Decl, owned: bool) {
@@ -318,7 +346,30 @@ impl Walker<'_> {
             return;
         };
         let at = self.range(p.syntax());
+        // A closure given to a std method (`it.map(f)`) isn't followed: its binding keeps
+        // dropping it, as the adapter that owns it in Rust isn't dropped explicitly here.
+        let mode = match self.lookup(name.text().to_string().as_str()) {
+            Some(d) if self.soft.contains(&d) && self.std_method_arg(p) => Mode::Use,
+            _ => mode,
+        };
         self.touch(name.text(), at, st, mode);
+    }
+
+    /// Whether `p` is an argument of a method that isn't one of the file's own types'.
+    fn std_method_arg(&self, p: &ast::PathExpr) -> bool {
+        let Some(m) = p
+            .syntax()
+            .parent()
+            .filter(|x| ast::ArgList::can_cast(x.kind()))
+            .and_then(|l| l.parent())
+            .and_then(ast::MethodCallExpr::cast)
+        else {
+            return false;
+        };
+        !matches!(
+            m.receiver().and_then(|r| self.ty(r.syntax()).cloned()),
+            Some(Ty::Adt(n, _)) if self.adts.defs.contains_key(&n)
+        )
     }
 
     /// A read of the binding `name` at `at`.
@@ -326,6 +377,13 @@ impl Walker<'_> {
         let Some(decl) = self.lookup(name) else {
             return;
         };
+        // (A `let f;` assigned a closure later is still checked for a use before that.)
+        if self.soft.contains(&decl) && !self.deferred.contains_key(&decl) {
+            if matches!(mode, Mode::Move(_)) && !st.unreachable {
+                self.move_sites.insert(at);
+            }
+            return;
+        }
         if !self.tracked.contains(&decl) && !self.deferred.contains_key(&decl) {
             return;
         }
@@ -416,6 +474,7 @@ impl Walker<'_> {
                     None => self.ty(n.syntax()).is_some_and(|t| self.moves(t)),
                 };
                 self.declare(&n, decl, owned);
+                self.soft_closure(&n, decl, owned);
                 st.moved.remove(&decl);
                 if init.is_none() {
                     self.deferred.insert(decl, ip.mut_token().is_some());

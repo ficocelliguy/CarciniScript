@@ -12,8 +12,15 @@
 //   T | undefined, `x?:` → Option<T> for fields; `#[optional]` for parameters (may be omitted)
 //   ...rest: T[] → a trailing `#[variadic]` parameter of type T
 //   string-literal unions and Bitburner's `_ValueOf<...EnumType>` enums → String
-//   interfaces → their name; anything else (other unions, generics, tuples, callbacks,
-//   intersections, inline object types) → JsValue (untyped)
+//   interfaces → their name, with `#[extends = "Base"]` for `interface X extends Base` (a value
+//   of `X` is accepted where a `Base` is expected)
+//   tuples → `[T; N]` when every element has the same type, else `(A, B, ..)`
+//   Map<K, V>, Record<K, V> (also Partial) → HashMap<K, V>; number keys are i32, others String
+//   inline object types in results and fields → a struct named after where they appear
+//   (`GoMakeMoveResult`); `Named & { extra }` → `NamedWithExtra`, extending `Named`; a
+//   `type X = A & { .. }` alias → struct `X`
+//   anything else (other unions, generics, callbacks, inline types in parameters) → JsValue
+//   (untyped; a `JsValue` parameter takes any value)
 import fs from "node:fs";
 import ts from "typescript";
 
@@ -71,11 +78,55 @@ export function dtsToRust(text) {
   );
   const isStruct = (name) =>
     !RESERVED_TYPE_NAMES.has(name) &&
-    ((interfaces.has(name) && interfaces.get(name).every((d) => !d.typeParameters)) || objectAliases.has(name));
+    ((interfaces.has(name) && interfaces.get(name).every((d) => !d.typeParameters)) ||
+      objectAliases.has(name) ||
+      intersectionAliases.has(name));
+  // `type X = A & { .. }` aliases of object types and interfaces: structs too, extending `A`.
+  const intersectionAliases = new Map(
+    [...aliases]
+      .filter(
+        ([, a]) =>
+          !a.typeParameters &&
+          ts.isIntersectionTypeNode(a.type) &&
+          a.type.types.every(
+            (t) =>
+              ts.isTypeLiteralNode(t) ||
+              (ts.isTypeReferenceNode(t) &&
+                ts.isIdentifier(t.typeName) &&
+                !t.typeArguments &&
+                (interfaces.has(t.typeName.text) || objectAliases.has(t.typeName.text))),
+          ),
+      )
+      .map(([n, a]) => [n, a]),
+  );
+  // Structs made for inline object types and intersections: name -> { members, extends, doc }.
+  const synthesized = new Map();
+  const synthByText = new Map();
+  const pascal = (s) =>
+    snakeCase(s)
+      .replace(/^r#/, "")
+      .split("_")
+      .filter(Boolean)
+      .map((w) => w[0].toUpperCase() + w.slice(1))
+      .join("");
+  /** A struct for an inline object type (or an intersection), named `hint` unless the same type
+   * was already given a name. */
+  function synthesize(node, members, bases, hint) {
+    const key = node.getText().replace(/\s+/g, " ");
+    if (synthByText.has(key)) return synthByText.get(key);
+    let name = hint;
+    for (let i = 2; interfaces.has(name) || aliases.has(name) || synthesized.has(name); i++) name = `${hint}${i}`;
+    synthByText.set(key, name);
+    synthesized.set(name, { members, bases });
+    return name;
+  }
+  /** `[A, B]` element types. */
+  const tupleElems = (node) => node.elements.map((e) => (ts.isNamedTupleMember(e) ? e.type : e));
 
   const resolving = new Set();
-  /** Map a TS type to `{ ty, optional }` (`optional`: the type admits undefined/null). */
-  function map(node) {
+  /** Map a TS type to `{ ty, optional }` (`optional`: the type admits undefined/null). `hint`
+   * names a struct made for an inline object type (none: such types are `JsValue`). */
+  function map(node, hint) {
     if (!node) return { ty: "JsValue", optional: false };
     switch (node.kind) {
       case ts.SyntaxKind.NumberKeyword:
@@ -90,9 +141,27 @@ export function dtsToRust(text) {
       case ts.SyntaxKind.NullKeyword:
         return { ty: "()", optional: true };
     }
-    if (ts.isParenthesizedTypeNode(node)) return map(node.type);
-    if (ts.isTypeOperatorNode(node) && node.operator === ts.SyntaxKind.ReadonlyKeyword) return map(node.type);
-    if (ts.isArrayTypeNode(node)) return { ty: `Vec<${map(node.elementType).ty}>`, optional: false };
+    if (ts.isParenthesizedTypeNode(node)) return map(node.type, hint);
+    if (ts.isTypeOperatorNode(node) && node.operator === ts.SyntaxKind.ReadonlyKeyword) return map(node.type, hint);
+    if (ts.isArrayTypeNode(node)) return { ty: `Vec<${map(node.elementType, hint).ty}>`, optional: false };
+    // `[number, number]` → `[f64; 2]`; `[number, string]` → `(f64, String)`.
+    if (ts.isTupleTypeNode(node)) {
+      const elems = tupleElems(node);
+      if (elems.length === 0 || elems.some((e) => ts.isRestTypeNode(e) || ts.isOptionalTypeNode(e))) {
+        return { ty: "JsValue", optional: false };
+      }
+      const tys = elems.map((e) => map(e, hint)).map((m) => (m.optional ? `Option<${m.ty}>` : m.ty));
+      if (tys.includes("JsValue") || tys.includes("()")) return { ty: "JsValue", optional: false };
+      const same = tys.every((t) => t === tys[0]);
+      return { ty: same ? `[${tys[0]}; ${tys.length}]` : `(${tys.join(", ")})`, optional: false };
+    }
+    // An inline object type: a struct of its own.
+    if (ts.isTypeLiteralNode(node) && hint) {
+      if (!node.members.every((m) => ts.isPropertySignature(m) || ts.isMethodSignature(m))) {
+        return { ty: "JsValue", optional: false };
+      }
+      return { ty: synthesize(node, [...node.members], [], hint), optional: false };
+    }
     if (ts.isLiteralTypeNode(node)) {
       const l = node.literal;
       if (ts.isStringLiteral(l)) return { ty: "String", optional: false };
@@ -102,16 +171,29 @@ export function dtsToRust(text) {
       return { ty: "JsValue", optional: false };
     }
     if (ts.isUnionTypeNode(node)) {
-      const parts = node.types.map(map);
+      const parts = node.types.map((t) => map(t, hint));
       const optional = parts.some((p) => p.optional);
       const tys = [...new Set(parts.filter((p) => !(p.optional && p.ty === "()")).map((p) => p.ty))];
       if (tys.length === 0) return { ty: "()", optional };
       if (tys.length === 1) return { ty: tys[0], optional };
       return { ty: "JsValue", optional };
     }
-    // `Server & { isOnline?: boolean }`: the named interface (the extra inline fields are dropped).
+    // `Server & { isOnline?: boolean }`: `ServerWithIsOnline`, extending `Server` (without a
+    // name for it, the named interface).
     if (ts.isIntersectionTypeNode(node)) {
-      const named = node.types.map(map).find((m) => isStruct(m.ty));
+      const named = node.types.map((t) => map(t)).find((m) => isStruct(m.ty));
+      const literals = node.types.filter(ts.isTypeLiteralNode);
+      const refs = node.types.filter((t) => ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName));
+      if (named && hint && literals.length && refs.length + literals.length === node.types.length) {
+        const bases = refs.map((t) => t.typeName.text).filter(isStruct);
+        if (bases.length === refs.length) {
+          const extra = literals.flatMap((l) => l.members);
+          const members = [...bases.flatMap((b) => membersOf(b)), ...extra];
+          const extraNames = extra.map(memberName).filter(Boolean).map(pascal).join("");
+          const name = synthesize(node, members, bases, `${bases[0]}With${extraNames || "Extra"}`);
+          return { ty: name, optional: false };
+        }
+      }
       return named ?? { ty: "JsValue", optional: false };
     }
     if (ts.isTypeReferenceNode(node)) {
@@ -119,14 +201,26 @@ export function dtsToRust(text) {
       const name = node.typeName.text;
       const args = node.typeArguments ?? [];
       if ((name === "Array" || name === "ReadonlyArray") && args.length === 1) {
-        return { ty: `Vec<${map(args[0]).ty}>`, optional: false };
+        return { ty: `Vec<${map(args[0], hint).ty}>`, optional: false };
+      }
+      // `Map<number, number>`, `Record<string, T>`, `Partial<Record<K, T>>`: a `HashMap` (string
+      // keys for every key type but `number`, whose keys are `i32`).
+      if ((name === "Map" || name === "Record") && args.length === 2) {
+        const k = map(args[0]);
+        const v = map(args[1], hint);
+        const key = k.ty === "f64" ? "i32" : k.ty === "String" ? "String" : null;
+        if (!key || v.ty === "JsValue" || v.ty === "()") return { ty: "JsValue", optional: false };
+        return { ty: `HashMap<${key}, ${v.optional ? `Option<${v.ty}>` : v.ty}>`, optional: false };
+      }
+      if (name === "Partial" && args.length === 1 && ts.isTypeReferenceNode(args[0]) && ts.isIdentifier(args[0].typeName) && args[0].typeName.text === "Record") {
+        return map(args[0], hint);
       }
       if (name === "_ValueOf" && args.length === 1) return enumValue(args[0]);
       if (args.length === 0 && isStruct(name)) return { ty: name, optional: false };
       const alias = aliases.get(name);
       if (alias && !alias.typeParameters && args.length === 0 && !resolving.has(name)) {
         resolving.add(name);
-        const r = map(alias.type);
+        const r = map(alias.type, hint);
         resolving.delete(name);
         return r;
       }
@@ -161,7 +255,34 @@ export function dtsToRust(text) {
     }
     const alias = objectAliases.get(name);
     if (alias) out.push(...alias.type.members);
+    const inter = intersectionAliases.get(name);
+    if (inter) {
+      for (const t of inter.type.types) {
+        if (ts.isTypeLiteralNode(t)) out.push(...t.members);
+        else out.push(...membersOf(t.typeName.text, seen));
+      }
+    }
+    const synth = synthesized.get(name);
+    if (synth) out.push(...synth.members);
     return out;
+  }
+
+  /** The interfaces `name` extends (`#[extends = ".."]`). */
+  function basesOf(name) {
+    const out = [];
+    for (const decl of interfaces.get(name) ?? []) {
+      for (const clause of decl.heritageClauses ?? []) {
+        for (const t of clause.types) {
+          if (ts.isIdentifier(t.expression) && isStruct(t.expression.text)) out.push(t.expression.text);
+        }
+      }
+    }
+    const inter = intersectionAliases.get(name);
+    if (inter) {
+      for (const t of inter.type.types) if (ts.isTypeReferenceNode(t)) out.push(t.typeName.text);
+    }
+    out.push(...(synthesized.get(name)?.bases ?? []));
+    return [...new Set(out)];
   }
 
   const memberName = (m) =>
@@ -179,18 +300,18 @@ export function dtsToRust(text) {
     });
   }
 
-  function returnOf(sig) {
+  function returnOf(sig, hint) {
     const t = sig.type;
     if (t && ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) && t.typeName.text === "Promise") {
-      const inner = t.typeArguments?.[0] ? map(t.typeArguments[0]) : { ty: "()", optional: false };
+      const inner = t.typeArguments?.[0] ? map(t.typeArguments[0], hint) : { ty: "()", optional: false };
       return { ...inner, isAsync: true };
     }
-    return { ...map(t), isAsync: false };
+    return { ...map(t, hint), isAsync: false };
   }
 
   /** One Rust signature for a set of TS overloads. */
-  function mergeOverloads(sigs) {
-    if (sigs.length === 1) return { params: paramList(sigs[0]), ret: returnOf(sigs[0]) };
+  function mergeOverloads(sigs, hint) {
+    if (sigs.length === 1) return { params: paramList(sigs[0]), ret: returnOf(sigs[0], hint) };
     const lists = sigs.map(paramList);
     const longest = lists.reduce((a, b) => (b.length > a.length ? b : a));
     const minLen = Math.min(...lists.map((l) => l.filter((p) => !p.optional).length));
@@ -198,12 +319,12 @@ export function dtsToRust(text) {
       const sameType = lists.every((l) => !l[i] || l[i].ty === p.ty);
       return { ...p, ty: sameType ? p.ty : "JsValue", optional: p.optional || i >= minLen };
     });
-    const rets = sigs.map(returnOf);
+    const rets = sigs.map((sg) => returnOf(sg, hint));
     const sameRet = rets.every((r) => r.ty === rets[0].ty && r.isAsync === rets[0].isAsync);
     return { params, ret: sameRet ? rets[0] : { ty: "JsValue", optional: false, isAsync: rets.every((r) => r.isAsync) } };
   }
 
-  const rustType = (m, asField) => (m.optional && asField && m.ty !== "JsValue" ? `Option<${m.ty}>` : m.ty);
+  const rustType = (m, asField) => (m.optional && asField ? `Option<${m.ty}>` : m.ty);
   const docLines = (node, indent) => docOf(node).map((l) => `${indent}/// ${l}\n`).join("");
 
   function emitType(name) {
@@ -222,18 +343,24 @@ export function dtsToRust(text) {
         const rust = snakeCase(js);
         if (used.has(rust)) continue;
         used.add(rust);
-        const t = map(m.type);
+        const t = map(m.type, `${name}${pascal(js)}`);
         const ty = rustType({ ...t, optional: t.optional || !!m.questionToken }, true);
         fields.push(`${docLines(m, "    ")}    #[js = ${JSON.stringify(js)}]\n    pub ${rust}: ${ty},\n`);
       }
     }
-    let out = `${docLines((interfaces.get(name) ?? [objectAliases.get(name)])[0], "")}pub struct ${name} {\n${fields.join("")}}\n`;
+    const declared = (interfaces.get(name) ?? [objectAliases.get(name) ?? intersectionAliases.get(name)])[0];
+    const bases = basesOf(name);
+    const extendsAttr = bases.length ? `#[extends = ${JSON.stringify(bases.join(", "))}]\n` : "";
+    let out = `${declared ? docLines(declared, "") : ""}${extendsAttr}pub struct ${name} {\n${fields.join("")}}\n`;
     const fns = [];
     for (const [js, overloads] of methods) {
       const rust = snakeCase(js);
       if (used.has(rust)) continue;
       used.add(rust);
-      const { params, ret } = mergeOverloads(overloads.map((o) => o.sig));
+      const { params, ret } = mergeOverloads(
+        overloads.map((o) => o.sig),
+        `${name === "NS" ? "" : name}${pascal(js)}Result`,
+      );
       const ps = params.map((p) => {
         const attr = p.variadic ? "#[variadic] " : p.optional ? "#[optional] " : "";
         return `${attr}${p.name}: ${p.ty}`;
@@ -248,16 +375,30 @@ export function dtsToRust(text) {
     return out;
   }
 
-  const names = [...new Set([...interfaces.keys(), ...objectAliases.keys()])].filter(isStruct).sort((a, b) => {
-    if (a === "NS") return -1;
-    if (b === "NS") return 1;
-    return a.localeCompare(b);
-  });
+  const names = [...new Set([...interfaces.keys(), ...objectAliases.keys(), ...intersectionAliases.keys()])]
+    .filter(isStruct)
+    .sort((a, b) => {
+      if (a === "NS") return -1;
+      if (b === "NS") return 1;
+      return a.localeCompare(b);
+    });
   const header =
     "// Generated by carciniscript/tools/dts2rs.mjs from Bitburner's NetscriptDefinitions.d.ts. Do not edit.\n" +
     "// `JsValue` is an untyped JS value. `#[optional]` parameters may be omitted; a `#[variadic]` last\n" +
     "// parameter takes any number of arguments.\n\n";
-  return header + names.map(emitType).join("\n");
+  const emitted = names.map(emitType);
+  // The structs made along the way (their own inline types may add more).
+  const done = new Set();
+  for (let more = true; more; ) {
+    more = false;
+    for (const n of [...synthesized.keys()].sort()) {
+      if (done.has(n)) continue;
+      done.add(n);
+      more = true;
+      emitted.push(emitType(n));
+    }
+  }
+  return header + emitted.join("\n");
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/").replace(/^\//, "")}`) {

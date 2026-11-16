@@ -76,6 +76,9 @@ async function runJs(jsPath, args = []) {
     } else if (e.name === "CarciniError") {
       // `fn main() -> Result<..>` returned `Err`: rustc's process exits with 1.
       code = 1;
+    } else if (e.name === "CarciniExit") {
+      // `std::process::exit(code)`.
+      code = e.exitCode;
     } else throw e;
   }
   κσ.$flush();
@@ -356,12 +359,13 @@ function mockNs(log) {
       state.money = 1000;
       return 10;
     },
-    async hack(t) {
-      log.push(`hack ${t}`);
+    async hack(t, opts) {
+      log.push(opts ? `hack ${t} ${JSON.stringify(opts)}` : `hack ${t}`);
       return 1234.5678;
     },
     tprint: (s) => log.push(s),
     getHostname: () => "home",
+    getScriptName: () => "deploy.js",
     getServer: (host) => ({
       hostname: host,
       maxRam: 32,
@@ -370,6 +374,43 @@ function mockNs(log) {
       moneyMax: host === "home" ? undefined : 1750000,
     }),
     hacknet: { numNodes: () => 3 },
+    // (For typed_values.rs: arguments, option objects, intersections, tuples and maps.)
+    args: ["n00dles", 4, "--fast"],
+    exec(script, host, opts, ...args) {
+      log.push(`exec ${script} ${host} ${JSON.stringify(opts)} ${JSON.stringify(args)}`);
+      return 7;
+    },
+    run(script, opts) {
+      log.push(`run ${script} ${JSON.stringify(opts)}`);
+      return 8;
+    },
+    getPlayer: () => ({ skills: { hacking: 50 }, money: 1e6, karma: -3 }),
+    formulas: {
+      hacking: {
+        hackPercent(server, person) {
+          log.push(`hackPercent ${server.hostname} ${server.moneyAvailable} ${server.hackDifficulty} ${person.skills.hacking}`);
+          return 0.0125;
+        },
+      },
+    },
+    dnet: {
+      authenticate: async (host, pw) => ({ success: false, code: 401, message: "denied", data: "7" }),
+      heartbleed: async (host, opts) => {
+        log.push(`heartbleed ${host} ${JSON.stringify(opts)}`);
+        return { success: true, code: 200, message: "ok", logs: ["a", "b"] };
+      },
+      getServerDetails: (host) => ({ modelId: "ZeroLogon", isOnline: true, data: "" }),
+    },
+    stock: { getPosition: () => [10, 1.5, 0, 0] },
+    getResetInfo: () => ({ ownedSF: new Map([[1, 3], [8, 2]]) }),
+    go: { makeMove: async (x, y) => ({ type: "move", x: 3, y: null }) },
+    codingcontract: {
+      getData: () => [[1, 3], [2, 6]],
+      attempt(answer, file, host) {
+        log.push(`attempt ${JSON.stringify(answer)} ${file} ${host}`);
+        return "reward";
+      },
+    },
   };
 }
 for (const f of fs.readdirSync(path.join(here, "ns")).filter((f) => f.endsWith(".rs"))) {
@@ -377,7 +418,10 @@ for (const f of fs.readdirSync(path.join(here, "ns")).filter((f) => f.endsWith("
   try {
     const { out, jsPath } = compileFixture(path.join(here, "ns", f));
     const log = [];
-    await runJs(jsPath, [mockNs(log)]);
+    const ns = mockNs(log);
+    // (clap reads the script's arguments.)
+    if (f === "clap_args.rs") ns.args = ["--target", "n00dles", "-t", 4, "--dry-run"];
+    await runJs(jsPath, [ns]);
     const expected = fs
       .readFileSync(path.join(here, "ns", f.replace(/\.rs$/, ".expected")), "utf8")
       .replace(/\r\n/g, "\n");
@@ -524,6 +568,8 @@ const rejected = [
   ["incompatible match arms", 'let x = match 1 {\n        1 => 2,\n        _ => "s",\n    };', "4:14 `match` arms have incompatible types"],
   // No fixed column: reported at the first expression whose type is ambiguous.
   ["nested Option", "let x: Option<Option<i32>> = None;", "`Option<Option<i32>>` is not supported yet"],
+  // (Only one read through `.flatten()` is.)
+  ["nested Option kept", "let v = vec![Some(1), None];\n    let x = v.first().copied();\n    println!(\"{:?}\", x);", "`Option<Option<i32>>` is not supported yet"],
   ["floats in a HashSet", "let mut s = std::collections::HashSet::new();\n    s.insert(1.5);", "the trait bound `f64: Hash` is not satisfied"],
   ["tuple field out of range", "let t = (1, 2);\n    let x = t.2;", "3:13 no field `2` on type `({integer}, {integer})`"],
   [
@@ -622,6 +668,10 @@ const rejected = [
   ["the start field of an inclusive range", "let r = 1..=3;\n    let s = r.start;", "3:13 no field `start` on type `RangeInclusive<"],
   ["a value used after drop()", "}\nstruct G { n: i32 }\nimpl Drop for G { fn drop(&mut self) {} }\nfn g() {\n    let a = G { n: 1 };\n    drop(a);\n    let b = a;", "8:13 use of moved value: `a`"],
   ["await on an async block outside async", "let f = async { 1 };\n    let x = f.await;", "3:13 `await` is only allowed inside `async` functions and blocks"],
+  ["await on an async closure's call outside async", "let f = async |x: i32| x;\n    let y = f(1).await;", "3:13 `await` is only allowed inside `async` functions and blocks"],
+  ["an async closure's call not awaited", "}\nasync fn g() {\n    let f = async |x: i32| x;\n    let y: i32 = f(1);", "5:18 mismatched types: expected `i32`, found `impl Future<Output = i32>` (did you forget `.await`?)"],
+  ["Default::default() that nothing types", "let x = Default::default();", "2:13 type annotations needed for `Default::default()`"],
+  ["a break Default::default() typed by a later break without Default", "}\nstruct S;\nfn g() {\n    let z = 'l: loop {\n        if true {\n            break 'l Default::default();\n        }\n        break 'l S;\n    };", "7:22 the trait bound `S: Default` is not satisfied"],
   ["a JoinHandle of the wrong type", "}\nasync fn g() {\n    let h: tokio::task::JoinHandle<String> = tokio::spawn(async { 1u8 });", "4:46 mismatched types"],
   ["bail! in a function that doesn't return a Result", "}\nuse anyhow::bail;\nfn g() -> i32 {\n    bail!(\"no\");", "5:5 mismatched types"],
   ["parse into a type parameter without FromStr", "}\nfn p<T: Copy>(s: &str) -> T {\n    s.parse::<T>().unwrap()", "4:5 the trait bound `T: FromStr` is not satisfied"],
@@ -1131,7 +1181,32 @@ const rejectedNs = [
   [
     "camelCase field name",
     'let s = ns.get_server("a");\n    let r = s.maxRam;',
-    "3:13 no field `maxRam` on type `Server`; did you mean `max_ram`?",
+    "3:13 no field `maxRam` on type `ServerWithIsOnline`; did you mean `max_ram`?",
+  ],
+  // A `JsValue` is read with `as_string()` / `as_f64()`, not taken as a `String` or `f64`.
+  ["a JsValue argument as a String", "let a: String = ns.args[0];", "2:21 mismatched types: expected `String`, found `JsValue`"],
+  ["a port read as a number", "let n: f64 = ns.read_port(1);", "2:18 mismatched types: expected `f64`, found `JsValue`"],
+  ["an unknown JsValue method", "let n = ns.args[0].as_strin();", "2:13 no method named `as_strin` found for `JsValue`; did you mean `as_string`?"],
+  [
+    "a misspelled option field",
+    "let o = RunOptions { thread: Some(2.0), ..Default::default() };",
+    "2:26 struct `RunOptions` has no field named `thread`; did you mean `threads`?",
+  ],
+  [
+    "an interface option without all its fields",
+    "let o = BasicHGWOptions { threads: Some(2.0) };",
+    "2:13 missing fields `additional_msec` and `stock` in initializer of `BasicHGWOptions`",
+  ],
+  [
+    "Default of an interface with required fields",
+    "let s: Server = Default::default();",
+    "2:21 the trait bound `Server: Default` is not satisfied",
+  ],
+  ["building an NS namespace", "let h = Hacknet { };", "2:13 `Hacknet` is an NS namespace, not a struct"],
+  [
+    "a Person where a Player is expected",
+    "fn f(ns: &NS) -> Player {\n    let p: Person = ns.get_player();\n    p\n}",
+    "4:5 mismatched types: expected `Player`, found `Person`",
   ],
   ["method used as a field", "let h = ns.get_hostname;", "2:13 `get_hostname` is a method on `NS`, not a field"],
   [

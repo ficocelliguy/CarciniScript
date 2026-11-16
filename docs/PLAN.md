@@ -64,7 +64,7 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 - **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). `usize`/`isize` are JS numbers
   (exact to 2^53). `i64`/`u64` and `i128`/`u128` are BigInt, wrapped to their width. Integer `/` truncates and panics on zero;
   JS `%` already matches Rust's truncated remainder.
-- **Option:** `None` is `null`, `Some(x)` is `x`. `Option<Option<T>>` and `Option<()>` are rejected.
+- **Option:** `None` is `null`, `Some(x)` is `x`. `Option<()>`'s `Some(())` is a marker; `Option<Option<T>>` is rejected except as a temporary `.flatten()` reads.
   The NS boundary is free: `undefined` results read as `None`.
 - **Result:** tagged object; `?` is an early return.
 - **Panics** throw `CarciniPanic` with `file:line:col` baked in at compile time.
@@ -99,7 +99,11 @@ panics instead of silently misbehaving).
 
 `tools/dts2rs.ts` uses the TypeScript compiler API on `NetscriptDefinitions.d.ts`:
 `number` → `f64`, `string` → `String`, `T[]` → `Vec<T>`, optional / `T | undefined` → `Option<T>`,
-`Promise<T>` → `impl Future<Output = T>`, interfaces → extern structs.
+`Promise<T>` → `impl Future<Output = T>`, interfaces → extern structs (with `#[extends = ".."]`
+for `interface X extends Y`), tuples → `[T; N]` / `(A, B)`, `Map` / `Record` → `HashMap`, inline
+object results and `Named & { .. }` intersections → structs of their own, anything else →
+`JsValue` (wasm-bindgen's, with `as_string()` and friends; a `JsValue` parameter takes any value).
+Scripts can name the interfaces and build the option ones (`RunOptions { .., ..Default::default() }`).
 
 ## Source maps
 
@@ -250,10 +254,37 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      renamed into them), `b"..."`, `async` blocks; and the crates `log` / `env_logger`, `num`
      (`num-traits`, `num-integer`) and `tokio` / `futures` (preludes, bundled macros and renames
      of their paths)
+   - [x] `rand_distr` (and `rand::distributions`), `chrono` and `clap`: Rust-source preludes, the
+     paths renamed into them; clap's derives written out by the pre-pass (`clap_derive.rs`).
+     Along the way `std::env::args` / `process::exit`, operator impls on generic types
+     (`impl<Tz> Sub for DateTime<Tz>`), `parse::<T>()` into a generic `FromStr` impl, a
+     per-script cache of trait statics on numbers (`$numT`)
+   - [x] Bitburner corpus C16 and C17, and two `Drop` / ordering gaps: async closures and
+     `AsyncFn` / `Future<Output = T>` bounds, `Pin<Box<dyn Future>>` with `Box::pin` (erased) for
+     recursive async fns; `Default::default()` typed by a later `break` or arm (checked at the
+     end of the function); closures owning their by-value captures (`κσ.$own`, dropped with the
+     closure, whose moves the move checker records without reporting them) and by-value `self`
+     dropped at the end of its method; NaN-aware partial comparisons (`$cmp` gives NaN)
+   - [x] The Bitburner corpus's section D, C6 and C10 (GAPS.md): std methods and paths as values
+     (the UFCS pass), a `hash_map::Entry` prelude over the map's slots, `Option<()>` markers and
+     `.flatten()` temporaries, `Into<f64>` bounds kept generic, `T: DeserializeOwned` through a
+     class's `$jsonSchema`
+   - [x] The rest of the Bitburner corpus (all 14 files compile as written): `include_str!`
+     through the module resolver, `impl Into` / `AsRef` parameters converted at calls,
+     temporaries as `&mut` arguments, `iter_mut().zip(..)` index loops, `step_by` jumping over
+     ranges, array lengths from declarations, `*h` of a `filter` closure's reference; chrono-tz on
+     `Intl`; clap's exit in Netscript scripts
    - [x] `std::time` (`Duration`, `Instant`, `SystemTime`) as a Rust-source prelude compiled in
      when used, diff-tested against rustc; `js::structured_clone`; Formatter specs for
      hand-written `Display` / `Debug` (`f.width()`, `f.precision()`, `f.pad(..)`); `impl Sum` /
      `impl Product`; `I: Iterator<Item = T>` type parameters
+   - [x] The Bitburner corpus' gaps (`corpus/bitburner/GAPS.md`): typed `JsValue` with
+     wasm-bindgen's methods and `serde_wasm_bindgen`; NS interfaces nameable and buildable,
+     `extends` subtyping, intersection / tuple / `Map` / inline-object results; `#[serde(untagged)]`;
+     `Default` of `[T; N]`; a local fn shadowing a module's; `mod` files' `Deref` / iterator impls
+     and `pub type` aliases; `Cell` as a user type name; `or_default()` of structs; `const`s in
+     format strings; irrefutable array patterns and `<[T; N]>::try_from`; `impl AsRef`; two
+     `From` impls of one source type; `Option` ordering; `Copy` structs with array fields
    - [x] User-written proc macros (function-like, derive, attribute) with `quote!` (nested
      repetitions), `format_ident!`, token trees and a `syn` subset with `ParseStream` parsers,
      `Token![..]` and `parse_quote!` (a Rust prelude stands in for
@@ -261,6 +292,92 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      crate compiled to JS and run at compile time with a step limit (`procmacro.rs`); tests build
      the same files with cargo (`test/procmacro/`); Bitburner recompiles a script when a macro
      crate it uses changes
+
+## Real-world corpus gaps (2026-11-16)
+
+Every `.rs` file in the local cargo registry (226 crates, 5,197 files after dropping 698 parser and
+compile-fail fixtures) was compiled file by file, and each error was sorted into "missing crate or
+module", "thread", "std library", or "language". Errors from names in other crates or other files of
+the same crate, and from threads, `Arc`, `Mutex` and atomics, don't count. Unresolved names don't
+hide later errors, so this is a fair per-file check.
+
+- **Language features all supported:** 67% of files (61% of `src/`, 85% of `examples/`, 86% of
+  `tests/`, 93% of `benches/`). Counting std-library gaps as failures, 50.5%. By lines, 39%.
+- **27 crates** pass in every file (strsim, shlex, percent-encoding, utf8parse, anstyle, unicode-ident ..).
+- **Not planned:** raw pointers, `transmute`, `MaybeUninit`, `alloc`, `union` and `extern` blocks
+  (602 + 130 + 53 files). JS values have no memory layout.
+
+### Language gaps
+
+Counts are files that hit the gap, then files where it's the only language gap.
+
+- [ ] **Trait impls on std types** (340 / 183): `impl Tr for Option<T>`, `Box<str>`, `HashMap<K, V>`,
+  `HashSet`, `Result`, `Path`, `File`, `Wrapping<u32>`, `u128` / `i128`; std traits on `String` /
+  `&str` (`impl From<A> for String`, `impl PartialEq<Id> for &str`). User traits on `str`, `String`,
+  `Vec`, and the numbers up to 64 bits already work.
+- [ ] **`where` clauses with Fn bounds over type parameters** (197 / 81): `fn run<F, T>(f: F) -> T
+  where F: FnOnce() -> T` fails with "type `T` is not supported yet". The same bound inline
+  (`<F: FnOnce() -> T>`) and `impl FnOnce(..) -> R` work.
+- [ ] **Nested `fn`s share the file's namespace** (125 / 55): two functions that each define a
+  nested `fn imp()` collide. The same error hits `#[cfg(windows)] fn x` next to
+  `#[cfg(not(windows))] fn x` (see target `cfg`, below).
+- [ ] **`macro_rules!` robustness** (201 files: 72 expansions that don't parse, 67 "no rules matched",
+  62 definitions in unsupported places):
+  - doc comments inside a repetition (`$( /// doc\n $name, )+`)
+  - a `ty` fragment repeated without a separator (`$($t:ty)*`), which is taken as one type
+  - `<$t>::MAX` / `<$t>::method()`: qualified type paths, which fail outside macros too (`<u8>::MAX`,
+    `<Vec<u8>>::new()`)
+  - `#[cfg(..)]`-gated alternative definitions of one macro
+  - `pub(crate) use my_macro;` re-exports
+- [ ] **Generic bounds on std traits** (82): `R: io::Read`, `R: BufRead`, `W: io::Write` /
+  `fmt::Write`, `F: Future`, `S: BuildHasher`, `A: Allocator`.
+- [ ] **Blanket impls on references** (65): `impl<T: Tr + ?Sized> Tr for &T`, `impl<I> Tr for &mut I`.
+  `impl<T: Debug> Tr for T` works.
+- [ ] **Target `cfg`** (62 / 35): `cfg!(target_os = ..)`, `windows`, `unix`, `target_arch`,
+  `target_endian`, `target_pointer_width`, `target_feature`, `miri`, and the matching `#[cfg]` on
+  `fn`s. Proposal: evaluate against one fixed JS target (not windows / unix, little-endian,
+  `target_family = "wasm"`) rather than rejecting.
+- [ ] **`write!` into anything but a `String` or `Formatter`** (62 / 39): `write!(vec_u8, ..)`
+  (`io::Write`), `write!(w, ..)` for a generic `W: Write`, `write!(self, ..)` in a type with its own
+  `impl fmt::Write`.
+- [ ] **Pre-2024 editions** (42 / 37): `gen` is parsed as the 2024 keyword, so `rng.gen()` and
+  `let gen = ..` fail. That's every rand 0.8 user. Parse as 2021 (gen blocks are unstable anyway) or
+  per file.
+- [ ] Smaller ones (13 to 40 files each): `{ .. }` blocks as a binary operand, a stored
+  `Option<Option<T>>`, `iter_mut()` outside a `for`, `use x as y` renames of types and crates,
+  default associated consts in traits, non-literal enum discriminants (`A = B as isize`), const
+  generics on traits.
+
+### Std-library gaps
+
+Files hitting each, among files that compile apart from external names. In all, 888 files miss a std
+type, 760 a std method, 357 a std trait impl, and 142 a std macro.
+
+- [ ] **Types:** `PhantomData` (232 files), `std::path::{Path, PathBuf}` (146 / 66), `OsStr` /
+  `OsString` (34 / 29), `fs::File` / `Metadata` (41 / 16), hand-written futures (`Pin` 39,
+  `task::Context` 37, `Poll` 20, `Waker` 14), `cell::Ref` / `RefMut` named as types (37),
+  `io::Cursor` (36), `process::Command` (25), `TypeId` (16), `fmt::Arguments` (16), `NonZeroUsize`
+  (15), `Infallible` (14), `IoSlice` (12), `SocketAddr` (16).
+- [ ] **Implementing std traits:** `ExactSizeIterator` (87), `FusedIterator` (84),
+  `DoubleEndedIterator` (65), `io::Read` (72), `io::Write` (39), `Future` (51), `Hasher` (17),
+  `BuildHasher` / `BufRead` (11 each), and the markers `UnwindSafe` / `RefUnwindSafe` (20 / 17),
+  which could be accepted and ignored.
+- [ ] **Methods:**
+  - `Vec`: `into_boxed_slice` (43), `resize` (32), `capacity` / `reserve` / `reserve_exact` /
+    `shrink_to_fit` (24 / 18 / 7 / 13, could be no-ops), `chunks_mut` / `chunks_exact_mut`
+    (18 / 9), `copy_within` (9), `retain_mut` (9), `splice` (7)
+  - arrays and slices: `[T; N]::map` (17), `eq_ignore_ascii_case` (8), `strip_prefix` (8)
+  - `Display::fmt` called on an inner field to delegate (`self.0.fmt(f)`, 32)
+  - `char`: `len_utf8` (30), `encode_utf8` (12), `escape_debug` (10)
+  - integers: `to_le_bytes` / `to_be_bytes` / `to_ne_bytes` (about 40 combined), `unsigned_abs`
+    (18), `next_power_of_two` (9)
+  - `str::get(range)` (11), `String::into_boxed_str` (12), `Option::get_or_insert_with` (11)
+  - `Iterator::size_hint` (53), and `for` over some iterator types (20)
+- [ ] **Macros:** `format_args!` (29), `compile_error!` (30, usually under a `cfg` that's false),
+  `include!` / `include_bytes!` (17 / 14), `env!` / `option_env!` (15).
+
+The raw-pointer methods (`as_ptr` 112, `as_mut_ptr` 82, `get_unchecked` 24, `set_len` 21), `asm!`
+and `is_x86_feature_detected!` fall under "not planned", above.
 
 ## Testing
 

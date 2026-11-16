@@ -86,6 +86,7 @@ pub fn split_args(src: &str, base: usize, mc: &ast::MacroCall) -> Vec<MacroArg> 
     let mut angle = 0usize;
     let mut prev: Option<SyntaxKind> = None;
     let mut prev2: Option<SyntaxKind> = None;
+    let mut closure_params = false;
     for el in inner_elements(mc) {
         let k = el.kind();
         let after_path_sep =
@@ -95,9 +96,23 @@ pub fn split_args(src: &str, base: usize, mc: &ast::MacroCall) -> Vec<MacroArg> 
         } else if k == T![>] && angle > 0 && prev != Some(T![-]) && prev != Some(T![=]) {
             angle -= 1;
         }
+        // A closure's parameters (`vec![|a, b| a + b]`): `|` opening an argument, up to the
+        // next `|`.
+        if k == T![|] {
+            if closure_params {
+                closure_params = false;
+            } else {
+                let opening = groups
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.kind().is_trivia() || matches!(e.kind(), T![move] | T![async]));
+                closure_params = opening;
+            }
+        }
         prev2 = prev;
         prev = Some(k);
-        if k == T![,] && angle == 0 {
+        if k == T![,] && angle == 0 && !closure_params {
             groups.push(vec![]);
         } else {
             groups.last_mut().unwrap().push(el);

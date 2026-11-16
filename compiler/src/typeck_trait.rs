@@ -753,6 +753,10 @@ impl Checker<'_> {
             Some(sig) if sig.receiver.is_some() => {
                 self.call_trait_method(m, recv, sig, Ty::Dyn(tr.to_string()), args)
             }
+            // `boxed.as_ref()`: the `dyn` value itself (boxes are erased).
+            _ if matches!(method, "as_ref" | "as_mut" | "borrow") && args.is_empty() => {
+                Ty::Dyn(tr.to_string())
+            }
             _ => {
                 for a in args {
                     self.infer(a, None);
@@ -778,6 +782,7 @@ pub fn subst_method(m: &Method, sub: &HashMap<String, Ty>) -> Method {
         is_async: m.is_async,
         receiver: m.receiver,
         cell_params: m.cell_params.clone(),
+        into_params: m.into_params.clone(),
         impl_args: m.impl_args.clone(),
         type_params: m.type_params.clone(),
     }

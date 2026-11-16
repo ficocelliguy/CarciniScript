@@ -15,6 +15,10 @@ const IO: &str = include_str!("io_prelude.rs");
 const LOG: &str = include_str!("log_prelude.rs");
 const NUM: &str = include_str!("num_prelude.rs");
 const TOKIO: &str = include_str!("tokio_prelude.rs");
+const RAND_DISTR: &str = include_str!("rand_distr_prelude.rs");
+const CHRONO: &str = include_str!("chrono_prelude.rs");
+const CLAP: &str = include_str!("clap_prelude.rs");
+const ENTRY: &str = include_str!("entry_prelude.rs");
 
 /// `text` with the preludes it needs after it, when it names their types and doesn't declare
 /// them itself.
@@ -25,7 +29,32 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
             .any(|kw| text.contains(&format!("{kw} {name}")))
     };
     let mut out = String::new();
-    if text.contains("time::")
+    // (After the rewrite: `chrono::NaiveDate` is `ChronoNaiveDate`, ..; its `TimeDelta::to_std`
+    // needs `std::time::Duration`.)
+    let chrono = [
+        "ChronoNaive",
+        "ChronoDateTime",
+        "ChronoUtc",
+        "ChronoLocal",
+        "ChronoFixedOffset",
+        "ChronoTimeDelta",
+        "ChronoWeekday",
+        "ChronoMonth",
+        "ChronoDatelike",
+        "ChronoTimelike",
+        "ChronoTimeZone",
+        "ChronoParse",
+        "ChronoDays",
+        "ChronoSecondsFormat",
+        "ChronoIsoWeek",
+        "ChronoOutOfRange",
+        "ChronoTz",
+    ]
+    .iter()
+    .any(|n| text.contains(n))
+        && !text.contains("// (chrono prelude)")
+        && !declares("ChronoNaiveDate");
+    if (text.contains("time::") || chrono)
         && !text.contains("// (std::time prelude)")
         && !["Duration", "Instant", "SystemTime"]
             .iter()
@@ -105,6 +134,63 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
     if tokio_names.iter().any(|n| text.contains(n)) && !text.contains("// (tokio prelude)") {
         out.push('\n');
         out.push_str(TOKIO);
+    }
+    // (After the rewrite: `rand_distr::Normal` is `RandNormal`, `Distribution` `RandDistribution`.)
+    let rand_names = [
+        "RandDistribution",
+        "RandStandard",
+        "RandExp",
+        "RandOpen",
+        "RandUniform",
+        "RandWeight",
+        "RandBernoulli",
+        "RandAlphanumeric",
+        "RandNormal",
+        "RandLogNormal",
+        "RandPoisson",
+        "RandBinomial",
+        "RandGamma",
+        "RandBeta",
+        "RandChiSquared",
+        "RandStudentT",
+        "RandTriangular",
+        "RandPareto",
+        "RandCauchy",
+        "RandWeibull",
+        "RandGeo",
+    ];
+    if rand_names.iter().any(|n| text.contains(n))
+        && !text.contains("// (rand_distr prelude)")
+        && !declares("RandDistribution")
+    {
+        out.push('\n');
+        out.push_str(RAND_DISTR);
+    }
+    if chrono {
+        out.push('\n');
+        out.push_str(CHRONO);
+    }
+    // (After the rewrite: `hash_map::Entry` is `StdMapEntry`.)
+    if text.contains("StdMapEntry") && !text.contains("// (map entry prelude)") {
+        out.push('\n');
+        out.push_str(ENTRY);
+    }
+    // (After the derives and the rewrite: `clap::Command` is `ClapCommand`, ..)
+    let clap_names = [
+        "ClapCommand",
+        "ClapArg",
+        "ClapMatches",
+        "ClapError",
+        "ClapAction",
+        "ClapValueParser",
+        "ClapPossibleValue",
+    ];
+    if clap_names.iter().any(|n| text.contains(n))
+        && !text.contains("// (clap prelude)")
+        && !declares("ClapCommand")
+    {
+        out.push('\n');
+        out.push_str(CLAP);
     }
     (!out.is_empty()).then(|| format!("{text}{out}"))
 }

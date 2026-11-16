@@ -1178,6 +1178,79 @@ pub fn preprocess(src: &str) -> Result<Option<Preprocessed>, Vec<(usize, usize, 
 
 /// `preprocess`, with `macros` (definitions from other files, see `imported_macros`) usable too.
 /// They go after `src`, so offsets in `src` stay put, and are dropped once expanded.
+/// `include_str!("path")` (and `include_bytes!`), read through the resolver that loads `mod`
+/// files, written in as a literal. (Found in the text, so also among other macros' arguments.)
+fn include_strs(
+    text: &mut String,
+    map: &mut OffsetMap,
+    resolver: crate::typeck::Resolver,
+) -> Result<bool, Vec<(usize, usize, String)>> {
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut errors = Vec::new();
+    for name in ["include_str", "include_bytes"] {
+        let pat = format!("{name}!");
+        let mut from = 0;
+        while let Some(k) = text[from..].find(&pat) {
+            let a = from + k;
+            from = a + pat.len();
+            // (Not the tail of a longer name, nor in a line comment.)
+            let before = text[..a].chars().next_back();
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                || text[..a]
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|l| l.contains("//"))
+            {
+                continue;
+            }
+            let rest = &text[from..];
+            let t = rest.trim_start();
+            let Some(t) = t.strip_prefix('(') else {
+                continue;
+            };
+            let t2 = t.trim_start();
+            let Some(t3) = t2.strip_prefix('"') else {
+                continue;
+            };
+            let Some(q) = t3.find('"') else { continue };
+            let path = t3[..q].replace("\\\\", "/");
+            let after = t3[q + 1..].trim_start();
+            let Some(after) = after.strip_prefix(')') else {
+                continue;
+            };
+            let b = text.len() - after.len();
+            match resolver(&path) {
+                Some(content) => {
+                    let new = if name == "include_str" {
+                        format!("{content:?}")
+                    } else {
+                        let bytes: Vec<String> =
+                            content.bytes().map(|x| format!("{x}u8")).collect();
+                        format!("&[{}]", bytes.join(", "))
+                    };
+                    edits.push((a, b, new));
+                }
+                None => errors.push((
+                    map.orig(a, false),
+                    map.orig(b, true),
+                    format!("couldn't read `{path}`: `{name}!` reads files next to the script"),
+                )),
+            }
+            from = b;
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let changed = !edits.is_empty();
+    for (a, b, new) in edits {
+        text.replace_range(a..b, &new);
+        map.replace(a, b, new.len());
+    }
+    Ok(changed)
+}
+
 pub fn preprocess_with(
     src: &str,
     macros: &str,
@@ -1193,6 +1266,10 @@ pub fn preprocess_with(
     let mut changed = false;
     // Proc macros first: their output may define or use `macro_rules!` macros.
     if let Some((filename, resolver)) = procs {
+        // `include_str!("words.txt")`: the file next to this one, as a string literal.
+        if text.contains("include_str!") {
+            changed |= include_strs(&mut text, &mut map, resolver)?;
+        }
         changed |= crate::procmacro::expand(&mut text, &mut map, filename, resolver)?;
     }
     // The bundled crates written as rewrites (`#[derive(thiserror::Error)]`, `bitflags!`, ..).

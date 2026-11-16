@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
     AstNode, SourceFile,
-    ast::{self, HasModuleItem, HasName, HasVisibility},
+    ast::{self, HasGenericParams, HasModuleItem, HasName, HasVisibility},
 };
 
 use super::{Checker, FnSig};
@@ -49,6 +49,36 @@ struct Exports {
     circular: Option<String>,
     /// Its `pub mod`s, by name.
     nested: Vec<(String, Exports)>,
+    /// Its `pub type X = ..;` aliases (without generic parameters).
+    aliases: HashMap<String, Ty>,
+}
+
+/// What a module's struct or enum `name` brings besides its definition and methods: `Deref`
+/// targets, iterator items, associated types and const parameters of its impls.
+fn export_type_extras(c: &Checker, out: &mut Exports, name: &str) {
+    // (Types leave this checker without its inference variables: `zonk` makes them `Unknown`.)
+    let a = &c.adts;
+    if let Some(t) = a.deref_targets.get(name) {
+        out.adts.deref_targets.insert(name.to_string(), c.zonk(t));
+    }
+    if a.deref_mut.contains(name) {
+        out.adts.deref_mut.insert(name.to_string());
+    }
+    if let Some(t) = a.iter_items.get(name) {
+        out.adts.iter_items.insert(name.to_string(), c.zonk(t));
+    }
+    if a.into_iters.contains(name) {
+        out.adts.into_iters.insert(name.to_string());
+    }
+    if let Some(cp) = a.const_params.get(name) {
+        out.adts.const_params.insert(name.to_string(), cp.clone());
+    }
+    for (k, v) in &a.impl_assoc {
+        if k.0 == name {
+            let v = v.iter().map(|(n, t)| (n.clone(), c.zonk(t))).collect();
+            out.adts.impl_assoc.insert(k.clone(), v);
+        }
+    }
 }
 
 /// `dir/of/current.rs` + `name` → `dir/of/name.rs`.
@@ -123,6 +153,10 @@ fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
         if let Some(ks) = c.adts.assoc_consts.get(name) {
             out.adts.assoc_consts.insert(name.to_string(), ks.clone());
         }
+        export_type_extras(c, out, name);
+        if let Some(t) = c.type_aliases.get(name) {
+            out.aliases.insert(name.to_string(), t.clone());
+        }
         if let Some(t) = c.adts.traits.get(name) {
             let mut t = t.clone();
             t.module = None;
@@ -183,6 +217,16 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
                 }
                 if let Some(ks) = c.adts.assoc_consts.get(&n) {
                     out.adts.assoc_consts.insert(n.clone(), ks.clone());
+                }
+                export_type_extras(&c, &mut out, &n);
+            }
+            // `pub type Op = fn(i64) -> i64;`
+            ast::Item::TypeAlias(t)
+                if public(t.visibility()) && t.generic_param_list().is_none() =>
+            {
+                if let (Some(n), Some(ty)) = (t.name(), t.ty()) {
+                    let lowered = c.lower_type(&ty);
+                    out.aliases.insert(n.text().to_string(), c.zonk(&lowered));
                 }
             }
             ast::Item::Trait(t) if public(t.visibility()) => {
@@ -462,6 +506,7 @@ impl Checker<'_> {
         for (n, mut sig) in ex.fns {
             sig.module = Some(module.to_string());
             names.insert(n.clone());
+            self.register_qualified(module, &n, Some(&sig), None);
             self.imported.push(Imported {
                 name: n.clone(),
                 module: module.to_string(),
@@ -480,6 +525,16 @@ impl Checker<'_> {
         self.adts.from_impls.extend(ex.adts.from_impls);
         self.adts.op_impls.extend(ex.adts.op_impls);
         self.adts.assoc_consts.extend(ex.adts.assoc_consts);
+        self.adts.deref_targets.extend(ex.adts.deref_targets);
+        self.adts.deref_mut.extend(ex.adts.deref_mut);
+        self.adts.iter_items.extend(ex.adts.iter_items);
+        self.adts.into_iters.extend(ex.adts.into_iters);
+        self.adts.const_params.extend(ex.adts.const_params);
+        self.adts.impl_assoc.extend(ex.adts.impl_assoc);
+        for (n, t) in ex.aliases {
+            names.insert(n.clone());
+            self.type_aliases.insert(n, t);
+        }
         for (n, mut def) in ex.adts.traits {
             def.module = Some(module.to_string());
             names.insert(n.clone());
@@ -487,6 +542,7 @@ impl Checker<'_> {
         }
         for (n, t) in ex.consts {
             names.insert(n.clone());
+            self.register_qualified(module, &n, None, Some(&t));
             self.imported.push(Imported {
                 name: n.clone(),
                 module: module.to_string(),
@@ -646,7 +702,27 @@ impl Checker<'_> {
         }
     }
 
-    /// `crate::util::x` / `util::x` → `x` when `util` is a loaded module.
+    /// A module's function or constant is also known as `module.name` (not a Rust name, so it
+    /// can't clash), which a written path `module::name` resolves to first: a local item of the
+    /// same name shadows the bare name, not the path.
+    fn register_qualified(&mut self, module: &str, n: &str, sig: Option<&FnSig>, t: Option<&Ty>) {
+        let key = format!("{module}.{n}");
+        if let Some(sig) = sig {
+            self.fns.insert(key.clone(), sig.clone());
+        }
+        if let Some(t) = t {
+            self.consts.insert(key.clone(), t.clone());
+        }
+        self.imported.push(Imported {
+            name: key,
+            module: module.to_string(),
+            js: n.to_string(),
+            sig: sig.cloned(),
+        });
+    }
+
+    /// `crate::util::x` / `util::x` → `x` when `util` is a loaded module (`util.x` when that's
+    /// one of the module's functions or constants).
     pub(super) fn strip_modules(&self, segs: &[String]) -> Vec<String> {
         let mut i = 0;
         while i + 1 < segs.len()
@@ -655,6 +731,27 @@ impl Checker<'_> {
         {
             i += 1;
         }
+        if let Some(key) = qualified_key(segs, i)
+            && (self.fns.contains_key(&key) || self.consts.contains_key(&key))
+        {
+            return vec![key];
+        }
         segs[i..].to_vec()
     }
+}
+
+/// `util::x` / `crate::geo::shapes::x` (modules up to `i`) → `util.x` / `geo.shapes.x`.
+pub fn qualified_key(segs: &[String], i: usize) -> Option<String> {
+    if i + 1 != segs.len() {
+        return None;
+    }
+    let mods: Vec<&str> = segs[..i]
+        .iter()
+        .map(String::as_str)
+        .skip_while(|s| matches!(*s, "crate" | "self"))
+        .collect();
+    if mods.is_empty() {
+        return None;
+    }
+    Some(format!("{}.{}", mods.join("."), segs[i]))
 }

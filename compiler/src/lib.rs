@@ -8,6 +8,7 @@ mod alias;
 mod bindings;
 mod borrows;
 mod bundled;
+mod clap_derive;
 mod codegen;
 mod fmt;
 mod json;

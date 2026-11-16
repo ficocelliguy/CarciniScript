@@ -145,6 +145,16 @@ impl Codegen<'_> {
         if def.implements("Drop") {
             self.line(Frag::text("static $dropImpl = true;"));
         }
+        // (Its JSON schema, for `serde_json::from_str::<T>` with `T: DeserializeOwned`.)
+        if def.type_params.is_empty()
+            && (def.derives("Deserialize") || def.derives("Serialize"))
+            && self.src.contains("Deserialize")
+        {
+            let schema = self.json_schema_expr(&Ty::Adt(def.name.clone(), Vec::new()));
+            self.line(Frag::text(format!(
+                "static get $jsonSchema() {{ return {schema}; }}"
+            )));
+        }
 
         // Constructor and variant factories.
         if def.is_enum {
@@ -263,7 +273,7 @@ impl Codegen<'_> {
         }
         self.self_adt = saved;
 
-        self.emit_derives(&def, &cls);
+        self.emit_derives(&def, &cls, node);
         self.out.indent -= 1;
         self.line(Frag::text("}"));
         self.line(Frag::default());
@@ -321,6 +331,11 @@ impl Codegen<'_> {
                     ty: self_ty.clone(),
                 },
             );
+        }
+        // `fn finish(self)`: `self` is dropped when the method ends, unless moved on.
+        if matches!(sig.receiver, Some(crate::adt::Receiver::Value)) && self.self_drops(f, &self_ty)
+        {
+            self.param_drops.push(("this".into(), self_ty.clone()));
         }
         let mut params = Vec::new();
         let mut destructured: Vec<(ast::Pat, String)> = Vec::new();
@@ -513,12 +528,39 @@ impl Codegen<'_> {
         }
         self.out.indent -= 1;
         self.close_line(close, f.body().as_ref());
+        self.drop_flags.remove("this");
         self.scopes.pop();
         self.dict_scope = saved_dicts;
         super::set_const_scope(Some(saved_consts));
         super::set_dbg_scope(saved_dbgs);
         self.tmp = saved_tmp;
         self.used_names = saved_names;
+    }
+
+    /// Whether a method taking `self` by value drops it at its end: its type has a value to drop,
+    /// and no field is moved out of it first. (A type with its own `Drop` can't have fields moved
+    /// out; otherwise any `self.field` outside a `&` or a macro might move it, so it's left.)
+    fn self_drops(&self, f: &ast::Fn, self_ty: &Ty) -> bool {
+        if !self.needs_drop(self_ty) {
+            return false;
+        }
+        if let Ty::Adt(n, _) = self_ty
+            && self.adt(n).is_some_and(|d| d.implements("Drop"))
+        {
+            return true;
+        }
+        let Some(body) = f.body() else { return false };
+        !body
+            .syntax()
+            .descendants()
+            .filter_map(ast::FieldExpr::cast)
+            .any(|fe| {
+                matches!(fe.expr(), Some(ast::Expr::PathExpr(p)) if p.syntax().text() == "self")
+                    && !fe
+                        .syntax()
+                        .parent()
+                        .is_some_and(|p| ast::RefExpr::can_cast(p.kind()))
+            })
     }
 
     /// `class $ext$f64 { .. }`: the user trait methods of a built-in type, called as
@@ -710,7 +752,7 @@ impl Codegen<'_> {
     }
 
     /// `$clone`, `$eq`, `$cmp`, `$dbg` and `static default()` for the derives.
-    fn emit_derives(&mut self, def: &AdtDef, cls: &str) {
+    fn emit_derives(&mut self, def: &AdtDef, cls: &str, node: &ra_ap_syntax::SyntaxNode) {
         let lines = |cg: &mut Self, ls: Vec<String>| {
             for l in ls {
                 cg.line(Frag::text(l));
@@ -937,7 +979,7 @@ impl Codegen<'_> {
                     if parts.is_empty() {
                         "return 0;".into()
                     } else {
-                        format!("return {} || 0;", parts.join(" || "))
+                        partial_chain(&parts)
                     }
                 },
                 "return 0;",
@@ -997,10 +1039,21 @@ impl Codegen<'_> {
                 }
             } else {
                 let v = &def.variants[0];
+                // (A `[T; N]` field: N elements, by its written type.)
+                let resolved: Vec<Ty> = v.fields.iter().map(|f| f.ty.clone()).collect();
+                let arrays = self.field_array_defaults(node, &resolved);
                 let mut vals: Vec<String> = v
                     .fields
                     .iter()
-                    .map(|f| default_value(&f.ty).unwrap_or_else(|| "undefined".into()))
+                    .enumerate()
+                    .map(|(k, f)| {
+                        arrays
+                            .get(k)
+                            .cloned()
+                            .flatten()
+                            .or_else(|| default_value(&f.ty))
+                            .unwrap_or_else(|| "undefined".into())
+                    })
                     .collect();
                 for c in self.carried_names(&def.name) {
                     let i = def.type_params.iter().position(|p| *p == c).unwrap_or(0);
@@ -1042,6 +1095,9 @@ impl Codegen<'_> {
     pub(super) fn emit_record(&mut self, r: &ast::RecordExpr) -> (Frag, Ty) {
         let segs = path_segments(r.path());
         let Some(Resolved::Ctor(adt, v)) = self.resolve(&segs) else {
+            if let Some(r) = self.emit_iface_record(r, &segs) {
+                return r;
+            }
             self.error(r.syntax(), "cannot find this struct or variant");
             return (Frag::text("undefined"), Ty::Unknown);
         };
@@ -1366,7 +1422,10 @@ impl Codegen<'_> {
             "eq" => (helper("eq", arg(self)), Ty::Bool),
             "ne" => (helper("eq", arg(self)).wrap("!", ""), Ty::Bool),
             "cmp" => (helper("cmp", arg(self)), Ty::Ordering),
-            "partial_cmp" => (helper("cmp", arg(self)), Ty::Option(Box::new(Ty::Ordering))),
+            "partial_cmp" => (
+                helper("cmp", arg(self)).wrap("κσ.$ordOpt(", ")"),
+                Ty::Option(Box::new(Ty::Ordering)),
+            ),
             "max" => (helper("max", arg(self)), t),
             "min" => (helper("min", arg(self)), t),
             "lt" => (helper("cmp", arg(self)).wrap("(", " < 0)"), Ty::Bool),
@@ -1494,4 +1553,15 @@ impl Codegen<'_> {
             _ => false,
         }
     }
+}
+
+/// A derived `$cmp` over fields: the first that isn't equal decides. A NaN (incomparable) stops
+/// the chain too, so `partial_cmp` gives `None` and every `<`/`>` is false, like Rust's.
+fn partial_chain(parts: &[String]) -> String {
+    let mut out = String::from("{ let $c; return ");
+    for p in parts {
+        out.push_str(&format!("($c = {p}) !== 0 ? $c : "));
+    }
+    out.push_str("0; }");
+    out
 }

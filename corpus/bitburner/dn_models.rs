@@ -483,9 +483,138 @@ pub fn mastermind_score(secret: &str, guess: &str) -> (usize, usize) {
     (exact, common - exact)
 }
 
+// ---------------------------------------------------------------------------------------
+// Dictionary: TopPass picks uniformly from the game's common-password list.
+
+/// The game's common-password list, one per line.
+pub fn common_passwords() -> impl Iterator<Item = &'static str> {
+    include_str!("common_passwords.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+}
+
+// ---------------------------------------------------------------------------------------
+// BigMo%od: a wrong guess `n` answers `(password % n) % (((n - 1) % 32) + 1)`.
+
+/// What the server reduces by the second time for a probe `n`.
+pub const fn second_modulus(n: u64) -> u64 {
+    (n - 1) % 32 + 1
+}
+
+/// Probes up to 32, where the second reduction is a no-op so the answer is `password % n`.
+/// They're pairwise coprime and their product is lcm(1..=32).
+pub const CRT_PROBES: [u64; 11] = [32, 27, 25, 7, 11, 13, 17, 19, 23, 29, 31];
+
+/// `(g, x, y)` with `a·x + b·y = g = gcd(a, b)`.
+fn extended_gcd(a: i128, b: i128) -> (i128, i128, i128) {
+    if b == 0 {
+        (a, 1, 0)
+    } else {
+        let (g, x, y) = extended_gcd(b, a % b);
+        (g, y, x - (a / b) * y)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Congruence {
+    pub residue: u128,
+    pub modulus: u128,
+}
+
+impl Congruence {
+    pub const ANY: Congruence = Congruence { residue: 0, modulus: 1 };
+
+    /// Combines `self` with `x ≡ residue (mod modulus)`; `None` if they contradict.
+    pub fn and(self, residue: u64, modulus: u64) -> Option<Congruence> {
+        let (m1, m2) = (self.modulus as i128, i128::from(modulus));
+        let (r1, r2) = (self.residue as i128, i128::from(residue));
+        let (g, p, _) = extended_gcd(m1, m2);
+        if (r2 - r1) % g != 0 {
+            return None;
+        }
+        let lcm = m1 / g * m2;
+        let k = ((r2 - r1) / g * p).rem_euclid(m2 / g);
+        Some(Congruence {
+            residue: (r1 + m1 * k).rem_euclid(lcm) as u128,
+            modulus: lcm as u128,
+        })
+    }
+
+    /// Every number with exactly `digits` digits (no leading zeros) that fits.
+    pub fn with_digits(self, digits: u32) -> impl Iterator<Item = u128> {
+        let lo = if digits <= 1 { 0 } else { 10u128.pow(digits - 1) };
+        let hi = 10u128.pow(digits);
+        let first = lo + (self.residue + self.modulus - lo % self.modulus) % self.modulus;
+        (first..hi).step_by(self.modulus as usize)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// KingOfTheHill: altitude is a sum of Gaussian hills, the tallest (10 000 m) centred on
+// the password.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hill {
+    pub height: f64,
+    pub width: f64,
+}
+
+impl Hill {
+    pub const PEAK: f64 = 10_000.0;
+
+    /// The password's hill for a numeric password of `digits` digits.
+    pub fn for_digits(digits: u32) -> Hill {
+        Hill { height: Self::PEAK, width: 10f64.powi(digits.saturating_sub(2) as i32) + 1.0 }
+    }
+
+    pub fn altitude(&self, centre: f64, x: f64) -> f64 {
+        self.height * (-((x - centre) / self.width).powi(2)).exp()
+    }
+
+    /// Where the centre would be if `altitude` was measured at `x` on this hill alone:
+    /// one guess on each side.
+    pub fn centres(&self, x: f64, altitude: f64) -> Option<[f64; 2]> {
+        if !(altitude > 0.0 && altitude <= self.height) {
+            return None;
+        }
+        let d = self.width * (self.height / altitude).ln().sqrt();
+        Some([x - d, x + d])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary() {
+        let words: Vec<_> = common_passwords().collect();
+        assert_eq!(words.len(), 93);
+        assert_eq!(words.first(), Some(&"123456"));
+    }
+
+    #[test]
+    fn triple_modulo() {
+        let password: u128 = 913_406_118_250_771;
+        let found = CRT_PROBES
+            .iter()
+            .try_fold(Congruence::ANY, |c, &n| c.and((password % u128::from(n)) as u64, n))
+            .unwrap();
+        assert_eq!(found.modulus, 144_403_552_893_600);
+        assert!(found.with_digits(15).any(|x| x == password));
+        assert_eq!(second_modulus(32), 32);
+        assert_eq!(second_modulus(33), 1);
+        assert_eq!(Congruence::ANY.and(1, 4).and_then(|c| c.and(2, 6)), None);
+    }
+
+    #[test]
+    fn hill() {
+        let hill = Hill::for_digits(6);
+        let at = hill.altitude(456_789.0, 450_000.0);
+        let [left, right] = hill.centres(450_000.0, at).unwrap();
+        assert!((right - 456_789.0).abs() < 1e-3, "{left} {right}");
+    }
 
     #[test]
     fn roman() {

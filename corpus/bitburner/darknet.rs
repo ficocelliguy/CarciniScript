@@ -6,7 +6,7 @@
 
 mod dn_models;
 
-use dn_models::{Candidates, Model};
+use dn_models::{Candidates, Congruence, Hill, Model};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -232,6 +232,7 @@ async fn crack(s: &mut Session<'_>) -> Result<Option<String>> {
     match model {
         Model::DefaultPassword => s.first_success(dn_models::DEFAULT_PASSWORDS).await,
         Model::DogNames => s.first_success(dn_models::DOG_NAMES).await,
+        Model::CommonPasswordDictionary => s.first_success(dn_models::common_passwords()).await,
         Model::EuCountryDictionary => s.first_success(dn_models::EU_COUNTRIES.iter().copied()).await,
         Model::SortedEchoVuln => {
             let digits = data.split(';').next().unwrap_or_default().to_owned();
@@ -247,6 +248,8 @@ async fn crack(s: &mut Session<'_>) -> Result<Option<String>> {
             s.first_success(["■".repeat(n * 2)]).await
         }
         Model::DivisibilityTest => divisibility(s).await,
+        Model::TripleModulo => triple_modulo(s).await,
+        Model::GlobalMaxima => king_of_the_hill(s).await,
         Model::PacketSniffer => {
             let entries = s.logs(8).await;
             let host = s.host.clone();
@@ -441,6 +444,76 @@ async fn divisibility(s: &mut Session<'_>) -> Result<Option<String>> {
         value *= power;
     }
     s.first_success([value.to_string()]).await
+}
+
+/// BigMo%od: learn `password % n` for coprime `n` up to 32, then solve with the CRT.
+async fn triple_modulo(s: &mut Session<'_>) -> Result<Option<String>> {
+    let mut known = Congruence::ANY;
+    for n in dn_models::CRT_PROBES {
+        let probe = n.to_string();
+        let fb = s.attempt(&probe).await?;
+        if fb == Feedback::Accepted {
+            return Ok(Some(probe));
+        }
+        let residue: u64 = fb
+            .data()
+            .and_then(|d| d.trim().parse().ok())
+            .ok_or_else(|| DnError::Feedback { host: s.host.clone(), detail: format!("{fb:?}") })?;
+        known = known.and(residue, n).ok_or_else(|| DnError::Feedback {
+            host: s.host.clone(),
+            detail: format!("{residue} (mod {n}) contradicts {known:?}"),
+        })?;
+    }
+    let digits = s.len() as u32;
+    s.first_success(known.with_digits(digits).map(|x| x.to_string())).await
+}
+
+/// KingOfTheHill: scan at half a hill's width, so the best sample is on the tallest hill
+/// rather than a side one, then jump to where that hill's shape puts its top.
+async fn king_of_the_hill(s: &mut Session<'_>) -> Result<Option<String>> {
+    /// The altitude at `x`, or `None` if `x` was the password.
+    async fn altitude(s: &mut Session<'_>, x: u64) -> Result<Option<f64>> {
+        match s.attempt(&x.to_string()).await? {
+            Feedback::Accepted => Ok(None),
+            Feedback::Rejected { data, message } => data
+                .as_deref()
+                .and_then(|d| d.parse().ok())
+                .map(Some)
+                .ok_or(DnError::Feedback { host: s.host.clone(), detail: message }),
+        }
+    }
+
+    let digits = s.len() as u32;
+    let hill = Hill::for_digits(digits);
+    let lo = if digits <= 1 { 0 } else { 10u64.pow(digits - 1) };
+    let hi = 10u64.pow(digits) - 1;
+    let step = ((hill.width / 2.0) as usize).max(1);
+
+    let mut seen: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut next: Vec<u64> = (lo..=hi).step_by(step).collect();
+    while !next.is_empty() {
+        for x in next.drain(..) {
+            match altitude(s, x).await? {
+                None => return Ok(Some(x.to_string())),
+                Some(a) => {
+                    seen.insert(x, a);
+                }
+            }
+        }
+        let Some((&best, &top)) = seen.iter().max_by(|a, b| a.1.total_cmp(b.1)) else {
+            break;
+        };
+        next = hill
+            .centres(best as f64, top)
+            .into_iter()
+            .flatten()
+            .map(|c| c.round().clamp(lo as f64, hi as f64) as u64)
+            .chain([best.saturating_sub(1).max(lo), (best + 1).min(hi)])
+            .filter(|x| !seen.contains_key(x))
+            .collect();
+        next.dedup();
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

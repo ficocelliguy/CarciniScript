@@ -59,8 +59,8 @@ impl Codegen<'_> {
             ) => method,
             (
                 Coll::BinaryHeap,
-                "push" | "pop" | "peek" | "into_sorted_vec" | "into_vec" | "drain" | "extend"
-                | "append",
+                "push" | "pop" | "peek" | "into_sorted_vec" | "into_vec" | "drain" | "into_iter"
+                | "extend" | "append",
             ) => method,
             (Coll::BTreeSet, "first" | "last" | "pop_first" | "pop_last" | "append") => method,
             (
@@ -121,6 +121,8 @@ impl Codegen<'_> {
             (Coll::BinaryHeap, "peek") => rf.clone().wrap("(", "[0] ?? null)"),
             (Coll::BinaryHeap, "into_sorted_vec") => call("heapSorted", vec![]),
             (Coll::BinaryHeap, "into_vec") => rf.clone(),
+            // (In the heap's array order, as std gives an arbitrary one.)
+            (Coll::BinaryHeap, "into_iter") => rf.clone().wrap("κσ.$iter(", ")"),
             (Coll::BinaryHeap, "drain") => rf
                 .clone()
                 .wrap("new κσ.Iter(", ".splice(0)[Symbol.iterator]())"),

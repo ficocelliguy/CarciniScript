@@ -130,7 +130,9 @@ A few popular crates are built in and need no `Cargo.toml`: `rand` (`rng.gen_ran
 (`serde_json::to_string(&state)?`, `from_str::<Config>(&text)?`, `json!`, `Value`), `regex`
 (`Regex::new(r"(\d+)GB")`, `captures`, `replace_all`) and `rayon` (`par_iter()`, run on one
 thread), `log` (`info!`, with `env_logger`), `num` (`Zero`, `gcd`, ..) and `tokio`
-(`tokio::spawn`, `sleep`, `join!`, on the script's event loop). `extern crate x;` works for
+(`tokio::spawn`, `sleep`, `join!`, on the script's event loop), `rand_distr` (`Normal`,
+`WeightedIndex`, ..), `chrono` (dates, times, time zones, `format`) and `clap` (`#[derive(Parser)]`
+and the builder, with clap's help and errors). `extern crate x;` works for
 these. See [FEATURES.md](docs/FEATURES.md) for what each
 covers and [RUST_GAPS.md](docs/RUST_GAPS.md) for what differs (rand's seeded sequences, for one).
 
@@ -174,7 +176,11 @@ rename providers for `.rs` files; a definition in another script opens it in a t
 `tools/dts2rs.mjs` turns Bitburner's `NetscriptDefinitions.d.ts` into Rust declarations
 (`bindings/ns.rs`), which the compiler loads with `setNsBindings(text)`. With them, every `ns.*`
 call, field and namespace is type-checked: wrong argument types, misspelled methods ("did you
-mean"), and a forgotten `.await` are compile errors. Regenerate after NS API changes:
+mean"), and a forgotten `.await` are compile errors. The interfaces are Rust structs a script can
+name and build (`RunOptions { threads: Some(4.0), ..Default::default() }`), a `Player` is accepted
+where a `Person` is, and untyped values are wasm-bindgen's `JsValue`
+(`ns.args.first().and_then(|a| a.as_string())`, `serde_wasm_bindgen::from_value(data)`).
+Regenerate after NS API changes:
 
 ```sh
 npm run bindings   # reads ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts

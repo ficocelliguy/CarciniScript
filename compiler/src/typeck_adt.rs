@@ -360,6 +360,7 @@ impl Checker<'_> {
                     is_async: false,
                     receiver: None,
                     cell_params: vec![],
+                    into_params: vec![],
                     impl_args: args,
                     type_params: vec![],
                 });
@@ -466,6 +467,7 @@ impl Checker<'_> {
             is_async: m.is_async,
             receiver: m.receiver,
             cell_params: m.cell_params.clone(),
+            into_params: m.into_params.clone(),
             impl_args: m.impl_args.iter().map(|t| subst(t, &map)).collect(),
             type_params: m.type_params.clone(),
         }
@@ -698,10 +700,18 @@ impl Checker<'_> {
                 fields: l
                     .fields()
                     .enumerate()
-                    .map(|(i, f)| Field {
-                        name: i.to_string(),
-                        ty: f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
-                        js: i.to_string(),
+                    .map(|(i, f)| {
+                        let ty = f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                        // (`struct Threads([u32; 4])`: a `Copy` array, as a named field would be.)
+                        if self.copy_array(f.ty().as_ref(), None, &ty) {
+                            self.array_fields
+                                .insert((variant_name.to_string(), i.to_string()));
+                        }
+                        Field {
+                            name: i.to_string(),
+                            ty,
+                            js: i.to_string(),
+                        }
                     })
                     .collect(),
             },
@@ -875,6 +885,8 @@ impl Checker<'_> {
             Some("Iterator" | "IntoIterator" | "Send" | "Sync" | "Unpin") => {}
             // `deref` / `deref_mut` are ordinary methods; auto-deref calls them.
             Some("Deref") => {}
+            // `as_ref()` / `as_mut()` / `borrow()`: ordinary methods too (`impl AsRef<str> for Host`).
+            Some("AsRef" | "AsMut" | "Borrow" | "BorrowMut") => {}
             // `from_str` is an associated function; `s.parse::<T>()` calls it.
             Some("FromStr") => {}
             // `x.try_into()` / `T::try_from(x)`, `collect()` into the type, `t.extend(..)`.
@@ -909,7 +921,7 @@ impl Checker<'_> {
                 let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
                 self.error(
                     &node,
-                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
+                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
                 );
                 return;
             }
@@ -1184,6 +1196,7 @@ impl Checker<'_> {
             is_async: f.async_token().is_some(),
             receiver,
             cell_params,
+            into_params: super::into_param_flags(f),
             impl_args: vec![],
             type_params: own.clone(),
         };
@@ -1590,8 +1603,10 @@ impl Checker<'_> {
                         .push((r, caller, format!("{adt}::{m}"), own));
                 }
                 let mut params = method.params.clone();
+                let mut into_params = method.into_params.clone();
                 if method.receiver.is_some() {
                     params.insert(0, Ty::Adt(adt.clone(), method.impl_args.clone()));
+                    into_params.insert(0, false);
                     if method.receiver == Some(Receiver::MutRef)
                         && let Some(first) = args.first()
                     {
@@ -1599,8 +1614,12 @@ impl Checker<'_> {
                     }
                 }
                 self.arg_count(c.syntax(), "function", params.len(), args.len());
-                for (a, p) in args.iter().zip(&params) {
-                    self.check(a, p);
+                for (i, (a, p)) in args.iter().zip(&params).enumerate() {
+                    if into_params.get(i) == Some(&true) {
+                        self.check_into_arg(a, p);
+                    } else {
+                        self.check(a, p);
+                    }
                 }
                 Some(if method.is_async {
                     Ty::Future(Box::new(method.ret))
@@ -1617,6 +1636,10 @@ impl Checker<'_> {
         let list = r.record_expr_field_list();
         let fields: Vec<ast::RecordExprField> = list.iter().flat_map(|l| l.fields()).collect();
         let Some(Resolved::Ctor(adt, v)) = self.resolve(&segs) else {
+            // `RunOptions { .. }`: an interface of the NS bindings.
+            if let Some(t) = self.iface_record(r, &segs) {
+                return t;
+            }
             let text = r
                 .path()
                 .map(|p| p.syntax().text().to_string())
@@ -1789,7 +1812,11 @@ impl Checker<'_> {
                 if sig.cell_params.get(i) == Some(&true) {
                     self.cell_arg(a);
                 }
-                self.check(a, p);
+                if sig.into_params.get(i) == Some(&true) {
+                    self.check_into_arg(a, p);
+                } else {
+                    self.check(a, p);
+                }
             }
             for a in args.iter().skip(sig.params.len()) {
                 self.infer(a, None);
@@ -2245,7 +2272,7 @@ pub(super) fn path_segs(path: Option<ast::Path>) -> Vec<String> {
 }
 
 /// `a`, `a and b`, `a, b and c`.
-fn join_and(items: &[String]) -> String {
+pub(super) fn join_and(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),

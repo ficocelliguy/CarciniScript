@@ -232,7 +232,7 @@ pub async fn main(ns: NS) {
         has_4s: ns.stock.has4_s_data_tix_api(),
         can_short: {
             let reset = ns.get_reset_info();
-            reset.current_node == 8.0 || reset.owned_sf.get(&8).is_some_and(|&lvl| lvl >= 2)
+            reset.current_node == 8.0 || reset.owned_sf.get(&8).is_some_and(|&lvl| lvl >= 2.0)
         },
         history: HashMap::new(),
         realized: 0.0,

@@ -115,6 +115,8 @@ pub struct Method {
     pub is_async: bool,
     /// Which parameters are `&mut` to a number, string, bool or Option (passed as cells).
     pub cell_params: Vec<bool>,
+    /// Which parameters are `impl Into<X>` / `T: Into<X>`.
+    pub into_params: Vec<bool>,
     /// The type arguments of the `impl`'s self type (`impl<U> Stack<U>` → `[U]`), which map a
     /// receiver's arguments onto the signature.
     pub impl_args: Vec<Ty>,

@@ -196,11 +196,28 @@ impl Codegen<'_> {
             return (f, ty);
         }
         // `impl FromStr for T`: `T.from_str(s)`.
-        if let Ty::Adt(n, _) = &target
+        if let Ty::Adt(n, targs) = &target
             && self.types.adts.method(n, "from_str").is_some()
         {
             let mut f = Frag::mapped(name_off, format!("{}.from_str(", self.class(n)));
-            f.append(rf.clone()).push(")");
+            f.append(rf.clone());
+            // (`impl<Tz: TimeZone> FromStr for DateTime<Tz>` that calls `Tz::f()`: `Tz`'s class.)
+            let dicts = self
+                .types
+                .dict_params
+                .get(&format!("{n}::from_str"))
+                .cloned()
+                .unwrap_or_default();
+            let params = self.types.adts.defs.get(n).map(|d| d.type_params.clone());
+            for d in dicts {
+                let arg = params
+                    .as_ref()
+                    .and_then(|ps| ps.iter().position(|p| *p == d))
+                    .and_then(|i| targs.get(i));
+                let js = arg.map_or_else(|| "undefined".to_string(), |a| self.dict_of(a));
+                f.push(format!(", {js}"));
+            }
+            f.push(")");
             return (f, ty);
         }
         // `s.parse::<T>()` with `T: FromStr`: `T`'s class parses it.

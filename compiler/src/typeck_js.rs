@@ -293,6 +293,12 @@ impl Checker<'_> {
                 continue;
             }
             let z = self.zonk(&t);
+            // (A type parameter's class carries its schema.)
+            let mut params = Vec::new();
+            z.collect_params(&mut params);
+            for p in params {
+                self.param_class(&p, &node, None);
+            }
             if let Some(bad) = self.json_bad(&z, &mut Vec::new()) {
                 let tr = if parse { "Deserialize" } else { "Serialize" };
                 let msg = format!(
@@ -320,6 +326,14 @@ impl Checker<'_> {
             | Ty::Unit => None,
             Ty::Unknown | Ty::Var(_) => None,
             Ty::Extern(n) if n == "JsValue" => None,
+            // `T: DeserializeOwned` (its class is passed in for its schema).
+            Ty::Param(p)
+                if ["Deserialize", "DeserializeOwned", "Serialize"]
+                    .iter()
+                    .any(|b| self.param_has(p, b)) =>
+            {
+                None
+            }
             Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::RefCell(e) => self.json_bad(e, seen),
             Ty::Coll(_, v) => self.json_bad(v, seen),
             Ty::Tuple(es) => all(self, es, seen),

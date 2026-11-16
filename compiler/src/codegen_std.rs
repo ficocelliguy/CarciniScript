@@ -150,7 +150,8 @@ impl Codegen<'_> {
                 f
             }
 
-            (Ty::Str | Ty::Vec(_), "as_ref" | "borrow") => rf.clone(),
+            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow") => rf.clone(),
+            (Ty::Int(_), "is_multiple_of") => helper("isMultipleOf", self.arg_frags(m)),
             // ---- integers
             // BigInt kinds: one runtime dispatcher, exact at the type's width.
             (Ty::Int(k), m2)
@@ -194,13 +195,13 @@ impl Codegen<'_> {
                 let a = self.arg_frags(m);
                 let b = a.into_iter().next().unwrap_or_else(|| Frag::text("0"));
                 let raw = match op {
-                    "add" => Frag::text("(")
+                    "add" | "add_signed" => Frag::text("(")
                         .append(rf.clone())
                         .push(" + ")
                         .append(b)
                         .push(")")
                         .clone(),
-                    "sub" => Frag::text("(")
+                    "sub" | "sub_signed" => Frag::text("(")
                         .append(rf.clone())
                         .push(" - ")
                         .append(b)
@@ -398,6 +399,8 @@ impl Codegen<'_> {
                 helper("binarySearchBy", vec![probe])
             }
             (Ty::Vec(_), "as_slice" | "as_mut_slice") => rf.clone(),
+            (Ty::Vec(_), "split_first") => helper("splitFirst", vec![]),
+            (Ty::Vec(_), "split_last") => helper("splitLast", vec![]),
             (Ty::Vec(_), "split_at") => helper(
                 "splitAt",
                 [self.arg_frags(m), vec![Frag::text(loc.clone())]].concat(),
@@ -483,6 +486,11 @@ impl Codegen<'_> {
             f
         };
         let f = match tail {
+            ["env", "args"] => call("envArgs", vec![]),
+            ["process", "exit"] => {
+                let code = emit(self, 0);
+                call("exit", vec![code])
+            }
             ["char", "from_digit"] => {
                 let (d, r) = (emit(self, 0), emit(self, 1));
                 call("fromDigit", vec![d, r])
@@ -541,6 +549,10 @@ impl Codegen<'_> {
             }
             ["hint", "black_box"] => emit(self, 0),
             ["Rc" | "Arc", "downgrade"] => self.emit_expr(args.first()?, None).0,
+            ["Rc" | "Arc", "default"] => Frag::mapped(
+                start,
+                super::default_value(&ty).unwrap_or_else(|| "undefined".into()),
+            ),
             ["Weak", "new"] => Frag::mapped(start, "null"),
             // (An error from the type checker.)
             ["Rc" | "Arc", "strong_count" | "weak_count"] => Frag::mapped(start, "0"),
@@ -574,6 +586,10 @@ impl Codegen<'_> {
             ["iter", "once"] => call("iterOnce", vec![emit(self, 0)]),
             ["iter", "empty"] => call("iterEmpty", vec![]),
             ["iter", "repeat_with"] => call("repeatWith", vec![emit(self, 0)]),
+            ["iter", "repeat_n"] => {
+                let (x, n) = (emit(self, 0), emit(self, 1));
+                call("itertools.repeatN", vec![x, n])
+            }
             ["iter", "from_fn"] => call("fromFn", vec![emit(self, 0)]),
             ["iter", "successors"] => call("successors", vec![emit(self, 0), emit(self, 1)]),
             [t @ ("f64" | "f32"), "from_bits"] => {

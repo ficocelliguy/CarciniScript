@@ -127,16 +127,26 @@ impl Codegen<'_> {
             Some(Ty::Closure { ret, .. }) => *ret,
             _ => Ty::Unknown,
         };
+        // `async |x| ..`: an async arrow function; its body returns the future's output.
+        let is_async = c.async_token().is_some();
+        let ret = match ret {
+            Ty::Future(out) if is_async => *out,
+            other => other,
+        };
         let rust_params: Vec<ast::Param> = c
             .param_list()
             .map(|l| l.params().collect())
             .unwrap_or_default();
         self.scopes.push(HashMap::new());
         let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
-        let saved_async = std::mem::replace(&mut self.in_async, false);
+        let saved_async = std::mem::replace(&mut self.in_async, is_async);
         let saved_loops = std::mem::take(&mut self.loop_dests);
         let (js_params, binds) = params(self, &rust_params);
-        let head = format!("({}) => ", js_params.join(", "));
+        let head = format!(
+            "{}({}) => ",
+            if is_async { "async " } else { "" },
+            js_params.join(", ")
+        );
         let body = c.body();
         let expression_body = binds.is_empty()
             && body.as_ref().is_some_and(|b| match b {
@@ -638,6 +648,25 @@ impl Codegen<'_> {
                 f.append(rf.clone()).push(")");
                 out(f)
             }
+            (Ty::Int(IntKind::U8), m2)
+                if m2.starts_with("is_ascii") && crate::typeck::char_predicate(m2).is_some() =>
+            {
+                let re = crate::typeck::char_predicate(m2).unwrap();
+                let mut f = Frag::mapped(name_off, format!("{re}.test(String.fromCharCode("));
+                f.append(rf.clone()).push("))");
+                out(f)
+            }
+            (Ty::Int(IntKind::U8), "to_ascii_lowercase" | "to_ascii_uppercase") => {
+                let (lo, hi, d) = if method == "to_ascii_lowercase" {
+                    (65, 90, "+ 32")
+                } else {
+                    (97, 122, "- 32")
+                };
+                let mut f = Frag::mapped(name_off, "((c) => (c >= ".to_string());
+                f.push(format!("{lo} && c <= {hi} ? c {d} : c))("));
+                f.append(rf.clone()).push(")");
+                out(f)
+            }
             (Ty::Char, "to_ascii_uppercase" | "to_ascii_lowercase") => {
                 let upper = method == "to_ascii_uppercase";
                 out(helper(
@@ -847,7 +876,10 @@ impl Codegen<'_> {
                         Frag::text((method == "eq" || method == "ne").to_string()),
                     ],
                 );
-                if op.is_empty() {
+                if method == "partial_cmp" {
+                    // `None` when a NaN makes them incomparable.
+                    c.wrap("κσ.$ordOpt(", ")")
+                } else if op.is_empty() {
                     // (`partial_cmp`'s `Some(ordering)` is the ordering itself.)
                     c
                 } else {

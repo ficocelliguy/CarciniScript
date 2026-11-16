@@ -130,7 +130,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Every file is its own crate root for `mod`.** `mod x;` in `util.rs` loads `x.rs` next to
   `util.rs` when there is one, since each Bitburner script is compiled on its own (and may be run
   directly); otherwise `x/mod.rs`, then `util/x.rs` like rustc. For the same reason `super::` works only inside inline `mod x { .. }` blocks, not at the top of a
-  module file, and `crate::` names this file.
+  module file, and `crate::` names this file. A module file's generic `pub type` aliases
+  (`pub type Grid<T> = ..`) aren't usable from the file that loads it (plain ones are).
 - **Generics are erased, so a few things need help at run time.** `T::new()`, `T::CONST` and
   `T::default()` work in free functions, on a method's own type parameters and on an `impl<T>`'s
   in its associated functions, which get `T`'s class as a hidden argument, but not on an
@@ -140,7 +141,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   one, so the two should use the same fields (as Rust requires anyway). `DefaultHasher::finish()`
   is FNV-1a, not SipHash: its values differ from rustc's (which aren't specified).
 - **`v.try_into()` from a slice to an array is always `Ok`**, since array lengths aren't in
-  the types; rustc returns `Err` (or panics at `unwrap`) for the wrong length.
+  the types; rustc returns `Err` (or panics at `unwrap`) for the wrong length. Written as
+  `<[T; N]>::try_from(v)` the length is known and checked.
+- **An array's length is known only where it's written.** `let [a, b] = arr;` is accepted when
+  `arr`'s length shows in the `let` (an annotation, an array literal, `<[T; N]>::try_from(..)`);
+  an array from a function call needs the annotation (`let [a, b]: [f64; 2] = f();`). The same
+  goes for `Default` of `[T; N]` (a `#[derive(Default)]` field or a `let` annotation).
 - **One `TryFrom`, `FromIterator` and `Extend` impl per type.** A second one is an error.
 - **Array lengths aren't part of types, so const generics lean on arguments.** A const parameter
   is inferred from a written argument or a struct's type (`Matrix<2, 3>`), or read at run time off
@@ -166,8 +172,15 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Option and patterns
 
-- **`None` is `null`.** `Option<Option<T>>` and `Option<()>` can't be represented (`Some(None)`
-  would equal `None`), so they're rejected at compile time. `undefined` from JS reads as `None`.
+- **`None` is `null`.** `Option<Option<T>>` can't be represented (`Some(None)` would equal
+  `None`), so it's rejected at compile time unless it's a temporary that `.flatten()` reads or
+  `.map(Some)` made. `Option<()>` works: a call giving one turns `()` (`undefined`) into a
+  non-null marker. `undefined` from JS reads as `None`.
+- **A kept `hash_map::Entry` holds the map**: `btree_map::Entry`'s `get_mut` / `insert` assume a
+  `HashMap`'s storage, and `let v = e.get_mut(); *v += 1;` (a binding of the `&mut`) is
+  rejected as a borrow of an immutable `v`; write `*e.get_mut() += 1`.
+- **A generic `T: DeserializeOwned` gets its schema from `T`'s class**, so `T` can be a number,
+  `String`, `bool`, `char` or a non-generic struct or enum, not a `Vec<..>` or a generic type.
 - **`unwrap_or(default)` evaluates `default` lazily** (it lowers to `??`). Rust evaluates it
   eagerly, so the difference shows only if the default expression has side effects.
 - **Exhaustiveness is approximate.** Catch-all arms, `true`/`false` and `None`/`Some(_)` are
@@ -191,10 +204,19 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   - A `...rest` parameter takes any number of arguments (`ns.tprint(a, b, c)`).
   - An unsuffixed integer literal is accepted for an `f64` parameter (`ns.sleep(100)`). Integer
     *variables* still need `as f64`.
-- **Some NS types are untyped (`JsValue`).** Unions of different types, generics, tuples,
-  callbacks and inline object types have no Rust equivalent yet; values of those types are
-  unchecked, as all NS values were before the bindings. An intersection like
-  `Server & { isOnline?: boolean }` is typed as the named interface; its extra fields are dropped.
+- **Some NS values are `JsValue`s.** Unions of different types, generics, callbacks and inline
+  object types in parameters have no Rust equivalent yet. A `JsValue` result is read with
+  wasm-bindgen's `as_string()` / `as_f64()` / `as_bool()` (or `serde_wasm_bindgen::from_value`);
+  a `JsValue` parameter takes any value, unchecked.
+- **NS interfaces are structurally typed in TS.** Here an interface is accepted where one it
+  `extends` is expected (`Player` for `Person`), and an intersection result is its own struct
+  (`ServerWithIsOnline` for `Server & { isOnline?: boolean }`) accepted as the named interface.
+  Other structural matches (two unrelated interfaces with the same fields) aren't.
+- **NS interfaces built in Rust are plain JS objects**: `RunOptions { .. }` needs every field
+  unless it has `..base`, as in Rust; `Default::default()` exists only for interfaces whose
+  fields are all optional.
+- **`Map` and `Record` results are copied into a `HashMap`** where they're read (`owned_sf` is
+  rebuilt on each read; changing it doesn't change the game's). `Map<number, V>` keys are `i32`.
 - **Without bindings** (`setNsBindings` not called), `NS` is entirely untyped and snake_case names
   map to camelCase.
 
@@ -202,8 +224,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **The bundled crates are `rand`, `itertools`, `anyhow`, `thiserror`, `bitflags`, `once_cell`,
   `lazy_static`, `either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex`, `rayon`, `log`
-  (with `env_logger` / `simple_logger`), `num` (`num-traits`, `num-integer`), `tokio` and
-  `futures`**; any other crate is an error.
+  (with `env_logger` / `simple_logger`), `num` (`num-traits`, `num-integer`), `tokio`,
+  `futures`, `rand_distr`, `chrono` and `clap`**; any other crate is an error.
 - **`log` writes `[LEVEL] message`** to stderr, without env_logger's timestamp and target, and
   there's no `RUST_LOG`: `env_logger::init()` logs errors only; set a level with
   `Builder::filter_level` or `Env::default().default_filter_or("info")`.
@@ -239,9 +261,32 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   also appends the two values (`(1 vs 0)`).
 - **`cfg_if!` decides for a script**: features and every OS are off, so code that picks
   `#[cfg(windows)]` natively takes another branch here.
-- **Only their common surface of `rand` and `itertools`** (see FEATURES.md):
-  no `rand::distributions` (`Uniform`, `WeightedIndex`), `fill`, `sample_iter`; no
+- **Only their common surface of `rand` and `itertools`** (see FEATURES.md): no
   `itertools::iproduct!` / `izip!` macros, `minmax`, `exactly_one`, `fold_while`, `kmerge`.
+- **rand's distributions:** the built-in ones have `sample` / `sample_iter` methods but don't
+  implement the `Distribution` trait, so a `D: Distribution<f64>` bound takes your own types only;
+  your `impl Distribution<T> for Standard` can be for one `T`. `Uniform::from(lo..hi)`,
+  `WeightedIndex::update_weights`, `Slice`, `Dirichlet`, `Zipf`, `Hypergeometric`, the unit
+  shapes (`UnitCircle`, ..) and `DistIter` as a named type aren't there, and `rng.sample_iter(..)`
+  doesn't move `rng` (rustc rejects using it afterwards).
+- **chrono:** `Local` is the JS host's time zone (Bitburner: the browser's). chrono-tz's zones
+  (`chrono_tz::Europe::London`, `"America/New_York".parse::<Tz>()`) use the host's `Intl` data:
+  offsets are the browser's tz database, and abbreviations come from `Intl`'s names (tried in a
+  few English locales and Japanese, else the tz database's `+04` form), which can differ from
+  chrono-tz's table for zones `Intl` names only by offset. `format(..)` gives a `String` (not a
+  `DelayedFormat`); leap seconds, `ParseResult`, `Date<Tz>` (deprecated), `round_subsecs` /
+  `DurationRound` and serde for its types aren't there; `parse_from_str` takes the common
+  specifiers (`%Y %m %d %H %M %S %y %b %B %a %A %j %I %p %f %.f %z %:z %s %T %D %F %R`, ..).
+- **clap:** `#[command(version)]` with no value is `0.1.0` and a command's name defaults to the
+  program's: a script has no Cargo.toml to read them from (`version = "1.2"` sets one). Help isn't
+  wrapped to the terminal and has no colors; `ArgGroup`, `conflicts_with` / `requires`, `env`,
+  `global`, `num_args`, `arg!` / `command!`, `#[arg(value_parser = ..)]` ranges and nested
+  subcommand variants aren't there. `get_one::<T>` parses the value it's asked for (clap checks
+  the type it was given).
+- **`std::process::exit` ends a script by unwinding**: code in `Drop` impls still runs (Rust's
+  doesn't). A Netscript `main(ns)` whose program can exit ends quietly, showing what clap's
+  `Error::exit` prints (help, errors) with `ns.tprint`; other output of `print!` goes to the
+  browser console, as always.
 - **Random numbers differ from rand's.** The generator is xoshiro128**, not ChaCha12, so a
   seeded `StdRng` repeats its own sequence but not rand's, and `shuffle` / `choose` pick
   differently for the same seed.
@@ -251,10 +296,13 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 ## Drop, ranges, `Cow` and `std::io`
 
 - **`Drop` follows moves the move checker sees**: by `let`, assignment, argument, method that
-  takes `self`, struct / tuple / `vec!` literal, `return`, `break` and `?`. A value moved some
-  other way (into a closure, out of a struct field) is still dropped at the end of its old
-  scope. `Rc` is erased, so an `Rc<T>` holding a `Drop` value drops it with the first `Rc`, not
-  the last; a method taking `self` by value doesn't drop `self` at its end; `v.clear()`,
+  takes `self`, struct / tuple / `vec!` literal, `return`, `break`, `?` and a closure capturing
+  it by value. A value moved out of a struct field is still dropped with the struct. A closure
+  given to a std method (`it.map(f)`) drops what it captured when its binding ends, where Rust
+  drops it with the adapter. A method taking `self` by value drops `self` at its end only when
+  the type has its own `Drop` or the body reads no field outside a `&` (it might move one out).
+  `Rc` is erased, so an `Rc<T>` holding a `Drop` value drops it with the first `Rc`, not
+  the last; `v.clear()`,
   `truncate` and assigning a new value to a field don't drop the old elements. On a panic the
   values in scope are dropped before the panic message is printed (Rust prints it first).
 - **A range made by `a..b` is an iterator until something asks for a `Range`** (a `let r =
@@ -325,8 +373,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Timer ids are `f64`.** `set_timeout` returns what JS does (a number in the browser), only
   good for `clear_timeout`. Closures given to timers and event listeners stay alive as long as JS
   holds them; there's no `Closure::forget`.
-- **`JsValue` is untyped.** `js::global(..)`, `Response::json()` and `console::log`'s arguments
-  aren't checked; read typed data with `JSON::parse::<T>`.
+- **`JsValue` is wasm-bindgen's, with two extensions.** `js::global(..)`, `Response::json()` and
+  untyped NS results are `JsValue`s, read with `as_string()` / `as_f64()` / `as_bool()` or
+  `serde_wasm_bindgen::from_value::<T>`; a `JsValue` parameter (`console::log`) takes any value
+  without `JsValue::from`; and `{}` prints a `JsValue` as JS's `String(v)` (wasm-bindgen has only
+  `{:?}`). `serde_wasm_bindgen::to_value` makes maps plain objects, not JS `Map`s.
 - **`Promise::all` / `race` take a `Vec` of futures** (unawaited async calls). They start when
   called, as JS promises do, not when polled.
 - **`JsValue` doesn't solve inference.** `let v: JsValue = JSON::parse(s).unwrap()` asks for

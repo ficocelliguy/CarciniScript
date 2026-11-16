@@ -23,6 +23,7 @@ pub fn uses_bundled(text: &str) -> bool {
         || text.contains("rayon")
         || text.contains("serde_json")
         || text.contains("regex")
+        || text.contains("clap")
         || uses_renamed(text)
 }
 
@@ -46,7 +47,54 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     let mut edits: Vec<(TextRange, String)> = Vec::new();
     let mut errors: Vec<(TextRange, String)> = Vec::new();
     rename_crate_items(&file, text, &mut edits);
+    if text.contains("chrono_tz") {
+        chrono_tz_zones(&file, &mut edits);
+    }
+    // `#[derive(Parser)]` and the other clap derives.
+    let clap_used = text.contains("clap");
+    let clap_ctx = crate::clap_derive::Ctx {
+        value_enums: if clap_used {
+            file.syntax()
+                .descendants()
+                .filter_map(ast::Adt::cast)
+                .filter(|a| {
+                    a.attrs().any(|at| {
+                        attr_name(&at).as_deref() == Some("derive")
+                            && attr_args(&at).is_some_and(|x| x.contains("ValueEnum"))
+                    })
+                })
+                .filter_map(|a| a.name().map(|n| n.text().to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+    };
     for node in file.syntax().descendants() {
+        if clap_used && let Some(adt) = ast::Adt::cast(node.clone()) {
+            crate::clap_derive::derive(&adt, &clap_ctx, &mut edits);
+        }
+        // `clap::value_parser!(u32)`.
+        if clap_used
+            && let Some(mc) = ast::MacroCall::cast(node.clone())
+            && mc
+                .path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "value_parser")
+            && let Some(tt) = mc.token_tree()
+        {
+            let t = tt.syntax().text().to_string();
+            let inner = t
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim()
+                .to_string();
+            edits.push((
+                mc.syntax().text_range(),
+                format!("ClapValueParser::__of({inner:?})"),
+            ));
+            continue;
+        }
         if thiserror && let Some(adt) = ast::Adt::cast(node.clone()) {
             derive_error(&adt, &mut edits, &mut errors);
             continue;
@@ -220,12 +268,12 @@ struct Case {
     named: Option<bool>,
 }
 
-fn attr_name(a: &ast::Attr) -> Option<String> {
+pub(crate) fn attr_name(a: &ast::Attr) -> Option<String> {
     Some(a.path()?.syntax().text().to_string())
 }
 
 /// What's inside an attribute's parentheses (`#[error("x {0}")]` → `"x {0}"`).
-fn attr_args(a: &ast::Attr) -> Option<String> {
+pub(crate) fn attr_args(a: &ast::Attr) -> Option<String> {
     let t = a.syntax().text().to_string();
     let open = t.find('(')?;
     let close = t.rfind(')')?;
@@ -640,7 +688,7 @@ fn strip_comments(s: &str) -> String {
 }
 
 /// Split `s` at top-level occurrences of `sep` (outside brackets and strings).
-fn split_top(s: &str, sep: char) -> Vec<String> {
+pub(crate) fn split_top(s: &str, sep: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut cur = String::new();
@@ -1713,6 +1761,249 @@ const TOKIO_RENAMES: Renames = Renames {
     result_err: None,
 };
 
+/// `rand::distributions` (rand 0.8) and `rand_distr`.
+const RAND_DISTR_RENAMES: Renames = Renames {
+    roots: &[
+        "rand::distributions",
+        "rand::distributions::uniform",
+        "rand::distributions::weighted",
+        "rand_distr",
+        "rand_distr::uniform",
+    ],
+    names: &[
+        ("Distribution", "RandDistribution"),
+        ("DistString", "RandDistribution"),
+        ("Standard", "RandStandard"),
+        ("StandardNormal", "RandStandardNormal"),
+        ("Exp1", "RandExp1"),
+        ("Open01", "RandOpen01"),
+        ("OpenClosed01", "RandOpenClosed01"),
+        ("Uniform", "RandUniform"),
+        ("SampleUniform", "RandSampleUniform"),
+        ("WeightedIndex", "RandWeightedIndex"),
+        ("WeightedError", "RandWeightedError"),
+        ("Bernoulli", "RandBernoulli"),
+        ("BernoulliError", "RandBernoulliError"),
+        ("Alphanumeric", "RandAlphanumeric"),
+        ("Normal", "RandNormal"),
+        ("NormalError", "RandNormalError"),
+        ("LogNormal", "RandLogNormal"),
+        ("Exp", "RandExp"),
+        ("ExpError", "RandExpError"),
+        ("Poisson", "RandPoisson"),
+        ("PoissonError", "RandPoissonError"),
+        ("Binomial", "RandBinomial"),
+        ("BinomialError", "RandBinomialError"),
+        ("Gamma", "RandGamma"),
+        ("GammaError", "RandGammaError"),
+        ("Beta", "RandBeta"),
+        ("BetaError", "RandBetaError"),
+        ("ChiSquared", "RandChiSquared"),
+        ("ChiSquaredError", "RandChiSquaredError"),
+        ("StudentT", "RandStudentT"),
+        ("Triangular", "RandTriangular"),
+        ("TriangularError", "RandTriangularError"),
+        ("Pareto", "RandPareto"),
+        ("ParetoError", "RandParetoError"),
+        ("Cauchy", "RandCauchy"),
+        ("CauchyError", "RandCauchyError"),
+        ("Weibull", "RandWeibull"),
+        ("WeibullError", "RandWeibullError"),
+        ("Geometric", "RandGeometric"),
+        ("GeoError", "RandGeoError"),
+        ("Float", "RandFloat"),
+    ],
+    star: &[
+        "Distribution",
+        "Standard",
+        "StandardNormal",
+        "Exp1",
+        "Open01",
+        "OpenClosed01",
+        "Uniform",
+        "WeightedIndex",
+        "WeightedError",
+        "Bernoulli",
+        "BernoulliError",
+        "Alphanumeric",
+        "Normal",
+        "NormalError",
+        "LogNormal",
+        "Exp",
+        "ExpError",
+        "Poisson",
+        "PoissonError",
+        "Binomial",
+        "BinomialError",
+        "Gamma",
+        "GammaError",
+        "Beta",
+        "BetaError",
+        "ChiSquared",
+        "ChiSquaredError",
+        "StudentT",
+        "Triangular",
+        "TriangularError",
+        "Pareto",
+        "ParetoError",
+        "Cauchy",
+        "CauchyError",
+        "Weibull",
+        "WeibullError",
+        "Geometric",
+        "GeoError",
+    ],
+    result_err: None,
+};
+
+const CHRONO_RENAMES: Renames = Renames {
+    roots: &[
+        "chrono",
+        "::chrono",
+        "chrono::prelude",
+        "chrono::offset",
+        "chrono::naive",
+        "chrono::format",
+    ],
+    names: &[
+        ("NaiveDate", "ChronoNaiveDate"),
+        ("NaiveTime", "ChronoNaiveTime"),
+        ("NaiveDateTime", "ChronoNaiveDateTime"),
+        ("NaiveWeek", "ChronoNaiveWeek"),
+        ("DateTime", "ChronoDateTime"),
+        ("Utc", "ChronoUtc"),
+        ("Local", "ChronoLocal"),
+        ("FixedOffset", "ChronoFixedOffset"),
+        ("TimeZone", "ChronoTimeZone"),
+        ("Duration", "ChronoTimeDelta"),
+        ("TimeDelta", "ChronoTimeDelta"),
+        ("Days", "ChronoDays"),
+        ("Months", "ChronoMonths"),
+        ("Weekday", "ChronoWeekday"),
+        ("Month", "ChronoMonth"),
+        ("Datelike", "ChronoDatelike"),
+        ("Timelike", "ChronoTimelike"),
+        ("ParseError", "ChronoParseError"),
+        ("ParseErrorKind", "ChronoParseErrorKind"),
+        ("ParseWeekdayError", "ChronoParseWeekdayError"),
+        ("OutOfRange", "ChronoOutOfRange"),
+        ("OutOfRangeError", "ChronoOutOfRangeError"),
+        ("LocalResult", "ChronoLocalResult"),
+        ("MappedLocalTime", "ChronoLocalResult"),
+        ("SecondsFormat", "ChronoSecondsFormat"),
+        ("IsoWeek", "ChronoIsoWeek"),
+    ],
+    star: &[
+        "NaiveDate",
+        "NaiveTime",
+        "NaiveDateTime",
+        "DateTime",
+        "Utc",
+        "Local",
+        "FixedOffset",
+        "TimeZone",
+        "Weekday",
+        "Month",
+        "Datelike",
+        "Timelike",
+        "LocalResult",
+        "MappedLocalTime",
+        "SecondsFormat",
+        "Days",
+        "Months",
+        "IsoWeek",
+    ],
+    result_err: None,
+};
+
+const CLAP_RENAMES: Renames = Renames {
+    roots: &["clap", "clap::builder", "clap::error", "clap::parser"],
+    names: &[
+        ("Command", "ClapCommand"),
+        ("Arg", "ClapArg"),
+        ("ArgAction", "ClapAction"),
+        ("ArgMatches", "ClapMatches"),
+        ("Error", "ClapError"),
+        ("ErrorKind", "ClapErrorKind"),
+        ("PossibleValue", "ClapPossibleValue"),
+    ],
+    star: &["Command", "Arg", "ArgAction", "ArgMatches", "Error"],
+    result_err: None,
+};
+
+/// `std::collections::hash_map::Entry` (and `btree_map`'s): the map entry prelude's.
+const ENTRY_RENAMES: Renames = Renames {
+    roots: &[
+        "std::collections::hash_map",
+        "std::collections::btree_map",
+        "collections::hash_map",
+        "collections::btree_map",
+        "hash_map",
+        "btree_map",
+    ],
+    names: &[
+        ("Entry", "StdMapEntry"),
+        ("OccupiedEntry", "StdOccupiedEntry"),
+        ("VacantEntry", "StdVacantEntry"),
+    ],
+    star: &["Entry", "OccupiedEntry", "VacantEntry"],
+    result_err: None,
+};
+
+/// `chrono_tz::Tz` and its error (its zones are `chrono_tz_zones`').
+const CHRONO_TZ_RENAMES: Renames = Renames {
+    roots: &["chrono_tz"],
+    names: &[
+        ("Tz", "ChronoTz"),
+        ("ParseError", "ChronoTzParseError"),
+        ("UTC", "ChronoTz::UTC"),
+    ],
+    star: &["Tz"],
+    result_err: None,
+};
+
+/// `Distribution` from `use rand::prelude::*;`.
+const RAND_PRELUDE_RENAMES: Renames = Renames {
+    roots: &["rand::prelude"],
+    names: &[("Distribution", "RandDistribution")],
+    star: &["Distribution"],
+    result_err: None,
+};
+
+/// rand 0.9's `rand::distr`: `Uniform::new` gives a `Result`, `Standard` is `StandardUniform`.
+const RAND_DISTR09_RENAMES: Renames = Renames {
+    roots: &[
+        "rand::distr",
+        "rand::distr::uniform",
+        "rand::distr::weighted",
+    ],
+    names: &[
+        ("Distribution", "RandDistribution"),
+        ("SampleString", "RandDistribution"),
+        ("StandardUniform", "RandStandard"),
+        ("Open01", "RandOpen01"),
+        ("OpenClosed01", "RandOpenClosed01"),
+        ("Uniform", "RandUniform09"),
+        ("SampleUniform", "RandSampleUniform"),
+        ("WeightedIndex", "RandWeightedIndex"),
+        ("Bernoulli", "RandBernoulli"),
+        ("BernoulliError", "RandBernoulliError"),
+        ("Alphanumeric", "RandAlphanumeric"),
+    ],
+    star: &[
+        "Distribution",
+        "StandardUniform",
+        "Open01",
+        "OpenClosed01",
+        "Uniform",
+        "WeightedIndex",
+        "Bernoulli",
+        "BernoulliError",
+        "Alphanumeric",
+    ],
+    result_err: None,
+};
+
 /// The crates of `text` that are renamed, and the names its `use`s bring in from each.
 fn renamed_crates(text: &str) -> Vec<&'static Renames> {
     let mut out: Vec<&'static Renames> = Vec::new();
@@ -1731,6 +2022,13 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
         &ENV_LOGGER_RENAMES,
         &NUM_RENAMES,
         &TOKIO_RENAMES,
+        &RAND_DISTR_RENAMES,
+        &RAND_DISTR09_RENAMES,
+        &RAND_PRELUDE_RENAMES,
+        &CHRONO_RENAMES,
+        &CLAP_RENAMES,
+        &ENTRY_RENAMES,
+        &CHRONO_TZ_RENAMES,
     ] {
         if r.roots.iter().any(|root| has(root)) {
             out.push(r);
@@ -1753,8 +2051,17 @@ fn renamed_imports(file: &SourceFile, r: &Renames) -> std::collections::HashMap<
             for root in r.roots {
                 let root = root.trim_start_matches("::");
                 if star && joined == root {
+                    // (A glob import is shadowed by the file's own `enum Month`.)
+                    let text = file.syntax().text().to_string();
+                    let declared = |n: &str| {
+                        ["struct", "enum", "type", "trait", "fn"]
+                            .iter()
+                            .any(|kw| text.contains(&format!("{kw} {n}")))
+                    };
                     for n in r.star {
-                        out.entry(n.to_string()).or_insert_with(|| n.to_string());
+                        if !declared(n) {
+                            out.entry(n.to_string()).or_insert_with(|| n.to_string());
+                        }
                     }
                 } else if !star
                     && let Some(item) = joined.strip_prefix(root).and_then(|x| x.strip_prefix("::"))
@@ -1932,4 +2239,129 @@ fn tokio_rewrite(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, St
         TextRange::new(r.end(), call.syntax().text_range().end()),
         ").await) }".into(),
     ));
+}
+
+// ---------------------------------------------------------------- chrono-tz
+
+/// chrono-tz's zones: `chrono_tz::Europe::London`, `London` after `use chrono_tz::Europe::London;`,
+/// `Europe::London` after `use chrono_tz::Europe;` and `Tz::Europe__London` are
+/// `ChronoTz::__of_name("Europe/London")` (also among macros' tokens).
+fn chrono_tz_zones(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
+    const NOT_ZONES: &[&str] = &[
+        "Tz",
+        "ParseError",
+        "UTC",
+        "OffsetName",
+        "OffsetComponents",
+        "TZ_VARIANTS",
+        "IANA_TZDB_VERSION",
+    ];
+    // alias -> a zone ("Europe/London") or a region ("Europe")
+    let mut zones: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tz_alias = None;
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        for (path, rename, star) in crate::typeck::use_leaves(&u) {
+            if path.first().map(String::as_str) != Some("chrono_tz") || star || path.len() < 2 {
+                continue;
+            }
+            let alias = rename
+                .clone()
+                .unwrap_or_else(|| path.last().cloned().unwrap_or_default());
+            if path[1] == "Tz" {
+                tz_alias = Some(alias);
+            } else if !NOT_ZONES.contains(&path[1].as_str()) {
+                zones.insert(alias, path[1..].join("/"));
+            }
+        }
+    }
+    let tz_alias = tz_alias.unwrap_or_else(|| "Tz".to_string());
+    let zone_of = |segs: &[String]| -> Option<String> {
+        match segs {
+            [first, rest @ ..]
+                if first == "chrono_tz"
+                    && rest.len() >= 2
+                    && !NOT_ZONES.contains(&rest[0].as_str()) =>
+            {
+                Some(rest.join("/"))
+            }
+            [t, v] if *t == tz_alias && v.contains("__") => Some(v.replace("__", "/")),
+            [one] => zones.get(one).filter(|z| z.contains('/')).cloned(),
+            [first, rest @ ..] => zones
+                .get(first)
+                .filter(|z| !z.contains('/'))
+                .map(|region| format!("{region}/{}", rest.join("/"))),
+            [] => None,
+        }
+    };
+    let mk = |zone: &str| format!("ChronoTz::__of_name({zone:?})");
+    for path in file.syntax().descendants().filter_map(ast::Path::cast) {
+        if path
+            .syntax()
+            .parent()
+            .is_some_and(|p| ast::Path::can_cast(p.kind()))
+            || path
+                .syntax()
+                .ancestors()
+                .any(|a| ast::Use::can_cast(a.kind()))
+        {
+            continue;
+        }
+        let segs: Vec<String> = path
+            .segments()
+            .filter_map(|s| s.name_ref().map(|n| n.text().to_string()))
+            .collect();
+        if let Some(zone) = zone_of(&segs) {
+            edits.push((path.syntax().text_range(), mk(&zone)));
+        }
+    }
+    // (In macros' tokens: `println!("{}", t.with_timezone(&London))`.)
+    use ra_ap_syntax::SyntaxKind::{COLON, COLON2, DOT, IDENT, WHITESPACE};
+    for tt in file.syntax().descendants().filter_map(ast::TokenTree::cast) {
+        if tt
+            .syntax()
+            .parent()
+            .is_some_and(|p| ast::TokenTree::can_cast(p.kind()))
+        {
+            continue;
+        }
+        let toks: Vec<_> = tt
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() != WHITESPACE)
+            .collect();
+        let mut i = 0;
+        while i < toks.len() {
+            let after = i > 0 && matches!(toks[i - 1].kind(), COLON | COLON2 | DOT);
+            if toks[i].kind() != IDENT || after {
+                i += 1;
+                continue;
+            }
+            let mut segs = vec![toks[i].text().to_string()];
+            let mut k = i + 1;
+            let mut last = i;
+            loop {
+                let mut s = k;
+                while toks
+                    .get(s)
+                    .is_some_and(|c| matches!(c.kind(), COLON | COLON2))
+                {
+                    s += 1;
+                }
+                if s == k || !toks.get(s).is_some_and(|c| c.kind() == IDENT) {
+                    break;
+                }
+                segs.push(toks[s].text().to_string());
+                last = s;
+                k = s + 1;
+            }
+            if let Some(zone) = zone_of(&segs) {
+                edits.push((
+                    toks[i].text_range().cover(toks[last].text_range()),
+                    mk(&zone),
+                ));
+            }
+            i = last + 1;
+        }
+    }
 }

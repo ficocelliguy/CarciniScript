@@ -1,8 +1,9 @@
 //! Path-call syntax for methods of built-in types, as a pre-pass over the source tokens (so it
 //! reaches macro arguments too): `u64::pow(2, 40)` is written as `(2u64).pow(40)`, `str::len(&s)`
 //! as `(s).len()`, and a method named as a value (`.fold(0, i32::max)`, `.map(str::trim)`)
-//! becomes a closure, `(|a, b| a.max(b))`. An `OffsetMap` keeps positions pointing at the
-//! original text.
+//! becomes a closure, `(|a, b| a.max(b))`. The same for some methods of `Vec`, `Option` and std
+//! traits (`.map(Vec::len)`, `.map(Into::into)`, `std::error::Error::source(&e)`). An `OffsetMap`
+//! keeps positions pointing at the original text.
 
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, SyntaxToken};
 
@@ -14,8 +15,26 @@ const PRIMS: &[&str] = &[
     "f64", "char", "bool", "str", "String",
 ];
 
+/// Other types and std traits whose methods are named by path (`Vec::len`,
+/// `std::error::Error::source`); their receivers' types aren't written into the closures.
+const OTHERS: &[&str] = &["Vec", "Option", "Into", "Clone", "ToString", "Error"];
+
 /// The methods (taking `self`) these types have, with how many more arguments they take.
 fn arity(prim: &str, method: &str) -> Option<usize> {
+    match (prim, method) {
+        (
+            "Vec",
+            "len" | "is_empty" | "iter" | "first" | "last" | "to_vec" | "into_iter" | "clone",
+        ) => return Some(0),
+        ("Vec", "contains") => return Some(1),
+        ("Option", "is_some" | "is_none" | "unwrap" | "unwrap_or_default" | "flatten") => {
+            return Some(0);
+        }
+        ("Into", "into") | ("Clone", "clone") | ("ToString", "to_string") => return Some(0),
+        ("Error", "source" | "description") => return Some(0),
+        ("Vec" | "Option" | "Into" | "Clone" | "ToString" | "Error", _) => return None,
+        _ => {}
+    }
     let numeric = !matches!(prim, "char" | "bool" | "str" | "String");
     let float = matches!(prim, "f32" | "f64");
     if numeric {
@@ -78,7 +97,10 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
 }
 
 pub fn has_prim_paths(text: &str) -> bool {
-    PRIMS.iter().any(|p| text.contains(&format!("{p}::")))
+    PRIMS
+        .iter()
+        .chain(OTHERS)
+        .any(|p| text.contains(&format!("{p}::")))
 }
 
 /// Rewrite path calls and method values of built-in types in `text`, recording the edits in
@@ -121,8 +143,51 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         };
         let m = i + 1 + sep_len;
         let prev = if i > 0 { at(i - 1) } else { String::new() };
+        let other = OTHERS.contains(&prim.as_str());
+        // `std::error::Error::source`, `std::vec::Vec::len`: from the path's start.
+        let mut first_tok = i;
+        if other {
+            let seg = |k: usize| {
+                toks[k].kind() == SyntaxKind::IDENT
+                    && matches!(
+                        at(k).as_str(),
+                        "std"
+                            | "core"
+                            | "alloc"
+                            | "error"
+                            | "vec"
+                            | "option"
+                            | "convert"
+                            | "clone"
+                            | "string"
+                    )
+            };
+            loop {
+                // (`::` is one token in a path, two `:` in a macro's tokens.)
+                if first_tok >= 2 && at(first_tok - 1) == "::" && seg(first_tok - 2) {
+                    first_tok -= 2;
+                } else if first_tok >= 3
+                    && at(first_tok - 1) == ":"
+                    && at(first_tok - 2) == ":"
+                    && seg(first_tok - 3)
+                {
+                    first_tok -= 3;
+                } else {
+                    break;
+                }
+            }
+        }
+        let prev = if first_tok != i {
+            if first_tok > 0 {
+                at(first_tok - 1)
+            } else {
+                String::new()
+            }
+        } else {
+            prev
+        };
         if !ok
-            || !PRIMS.contains(&prim.as_str())
+            || !(PRIMS.contains(&prim.as_str()) || other)
             || matches!(prev.as_str(), "::" | ":" | "." | "<" | "as")
             || toks[m].kind() != SyntaxKind::IDENT
             || skip(&toks[i])
@@ -189,7 +254,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                 continue;
             }
             let last = j - 1;
-            edits.push((start(i), end(open), "(".to_string()));
+            edits.push((start(first_tok), end(open), "(".to_string()));
             if let Some(to) = drop_to {
                 edits.push((end(open), to, String::new()));
             }
@@ -206,7 +271,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         if !matches!(at(m + 1).as_str(), "::" | ":" | "!") {
             let params: Vec<String> = (0..=n_args).map(|k| format!("__ufcs{k}")).collect();
             // The receiver's type, as rustc knows it from the path (`i32::abs` takes an `i32`).
-            let typed = if matches!(prim.as_str(), "str" | "String") {
+            let typed = if matches!(prim.as_str(), "str" | "String") || other {
                 params.join(", ")
             } else {
                 let mut all = params.clone();
@@ -218,7 +283,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                 params[0],
                 params[1..].join(", ")
             );
-            edits.push((start(i), end(m), closure));
+            edits.push((start(first_tok), end(m), closure));
             i = m + 1;
             continue;
         }

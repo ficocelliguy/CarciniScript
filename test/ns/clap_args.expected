@@ -1,0 +1,20 @@
+Args { target: "n00dles", threads: 4, dry_run: true }
+error: invalid value 'x' for '--threads <THREADS>': invalid digit found in string
+
+For more information, try '--help'.
+
+Deploy a script
+
+Usage: deploy.js [OPTIONS] --target <TARGET>
+
+Options:
+      --target <TARGET>    The server to deploy to
+  -t, --threads <THREADS>  Threads per server [default: 1]
+      --dry-run            
+  -h, --help               Print help
+
+error: unexpected argument '--bogus' found
+
+Usage: deploy.js --target <TARGET>
+
+For more information, try '--help'.

@@ -16,6 +16,38 @@
     }
   }
 
+  // `std::process::exit(code)`: unwinds to the host, which ends the script with `exitCode`.
+  class CarciniExit extends Error {
+    constructor(code) {
+      super(`process exited with code ${code}`);
+      this.name = "CarciniExit";
+      this.exitCode = code;
+    }
+  }
+  // (`Intl` formatters by zone, for chrono-tz: making one is slow.)
+  const tzFormats = new Map();
+  const tzNames = ["UTC"];
+  function tzFormat(zone, loc) {
+    const k = zone + "|" + loc;
+    let f = tzFormats.get(k);
+    if (!f) {
+      f = new Intl.DateTimeFormat(loc, {
+        timeZone: zone,
+        hourCycle: "h23",
+        year: "numeric",
+        month: "numeric",
+        day: "numeric",
+        hour: "numeric",
+        minute: "numeric",
+        second: "numeric",
+      });
+      tzFormats.set(k, f);
+    }
+    return f;
+  }
+  // `std::env::args()`: what the host set with `$setArgs` (the program's name first).
+  let argv = ["main"];
+
   let outSink = (line) => console.log(line);
   let errSink = (line) => console.error(line);
   let outBuf = "";
@@ -123,6 +155,8 @@
       }
       return Math.sign(a.length - b.length);
     }
+    // A NaN is incomparable (`partial_cmp` gives `None`): NaN makes every `<`/`>` on it false.
+    if (a !== a || b !== b) return NaN;
     return a < b ? -1 : a > b ? 1 : 0;
   }
 
@@ -467,6 +501,13 @@
       if (this.first) {
         this.first = false;
         return this.src.next();
+      }
+      // (Over a range: jump, so `(0..1e12).step_by(1e9)` takes 1000 steps, not 1e12.)
+      if (this.src instanceof RangeIt) {
+        const r = this.src;
+        const skip = typeof r.one === "bigint" ? BigInt(this.n - 1) : (this.n - 1) * r.one;
+        r.i = r.end - r.i <= skip ? r.end : r.i + skip;
+        return r.next();
       }
       for (let k = 1; k < this.n; k++) {
         const r = this.src.next();
@@ -1009,6 +1050,7 @@
   }
 
   const NUM_TYPES = {};
+  const NUM_EXT = new WeakMap();
   const OP_METHODS = {
     "+": "add",
     "-": "sub",
@@ -1409,6 +1451,72 @@
 
   const rt = {
     CarciniPanic,
+    CarciniExit,
+    // `std::env::args()`: hosts set the program's arguments (its name first).
+    $setArgs(args) {
+      argv = Array.from(args, String);
+    },
+    $envArgs() {
+      return rt.$iter(argv.slice());
+    },
+    $exit(code) {
+      rt.$flush();
+      throw new CarciniExit(code);
+    },
+    $exitWith(code, text, toStdout) {
+      write(text, !toStdout);
+      rt.$flush();
+      const e = new CarciniExit(code);
+      e.text = text;
+      throw e;
+    },
+    // The bundled `chrono-tz`, on the host's `Intl` time zone data.
+    $tzOffset(zone, ms) {
+      if (zone === "UTC") return 0;
+      const parts = tzFormat(zone, "en-US").formatToParts(new Date(ms));
+      const get = (t) => Number(parts.find((p) => p.type === t)?.value);
+      const wall = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour") % 24, get("minute"), get("second"));
+      return Math.round((wall - Math.floor(ms / 1000) * 1000) / 1000);
+    },
+    $tzAbbr(zone, ms) {
+      if (zone === "UTC" || zone === "Etc/UTC") return "UTC";
+      const d = new Date(ms);
+      for (const loc of ["en-US", "en-GB", "en-AU", "en-IN", "ja-JP", "en-NZ", "en-CA"]) {
+        const name = new Intl.DateTimeFormat(loc, { timeZone: zone, timeZoneName: "short" })
+          .formatToParts(d)
+          .find((p) => p.type === "timeZoneName")?.value;
+        if (name && /^[A-Z]{2,5}$/.test(name) && !(name === "GMT" && rt.$tzOffset(zone, ms) !== 0)) return name;
+      }
+      // (The tz database's numeric names: `+04`, `+0530`.)
+      const off = rt.$tzOffset(zone, ms);
+      const a = Math.abs(off);
+      const h = String(Math.floor(a / 3600)).padStart(2, "0");
+      const m = Math.floor(a / 60) % 60;
+      return (off < 0 ? "-" : "+") + h + (m ? String(m).padStart(2, "0") : "");
+    },
+    $tzValid(zone) {
+      try {
+        tzFormat(zone, "en-US");
+        return zone.includes("/") || zone === "UTC" || zone === "GMT";
+      } catch {
+        return false;
+      }
+    },
+    $tzIntern(zone) {
+      let i = tzNames.indexOf(zone);
+      if (i < 0) i = tzNames.push(zone) - 1;
+      return i;
+    },
+    $tzName(id) {
+      return tzNames[id];
+    },
+    // A Netscript `main(ns)` that can exit: a `CarciniExit` ends the script quietly, showing
+    // what it was given to print (clap's help or error) in the terminal.
+    $nsExit(ns, e) {
+      if (e?.name !== "CarciniExit") return false;
+      if (e.text) ns.tprint(e.text.replace(/\n$/, ""));
+      return true;
+    },
 
     // Output. Bitburner and tests can redirect with $setOutput.
     $setOutput(out, err) {
@@ -1775,6 +1883,37 @@
     // `max`, `clamp`, `rem_euclid`, `div_euclid`, `abs_diff`, the bit counts, `isqrt`, `ilog*`.
     // Debug builds pass a location after the arguments of `abs` / `pow`, which then panic on
     // overflow.
+    // `n.is_multiple_of(m)` (unsigned): `m == 0` only for `n == 0`.
+    $splitFirst(v) {
+      return v.length === 0 ? null : [v[0], v.slice(1)];
+    },
+    $splitLast(v) {
+      return v.length === 0 ? null : [v[v.length - 1], v.slice(0, -1)];
+    },
+    // `serde_json::from_str::<T>()` in a function generic over `T: DeserializeOwned`: the
+    // schema of what the caller passed for `T` (a class's own, or a number kind's).
+    $schemaOf(d) {
+      if (d == null) return { t: "any" };
+      if (d.$jsonSchema) return d.$jsonSchema;
+      if (d === rt.$prims.str) return { t: "str" };
+      if (d === rt.$prims.bool) return { t: "bool" };
+      if (d === rt.$prims.char) return { t: "char" };
+      if (d.kind !== undefined) {
+        if (d.float) return { t: "float", f32: d.kind === "f32" };
+        const bits = BigInt(d.bits);
+        const min = d.signed ? -(1n << (bits - 1n)) : 0n;
+        const max = d.signed ? (1n << (bits - 1n)) - 1n : (1n << bits) - 1n;
+        return { t: d.big ? "big" : "int", name: d.kind, min: String(min), max: String(max) };
+      }
+      return { t: "any" };
+    },
+    // An `Option<()>` from a call: `undefined` there is `Some(())`.
+    $someUnit(x) {
+      return x === undefined ? true : x;
+    },
+    $isMultipleOf(n, m) {
+      return m == 0 ? n == 0 : n % m == 0;
+    },
     $big(name, x, bits, signed, ...args) {
       const B = BigInt(bits);
       const min = signed ? -(1n << (B - 1n)) : 0n;
@@ -1807,8 +1946,8 @@
         if (op === "pow" && kind === "wrapping") return powWrap(x, b);
         if (op === "rem" && signed && x === min && b === -1n) return kind === "checked" ? null : 0n;
         const r =
-          op === "add" ? x + b
-          : op === "sub" ? x - b
+          op === "add" || op === "add_signed" ? x + b
+          : op === "sub" || op === "sub_signed" ? x - b
           : op === "mul" ? x * b
           : op === "div" ? x / b
           : op === "rem" ? x % b
@@ -1966,6 +2105,13 @@
         },
       };
     },
+    // The map entry prelude's `get_mut` / `insert` / `or_insert(_with)`: the slot for its key.
+    $entrySlot(e, mode, v) {
+      const map = e.__m();
+      const k = e.__k();
+      if (mode === "get") return map.m.get(key(k));
+      return rt.$slot(map, k, v, mode === "lazy");
+    },
     // `map.get_mut(k)` of numbers, strings or bools: the `[k, v]` slot, or null.
     $slotOf(map, k) {
       return map.m.get(key(k)) ?? null;
@@ -2005,10 +2151,14 @@
     },
     $cmp: cmp,
     $clone: clone,
-    // `partial_cmp`: `None` when either side is NaN.
+    // `partial_cmp`: `None` when the values are incomparable (a NaN decides it).
     $partialCmp(a, b) {
-      if (Number.isNaN(a) || Number.isNaN(b)) return null;
-      return cmp(a, b);
+      const c = a instanceof Iter ? a.$cmpWith(b, false) : cmp(a, b);
+      return Number.isNaN(c) ? null : c;
+    },
+    // A comparison's result as `partial_cmp`'s `Option<Ordering>` (NaN: incomparable).
+    $ordOpt(c) {
+      return Number.isNaN(c) ? null : c;
     },
     $ordReverse(o) {
       return o === 0 ? 0 : -o;
@@ -3108,7 +3258,7 @@
       return out;
     },
     $isSorted(v) {
-      for (let i = 1; i < v.length; i++) if (cmp(v[i - 1], v[i]) > 0) return false;
+      for (let i = 1; i < v.length; i++) if (!(cmp(v[i - 1], v[i]) <= 0)) return false;
       return true;
     },
     $drain(v, lo, hi, inclusive, location) {
@@ -3215,10 +3365,12 @@
     // associated functions, for `T::zero()`.
     $numT(kind, ext) {
       if (ext) {
-        const key = `${kind}+`;
-        let d = NUM_TYPES[key];
+        // (Per impl class: each script has its own `$ext$u32`.)
+        let byKind = NUM_EXT.get(ext);
+        if (byKind === undefined) NUM_EXT.set(ext, (byKind = {}));
+        let d = byKind[kind];
         if (d === undefined) {
-          d = NUM_TYPES[key] = Object.create(rt.$numT(kind));
+          d = byKind[kind] = Object.create(rt.$numT(kind));
           for (const k of Object.getOwnPropertyNames(ext)) {
             if (typeof ext[k] === "function" && !["length", "name", "prototype"].includes(k)) d[k] = ext[k].bind(ext);
           }
@@ -3419,6 +3571,12 @@
   // declaration order) and its elements'. Each object is dropped once, however it's reached.
   const dropped = new WeakSet();
   rt.$drop = (v) => {
+    // A closure drops the values it owns (`move` captures, see `$own`).
+    if (typeof v === "function" && v.$caps && !dropped.has(v)) {
+      dropped.add(v);
+      for (const x of v.$caps) rt.$drop(x);
+      return;
+    }
     if (v === null || typeof v !== "object" || dropped.has(v)) return;
     dropped.add(v);
     if (v.constructor?.$dropImpl) v.drop();
@@ -3438,6 +3596,11 @@
     } else if (!(v instanceof Iter)) {
       for (const k of Object.keys(v)) if (k !== "$tag") rt.$drop(v[k]);
     }
+  };
+  // A closure that owns captured values with a `Drop` impl: they drop when it does.
+  rt.$own = (f, caps) => {
+    f.$caps = caps;
+    return f;
   };
   // The end of a block: its values, last declared first.
   rt.$dropAll = (list) => {
@@ -3499,6 +3662,11 @@
         return jsonFields(v, s.shape, s.fields, pretty, ind, obj, arr, sub);
       case "enum": {
         const variant = s.variants[v.$tag];
+        // `#[serde(untagged)]`: the content alone (`null` for a unit variant).
+        if (s.untagged) {
+          if (variant.shape === "unit") return "null";
+          return jsonFields(v, variant.shape, variant.fields, pretty, ind, obj, arr, sub);
+        }
         if (variant.shape === "unit") return JSON.stringify(variant.key);
         const content = (ind2) =>
           jsonFields(v, variant.shape, variant.fields, pretty, ind2, objAt(ind2), arrAt(ind2), (x, ss) =>
@@ -3537,6 +3705,9 @@
   }
 
   rt.$jsonStringify = (v, schema, pretty) => jsonOut(v, schema, pretty, "");
+  // `serde_wasm_bindgen::from_value::<T>(v)` / `to_value(&x)`: through JSON, by `T`'s schema.
+  rt.$swbFrom = (v, schema) => rt.$jsonParse(v === undefined ? "null" : JSON.stringify(v), schema);
+  rt.$swbTo = (v, schema) => rt.Ok(JSON.parse(jsonOut(v, schema, false, "")));
 
   // ---- the `js` crate's other helpers
   // An array-like value (`NodeList`, `HTMLCollection`) as an array; null as empty.
@@ -3735,7 +3906,45 @@
     nextU64(rng) {
       return rng.big(64);
     },
+    // `rng.sample(d)` / `rng.sample_iter(d)`: the distribution's own `sample`.
+    sampleDist(rng, d) {
+      return d.sample(rng);
+    },
+    sampleDistIter(rng, d) {
+      return Iter.of(function* () {
+        for (;;) yield d.sample(rng);
+      });
+    },
   };
+  // The distributions whose output is the caller's type, as `rng.sample(StandardNormal)` (the
+  // RNG first) or `StandardNormal.sample(&mut rng)` (the RNG second), and their `sample_iter`.
+  const unitDists = {
+    standard: (rng, d, T) => (typeof T === "function" && typeof d?.sample === "function" ? d.sample(rng) : rand.gen(rng, T)),
+    standardNormal: (rng) => {
+      const u = 1 - rng.f64();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng.f64());
+    },
+    exp1: (rng) => -Math.log(1 - rng.f64()),
+    open01: (rng) => {
+      for (;;) {
+        const f = rng.f64();
+        if (f > 0) return f;
+      }
+    },
+    openClosed01: (rng) => 1 - rng.f64(),
+  };
+  for (const [name, f] of Object.entries(unitDists)) {
+    const one = (a, b, T) => {
+      const [rng, d] = a instanceof RandRng ? [a, b] : [b, a];
+      const v = f(rng, d, T);
+      return T?.kind === "f32" ? Math.fround(v) : v;
+    };
+    rand[name] = one;
+    rand[name + "Iter"] = (a, b, T) =>
+      Iter.of(function* () {
+        for (;;) yield one(a, b, T);
+      });
+  }
   rt.$rand = rand;
   // The bundled `itertools` crate's `Itertools` methods, on the runtime's iterators: lazy where
   // itertools is lazy, by Rust's equality (`key`) and order (`cmp`).
@@ -4200,9 +4409,60 @@
     if (v instanceof RefCell) return new RefCell(rt.$structuredClone(v.v), v.kind);
     return globalThis.structuredClone(v);
   };
+  // `<[T; N]>::try_from(v)`: `v` when it has `n` elements (a copy of a slice); else `Err` of the
+  // `Vec`, or a `TryFromSliceError` for a slice.
+  rt.$arrayTryFrom = (v, n, slice) =>
+    v.length === n ? rt.Ok(slice ? rt.$clone(v) : v) : rt.Err(slice ? new ParseError("TryFromSliceError", "") : v);
   rt.$global = (name) => globalThis[name];
   rt.$setGlobal = (name, value) => {
     globalThis[name] = value;
+  };
+  // An NS interface built in Rust (`RunOptions { threads: Some(t), ..base }`): a plain object,
+  // `base`'s properties overridden by `fields`; a `None` field is left out.
+  rt.$iface = (fields, base) => {
+    const o = base == null ? {} : { ...base };
+    for (const k of Object.keys(fields)) {
+      if (fields[k] == null) delete o[k];
+      else o[k] = fields[k];
+    }
+    return o;
+  };
+  // A `HashMap` the NS API hands out as a JS `Map` or a plain object (`Record`).
+  rt.$mapOfJs = (x) => {
+    if (x == null || x instanceof HashMap) return x;
+    return HashMap.from(x instanceof Map ? x : Object.entries(x));
+  };
+  // `JsValue`'s methods (wasm-bindgen's): `v.as_string()` is `κσ.$jsv.$asString(v)`. `None` is
+  // `null`.
+  rt.$jsv = {
+    $asString: (v) => (typeof v === "string" ? v : null),
+    $asF64: (v) => (typeof v === "number" ? v : null),
+    $asBool: (v) => (typeof v === "boolean" ? v : null),
+    $isString: (v) => typeof v === "string",
+    $isUndefined: (v) => v === undefined,
+    $isNull: (v) => v === null,
+    $isNullOrUndefined: (v) => v == null,
+    $isObject: (v) => typeof v === "object" && v !== null,
+    $isArray: (v) => Array.isArray(v),
+    $isFunction: (v) => typeof v === "function",
+    $isBigint: (v) => typeof v === "bigint",
+    $isSymbol: (v) => typeof v === "symbol",
+    $isTruthy: (v) => !!v,
+    $isFalsy: (v) => !v,
+    $looseEq: (a, b) => a == b,
+    $asDebugString: (v) => {
+      if (typeof v === "string") return JSON.stringify(v);
+      if (typeof v === "bigint") return `${v}n`;
+      if (typeof v === "object" && v !== null) {
+        try {
+          return JSON.stringify(v);
+        } catch {
+          return String(v);
+        }
+      }
+      return String(v);
+    },
+    $from: (v) => v,
   };
 
   // ---- parsing: JSON text to tagged values (`{k:"num", raw, int}` keeps `1` and `1.0` apart,
@@ -4572,6 +4832,24 @@
       case "struct":
         return jsonBuild(n, s.shape, s.fields, s, (args) => new s.cls(...args));
       case "enum": {
+        // `#[serde(untagged)]`: the first variant whose content matches.
+        if (s.untagged) {
+          for (const variant of s.variants) {
+            if (variant.shape === "unit") {
+              if (n.k === "null") return s.cls[variant.js];
+              continue;
+            }
+            try {
+              return jsonBuild(n, variant.shape, variant.fields, `${s.name}::${variant.js}`, (args) => s.cls[variant.js](...args));
+            } catch (e) {
+              if (!(e instanceof JsonError)) throw e;
+            }
+          }
+          const e = new JsonError(`data did not match any variant of untagged enum ${s.name}`);
+          // (serde_json reports it without a position.)
+          e.noPos = true;
+          throw e;
+        }
         let key;
         let content = null;
         if (n.k === "str") key = n.v;
@@ -4642,7 +4920,7 @@
       if (mode === undefined) return rt.Err(e);
       let line = 0;
       let col = 0;
-      if (mode === "pos") {
+      if (mode === "pos" && !e.noPos) {
         const before = text.slice(0, e.at ?? text.length);
         const nl = before.lastIndexOf("\n");
         line = before.split("\n").length;

@@ -62,6 +62,14 @@ impl Checker<'_> {
         } else {
             fits
         };
+        // `From<&str>` and `From<String>`: one source type here (references are erased), so
+        // either impl converts it; the first serves.
+        let fits = match fits.split_first() {
+            Some((first, rest)) if !rest.is_empty() && rest.iter().all(|i| i.src == first.src) => {
+                vec![*first]
+            }
+            _ => fits,
+        };
         let [one] = fits.as_slice() else { return None };
         self.unify(&one.src, src);
         Some(one.key.clone())
@@ -225,12 +233,67 @@ impl Checker<'_> {
         self.base = saved;
     }
 
+    /// An argument for an `impl Into<X>` parameter: an `X`, or what an `impl From<..> for X`
+    /// converts (the conversion is settled with the other `.into()`s).
+    pub(super) fn check_into_arg(&mut self, a: &ast::Expr, p: &Ty) -> Ty {
+        let target = self.shallow(p);
+        let from_target =
+            matches!(&target, Ty::Adt(tn, _) if self.adts.from_impls.contains_key(tn));
+        // (Literals, closures and the like take the parameter's type as written.)
+        if !from_target
+            && !matches!(
+                crate::typeck::strip_parens(a),
+                ast::Expr::PathExpr(_)
+                    | ast::Expr::CallExpr(_)
+                    | ast::Expr::MethodCallExpr(_)
+                    | ast::Expr::FieldExpr(_)
+                    | ast::Expr::RefExpr(_)
+                    | ast::Expr::IndexExpr(_)
+                    | ast::Expr::MacroExpr(_)
+            )
+        {
+            return self.check(a, p);
+        }
+        let t = self.infer(a, None);
+        if self.could_be(&t, p) {
+            self.unify(&t, p);
+            return p.clone();
+        }
+        let r = self.range(a.syntax());
+        // `impl AsRef<str>` given your type with `impl AsRef<str>`: its `as_ref()`.
+        if let Ty::Adt(n, _) = self.shallow(&t)
+            && !matches!(&target, Ty::Adt(tn, _) if self.adts.from_impls.contains_key(tn))
+        {
+            for m in ["as_ref", "borrow"] {
+                if let Some(sig) = self.adts.method(&n, m)
+                    && self.could_be(&sig.ret.clone(), p)
+                {
+                    self.into_args.insert(r);
+                    self.record_conv(a.syntax(), Conv::Method { key: m.to_string() });
+                    return p.clone();
+                }
+            }
+        }
+        self.into_args.insert(r);
+        self.pending_intos
+            .push((t, p.clone(), a.syntax().clone(), self.base));
+        p.clone()
+    }
+
     pub(super) fn resolve_intos(&mut self) {
         let saved = self.base;
         for (src, target, node, base) in std::mem::take(&mut self.pending_intos) {
             // Calls inside macro arguments were parsed from the argument's text.
             self.base = base;
             let (s, t) = (self.shallow(&src), self.shallow(&target));
+            // `x.into()` with `x: T` where `T: Into<f64>`: the number as it is.
+            if let Ty::Param(p) = &s
+                && let Some(into) = self.into_targets.get(p).cloned()
+            {
+                self.unify(&t, &into);
+                self.record_conv(&node, Conv::Identity);
+                continue;
+            }
             let conv = match (&s, &t) {
                 (_, Ty::Var(_)) if self.var_kind(&t) == Some(VarKind::General) => {
                     self.error(&node, "type annotations needed: say what `.into()` converts to (e.g. `let y: Y = x.into();`)");
@@ -241,6 +304,35 @@ impl Checker<'_> {
                 {
                     let adt = adt.clone();
                     self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
+                }
+                // `vec.into()` as a `VecDeque` (or another collection made from a `Vec`), and
+                // back.
+                (Ty::Vec(e), Ty::Coll(kind, view)) => {
+                    use crate::ty::Coll;
+                    let items = match &**view {
+                        Ty::Map(k, v) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
+                        Ty::Vec(x) | Ty::Set(x) => (**x).clone(),
+                        _ => Ty::Unknown,
+                    };
+                    self.unify(e, &items);
+                    let js = match kind {
+                        Coll::VecDeque => "Array.from",
+                        Coll::BinaryHeap => "κσ.$heapFrom",
+                        Coll::BTreeSet => "κσ.BTreeSet.from",
+                        Coll::BTreeMap => "κσ.BTreeMap.from",
+                    };
+                    Some(Conv::Wrap { js: js.into() })
+                }
+                (
+                    Ty::Coll(crate::ty::Coll::VecDeque | crate::ty::Coll::BinaryHeap, view),
+                    Ty::Vec(e),
+                ) => {
+                    if let Ty::Vec(x) = &**view {
+                        self.unify(x, e);
+                    }
+                    Some(Conv::Wrap {
+                        js: "Array.from".into(),
+                    })
                 }
                 _ if self.lossless(&s, &t) => Some(Conv::Identity),
                 _ if self.could_be(&s, &t) => {
@@ -327,16 +419,40 @@ impl Checker<'_> {
             base.to_string()
         };
         let rt = self.infer(rhs, None);
-        let impls: Vec<crate::adt::OpImpl> = self
+        let mut impls: Vec<crate::adt::OpImpl> = self
             .adts
             .op_impls
             .get(adt)
             .map(|v| v.iter().filter(|i| i.trait_name == tr).cloned().collect())
             .unwrap_or_default();
+        // `impl<Tz> Sub<DateTime<Tz>> for DateTime<Tz>`: the impl's parameters are the left
+        // operand's type arguments, in the right operand's type and the result's.
+        let mut rets: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+        if let Ty::Adt(_, targs) = self.shallow(lt) {
+            for i in &mut impls {
+                if let Some(sig) = self.adts.method(adt, &i.key).cloned()
+                    && sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                {
+                    let sig = self.method_inst(&sig, Some(&targs));
+                    self.last_type_args.clear();
+                    if let Some(p) = sig.params.first() {
+                        i.rhs = p.clone();
+                    }
+                    rets.insert(i.key.clone(), sig.ret);
+                }
+            }
+        }
         let mut fits: Vec<&crate::adt::OpImpl> = impls
             .iter()
             .filter(|i| self.could_be(&i.rhs, &rt))
             .collect();
+        // (`loot += cache_result` with `impl AddAssign<CacheReward>`: an NS interface it extends.)
+        if fits.is_empty() {
+            fits = impls
+                .iter()
+                .filter(|i| self.iface_coerces(&rt, &i.rhs))
+                .collect();
+        }
         // References are erased, so `impl Add for V` and `impl Add<&V> for &V` (or `Add<&V>
         // for V`) are the same operation here: the first one serves.
         if fits.len() > 1 {
@@ -351,6 +467,9 @@ impl Checker<'_> {
             self.record_conv(node, Conv::Method { key: key.clone() });
             if assign {
                 return Ty::Unit;
+            }
+            if let Some(r) = rets.remove(&key) {
+                return r;
             }
             return self
                 .adts

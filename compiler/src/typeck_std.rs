@@ -211,7 +211,7 @@ impl Checker<'_> {
             }
 
             // `s.as_ref()` / `v.borrow()` (`AsRef<str>`, `AsRef<[T]>`): the value itself.
-            (Ty::Str | Ty::Vec(_), "as_ref" | "borrow") => {
+            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow") => {
                 count(self, 0);
                 rt.clone()
             }
@@ -236,6 +236,13 @@ impl Checker<'_> {
                         }
                     }
                     "neg" | "abs" => count(self, 0),
+                    // `index.checked_add_signed(-1)`: the signed kind of the same width.
+                    "add_signed" | "sub_signed" if !k.is_signed() => {
+                        count(self, 1);
+                        if let Some(a) = a0 {
+                            self.check(a, &Ty::Int(signed_of(k)));
+                        }
+                    }
                     _ => return None,
                 }
                 if m2.starts_with("checked_") {
@@ -257,6 +264,13 @@ impl Checker<'_> {
             }
             (Ty::Int(_), "is_power_of_two") => {
                 count(self, 0);
+                Ty::Bool
+            }
+            (Ty::Int(k), "is_multiple_of") if !k.is_signed() => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Int(k));
+                }
                 Ty::Bool
             }
             (Ty::Int(k), "div_euclid") => {
@@ -349,6 +363,10 @@ impl Checker<'_> {
                 count(self, 0);
                 Ty::Vec(e)
             }
+            (Ty::Vec(e), "split_first" | "split_last") => {
+                count(self, 0);
+                opt(Ty::Tuple(vec![(*e).clone(), Ty::Vec(e)]))
+            }
             (Ty::Vec(e), "split_at" | "split_at_mut") => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -370,9 +388,9 @@ impl Checker<'_> {
                 }
                 Ty::Vec(e)
             }
-            (Ty::Vec(e), "is_sorted") => {
+            (Ty::Vec(_), "is_sorted") => {
+                // (`PartialOrd` is enough: floats too, where a NaN makes it `false`.)
                 count(self, 0);
-                self.require_ord(m.syntax(), &e, "is_sorted");
                 Ty::Bool
             }
             (
@@ -470,6 +488,21 @@ impl Checker<'_> {
         let a0 = args.first();
         let a1 = args.get(1);
         Some(match tail {
+            // The script's arguments (the host's, `κσ.$setArgs`), its name first.
+            ["env", "args"] => {
+                count(self, 0);
+                Ty::Iter {
+                    elem: Box::new(Ty::Str),
+                    mutable: false,
+                }
+            }
+            ["process", "exit"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Int(IntKind::I32));
+                }
+                Ty::Never
+            }
             ["char", "from_digit"] => {
                 count(self, 2);
                 for a in args.iter().take(2) {
@@ -539,6 +572,11 @@ impl Checker<'_> {
                 Ty::from_name(t)
             }
             // `Rc::downgrade(&rc)`: a `Weak` is the value itself (or `null`).
+            // `Rc::default()`: the value's own default (an `Rc` is the value here).
+            ["Rc" | "Arc", "default"] => {
+                count(self, 0);
+                self.fresh(VarKind::General)
+            }
             ["Rc" | "Arc", "downgrade"] => {
                 count(self, 1);
                 let t = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
@@ -614,6 +652,14 @@ impl Checker<'_> {
             ["iter", "empty"] => {
                 count(self, 0);
                 iter_of(self.fresh(VarKind::General))
+            }
+            ["iter", "repeat_n"] => {
+                count(self, 2);
+                let t = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
+                if let Some(a) = a1 {
+                    self.check(a, &USIZE);
+                }
+                iter_of(t)
             }
             ["iter", "repeat_with"] => {
                 count(self, 1);
@@ -718,5 +764,18 @@ impl Checker<'_> {
             }
             _ => return None,
         })
+    }
+}
+
+/// The signed kind of an integer kind's width (`usize` → `isize`).
+pub(super) fn signed_of(k: IntKind) -> IntKind {
+    match k {
+        IntKind::U8 => IntKind::I8,
+        IntKind::U16 => IntKind::I16,
+        IntKind::U32 => IntKind::I32,
+        IntKind::U64 => IntKind::I64,
+        IntKind::U128 => IntKind::I128,
+        IntKind::Usize => IntKind::Isize,
+        other => other,
     }
 }

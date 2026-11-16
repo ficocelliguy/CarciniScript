@@ -5,7 +5,8 @@
 // Beyond the NS bindings' format: a function without `self` is called on the type
 // (`Date::now()`) or the crate (`js::alert(..)`), its `#[js]` naming the whole JS callee;
 // `#[getter]` is the expression itself rather than a call; `#[array]` makes an array-like
-// result (a `NodeList`) a `Vec`.
+// result (a `NodeList`) a `Vec`. `JsAny` is an unchecked value (for the compiler's own helpers);
+// a `JsValue` parameter takes any value, and a `JsValue` result is a typed `JsValue`.
 
 /// A JS `Date`: a moment, as milliseconds since the Unix epoch. `Date::new()` is now,
 /// `Date::from_millis(ms)` a given moment, `Date::local(y, m, d, ..)` one in local time.
@@ -288,7 +289,32 @@ pub fn __regex_char_len(hay: &str, at: usize) -> usize;
 
 /// (`Cow::to_mut`: the cow made `Owned` in place, and its data.)
 #[js = "κσ.$cowToMut"]
-pub fn __cow_to_mut(cow: JsValue) -> JsValue;
+pub fn __cow_to_mut(cow: JsAny) -> JsAny;
+
+/// Print `text` (to stdout or stderr) and end the program with `code`; a Netscript script shows
+/// the text in the terminal (for the bundled `clap`'s `Error::exit`).
+#[js = "κσ.$exitWith"]
+pub fn __exit_with(code: i32, text: &str, to_stdout: bool) -> !;
+
+/// An IANA zone's offset from UTC, in seconds, at `ms` (for the bundled `chrono-tz`).
+#[js = "κσ.$tzOffset"]
+pub fn __tz_offset(zone: &str, ms: f64) -> i32;
+
+/// Its abbreviation then (`BST`, `EDT`, or `+04` where there's none).
+#[js = "κσ.$tzAbbr"]
+pub fn __tz_abbr(zone: &str, ms: f64) -> String;
+
+/// Whether the host knows the zone.
+#[js = "κσ.$tzValid"]
+pub fn __tz_valid(zone: &str) -> bool;
+
+/// A zone's number in the runtime's list (`UTC` is 0).
+#[js = "κσ.$tzIntern"]
+pub fn __tz_intern(zone: &str) -> u32;
+
+/// The zone with that number.
+#[js = "κσ.$tzName"]
+pub fn __tz_name(id: u32) -> String;
 
 /// A float as serde_json writes it (for the bundled `serde_json`).
 #[js = "κσ.$ryu"]
@@ -305,6 +331,77 @@ pub fn atob(base64: &str) -> String;
 pub fn encode_uri_component(text: &str) -> String;
 #[js = "globalThis.decodeURIComponent"]
 pub fn decode_uri_component(text: &str) -> String;
+
+// ---- JsValue
+
+/// Any JS value, as in wasm-bindgen: what untyped NS functions return (`ns.args`, port reads,
+/// `codingcontract.get_data`), `js::global(..)` and `JSON::parse::<JsValue>(..)`. Read it with
+/// `as_string()`, `as_f64()` or `as_bool()`; turn it into a typed value with
+/// `serde_wasm_bindgen::from_value(v)`. (Its methods are the runtime's `κσ.$jsv` helpers.)
+pub struct JsValue {}
+
+impl JsValue {
+    /// The string, if the value is one.
+    #[js = "asString"]
+    pub fn as_string(&self) -> Option<String>;
+    /// The number, if the value is one.
+    #[js = "asF64"]
+    pub fn as_f64(&self) -> Option<f64>;
+    /// The boolean, if the value is one.
+    #[js = "asBool"]
+    pub fn as_bool(&self) -> Option<bool>;
+    /// Whether the value is a string.
+    #[js = "isString"]
+    pub fn is_string(&self) -> bool;
+    /// Whether the value is `undefined`.
+    #[js = "isUndefined"]
+    pub fn is_undefined(&self) -> bool;
+    /// Whether the value is `null`.
+    #[js = "isNull"]
+    pub fn is_null(&self) -> bool;
+    /// Whether the value is `null` or `undefined`.
+    #[js = "isNullOrUndefined"]
+    pub fn is_null_or_undefined(&self) -> bool;
+    /// Whether the value is an object (not `null`): arrays and NS objects too.
+    #[js = "isObject"]
+    pub fn is_object(&self) -> bool;
+    /// Whether the value is an array.
+    #[js = "isArray"]
+    pub fn is_array(&self) -> bool;
+    /// Whether the value is a function.
+    #[js = "isFunction"]
+    pub fn is_function(&self) -> bool;
+    /// Whether the value is a BigInt.
+    #[js = "isBigint"]
+    pub fn is_bigint(&self) -> bool;
+    /// Whether the value is a symbol.
+    #[js = "isSymbol"]
+    pub fn is_symbol(&self) -> bool;
+    /// Whether JS counts the value as true (`!!v`).
+    #[js = "isTruthy"]
+    pub fn is_truthy(&self) -> bool;
+    /// Whether JS counts the value as false (`!v`).
+    #[js = "isFalsy"]
+    pub fn is_falsy(&self) -> bool;
+    /// JS's `==`.
+    #[js = "looseEq"]
+    pub fn loose_eq(&self, other: &JsValue) -> bool;
+    /// A description of the value for debugging (`"a"`, `5`, `[1, 2]`, `{"x":1}`).
+    #[js = "asDebugString"]
+    pub fn as_debug_string(&self) -> String;
+    /// A JS string.
+    #[js = "globalThis.String"]
+    pub fn from_str(s: &str) -> JsValue;
+    /// A JS number.
+    #[js = "globalThis.Number"]
+    pub fn from_f64(n: f64) -> JsValue;
+    /// A JS boolean.
+    #[js = "globalThis.Boolean"]
+    pub fn from_bool(b: bool) -> JsValue;
+    /// Any value as a JS value: numbers, strings and bools as themselves, a `Vec` as an array.
+    #[js = "κσ.$jsv.$from"]
+    pub fn from(value: JsAny) -> JsValue;
+}
 
 // ---- globals by name
 

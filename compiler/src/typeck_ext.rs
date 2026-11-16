@@ -14,9 +14,8 @@ impl Checker<'_> {
     /// `|params| body`. Parameter and return types come from annotations, then from the expected
     /// closure type (so `v.iter().map(|x| x.len())` knows `x`), then from fresh variables.
     pub(super) fn closure(&mut self, c: &ast::ClosureExpr, expected: Option<&Ty>) -> Ty {
-        if c.async_token().is_some() {
-            self.error(c.syntax(), "async closures are not supported yet");
-        }
+        // `async |x| ..`: calling it gives a future of the body's value.
+        let is_async = c.async_token().is_some();
         let params: Vec<ast::Param> = c
             .param_list()
             .map(|l| l.params().collect())
@@ -55,8 +54,13 @@ impl Checker<'_> {
             (None, Some((_, r))) => r.clone(),
             (None, None) => self.fresh(VarKind::General),
         };
+        let ret = if is_async && c.ret_type().is_none() {
+            self.async_closure_output(ret)
+        } else {
+            ret
+        };
         let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
-        let saved_async = std::mem::replace(&mut self.in_async, false);
+        let saved_async = std::mem::replace(&mut self.in_async, is_async);
         // A closure body can't `break` out of the loop around it.
         let saved_loops = std::mem::take(&mut self.loops);
         if let Some(body) = c.body() {
@@ -74,9 +78,23 @@ impl Checker<'_> {
         self.in_async = saved_async;
         self.loops = saved_loops;
         self.scopes.pop();
+        let ret = if is_async {
+            Ty::Future(Box::new(ret))
+        } else {
+            ret
+        };
         Ty::Closure {
             params: ptys,
             ret: Box::new(ret),
+        }
+    }
+
+    /// The output of an `async` closure without a return annotation, from the return type it's
+    /// expected to have (`impl Future<Output = T>`), or a fresh type.
+    fn async_closure_output(&mut self, hinted: Ty) -> Ty {
+        match self.shallow(&hinted) {
+            Ty::Future(t) => *t,
+            _ => self.fresh(VarKind::General),
         }
     }
 
@@ -117,10 +135,18 @@ impl Checker<'_> {
             ast::Type::PathType(p) => {
                 let seg = p.path()?.segment()?;
                 let name = seg.name_ref()?.text().to_string();
-                matches!(name.as_str(), "Fn" | "FnMut" | "FnOnce").then_some(seg)
+                matches!(
+                    name.as_str(),
+                    "Fn" | "FnMut" | "FnOnce" | "AsyncFn" | "AsyncFnMut" | "AsyncFnOnce"
+                )
+                .then_some(seg)
             }
             _ => None,
         })?;
+        // `AsyncFn(A) -> R`: calling it gives a future of `R`.
+        let is_async = seg
+            .name_ref()
+            .is_some_and(|n| n.text().to_string().starts_with("Async"));
         let params: Vec<ast::Type> = seg
             .parenthesized_arg_list()?
             .type_args()
@@ -129,6 +155,11 @@ impl Checker<'_> {
         let ret = seg.ret_type().and_then(|r| r.ty());
         let params = params.iter().map(|p| self.lower_type(p)).collect();
         let ret = ret.map(|r| self.lower_type(&r)).unwrap_or(Ty::Unit);
+        let ret = if is_async {
+            Ty::Future(Box::new(ret))
+        } else {
+            ret
+        };
         Some(Ty::Closure {
             params,
             ret: Box::new(ret),
@@ -646,6 +677,17 @@ impl Checker<'_> {
                 count(self, 0);
                 Ty::Bool
             }
+            // `b.is_ascii_digit()` on a byte.
+            (Ty::Int(crate::ty::IntKind::U8), m2)
+                if m2.starts_with("is_ascii") && char_predicate(m2).is_some() =>
+            {
+                count(self, 0);
+                Ty::Bool
+            }
+            (Ty::Int(crate::ty::IntKind::U8), "to_ascii_lowercase" | "to_ascii_uppercase") => {
+                count(self, 0);
+                Ty::Int(crate::ty::IntKind::U8)
+            }
             (Ty::Char, "to_ascii_uppercase" | "to_ascii_lowercase") => {
                 count(self, 0);
                 Ty::Char
@@ -777,7 +819,14 @@ impl Checker<'_> {
             let z = self.zonk(&e);
             !z.is_js_primitive() && z != Ty::Unknown
         };
-        if mutable && !objects && !matches!(method, "for_each" | "enumerate") {
+        // (`for (x, y) in v.iter_mut().zip(..)` loops by index, so writes reach `v`.)
+        let for_zip = method == "zip"
+            && m.syntax()
+                .parent()
+                .and_then(ast::ForExpr::cast)
+                .and_then(|f| f.iterable())
+                .is_some_and(|it| it.syntax() == m.syntax());
+        if mutable && !objects && !matches!(method, "for_each" | "enumerate") && !for_zip {
             self.error(
                 m.syntax(),
                 format!("`iter_mut()` followed by `.{method}()` isn't supported yet (only `.for_each(..)`); use a `for` loop"),
