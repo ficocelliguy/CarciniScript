@@ -134,8 +134,7 @@ impl Parser<'_> {
             let Some(e) = self.peek() else {
                 return self.err("expected a name");
             };
-            let ok = e.kind() == SyntaxKind::IDENT
-                || e.kind().is_keyword(ra_ap_syntax::Edition::Edition2024);
+            let ok = e.kind() == SyntaxKind::IDENT || e.kind().is_keyword(crate::macros::EDITION);
             if !ok {
                 return self.err(format!("expected a name, found `{e}`"));
             }

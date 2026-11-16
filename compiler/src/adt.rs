@@ -161,6 +161,8 @@ pub struct TraitDef {
     pub consts: Vec<String>,
     /// Their types.
     pub const_tys: HashMap<String, Ty>,
+    /// The ones with a default value (`const N: usize = 3;`), which impls may leave out.
+    pub const_defaults: Vec<String>,
     /// The module it was imported from; None when declared in this file.
     pub module: Option<String>,
     /// Associated types (`type Unit;`), which each impl names (`type Unit = f64;`).
@@ -247,7 +249,8 @@ pub fn own_method(m: &str) -> bool {
 }
 
 /// The key a built-in type's extension-trait methods are stored under: `i32`, `f64`, `bool`,
-/// `char`, `String` (also for `str`), `Vec`.
+/// `char`, `String` (also for `str`), `Vec`, `Option`, `Result`, `HashMap`, `HashSet`,
+/// `BTreeMap`, `BTreeSet`.
 pub fn ext_key(name: &str) -> Option<&'static str> {
     Some(match name {
         "i8" => "i8",
@@ -260,12 +263,20 @@ pub fn ext_key(name: &str) -> Option<&'static str> {
         "u32" => "u32",
         "u64" => "u64",
         "usize" => "usize",
+        "i128" => "i128",
+        "u128" => "u128",
         "f32" => "f32",
         "f64" => "f64",
         "bool" => "bool",
         "char" => "char",
         "str" | "String" => "String",
         "Vec" => "Vec",
+        "Option" => "Option",
+        "Result" => "Result",
+        "HashMap" => "HashMap",
+        "HashSet" => "HashSet",
+        "BTreeMap" => "BTreeMap",
+        "BTreeSet" => "BTreeSet",
         _ => return None,
     })
 }
@@ -281,7 +292,24 @@ pub fn ext_key_of(t: &Ty) -> Option<&'static str> {
         Ty::Char => Some("char"),
         Ty::Str => Some("String"),
         Ty::Vec(_) => Some("Vec"),
+        Ty::Option(_) => Some("Option"),
+        Ty::Result(..) => Some("Result"),
+        Ty::Map(..) => Some("HashMap"),
+        Ty::Set(_) => Some("HashSet"),
+        Ty::Coll(crate::ty::Coll::BTreeMap, _) => Some("BTreeMap"),
+        Ty::Coll(crate::ty::Coll::BTreeSet, _) => Some("BTreeSet"),
         _ => None,
+    }
+}
+
+/// The type arguments of a built-in type a trait is implemented for (`HashMap<String, i64>` →
+/// `[String, i64]`), matched against a receiver's.
+pub fn ext_args(t: &Ty) -> Vec<Ty> {
+    match t {
+        Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) => vec![(**e).clone()],
+        Ty::Map(k, v) | Ty::Result(k, v) => vec![(**k).clone(), (**v).clone()],
+        Ty::Coll(_, view) => ext_args(view),
+        _ => vec![],
     }
 }
 
@@ -293,6 +321,8 @@ pub fn impl_self_name(imp: &ast::Impl) -> Option<String> {
     }
     match t {
         ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+        // `impl<const N: usize> Tr for [u8; N]`: arrays and slices are `Vec`s in JS.
+        ast::Type::ArrayType(_) | ast::Type::SliceType(_) => Some("Vec".into()),
         _ => None,
     }
 }
@@ -516,8 +546,22 @@ pub fn impl_parts(imp: &ast::Impl) -> (Option<String>, Option<String>) {
 /// `impl<T: Bound> Trait for T`: (the trait, `T`, `T`'s bounds from the parameter list and the
 /// `where` clause).
 pub fn blanket_impl(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
-    let (Some(tr), Some(self_name)) = impl_parts(imp) else {
+    let b = blanket_parts(imp)?;
+    // (`impl<T: Tr> Tr for &T` is no blanket impl: it forwards, see `forwarding_impl`.)
+    if b.2.contains(&b.0) && wrapped_param(imp).is_some() {
         return None;
+    }
+    Some(b)
+}
+
+fn blanket_parts(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
+    let (Some(tr), self_name) = impl_parts(imp) else {
+        return None;
+    };
+    // (`for &T`, `for &mut I`, `for Box<T>`: references and boxes are erased in JS.)
+    let self_name = match self_name {
+        Some(n) if !matches!(n.as_str(), "Box" | "Rc" | "Arc") => n,
+        _ => wrapped_param(imp)?,
     };
     let tp = imp
         .generic_param_list()?
@@ -554,6 +598,246 @@ pub fn blanket_impl(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
         }
     }
     Some((tr, self_name, bounds))
+}
+
+/// `impl<T> Tr for &T` / `&mut T` / `Box<T>` / `Rc<T>` / `Arc<T>`: `T`, a type parameter of the
+/// impl (or `dyn Tr` for `Box<dyn Tr>`).
+fn wrapped_param(imp: &ast::Impl) -> Option<String> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let mut t = imp.self_ty()?;
+    let mut wrapped = false;
+    loop {
+        t = match t {
+            ast::Type::RefType(r) => r.ty()?,
+            ast::Type::PathType(ref p)
+                if p.path()?.segment()?.name_ref().is_some_and(|n| {
+                    matches!(n.text().to_string().as_str(), "Box" | "Rc" | "Arc")
+                }) =>
+            {
+                let args: Vec<ast::GenericArg> = p
+                    .path()?
+                    .segment()?
+                    .generic_arg_list()?
+                    .generic_args()
+                    .collect();
+                match args.as_slice() {
+                    [ast::GenericArg::TypeArg(ta)] => ta.ty()?,
+                    _ => return None,
+                }
+            }
+            ast::Type::PathType(p) if wrapped => {
+                let n = p.path()?.as_single_name_ref()?.text().to_string();
+                let is_param = imp.generic_param_list()?.generic_params().any(|g| {
+                    matches!(g, ast::GenericParam::TypeParam(tp)
+                        if tp.name().is_some_and(|x| x.text() == n.as_str()))
+                });
+                return is_param.then_some(n);
+            }
+            // (`impl Tr for Box<dyn Tr>`: "dyn Tr".)
+            ast::Type::DynTraitType(d) if wrapped => {
+                let b = d.type_bound_list()?.bounds().next()?;
+                let ast::Type::PathType(p) = b.ty()? else {
+                    return None;
+                };
+                return Some(format!("dyn {}", p.path()?.segment()?.name_ref()?.text()));
+            }
+            _ => return None,
+        };
+        wrapped = true;
+    }
+}
+
+/// `impl<T: Tr + ?Sized> Tr for &T { fn f(&self) { (**self).f() } }` (or for `&mut T`,
+/// `Box<T>`): every method hands the call on to `T`'s impl. References and boxes are erased in
+/// JS, so a value of `&T` already is a `T` with that impl: the impl is left out.
+fn forwarding_impl(imp: &ast::Impl) -> bool {
+    if !wrapping_impl(imp) {
+        return false;
+    }
+    let Some(items) = imp.assoc_item_list() else {
+        return true;
+    };
+    items.assoc_items().all(|item| match item {
+        ast::AssocItem::Fn(f) => forwards(&f),
+        ast::AssocItem::TypeAlias(_) | ast::AssocItem::Const(_) => true,
+        ast::AssocItem::MacroCall(_) => false,
+    })
+}
+
+/// `impl<T: Tr> Tr for &T` (or `&mut T`, `Box<T>`, ..): the trait for a wrapper of `T` given
+/// `T`'s impl of it.
+pub fn wrapping_impl(imp: &ast::Impl) -> bool {
+    match wrapped_param(imp) {
+        Some(d) if d.starts_with("dyn ") => impl_parts(imp).0.is_some_and(|tr| d[4..] == tr),
+        Some(_) => blanket_parts(imp).is_some_and(|(tr, _, bounds)| bounds.contains(&tr)),
+        None => false,
+    }
+}
+
+/// Whether `f`'s body is just the same method of what `self` points at, with `f`'s parameters:
+/// `(**self).f(a, b)`, `T::f(self, a)`, `Tr::f(&**self, a)`.
+fn forwards(f: &ast::Fn) -> bool {
+    use ra_ap_syntax::ast::HasArgList;
+    fn strip(mut e: ast::Expr) -> Option<ast::Expr> {
+        loop {
+            e = match e {
+                ast::Expr::ParenExpr(p) => p.expr()?,
+                ast::Expr::RefExpr(r) => r.expr()?,
+                ast::Expr::PrefixExpr(p) if p.op_kind() == Some(ast::UnaryOp::Deref) => p.expr()?,
+                ast::Expr::MethodCallExpr(m)
+                    if m.arg_list().is_some_and(|l| l.args().next().is_none())
+                        && m.name_ref().is_some_and(|n| {
+                            matches!(
+                                n.text().to_string().as_str(),
+                                "as_ref"
+                                    | "as_mut"
+                                    | "deref"
+                                    | "deref_mut"
+                                    | "borrow"
+                                    | "borrow_mut"
+                            )
+                        }) =>
+                {
+                    m.receiver()?
+                }
+                other => return Some(other),
+            };
+        }
+    }
+    let path_name = |e: ast::Expr| -> Option<String> {
+        match strip(e)? {
+            ast::Expr::PathExpr(p) => Some(p.path()?.as_single_name_ref()?.text().to_string()),
+            _ => None,
+        }
+    };
+    let Some(name) = f.name().map(|n| n.text().to_string()) else {
+        return false;
+    };
+    let Some(pl) = f.param_list() else {
+        return false;
+    };
+    let params: Vec<String> = pl
+        .params()
+        .map(|p| match p.pat() {
+            Some(ast::Pat::IdentPat(ip)) => ip.name().map(|n| n.text().to_string()),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .unwrap_or_else(|| vec![String::new()]);
+    let Some(body) = f.body().and_then(|b| b.stmt_list()) else {
+        return false;
+    };
+    // (The call is the tail, or the only statement: `(**self).consume(buf);`.)
+    let stmts: Vec<ast::Stmt> = body.statements().collect();
+    let tail = match (body.tail_expr(), stmts.as_slice()) {
+        (Some(t), []) => t,
+        (None, [ast::Stmt::ExprStmt(s)]) => match s.expr() {
+            Some(e) => e,
+            None => return false,
+        },
+        _ => return false,
+    };
+    // (Through parentheses and `unsafe { .. }`.)
+    let mut tail = tail;
+    loop {
+        tail = match tail {
+            ast::Expr::ParenExpr(p) => match p.expr() {
+                Some(e) => e,
+                None => return false,
+            },
+            ast::Expr::BlockExpr(b)
+                if b.label().is_none()
+                    && matches!(b.modifier(), None | Some(ast::BlockModifier::Unsafe(_)))
+                    && b.stmt_list()
+                        .is_some_and(|l| l.statements().next().is_none()) =>
+            {
+                match b.stmt_list().and_then(|l| l.tail_expr()) {
+                    Some(e) => e,
+                    None => return false,
+                }
+            }
+            _ => break,
+        };
+    }
+    let (callee, recv, args): (String, Option<ast::Expr>, Vec<ast::Expr>) = match tail {
+        ast::Expr::MethodCallExpr(m) => {
+            if pl.self_param().is_none() {
+                return false;
+            }
+            let Some(n) = m.name_ref() else { return false };
+            (
+                n.text().to_string(),
+                m.receiver(),
+                m.arg_list().into_iter().flat_map(|l| l.args()).collect(),
+            )
+        }
+        ast::Expr::CallExpr(c) => {
+            let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+                return false;
+            };
+            let Some(n) = p
+                .path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+            else {
+                return false;
+            };
+            let mut args = c.arg_list().into_iter().flat_map(|l| l.args());
+            let recv = if pl.self_param().is_some() {
+                args.next()
+            } else {
+                None
+            };
+            (n.text().to_string(), recv, args.collect())
+        }
+        _ => return false,
+    };
+    callee == name
+        && (pl.self_param().is_none() || recv.and_then(path_name).as_deref() == Some("self"))
+        && args.len() == params.len()
+        && args
+            .into_iter()
+            .zip(&params)
+            .all(|(a, p)| path_name(a).as_deref() == Some(p.as_str()))
+}
+
+/// The default methods of trait `tr` (declared in `items`) that a forwarding impl leaves to the
+/// default while another impl of `tr` overrides them: then `&T`'s method isn't `T`'s.
+fn shadowed_defaults(imp: &ast::Impl, tr: &str, items: &[ast::Item]) -> bool {
+    let fn_names = |l: Option<ast::AssocItemList>| -> Vec<String> {
+        l.into_iter()
+            .flat_map(|l| l.assoc_items())
+            .filter_map(|i| match i {
+                ast::AssocItem::Fn(f) => f.name().map(|n| n.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let own = fn_names(imp.assoc_item_list());
+    let defaults: Vec<String> = items
+        .iter()
+        .filter_map(|i| match i {
+            ast::Item::Trait(t) if t.name().is_some_and(|n| n.text() == tr) => Some(t),
+            _ => None,
+        })
+        .flat_map(|t| t.assoc_item_list())
+        .flat_map(|l| l.assoc_items())
+        .filter_map(|i| match i {
+            ast::AssocItem::Fn(f) if f.body().is_some() => f.name().map(|n| n.text().to_string()),
+            _ => None,
+        })
+        .filter(|n| !own.contains(n))
+        .collect();
+    !defaults.is_empty()
+        && items.iter().any(|i| match i {
+            ast::Item::Impl(other) if other.syntax() != imp.syntax() => {
+                impl_parts(other).0.as_deref() == Some(tr)
+                    && fn_names(other.assoc_item_list())
+                        .iter()
+                        .any(|n| defaults.contains(n))
+            }
+            _ => false,
+        })
 }
 
 /// Whether `node` is (inside) an item that only exists in test builds: `#[cfg(test)]` or
@@ -601,6 +885,20 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
             })
             .filter(|n| !test_only(n))
             .filter_map(ast::Item::cast)
+            .collect();
+        // `impl<T: Tr> Tr for &T` handing every call on to `T`'s impl: nothing to do in JS.
+        let items: Vec<ast::Item> = items
+            .iter()
+            .filter(|i| match i {
+                ast::Item::Impl(imp) => {
+                    !(forwarding_impl(imp)
+                        && !impl_parts(imp)
+                            .0
+                            .is_some_and(|tr| shadowed_defaults(imp, &tr, &items)))
+                }
+                _ => true,
+            })
+            .cloned()
             .collect();
         *last.borrow_mut() = Some((file.syntax().clone(), items.clone()));
         items

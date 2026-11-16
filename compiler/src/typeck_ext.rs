@@ -596,6 +596,14 @@ impl Checker<'_> {
             }
 
             // ---- Option methods taking closures
+            // `opt.get_or_insert_with(f)`: a `&mut T` into the option.
+            (Ty::Option(t), "get_or_insert_with")
+                if matches!(a0, Some(ast::Expr::ClosureExpr(_))) =>
+            {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 1);
+                self.closure_arg(a0, vec![], *t)
+            }
             (Ty::Option(t), m2) if is_option_closure_method(m2) => {
                 let t = *t;
                 let opt = |x: Ty| Ty::Option(Box::new(x));
@@ -829,10 +837,31 @@ impl Checker<'_> {
                 .and_then(ast::ForExpr::cast)
                 .and_then(|f| f.iterable())
                 .is_some_and(|it| it.syntax() == m.syntax());
-        if mutable && !objects && !matches!(method, "for_each" | "enumerate") && !for_zip {
+        // Slots (see `typeck_slots.rs`) pass through adapters that don't look at the items.
+        let slots = matches!(
+            method,
+            "skip"
+                | "take"
+                | "rev"
+                | "step_by"
+                | "peekable"
+                | "by_ref"
+                | "fuse"
+                | "zip"
+                | "collect"
+                | "count"
+                | "nth"
+                | "nth_back"
+                | "last"
+                | "next_back"
+        ) && m
+            .receiver()
+            .is_some_and(|r| self.iter_slot_shape(&r).is_some());
+        if mutable && !objects && !matches!(method, "for_each" | "enumerate") && !for_zip && !slots
+        {
             self.error(
                 m.syntax(),
-                format!("`iter_mut()` followed by `.{method}()` isn't supported yet (only `.for_each(..)`); use a `for` loop"),
+                format!("`iter_mut()` followed by `.{method}()` isn't supported yet over numbers, strings or bools (only `.for_each(..)` and adapters without closures: `next`, `enumerate`, `zip`, `skip`, `rev`, `collect`, ..); use a `for` loop"),
             );
             for a in args {
                 self.infer(a, None);

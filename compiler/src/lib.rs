@@ -19,6 +19,7 @@ mod mbe;
 mod modflat;
 mod moves;
 mod nav;
+mod nested;
 mod procmacro;
 pub mod service;
 mod sourcemap;

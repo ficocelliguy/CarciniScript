@@ -309,53 +309,109 @@ hide later errors, so this is a fair per-file check.
 - **27 crates** pass in every file (strsim, shlex, percent-encoding, utf8parse, anstyle, unicode-ident ..).
 - **Not planned:** raw pointers, `transmute`, `MaybeUninit`, `alloc`, `union` and `extern` blocks
   (602 + 130 + 53 files). JS values have no memory layout.
+- **Re-run after `3c15b78`** (230 crates, 5,220 files): language features all supported in 67.7%;
+  counting std gaps, 56.4% (up from 50.5%); by lines, 42.6%. Files whose only problem is std fell
+  from 861 to 594. Language gaps barely moved (1,629 to 1,594 files), since that commit was std work.
+  25 crates pass in every file: the two icu `*_data` crates dropped out because `include!` now
+  works and pulls in a `macro_rules!` in an unsupported place. Counts below are from this run.
+  Most "std type" hits that remain (`Path`, `Ref`, `Cursor`, `Output`) are the crate's own types
+  with std names, such as `syn::Path` or chrono's private `Cursor`, not std gaps.
+- [ ] **Regressions in `3c15b78`**, both in files that compiled before:
+  - a user `enum Ordering` in a pattern is taken as `std::cmp::Ordering`: "expected `Ordering`,
+    found `Ordering`" (`ra_ap_syntax` `ast/operators.rs`)
+  - `#[derive(Clone, Copy)] struct W<'a> { s: &'a [u8] }` gives "the trait `Copy` is not
+    implemented for `Vec<u8>`" (`miniz_oxide`)
 
 ### Language gaps
 
-Counts are files that hit the gap, then files where it's the only language gap.
+Counts are files that hit the gap, then files where it's the only language gap. Status: `[x]`
+done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
 
-- [ ] **Trait impls on std types** (340 / 183): `impl Tr for Option<T>`, `Box<str>`, `HashMap<K, V>`,
-  `HashSet`, `Result`, `Path`, `File`, `Wrapping<u32>`, `u128` / `i128`; std traits on `String` /
-  `&str` (`impl From<A> for String`, `impl PartialEq<Id> for &str`). User traits on `str`, `String`,
-  `Vec`, and the numbers up to 64 bits already work.
-- [ ] **`where` clauses with Fn bounds over type parameters** (197 / 81): `fn run<F, T>(f: F) -> T
-  where F: FnOnce() -> T` fails with "type `T` is not supported yet". The same bound inline
-  (`<F: FnOnce() -> T>`) and `impl FnOnce(..) -> R` work.
-- [ ] **Nested `fn`s share the file's namespace** (125 / 55): two functions that each define a
-  nested `fn imp()` collide. The same error hits `#[cfg(windows)] fn x` next to
-  `#[cfg(not(windows))] fn x` (see target `cfg`, below).
-- [ ] **`macro_rules!` robustness** (201 files: 72 expansions that don't parse, 67 "no rules matched",
-  62 definitions in unsupported places):
-  - doc comments inside a repetition (`$( /// doc\n $name, )+`)
-  - a `ty` fragment repeated without a separator (`$($t:ty)*`), which is taken as one type
-  - `<$t>::MAX` / `<$t>::method()`: qualified type paths, which fail outside macros too (`<u8>::MAX`,
-    `<Vec<u8>>::new()`)
-  - `#[cfg(..)]`-gated alternative definitions of one macro
-  - `pub(crate) use my_macro;` re-exports
-- [ ] **Generic bounds on std traits** (82): `R: io::Read`, `R: BufRead`, `W: io::Write` /
-  `fmt::Write`, `F: Future`, `S: BuildHasher`, `A: Allocator`. (`R: io::Read`, `R: BufRead` and
-  `W: io::Write` work now: see Std-library gaps.)
-- [ ] **Blanket impls on references** (65): `impl<T: Tr + ?Sized> Tr for &T`, `impl<I> Tr for &mut I`.
-  `impl<T: Debug> Tr for T` works.
-- [ ] **Target `cfg`** (62 / 35): `cfg!(target_os = ..)`, `windows`, `unix`, `target_arch`,
+- [x] **Trait impls on std types** (336 / 182): your traits on `Option<T>`, `Result<T, E>`,
+  `HashMap` / `BTreeMap`, `HashSet` / `BTreeSet` and `u128` / `i128` (generic impls too, through a
+  generic `T: Tr` for all but `Option`), and `impl From<A> for String` / for a number type
+  (`String::from(a)`, `a.into()`, `impl Into<String>`). `fixtures/std_type_impls.rs`.
+  - [ ] Still open: `Box<str>`, `Path`, `File`, `Wrapping<u32>`; std traits other than `From`
+    (`impl PartialEq<Id> for &str`); an `Option` reached through a generic `T: Tr` (an `Option` is
+    `null` or its value, so `κσ.$dcall` can't tell it apart); `&mut self` methods of your traits on
+    a `String`, number, bool or `Option` (JS can't write those through `this`).
+- [x] **`where` clauses with Fn bounds over type parameters** (200 / 85): `fn run<F, T>(f: F) -> T
+  where F: FnOnce() -> T` and `<F: FnOnce() -> T, T>` (a bound naming a parameter declared after
+  it), and `impl<F, T> Memo<F, T> where F: Fn(u64) -> T` (an impl's closure parameters).
+  `fixtures/where_fn_bounds.rs`. (A struct literal's closure doesn't take its parameter types from
+  the struct's bound yet: `Memo { f: |x: u64| .. }` needs the annotation.)
+- [x] **Nested `fn`s share the file's namespace** (125 / 55): a nested `fn` named like another
+  function is renamed `imp__1`, .. with the calls in its block (`compiler/src/nested.rs`), so two
+  helpers can each define `fn imp()`, and a block's `fn` hides the file's. `fixtures/nested_fns.rs`.
+  (`#[cfg(windows)] fn x` next to `#[cfg(not(windows))] fn x` works too: see target `cfg`, below.)
+- [x] **`macro_rules!` robustness** (205 files: 72 expansions that don't parse, 67 "no rules matched",
+  66 definitions in unsupported places; first errors now: "no rules matched" 109 → 14, "not
+  supported" 40 → 2; `fixtures/macro_robust.rs`):
+  - [x] doc comments inside a repetition (`$( /// doc\n $name, )+`): doc comments are
+    `#[doc = ".."]` tokens, in the input and in the transcriber (where a `///` used to comment out
+    the rest of the line)
+  - [x] a `ty` fragment repeated without a separator (`$($t:ty)*`): one type per repetition; also
+    an `item` fragment with generics, closures and turbofish commas in an `expr`, `::` separators,
+    and repetitions without a separator kept apart (`$($a : $b)*` used to glue `b` and the next `a`)
+  - [x] `<$t>::MAX` / `<$t>::method()`: qualified type paths, which failed outside macros too
+    (`<u8>::MAX`, `<Vec<u8>>::new()`); a pre-pass writes them as plain paths (`ufcs.rs`,
+    `fixtures/qualified_type_paths.rs`)
+  - [x] `#[cfg(..)]`-gated alternative definitions of one macro (the extra definitions were left in
+    and reported as "`macro_rules!` is not supported"), and a macro defined again
+  - [x] `pub(crate) use my_macro;` re-exports in the defining file
+  - [x] `std::name!` / `$crate::__priv::name!` aren't the file's `name!` (memoffset recursed)
+  - Left: macros of other files that aren't `mod`-loaded (`#[macro_use] mod macros;` in `lib.rs`
+    used from a sibling file), bundled `log!` / `bail!` / `anyhow!` shadowing a crate's own
+    cross-file macros, and rules relying on finer fragment parsing.
+- [ ] **Generic bounds on std traits** (49, down from 82): left: `A: Allocator`,
+  `impl Future for ..`. Done: `W: fmt::Write` (given a `String`, a `Formatter` or your own
+  writer) and `Vec<u8>: io::Write` (`put(&mut vec)`); `&[u8]` (`"abc".as_bytes()`, `&data[..]`)
+  satisfies `R: Read` / `R: BufRead` / `impl Read` / `Box<dyn Read>` parameters and
+  `BufReader::new`, read through a `Cursor` the function makes (a `&mut &[u8]` argument, whose
+  reads would advance the caller's slice, is an error); `F: Future<Output = T>` with `T` another
+  type parameter and a bare `F: Future` (`F::Output`); `S: BuildHasher` (`HashMap<K, V, S>`,
+  `RandomState::new()`, ignored). `fixtures/byte_readers.rs`, `fixtures/future_bounds.rs`.
+- [x] **Blanket impls on references** (66): `impl<T: Tr + ?Sized> Tr for &T` / `&mut T` / `Box<T>` /
+  `Rc<T>` / `Arc<T>` / `Box<dyn Tr>` whose methods each call `T`'s (`(**self).f(a)`,
+  `T::f(self, a)`, `self.as_ref().f(a)`) are left out (`&T` is `T` in JS); one that does more is
+  an error. `impl<T: Display> Tr for &T` and `impl<I: Iterator> Tr for &mut I` are blanket impls
+  over `T`. `fixtures/blanket_ref_impls.rs`. (Impls whose bodies are macro calls, `Pin`
+  forwarding, and impls for `Box<Concrete>` remain.)
+- [x] **Target `cfg`** (62 / 35): `cfg!(target_os = ..)`, `windows`, `unix`, `target_arch`,
   `target_endian`, `target_pointer_width`, `target_feature`, `miri`, and the matching `#[cfg]` on
-  `fn`s. Proposal: evaluate against one fixed JS target (not windows / unix, little-endian,
-  `target_family = "wasm"`) rather than rejecting.
-- [ ] **`write!` into anything but a `String` or `Formatter`** (62 / 39): `write!(vec_u8, ..)`
-  (`io::Write`), `write!(w, ..)` for a generic `W: Write`, `write!(self, ..)` in a type with its own
-  `impl fmt::Write`.
-- [ ] **Pre-2024 editions** (42 / 37): `gen` is parsed as the 2024 keyword, so `rng.gen()` and
-  `let gen = ..` fail. That's every rand 0.8 user. Parse as 2021 (gen blocks are unstable anyway) or
-  per file.
-- [ ] Smaller ones (13 to 40 files each): `{ .. }` blocks as a binary operand, a stored
-  `Option<Option<T>>`, `iter_mut()` outside a `for`, `use x as y` renames of types and crates,
-  default associated consts in traits, non-literal enum discriminants (`A = B as isize`), const
-  generics on traits.
+  `fn`s. Evaluated against one fixed JS target (`wasm32-unknown-unknown`, not windows / unix,
+  little-endian, `target_pointer_width = "64"` like `usize` here), and a pre-pass blanks out
+  items, statements, fields, variants and arms under a `#[cfg]` that's off (features count as
+  undecided there, so their items stay; a `#[cfg]` inside macro arguments isn't evaluated).
+  `fixtures/cfg_items.rs`, `js-node/target_cfg.rs`.
+- [x] **`write!` into anything but a `String` or `Formatter`** (63 / 42): `write!(vec_u8, ..)`
+  (`io::Write`), `write!(w, ..)` for a generic `W: fmt::Write` or `io::Write`, and a type with its
+  own `impl fmt::Write` (`write_str` / `write_char`, `Err(fmt::Error)`). `fixtures/fmt_write.rs`,
+  `fixtures/io_write_vec.rs`. Not yet: `&mut dyn fmt::Write`, and a `Vec::new()` with no element
+  type that only a generic writer call would make a `Vec<u8>`.
+- [x] **Pre-2024 editions** (42 / 37): files parse as the 2021 edition, so `rng.gen()` and
+  `let gen = ..` work (gen blocks are unstable anyway). A fixture's `// edition: 2021` line builds
+  its native side as 2021 (`fixtures/rand_gen_2021.rs`).
+- [x] **`&mut T` with `T` a type parameter** (found on the way, a silent miscompile): `fn bump<T:
+  AddAssign>(x: &mut T, d: T)` lost its writes when `T` was a number, string, bool or `Option`. Such
+  parameters now take a cell like `&mut i32` does (a getter/setter cell over a struct, field or
+  element). `fixtures/generic_mut_refs.rs`.
+- [x] Smaller ones (12 to 39 files each). Done: `iter_mut()` outside a `for` (slots over numbers
+  and strings, `fixtures/iter_mut_outside_for.rs`; closure adapters such as `filter` on them are
+  still an error), `use x as y` renames of std types and modules (crates already worked;
+  `fixtures/use_renames.rs`), default associated consts in traits
+  (`fixtures/trait_default_consts.rs`), non-literal enum discriminants (`A = B as isize`, a
+  constant evaluator; `fixtures/enum_const_discriminants.rs`), `{ .. }` blocks on the right of `&&` / `||`
+  (`fixtures/logic_block_operands.rs`); const generics on traits (`trait Buf<const N: usize>`,
+  `impl Buf<4> for X`, `impl<const N: usize> Tr for [u8; N]`; the trait's own default methods
+  can't read `N` yet; `fixtures/const_generic_traits.rs`).
 
 ### Std-library gaps
 
 Files hitting each, among files that compile apart from external names. In all, 888 files miss a std
-type, 760 a std method, 357 a std trait impl, and 142 a std macro.
+type, 760 a std method, 357 a std trait impl, and 142 a std macro. After `3c15b78`: 569, 603, 148
+and 60, and most of what's left is raw pointers (`as_ptr` and friends), `Future`, the io types
+without a script meaning, or crate types named like std ones.
 
 - [x] **Types:** `PhantomData` (232 files), `std::path::{Path, PathBuf}` (146 / 66), `OsStr` /
   `OsString` (34 / 29), `cell::Ref` / `RefMut` named as types (37), `io::Cursor` (36),
@@ -388,9 +444,10 @@ type, 760 a std method, 357 a std trait impl, and 142 a std macro.
     (18), `next_power_of_two` (9)
   - `str::get(range)` (11), `String::into_boxed_str` (12)
   - `Iterator::size_hint` (53), and `for` over a type's own `iter()` (20)
-  - Not done: `Option::get_or_insert_with` (11), left to the `Option` representation work.
+  - `Option::get_or_insert_with` (11), with `get_or_insert`, `get_or_insert_default` and
+    `insert`: `(o ??= v)` on the option's place (`fixtures/option_get_or_insert.rs`).
 - [x] **Macros:** `format_args!` (29, a `String` here), `compile_error!` (30: an error unless
-  it's under a `#[cfg]` that's off, platform predicates counting as off), `include!` /
+  it's under a `#[cfg]` that's off for the JS target), `include!` /
   `include_bytes!` (17 / 14), `env!` / `option_env!` (15: a script has no build environment, so
   `env!` is an error and `option_env!` is `None`, except Cargo's `CARGO_*` variables, which get
   placeholders).
@@ -405,11 +462,19 @@ rand, log, anyhow, rayon, itertools, hashbrown, once_cell, either, num-traits, c
 errors in the survey were library files reaching into their own crate. What's left worth adding,
 cheapest first:
 
-- [ ] **`rustc_hash`** (4 crates): `FxHashMap` / `FxHashSet` as aliases of `HashMap` / `HashSet`.
+- [x] **`rustc_hash`** (4 crates): `FxHashMap` / `FxHashSet` as std's `HashMap` / `HashSet`
+  (`default()`, `with_capacity_and_hasher`, `with_hasher(FxBuildHasher)`; `FxHasher` is
+  `DefaultHasher`). `fixtures/crate_rustc_hash.rs`, against rustc-hash 2.
   It's the usual "fast map" import in puzzle-style code (BFS, memoized contract DP).
-- [ ] **`smallvec`** (3): `SmallVec<[T; N]>` and `smallvec![..]` as `Vec`.
-- [ ] **`indexmap`** (4): `IndexMap` / `IndexSet`, which keep insertion order, so server lists and
-  stats tables print the same way every run. A JS `Map` already keeps insertion order.
+- [x] **`smallvec`** (3): `SmallVec<[T; N]>` and `smallvec![..]` as `Vec` (a rewrite in
+  `bundled.rs`; `from_vec` / `from_slice` / `from_buf` are `Vec::from`, which works now too).
+  `fixtures/crate_smallvec.rs`. (`spilled()` / `inline_size()` aren't there: there's no inline buffer.)
+- [x] **`indexmap`** (4): `IndexMap` / `IndexSet` (a `Ty::Coll` over `HashMap` / `HashSet`, and
+  runtime classes extending them: a JS `Map` already keeps insertion order), with positions
+  (`get_index`, `get_index_of`, `get_full`, `insert_full`), `swap_remove` (what `remove` is) and
+  `shift_remove`, `first` / `last` / `pop`, `sort_keys` / `sort_by` / `sort`, `reverse`,
+  `truncate`, collecting, and `indexmap! {..}` / `indexset! {..}`. `fixtures/crate_indexmap.rs`.
+  (`map[i]` by position isn't there yet.)
 
 Not in the corpus (it's library internals), but likely to matter more to players:
 

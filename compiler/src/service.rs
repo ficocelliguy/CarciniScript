@@ -816,6 +816,8 @@ pub fn std_methods(t: &Ty) -> &'static [&'static str] {
             "push",
             "push_str",
             "remove",
+            "write_str",
+            "write_char",
             "repeat",
             "replace",
             "replacen",

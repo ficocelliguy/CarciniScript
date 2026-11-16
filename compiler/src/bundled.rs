@@ -2,7 +2,7 @@
 //! `Error` and the `From` impls), `bitflags!` (a struct of bits with consts, set operations and
 //! bitflags' `{:?}`), `cfg_if!` (the first branch whose predicate holds), `lazy_static!`
 //! (`LazyLock` statics), serde_json's `json!` (the `Value` it makes) and rayon (run
-//! sequentially: `par_iter()` is `iter()`). A pre-pass over
+//! sequentially: `par_iter()` is `iter()`), smallvec (`SmallVec<[T; N]>` is a `Vec<T>`). A pre-pass over
 //! the text, like the proc macros': each rewrite keeps the `OffsetMap` in step, so positions
 //! still point into the original.
 
@@ -25,6 +25,10 @@ pub fn uses_bundled(text: &str) -> bool {
         || text.contains("regex")
         || text.contains("clap")
         || text.contains("jsx!")
+        || text.contains("SmallVec")
+        || text.contains("smallvec!")
+        || text.contains("indexmap!")
+        || text.contains("indexset!")
         || uses_renamed(text)
 }
 
@@ -48,6 +52,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     let mut edits: Vec<(TextRange, String)> = Vec::new();
     let mut errors: Vec<(TextRange, String)> = Vec::new();
     rename_crate_items(&file, text, &mut edits);
+    if text.contains("SmallVec") || text.contains("smallvec!") {
+        smallvec_edits(&file, &mut edits);
+    }
+    if text.contains("indexmap!") || text.contains("indexset!") {
+        indexmap_macros(&file, &mut edits);
+    }
     if text.contains("chrono_tz") {
         chrono_tz_zones(&file, &mut edits);
     }
@@ -1653,6 +1663,178 @@ fn regex_tokens(tt: &ast::TokenTree, edits: &mut Vec<(TextRange, String)>) {
     }
 }
 
+// ---------------------------------------------------------------- smallvec
+
+/// `SmallVec<[T; N]>` as `Vec<T>` (the inline buffer is an allocation detail), with the element
+/// type rewritten too when it's a `SmallVec` itself.
+fn smallvec_type(t: &ast::Type) -> String {
+    if let ast::Type::PathType(p) = t
+        && let Some(seg) = p.path().and_then(|p| p.segment())
+        && seg.name_ref().is_some_and(|n| n.text() == "SmallVec")
+        && let Some(elem) = smallvec_elem(&seg)
+    {
+        return format!("Vec<{}>", smallvec_type(&elem));
+    }
+    t.syntax().text().to_string()
+}
+
+/// The `T` of a `SmallVec<[T; N]>` segment.
+fn smallvec_elem(seg: &ast::PathSegment) -> Option<ast::Type> {
+    let ast::GenericArg::TypeArg(a) = seg.generic_arg_list()?.generic_args().next()? else {
+        return None;
+    };
+    match a.ty()? {
+        ast::Type::ArrayType(arr) => arr.ty(),
+        _ => None,
+    }
+}
+
+/// The bundled `smallvec`: `SmallVec<[T; N]>` / `SmallVec::<[T; N]>::new()` / `smallvec::SmallVec`
+/// are `Vec`'s, `SmallVec::from_vec(v)` / `from_slice(s)` / `from_buf(a)` are `Vec::from(..)`, and
+/// `smallvec![..]` is `vec![..]`.
+fn smallvec_edits(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
+    for seg in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::PathSegment::cast)
+    {
+        let Some(name) = seg.name_ref() else { continue };
+        if name.text() != "SmallVec"
+            || seg.syntax().ancestors().any(|a| ast::Use::can_cast(a.kind()))
+            // (Inside another `SmallVec<[..]>`: rewritten with it.)
+            || seg.syntax().ancestors().skip(1).any(|a| {
+                ast::PathSegment::cast(a)
+                    .and_then(|s| s.name_ref())
+                    .is_some_and(|n| n.text() == "SmallVec")
+            })
+        {
+            continue;
+        }
+        let Some(path) = seg.parent_path().into() else {
+            continue;
+        };
+        let path: ast::Path = path;
+        // `smallvec::SmallVec`: the crate goes too.
+        let start = match path.qualifier() {
+            Some(q)
+                if matches!(
+                    q.syntax().text().to_string().as_str(),
+                    "smallvec" | "::smallvec"
+                ) =>
+            {
+                path.syntax().text_range().start()
+            }
+            _ => seg.syntax().text_range().start(),
+        };
+        let mut new = String::from("Vec");
+        if let Some(gl) = seg.generic_arg_list() {
+            let turbofish = gl.coloncolon_token().is_some();
+            match smallvec_elem(&seg) {
+                Some(elem) => {
+                    new.push_str(if turbofish { "::<" } else { "<" });
+                    new.push_str(&smallvec_type(&elem));
+                    new.push('>');
+                }
+                None => new.push_str(&gl.syntax().text().to_string()),
+            }
+        }
+        edits.push((TextRange::new(start, seg.syntax().text_range().end()), new));
+        // `SmallVec::from_vec(v)` and the other constructors from a buffer.
+        if let Some(outer) = path.parent_path()
+            && let Some(f) = outer.segment().and_then(|s| s.name_ref())
+            && matches!(
+                f.text().to_string().as_str(),
+                "from_vec" | "from_slice" | "from_buf"
+            )
+        {
+            edits.push((f.syntax().text_range(), "from".into()));
+        }
+    }
+    // `smallvec![1, 2]` (also `smallvec::smallvec!`, and inside other macros' arguments).
+    for mc in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
+        if let Some(p) = mc.path()
+            && p.segment()
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "smallvec")
+        {
+            edits.push((p.syntax().text_range(), "vec".into()));
+        }
+    }
+    for tt in file.syntax().descendants().filter_map(ast::TokenTree::cast) {
+        let toks: Vec<_> = tt
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia())
+            .collect();
+        for (i, t) in toks.iter().enumerate() {
+            if t.text() == "smallvec" && toks.get(i + 1).is_some_and(|n| n.text() == "!") {
+                edits.push((t.text_range(), "vec".into()));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- indexmap
+
+/// `indexmap! { k => v, .. }` / `indexset! { x, .. }`: `IndexMap::from([(k, v), ..])` /
+/// `IndexSet::from([x, ..])` (`IndexMap::new()` when empty).
+fn indexmap_macros(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
+    for mc in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
+        let Some(name) = mc.path().and_then(|p| p.segment()?.name_ref()) else {
+            continue;
+        };
+        let ty = match name.text().to_string().as_str() {
+            "indexmap" => "IndexMap",
+            "indexset" => "IndexSet",
+            _ => continue,
+        };
+        let Some(tt) = mc.token_tree() else { continue };
+        // The items, split at top-level commas (a nested `(..)` / `[..]` / `{..}` is one child).
+        let children: Vec<_> = tt.syntax().children_with_tokens().collect();
+        // (An unclosed `indexmap! {` while typing: left for the parser's error.)
+        let closed = children.len() >= 2
+            && matches!(
+                children[children.len() - 1].kind(),
+                ra_ap_syntax::SyntaxKind::R_CURLY
+                    | ra_ap_syntax::SyntaxKind::R_BRACK
+                    | ra_ap_syntax::SyntaxKind::R_PAREN
+            );
+        if !closed {
+            continue;
+        }
+        let inner = &children[1..children.len() - 1];
+        let mut items: Vec<String> = vec![String::new()];
+        for el in inner {
+            if el.kind() == ra_ap_syntax::SyntaxKind::COMMA {
+                items.push(String::new());
+            } else if let Some(last) = items.last_mut() {
+                last.push_str(&el.to_string());
+            }
+        }
+        let items: Vec<String> = items
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let new = if items.is_empty() {
+            format!("{ty}::new()")
+        } else if ty == "IndexMap" {
+            let pairs: Vec<String> = items
+                .iter()
+                .map(|it| match it.split_once("=>") {
+                    Some((k, v)) => format!("({}, {})", k.trim(), v.trim()),
+                    None => format!("({it})"),
+                })
+                .collect();
+            format!("{ty}::from([{}])", pairs.join(", "))
+        } else {
+            format!("{ty}::from([{}])", items.join(", "))
+        };
+        edits.push((mc.syntax().text_range(), new));
+    }
+}
+
 // ---------------------------------------------------------------- crate items as prelude items
 
 /// A crate (or std module) whose items are a prelude's under other names (so they can't collide
@@ -1691,6 +1873,28 @@ const IO_RENAMES: Renames = Renames {
     ],
     star: &["Write", "Error", "ErrorKind", "stdout", "stderr", "stdin"],
     result_err: Some("IoError"),
+};
+
+// `rustc_hash`'s maps and sets are std's (a JS `Map` / `Set` hashes its own way; the faster hash
+// is the point of the crate, and the runtime's is already fast).
+const RUSTC_HASH_RENAMES: Renames = Renames {
+    roots: &["rustc_hash", "::rustc_hash"],
+    names: &[
+        ("FxHashMap", "HashMap"),
+        ("FxHashSet", "HashSet"),
+        ("FxHasher", "DefaultHasher"),
+        ("FxBuildHasher", "RandomState"),
+    ],
+    star: &["FxHashMap", "FxHashSet", "FxHasher", "FxBuildHasher"],
+    result_err: None,
+};
+
+// `fmt::Write` (`use std::fmt::Write;`): the io prelude's `FmtWrite`.
+const FMT_RENAMES: Renames = Renames {
+    roots: &["fmt", "std::fmt", "::std::fmt", "core::fmt", "::core::fmt"],
+    names: &[("Write", "FmtWrite")],
+    star: &["Write"],
+    result_err: None,
 };
 
 const LOG_RENAMES: Renames = Renames {
@@ -2064,6 +2268,8 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
     };
     for r in [
         &IO_RENAMES,
+        &FMT_RENAMES,
+        &RUSTC_HASH_RENAMES,
         &LOG_RENAMES,
         &ENV_LOGGER_RENAMES,
         &NUM_RENAMES,

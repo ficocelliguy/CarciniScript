@@ -436,8 +436,12 @@ impl Checker<'_> {
                 "HashMap",
                 "with_hasher" | "with_capacity_and_hasher" | "default",
             ] => {
-                for a in args {
-                    self.infer(a, None);
+                // (The hasher, `Default::default()` or `FxBuildHasher`, is never used: only a
+                // capacity is typed.)
+                if names.last() == Some(&"with_capacity_and_hasher")
+                    && let Some(a) = a0
+                {
+                    self.check(a, &Ty::Int(crate::ty::IntKind::Usize));
                 }
                 let (k, v) = (self.fresh(VarKind::General), self.fresh(VarKind::General));
                 Ty::Map(Box::new(k), Box::new(v))
@@ -447,10 +451,19 @@ impl Checker<'_> {
                 "HashSet",
                 "with_hasher" | "with_capacity_and_hasher" | "default",
             ] => {
-                for a in args {
-                    self.infer(a, None);
+                // (The hasher, `Default::default()` or `FxBuildHasher`, is never used: only a
+                // capacity is typed.)
+                if names.last() == Some(&"with_capacity_and_hasher")
+                    && let Some(a) = a0
+                {
+                    self.check(a, &Ty::Int(crate::ty::IntKind::Usize));
                 }
                 Ty::Set(Box::new(self.fresh(VarKind::General)))
+            }
+            // `RandomState::new()`: a map ignores its hasher, so it's nothing at run time.
+            [.., "RandomState" | "BuildHasherDefault", "new" | "default"] => {
+                count(self, 0);
+                Ty::Unit
             }
             [.., "Ref" | "RefMut", "clone"] => {
                 count(self, 1);

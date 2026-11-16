@@ -105,9 +105,12 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
     }
     // (After the rewrite: `io::Error` is `IoError`, `io::stdout()` `__io_stdout()`, ..)
     let io_names = [
-        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor",
+        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor", "FmtWrite",
     ];
-    if io_names.iter().any(|n| text.contains(n))
+    // (`use std::io::Write;` alone stays as written: its methods on a `Vec<u8>` need the impl.)
+    if (io_names.iter().any(|n| text.contains(n))
+        || text.contains("io::Write")
+        || text.contains("io::prelude"))
         && !text.contains("// (io prelude)")
         && !declares("IoError")
     {

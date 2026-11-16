@@ -186,12 +186,26 @@ fn token_tree(tt: &SyntaxNode) -> (String, String, Vec<Tok>) {
     let mut close = String::new();
     let n = items.len();
     for (i, it) in items.iter().enumerate() {
-        let spaced = items
-            .get(i + 1)
-            .is_some_and(|nx| matches!(nx.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT));
+        let spaced = items.get(i + 1).is_some_and(|nx| {
+            matches!(
+                nx.kind(),
+                SyntaxKind::WHITESPACE
+                    | SyntaxKind::COMMENT
+                    | SyntaxKind::OUTER_DOC_COMMENT
+                    | SyntaxKind::INNER_DOC_COMMENT
+            )
+        });
         match it {
             NodeOrToken::Token(t) => {
                 if matches!(t.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT) {
+                    continue;
+                }
+                // A doc comment is the attribute `#[doc = ".."]` (`#![doc = ".."]`), as in rustc.
+                if matches!(
+                    t.kind(),
+                    SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT
+                ) {
+                    toks.extend(doc_attr(t));
                     continue;
                 }
                 let is_delim = matches!(
@@ -235,6 +249,112 @@ fn token_tree(tt: &SyntaxNode) -> (String, String, Vec<Tok>) {
     (open, close, toks)
 }
 
+/// The tokens of `#[doc = ".."]` for a doc comment (`#![doc = ".."]` for an inner one). They
+/// don't hold the comment's text, so `capture` renders them rather than copying the source.
+fn doc_attr(t: &ra_ap_syntax::SyntaxToken) -> Vec<Tok> {
+    let text = t.text();
+    let body = if let Some(b) = text
+        .strip_prefix("/**")
+        .or_else(|| text.strip_prefix("/*!"))
+    {
+        b.strip_suffix("*/").unwrap_or(b)
+    } else {
+        text.get(3..).unwrap_or("")
+    };
+    let r = t.text_range();
+    let (a, b): (usize, usize) = (r.start().into(), r.end().into());
+    let leaf = |text: &str, kind| Tok::Leaf {
+        text: text.to_string(),
+        kind,
+        range: (a, a),
+        spaced: true,
+    };
+    let mut out = vec![Tok::Leaf {
+        text: "#".into(),
+        kind: SyntaxKind::POUND,
+        range: (a, a),
+        spaced: false,
+    }];
+    if t.kind() == SyntaxKind::INNER_DOC_COMMENT {
+        out.push(Tok::Leaf {
+            text: "!".into(),
+            kind: SyntaxKind::BANG,
+            range: (a, a),
+            spaced: false,
+        });
+    }
+    out.push(Tok::Group {
+        open: "[".into(),
+        close: "]".into(),
+        toks: vec![
+            leaf("doc", SyntaxKind::IDENT),
+            leaf("=", SyntaxKind::EQ),
+            leaf(&format!("{body:?}"), SyntaxKind::STRING),
+        ],
+        range: (a, b),
+        spaced: true,
+    });
+    out
+}
+
+/// Whether `t` stands for source text other than its own (a doc comment's attribute).
+fn synthetic(t: &Tok, src: &str) -> bool {
+    match t {
+        Tok::Leaf { text, range, .. } => src.get(range.0..range.1) != Some(text.as_str()),
+        Tok::Group {
+            open, range, toks, ..
+        } => {
+            !src.get(range.0..range.1)
+                .is_some_and(|s| s.starts_with(open.as_str()))
+                || toks.iter().any(|t| synthetic(t, src))
+        }
+    }
+}
+
+/// The text of `toks` (consecutive tokens of one tree): the source as written, with a doc
+/// comment's attribute written out.
+fn capture(toks: &[Tok], src: &str) -> String {
+    let (Some(first), Some(last)) = (toks.first(), toks.last()) else {
+        return String::new();
+    };
+    if !toks.iter().any(|t| synthetic(t, src)) {
+        return src[first.range().0..last.range().1].to_string();
+    }
+    let mut out = String::new();
+    let mut prev: Option<usize> = None;
+    for t in toks {
+        if let Some(p) = prev {
+            match src.get(p..t.range().0) {
+                Some(gap) => out.push_str(gap),
+                None => out.push(' '),
+            }
+        }
+        match t {
+            _ if !synthetic(t, src) => out.push_str(&src[t.range().0..t.range().1]),
+            Tok::Leaf { text, .. } => out.push_str(text),
+            Tok::Group {
+                open, close, toks, ..
+            } => {
+                out.push_str(open);
+                out.push(' ');
+                if toks.iter().all(|t| synthetic(t, src)) {
+                    let parts: Vec<String> = toks
+                        .iter()
+                        .map(|t| capture(std::slice::from_ref(t), src))
+                        .collect();
+                    out.push_str(&parts.join(" "));
+                } else {
+                    out.push_str(&capture(toks, src));
+                }
+                out.push(' ');
+                out.push_str(close);
+            }
+        }
+        prev = Some(t.range().1);
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 enum Pat {
     Tok(String),
@@ -261,7 +381,50 @@ fn rep_suffix(toks: &[Tok], i: usize) -> Option<(Option<String>, char, usize)> {
     if matches!(t2, "*" | "+") {
         return Some((Some(t1.to_string()), t2.chars().next()?, i + 2));
     }
+    // A separator of joined punctuation: `$($seg)::+`, `$(..)=>*`.
+    let mut sep = t1.to_string();
+    let mut j = i;
+    while sep.len() < 3 {
+        let Some(Tok::Leaf {
+            kind,
+            spaced: false,
+            ..
+        }) = toks.get(j)
+        else {
+            return None;
+        };
+        let next = toks.get(j + 1).and_then(Tok::text)?;
+        if !kind.is_punct() || !next.chars().all(|c| c.is_ascii_punctuation()) {
+            return None;
+        }
+        if matches!(toks.get(j + 2).and_then(Tok::text), Some("*" | "+")) {
+            sep.push_str(next);
+            return Some((Some(sep), toks[j + 2].text()?.chars().next()?, j + 3));
+        }
+        sep.push_str(next);
+        j += 1;
+    }
     None
+}
+
+/// The number of tokens at `toks[at..]` that spell the separator `sep` (`::` is two).
+fn sep_at(toks: &[Tok], at: usize, sep: &str) -> Option<usize> {
+    let mut s = String::new();
+    let mut k = 0;
+    while s.len() < sep.len() {
+        s.push_str(toks.get(at + k).and_then(Tok::text)?);
+        k += 1;
+    }
+    (s == sep).then_some(k)
+}
+
+/// A separator as the tokens that end a fragment before it (`::` → `:`, `:`).
+fn sep_tokens(sep: &str) -> Vec<String> {
+    if sep.len() > 1 && sep.chars().all(|c| c.is_ascii_punctuation()) {
+        sep.chars().map(String::from).collect()
+    } else {
+        vec![sep.to_string()]
+    }
 }
 
 fn parse_matcher(toks: &[Tok]) -> Result<Vec<Pat>, String> {
@@ -442,12 +605,7 @@ impl Matcher<'_> {
                     }
                     let end = self.fragment(kind, toks, pos, &stop)?;
                     // (An empty `vis` binds nothing.)
-                    let text = if end == pos {
-                        String::new()
-                    } else {
-                        let (s, e) = (toks[pos].range().0, toks[end - 1].range().1);
-                        self.src[s..e].to_string()
-                    };
+                    let text = capture(&toks[pos..end], self.src);
                     b.insert(name.clone(), Bound::One(text, kind == "expr"));
                     pos = end;
                 }
@@ -457,7 +615,7 @@ impl Matcher<'_> {
                     let mut iters: Vec<Bindings> = Vec::new();
                     // A greedy fragment at the end of the repetition stops at the separator.
                     let inner_follow: Vec<String> = match sep {
-                        Some(s) => vec![s.clone()],
+                        Some(s) => sep_tokens(s),
                         None => pats[i + 1..]
                             .iter()
                             .map_while(|p| match p {
@@ -480,14 +638,14 @@ impl Matcher<'_> {
                         iters.push(ib);
                         pos = next;
                         match sep {
-                            Some(s) if toks.get(pos).and_then(Tok::text) == Some(s.as_str()) => {
+                            Some(s) if let Some(k) = sep_at(toks, pos, s) => {
                                 // Only consume the separator if another repetition follows.
                                 let mut probe = Bindings::new();
                                 if self
-                                    .seq(inner, toks, pos + 1, &inner_follow, &mut probe)
+                                    .seq(inner, toks, pos + k, &inner_follow, &mut probe)
                                     .is_some()
                                 {
-                                    pos += 1;
+                                    pos += k;
                                 } else {
                                     break;
                                 }
@@ -559,6 +717,9 @@ impl Matcher<'_> {
             },
             // `expr`, `ty`, `pat`, `path`, `stmt`, `item`, `meta`, ..: everything up to the
             // literal tokens that follow the fragment in the rule (or the end).
+            // One type, as rustc parses it: `$($t:ty)*` takes `u8 Vec<u8> &str` as three.
+            "ty" if let Some(end) = ty_end(toks, pos, stop) => Some(end),
+            "item" if let Some(end) = item_end(toks, pos) => Some(end),
             _ => {
                 // Like rustc's fragment parsers: an `expr` never holds a top-level `,`, `;` or
                 // `=>`; a type or path holds commas only between `<` and `>`.
@@ -566,10 +727,21 @@ impl Matcher<'_> {
                 let mut angle = 0i32;
                 let mut end = pos;
                 while end < toks.len() {
-                    if !stop.is_empty() && starts_with(toks, end, stop) {
+                    // (A `,` between `<` and `>` is the type's own: `size_of::<R<u8, E>>()`.)
+                    if angle == 0 && !stop.is_empty() && starts_with(toks, end, stop) {
                         break;
                     }
                     let t = toks[end].text();
+                    // A closure's parameters hold commas too: `|a, b| a + b`.
+                    if t == Some("|")
+                        && kind == "expr"
+                        && (end == pos || (end == pos + 1 && toks[pos].text() == Some("move")))
+                        && let Some(close) =
+                            (end + 1..toks.len()).find(|&k| toks[k].text() == Some("|"))
+                    {
+                        end = close + 1;
+                        continue;
+                    }
                     // An expression's turbofish (`parse::<Map<K, V>>()`) holds commas too.
                     let prev = |k: usize| end.checked_sub(k).and_then(|j| toks[j].text());
                     let turbofish =
@@ -598,9 +770,162 @@ impl Matcher<'_> {
 }
 
 fn starts_with(toks: &[Tok], at: usize, seq: &[String]) -> bool {
+    // (A `:` doesn't stop at half of a `::`: `$t:ty : $n:ident` takes `core::num::X: Y`.)
+    let colon = |k: usize| toks.get(k).and_then(Tok::text) == Some(":");
+    let joint = |k: usize| matches!(toks.get(k), Some(Tok::Leaf { spaced: false, .. }));
+    let n = seq.len();
     seq.iter()
         .enumerate()
         .all(|(k, s)| toks.get(at + k).and_then(Tok::text) == Some(s.as_str()))
+        && !(seq.first().is_some_and(|s| s == ":") && at > 0 && colon(at - 1) && joint(at - 1))
+        && !(seq.last().is_some_and(|s| s == ":") && colon(at + n) && joint(at + n - 1))
+}
+
+/// The end of the one type at `toks[pos..]`: it ends at a token that can't continue it (`u8 &str`
+/// is two types, `Vec<u8>`, `Fn(u8) -> u8`, `dyn A + B` and `<T as Tr>::X` are one each). `None`
+/// when it isn't a type this recognizes (the caller then takes what comes before `stop`).
+fn ty_end(toks: &[Tok], pos: usize, stop: &[String]) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum Last {
+        Ident,
+        Call,
+        Other,
+    }
+    let text = |k: usize| toks.get(k).and_then(Tok::text);
+    let joint = |k: usize| matches!(toks.get(k), Some(Tok::Leaf { spaced: false, .. }));
+    let mut end = pos;
+    // Whether the type needs more tokens (after `&`, `::`, `dyn`, `->`, ..).
+    let mut need = true;
+    let mut last = Last::Other;
+    // After `dyn` / `impl`, `+ Send` continues the type.
+    let mut bounds = false;
+    let mut angle = 0i32;
+    // `for<'a>` is followed by the rest of the type.
+    let mut hrtb = false;
+    while end < toks.len() {
+        let t = text(end);
+        if angle > 0 {
+            match t {
+                Some("<") => angle += 1,
+                Some(">") if !matches!(text(end - 1), Some("-" | "=")) => {
+                    angle -= 1;
+                    if angle == 0 {
+                        need = hrtb;
+                        hrtb = false;
+                        last = Last::Other;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+            continue;
+        }
+        if need {
+            match (&toks[end], t) {
+                (Tok::Group { .. }, _) => {
+                    last = if end > pos && text(end - 1) == Some("fn") {
+                        Last::Call
+                    } else {
+                        Last::Other
+                    };
+                    need = false;
+                }
+                (_, Some(":")) if text(end + 1) == Some(":") && joint(end) => end += 1,
+                (_, Some("<")) => {
+                    hrtb = end > pos && text(end - 1) == Some("for");
+                    angle = 1;
+                }
+                (_, Some("dyn" | "impl")) => bounds = true,
+                (
+                    _,
+                    Some("&" | "*" | "mut" | "const" | "unsafe" | "extern" | "fn" | "for" | "?"),
+                ) => {}
+                (_, Some(l)) if l.starts_with('\'') => {
+                    if !(end > pos && text(end - 1) == Some("&")) {
+                        need = false;
+                        last = Last::Other;
+                    }
+                }
+                (Tok::Leaf { kind, .. }, _) if *kind == SyntaxKind::STRING => {}
+                (_, Some("!")) => {
+                    need = false;
+                    last = Last::Other;
+                }
+                (_, Some(x)) if x.starts_with(|c: char| c.is_alphabetic() || c == '_') => {
+                    need = false;
+                    last = Last::Ident;
+                }
+                _ => return None,
+            }
+            end += 1;
+            continue;
+        }
+        if !stop.is_empty() && starts_with(toks, end, stop) {
+            break;
+        }
+        match (&toks[end], t) {
+            (_, Some(":")) if text(end + 1) == Some(":") && joint(end) => {
+                end += 2;
+                need = true;
+            }
+            (_, Some("<")) if last == Last::Ident => {
+                angle = 1;
+                end += 1;
+            }
+            (_, Some("!"))
+                if last == Last::Ident && matches!(toks.get(end + 1), Some(Tok::Group { .. })) =>
+            {
+                end += 2;
+                last = Last::Other;
+            }
+            (Tok::Group { open, .. }, _) if last == Last::Ident && open == "(" => {
+                end += 1;
+                last = Last::Call;
+            }
+            (_, Some("-")) if last == Last::Call && text(end + 1) == Some(">") => {
+                end += 2;
+                need = true;
+            }
+            (_, Some("+")) if bounds => {
+                end += 1;
+                need = true;
+            }
+            _ => break,
+        }
+    }
+    (!need && angle == 0 && end > pos).then_some(end)
+}
+
+/// The end of the item at `toks[pos..]`: after its `;`, or its `{ .. }` body (`impl<A, B> ..`
+/// holds commas outside any group).
+fn item_end(toks: &[Tok], pos: usize) -> Option<usize> {
+    let text = |k: usize| toks.get(k).and_then(Tok::text);
+    let mut k = pos;
+    // Attributes and visibility.
+    while text(k) == Some("#") && matches!(toks.get(k + 1), Some(Tok::Group { .. })) {
+        k += 2;
+    }
+    if text(k) == Some("pub") {
+        k += 1;
+        if matches!(toks.get(k), Some(Tok::Group { open, .. }) if open == "(") {
+            k += 1;
+        }
+    }
+    // These end at their `;` (their value may hold a `{ .. }`).
+    let semi = match text(k) {
+        Some("static" | "type" | "use") => true,
+        Some("const") => !matches!(text(k + 1), Some("fn" | "unsafe" | "async" | "extern")),
+        Some("extern") => text(k + 1) == Some("crate"),
+        _ => false,
+    };
+    for (e, t) in toks.iter().enumerate().skip(k) {
+        match t {
+            Tok::Leaf { text, .. } if text == ";" => return Some(e + 1),
+            Tok::Group { open, .. } if open == "{" && !semi => return Some(e + 1),
+            _ => {}
+        }
+    }
+    (toks.len() > pos).then_some(toks.len())
 }
 
 fn is_literal(k: SyntaxKind) -> bool {
@@ -675,7 +1000,15 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
                         j += 1;
                     }
                     match t.get(j) {
-                        Some(Tpl::Tok(name, _)) if is_ident(name) => out.push(name.clone()),
+                        // (Not a pattern's constructor: `if let Some(x) = ..`, `let Point { .. }`.)
+                        Some(Tpl::Tok(name, _))
+                            if is_ident(name)
+                                && !matches!(t.get(j + 1), Some(Tpl::Group(..)))
+                                && !(t.get(j + 1).and_then(text) == Some(":")
+                                    && t.get(j + 2).and_then(text) == Some(":")) =>
+                        {
+                            out.push(name.clone())
+                        }
                         // `let (a, b) = ..`
                         Some(Tpl::Group(o, _, inner, _)) if o == "(" => {
                             for x in inner {
@@ -839,7 +1172,18 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
                         out.push_str(s);
                         out.push(' ');
                     }
+                    let at = out.len();
                     transcribe(inner, &ib, out)?;
+                    // Repetitions are separate tokens: `$($a : $b)*` → `a : b c : d`, not `bc`.
+                    // (Punctuation stays joined: `$($t)*` of `::` is `::`.)
+                    let word = |c: char| c.is_alphanumeric() || c == '_';
+                    if k > 0
+                        && sep.is_none()
+                        && out[..at].ends_with(word)
+                        && out[at..].starts_with(word)
+                    {
+                        out.insert(at, ' ');
+                    }
                 }
                 if *spaced {
                     out.push(' ');
@@ -989,6 +1333,16 @@ struct Site {
     in_expr: bool,
 }
 
+/// Whether a macro path names another crate's macro (`std::assert!`, `$crate::__priv::mem::
+/// offset_of!` in a macro that is itself `offset_of!`), not one of the file's.
+fn foreign_path(segs: &[String]) -> bool {
+    segs.split_last().is_some_and(|(_, quals)| {
+        quals
+            .iter()
+            .any(|q| matches!(q.as_str(), "std" | "core" | "alloc") || q.starts_with("__"))
+    })
+}
+
 fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Vec<Site> {
     let in_def = |n: &SyntaxNode| n.ancestors().any(|a| ast::MacroRules::can_cast(a.kind()));
     let mut sites: Vec<Site> = Vec::new();
@@ -1001,6 +1355,20 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
             continue;
         };
         if !defs.contains_key(name.text()) || in_def(c.syntax()) {
+            continue;
+        }
+        // (Not `std::name!` / `$crate::__priv::name!`, another crate's macro of the same name.)
+        let segs: Vec<String> = c
+            .path()
+            .map(|p| {
+                p.syntax()
+                    .descendants()
+                    .filter_map(ast::PathSegment::cast)
+                    .map(|s| s.syntax().text().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if foreign_path(&segs) {
             continue;
         }
         let Some(tt) = c.token_tree() else { continue };
@@ -1033,7 +1401,23 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
             .children_with_tokens()
             .filter(|e| !matches!(e.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))
             .collect();
-        for w in items.windows(3) {
+        for (k, w) in items.windows(3).enumerate() {
+            // The path before it (`log::info!(..)`), unless it's another crate's macro.
+            let text = |j: usize| items.get(j).map(|e| e.to_string()).unwrap_or_default();
+            let mut first = k;
+            let mut segs = vec![text(k)];
+            while first >= 3
+                && text(first - 1) == ":"
+                && text(first - 2) == ":"
+                && matches!(&items[first - 3], NodeOrToken::Token(t)
+                    if t.kind() == SyntaxKind::IDENT || matches!(t.text(), "crate" | "self" | "super"))
+            {
+                first -= 3;
+                segs.insert(0, text(first));
+            }
+            if foreign_path(&segs) {
+                continue;
+            }
             if let (NodeOrToken::Token(id), NodeOrToken::Token(bang), NodeOrToken::Node(args)) =
                 (&w[0], &w[1], &w[2])
                 && id.kind() == SyntaxKind::IDENT
@@ -1041,12 +1425,10 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
                 && args.kind() == SyntaxKind::TOKEN_TREE
                 && defs.contains_key(id.text())
             {
+                let start = items[first].text_range().start();
                 sites.push(Site {
                     name: id.text().to_string(),
-                    range: (
-                        id.text_range().start().into(),
-                        args.text_range().end().into(),
-                    ),
+                    range: (start.into(), args.text_range().end().into()),
                     tt: args.clone(),
                     in_expr: true,
                 });
@@ -1064,6 +1446,125 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
     out
 }
 
+/// The ranges of the `use` items (or of the trees in a `use a::{b, c}` list) that import a macro
+/// of the file by path: `pub(crate) use my_macro;`, `use crate::my_macro;`. Nothing else may
+/// have the name (a `fn` and a macro can share one).
+fn macro_uses(
+    file: &SourceFile,
+    defs: &HashMap<String, Vec<ast::MacroRules>>,
+) -> Vec<(usize, usize)> {
+    let range = |n: &SyntaxNode| -> (usize, usize) {
+        let r = n.text_range();
+        (r.start().into(), r.end().into())
+    };
+    let taken: Vec<String> = file
+        .syntax()
+        .descendants()
+        .filter(|n| !ast::MacroRules::can_cast(n.kind()))
+        .filter_map(|n| ast::Item::cast(n).and_then(|i| ast::AnyHasName::cast(i.syntax().clone())))
+        .filter_map(|i| i.name())
+        .map(|n| n.text().to_string())
+        .collect();
+    let is_macro = |name: &str| defs.contains_key(name) && !taken.iter().any(|t| t == name);
+    // Whether a path starts at this crate (`crate::`, `self::`, `super::`).
+    let in_crate = |p: &ast::Path| {
+        let first = p
+            .syntax()
+            .descendants()
+            .find_map(ast::PathSegment::cast)
+            .map(|s| s.syntax().text().to_string());
+        matches!(first.as_deref(), Some("crate" | "self" | "super"))
+    };
+    let last_name = |p: &ast::Path| {
+        p.segment()
+            .and_then(|s| s.name_ref())
+            .map(|n| n.text().to_string())
+    };
+    let mut out = Vec::new();
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        let Some(tree) = u.use_tree() else { continue };
+        if tree.rename().is_some() || tree.star_token().is_some() {
+            continue;
+        }
+        match (tree.path(), tree.use_tree_list()) {
+            (Some(p), None) => {
+                if (p.qualifier().is_none() || in_crate(&p))
+                    && last_name(&p).is_some_and(|n| is_macro(&n))
+                {
+                    out.push(range(u.syntax()));
+                }
+            }
+            (prefix, Some(list)) => {
+                if prefix.as_ref().is_some_and(|p| !in_crate(p)) {
+                    continue;
+                }
+                let trees: Vec<ast::UseTree> = list.use_trees().collect();
+                let gone: Vec<&ast::UseTree> = trees
+                    .iter()
+                    .filter(|t| {
+                        t.use_tree_list().is_none()
+                            && t.rename().is_none()
+                            && t.star_token().is_none()
+                            && t.path().is_some_and(|p| {
+                                p.qualifier().is_none()
+                                    && last_name(&p).is_some_and(|n| is_macro(&n))
+                            })
+                    })
+                    .collect();
+                if gone.is_empty() {
+                    continue;
+                }
+                if gone.len() == trees.len() {
+                    out.push(range(u.syntax()));
+                    continue;
+                }
+                for t in gone {
+                    let (a, mut b) = range(t.syntax());
+                    // (With its `,`.)
+                    let mut next = t.syntax().next_sibling_or_token();
+                    while let Some(e) = next {
+                        match e.kind() {
+                            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => {
+                                next = e.next_sibling_or_token()
+                            }
+                            SyntaxKind::COMMA => {
+                                b = e.text_range().end().into();
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    out.push((a, b));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The definition an invocation at `at` uses, of those of its name: one whose `#[cfg]` holds
+/// (`#[cfg(feature = "std")]` / `#[cfg(not(feature = "std"))]` alternatives), the last one
+/// before the invocation (a macro defined again replaces the first from there on).
+fn pick_def(defs: &[ast::MacroRules], at: usize) -> ast::MacroRules {
+    let on: Vec<&ast::MacroRules> = defs
+        .iter()
+        .filter(|d| !crate::macros::under_false_cfg(d.syntax()))
+        .collect();
+    let candidates = if on.is_empty() {
+        defs.iter().collect()
+    } else {
+        on
+    };
+    let before = candidates
+        .iter()
+        .rev()
+        .find(|d| usize::from(d.syntax().text_range().start()) < at);
+    before
+        .or(candidates.first())
+        .map_or_else(|| defs[0].clone(), |d| (*d).clone())
+}
+
 /// Expand every `macro_rules!` macro in `src`. Errors are (start, end, message) at original
 /// offsets.
 /// `expand` on text already rewritten by earlier passes, whose `map` leads back to the source.
@@ -1078,32 +1579,42 @@ fn expand_with(
     let mut changed = false;
     loop {
         let file = SourceFile::parse(&text, EDITION).tree();
-        let mut defs: HashMap<String, ast::MacroRules> = HashMap::new();
+        // Every definition of each name, in source order (`#[cfg]`-gated alternatives, or a
+        // macro defined again further down).
+        let mut all: HashMap<String, Vec<ast::MacroRules>> = HashMap::new();
         for d in file
             .syntax()
             .descendants()
             .filter_map(ast::MacroRules::cast)
         {
             if let Some(n) = d.name() {
-                defs.insert(n.text().to_string(), d);
+                all.entry(n.text().to_string()).or_default().push(d);
             }
         }
-        if defs.is_empty() {
+        if all.is_empty() {
             break;
         }
+        let defs: HashMap<String, ast::MacroRules> = all
+            .iter()
+            .filter_map(|(n, ds)| ds.last().map(|d| (n.clone(), d.clone())))
+            .collect();
         // Every outermost invocation of a file macro, outside the definitions: macro calls in
         // the syntax tree, and `name!(..)` inside other macros' arguments (token trees).
         let sites = outer_sites(&file, &defs);
         if sites.is_empty() {
             // Done: drop the definitions.
-            let mut ranges: Vec<(usize, usize)> = defs
+            let mut ranges: Vec<(usize, usize)> = all
                 .values()
+                .flatten()
                 .map(|d| {
                     let r = d.syntax().text_range();
                     (r.start().into(), r.end().into())
                 })
                 .collect();
+            // (And `pub(crate) use my_macro;`, the macro's path-based import.)
+            ranges.extend(macro_uses(&file, &all));
             ranges.sort();
+            ranges.dedup();
             for (a, b) in ranges.into_iter().rev() {
                 text.replace_range(a..b, "");
                 map.replace(a, b, 0);
@@ -1123,7 +1634,7 @@ fn expand_with(
                 ));
             }
             let name = site.name.clone();
-            let rules = rules_of(&defs[&name])
+            let rules = rules_of(&pick_def(&all[&name], a))
                 .map_err(|m| err(format!("in `macro_rules! {name}`: {m}")))?;
             let (_, _, toks) = token_tree(&site.tt);
             let m = Matcher { src: &text };
@@ -1264,7 +1775,8 @@ pub fn preprocess_with(
     };
     let mut text = full.clone();
     let mut map = OffsetMap::identity(full.len());
-    let mut changed = false;
+    // Items under a `#[cfg(..)]` that's off go first (alternative definitions of one name).
+    let mut changed = crate::macros::strip_cfg(&mut text);
     // Proc macros first: their output may define or use `macro_rules!` macros.
     if let Some((filename, resolver)) = procs {
         // (`jsx!` components can be `pub fn`s of the `mod` files.)
@@ -1287,6 +1799,8 @@ pub fn preprocess_with(
         text = e.text;
         map = e.map;
         changed = true;
+        // (Expansions can have `#[cfg]`s too.)
+        crate::macros::strip_cfg(&mut text);
     }
     let mut names = HashMap::new();
     if crate::modflat::has_inline_modules(&text) {
@@ -1306,12 +1820,23 @@ pub fn preprocess_with(
         crate::variants::expand(&mut text, &mut map);
         changed = true;
     }
+    if crate::alias::has_use_renames(&text) {
+        changed |= crate::alias::expand_use_renames(&mut text, &mut map);
+    }
     if crate::alias::has_aliases(&text) {
         crate::alias::expand(&mut text, &mut map);
         changed = true;
     }
+    // (`<u8>::max(a, b)` is `u8::max(a, b)`, for the next one.)
+    if crate::ufcs::has_type_anchors(&text) {
+        changed |= crate::ufcs::expand_type_anchors(&mut text, &mut map);
+    }
     if crate::ufcs::has_prim_paths(&text) {
         changed |= crate::ufcs::expand(&mut text, &mut map);
+    }
+    // Nested `fn`s named like another function.
+    if crate::nested::has_duplicate_fns(&text) {
+        changed |= crate::nested::expand(&mut text, &mut map);
     }
     // `std::path` / `OsStr` / `fmt::Arguments` names, `format_args!`, `env!`, `include!`.
     if crate::stdgaps::has_rewrites(&text) {

@@ -116,6 +116,11 @@ pub enum Coll {
     BTreeMap,
     /// `κσ.BTreeSet`; the view is `HashSet<T>`.
     BTreeSet,
+    /// The bundled `indexmap`'s `κσ.IndexMap` (a `HashMap`, which keeps insertion order, with
+    /// positions); the view is `HashMap<K, V>`.
+    IndexMap,
+    /// `κσ.IndexSet`; the view is `HashSet<T>`.
+    IndexSet,
 }
 
 impl Coll {
@@ -125,6 +130,8 @@ impl Coll {
             "BinaryHeap" => Coll::BinaryHeap,
             "BTreeMap" => Coll::BTreeMap,
             "BTreeSet" => Coll::BTreeSet,
+            "IndexMap" => Coll::IndexMap,
+            "IndexSet" => Coll::IndexSet,
             _ => return None,
         })
     }
@@ -135,6 +142,8 @@ impl Coll {
             Coll::BinaryHeap => "BinaryHeap",
             Coll::BTreeMap => "BTreeMap",
             Coll::BTreeSet => "BTreeSet",
+            Coll::IndexMap => "IndexMap",
+            Coll::IndexSet => "IndexSet",
         }
     }
 
@@ -528,6 +537,10 @@ pub fn std_tail<'a>(segs: &'a [&'a str]) -> &'a [&'a str] {
 
 /// A std constant such as `i32::MAX` or `f64::consts::PI`, as a JS expression and its type.
 pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
+    // `Err(fmt::Error)` from your own `fmt::Write` or `Display`.
+    if let ["fmt", "Error"] = tail {
+        return Some(("κσ.$fmtError", Ty::Extern("fmt::Error".into())));
+    }
     if let [ty_name, konst] = tail {
         if let Ty::Int(k) = Ty::from_name(ty_name) {
             // `i128` / `u128` are BigInts.

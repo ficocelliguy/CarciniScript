@@ -18,6 +18,7 @@ mod adt_check;
 mod arrays;
 #[path = "typeck_coll.rs"]
 mod coll;
+pub(crate) use coll::index_method as coll_index_method;
 #[path = "typeck_conv.rs"]
 mod conv;
 #[path = "typeck_crates.rs"]
@@ -42,6 +43,8 @@ mod ptr;
 mod quote;
 #[path = "typeck_res.rs"]
 mod res;
+#[path = "typeck_slots.rs"]
+mod slots;
 #[path = "typeck_std.rs"]
 mod std_lib;
 #[path = "typeck_trait.rs"]
@@ -89,6 +92,9 @@ pub struct Types {
     pub move_sites: std::collections::HashSet<(usize, usize)>,
     /// `write!` / `writeln!` destinations (by their start) that are `io::Write`rs.
     pub io_writes: std::collections::HashSet<usize>,
+    /// `write!` / `writeln!` destinations (by their start) that are `fmt::Write`rs of your own or
+    /// a `W: fmt::Write` parameter.
+    pub fmt_writes: std::collections::HashSet<usize>,
     /// Bindings of numbers, strings, bools or Options that live in a one-element array (a cell),
     /// because a `&mut` to them is taken or they are `&mut` parameters (by name range).
     pub boxed: std::collections::HashSet<(usize, usize)>,
@@ -244,6 +250,7 @@ impl<'a> Checker<'a> {
             param_bounds: HashMap::new(),
             into_targets: HashMap::new(),
             nested_ok: Default::default(),
+            slot_locals: HashMap::new(),
             pending_bounds: Vec::new(),
             loops: Vec::new(),
             boxed: Default::default(),
@@ -256,6 +263,7 @@ impl<'a> Checker<'a> {
             copy_arrays: Default::default(),
             move_sites: Default::default(),
             io_writes: Default::default(),
+            fmt_writes: Default::default(),
             array_fields: Default::default(),
             array_reads: Default::default(),
             cell_returns: Default::default(),
@@ -349,7 +357,7 @@ impl<'a> Checker<'a> {
                             .zip(params.iter())
                             .map(|(p, t)| {
                                 p.ty().as_ref().and_then(Self::ref_kind) == Some(true)
-                                    && self.cellable(t)
+                                    && self.cell_param(t)
                             })
                             .collect()
                     })
@@ -385,10 +393,7 @@ impl<'a> Checker<'a> {
                 {
                     self.error(
                         name.syntax(),
-                        format!(
-                            "the name `{}` is defined multiple times (functions nested in other functions share the file's namespace)",
-                            name.text()
-                        ),
+                        format!("the name `{}` is defined multiple times", name.text()),
                     );
                 }
                 self.fns.insert(name.text().to_string(), sig);
@@ -533,6 +538,7 @@ pub fn check(
             mut_bindings,
             move_sites: std::mem::take(&mut c.move_sites),
             io_writes: std::mem::take(&mut c.io_writes),
+            fmt_writes: std::mem::take(&mut c.fmt_writes),
             boxed,
             cell_args,
             slot_args,
@@ -606,6 +612,9 @@ struct Checker<'a> {
     into_targets: HashMap<String, Ty>,
     /// Expressions of type `Option<Option<T>>` that only feed a `.flatten()`.
     nested_ok: std::collections::HashSet<(usize, usize)>,
+    /// Locals holding an iterator of slots (`false`) or a Vec of them (`true`), by name, with
+    /// their items' shape (see `typeck_slots.rs`).
+    slot_locals: HashMap<String, (bool, slots::SlotShape)>,
     /// Bounds to check once a generic call's type arguments are known.
     pending_bounds: Vec<(Ty, String, SyntaxNode, usize)>,
     boxed: std::collections::HashSet<(usize, usize)>,
@@ -621,6 +630,8 @@ struct Checker<'a> {
     move_sites: std::collections::HashSet<(usize, usize)>,
     /// `write!` destinations that are `io::Write`rs (by their start).
     io_writes: std::collections::HashSet<usize>,
+    /// `write!` destinations that are `fmt::Write`rs (your own, or a type parameter's).
+    fmt_writes: std::collections::HashSet<usize>,
     /// Struct fields declared as fixed-size arrays of `Copy` values: (struct, field).
     pub(super) array_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
@@ -886,6 +897,14 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether the variable `v` appears in `t`.
+    fn occurs(&self, v: u32, t: &Ty) -> bool {
+        match self.shallow(t) {
+            Ty::Var(x) => x == v,
+            t => t.inner_types().iter().any(|i| self.occurs(v, i)),
+        }
+    }
+
     fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
         let (a, b) = (self.shallow(a), self.shallow(b));
         // `B::Item` where `B: Array<Item = A::Item>`: compare as `A::Item`.
@@ -906,6 +925,9 @@ impl<'a> Checker<'a> {
                 }
                 true
             }
+            // (Never a cyclic type, `?0 = Regex<?0>`: a struct used without its type arguments
+            // then overflowed the stack.)
+            (Ty::Var(v), t) | (t, Ty::Var(v)) if self.occurs(*v, t) => true,
             (Ty::Var(v), t) | (t, Ty::Var(v)) => {
                 let ok = match self.var_kind(&Ty::Var(*v)).unwrap() {
                     VarKind::General => true,
@@ -1597,6 +1619,7 @@ impl<'a> Checker<'a> {
         self.ret_ty = ret.clone();
         self.in_async = is_async;
         self.scopes = vec![HashMap::new()];
+        self.slot_locals.clear();
         // Const generic parameters: values in the body.
         for (n, ty) in self.const_tys.clone() {
             let local = Local {
@@ -1617,7 +1640,7 @@ impl<'a> Checker<'a> {
                     && let Some(n) = ip.name()
                 {
                     let reference = p.ty().as_ref().and_then(Self::ref_kind);
-                    if reference == Some(true) && self.cellable(&ty) {
+                    if reference == Some(true) && self.cell_param(&ty) {
                         let r = self.range(n.syntax());
                         self.boxed.insert(r);
                     }
@@ -1914,8 +1937,24 @@ impl<'a> Checker<'a> {
                             | "or_insert_with"
                             | "or_insert_with_key"
                             | "borrow_mut"
+                            | "get_or_insert"
+                            | "get_or_insert_with"
+                            | "get_or_insert_default"
                     )
                 }) =>
+            {
+                Some(true)
+            }
+            // `let r = opt.insert(v);`: a `&mut T` into the option.
+            Some(ast::Expr::MethodCallExpr(m))
+                if m.name_ref().is_some_and(|n| n.text() == "insert")
+                    && m.receiver()
+                        .and_then(|r| match strip_parens(&r) {
+                            ast::Expr::PathExpr(p) => p.path()?.as_single_name_ref(),
+                            _ => None,
+                        })
+                        .and_then(|n| self.lookup(n.text().to_string().as_str()))
+                        .is_some_and(|l| matches!(self.zonk(&l.ty), Ty::Option(_))) =>
             {
                 Some(true)
             }
@@ -1931,6 +1970,7 @@ impl<'a> Checker<'a> {
         if let (ast::Pat::IdentPat(ip), true, None) = (&pat, simple_binding, l.let_else()) {
             let Some(name) = ip.name() else { return };
             let deferred = l.initializer().is_none();
+            self.note_slot_let(&name, l.initializer().as_ref());
             let ty = match (declared, init_ty) {
                 (Some(d), _) => d,
                 (None, Some(t)) => t,
@@ -2095,6 +2135,8 @@ impl<'a> Checker<'a> {
                 local.reference = Some(true);
             }
         }
+        // `Some(x)` against `it.next()` of an `iter_mut()` over numbers: `x` is a slot.
+        self.bind_slot_option(scrutinee, pat);
     }
 
     fn let_condition(&mut self, le: &ast::LetExpr) {
@@ -4215,6 +4257,18 @@ impl<'a> Checker<'a> {
                 self.arg_count(c.syntax(), "function", 0, args.len());
                 Ty::Str
             }
+            ["String", "from"] if self.adts.from_impls.contains_key("String") => {
+                // Your `impl From<A> for String`, or the string itself.
+                let at = args.first().map(|a| self.infer(a, None));
+                if let Some(at) = at
+                    && !self.could_be(&at, &Ty::Str)
+                {
+                    self.conv_from_call(c, "String", &args);
+                    return Ty::Str;
+                }
+                self.arg_count(c.syntax(), "function", 1, args.len());
+                Ty::Str
+            }
             ["String", "from"] => {
                 self.arg_count(c.syntax(), "function", 1, args.len());
                 if let Some(a) = args.first() {
@@ -4245,6 +4299,33 @@ impl<'a> Checker<'a> {
                 Ty::Vec(Box::new(
                     elem.unwrap_or_else(|| self.fresh(VarKind::General)),
                 ))
+            }
+            // `Vec::from(array)` / `Vec::from(&slice[..])` / `Vec::from(v)`, and `Vec::from("ab")`'s
+            // bytes.
+            ["Vec" | "vec", "from"] => {
+                self.arg_count(c.syntax(), "function", 1, args.len());
+                let elem = self
+                    .segment_targs(&segs, "Vec")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| self.fresh(VarKind::General));
+                if let Some(a) = args.first() {
+                    let at = self.infer(a, None);
+                    if matches!(self.shallow(&at), Ty::Str) {
+                        self.unify(&elem, &Ty::Int(IntKind::U8));
+                    } else {
+                        let want = Ty::Vec(Box::new(elem.clone()));
+                        if !self.unify(&at, &want) {
+                            let msg = format!(
+                                "the trait bound `Vec<{}>: From<{}>` is not satisfied",
+                                self.describe(&elem),
+                                self.describe(&at)
+                            );
+                            self.error(a.syntax(), msg);
+                        }
+                    }
+                }
+                Ty::Vec(Box::new(elem))
             }
             [.., "HashMap", ctor @ ("new" | "with_capacity" | "from")] => {
                 // (`HashMap::<K, V>::new()` names them.)
@@ -4648,6 +4729,13 @@ impl<'a> Checker<'a> {
                 Some(p) if into_params.get(i) == Some(&true) => {
                     self.check_into_arg(a, p);
                 }
+                // `impl Read` given bytes (`&[u8]`): read through a `Cursor` (`byte_reader`).
+                Some(p @ Ty::Dyn(tr)) if tr == "IoRead" || tr == "IoBufRead" => {
+                    let t = self.infer(a, None);
+                    if !self.is_bytes(&t) {
+                        self.expect(a.syntax(), &t, p);
+                    }
+                }
                 Some(p) => {
                     self.check(a, p);
                 }
@@ -4656,6 +4744,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.check_byte_readers(name, args, &params);
         self.resolve_projections(false);
         if is_async {
             Ty::Future(Box::new(ret))
@@ -4677,6 +4766,12 @@ impl<'a> Checker<'a> {
             Ty::Var(_) => matches!(self.var_kind(t), Some(VarKind::Int | VarKind::Float)),
             _ => false,
         }
+    }
+
+    /// A `&mut` parameter of this type takes a cell: a number, string, bool or `Option`, or a type
+    /// parameter (which may be one: `fn bump<T: AddAssign>(x: &mut T, d: T)`).
+    pub(super) fn cell_param(&self, t: &Ty) -> bool {
+        self.cellable(t) || matches!(self.zonk(t), Ty::Param(_))
     }
 
     /// `&mut x` with `x` a number/string/bool/Option local: `x` lives in a cell.
@@ -4712,6 +4807,17 @@ impl<'a> Checker<'a> {
             ast::Expr::RefExpr(r) => {
                 let Some(inner) = r.expr() else { return };
                 match strip_parens(&inner) {
+                    // Any other local, for a `&mut T` parameter: a getter/setter cell over it.
+                    ast::Expr::PathExpr(p)
+                        if p.path().and_then(|p| p.as_single_name_ref()).is_some_and(|n| {
+                            self.lookup(n.text().to_string().as_str()).is_some_and(|l| {
+                                l.reference.is_none() && !self.cellable(&l.ty)
+                            })
+                        }) =>
+                    {
+                        let rr = self.range(r.syntax());
+                        self.slot_args.insert(rr);
+                    }
                     ast::Expr::PathExpr(_) => self.box_if_needed(&inner),
                     // `&mut *x` reborrows the cell.
                     ast::Expr::PrefixExpr(pe) if pe.op_kind() == Some(UnaryOp::Deref) => {
@@ -4750,7 +4856,11 @@ impl<'a> Checker<'a> {
                     && local.reference == Some(true)
                 {
                     let r = self.range(p.syntax());
-                    self.cell_args.insert(r);
+                    if self.cell_param(&local.ty) {
+                        self.cell_args.insert(r);
+                    } else {
+                        self.slot_args.insert(r);
+                    }
                 }
             }
             _ => {}
@@ -4910,7 +5020,20 @@ impl<'a> Checker<'a> {
             if sig.receiver == Some(crate::adt::Receiver::MutRef) {
                 self.check_mutable(&recv, Mutation::Borrow);
             }
-            let sig = self.method_inst(&sig, None);
+            // The impl's type arguments: its parameters take the receiver's, and the receiver
+            // takes its concrete ones (`HashMap::new()` is a `HashMap<String, i64>` once it calls
+            // `impl Total for HashMap<String, i64>`'s method).
+            let recv_args = crate::adt::ext_args(&self.zonk(&rt));
+            for (ra, ia) in recv_args.iter().zip(&sig.impl_args) {
+                if !matches!(ia, Ty::Param(_)) {
+                    self.unify(ra, ia);
+                }
+            }
+            let sig = if !recv_args.is_empty() && recv_args.len() == sig.impl_args.len() {
+                self.method_inst(&sig, Some(&recv_args))
+            } else {
+                self.method_inst(&sig, None)
+            };
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
             for (a, p) in args.iter().zip(&sig.params) {
                 self.check(a, p);
@@ -5238,6 +5361,20 @@ impl<'a> Checker<'a> {
                     self.check_mutable(&recv, Mutation::Borrow);
                     sig(self, &[Ty::Char], Ty::Unit)
                 }
+                // `fmt::Write`'s methods: `push_str` / `push` that return `Ok(())`.
+                "write_str" | "write_char" => {
+                    self.check_mutable(&recv, Mutation::Borrow);
+                    let arg = if method == "write_str" {
+                        Ty::Str
+                    } else {
+                        Ty::Char
+                    };
+                    let fmt_result = Ty::Result(
+                        Box::new(Ty::Unit),
+                        Box::new(Ty::Extern("fmt::Error".into())),
+                    );
+                    sig(self, &[arg], fmt_result)
+                }
                 // `s.extend(chars)` / `s.extend(strs)`
                 "extend" => {
                     self.check_mutable(&recv, Mutation::Borrow);
@@ -5338,14 +5475,17 @@ impl<'a> Checker<'a> {
                             mutable: false,
                         },
                     ),
-                    "iter_mut" => sig(
-                        self,
-                        &[],
-                        Ty::Iter {
-                            elem: Box::new(elem),
-                            mutable: true,
-                        },
-                    ),
+                    "iter_mut" => {
+                        self.note_iter_mut(m, &elem);
+                        sig(
+                            self,
+                            &[],
+                            Ty::Iter {
+                                elem: Box::new(elem),
+                                mutable: true,
+                            },
+                        )
+                    }
                     "pop" | "first" | "last" => sig(self, &[], Ty::Option(Box::new(elem))),
                     "get" => sig(self, &[USIZE], Ty::Option(Box::new(elem))),
                     // The element itself, which writes go through when it's a JS object (a struct,
@@ -5406,6 +5546,44 @@ impl<'a> Checker<'a> {
                     "replace" => {
                         self.check_mutable(&recv, Mutation::Borrow);
                         sig(self, &[inner], t)
+                    }
+                    // `&mut T` into the option (references are erased).
+                    "get_or_insert" | "insert" => {
+                        self.check_mutable(&recv, Mutation::Borrow);
+                        sig(self, &[inner.clone()], inner)
+                    }
+                    // `opt.get_or_insert_with(Vec::new)` (closures are checked elsewhere).
+                    "get_or_insert_with" => {
+                        self.check_mutable(&recv, Mutation::Borrow);
+                        match (self.ctor_path_ty(args.first()), args.first()) {
+                            (Some(made), Some(a)) => {
+                                self.record(a.syntax(), made.clone());
+                                if !self.unify(&made, &inner) {
+                                    let msg = format!(
+                                        "mismatched types: expected `{}`, found `{}`",
+                                        self.describe(&inner),
+                                        self.describe(&made)
+                                    );
+                                    self.error(a.syntax(), msg);
+                                }
+                            }
+                            (_, a) => {
+                                self.closure_arg(a, vec![], inner.clone());
+                            }
+                        }
+                        inner
+                    }
+                    "get_or_insert_default" => {
+                        self.check_mutable(&recv, Mutation::Borrow);
+                        let resolved = self.zonk(&inner);
+                        if !resolved.has_default() {
+                            let msg = format!(
+                                "the trait bound `{}: Default` is not satisfied",
+                                self.describe(&inner)
+                            );
+                            self.error(m.syntax(), msg);
+                        }
+                        sig(self, &[], inner)
                     }
                     "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" => sig(self, &[], t),
                     // Zero or one item.
@@ -5543,26 +5721,7 @@ impl<'a> Checker<'a> {
                     }
                     "or_insert_with" => {
                         // Closures don't exist yet; constructor paths like `Vec::new` work.
-                        let made = match args.first() {
-                            Some(ast::Expr::PathExpr(p)) => {
-                                let text = p.syntax().text().to_string();
-                                match std_tail(&text.split("::").collect::<Vec<_>>()) {
-                                    [.., "Vec", "new"] => {
-                                        Some(Ty::Vec(Box::new(self.fresh(VarKind::General))))
-                                    }
-                                    [.., "String", "new"] => Some(Ty::Str),
-                                    [.., "HashSet", "new"] => {
-                                        Some(Ty::Set(Box::new(self.fresh(VarKind::General))))
-                                    }
-                                    [.., "HashMap", "new"] => Some(Ty::Map(
-                                        Box::new(self.fresh(VarKind::General)),
-                                        Box::new(self.fresh(VarKind::General)),
-                                    )),
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        };
+                        let made = self.ctor_path_ty(args.first());
                         match (made, args.first()) {
                             (Some(made), Some(a)) => {
                                 self.record(a.syntax(), made.clone());
@@ -5692,7 +5851,10 @@ impl<'a> Checker<'a> {
         }
         // `deque[i]`, `btree_map[&k]`
         let bt = match self.shallow(&bt) {
-            Ty::Coll(crate::ty::Coll::VecDeque | crate::ty::Coll::BTreeMap, view) => *view,
+            Ty::Coll(
+                crate::ty::Coll::VecDeque | crate::ty::Coll::BTreeMap | crate::ty::Coll::IndexMap,
+                view,
+            ) => *view,
             other => other,
         };
         if let Ty::Map(k, v) = self.shallow(&bt) {
@@ -5889,6 +6051,10 @@ impl<'a> Checker<'a> {
                     local.reference = reference;
                 }
             }
+            // Over slots (`for r in refs`, a collected `Vec<&mut i32>`): `r` reads `r[1]`.
+            if let Some(shape) = self.for_slot_shape(&iterable) {
+                self.bind_slot_shape(&pat, &shape);
+            }
         }
         if let Some(body) = f.loop_body() {
             self.block(&body, None);
@@ -6038,6 +6204,25 @@ impl<'a> Checker<'a> {
                     return fmt_result;
                 };
                 let tt = self.macro_arg(target, None);
+                // `let mut buf = Vec::new(); write!(buf, ..)`: a `Vec<u8>`, the one `Vec` writer.
+                if let Ty::Vec(e) = self.shallow(&tt)
+                    && matches!(self.shallow(&e), Ty::Var(_))
+                    && self.adts.traits.contains_key("IoWrite")
+                {
+                    self.unify(&e, &Ty::Int(IntKind::U8));
+                }
+                // Into a `fmt::Write` of your own, or a `W: fmt::Write` (a `String`, a `Formatter`
+                // or your own writer): its `write_str` of the text.
+                if self.adts.traits.contains_key("FmtWrite")
+                    && matches!(self.zonk(&tt), Ty::Adt(..) | Ty::Param(_))
+                    && self.implements_user_trait(&tt, "FmtWrite")
+                {
+                    if args.len() > 1 {
+                        self.format_args(&args[1..]);
+                    }
+                    self.fmt_writes.insert(target.start);
+                    return fmt_result;
+                }
                 // Into an `io::Write` (`stdout()`, a `BufWriter`, your own writer): its
                 // `write_all` of the text, an `io::Result<()>`.
                 if self.adts.traits.contains_key("IoWrite")
@@ -7712,6 +7897,27 @@ impl Checker<'_> {
             }
             _ => return None,
         })
+    }
+}
+
+impl Checker<'_> {
+    /// The value a constructor path passed as a function makes (`Vec::new`, `String::new`,
+    /// `HashSet::new`, `HashMap::new`): `or_insert_with(Vec::new)` builds the type's default.
+    fn ctor_path_ty(&mut self, arg: Option<&ast::Expr>) -> Option<Ty> {
+        let Some(ast::Expr::PathExpr(p)) = arg else {
+            return None;
+        };
+        let text = p.syntax().text().to_string();
+        match std_tail(&text.split("::").collect::<Vec<_>>()) {
+            [.., "Vec", "new"] => Some(Ty::Vec(Box::new(self.fresh(VarKind::General)))),
+            [.., "String", "new"] => Some(Ty::Str),
+            [.., "HashSet", "new"] => Some(Ty::Set(Box::new(self.fresh(VarKind::General)))),
+            [.., "HashMap", "new"] => Some(Ty::Map(
+                Box::new(self.fresh(VarKind::General)),
+                Box::new(self.fresh(VarKind::General)),
+            )),
+            _ => None,
+        }
     }
 }
 

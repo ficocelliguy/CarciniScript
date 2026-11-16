@@ -227,18 +227,11 @@ impl Checker<'_> {
                             self.adts.cfg_variants.insert((en, variants.len()));
                         }
                         if let Some(d) = v.const_arg().and_then(|c| c.expr()) {
-                            let text: String = d
-                                .syntax()
-                                .text()
-                                .to_string()
-                                .chars()
-                                .filter(|c| !c.is_whitespace() && *c != '_')
-                                .collect();
-                            match text.parse::<i64>() {
-                                Ok(n) => next_discr = n,
-                                Err(_) => self.error(
+                            match const_eval(file, &d, 0).and_then(|n| i64::try_from(n).ok()) {
+                                Some(n) => next_discr = n,
+                                None => self.error(
                                     d.syntax(),
-                                    "enum discriminants must be integer literals",
+                                    "enum discriminants must be constant integer expressions (literals, `const`s, other enums' variants, arithmetic and `as` casts)",
                                 ),
                             }
                         }
@@ -651,6 +644,11 @@ impl Checker<'_> {
                 }
             }
             self.record_bound_args(&n, &lists);
+            // `impl<F, T> Memo<F, T> where F: Fn(u64) -> T`: `F` is a closure type (once every
+            // parameter it names is declared).
+            if let Some(closure) = lists.iter().find_map(|l| self.lower_fn_bounds(l)) {
+                self.generics.insert(n, closure);
+            }
         }
         self.note_where_projections(imp.where_clause());
         match imp.self_ty() {
@@ -845,17 +843,23 @@ impl Checker<'_> {
             self.adts.ext_types.insert(type_name.clone());
             self.adts.blankets.insert(tr, bounds);
         }
-        // `impl Money for f64`: a user trait for a built-in type.
+        // `impl Money for f64`: a user trait for a built-in type (and `impl From<Id> for String`).
         if !self.adts.defs.contains_key(&type_name)
             && let Some(key) = crate::adt::ext_key(&type_name)
             && trait_name
                 .as_deref()
-                .is_some_and(|t| self.adts.traits.contains_key(t))
+                .is_some_and(|t| self.adts.traits.contains_key(t) || t == "From")
         {
             type_name = key.to_string();
             self.adts.ext_types.insert(type_name.clone());
         }
         if !self.adts.defs.contains_key(&type_name) && !self.adts.ext_types.contains(&type_name) {
+            // `impl<T: Tr> Tr for &T` whose methods do more than call `T`'s: `&T` and `T` are
+            // the same value in JS, so they can't have different impls.
+            if crate::adt::wrapping_impl(imp) {
+                self.error(&node, "an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl (`(**self).method(args)`, overriding the default methods `T`'s impls override): references and boxes are erased in JS, so `&T` can't behave differently from `T`");
+                return;
+            }
             self.error(&node, format!("cannot find type `{type_name}` in this scope (impls are for structs and enums in this file)"));
             return;
         }
@@ -942,7 +946,8 @@ impl Checker<'_> {
         let self_ty = self.enter_impl(imp, &type_name);
         let impl_args = match &self_ty {
             Ty::Adt(_, args) => args.clone(),
-            _ => vec![],
+            // `impl Total for HashMap<String, i64>` / `impl<T> Tr for Option<T>`.
+            t => crate::adt::ext_args(t),
         };
         let saved = self.self_ty.replace(self_ty);
         // `type Target = Vec<i32>;`
@@ -1082,6 +1087,20 @@ impl Checker<'_> {
             };
             let Some(name) = f.name() else { continue };
             let mut method = self.lower_method(&f);
+            // A string, number, bool, char or `Option` is a JS value `this` can't change.
+            if method.receiver == Some(crate::adt::Receiver::MutRef)
+                && self.adts.ext_types.contains(&type_name)
+                && !matches!(
+                    type_name.as_str(),
+                    "Vec" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "Result"
+                )
+                && !type_name.ends_with("$all")
+            {
+                self.error(
+                    name.syntax(),
+                    format!("`&mut self` methods of a trait implemented for `{type_name}` aren't supported yet (a JS string, number or bool can't be changed in place); take `self` and return the new value"),
+                );
+            }
             method.impl_args = impl_args.clone();
             if let (Some(op), Some(rhs)) = (op, &op_rhs)
                 && name.text() == op
@@ -1196,7 +1215,7 @@ impl Checker<'_> {
                     .map(|(p, t)| {
                         (matches!(p.ty(), Some(ast::Type::RefType(r)) if r.mut_token().is_some())
                             || p.ty().is_some_and(|t| super::is_ptr_type(&t)))
-                            && self.cellable(t)
+                            && self.cell_param(t)
                     })
                     .collect()
             })
@@ -2332,4 +2351,141 @@ fn where_bounds(f: &ast::Fn, name: &str) -> Vec<ast::TypeBoundList> {
         })
         .filter_map(|p| p.type_bound_list())
         .collect()
+}
+
+/// The value of a constant integer expression, for enum discriminants: literals, `const` items,
+/// another enum's variants (`Other::X as isize`), `u8::MAX`-style bounds, arithmetic, bit
+/// operations and `as` casts between integer types. `None` for anything else.
+fn const_eval(file: &ast::SourceFile, e: &ast::Expr, depth: u32) -> Option<i128> {
+    use ast::{ArithOp, BinaryOp, UnaryOp};
+    if depth > 32 {
+        return None;
+    }
+    let ev = |e: &ast::Expr| const_eval(file, e, depth + 1);
+    match e {
+        ast::Expr::Literal(l) => match l.kind() {
+            ast::LiteralKind::IntNumber(n) => i128::try_from(n.value().ok()?).ok(),
+            ast::LiteralKind::Byte(b) => Some(i128::from(b.value().ok()?)),
+            ast::LiteralKind::Char(c) => Some(i128::from(u32::from(c.value().ok()?))),
+            ast::LiteralKind::Bool(b) => Some(i128::from(b)),
+            _ => None,
+        },
+        ast::Expr::ParenExpr(p) => ev(&p.expr()?),
+        ast::Expr::BlockExpr(b) if b.statements().next().is_none() => ev(&b.tail_expr()?),
+        ast::Expr::PrefixExpr(p) => {
+            let v = ev(&p.expr()?)?;
+            match p.op_kind()? {
+                UnaryOp::Neg => v.checked_neg(),
+                UnaryOp::Not => Some(!v),
+                _ => None,
+            }
+        }
+        ast::Expr::BinExpr(b) => {
+            let (l, r) = (ev(&b.lhs()?)?, ev(&b.rhs()?)?);
+            match b.op_kind()? {
+                BinaryOp::ArithOp(ArithOp::Add) => l.checked_add(r),
+                BinaryOp::ArithOp(ArithOp::Sub) => l.checked_sub(r),
+                BinaryOp::ArithOp(ArithOp::Mul) => l.checked_mul(r),
+                BinaryOp::ArithOp(ArithOp::Div) => l.checked_div(r),
+                BinaryOp::ArithOp(ArithOp::Rem) => l.checked_rem(r),
+                BinaryOp::ArithOp(ArithOp::Shl) => l.checked_shl(u32::try_from(r).ok()?),
+                BinaryOp::ArithOp(ArithOp::Shr) => l.checked_shr(u32::try_from(r).ok()?),
+                BinaryOp::ArithOp(ArithOp::BitAnd) => Some(l & r),
+                BinaryOp::ArithOp(ArithOp::BitOr) => Some(l | r),
+                BinaryOp::ArithOp(ArithOp::BitXor) => Some(l ^ r),
+                _ => None,
+            }
+        }
+        ast::Expr::CastExpr(c) => {
+            let v = ev(&c.expr()?)?;
+            let ast::Type::PathType(t) = c.ty()? else {
+                return None;
+            };
+            let name = t.path()?.as_single_name_ref()?.text().to_string();
+            let (bits, signed) = int_kind(&name)?;
+            if bits == 128 {
+                return Some(v);
+            }
+            let m = v.rem_euclid(1i128 << bits);
+            Some(if signed && m >= 1i128 << (bits - 1) {
+                m - (1i128 << bits)
+            } else {
+                m
+            })
+        }
+        ast::Expr::PathExpr(p) => {
+            let path = p.path()?;
+            let segs: Vec<String> = path
+                .segments()
+                .map(|s| s.name_ref().map(|n| n.text().to_string()))
+                .collect::<Option<_>>()?;
+            match segs.as_slice() {
+                [name] => {
+                    let body = crate::adt::all_items(file)
+                        .into_iter()
+                        .find_map(|i| match i {
+                            ast::Item::Const(k)
+                                if k.name().is_some_and(|n| n.text() == name.as_str()) =>
+                            {
+                                k.body()
+                            }
+                            _ => None,
+                        })?;
+                    ev(&body)
+                }
+                [ty, bound] if matches!(bound.as_str(), "MAX" | "MIN") => {
+                    let (bits, signed) = int_kind(ty)?;
+                    Some(match (bound.as_str(), signed) {
+                        ("MAX", true) => (1i128 << (bits - 1)) - 1,
+                        ("MIN", true) => -(1i128 << (bits - 1)),
+                        ("MAX", false) if bits == 128 => i128::MAX,
+                        ("MAX", false) => (1i128 << bits) - 1,
+                        _ => 0,
+                    })
+                }
+                [en, variant] => {
+                    let e = crate::adt::all_items(file)
+                        .into_iter()
+                        .find_map(|i| match i {
+                            ast::Item::Enum(e)
+                                if e.name().is_some_and(|n| n.text() == en.as_str()) =>
+                            {
+                                Some(e)
+                            }
+                            _ => None,
+                        })?;
+                    let mut next = 0i128;
+                    for v in e.variant_list()?.variants() {
+                        if let Some(d) = v.const_arg().and_then(|c| c.expr()) {
+                            next = ev(&d)?;
+                        }
+                        if v.name().is_some_and(|n| n.text() == variant.as_str()) {
+                            return Some(next);
+                        }
+                        next = next.checked_add(1)?;
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// An integer type's width and signedness (`isize` / `usize` are 64 bits here).
+fn int_kind(name: &str) -> Option<(u32, bool)> {
+    Some(match name {
+        "i8" => (8, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" | "isize" => (64, true),
+        "i128" => (128, true),
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" | "usize" => (64, false),
+        "u128" => (128, false),
+        _ => return None,
+    })
 }

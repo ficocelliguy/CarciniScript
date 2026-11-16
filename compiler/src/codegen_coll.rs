@@ -33,6 +33,8 @@ impl Codegen<'_> {
                     Coll::BinaryHeap => arg.wrap("κσ.$heapFrom([...", "])"),
                     Coll::BTreeMap => arg.wrap("κσ.BTreeMap.from(", ")"),
                     Coll::BTreeSet => arg.wrap("κσ.BTreeSet.from(", ")"),
+                    Coll::IndexMap => arg.wrap("κσ.IndexMap.from(", ")"),
+                    Coll::IndexSet => arg.wrap("κσ.IndexSet.from(", ")"),
                 }
             }
             _ => Frag::text(new_coll(kind)),
@@ -48,6 +50,44 @@ impl Codegen<'_> {
         rf: Frag,
         method: &str,
     ) -> Option<(Frag, Ty)> {
+        // indexmap's position methods: `map.$getIndex(i)`, `map.$swapRemove(k)`, ..
+        if matches!(kind, Coll::IndexMap | Coll::IndexSet)
+            && crate::typeck::coll_index_method(method)
+        {
+            let js = match method {
+                "remove" => "swapRemove".to_string(),
+                "sort_unstable_keys" => "sortKeys".to_string(),
+                "sort_unstable_by" => "sortBy".to_string(),
+                "sort_unstable" => "sort".to_string(),
+                m => {
+                    let mut out = String::new();
+                    let mut up = false;
+                    for ch in m.chars() {
+                        if ch == '_' {
+                            up = true;
+                        } else if up {
+                            out.extend(ch.to_uppercase());
+                            up = false;
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out
+                }
+            };
+            let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            let args: Vec<ast::Expr> = m.arg_list().map(|l| l.args().collect()).unwrap_or_default();
+            let mut vals = Vec::new();
+            for a in &args {
+                let (f, t) = self.emit_expr(a, None);
+                vals.push(self.by_value(a, f, &t));
+            }
+            let mut f = rf.clone();
+            f.push(format!(".${js}("))
+                .append(Frag::join(vals, ", "))
+                .push(")");
+            return Some((f.at(self.off(m.syntax())), ty));
+        }
         let js: &str = match (kind, method) {
             (Coll::VecDeque, "push_back") => "push",
             (Coll::VecDeque, "push_front") => "unshift",
@@ -180,5 +220,7 @@ pub(super) fn new_coll(kind: Coll) -> &'static str {
         Coll::VecDeque | Coll::BinaryHeap => "[]",
         Coll::BTreeMap => "new κσ.BTreeMap()",
         Coll::BTreeSet => "new κσ.BTreeSet()",
+        Coll::IndexMap => "new κσ.IndexMap()",
+        Coll::IndexSet => "new κσ.IndexSet()",
     }
 }

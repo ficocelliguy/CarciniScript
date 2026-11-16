@@ -305,6 +305,14 @@ impl Checker<'_> {
                     let adt = adt.clone();
                     self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
                 }
+                // `id.into()` as a `String` (or a number) through your `impl From<Id> for String`.
+                (Ty::Adt(..), _)
+                    if crate::adt::ext_key_of(&t)
+                        .is_some_and(|k| self.adts.from_impls.contains_key(k)) =>
+                {
+                    let adt = crate::adt::ext_key_of(&t).unwrap_or_default().to_string();
+                    self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
+                }
                 // `"x".into()` / `2.5.into()` / `true.into()` as a `JsValue`: the JS value itself.
                 (
                     Ty::Str
@@ -338,6 +346,8 @@ impl Checker<'_> {
                         Coll::BinaryHeap => "κσ.$heapFrom",
                         Coll::BTreeSet => "κσ.BTreeSet.from",
                         Coll::BTreeMap => "κσ.BTreeMap.from",
+                        Coll::IndexSet => "κσ.IndexSet.from",
+                        Coll::IndexMap => "κσ.IndexMap.from",
                     };
                     Some(Conv::Wrap { js: js.into() })
                 }

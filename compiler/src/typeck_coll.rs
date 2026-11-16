@@ -29,7 +29,7 @@ fn shared(kind: Coll, method: &str) -> bool {
                 | "drain"
         ),
         Coll::BinaryHeap => matches!(method, "len" | "is_empty" | "iter" | "clear"),
-        Coll::BTreeMap => matches!(
+        Coll::BTreeMap | Coll::IndexMap => matches!(
             method,
             "insert"
                 | "get"
@@ -51,7 +51,7 @@ fn shared(kind: Coll, method: &str) -> bool {
                 | "extend"
                 | "clear"
         ),
-        Coll::BTreeSet => matches!(
+        Coll::BTreeSet | Coll::IndexSet => matches!(
             method,
             "insert"
                 | "contains"
@@ -65,6 +65,33 @@ fn shared(kind: Coll, method: &str) -> bool {
                 | "clear"
         ),
     }
+}
+
+/// `IndexMap` / `IndexSet` methods about positions, sorting and the two kinds of removal.
+pub(crate) fn index_method(method: &str) -> bool {
+    matches!(
+        method,
+        "get_index"
+            | "get_index_of"
+            | "get_full"
+            | "insert_full"
+            | "first"
+            | "last"
+            | "pop"
+            | "remove"
+            | "swap_remove"
+            | "shift_remove"
+            | "swap_remove_index"
+            | "shift_remove_index"
+            | "sort_keys"
+            | "sort_unstable_keys"
+            | "sort_by"
+            | "sort_unstable_by"
+            | "sort"
+            | "sort_unstable"
+            | "reverse"
+            | "truncate"
+    )
 }
 
 impl Checker<'_> {
@@ -95,15 +122,19 @@ impl Checker<'_> {
 
     /// `VecDeque<T>` etc. from the written (or missing) type arguments.
     pub(super) fn coll_type(&mut self, kind: Coll, mut args: Vec<Ty>) -> Ty {
-        let want = if kind == Coll::BTreeMap { 2 } else { 1 };
+        let want = if matches!(kind, Coll::BTreeMap | Coll::IndexMap) {
+            2
+        } else {
+            1
+        };
         while args.len() < want {
             args.push(self.fresh(VarKind::General));
         }
         let b = |t: &Ty| Box::new(t.clone());
         let view = match kind {
             Coll::VecDeque | Coll::BinaryHeap => Ty::Vec(b(&args[0])),
-            Coll::BTreeSet => Ty::Set(b(&args[0])),
-            Coll::BTreeMap => Ty::Map(b(&args[0]), b(&args[1])),
+            Coll::BTreeSet | Coll::IndexSet => Ty::Set(b(&args[0])),
+            Coll::BTreeMap | Coll::IndexMap => Ty::Map(b(&args[0]), b(&args[1])),
         };
         Ty::Coll(kind, Box::new(view))
     }
@@ -164,6 +195,79 @@ impl Checker<'_> {
         Some(t)
     }
 
+    /// An `IndexMap` / `IndexSet` method about positions (see `index_method`).
+    fn index_coll_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        view: &Ty,
+        method: &str,
+        args: &[ast::Expr],
+    ) -> Ty {
+        let opt = |t: Ty| Ty::Option(Box::new(t));
+        let sig = |c: &mut Self, params: &[Ty], ret: Ty| {
+            c.arg_count(m.syntax(), "method", params.len(), args.len());
+            for (a, p) in args.iter().zip(params) {
+                c.check(a, p);
+            }
+            ret
+        };
+        match view {
+            Ty::Map(k, v) => {
+                let (k, v) = ((**k).clone(), (**v).clone());
+                let kv = Ty::Tuple(vec![k.clone(), v.clone()]);
+                match method {
+                    "get_index" => sig(self, &[USIZE], opt(kv)),
+                    "get_index_of" => sig(self, &[k], opt(USIZE)),
+                    "get_full" => sig(self, &[k.clone()], opt(Ty::Tuple(vec![USIZE, k, v]))),
+                    "insert_full" => sig(self, &[k, v.clone()], Ty::Tuple(vec![USIZE, opt(v)])),
+                    "first" | "last" | "pop" => sig(self, &[], opt(kv)),
+                    "remove" | "swap_remove" | "shift_remove" => sig(self, &[k], opt(v)),
+                    "swap_remove_index" | "shift_remove_index" => sig(self, &[USIZE], opt(kv)),
+                    "sort_keys" | "sort_unstable_keys" => {
+                        self.require_ord(m.syntax(), &k, "sort");
+                        sig(self, &[], Ty::Unit)
+                    }
+                    "sort_by" | "sort_unstable_by" => {
+                        self.arg_count(m.syntax(), "method", 1, args.len());
+                        self.closure_arg(
+                            args.first(),
+                            vec![k.clone(), v.clone(), k, v],
+                            Ty::Ordering,
+                        );
+                        Ty::Unit
+                    }
+                    "reverse" => sig(self, &[], Ty::Unit),
+                    "truncate" => sig(self, &[USIZE], Ty::Unit),
+                    _ => Ty::Unknown,
+                }
+            }
+            Ty::Set(e) => {
+                let e = (**e).clone();
+                match method {
+                    "get_index" => sig(self, &[USIZE], opt(e)),
+                    "get_index_of" => sig(self, &[e], opt(USIZE)),
+                    "insert_full" => sig(self, &[e], Ty::Tuple(vec![USIZE, Ty::Bool])),
+                    "first" | "last" | "pop" => sig(self, &[], opt(e)),
+                    "remove" | "swap_remove" | "shift_remove" => sig(self, &[e], Ty::Bool),
+                    "swap_remove_index" | "shift_remove_index" => sig(self, &[USIZE], opt(e)),
+                    "sort" | "sort_unstable" => {
+                        self.require_ord(m.syntax(), &e, "sort");
+                        sig(self, &[], Ty::Unit)
+                    }
+                    "sort_by" | "sort_unstable_by" => {
+                        self.arg_count(m.syntax(), "method", 1, args.len());
+                        self.closure_arg(args.first(), vec![e.clone(), e], Ty::Ordering);
+                        Ty::Unit
+                    }
+                    "reverse" => sig(self, &[], Ty::Unit),
+                    "truncate" => sig(self, &[USIZE], Ty::Unit),
+                    _ => Ty::Unknown,
+                }
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
     /// Methods particular to a collection kind. `None` hands the call to the view's methods.
     pub(super) fn coll_method(
         &mut self,
@@ -203,8 +307,24 @@ impl Checker<'_> {
                 | "pop_first"
                 | "pop_last"
                 | "extend"
+                | "insert_full"
+                | "swap_remove"
+                | "shift_remove"
+                | "swap_remove_index"
+                | "shift_remove_index"
+                | "sort_keys"
+                | "sort_unstable_keys"
+                | "sort_by"
+                | "sort_unstable_by"
+                | "sort"
+                | "sort_unstable"
+                | "reverse"
+                | "truncate"
         );
-        if mutates && !(kind == Coll::BTreeMap && method == "insert") {
+        if mutates
+            && !(matches!(kind, Coll::BTreeMap | Coll::IndexMap | Coll::IndexSet)
+                && method == "insert")
+        {
             self.check_mutable(recv, Mutation::Borrow);
         }
         Some(match (kind, method) {
@@ -306,6 +426,11 @@ impl Checker<'_> {
                     elem: Box::new(elem),
                     mutable: false,
                 }
+            }
+            // indexmap's positions: `get_index(i)`, `get_index_of(&k)`, `swap_remove` (what
+            // `remove` is) and `shift_remove`, sorting.
+            (Coll::IndexMap | Coll::IndexSet, m2) if index_method(m2) => {
+                self.index_coll_method(m, view, method, args)
             }
             (_, m2) if shared(kind, m2) => return None,
             _ => {

@@ -191,7 +191,7 @@ impl Codegen<'_> {
     }
 
     /// An argument as a closure (default lowering) or other function value.
-    fn fn_arg(&mut self, arg: Option<ast::Expr>) -> Frag {
+    pub(super) fn fn_arg(&mut self, arg: Option<ast::Expr>) -> Frag {
         match arg {
             Some(a) => self.emit_expr(&a, None).0,
             None => Frag::text("undefined"),
@@ -940,6 +940,8 @@ impl Codegen<'_> {
                     Ty::Str => "collectString",
                     Ty::Coll(crate::ty::Coll::BTreeSet, _) => "collectBTreeSet",
                     Ty::Coll(crate::ty::Coll::BTreeMap, _) => "collectBTreeMap",
+                    Ty::Coll(crate::ty::Coll::IndexSet, _) => "collectIndexSet",
+                    Ty::Coll(crate::ty::Coll::IndexMap, _) => "collectIndexMap",
                     Ty::Coll(crate::ty::Coll::BinaryHeap, _) => "collectHeap",
                     _ => "collectVec",
                 };

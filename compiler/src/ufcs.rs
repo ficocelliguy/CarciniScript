@@ -302,3 +302,134 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
     }
     changed
 }
+
+/// Whether `text` may have a qualified type path without a trait (`<u8>::MAX`).
+pub fn has_type_anchors(text: &str) -> bool {
+    text.contains(">::") || text.contains("> ::")
+}
+
+/// Qualified type paths without a trait, `<u8>::MAX`, `<Vec<u8>>::new()`, `<T>::f()` (also in
+/// macro arguments and `macro_rules!` expansions, `<$t>::MAX`), written as plain paths: `u8::MAX`,
+/// `Vec::<u8>::new()`. Types that aren't paths (`<[u8]>::len`, `<&str>::..`) stay. Whether
+/// anything changed.
+pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
+    let file = SourceFile::parse(text, EDITION).tree();
+    let toks: Vec<SyntaxToken> = file
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    let at = |i: usize| {
+        toks.get(i)
+            .map(|t| t.text().to_string())
+            .unwrap_or_default()
+    };
+    let start = |i: usize| usize::from(toks[i].text_range().start());
+    let end = |i: usize| usize::from(toks[i].text_range().end());
+    let in_rules = |t: &SyntaxToken| {
+        t.parent_ancestors()
+            .any(|a| matches!(a.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::ATTR))
+    };
+    // `::` is one token in a path, two `:` in a macro's tokens.
+    let colons =
+        |i: usize| at(i) == "::" || (at(i) == ":" && at(i + 1) == ":" && end(i) == start(i + 1));
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if at(i) != "<" || in_rules(&toks[i]) {
+            i += 1;
+            continue;
+        }
+        // Not generic arguments (`Vec<..>`, `f::<..>`) nor a comparison (`a < b`).
+        if i > 0 {
+            let p = &toks[i - 1];
+            let prev = at(i - 1);
+            let value_end = matches!(
+                p.kind(),
+                SyntaxKind::IDENT
+                    | SyntaxKind::INT_NUMBER
+                    | SyntaxKind::FLOAT_NUMBER
+                    | SyntaxKind::STRING
+                    | SyntaxKind::CHAR
+                    | SyntaxKind::SELF_KW
+                    | SyntaxKind::SELF_TYPE_KW
+                    | SyntaxKind::SUPER_KW
+                    | SyntaxKind::CRATE_KW
+                    | SyntaxKind::LIFETIME_IDENT
+                    | SyntaxKind::TRUE_KW
+                    | SyntaxKind::FALSE_KW
+            ) || matches!(
+                prev.as_str(),
+                "::" | ":"
+                    | ")"
+                    | "]"
+                    | ">"
+                    | "?"
+                    | "$"
+                    | "impl"
+                    | "fn"
+                    | "for"
+                    | "struct"
+                    | "enum"
+                    | "union"
+                    | "type"
+                    | "trait"
+            );
+            if value_end {
+                i += 1;
+                continue;
+            }
+        }
+        // The matching `>`, with no `as` (`<T as Tr>::f` is another pass's) at the top level.
+        let mut depth = 0usize;
+        let mut j = i + 1;
+        let mut close = None;
+        let mut nested_opens = Vec::new();
+        while j < toks.len() {
+            let t = at(j);
+            match t.as_str() {
+                "<" => {
+                    if depth == 0 && !colons(j - 1) && !(at(j - 1) == ":" && colons(j - 2)) {
+                        nested_opens.push(j);
+                    }
+                    depth += 1;
+                }
+                ">" if depth == 0 => {
+                    close = Some(j);
+                    break;
+                }
+                ">" => depth -= 1,
+                ">>" | "->" | "=>" | ";" | "{" | "}" | "=" | "as" | "<<" | "<=" | ">=" => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(c) = close else {
+            i += 1;
+            continue;
+        };
+        let first = at(i + 1);
+        let path_like = c > i + 1
+            && (toks[i + 1].kind() == SyntaxKind::IDENT
+                || matches!(first.as_str(), "Self" | "crate" | "self" | "super" | "$")
+                || first == "::");
+        if !path_like || !colons(c + 1) {
+            i += 1;
+            continue;
+        }
+        edits.push((start(i), end(i), String::new()));
+        for o in nested_opens {
+            edits.push((start(o), start(o), "::".to_string()));
+        }
+        edits.push((start(c), end(c), String::new()));
+        i = c + 1;
+    }
+    let changed = !edits.is_empty();
+    edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
+    for (a, b, new) in edits {
+        text.replace_range(a..b, &new);
+        map.replace(a, b, new.len());
+    }
+    changed
+}

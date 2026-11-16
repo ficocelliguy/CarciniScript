@@ -69,6 +69,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **A closure passed where `&mut T` is expected can only write back through collections.** Map
   slots (`retain`, `and_modify`) and `iter_mut().for_each` alias the real element; a named
   function passed in their place gets a copy.
+- **`iter_mut()` over numbers, strings or bools outside a loop yields slots** (objects whose
+  `[1]` is the element), followed through `next()`, non-closure adapters and `collect()` into a
+  `Vec<&mut T>`. A slot passed on to a function that takes `&mut i32`, or printed with `{:?}`,
+  is a copy of the element or the slot object; adapters with closures (`filter`, `map`) on such
+  an iterator are rejected.
 - **`sum()` / `product()` without a type use the element type** where rustc asks for an
   annotation.
 - **Generic functions take only `Fn`-bounded type parameters**, and each one is a single concrete
@@ -154,8 +159,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   needs `zeros::<4>()` (it's a "type annotations needed" error, not a wrong value). For the same
   reason a mismatched length (`sum::<2>([1, 2, 3])`) isn't an error. A const argument can be a
   literal, integer arithmetic on literals (`{ 128 / 8 }`), a const parameter or a `const` item,
-  not a `const fn` call. Const parameters on enums and traits, and 64/128-bit ones, aren't
-  supported.
+  not a `const fn` call. Const parameters on enums, a trait's const parameter read in the
+  trait's default methods, and 64/128-bit ones, aren't supported.
 - **Associated types are checked through function type parameters, not `impl<T>`'s or `dyn`.**
   In `fn f<S: Shape>`, `S::Unit` is its own type with the bounds the trait declares, as in
   rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
@@ -260,8 +265,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   in the initializer differs). `OnceLock` / `OnceCell` have no `take` / `into_inner`.
 - **`ensure!(a == b)` without a message** reports `Condition failed: `a == b``; anyhow 1.0.104
   also appends the two values (`(1 vs 0)`).
-- **`cfg_if!` decides for a script**: features and every OS are off, so code that picks
-  `#[cfg(windows)]` natively takes another branch here.
+- **`cfg_if!` and `cfg` decide for a script**: features and every OS are off, so code that picks
+  `#[cfg(windows)]` natively takes another branch here. The target is JS, described as rustc's
+  `wasm32-unknown-unknown` but with `target_pointer_width = "64"` (`usize` is 64 bits here).
+  `#[cfg(feature = "..")]` items are kept (a crate's code may have the feature on), and
+  `#[cfg]`s inside macro arguments (`vec![#[cfg(x)] 1]`) aren't evaluated.
 - **Only their common surface of `rand` and `itertools`** (see FEATURES.md): no
   `itertools::iproduct!` / `izip!` macros, `minmax`, `exactly_one`, `fold_while`, `kmerge`.
 - **rand's distributions:** the built-in ones have `sample` / `sample_iter` methods but don't
@@ -320,6 +328,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   than lazily. `Seek` isn't there. `Cursor::new(Vec::new())` is a `Cursor<Vec<u8>>` (as its
   `Write` impl would say in Rust); another untyped `Vec` inside a `Cursor` needs an annotation. A
   `Cursor` over a `String` accepts writes (Rust has no such impl), which don't change the string.
+- **`&[u8]` reads through a `Cursor` of its own.** Passed for an `R: Read` parameter, the bytes
+  are wrapped on entry, so reading leaves the caller's slice where it was, as passing `&[u8]` by
+  value does in Rust. Passing `&mut slice` (whose reads advance `slice` in Rust) is an error: use
+  a `Cursor`. `get_ref()` of a `BufReader` over bytes gives that `Cursor`.
 
 ## Std types and traits filled in
 
@@ -468,6 +480,18 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   chosen at compile time.
 - **A trait of yours named like a std trait** (`trait Write`) is the one `impl fmt::Write for X`
   is checked against, since traits are matched by their last path segment.
+- **`impl Tr for &T` / `&mut T` / `Box<T>` must forward to `T`'s impl.** References and boxes are
+  erased, so `&x` is `x` and its methods are `T`'s: an impl whose methods each call `T`'s
+  (`(**self).f(a)`, `T::f(self, a)`, `self.as_ref().f(a)`) is left out, and one that does
+  anything else (or leaves to the default a method another impl overrides) is an error.
+- **Arrays and slices share `Vec`'s impls**: `impl Tr for [u8; 4]` and `impl Tr for Vec<u8>` (or
+  `[u16]`) would collide, and the element type isn't checked.
+
+## Editions
+
+- **Files are parsed as the 2021 edition.** `gen` is a name (`rng.gen()`, `let gen = ..`), as in
+  rand 0.8 code; 2024-only syntax that depends on the edition (`gen` blocks, which are unstable)
+  doesn't parse.
 
 ## Macros
 
@@ -476,11 +500,19 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   names (functions, types, a `static` the body names) resolve at the call site, as in a textual
   expansion.
 - **Fragments are matched by their tokens**, the way rustc's fragment parsers would split them:
-  an `expr` ends at a top-level `,`, `;` or `=>`, a `ty` or `path` keeps commas inside `<..>`.
-  Rules that rely on finer parsing (an `expr` followed by an operator token) can match differently.
-- **`compile_error!` under a platform `#[cfg]` never fires**: a predicate about the target
-  (`unix`, `target_os = ..`) counts as off, so `#[cfg(not(any(unix, windows)))]
-  compile_error!(..)` passes but so would `#[cfg(unix)] compile_error!(..)`.
+  an `expr` ends at a top-level `,`, `;` or `=>` (a leading closure's `|a, b|` and a turbofish's
+  `<A, B>` keep theirs), a `path` keeps commas inside `<..>`, a `ty` ends at a token that can't
+  continue a type, an `item` after its `;` or `{ .. }` body. Rules that rely on finer parsing (an
+  `expr` followed by an operator token) can match differently.
+- **`#[cfg]`-gated alternative macros**: of several `macro_rules!` definitions of one name, an
+  invocation uses the last one before it whose `#[cfg]` holds (features off, `test` off). A `cfg`
+  the compiler can't evaluate (a custom `--cfg` name, a platform predicate) counts as off; when
+  every definition is off, the last one before the invocation is used.
+- **A macro's path import is dropped**: `pub(crate) use my_macro;` and `use crate::{my_macro, ..}`
+  are removed with the definitions, unless an item of the file has that name too. Another file's
+  `use crate::my_macro;` is still unresolved (macros come through `mod`, below).
+- **`compile_error!` under a target `#[cfg]` fires as it would on wasm**: `#[cfg(not(any(unix,
+  windows)))] compile_error!(..)` is an error here.
 - **`env!` is an error and `option_env!` `None`**, except for Cargo's own variables, which get
   placeholders (`CARGO_PKG_NAME` `"script"`, `CARGO_PKG_VERSION` `"0.1.0"`, `CARGO_MANIFEST_DIR`
   `"."`, the rest empty): a script isn't built by cargo.

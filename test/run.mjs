@@ -631,7 +631,12 @@ const rejected = [
   ["an or-pattern binding a name at two types", "let r: Result<i32, String> = Ok(1);\n    match r {\n        Ok(x) | Err(x) => {}\n    }", "4:17 mismatched types: `x` is `i32` in one alternative and `String` in another"],
   ["a struct builder method on a list builder", "}\nstruct P;\nimpl std::fmt::Debug for P {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        f.debug_list().field(\"a\", &1).finish()\n    }\n}\nfn g() {", "6:9 no method named `field` found for struct `DebugList` in the current scope"],
   ["a builder value without Debug", "}\nstruct Q;\nstruct P {\n    q: Q,\n}\nimpl std::fmt::Debug for P {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        f.debug_struct(\"P\").field(\"q\", &self.q).finish()\n    }\n}\nfn g() {", "9:40 `Q` doesn't implement `std::fmt::Debug`"],
-  ["cfg! of the target", "let w = cfg!(target_os = \"linux\");", "2:13 `cfg!(target_os)` isn't supported"],
+  ["cfg! with a malformed predicate", "let w = cfg!(not(unix, windows));", "2:13 `not(..)` takes one predicate"],
+  ["enum discriminant that isn't constant", "}\nfn f() -> isize { 1 }\nenum E { A = f() }\nfn g() {", "4:14 enum discriminants must be constant integer expressions"],
+  ["a required trait const next to a default one", "}\ntrait T { const N: usize = 1; const M: usize; }\nstruct S;\nimpl T for S {}\nfn g() {", "5:12 not all trait items implemented, missing: `M`"],
+  ["a trait const default of the wrong type", "}\ntrait T { const N: usize = \"x\"; }\nfn g() {", "3:28 mismatched types: expected `usize`, found `String`"],
+  ["get_or_insert on an immutable binding", "let o: Option<i32> = None;\n    *o.get_or_insert(1) += 1;", "3:6 cannot borrow `o` as mutable, as it is not declared as mutable"],
+  ["iter_mut of numbers through a closure adapter", "let mut v = vec![1, 2];\n    let mut it = v.iter_mut().filter(|x| **x > 1);", "3:18 `iter_mut()` followed by `.filter()` isn't supported yet"],
   ["TryFrom implemented twice", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<u8> for E {\n    type Error = ();\n    fn try_from(v: u8) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {", "12:8 implementing `TryFrom` more than once for `E` isn't supported yet"],
   ["try_into without a target", "let x = 5i64.try_into();", "2:13 type annotations needed: say what `.try_into()` converts to"],
   ["hash of a float", "}\nuse std::hash::{Hash, Hasher};\nstruct P(f64);\nimpl Hash for P {\n    fn hash<H: Hasher>(&self, state: &mut H) {\n        self.0.hash(state);\n    }\n}\nfn g() {", "7:9 the trait bound `f64: Hash` is not satisfied"],
@@ -734,6 +739,7 @@ const rejected = [
   ["`get_mut` on a Vec of numbers, not matched or unwrapped", "let mut v = vec![1, 2];\n    let o = v.get_mut(0);\n    if let Some(x) = o {\n        *x += 1;\n    }", "3:13 `Vec::get_mut` on a Vec of `{integer}` isn't supported here"],
   ["`impl PartialOrd` without `PartialEq`", "}\nstruct T(i32);\nimpl PartialOrd for T {\n    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { self.0.partial_cmp(&o.0) }\n}\nfn f() {", "4:1 the trait bound `T: PartialEq` is not satisfied (`PartialOrd` requires it"],
   ["a macro call no rule matches", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a = twice!();", "7:13 no rules of `macro_rules! twice` matched this invocation"],
+  ["a call matching only the `#[cfg]`-off definition of a macro", "}\n#[cfg(feature = \"x\")]\nmacro_rules! m {\n    () => { 1 };\n}\n#[cfg(not(feature = \"x\"))]\nmacro_rules! m {\n    ($x:expr) => { $x };\n}\nfn f() {\n    let a = m!();", "12:13 no rules of `macro_rules! m` matched this invocation"],
   ["a type error inside a macro expansion", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a: i32 = twice!(\"s\");", "7:18 mismatched types: expected `i32`, found `String`"],
   ["a type error after a macro expansion keeps its position", "}\nmacro_rules! twice {\n    ($x:expr) => { $x + $x };\n}\nfn f() {\n    let a = twice!(1);\n    let b: String = a;", "8:21 mismatched types: expected `String`, found `{integer}`"],
   ["mixed arithmetic", "let a: i32 = 1;\n    let b: f64 = 2.0;\n    let c = a + b;", "4:13 cannot add `f64` to `i32`"],
@@ -796,6 +802,27 @@ const rejected = [
   ["a mismatch inside `u32::pow(..)`", "let x = u32::pow(2, \"a\");", "2:25 mismatched types: expected `u32`, found `String`"],
   ["unzip of non-pairs","let v: (Vec<i32>, Vec<i32>) = vec![1, 2].into_iter().unzip();", "2:35 `unzip` needs an iterator of pairs"],
   ["returning a pointer to a number", "}\nfn g(p: *mut i32) -> *mut i32 {\n    p", "3:22 returning a raw pointer to a number, string or bool isn't supported yet"],
+  // Language gaps (PLAN): impls for `&T` / `Box<T>`, byte readers, const generics on traits.
+  [
+    "an impl for `Box<T>` that doesn't forward to `T`'s",
+    "}\ntrait T { fn a(&self) -> i32; }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 1 } }\nimpl<X: T> T for Box<X> { fn a(&self) -> i32 { (**self).a() + 1 } }\nfn f() {",
+    "6:18 an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl",
+  ],
+  [
+    "an impl for `&T` leaving a default method another impl overrides",
+    "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 0 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 1 } fn b(&self) -> i32 { 2 } }\nimpl<X: T + ?Sized> T for &X { fn a(&self) -> i32 { (**self).a() } }\nfn f() {",
+    "6:27 an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl",
+  ],
+  [
+    "reading through a `&mut &[u8]`",
+    "}\nuse std::io::Read;\nfn r<R: Read>(r: &mut R) -> usize { 0 }\nfn f() {\n    let d = vec![1u8];\n    let mut s = &d[..];\n    r(&mut s);",
+    "8:7 reading from a `&mut &[u8]` would advance the caller's slice",
+  ],
+  [
+    "a trait's const parameter in a default method",
+    "}\ntrait B<const N: usize> { fn n(&self) -> usize { N } }\nfn f() {",
+    "3:50 a trait's const generic parameter (`N`) in its default methods is not supported yet",
+  ],
   // Std gaps (PLAN "Std-library gaps").
   ["`env!` of a variable the build doesn't have", 'let v = env!("CARCINI_NOPE");', "2:13 environment variable `CARCINI_NOPE` not defined at compile time"],
   ["`compile_error!` that's reached", 'compile_error!("boom");', "2:5 boom"],
@@ -820,6 +847,11 @@ for (const [label, body, want] of rejected) {
 
 // Modules: each case is a set of files; the first is compiled.
 const rejectedFiles = [
+  [
+    "a `&mut self` trait method on `String`",
+    { "main.rs": "trait Sink {\n    fn put(&mut self, s: &str);\n}\nimpl Sink for String {\n    fn put(&mut self, s: &str) {\n        self.push_str(s);\n    }\n}\nfn main() {}\n" },
+    "5:8 `&mut self` methods of a trait implemented for `String` aren't supported yet",
+  ],
   [
     "importing a missing item through a nested module file",
     { "main.rs": "mod geo;\nuse geo::shapes::nope;\nfn main() {}", "geo.rs": "pub mod shapes;", "geo/shapes.rs": "pub fn area() {}" },

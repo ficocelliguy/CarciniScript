@@ -1045,6 +1045,12 @@
     $collectBTreeMap() {
       return BTreeMap.from(iterable(this.it));
     }
+    $collectIndexSet() {
+      return IndexSet.from(iterable(this.it));
+    }
+    $collectIndexMap() {
+      return IndexMap.from(iterable(this.it));
+    }
     $collectHeap() {
       const a = Array.from(iterable(this.it));
       heapRebuild(a);
@@ -1218,6 +1224,7 @@
     "TryFromIntError:NegOverflow": "number too small to fit in target type",
     "TryFromSliceError:": "could not convert slice to array",
     "CharTryFromError:": "converted integer out of range for `char`",
+    "Error:": "an error occurred when formatting an argument",
   };
   class ParseError {
     constructor(type, kind) {
@@ -1276,6 +1283,123 @@
     }
     $dbg(f) {
       return `Reverse(${(f ?? rt.$dbgAny)(this[0])})`;
+    }
+  }
+
+  // indexmap's IndexMap / IndexSet: the hash classes (a JS `Map` keeps insertion order) with
+  // positions. `swap_remove` (what `remove` is) moves the last entry into the hole; `shift_remove`
+  // closes it up. `valueOf` is a slot's key (`[k, v]` for a map, the item for a set).
+  function indexed(Base, keyOfSlot, out) {
+    return class extends Base {
+      static from(items) {
+        const h = new this();
+        if (keyOfSlot === null) for (const x of items) h.$insert(x);
+        else for (const [k, v] of items) h.$insert(k, v);
+        return h;
+      }
+      $clone() {
+        const h = new this.constructor();
+        for (const [kk, slot] of this.m) h.m.set(kk, clone(slot));
+        return h;
+      }
+      $slotAt(i) {
+        if (i < 0 || i >= this.m.size) return undefined;
+        let j = 0;
+        for (const s of this.m.values()) if (j++ === i) return s;
+        return undefined;
+      }
+      $getIndex(i) {
+        const s = this.$slotAt(i);
+        return s === undefined ? null : out(s);
+      }
+      $getIndexOf(k) {
+        const kk = key(k);
+        let j = 0;
+        for (const x of this.m.keys()) {
+          if (x === kk) return j;
+          j++;
+        }
+        return null;
+      }
+      $first() {
+        return this.$getIndex(0);
+      }
+      $last() {
+        return this.$getIndex(this.m.size - 1);
+      }
+      $pop() {
+        return this.$shiftRemoveIndex(this.m.size - 1);
+      }
+      $shiftRemoveIndex(i) {
+        const s = this.$slotAt(i);
+        if (s === undefined) return null;
+        this.m.delete(key(keyOfSlot === null ? s : s[0]));
+        return out(s);
+      }
+      $swapRemoveIndex(i) {
+        const entries = [...this.m];
+        if (i < 0 || i >= entries.length) return null;
+        const removed = entries[i][1];
+        const last = entries.pop();
+        if (i < entries.length) entries[i] = last;
+        this.m = new Map(entries);
+        return out(removed);
+      }
+      $reverse() {
+        this.m = new Map([...this.m].reverse());
+      }
+      $truncate(n) {
+        if (n < this.m.size) this.m = new Map([...this.m].slice(0, n));
+      }
+      $sortWith(f) {
+        this.m = new Map([...this.m].sort((a, b) => f(a[1], b[1])));
+      }
+    };
+  }
+  class IndexMap extends indexed(HashMap, (slot) => slot[0], (s) => [s[0], s[1]]) {
+    $getFull(k) {
+      const i = this.$getIndexOf(k);
+      if (i === null) return null;
+      const s = this.m.get(key(k));
+      return [i, s[0], s[1]];
+    }
+    $insertFull(k, v) {
+      const old = this.$insert(k, v);
+      return [this.$getIndexOf(k), old];
+    }
+    $swapRemove(k) {
+      const i = this.$getIndexOf(k);
+      return i === null ? null : some(this.$swapRemoveIndex(i)[1]);
+    }
+    $shiftRemove(k) {
+      return this.$remove(k);
+    }
+    $sortKeys() {
+      this.$sortWith((a, b) => cmp(a[0], b[0]));
+    }
+    $sortBy(f) {
+      this.$sortWith((a, b) => f(a[0], a[1], b[0], b[1]));
+    }
+  }
+  class IndexSet extends indexed(HashSet, null, (x) => some(x)) {
+    $insertFull(x) {
+      const added = this.$insert(x);
+      return [this.$getIndexOf(x), added];
+    }
+    $swapRemove(x) {
+      const i = this.$getIndexOf(x);
+      if (i === null) return false;
+      this.$swapRemoveIndex(i);
+      return true;
+    }
+    $shiftRemove(x) {
+      return this.$remove(x);
+    }
+    $sort() {
+      this.$sortWith(cmp);
+    }
+    $sortBy(f) {
+      this.$sortWith(f);
     }
   }
 
@@ -1812,6 +1936,8 @@
     HashMap,
     BTreeSet,
     BTreeMap,
+    IndexSet,
+    IndexMap,
     Reverse,
     $heapPush(a, x) {
       a.push(x);
@@ -2056,7 +2182,19 @@
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
-      const kind = Array.isArray(x) ? "array" : typeof x;
+      const kind = Array.isArray(x)
+        ? "array"
+        : x instanceof BTreeMap
+          ? "btreemap"
+          : x instanceof BTreeSet
+            ? "btreeset"
+            : x instanceof HashMap
+              ? "map"
+              : x instanceof HashSet
+                ? "set"
+                : x instanceof Res
+                  ? "result"
+                  : typeof x;
       let pick = null;
       for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
@@ -2350,6 +2488,13 @@
           a[j] = v;
         },
       };
+    },
+    // `v.iter_mut()` of numbers, strings or bools outside a loop by index: each item is a slot
+    // whose `[1]` reads and writes the element.
+    $iterMutSlots(a) {
+      return Iter.of(function* () {
+        for (let i = 0; i < a.length; i++) yield rt.$vecSlot(a, i);
+      });
     },
     $andModify(map, k, modify) {
       const slot = map.m.get(key(k));
@@ -2873,6 +3018,19 @@
     },
     // `f.debug_struct("P")` and friends; see `DbgBuilder`.
     DbgBuilder,
+    // `fmt::Error`.
+    $fmtError: new ParseError("Error", ""),
+    // `w.write_str(s)` / `write!(w, ..)` for a `w: &mut W` with `W: fmt::Write`: `c` is its cell,
+    // holding a `String`, a Formatter or your own writer.
+    $fmtWriteCall(c, method, s) {
+      const w = c[0];
+      if (typeof w === "string") {
+        c[0] = w + s;
+        return new Res(0, undefined);
+      }
+      if (w !== null && typeof w === "object" && typeof w[method] === "function") return w[method](s);
+      return rt.$write(w, s, false);
+    },
     // `Display` impls write into a Formatter: `{ s: "" }`.
     $write(f, s, nl) {
       f.s += nl ? s + "\n" : s;
@@ -3576,9 +3734,10 @@
       const into = (target, from) => {
         for (const k of Object.getOwnPropertyNames(from)) {
           for (const name of tr ? [k, `${tr}$${k}`] : [k]) {
-            // (A class's own `name` and `length` aren't methods: those may be replaced.)
+            // (A class's own `name` and `length` aren't its items: those may be replaced. Its
+            // own constants (`static N = 5`) override a trait's default ones.)
             const own = Object.getOwnPropertyDescriptor(target, name);
-            if (!own || (target === cls && typeof own.value !== "function")) {
+            if (!own || (target === cls && (name === "name" || name === "length"))) {
               Object.defineProperty(target, name, Object.getOwnPropertyDescriptor(from, k));
             }
           }

@@ -561,6 +561,7 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
         || crate::ufcs::has_prim_paths(src)
         || src.contains("include_str!")
         || src.contains("include_bytes!")
+        || src.contains("cfg(")
         || crate::stdgaps::has_rewrites(src)
         // (`mac::show!(..)`, `#[derive(mac::Show)]`: a proc-macro crate, maybe)
         || src.contains("::")
@@ -999,6 +1000,9 @@ impl<'a> Codegen<'a> {
             crate::adt::Conv::Identity => value,
             crate::adt::Conv::Method { key } => value.wrap("(", &format!(").{key}()")),
             crate::adt::Conv::Ext { .. } => value,
+            crate::adt::Conv::From { adt, key } if self.types.adts.ext_types.contains(&adt) => {
+                value.wrap(&format!("$ext${adt}.{key}("), ")")
+            }
             crate::adt::Conv::From { adt, key } => {
                 value.wrap(&format!("{}.{}(", self.class(&adt), key), ")")
             }
@@ -2021,6 +2025,19 @@ impl<'a> Codegen<'a> {
             );
             return;
         }
+        // `let r = opt.get_or_insert(0);`: `r` aliases the option, so `*r += 1` sticks.
+        if matches!(&init, ast::Expr::MethodCallExpr(_))
+            && let Some((fill, place)) = self.option_place(&init)
+        {
+            self.line(Frag::mapped(start, "").append(fill).push(";").clone());
+            let ty = self.ty_of(init.syntax()).unwrap_or(Ty::Unknown);
+            let local = Local {
+                js: place.plain(),
+                ty,
+            };
+            self.declare(name.text(), Some(name.syntax()), local);
+            return;
+        }
         // `let v = map.entry(k).or_insert(0);`: `v` aliases the slot's value, so `*v += 1` sticks.
         if let ast::Expr::MethodCallExpr(m) = &init
             && let Some(slot) = self.entry_slot(m)
@@ -2964,6 +2981,16 @@ impl<'a> Codegen<'a> {
     fn emit_expr_inner(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> (Frag, Ty) {
         match e {
             ast::Expr::Literal(l) => self.emit_literal(l, expected),
+            // A `&mut` parameter that isn't a cell, handed on to a `&mut T`: a cell over it.
+            ast::Expr::PathExpr(p) if self.types.slot_args.contains(&self.range_of(p.syntax())) => {
+                let (pf, t) = self.emit_path(p);
+                let mut f = Frag::text("({ get 0() { return ");
+                f.append(pf.clone())
+                    .push("; }, set 0($v) { ")
+                    .append(pf)
+                    .push(" = $v; } })");
+                (f, t)
+            }
             ast::Expr::PathExpr(p) => self.emit_path(p),
             ast::Expr::ParenExpr(p) => match p.expr() {
                 Some(inner) => {
@@ -3687,7 +3714,14 @@ impl<'a> Codegen<'a> {
                                 self.ty_of(lhs.syntax()).unwrap_or(Ty::Unknown),
                             )
                         }
-                        None => self.emit_expr(&lhs, None),
+                        // `*opt.get_or_insert(0) += 1`: fill it, then write to the option.
+                        None => match self.option_place(&lhs) {
+                            Some((fill, place)) => {
+                                self.line(fill.wrap("", ";"));
+                                (place, self.ty_of(lhs.syntax()).unwrap_or(Ty::Unknown))
+                            }
+                            None => self.emit_expr(&lhs, None),
+                        },
                     },
                 };
                 let (rf, rt) = self.operand(&rhs, Some(&lt));
@@ -3734,14 +3768,27 @@ impl<'a> Codegen<'a> {
                 (f, Ty::Unit)
             }
             BinaryOp::LogicOp(op) => {
-                if needs_hoist(rhs.syntax()) {
-                    self.unsupported(
-                        rhs.syntax(),
-                        "block expressions on the right of `&&`/`||`",
-                        1,
-                    );
-                }
                 let (lf, _) = self.operand(&lhs, Some(&Ty::Bool));
+                // `a && { let x = f(); x > 1 }`: the right side's statements only run when the
+                // left doesn't decide.
+                if needs_hoist(rhs.syntax()) {
+                    let t = self.temp();
+                    let mut f = Frag::text(format!("let {t} = "));
+                    f.append(lf).push(";");
+                    self.line(f);
+                    let not = if op == LogicOp::And { "" } else { "!" };
+                    self.line(Frag::text(format!("if ({not}{t}) {{")));
+                    self.out.indent += 1;
+                    self.scopes.push(HashMap::new());
+                    let (rf, _) = self.emit_expr(&rhs, Some(&Ty::Bool));
+                    let mut f = Frag::text(format!("{t} = "));
+                    f.append(rf).push(";");
+                    self.line(f);
+                    self.scopes.pop();
+                    self.out.indent -= 1;
+                    self.line(Frag::text("}"));
+                    return (Frag::text(t), Ty::Bool);
+                }
                 let (rf, _) = self.operand(&rhs, Some(&Ty::Bool));
                 let mut f = lf;
                 f.push(if op == LogicOp::And { " && " } else { " || " })
@@ -4160,6 +4207,13 @@ impl<'a> Codegen<'a> {
         if matches!(inner, ast::Expr::RefExpr(_)) {
             return f;
         }
+        // A `&mut` parameter handed on (as its cell).
+        if let ast::Expr::PathExpr(p) = &inner {
+            let r = self.range_of(p.syntax());
+            if self.types.cell_args.contains(&r) || self.types.slot_args.contains(&r) {
+                return f;
+            }
+        }
         let place = matches!(
             strip_refs(e),
             ast::Expr::PathExpr(_)
@@ -4379,6 +4433,19 @@ impl<'a> Codegen<'a> {
                 && matches!(local.ty, Ty::IntoIter(_))
             {
                 lines.push(format!("{0} = κσ.$intoIter({0});", local.js));
+            }
+        }
+        // An `R: Read` parameter given bytes (`&[u8]`): a `Cursor` over them, which reads.
+        for p in f.param_list().into_iter().flat_map(|pl| pl.params()) {
+            if let Some(ast::Pat::IdentPat(ip)) = p.pat()
+                && let Some(n) = ip.name()
+                && p.ty().is_some_and(|t| byte_reader(f, &t))
+                && let Some(local) = self.lookup(n.text().to_string().as_str())
+            {
+                lines.push(format!(
+                    "if (Array.isArray({0})) {0} = IoCursor.new({0});",
+                    local.js
+                ));
             }
         }
         for (n, js, ty) in consts {
@@ -4755,12 +4822,30 @@ impl<'a> Codegen<'a> {
             ["Vec" | "vec", "new" | "with_capacity"] => {
                 (Frag::text("[]"), Ty::Vec(Box::new(Ty::Unknown)))
             }
+            ["Vec" | "vec", "from"] => {
+                let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
+                let Some(arg) = c.arg_list().and_then(|l| l.args().next()) else {
+                    return (Frag::text("[]"), ty);
+                };
+                let (f, at) = self.emit_expr(&arg, None);
+                let f = if at == Ty::Str {
+                    f.wrap("κσ.$utf8(", ")")
+                } else {
+                    f.wrap("κσ.$clone(", ")")
+                };
+                (f, ty)
+            }
             ["String", "from"] => {
                 let a = self.emit_args(c.arg_list(), &[Ty::Str]);
-                (
-                    a.into_iter().next().unwrap_or_else(|| Frag::text("\"\"")),
-                    Ty::Str,
-                )
+                let a = a.into_iter().next().unwrap_or_else(|| Frag::text("\"\""));
+                // Through your `impl From<Id> for String`.
+                let a = match self.conv_of(c.syntax()) {
+                    Some(conv @ crate::adt::Conv::From { .. }) if matches!(&conv, crate::adt::Conv::From { adt, .. } if adt == "String") => {
+                        self.convert(conv, a)
+                    }
+                    _ => a,
+                };
+                (a, Ty::Str)
             }
             ["cmp", f @ ("max" | "min")] => {
                 let a = self.emit_args(c.arg_list(), &[]);
@@ -4879,6 +4964,21 @@ impl<'a> Codegen<'a> {
         name_off: usize,
     ) -> Frag {
         let args = self.emit_args(m.arg_list(), &[]);
+        // `w.write_str(s)` with `W: fmt::Write`: `w` may be a `String` or a `Formatter`, so the
+        // call goes through its cell.
+        if matches!(method, "write_str" | "write_char")
+            && self.types.adts.traits.contains_key("FmtWrite")
+            && let Some(recv) = m.receiver()
+            && let Some(cell) = self.writer_cell(&recv)
+        {
+            let mut f = Frag::mapped(name_off, format!("κσ.$fmtWriteCall({cell}, "));
+            f.push(js_string(&adt_gen::prop(method)));
+            for a in args {
+                f.push(", ").append(a);
+            }
+            f.push(")");
+            return f;
+        }
         let ext = self
             .types
             .adts
@@ -4888,7 +4988,7 @@ impl<'a> Codegen<'a> {
         if ext {
             let mut f = Frag::mapped(name_off, "κσ.$dcall($extRegs, ");
             f.append(rf.clone())
-                .push(format!(", {}", js_string(method)));
+                .push(format!(", {}", js_string(&adt_gen::prop(method))));
             for a in args {
                 f.push(", ").append(a);
             }
@@ -4902,6 +5002,20 @@ impl<'a> Codegen<'a> {
             .append(Frag::join(args, ", "))
             .push(")");
         f
+    }
+
+    /// The cell of a `w: &mut W` parameter (`W: fmt::Write`) that `write!` or `w.write_str(..)`
+    /// writes through.
+    fn writer_cell(&self, e: &ast::Expr) -> Option<String> {
+        let ast::Expr::PathExpr(p) = crate::typeck::strip_parens(e) else {
+            return None;
+        };
+        let name = p.path()?.as_single_name_ref()?;
+        let local = self.lookup(name.text())?;
+        if !matches!(local.ty, Ty::Param(_)) {
+            return None;
+        }
+        local.js.strip_suffix("[0]").map(str::to_string)
     }
 
     /// `v[a..b].sort()` and the other in-place slice methods on a range of a Vec.
@@ -4951,6 +5065,35 @@ impl<'a> Codegen<'a> {
         let name_off = self.off(name.syntax());
         let method = name.text().to_string();
         let node = m.syntax().clone();
+        // `s.get_or_insert_with(String::new).push_str(..)`: a JS string can't change in place, so
+        // the option is filled first and the method works on it as a place.
+        if self.recv_override.is_none()
+            && matches!(
+                method.as_str(),
+                "push_str"
+                    | "push"
+                    | "insert"
+                    | "insert_str"
+                    | "clear"
+                    | "truncate"
+                    | "pop"
+                    | "remove"
+                    | "retain"
+                    | "extend"
+                    | "drain"
+                    | "replace_range"
+                    | "make_ascii_uppercase"
+                    | "make_ascii_lowercase"
+            )
+            && matches!(self.ty_of(recv.syntax()), Some(Ty::Str))
+            && let Some((fill, place)) = self.option_place(&recv)
+        {
+            self.line(fill.wrap("", ";"));
+            self.recv_override = Some((self.range_of(recv.syntax()), place.plain(), Ty::Str));
+            let out = self.emit_method(m);
+            self.recv_override = None;
+            return out;
+        }
         // A range value's own methods.
         if let Some(Ty::Range(elem, incl)) = self.raw_ty_of(recv.syntax()) {
             let helper = match method.as_str() {
@@ -5178,7 +5321,15 @@ impl<'a> Codegen<'a> {
         if let Some(key) = ext {
             let sig = self.types.adts.method(&key, &method).cloned();
             let (rf, rt) = self.emit_expr(&recv, None);
-            let rf = self.by_value(&recv, rf, &rt);
+            // (Only a `self` receiver takes a copy: `&mut self` writes into the value itself.)
+            let rf = if sig
+                .as_ref()
+                .is_some_and(|s| s.receiver != Some(crate::adt::Receiver::Value))
+            {
+                rf
+            } else {
+                self.by_value(&recv, rf, &rt)
+            };
             let params = sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
             let mut args = self.emit_args(m.arg_list(), &params);
             // A blanket impl's method takes the receiver's `{:?}` formatter.
@@ -5571,15 +5722,30 @@ impl<'a> Codegen<'a> {
                 ),
                 "push_str" | "push" => {
                     // Lowered as `s += x`, so the receiver must be an assignable JS place.
-                    if !is_pure(&strip_refs(&recv)) {
+                    if !self.place_receiver(&recv) {
                         self.unsupported(&node, "`push_str` on this expression", 1);
                     }
                     let mut f = rf.clone();
                     f.push(" += ").append(a(0));
                     (f, Ty::Unit)
                 }
-                "extend" => {
+                "write_str" | "write_char" => {
                     if !is_pure(&strip_refs(&recv)) {
+                        self.unsupported(&node, "`write_str` on this expression", 1);
+                    }
+                    let mut f = Frag::text("(");
+                    f.append(rf.clone())
+                        .push(" += ")
+                        .append(a(0))
+                        .push(", κσ.Ok(undefined))");
+                    let fmt_result = Ty::Result(
+                        Box::new(Ty::Unit),
+                        Box::new(Ty::Extern("fmt::Error".into())),
+                    );
+                    (f, fmt_result)
+                }
+                "extend" => {
+                    if !self.place_receiver(&recv) {
                         self.unsupported(&node, "`extend` on this expression", 1);
                     }
                     let mut f = rf.clone();
@@ -6061,6 +6227,26 @@ impl<'a> Codegen<'a> {
         inner: &Ty,
         method: &str,
     ) -> (Frag, Ty) {
+        // (Before the arguments are emitted: `Vec::new` there isn't a value.)
+        if matches!(
+            method,
+            "get_or_insert" | "get_or_insert_with" | "get_or_insert_default" | "insert"
+        ) {
+            if !is_pure(&strip_refs(recv)) {
+                self.unsupported(
+                    m.syntax(),
+                    &format!("`Option::{method}` on this expression"),
+                    1,
+                );
+            }
+            let f = self.option_fill(m, rf, inner, method);
+            let f = if nullable_payload(inner) {
+                f.wrap("κσ.$unsome(", ")")
+            } else {
+                f
+            };
+            return (f, inner.clone());
+        }
         let name_off = m.name_ref().map(|n| self.off(n.syntax())).unwrap_or(0);
         // rustc's `#[track_caller]` location for a method call is the method name.
         let loc = js_string(&self.location_at(name_off));
@@ -6173,6 +6359,83 @@ impl<'a> Codegen<'a> {
             }
             _ => self.no_method(m.syntax(), method, &opt),
         }
+    }
+
+    /// `opt.get_or_insert_with(f)` / `get_or_insert(v)` / `get_or_insert_default()` /
+    /// `insert(v)` on the option at `rf` (an assignable place): `(opt ??= v)`, which fills it
+    /// and gives what it holds (`κσ.$some`-wrapped when that's an `Option` too).
+    fn option_fill(&mut self, m: &ast::MethodCallExpr, rf: Frag, inner: &Ty, method: &str) -> Frag {
+        let arg = m.arg_list().and_then(|a| a.args().next());
+        let value = match method {
+            // (A constructor path, `Vec::new`, makes the type's default.)
+            "get_or_insert_with"
+                if !arg.as_ref().is_some_and(|a| {
+                    matches!(a, ast::Expr::ClosureExpr(_))
+                        || matches!(self.ty_of(a.syntax()), Some(Ty::Closure { .. }))
+                }) =>
+            {
+                Frag::text(default_value(inner).unwrap_or_else(|| "undefined".into()))
+            }
+            "get_or_insert_with" => self.fn_arg(arg).wrap("(", ")()"),
+            "get_or_insert_default" => {
+                Frag::text(default_value(inner).unwrap_or_else(|| "undefined".into()))
+            }
+            _ => match arg {
+                Some(a) => self.emit_expr(&a, Some(inner)).0,
+                None => Frag::text("undefined"),
+            },
+        };
+        let value = if nullable_payload(inner) {
+            value.wrap("κσ.$some(", ")")
+        } else {
+            value
+        };
+        let op = if method == "insert" { " = " } else { " ??= " };
+        let mut f = Frag::mapped(self.off(m.syntax()), "(");
+        f.append(rf).push(op).append(value).push(")");
+        f
+    }
+
+    /// Whether a method can assign to its receiver `recv`: a place expression, or one standing
+    /// in for a place (`recv_override`).
+    pub(super) fn place_receiver(&self, recv: &ast::Expr) -> bool {
+        is_pure(&strip_refs(recv))
+            || self
+                .recv_override
+                .as_ref()
+                .is_some_and(|(r, _, _)| *r == self.range_of(recv.syntax()))
+    }
+
+    /// `*opt.get_or_insert(0) += 1` / `let r = opt.get_or_insert_with(Vec::new);`: the option
+    /// as a place (a local, field or element), after `(opt ??= v)` fills it. `None` for other
+    /// expressions.
+    fn option_place(&mut self, e: &ast::Expr) -> Option<(Frag, Frag)> {
+        let e = match strip_parens_expr(e) {
+            ast::Expr::PrefixExpr(p) if p.op_kind() == Some(ast::UnaryOp::Deref) => {
+                strip_parens_expr(&p.expr()?)
+            }
+            other => other,
+        };
+        let ast::Expr::MethodCallExpr(m) = e else {
+            return None;
+        };
+        let method = m.name_ref()?.text().to_string();
+        if !matches!(
+            method.as_str(),
+            "get_or_insert" | "get_or_insert_with" | "get_or_insert_default" | "insert"
+        ) {
+            return None;
+        }
+        let recv = m.receiver()?;
+        let Some(Ty::Option(inner)) = self.ty_of(recv.syntax()) else {
+            return None;
+        };
+        if nullable_payload(&inner) || !is_pure(&strip_refs(&recv)) {
+            return None;
+        }
+        let (rf, _) = self.receiver(&recv);
+        let fill = self.option_fill(&m, rf.clone(), &inner, &method);
+        Some((fill, rf))
     }
 
     // ---------------------------------------------------------------- HashMap
@@ -6731,6 +6994,8 @@ impl<'a> Codegen<'a> {
         if self.types.slot_calls.contains(&self.range_of(m.syntax())) {
             // A slot over the element (`{ get 1(), set 1() }`), or null when there's none.
             let f = match method {
+                // `iter_mut()` outside a loop by index: an iterator of slots.
+                "iter_mut" => helper("iterMutSlots", vec![]),
                 "first_mut" => helper("vecSlot", vec![Frag::text("0")]),
                 "last_mut" => helper("vecSlot", vec![Frag::text("-1")]),
                 _ => helper("vecSlot", vec![a(0)]),
@@ -7030,10 +7295,44 @@ impl<'a> Codegen<'a> {
                     Frag::text("\"\"")
                 };
                 let nl = name == "writeln";
-                // Into an `io::Write`: `w.__write_str(text)`.
+                // Into a `fmt::Write`: `w.__write_str(text)`, or through the cell of a
+                // `W: fmt::Write` parameter (a `String` or `Formatter` has no such method).
+                if self.types.fmt_writes.contains(&target.start) {
+                    let mut text = tpl;
+                    if nl {
+                        text.push(" + \"\\n\"");
+                    }
+                    let mut f = Frag::mapped(start, "");
+                    match crate::macros::parse_arg(target)
+                        .0
+                        .and_then(|e| self.writer_cell(&e))
+                    {
+                        Some(cell) => {
+                            f.push(format!(
+                                "κσ.$fmtWriteCall({cell}, {}, ",
+                                js_string(&adt_gen::prop("__write_str"))
+                            ))
+                            .append(text)
+                            .push(")");
+                        }
+                        None => {
+                            f.append(tf).push(".__write_str(").append(text).push(")");
+                        }
+                    }
+                    return (f, fmt_result);
+                }
+                // Into an `io::Write`: `w.__write_str(text)` (through `κσ.$dcall` for a
+                // `Vec<u8>` or a type parameter, which may be one).
                 if self.types.io_writes.contains(&target.start) {
                     let mut f = Frag::mapped(start, "");
-                    f.append(tf).push(".__write_str(").append(tpl);
+                    if crate::adt::ext_key_of(&tt).is_some() || matches!(tt, Ty::Param(_)) {
+                        f.push("κσ.$dcall($extRegs, ")
+                            .append(tf)
+                            .push(format!(", {}, ", js_string(&adt_gen::prop("__write_str"))))
+                            .append(tpl);
+                    } else {
+                        f.append(tf).push(".__write_str(").append(tpl);
+                    }
                     if nl {
                         f.push(" + \"\\n\"");
                     }
@@ -7715,4 +8014,55 @@ fn macro_arg_names(node: &SyntaxNode) -> Vec<String> {
 /// include `null` / `undefined`.
 fn nullable_payload(t: &Ty) -> bool {
     matches!(t, Ty::Option(_) | Ty::Unit)
+}
+
+/// Whether parameter type `t` of `f` is an `R: Read` / `R: BufRead` (`f`'s or its impl's),
+/// `impl Read` or `Box<dyn Read>` taken by value: what `&[u8]` may be passed as.
+fn byte_reader(f: &ast::Fn, t: &ast::Type) -> bool {
+    use ast::HasTypeBounds;
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let reads = |l: Option<ast::TypeBoundList>| {
+        l.into_iter().flat_map(|l| l.bounds()).any(|b| {
+            matches!(b.ty(), Some(ast::Type::PathType(p)) if p.path().and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "IoRead" || n.text() == "IoBufRead"))
+        })
+    };
+    let name = match t {
+        ast::Type::ImplTraitType(it) => return reads(it.type_bound_list()),
+        ast::Type::PathType(p) => match p.path().and_then(|p| p.segment()) {
+            // `Box<dyn Read>`
+            Some(seg) if seg.name_ref().is_some_and(|n| n.text() == "Box") => {
+                return seg
+                    .generic_arg_list()
+                    .and_then(|l| l.generic_args().next())
+                    .is_some_and(|g| {
+                        matches!(g, ast::GenericArg::TypeArg(ta)
+                            if matches!(ta.ty(), Some(ast::Type::DynTraitType(d)) if reads(d.type_bound_list())))
+                    });
+            }
+            _ => match p.path().and_then(|p| p.as_single_name_ref()) {
+                Some(n) => n.text().to_string(),
+                None => return false,
+            },
+        },
+        _ => return false,
+    };
+    let imp = f.syntax().ancestors().find_map(ast::Impl::cast);
+    let scopes = [
+        (f.generic_param_list(), f.where_clause()),
+        (
+            imp.as_ref().and_then(|i| i.generic_param_list()),
+            imp.as_ref().and_then(|i| i.where_clause()),
+        ),
+    ];
+    scopes.into_iter().any(|(params, wc)| {
+        params.into_iter().flat_map(|l| l.generic_params()).any(|g| {
+            matches!(g, ast::GenericParam::TypeParam(tp)
+                if tp.name().is_some_and(|n| n.text() == name.as_str()) && reads(tp.type_bound_list()))
+        }) || wc.into_iter().flat_map(|w| w.predicates()).any(|pred| {
+            pred.ty().is_some_and(|t| t.syntax().text() == name.as_str())
+                && reads(pred.type_bound_list())
+        })
+    })
 }

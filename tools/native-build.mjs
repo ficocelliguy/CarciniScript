@@ -28,6 +28,9 @@ const VERSIONS = {
   chrono: "0.4",
   chrono_tz: "0.10",
   clap: "4",
+  rustc_hash: "2",
+  smallvec: "1",
+  indexmap: "2",
 };
 const CRATES = Object.keys(VERSIONS).concat(["lazy_static", "hashbrown"]).join("|");
 const uses = (src, c) => new RegExp(`\\b${c}(::|!)|\\buse ${c}\\b`).test(src);
@@ -36,8 +39,10 @@ export const usesCrates = (src) => new RegExp(`\\b(${CRATES})(::|!)|\\buse (${CR
 /** Compile `file` to the executable `exe` (`debug`: without optimizations). Throws on errors. */
 export function buildNative(file, exe, { debug = false } = {}) {
   const src = fs.readFileSync(file, "utf8");
+  // A `// edition: 2021` line builds the program as that edition (e.g. for `rng.gen()`).
+  const edition = /^\/\/ edition: (\d{4})\r?$/m.exec(src)?.[1] ?? "2024";
   if (!usesCrates(src)) {
-    const args = [...(debug ? [] : ["-O"]), "--edition", "2024", "-A", "warnings", "-o", exe, file];
+    const args = [...(debug ? [] : ["-O"]), "--edition", edition, "-A", "warnings", "-o", exe, file];
     execFileSync("rustc", args, { stdio: "pipe" });
     return;
   }
@@ -48,9 +53,9 @@ export function buildNative(file, exe, { debug = false } = {}) {
     .map(([c, v]) =>
       c === "serde" || c === "clap"
         ? `${c} = { version = "${v}", features = ["derive"] }`
-        : `${c === "cfg_if" ? "cfg-if" : c === "chrono_tz" ? "chrono-tz" : c === "num_traits" ? "num-traits" : c === "env_logger" ? "env_logger" : c} = "${v}"`,
+        : `${c === "cfg_if" ? "cfg-if" : c === "chrono_tz" ? "chrono-tz" : c === "num_traits" ? "num-traits" : c === "rustc_hash" ? "rustc-hash" : c === "env_logger" ? "env_logger" : c} = "${v}"`,
     );
-  const toml = ["[package]", 'name = "prog"', 'version = "0.1.0"', 'edition = "2024"', "", "[dependencies]", ...deps, ""];
+  const toml = ["[package]", 'name = "prog"', 'version = "0.1.0"', `edition = "${edition}"`, "", "[dependencies]", ...deps, ""];
   fs.writeFileSync(path.join(proj, "Cargo.toml"), toml.join("\n"));
   fs.writeFileSync(path.join(proj, "src", "main.rs"), src);
   execFileSync("cargo", ["build", "--offline", "-q", ...(debug ? [] : ["--release"])], {

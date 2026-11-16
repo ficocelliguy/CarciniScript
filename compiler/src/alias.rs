@@ -255,3 +255,93 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) {
         }
     }
 }
+
+/// Whether `text` may rename a std item in a `use` (`use std::collections::HashMap as Map;`).
+pub fn has_use_renames(text: &str) -> bool {
+    text.contains("use ") && text.contains(" as ")
+}
+
+/// `use std::collections::HashMap as Map;` (also `core::` / `alloc::`, in a list, and modules:
+/// `use std::collections as coll;`): each use of `Map` in the file is written as the path it
+/// stands for, `std::collections::HashMap`, which the compiler knows. (Renames of the file's own
+/// items and of crates are resolved elsewhere.) Whether anything changed.
+pub fn expand_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
+    let file = SourceFile::parse(text, EDITION).tree();
+    let mut renames: std::collections::HashMap<String, String> = Default::default();
+    let mut uses = Vec::new();
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        uses.push(u.syntax().text_range());
+        for (mut path, rename, star) in crate::typeck::use_leaves(&u) {
+            let Some(r) = rename else { continue };
+            if path.last().is_some_and(|s| s == "self") {
+                path.pop();
+            }
+            if star
+                || r == "_"
+                || path.len() < 2
+                || path.last() == Some(&r)
+                || !matches!(path[0].as_str(), "std" | "core" | "alloc")
+            {
+                continue;
+            }
+            renames.insert(r, path.join("::"));
+        }
+    }
+    // (Not when the file declares something of that name too.)
+    for n in file.syntax().descendants().filter_map(ast::Name::cast) {
+        let is_rename = n
+            .syntax()
+            .parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::RENAME);
+        if !is_rename {
+            renames.remove(n.text());
+        }
+    }
+    if renames.is_empty() {
+        return false;
+    }
+    let toks: Vec<ra_ap_syntax::SyntaxToken> = file
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if t.kind() != SyntaxKind::IDENT {
+            continue;
+        }
+        let Some(full) = renames.get(t.text()) else {
+            continue;
+        };
+        let r = t.text_range();
+        let prev = if i > 0 { toks[i - 1].text() } else { "" };
+        let next = toks.get(i + 1).map(|t| t.text()).unwrap_or("");
+        if uses.iter().any(|u| u.contains_range(r))
+            || matches!(prev, "." | "::" | "$" | "'")
+            || (prev == ":" && i >= 2 && toks[i - 2].text() == ":")
+            || next == "!"
+            || t.parent_ancestors()
+                .any(|a| a.kind() == SyntaxKind::MACRO_RULES)
+            || t.parent().is_some_and(|p| {
+                p.kind() == SyntaxKind::NAME
+                    || p.parent().is_some_and(|g| {
+                        matches!(
+                            g.kind(),
+                            SyntaxKind::RECORD_EXPR_FIELD | SyntaxKind::RECORD_PAT_FIELD
+                        )
+                    })
+            })
+        {
+            continue;
+        }
+        edits.push((usize::from(r.start()), usize::from(r.end()), full.clone()));
+    }
+    let changed = !edits.is_empty();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    for (a, b, new) in edits {
+        text.replace_range(a..b, &new);
+        map.replace(a, b, new.len());
+    }
+    changed
+}

@@ -55,6 +55,7 @@ const KNOWN_BOUNDS: &[&str] = &[
     "Sync",
     "Unpin",
     "Sized",
+    "BuildHasher",
     "ToString",
     // (`T: Into<f64>`: its target is recorded; serde's bounds are checked where JSON is read.)
     "Into",
@@ -173,26 +174,44 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         let mut params = Vec::new();
-        // (`I: IntoIterator<Item = P>` names `P`, which may come later: those go last.)
+        // Bounds that name other parameters come after the plain ones: `Fut: Future<Output = T>`,
+        // then `F: Fn() -> Fut` / `S: Into<T>`, then `I: IntoIterator<Item = P>`. (Rust takes
+        // `<F: FnOnce() -> T, T>` and `where F: FnOnce() -> T` in any order.)
         let mut tps = type_params(f);
         tps.sort_by_key(|(_, lists, _)| {
-            lists.iter().any(|l| {
+            if lists.iter().any(|l| {
                 super::bounds_into_iter_item(l).is_some()
                     || super::bounds_iterator_item(l).is_some()
-            })
-        });
-        // (`Fut: Future<Output = T>` first: an `F: Fn() -> Fut` names it.)
-        tps.sort_by_key(|(_, lists, _)| {
-            !lists
+            }) {
+                3
+            } else if lists
                 .iter()
                 .any(|l| super::bounds_future_output(l).is_some())
+            {
+                1
+            } else if bound_names(lists)
+                .iter()
+                .any(|(b, _)| matches!(b.as_str(), "Fn" | "FnMut" | "FnOnce"))
+                || lists.iter().any(|l| super::conversion_target(l).is_some())
+            {
+                2
+            } else {
+                0
+            }
         });
         for (name, lists, node) in tps {
             // `Fut: Future<Output = T>`: a future of `T`, like `impl Future<Output = T>`.
             if let Some(out) = lists.iter().find_map(super::bounds_future_output) {
                 let out = match out {
                     Some(t) => self.lower_type(&t),
-                    None => Ty::Unit,
+                    // `F: Future`: its output is a type parameter of its own, `F::Output`.
+                    None => {
+                        let out = format!("{name}::Output");
+                        self.generics.insert(out.clone(), Ty::Param(out.clone()));
+                        self.param_bounds.insert(out.clone(), Vec::new());
+                        params.push((out.clone(), Vec::new()));
+                        Ty::Param(out)
+                    }
                 };
                 self.generics.insert(name, Ty::Future(Box::new(out)));
                 continue;
@@ -589,9 +608,40 @@ impl Checker<'_> {
     }
 
     /// Whether a concrete type meets a bound.
+    /// `f(&mut bytes)` for an `R: Read` parameter: reading would advance the caller's `&[u8]`,
+    /// but the function reads from a `Cursor` of its own (see `is_bytes`).
+    pub(super) fn check_byte_readers(&mut self, f: &str, args: &[ast::Expr], inst: &[Ty]) {
+        let Some(sig) = self.fns.get(f) else { return };
+        let readers: Vec<usize> = (sig.params.iter().enumerate())
+            .filter(|(_, p)| match p {
+                Ty::Param(n) => sig
+                    .type_params
+                    .iter()
+                    .any(|(x, bs)| x == n && bs.iter().any(|b| b == "IoRead" || b == "IoBufRead")),
+                Ty::Dyn(tr) => tr == "IoRead" || tr == "IoBufRead",
+                _ => false,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in readers {
+            if let (Some(ast::Expr::RefExpr(r)), Some(t)) = (args.get(i), inst.get(i))
+                && r.mut_token().is_some()
+                && self.is_bytes(t)
+            {
+                let node = r.syntax().clone();
+                self.error(&node, "reading from a `&mut &[u8]` would advance the caller's slice, which isn't supported; pass the bytes (`&data[..]`) or an `io::Cursor::new(data)`");
+            }
+        }
+    }
+
+    /// `Vec<u8>` / `&[u8]`.
+    pub(super) fn is_bytes(&self, t: &Ty) -> bool {
+        matches!(self.zonk(t), Ty::Vec(e) if matches!(self.zonk(&e), Ty::Int(crate::ty::IntKind::U8)))
+    }
+
     fn satisfies(&self, t: &Ty, b: &str) -> bool {
         match b {
-            "Sized" | "Send" | "Sync" | "Unpin" => true,
+            "Sized" | "Send" | "Sync" | "Unpin" | "BuildHasher" => true,
             "FromStr" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.method(n, "from_str").is_some(),
@@ -642,6 +692,8 @@ impl Checker<'_> {
                 Ty::Adt(n, _) => self.has_op_impl(n, b),
                 _ => false,
             },
+            // `&[u8]` reads its bytes: a generic function wraps it in a `Cursor` on entry.
+            "IoRead" | "IoBufRead" if self.is_bytes(t) => true,
             tr if self.adts.traits.contains_key(tr) => self.implements_user_trait(t, tr),
             "Copy" => match t {
                 Ty::Vec(_) | Ty::Str | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) => false,

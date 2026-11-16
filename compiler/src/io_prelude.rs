@@ -1,6 +1,7 @@
 // (io prelude)
 // `std::io`, compiled in when a program uses it: `io::Error` / `io::ErrorKind` / `io::Result`,
-// the `Write` trait (your own writers too; `write!` / `writeln!` into one), `stdout()` /
+// the `Write` trait (your own writers and `Vec<u8>` too; `write!` / `writeln!` into one), and
+// `fmt::Write` (as `FmtWrite`), `stdout()` /
 // `stderr()` (and their locks, `BufWriter`), and `stdin()` (and `BufReader`), which is at its end:
 // a script has no input stream. A rewrite (`bundled.rs`) gives these the `Io` names below. The
 // `Read` and `BufRead` traits (your own readers too) and `Cursor` (reading lines or bytes from a
@@ -131,6 +132,30 @@ pub trait IoWrite {
     }
 }
 
+/// A `Vec<u8>` is a writer: the bytes are appended.
+impl IoWrite for Vec<u8> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        self.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+}
+
+/// `std::fmt::Write`, for your own writers (a `String` and a `Formatter` are writers without an
+/// impl here: `write!` and these methods reach them through `κσ.$fmtWriteCall`).
+pub trait FmtWrite {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result;
+    fn write_char(&mut self, c: char) -> std::fmt::Result {
+        self.write_str(&c.to_string())
+    }
+    // What `write!` / `writeln!` call.
+    fn __write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write_str(s)
+    }
+}
+
 /// `std::io::Stdout` (and its lock): what's written is printed.
 #[derive(Clone)]
 pub struct IoStdout {}
@@ -238,7 +263,8 @@ pub struct IoBufReader<R> {
     __pos: usize,
 }
 
-impl<R> IoBufReader<R> {
+// (`R: IoRead`: over bytes, `inner` is a `Cursor` of them.)
+impl<R: IoRead> IoBufReader<R> {
     pub fn new(inner: R) -> IoBufReader<R> {
         IoBufReader {
             __inner: inner,
@@ -249,6 +275,9 @@ impl<R> IoBufReader<R> {
     pub fn with_capacity(_capacity: usize, inner: R) -> IoBufReader<R> {
         IoBufReader::new(inner)
     }
+}
+
+impl<R> IoBufReader<R> {
     pub fn get_ref(&self) -> &R {
         &self.__inner
     }

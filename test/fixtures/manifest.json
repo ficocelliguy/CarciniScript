@@ -60,6 +60,18 @@
     "panic": null
   },
   {
+    "file": "blanket_ref_impls.rs",
+    "stdout": "44\n44\n99\n63\n4 shape(4)\nshape(4)\nshape(3)\n24.75 shape(2.25)\n252 shape(12)\n63\nHI!\n5!\n3\n3\nsq 4\nsq 0.5\n[\"A\", \"B\", \"A\", \"B\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "byte_readers.rs",
+    "stdout": "3\n4\n4\n[104, 105, 10, 33]\n3\nalpha beta\nOk([120, 121])\ntrue\n[\"alpha\", \"beta\", \"gamma\"]\n6\n[alpha beta]\n[gamma]\n\"hi\\n\"\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "cache_program.rs",
     "stdout": "Some(1) None\nNone [(\"a\", 1), (\"c\", 3)]\n11/13 hits (84.6%) | 0/0 hits\n12586269025 9 1.50\nSome((\"x\", 5))\nNone\nSome((\"y\", -3))\nNone\n[[0, 1, 2], [3, 4, 0], [0, 0, 0]]\nshadow\n10\n3 2 20 10 1 \n",
     "exitCode": 0,
@@ -68,6 +80,12 @@
   {
     "file": "cards_traits.rs",
     "stdout": "[Card { rank: 5, suit: Hearts }, Card { rank: 5, suit: Spades }, Card { rank: 9, suit: Hearts }]\nSome(Card { rank: 9, suit: Hearts }) true\n238\n[Hearts, Spades] [5, 9]\ntrue Less\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "cfg_items.rs",
+    "stdout": "always somewhere\nConfig { name: \"x\", level: 3 }\nprinted\n1 fast slow true\n[1, 3] true\n",
     "exitCode": 0,
     "panic": null
   },
@@ -116,6 +134,12 @@
   {
     "file": "const_generic_named.rs",
     "stdout": "History { values: [1.0, 2.0, 3.0] } true [0.0, 2.0, 4.0, 6.0] false\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "const_generic_traits.rs",
+    "stdout": "4 8 [1, 2, 3, 4]\n8 [7, 7]\n8\nxxx\n9\n50\n4 -1\n",
     "exitCode": 0,
     "panic": null
   },
@@ -234,6 +258,12 @@
     "panic": null
   },
   {
+    "file": "crate_indexmap.rs",
+    "stdout": "{\"n00dles\": 1.75, \"joesguns\": 30.0, \"foodnstuff\": 2.25, \"sigma-cosmetics\": 12.0}\nSome((\"joesguns\", 30.0)) Some(2) Some((1, \"joesguns\", 30.0))\nSome((\"n00dles\", 1.75)) Some((\"sigma-cosmetics\", 12.0))\n4 None (1, Some(30.0))\nSome(1.75) [\"harakiri-sushi\", \"joesguns\", \"foodnstuff\", \"sigma-cosmetics\"]\nSome(1.75) [\"joesguns\", \"foodnstuff\", \"sigma-cosmetics\", \"harakiri-sushi\"]\nSome((\"n00dles\", 1.75)) Some((\"joesguns\", 31.0)) Some((\"sigma-cosmetics\", 12.0))\n{\"harakiri-sushi\": 8.0, \"foodnstuff\": 2.25}\n[\"joesguns=31\", \"sigma-cosmetics=12\", \"harakiri-sushi=8\", \"foodnstuff=2.25\", \"n00dles=1.75\"]\n[\"foodnstuff\", \"harakiri-sushi\", \"joesguns\", \"n00dles\", \"sigma-cosmetics\"]\n{\"sigma-cosmetics\": 12.0, \"n00dles\": 1.75, \"joesguns\": 31.0} 3\n{'h': 1, 'e': 1, 'l': 3, 'o': 2, 'w': 1, 'r': 1, 'd': 1}\n{4: 16, 3: 9, 2: 4, 1: 1} 30\n{\"b\", \"a\", \"c\", \"d\"} Some(\"c\") Some(2)\n(1, false)\ntrue {\"d\", \"a\", \"c\"}\ntrue {\"a\", \"c\"} Some(\"d\")\n{\"a\", \"c\"} Some(\"a\") Some(\"c\")\n{5, 3, 1} true\n{\"z\": 1, \"a\": 2, \"m\": 7} Some((\"m\", 7)) {} {\"x\", \"y\"}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "crate_itertools.rs",
     "stdout": "3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5\n[1, 1, 2, 3, 3, 4, 5, 5, 5, 6, 9]\n[9, 6, 5, 5, 5, 4, 3, 3, 2, 1, 1]\n[3, 3, 6, 9, 1, 1, 4, 2, 5, 5, 5]\n[3, 1, 4, 5, 9, 2, 6]\n[3, 1, 4, 2]\n[1, 2, 3, 1]\n[1, 5, 3]\n[-2, 3, -3, 4, 4, -7, 4, -1, -2, 2]\n123 234 345 \n[(1, 2), (3, 4), (5, 6)]\n[[1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]]\n[[1, 2], [1, 3], [2, 1], [2, 3], [3, 1], [3, 2]]\n[[1, 1], [1, 2], [1, 3], [2, 2], [2, 3], [3, 3]]\n[[], [1], [2], [3], [1, 2], [1, 3], [2, 3], [1, 2, 3]]\n[(1, 'a'), (1, 'b'), (2, 'a'), (2, 'b')]\n[[1, 3], [1, 4], [2, 3], [2, 4]]\n[1, 10, 2, 11, 3, 12, 13, 14]\n[1, 0, 2, 0, 3]\n[1, 2, 3, 4, 7, 9]\n[1, 2, 3, 4]\n[4, 8, 10]\n[(1, 2), (2, 1), (3, 2), (4, 1), (5, 3), (6, 1), (9, 1)]\ntrue false true\ntrue Some((4, 5))\n[1, 1, 2] [9, 6]\na [1, 2]\nb [3]\na [4]\na [1, 2, 4]\nb [3]\n[2, 4]\nx 5\nNone\n[8, 9]\n[\"ab\", \"ab\", \"ab\"]\n1-4-9\n",
     "exitCode": 0,
@@ -276,8 +306,20 @@
     "panic": null
   },
   {
+    "file": "crate_rustc_hash.rs",
+    "stdout": "20365011074 49\nSome(6)\n[(\"a\", 3), (\"b\", 2), (\"c\", 1)]\n[1, 2, 3] true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "crate_serde_json.rs",
     "stdout": "{\"name\":\"n00dles\",\"ram\":4,\"ports\":[22,80],\"root\":true,\"tags\":[],\"owner\":null}\n{\n  \"name\": \"n00dles\",\n  \"ram\": 4,\n  \"ports\": [\n    22,\n    80\n  ],\n  \"root\": true,\n  \"tags\": [],\n  \"owner\": null\n}\nServer { name: \"n00dles\", ram: 4, ports: [22, 80], root: true, tags: [], owner: None } true\nEOF while parsing a value at line 1 column 0 | line 1 col 0 eof true syntax false data false | Error(\"EOF while parsing a value\", line: 1, column: 0)\nEOF while parsing an object at line 1 column 1 | line 1 col 1 eof true syntax false data false | Error(\"EOF while parsing an object\", line: 1, column: 1)\nmissing field `ram` at line 1 column 13 | line 1 col 13 eof false syntax false data true | Error(\"missing field `ram`\", line: 1, column: 13)\ninvalid type: integer `5`, expected a string at line 1 column 10 | line 1 col 10 eof false syntax false data true | Error(\"invalid type: integer `5`, expected a string\", line: 1, column: 10)\ninvalid value: integer `70000000000`, expected u32 at line 1 column 29 | line 1 col 29 eof false syntax false data true | Error(\"invalid value: integer `70000000000`, expected u32\", line: 1, column: 29)\ninvalid value: integer `-1`, expected u32 at line 3 column 11 | line 3 col 11 eof false syntax false data true | Error(\"invalid value: integer `-1`, expected u32\", line: 3, column: 11)\nEOF while parsing a value at line 1 column 3 | line 1 col 3 eof true syntax false data false | Error(\"EOF while parsing a value\", line: 1, column: 3)\ntrailing characters at line 1 column 46 | line 1 col 46 eof false syntax true data false | Error(\"trailing characters\", line: 1, column: 46)\ntrailing comma at line 1 column 7\nboxed: invalid type: boolean `true`, expected a string at line 1 column 13\n{\"money\":1500000.0,\"name\":\"foodnstuff\",\"neg\":-3,\"nested\":{\"deep\":[true,null,\"x\"]},\"ports\":[21,22],\"ram\":16,\"ratio\":0.25}\n{\n  \"money\": 1500000.0,\n  \"name\": \"foodnstuff\",\n  \"neg\": -3,\n  \"nested\": {\n    \"deep\": [\n      true,\n      null,\n      \"x\"\n    ]\n  },\n  \"ports\": [\n    21,\n    22\n  ],\n  \"ram\": 16,\n  \"ratio\": 0.25\n}\nArray [Number(21), Number(22)]\n\"foodnstuff\" 22 null\nSome(16) Some(1500000.0) Some(\"foodnstuff\")\nSome(-3) None\nSome(Number(16)) None\nSome(String(\"x\"))\ntrue true true\nport total 43\n[\"money\", \"name\", \"neg\", \"nested\", \"ports\", \"ram\", \"ratio\"]\n{\"list\":[1,2,3],\"s\":\"n00dles\",\"server\":\"sigma\",\"threads\":14}\n[1,\"two\",null,false,{\"k\":[]}]\nnull\n{\"a\":{\"x\":\"é\\n\"},\"b\":[1,2.5,-7,1000.0]}\nObject {\"a\": Object {\"x\": String(\"é\\n\")}, \"b\": Array [Number(1), Number(2.5), Number(-7), Number(1000.0)]}\n{\"name\":\"n00dles\",\"owner\":null,\"ports\":[22,80],\"ram\":4,\"root\":true,\"tags\":[]}\nServer { name: \"n00dles\", ram: 4, ports: [22, 80], root: true, tags: [], owner: None }\ninvalid type: integer `1`, expected a string\n[1,2]\n{\"actions\":[{\"hack\":{\"target\":\"n00dles\"}},{\"grow\":\"joesguns\"},\"idle\"],\"weights\":{\"hack\":0.5},\"meta\":{\"tags\":[\"a\"],\"v\":2}}\nPlan { actions: [Hack { target: \"n00dles\" }, Grow(\"joesguns\"), Idle], weights: {\"hack\": 0.5}, meta: Object {\"tags\": Array [String(\"a\")], \"v\": Number(2)} }\n{\n  \"tags\": [\n    \"a\"\n  ],\n  \"v\": 2\n}\n{\"a\":\"s\",\"z\":1}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_smallvec.rs",
+    "stdout": "[1, 2, 3, 5, 7, 9] 6 Some(9)\nRoute { hops: [\"home\", \"n00dles\"], cost: 4 } [\"home\", \"n00dles\", \"foodnstuff\"]\n[12, 6, 4]\n[1, 2, 3, 4, 5, 6, 7, 8]\n[['a', 'b'], ['c']] 3\n[0.5, 0.5, 0.5]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -348,6 +390,12 @@
     "panic": null
   },
   {
+    "file": "enum_const_discriminants.rs",
+    "stdout": "A = 5\nB = 6\nC = 8\nD = 11\nE = 12\nF = -14\nG = -13\nH = 256\nI = 97\nJ = 90\nK = 240\n10 11\n17 200 117\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "enums.rs",
     "stdout": "Circle(1.0) 3 true\nRect { w: 2.0, h: 3.0 } 6 false\nEmpty 0 false\nRect { w: 4.0, h: 6.0 } true\n27\nw 4\n5 11 Low\ntrue Some(High)\nEast 1 true\nsay hi\nwait 5\nwait 1 for coffee\n(-5, 3)\nMove { dir: North, steps: 3 }\n[(North, 2), (East, 1), (West, 1)]\nwest\nNorth\nSouth\nSome(High) None\n",
     "exitCode": 0,
@@ -390,6 +438,12 @@
     "panic": null
   },
   {
+    "file": "fmt_write.rs",
+    "stdout": "alice | hp   12\nbob   | hp  340\n>carol | hp    7\ndave  | hp    8\nHI 5!ALICE | HP   12\nErr(Error) true\nreport:\neve   | hp    1\nabc1\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "format.rs",
     "stdout": "crab has 10 legs\na b a\ncrab!\n[    crab] [crab    ] [  crab  ] [**crab***]\n[   10] [10   ] [-0010] [+10]\n3.14 3    3.142|\n\"crab\" 'c' \"tab\\there \\\"quoted\\\"\"\n1 1.0 0.30000000000000004 1e21\ninf -inf\n0.0000001 1e-7\n{literal} braces\n10-crab has len 7\n6\ntru\nCRAB\npadded\ntrue\n",
     "exitCode": 0,
@@ -410,6 +464,12 @@
   {
     "file": "from_into.rs",
     "stdout": "Fahrenheit(212.0)\nFahrenheit(98.6) false\nnum 42\ntext \"hi\"\nflag true\nlist [num 1, text \"two\", flag false]\noven Fahrenheit(392.0)\nowned 10 5 200\nsum = 6\nerror: parse error on line 2 (Parse(ParseErr { line: 2 }))\nerror: missing input (Missing(\"input\"))\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "future_bounds.rs",
+    "stdout": "3\n20\n2\nn\n6\nn\n[2]\n9\n",
     "exitCode": 0,
     "panic": null
   },
@@ -446,6 +506,12 @@
   {
     "file": "generic_method_statics.rs",
     "stdout": "2m 15ft\n2 values in m / 2 values in ft\n6ft 15ft\nMeters(0) Feet(0)\n[\"3ft\", \"6ft\"] 4m m ft\n3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_mut_refs.rs",
+    "stdout": "23 0.75 V(5, 7)\nb true None\nyx V(3, 4) V(1, 2)\nStats { hp: 3.5, name: \"bot\", tags: [7, 7] } [1, 42, 3] [\"q\"]\ntaken None 9\n9 abab\n",
     "exitCode": 0,
     "panic": null
   },
@@ -546,6 +612,12 @@
     "panic": null
   },
   {
+    "file": "io_write_vec.rs",
+    "stdout": "\"5-x\\nabcd\" 2\n19 [114, 97, 119, 10]\nline 3\nraw\n  1 a; 22 bb;\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "iter_clone.rs",
     "stdout": "[2, 3] [2, 3]\nSome((1, 'é')) Some((3, 'l'))\n",
     "exitCode": 0,
@@ -560,6 +632,12 @@
   {
     "file": "iter_mut_element.rs",
     "stdout": "Some(\"b\") Some(\"a\") None\n[Slot { host: \"a\", free: 5.5 }, Slot { host: \"b\", free: 1.0 }, Slot { host: \"c!\", free: 16.0 }]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_mut_outside_for.rs",
+    "stdout": "[9, 20, 3, 4, 5]\n[9, 21, 5, 7, 9]\n[-1, 1, -25, 7, 9]\n[19, 41, 35, 7, 9]\n[38, 82, 70, 14, 18]\n5 [39, 83, 71, 15, 19]\n[-1, 83, 71, 15, 0]\n[-1, 83, 333, 15, 0] 5\n[-1, 183, 333, 115, 0]\n[\"A!\", \"B!\"]\n[true, false, true]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -594,6 +672,12 @@
     "panic": null
   },
   {
+    "file": "logic_block_operands.rs",
+    "stdout": "1 2 -1\n1\n{\"a\": 1}\ntrue false false true false [\"check 3\", \"check 0\", \"check 2\", \"check 3\", \"check 1\"]\nbig small odd odd\n[1, 2, 3]\ntrue true\nsmall\nnone\nedge\nedge\nfalse true\n[3, 6]\n3\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "loops_slices.rs",
     "stdout": "64 4\nSome((2, 6)) None\n400 4\ndone\nempty | 0\none: 7 | 7\nbookends 3 | 12\n1 then 2 then 3 more | 9\n4 then 6 then 0 more | 10\ngo [\"north\", \"fast\"]\n1 a\n",
     "exitCode": 0,
@@ -608,6 +692,12 @@
   {
     "file": "macro_hygiene.rs",
     "stdout": "2 1 100 210 42 [0, 1, 2] 43 9\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "macro_robust.rs",
+    "stdout": "Sect(1) Some(\"SECT_ABBREV\")\nNone\n[(100, \"Continue\"), (404, \"Not Found\"), (418, \"I'm a teapot\")]\n100 Not Found I'm a teapot\n42\n[\"0\", \"0\", \"false\", \"\\\"\\\"\", \"[]\", \"None\"]\n9\n[(\"Nested\", 3), (\"OptBox\", 6)]\na/b/c\n[(\"a\", 1), (\"b\", 5), (\"c\", 4)]\nwithout std normal\n49 12\nPair(\"left\", 2) left 7\n50\ntrue\n1 2\n",
     "exitCode": 0,
     "panic": null
   },
@@ -666,6 +756,12 @@
     "panic": null
   },
   {
+    "file": "nested_fns.rs",
+    "stdout": "2\n1 4 100 170\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "nested_items.rs",
     "stdout": "8 3 4 6 [1, 3] Pair { a: 4, b: 6 } 10\n",
     "exitCode": 0,
@@ -700,6 +796,12 @@
     "stdout": "Some(1) None\ntrue false false true\n4 -1 0\nSome(4) None Some(\"text\")\ntrue true\nSome(10) None\nNone Some(20)\nholds 9 | empty\ndigits: 113\nSome(1) Some(3) Some(2) None\n[30, 20, 10] None None\nlast word bb has 2 bytes\n[Some(\"x\"), None]\n",
     "exitCode": 101,
     "panic": "thread 'main' panicked at option.rs:76:23:\nthe reading should exist"
+  },
+  {
+    "file": "option_get_or_insert.rs",
+    "stdout": "Some([1, 2])\nSome(11)\nSome(21)\nSome(42)\nSome(\"abcd\") 4\n5 5 Some(\"hello\")\n2 Cache { hits: Some(2), names: Some([\"a\", \"b\"]) }\nSome(7.0)\nSome(false)\n",
+    "exitCode": 0,
+    "panic": null
   },
   {
     "file": "option_nan_cmp.rs",
@@ -794,6 +896,18 @@
   {
     "file": "qualified_calls.rs",
     "stdout": "captain 7 up 7\npilot wizard\nup 7\nhello cat HELLO\ncat [\"hello cat\", \"hello cat\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "qualified_type_paths.rs",
+    "stdout": "255 7 [255] [] hi {\"hi\": 1}\nPoint Point { x: 0 } Point { x: 0 }\n65536 true\ntrue\n0 4\ni8 -128 127\nu16 0 65535\ni64 -9223372036854775808 9223372036854775807\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "rand_gen_2021.rs",
+    "stdout": "true true true true 42\n",
     "exitCode": 0,
     "panic": null
   },
@@ -948,6 +1062,12 @@
     "panic": null
   },
   {
+    "file": "std_type_impls.rs",
+    "stdout": "some 3 none SOME 3\nerr bad\n9 20 6 456\n18\nid-7 id-8 n00dles(4GB) 3000 plain id-9\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "stringify_cfg.rs",
     "stdout": "[a + b]\n[a + b]\n[Vec<i32>]\n[foo(x, y).bar]\n[x]\n[\"s\" 'c' 1.5]\n[if a { b } else { c }]\n[a, b]\n[&mut x[0]]\n[let y = 2;]\n[a::b::<T>()]\n[#[derive(Debug)] struct S;]\n[false true]\n",
     "exitCode": 0,
@@ -968,6 +1088,12 @@
   {
     "file": "structs_mut.rs",
     "stdout": "P { x: 1, y: 2 } P { x: 101, y: 2 }\nP { x: 1, y: 2 } P { x: 0, y: -1 }\nOuter { inner: P { x: 50, y: 2 }, tag: \"t\", list: [P { x: -5, y: 2 }, P { x: 101, y: 7 }] } P { x: 1, y: 2 } P { x: 1, y: 2 }\nt t! 2\nCircle(3.0) Rect { w: 2.0, h: 3.0 }\n[Circle(2.25), Rect { w: 1.5, h: 1.5 }]\n[P { x: 3, y: 2 }, P { x: 303, y: 2 }] 310\n[[P { x: 0, y: 0 }, P { x: 0, y: 0 }], [P { x: 9, y: 0 }, P { x: 0, y: 0 }]]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "trait_default_consts.rs",
+    "stdout": "4 3 6\n8 6 100\nshape square has 4 sides (x1)\nshape triangle has 3 sides (x0.5)\npolygon hexagon has 6 sides (x1) 2\n8 6 100\n12 9 106\nshape 2\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1014,6 +1140,12 @@
     "panic": null
   },
   {
+    "file": "use_renames.rs",
+    "stdout": "a=3;b=2;c=1;\n1 [0, 1] {4, 9}\n1-2\n[Square(1), Square(5)] [Small, Big]\n{1: \"one\", 2: \"two\"}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "use_variants.rs",
     "stdout": "a\nb2\na\n[A, B(2), A] true\nfalse true\n3\ntrue\n",
     "exitCode": 0,
@@ -1040,6 +1172,12 @@
   {
     "file": "visibility.rs",
     "stdout": "3 3 5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "where_fn_bounds.rs",
+    "stdout": "3 s\n[10, 20, 30]\n[1, 2]\nOk(200) Err(\"fail 2\")\n[(0, [3, 6]), (1, [1, 4]), (2, [2, 5])]\n9 16 2\n",
     "exitCode": 0,
     "panic": null
   }

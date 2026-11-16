@@ -8,7 +8,7 @@ use ra_ap_syntax::{
     AstNode, AstToken, Edition, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxToken, T, ast,
 };
 
-pub const EDITION: Edition = Edition::Edition2024;
+pub const EDITION: Edition = Edition::Edition2021;
 
 pub struct MacroArg {
     /// Absolute byte offset of the argument text in the original source.
@@ -403,8 +403,8 @@ fn tts_text(tt: &ast::TokenTree) -> String {
 }
 
 /// `cfg!(..)`'s predicate: `debug_assertions` (on in debug builds), `test` and `feature = ".."`
-/// (off), and `not` / `all` / `any` of those. Anything about the platform is an error: the
-/// script runs in JS, where rustc's answer for its own target wouldn't hold.
+/// (off), the target's (see `target_cfg`), and `not` / `all` / `any` of those. Other names are
+/// off, as in rustc.
 pub fn eval_cfg(mc: &ast::MacroCall, debug: bool) -> Result<bool, String> {
     let tt = mc.token_tree().ok_or("`cfg!` needs a predicate")?;
     let toks: Vec<String> = tt
@@ -425,8 +425,8 @@ pub fn eval_cfg(mc: &ast::MacroCall, debug: bool) -> Result<bool, String> {
 }
 
 /// Whether `node` sits under a `#[cfg(..)]` (on it or an enclosing item, statement or
-/// expression) that's off. A predicate about the platform counts as off: rustc's target isn't
-/// the script's (`#[cfg(not(any(unix, windows)))] compile_error!(..)` must not fire).
+/// expression) that's off for the script's target (`#[cfg(not(any(unix, windows)))]
+/// compile_error!(..)` fires, as it would on wasm), or malformed.
 pub fn under_false_cfg(node: &ra_ap_syntax::SyntaxNode) -> bool {
     node.ancestors().any(|a| {
         a.children()
@@ -457,6 +457,38 @@ fn attr_cfg_tokens(attr: &ast::Attr) -> Option<Vec<String>> {
 }
 
 fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String> {
+    Ok(cfg_pred3(toks, i, debug, false)?.unwrap_or(false))
+}
+
+/// A target cfg of the one target scripts compile for: JS, described as rustc's
+/// `wasm32-unknown-unknown` (not `unix` / `windows`, little-endian, no target features), except
+/// that `usize` is 64 bits here (`usize::MAX` is `u64::MAX`), so `target_pointer_width = "64"`.
+/// `None` for a name that isn't about the target.
+fn target_cfg(name: &str, value: Option<&str>) -> Option<bool> {
+    let v = value.map(|v| v.trim_matches('"'));
+    Some(match (name, v) {
+        ("unix" | "windows" | "miri" | "doc" | "docsrs" | "proc_macro", None) => false,
+        ("target_family", Some(v)) => v == "wasm",
+        ("target_arch", Some(v)) => v == "wasm32",
+        ("target_os", Some(v)) => v == "unknown",
+        ("target_vendor", Some(v)) => v == "unknown",
+        ("target_env" | "target_abi", Some(v)) => v.is_empty(),
+        ("target_endian", Some(v)) => v == "little",
+        ("target_pointer_width", Some(v)) => v == "64",
+        ("target_has_atomic", Some(_)) => true,
+        ("target_feature", Some(_)) => false,
+        _ => return None,
+    })
+}
+
+/// `cfg_pred`, three-valued: with `features_unknown`, `feature = ".."` is neither on nor off
+/// (`None`), so an item under it is kept.
+fn cfg_pred3(
+    toks: &[String],
+    i: &mut usize,
+    debug: bool,
+    features_unknown: bool,
+) -> Result<Option<bool>, String> {
     let name = toks.get(*i).ok_or("`cfg!` needs a predicate")?.clone();
     *i += 1;
     match name.as_str() {
@@ -467,7 +499,7 @@ fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String>
             *i += 1;
             let mut vals = Vec::new();
             while toks.get(*i).map(String::as_str) != Some(")") {
-                vals.push(cfg_pred(toks, i, debug)?);
+                vals.push(cfg_pred3(toks, i, debug, features_unknown)?);
                 if toks.get(*i).map(String::as_str) == Some(",") {
                     *i += 1;
                 }
@@ -476,11 +508,14 @@ fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String>
                 }
             }
             *i += 1;
+            let (on, unknown) = (vals.contains(&Some(true)), vals.contains(&None));
             match name.as_str() {
-                "not" if vals.len() == 1 => Ok(!vals[0]),
+                "not" if vals.len() == 1 => Ok(vals[0].map(|v| !v)),
                 "not" => Err("`not(..)` takes one predicate".into()),
-                "all" => Ok(vals.iter().all(|v| *v)),
-                _ => Ok(vals.iter().any(|v| *v)),
+                "all" if vals.contains(&Some(false)) => Ok(Some(false)),
+                "all" => Ok((!unknown).then_some(true)),
+                _ if on => Ok(Some(true)),
+                _ => Ok((!unknown).then_some(false)),
             }
         }
         _ => {
@@ -490,14 +525,81 @@ fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String>
             } else {
                 None
             };
+            if let Some(v) = target_cfg(&name, value.as_deref()) {
+                return Ok(Some(v));
+            }
             match (name.as_str(), value) {
-                ("debug_assertions", None) => Ok(debug),
-                ("test", None) => Ok(false),
-                ("feature", Some(_)) => Ok(false),
-                (n, _) => Err(format!(
-                    "`cfg!({n})` isn't supported: scripts run in JS, not on rustc's target (`debug_assertions`, `test`, `feature = \"..\"` and `not`/`all`/`any` are)"
-                )),
+                ("debug_assertions", None) => Ok(Some(debug)),
+                ("feature", Some(_)) if features_unknown => Ok(None),
+                // `test`, features, and names nothing sets (`loom`, `fuzzing`, ..) are off.
+                _ => Ok(Some(false)),
             }
         }
     }
+}
+
+/// Blanks out (with spaces, so offsets stay put) every item, statement, field, variant, match
+/// arm or expression under a `#[cfg(..)]` that's off for a script, so `#[cfg(windows)] fn x`
+/// next to `#[cfg(not(windows))] fn x` leaves one `x`. Features count as unknown here (such
+/// items stay), as they may be on in the crate the code comes from.
+pub fn strip_cfg(text: &mut String) -> bool {
+    if !text.contains("cfg(") {
+        return false;
+    }
+    let file = ra_ap_syntax::SourceFile::parse(text, EDITION).tree();
+    let debug = crate::codegen::overflow_checks();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for attr in file.syntax().descendants().filter_map(ast::Attr::cast) {
+        if attr.excl_token().is_some() {
+            continue;
+        }
+        let Some(toks) = attr_cfg_tokens(&attr) else {
+            continue;
+        };
+        let mut i = 0;
+        if !matches!(cfg_pred3(&toks, &mut i, debug, true), Ok(Some(false)) if i == toks.len()) {
+            continue;
+        }
+        let Some(node) = attr.syntax().parent() else {
+            continue;
+        };
+        if node.kind() == SyntaxKind::SOURCE_FILE {
+            continue;
+        }
+        let r = node.text_range();
+        let (a, mut b) = (usize::from(r.start()), usize::from(r.end()));
+        // A trailing comma goes too (fields, variants, arms, arguments).
+        let mut next = node.next_sibling_or_token();
+        while let Some(e) = &next {
+            match e.kind() {
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => next = e.next_sibling_or_token(),
+                SyntaxKind::COMMA => {
+                    b = usize::from(e.text_range().end());
+                    break;
+                }
+                _ => break,
+            }
+        }
+        cuts.push((a, b));
+    }
+    if cuts.is_empty() {
+        return false;
+    }
+    cuts.sort();
+    let mut end = 0;
+    for (a, b) in cuts {
+        if a < end || b > text.len() {
+            continue;
+        }
+        let blank: String = text[a..b]
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' => c.to_string(),
+                _ => " ".repeat(c.len_utf8()),
+            })
+            .collect();
+        text.replace_range(a..b, &blank);
+        end = b;
+    }
+    true
 }

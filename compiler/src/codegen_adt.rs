@@ -437,6 +437,34 @@ impl Codegen<'_> {
                 }
             }
         }
+        // `impl<const N: usize> Tr for [u8; N]`: `N` is read off `self` (`this?.length`).
+        if let Some(imp) = f
+            .syntax()
+            .parent()
+            .and_then(|l| l.parent())
+            .and_then(ast::Impl::cast)
+            && !matches!(self_ty, Ty::Adt(..))
+            && sig.receiver.is_some()
+            && let Some(st) = imp.self_ty()
+        {
+            for p in imp
+                .generic_param_list()
+                .into_iter()
+                .flat_map(|l| l.generic_params())
+            {
+                if let ast::GenericParam::ConstParam(cp) = p
+                    && let Some(n) = cp.name()
+                {
+                    let n = n.text().to_string();
+                    let ty = cp.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                    let js = match crate::adt::const_path(&st, &n, &self.types.adts) {
+                        Some(suffix) => format!("this{suffix}"),
+                        None => "undefined".into(),
+                    };
+                    outer.push((n, js, ty));
+                }
+            }
+        }
         let saved_consts = super::set_const_scope(None);
         // An `impl<T>`'s `T` whose class the values carry: `this.$T` in a method with `self`.
         if sig.receiver.is_some()
@@ -574,6 +602,18 @@ impl Codegen<'_> {
             _ if blanket.is_some() => Ty::Param(blanket.map(|(_, t, _)| t).unwrap_or_default()),
             "String" => Ty::Str,
             "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+            "Option" => Ty::Option(Box::new(Ty::Unknown)),
+            "Result" => Ty::Result(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+            "HashMap" => Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+            "HashSet" => Ty::Set(Box::new(Ty::Unknown)),
+            "BTreeMap" => Ty::Coll(
+                crate::ty::Coll::BTreeMap,
+                Box::new(Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown))),
+            ),
+            "BTreeSet" => Ty::Coll(
+                crate::ty::Coll::BTreeSet,
+                Box::new(Ty::Set(Box::new(Ty::Unknown))),
+            ),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             k => Ty::from_name(k),
@@ -591,6 +631,19 @@ impl Codegen<'_> {
                 .into_iter()
                 .flat_map(|l| l.assoc_items())
             {
+                // `impl From<Id> for String`'s `from`, as its `from$N`.
+                if let ast::AssocItem::Fn(f) = &item
+                    && let Some(n) = f.name()
+                    && n.text() == "from"
+                    && let Some(fi) = self.types.adts.from_impls.get(key).and_then(|v| {
+                        let at = self.off(n.syntax());
+                        v.iter().find(|i| i.at == at).cloned()
+                    })
+                    && let Some(sig) = self.types.adts.method(key, &fi.key).cloned()
+                {
+                    self.emit_method_fn(f, sig, self_ty.clone(), "}", Some(fi.key.clone()));
+                    continue;
+                }
                 if let ast::AssocItem::Fn(f) = item
                     && let Some(n) = f.name()
                     && let Some(sig) = self.types.adts.method(key, n.text()).cloned()
@@ -641,6 +694,13 @@ impl Codegen<'_> {
             "String" | "char" => ("string", false),
             "bool" => ("boolean", false),
             "Vec" => ("array", false),
+            // (An `Option` is `null` or its value: only called directly, never found here.)
+            "Option" => ("option", false),
+            "Result" => ("result", false),
+            "HashMap" => ("map", false),
+            "HashSet" => ("set", false),
+            "BTreeMap" => ("btreemap", false),
+            "BTreeSet" => ("btreeset", false),
             "f32" | "f64" => ("number", false),
             // (The 64- and 128-bit kinds are BigInts.)
             "i64" | "u64" | "i128" | "u128" => ("bigint", true),
@@ -701,6 +761,26 @@ impl Codegen<'_> {
         self.out.indent += 1;
         for (f, sig) in defaults(true) {
             self.emit_method_fn(&f, sig, Ty::Param("Self".into()), "},", None);
+        }
+        // Default consts as getters on the class (`this` is the class: `Self::N` is `this.N`);
+        // an impl's own `static N` stays.
+        for item in t
+            .assoc_item_list()
+            .into_iter()
+            .flat_map(|l| l.assoc_items())
+        {
+            if let ast::AssocItem::Const(k) = item
+                && let (Some(n), Some(body)) = (k.name(), k.body())
+            {
+                let ty = k.ty().map(|t| self.lower_type(&t));
+                let (f, _) = self.emit_expr(&body, ty.as_ref());
+                let mut line = Frag::mapped(
+                    self.off(k.syntax()),
+                    format!("get {}() {{ return ", escape_ident(n.text())),
+                );
+                line.append(f).push("; },");
+                self.line(line);
+            }
         }
         self.out.indent -= 1;
         self.in_trait_default = false;

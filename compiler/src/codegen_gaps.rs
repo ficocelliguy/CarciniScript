@@ -346,6 +346,9 @@ impl Codegen<'_> {
                 g
             }
             [.., "Ref" | "RefMut", "clone"] => self.gap_arg(a0),
+            [.., "RandomState" | "BuildHasherDefault", "new" | "default"] => {
+                Frag::mapped(start, "undefined")
+            }
             [
                 ..,
                 "HashMap",

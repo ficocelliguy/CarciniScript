@@ -23,7 +23,7 @@ impl Codegen<'_> {
 
     /// `recv = <value>`, for `String` methods that change the string (JS strings are immutable).
     fn reassign(&mut self, m: &ast::MethodCallExpr, rf: &Frag, value: Frag) -> Frag {
-        if !m.receiver().is_some_and(|r| is_pure(&strip_refs(&r))) {
+        if !m.receiver().is_some_and(|r| self.place_receiver(&r)) {
             let what = m
                 .name_ref()
                 .map(|n| n.text().to_string())
@@ -135,7 +135,7 @@ impl Codegen<'_> {
                 } else {
                     helper("strRemove", [a, vec![Frag::text(loc.clone())]].concat())
                 };
-                if !m.receiver().is_some_and(|r| is_pure(&strip_refs(&r))) {
+                if !m.receiver().is_some_and(|r| self.place_receiver(&r)) {
                     self.unsupported(
                         m.syntax(),
                         &format!("`String::{method}` on this expression"),

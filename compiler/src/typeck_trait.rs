@@ -51,15 +51,35 @@ impl Checker<'_> {
                     _ => None,
                 })
                 .collect();
-            if let Some(gp) = t.generic_param_list()
-                && gp
-                    .generic_params()
-                    .any(|p| matches!(p, ast::GenericParam::ConstParam(_)))
+            // `trait Buf<const N: usize>`: each impl names `N` (`impl Buf<4> for X`), which the
+            // trait's default methods can't read yet (they're shared by every impl in JS).
+            for p in t
+                .generic_param_list()
+                .iter()
+                .flat_map(|l| l.generic_params())
             {
-                self.error(
-                    gp.syntax(),
-                    "const generic parameters on traits are not supported yet (they are on structs, functions and impls)",
-                );
+                let ast::GenericParam::ConstParam(cp) = p else {
+                    continue;
+                };
+                let Some(cn) = cp.name().map(|n| n.text().to_string()) else {
+                    continue;
+                };
+                let used = t
+                    .assoc_item_list()
+                    .into_iter()
+                    .flat_map(|l| l.assoc_items())
+                    .filter_map(|i| match i {
+                        ast::AssocItem::Fn(f) => f.body(),
+                        _ => None,
+                    })
+                    .flat_map(|b| b.syntax().descendants().filter_map(ast::NameRef::cast))
+                    .find(|r| r.text() == cn.as_str());
+                if let Some(r) = used {
+                    self.error(
+                        r.syntax(),
+                        format!("a trait's const generic parameter (`{cn}`) in its default methods is not supported yet (it is in impls: `impl<const {cn}: usize> ..`)"),
+                    );
+                }
             }
             let assoc_types: Vec<String> = t
                 .assoc_item_list()
@@ -100,6 +120,7 @@ impl Checker<'_> {
                     methods: Vec::new(),
                     consts: Vec::new(),
                     const_tys: HashMap::new(),
+                    const_defaults: Vec::new(),
                     module: None,
                     assoc_types,
                     type_params,
@@ -135,20 +156,23 @@ impl Checker<'_> {
             let mut methods = Vec::new();
             let mut consts = Vec::new();
             let mut const_tys = HashMap::new();
+            let mut const_defaults = Vec::new();
             for it in t
                 .assoc_item_list()
                 .into_iter()
                 .flat_map(|l| l.assoc_items())
             {
                 let ast::AssocItem::Fn(f) = it else {
-                    // `const X: T;`: each impl gives the value.
-                    if let ast::AssocItem::Const(k) = &it
-                        && k.body().is_none()
-                    {
+                    // `const X: T;`: each impl gives the value; `const X: T = ..;` is a
+                    // default that impls may override.
+                    if let ast::AssocItem::Const(k) = &it {
                         if let Some(n) = k.name() {
                             consts.push(n.text().to_string());
                             let t = k.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
                             const_tys.insert(n.text().to_string(), t);
+                            if k.body().is_some() {
+                                const_defaults.push(n.text().to_string());
+                            }
                         }
                         continue;
                     }
@@ -164,7 +188,7 @@ impl Checker<'_> {
                     }
                     self.error(
                         it.syntax(),
-                        "only methods, `type X;` and `const X: T;` declarations are supported in traits so far (default consts are planned for phase 4)",
+                        "only methods, associated types and associated consts are supported in traits so far",
                     );
                     continue;
                 };
@@ -184,6 +208,7 @@ impl Checker<'_> {
                 def.methods = methods;
                 def.consts = consts;
                 def.const_tys = const_tys;
+                def.const_defaults = const_defaults;
             }
         }
     }
@@ -284,7 +309,7 @@ impl Checker<'_> {
             .chain(
                 def.consts
                     .iter()
-                    .filter(|k| !given_consts.contains(k))
+                    .filter(|k| !given_consts.contains(k) && !def.const_defaults.contains(k))
                     .map(|k| format!("`{k}`")),
             )
             .collect();
@@ -300,6 +325,19 @@ impl Checker<'_> {
                     missing.join(", ")
                 ),
             );
+        }
+        // Defaults the impl leaves out are the type's constants too (`S::N`), read off the
+        // class, where the trait's `$statics` put them.
+        for k in &def.const_defaults {
+            if !given_consts.contains(k) {
+                let ty = def.const_tys.get(k).cloned().unwrap_or(Ty::Unknown);
+                self.adts
+                    .assoc_consts
+                    .entry(type_name.to_string())
+                    .or_default()
+                    .entry(k.clone())
+                    .or_insert(ty);
+            }
         }
         let mut m: HashMap<String, Ty> =
             [("Self".to_string(), self.self_ty_named(type_name))].into();
@@ -389,6 +427,21 @@ impl Checker<'_> {
                 .into_iter()
                 .flat_map(|l| l.assoc_items())
             {
+                // A default const's value, with `Self: Trait`.
+                if let ast::AssocItem::Const(k) = &it
+                    && let (Some(n), Some(body)) = (k.name(), k.body())
+                {
+                    let ty = def.const_tys.get(n.text()).cloned().unwrap_or(Ty::Unknown);
+                    let saved = self.self_ty.replace(Ty::Param("Self".into()));
+                    self.param_bounds.insert("Self".into(), vec![tr.clone()]);
+                    self.scopes = vec![HashMap::new()];
+                    self.ret_ty = Ty::Unit;
+                    self.in_async = false;
+                    self.check(&body, &ty);
+                    self.param_bounds.clear();
+                    self.self_ty = saved;
+                    continue;
+                }
                 let ast::AssocItem::Fn(f) = it else { continue };
                 if f.body().is_none() {
                     continue;
@@ -497,6 +550,13 @@ impl Checker<'_> {
     fn meets_bound(&self, ty: &Ty, b: &str) -> bool {
         if self.adts.traits.contains_key(b) {
             self.implements_user_trait(ty, b)
+        } else if b == "Iterator" {
+            // (`impl<I: Iterator> Tr for &mut I`.)
+            match self.zonk(ty) {
+                Ty::Iter { .. } | Ty::Range(..) => true,
+                Ty::Adt(n, _) => self.adts.iter_items.contains_key(&n),
+                _ => false,
+            }
         } else {
             self.implements(ty, b)
         }
@@ -508,6 +568,10 @@ impl Checker<'_> {
             && !matches!(self.zonk(ty), Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown)
             && bounds.iter().all(|b| b != tr && self.meets_bound(ty, b))
         {
+            return true;
+        }
+        // A `String` and a `Formatter` are `fmt::Write`rs (through `κσ.$fmtWriteCall`).
+        if tr == "FmtWrite" && matches!(self.zonk(ty), Ty::Str | Ty::Formatter) {
             return true;
         }
         // `impl std::error::Error for MyError {}`
