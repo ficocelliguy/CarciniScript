@@ -155,7 +155,9 @@ fn shadowed(n: &SyntaxNode, name: &str) -> bool {
 fn generic_args(seg: &ast::PathSegment) -> Vec<String> {
     seg.generic_arg_list()
         .map(|l| {
+            // (Lifetimes aren't among the parameters: they're erased.)
             l.generic_args()
+                .filter(|g| !matches!(g, ast::GenericArg::LifetimeArg(_)))
                 .map(|g| g.syntax().text().to_string())
                 .collect()
         })

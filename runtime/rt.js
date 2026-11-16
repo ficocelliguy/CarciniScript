@@ -135,7 +135,77 @@
   // Map key for a HashSet element: primitives as themselves, composite values (tuples, Vecs)
   // structurally. A set holds one element type, so the two kinds never mix.
   function key(x) {
-    return typeof x === "object" && x !== null ? JSON.stringify(x) : x;
+    return typeof x === "object" && x !== null ? JSON.stringify(x, bigKey) : x;
+  }
+  // (`JSON.stringify` can't write a BigInt; a key only needs to be distinct.)
+  function bigKey(_, v) {
+    return typeof v === "bigint" ? `${v}n` : v;
+  }
+
+  // A `std::hash::Hasher`: collects the values written to it. `finish()` is FNV-1a (64-bit) of
+  // them, which differs from Rust's SipHash (its values aren't specified anyway).
+  class Hasher {
+    constructor() {
+      this.parts = [];
+    }
+    $write(x) {
+      this.parts.push(typeof x === "object" && x !== null ? key(x) : x);
+    }
+    $finish() {
+      const s = JSON.stringify(this.parts, bigKey);
+      let h = 0xcbf29ce484222325n;
+      for (let i = 0; i < s.length; i++) {
+        h ^= BigInt(s.charCodeAt(i));
+        h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+      }
+      return h;
+    }
+  }
+
+  // What `f.debug_struct("P")` / `debug_tuple` / `debug_list` / `debug_set` / `debug_map`
+  // return: collects each value's `{:?}` text and writes `P { x: 1 }`, `P(1)`, `[1]` or
+  // `{"k": 1}` into the Formatter at `finish()` (`{:#?}` re-lays it like any `{:?}`).
+  class DbgBuilder {
+    constructor(f, kind, name) {
+      this.f = f;
+      this.kind = kind;
+      this.name = name;
+      this.parts = [];
+      this.k = null;
+    }
+    $field(name, s) {
+      this.parts.push(name === null ? s : `${name}: ${s}`);
+      return this;
+    }
+    $entry(a, b) {
+      this.parts.push(b === undefined ? a : `${a}: ${b}`);
+      return this;
+    }
+    $key(k) {
+      this.k = k;
+      return this;
+    }
+    $value(v) {
+      this.parts.push(`${this.k}: ${v}`);
+      this.k = null;
+      return this;
+    }
+    $entries(items, fmt) {
+      for (const x of items) this.parts.push(fmt(x));
+      return this;
+    }
+    $finish(more) {
+      const p = more ? [...this.parts, ".."] : this.parts;
+      let s;
+      if (this.kind === "struct") s = p.length ? `${this.name} { ${p.join(", ")} }` : this.name;
+      else if (this.kind === "tuple") s = p.length ? `${this.name}(${p.join(", ")})` : this.name;
+      else if (this.kind === "list") s = `[${p.join(", ")}]`;
+      else s = `{${p.join(", ")}}`;
+      // (`{:#?}`: one item per line, as Rust's builders write in alternate mode.)
+      if (this.f.o?.alt) s = rt.$pretty(s);
+      this.f.s += s;
+      return new Res(0, undefined);
+    }
   }
 
   // Rust's HashSet<T>. Methods are `$`-prefixed so Bitburner's RAM calculator never mistakes them
@@ -607,6 +677,49 @@
     $skipWhile(p) {
       return new Iter(new SkipWhileIt(this.it, p));
     }
+    // `it.clone()`: an iterator over what's left, independent of this one.
+    $clone() {
+      const all = Array.from(iterable(this.it));
+      this.it = all[Symbol.iterator]();
+      return new Iter(all.slice()[Symbol.iterator]());
+    }
+    // `peekable()`: this iterator, with one item of lookahead for `peek` and `next_if`.
+    $peekable() {
+      if (!(this.it instanceof PeekIt)) this.it = new PeekIt(this.it);
+      return this;
+    }
+    $peek() {
+      return this.$peekable().it.peek();
+    }
+    $nextIf(p) {
+      const x = this.$peek();
+      if (x === null || !p(x)) return null;
+      return this.$next();
+    }
+    // Double-ended steps collect what's left first: JS iterators only go forward.
+    $nextBack() {
+      const all = Array.from(iterable(this.it));
+      if (all.length === 0) return null;
+      const x = all.pop();
+      this.it = all[Symbol.iterator]();
+      return x;
+    }
+    $nthBack(n) {
+      const all = Array.from(iterable(this.it));
+      if (n >= all.length) {
+        this.it = [][Symbol.iterator]();
+        return null;
+      }
+      const x = all[all.length - 1 - n];
+      this.it = all.slice(0, all.length - 1 - n)[Symbol.iterator]();
+      return x;
+    }
+    // `len()`: how many are left, without using them up.
+    $len() {
+      const all = Array.from(iterable(this.it));
+      this.it = all[Symbol.iterator]();
+      return all.length;
+    }
     $inspect(f) {
       const src = this.it;
       return Iter.of(function* () {
@@ -633,6 +746,49 @@
     }
     toString() {
       return this.$asStr();
+    }
+    $rfind(p) {
+      const all = Array.from(iterable(this.it));
+      for (let i = all.length - 1; i >= 0; i--) if (p(all[i])) return all[i];
+      return null;
+    }
+    $rfold(acc, f) {
+      const all = Array.from(iterable(this.it));
+      for (let i = all.length - 1; i >= 0; i--) acc = f(acc, all[i]);
+      return acc;
+    }
+    // `try_fold` / `try_for_each`: stops at the first `Err` (or `None`, for `option`).
+    $tryFold(acc, f, option, fold) {
+      for (const x of iterable(this.it)) {
+        const r = fold ? f(acc, x) : f(x);
+        if (option ? r == null : r.$tag === 1) return r;
+        acc = option ? r : r[0];
+      }
+      return option ? acc : new Res(0, acc);
+    }
+    // Lexicographic comparison with another iterable (`eqOnly`: just equality, so floats and
+    // unordered items compare too).
+    $cmpWith(other, eqOnly) {
+      const a = Array.from(iterable(this.it));
+      const b = Array.from(items(other));
+      if (eqOnly) return eq(a, b) ? 0 : 1;
+      return cmp(a, b);
+    }
+    $isSorted() {
+      return this.$isSortedBy((a, b) => cmp(a, b) <= 0);
+    }
+    $isSortedByKey(f) {
+      return this.$map(f).$isSorted();
+    }
+    $isSortedBy(le) {
+      let prev;
+      let first = true;
+      for (const x of iterable(this.it)) {
+        if (!first && !le(prev, x)) return false;
+        prev = x;
+        first = false;
+      }
+      return true;
     }
     $count() {
       let n = 0;
@@ -806,6 +962,78 @@
     }
   }
 
+  // `peekable()`'s source: a JS iterator with one item of lookahead.
+  class PeekIt {
+    constructor(it) {
+      this.it = it;
+      this.has = false;
+      this.v = undefined;
+    }
+    [Symbol.iterator]() {
+      return this;
+    }
+    next() {
+      if (this.has) {
+        this.has = false;
+        return { done: false, value: this.v };
+      }
+      return this.it.next();
+    }
+    peek() {
+      if (!this.has) {
+        const r = this.it.next();
+        if (r.done) return null;
+        this.has = true;
+        this.v = r.value;
+      }
+      return this.v;
+    }
+  }
+
+  const NUM_TYPES = {};
+  const OP_METHODS = {
+    "+": "add",
+    "-": "sub",
+    "*": "mul",
+    "/": "div",
+    "%": "rem",
+    "&": "bitand",
+    "|": "bitor",
+    "^": "bitxor",
+    "<<": "shl",
+    ">>": "shr",
+  };
+  // `a & b`, `a << n` (and `|`, `^`, `>>`) on integers of kind `k` (or unknown: `null`). Shift
+  // amounts are masked to the width, as Rust does in release builds.
+  function bitOp(op, a, b, k) {
+    if (typeof a === "bigint") {
+      const n = BigInt(Number(b) & ((k ? k.bits : 128) - 1));
+      const r = op === "&" ? a & b : op === "|" ? a | b : op === "^" ? a ^ b : op === "<<" ? a << n : a >> n;
+      return k ? rt.$w128(r, k.signed, k.bits) : r;
+    }
+    const bits = k ? k.bits : 64;
+    if (op === "<<" || op === ">>") {
+      const n = Number(b) & (bits - 1);
+      if (bits === 64) return op === "<<" ? rt.$shl64(a, n, k.signed) : rt.$shr64(a, n);
+      return op === "<<" ? wrapInt(a << n, k) : k.signed ? a >> n : a >>> n;
+    }
+    if (bits === 64) return rt.$bit64(a, b, op, k ? k.signed : true);
+    return wrapInt(op === "&" ? a & b : op === "|" ? a | b : a ^ b, k);
+  }
+  function divZero(op) {
+    return op === "/" ? "attempt to divide by zero" : "attempt to calculate the remainder with a divisor of zero";
+  }
+  // An integer result wrapped to its type's width (`usize` / `isize` are JS numbers: as is).
+  function wrapInt(r, k) {
+    if (k.bits === 32) return k.signed ? r | 0 : r >>> 0;
+    if (k.bits === 8 || k.bits === 16) {
+      const m = 2 ** k.bits;
+      r = ((r % m) + m) % m;
+      return k.signed && r >= m / 2 ? r - m : r;
+    }
+    return r;
+  }
+
   // A JS iterator as something `for...of` accepts without restarting it.
   function iterable(it) {
     return { [Symbol.iterator]: () => it };
@@ -863,6 +1091,10 @@
     "ParseBoolError:": "provided string was not `true` or `false`",
     "ParseCharError:EmptyString": "cannot parse char from empty string",
     "ParseCharError:TooManyChars": "too many characters in string",
+    "TryFromIntError:PosOverflow": "number too large to fit in target type",
+    "TryFromIntError:NegOverflow": "number too small to fit in target type",
+    "TryFromSliceError:": "could not convert slice to array",
+    "CharTryFromError:": "converted integer out of range for `char`",
   };
   class ParseError {
     constructor(type, kind) {
@@ -873,6 +1105,8 @@
       return this.type === o.type && this.kind === o.kind;
     }
     $dbg() {
+      if (this.type === "TryFromIntError") return `TryFromIntError(${this.kind})`;
+      if (this.type === "TryFromSliceError" || this.type === "CharTryFromError") return `${this.type}(())`;
       return this.kind ? `${this.type} { kind: ${this.kind} }` : this.type;
     }
     toString() {
@@ -1154,7 +1388,6 @@
     else for (let i = start; i < a.length; i++) siftUp(a, 0, i);
   }
 
-  const extRegs = {};
 
   const rt = {
     CarciniPanic,
@@ -1463,17 +1696,25 @@
       }
     },
     // User trait impls for built-in types (`impl Money for f64`), by JS kind, for calls through
-    // a type parameter or `dyn Trait` (`$dcall`).
-    $extReg(kind, cls, integral) {
-      (extRegs[kind] ??= []).push({ cls, integral });
+    // a type parameter or `dyn Trait` (`$dcall`). Each compiled script has its own registry
+    // (`$newRegs`), so one script's impls never answer another's calls.
+    $newRegs() {
+      return { kinds: {}, blankets: [] };
     },
-    $dcall(x, name, ...args) {
+    $extReg(regs, kind, cls, integral) {
+      (regs.kinds[kind] ??= []).push({ cls, integral });
+    },
+    // Blanket impls (`impl<T: Display> Shout for T`): tried for any value, last.
+    $blanketReg(regs, cls) {
+      regs.blankets.push(cls);
+    },
+    $dcall(regs, x, name, ...args) {
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
       const kind = Array.isArray(x) ? "array" : typeof x;
       let pick = null;
-      for (const r of extRegs[kind] ?? []) {
+      for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
         pick ??= r;
         // A number goes to an integer type's impl when it's whole, else to a float type's.
@@ -1483,40 +1724,197 @@
         }
       }
       if (pick) return pick.cls.prototype[name].call(x, ...args);
+      for (const cls of regs.blankets) {
+        if (typeof cls.prototype[name] === "function") return cls.prototype[name].call(x, ...args);
+      }
       return x[name](...args);
     },
-    // `i128` / `u128` are BigInts, wrapped to 128 bits like Rust's release builds.
-    $w128(x, signed) {
-      return signed ? BigInt.asIntN(128, x) : BigInt.asUintN(128, x);
+    // `i64` / `u64` / `i128` / `u128` are BigInts, wrapped to their width like Rust's release
+    // builds.
+    $w128(x, signed, bits = 128) {
+      return signed ? BigInt.asIntN(bits, x) : BigInt.asUintN(bits, x);
     },
-    $div128(a, b) {
+    // (`MIN / -1` overflows, which panics in release builds too.)
+    $div128(a, b, signed, bits = 128) {
       if (b === 0n) throw new CarciniPanic("attempt to divide by zero", "<std>");
+      if (signed && b === -1n && a === -(1n << BigInt(bits - 1))) {
+        throw new CarciniPanic("attempt to divide with overflow", "<std>");
+      }
       return a / b;
     },
-    $rem128(a, b) {
+    $rem128(a, b, signed, bits = 128) {
       if (b === 0n) throw new CarciniPanic("attempt to calculate the remainder with a divisor of zero", "<std>");
+      if (signed && b === -1n && a === -(1n << BigInt(bits - 1))) {
+        throw new CarciniPanic("attempt to calculate the remainder with overflow", "<std>");
+      }
       return a % b;
     },
     $abs128(x) {
       return x < 0n ? -x : x;
     },
-    // `x as i128`: from a number (truncated) or another BigInt.
-    $to128(x, signed) {
-      const b = typeof x === "bigint" ? x : BigInt(Math.trunc(x));
-      return signed ? BigInt.asIntN(128, b) : BigInt.asUintN(128, b);
+    // The integer methods of the BigInt kinds, exact at `bits`: `checked_*` / `saturating_*` /
+    // `wrapping_*` (add, sub, mul, div, rem, pow, neg, abs), `abs`, `pow`, `signum`, `min`,
+    // `max`, `clamp`, `rem_euclid`, `div_euclid`, `abs_diff`, the bit counts, `isqrt`, `ilog*`.
+    // Debug builds pass a location after the arguments of `abs` / `pow`, which then panic on
+    // overflow.
+    $big(name, x, bits, signed, ...args) {
+      const B = BigInt(bits);
+      const min = signed ? -(1n << (B - 1n)) : 0n;
+      const max = signed ? (1n << (B - 1n)) - 1n : (1n << B) - 1n;
+      const wrap = (v) => (signed ? BigInt.asIntN(bits, v) : BigInt.asUintN(bits, v));
+      const arg = (i) => (typeof args[i] === "bigint" ? args[i] : BigInt(args[i] ?? 0));
+      const panic = (msg, loc = "<std>") => {
+        throw new CarciniPanic(msg, loc);
+      };
+      // `a ** e` exactly, or just past the range when it overflows (`e` can be huge).
+      const powExact = (a, e) =>
+        (a > 1n || a < -1n) && e > B ? (a < 0n && e & 1n ? min - 1n : max + 1n) : a ** e;
+      const powWrap = (a, e) => {
+        let r = 1n;
+        let base = wrap(a);
+        for (let n = e; n > 0n; n >>= 1n) {
+          if (n & 1n) r = wrap(r * base);
+          base = wrap(base * base);
+        }
+        return r;
+      };
+      const m = /^(checked|saturating|wrapping)_(.*)$/.exec(name);
+      if (m) {
+        const [, kind, op] = m;
+        const b = op === "neg" || op === "abs" ? 0n : arg(0);
+        if ((op === "div" || op === "rem") && b === 0n) {
+          if (kind === "checked") return null;
+          panic(op === "div" ? "attempt to divide by zero" : "attempt to calculate the remainder with a divisor of zero");
+        }
+        if (op === "pow" && kind === "wrapping") return powWrap(x, b);
+        if (op === "rem" && signed && x === min && b === -1n) return kind === "checked" ? null : 0n;
+        const r =
+          op === "add" ? x + b
+          : op === "sub" ? x - b
+          : op === "mul" ? x * b
+          : op === "div" ? x / b
+          : op === "rem" ? x % b
+          : op === "pow" ? powExact(x, b)
+          : op === "neg" ? -x
+          : x < 0n ? -x : x;
+        const ok = r >= min && r <= max;
+        if (kind === "checked") return ok ? r : null;
+        if (kind === "saturating") return ok ? r : r < min ? min : max;
+        return wrap(r);
+      }
+      const u = BigInt.asUintN(bits, x);
+      switch (name) {
+        case "abs":
+          if (signed && x === min) {
+            if (args.length) panic("attempt to negate with overflow", args[0]);
+            return min;
+          }
+          return x < 0n ? -x : x;
+        case "pow": {
+          const e = arg(0);
+          const r = powExact(x, e);
+          if (r >= min && r <= max) return r;
+          if (args.length > 1) panic("attempt to exponentiate with overflow", args[1]);
+          return powWrap(x, e);
+        }
+        case "signum":
+          return x > 0n ? 1n : x < 0n ? -1n : 0n;
+        case "min":
+          return arg(0) < x ? arg(0) : x;
+        case "max":
+          return arg(0) > x ? arg(0) : x;
+        case "clamp":
+          if (arg(0) > arg(1)) panic("assertion failed: min <= max");
+          return x < arg(0) ? arg(0) : x > arg(1) ? arg(1) : x;
+        case "rem_euclid":
+        case "div_euclid": {
+          const y = arg(0);
+          if (y === 0n) {
+            panic(name === "div_euclid" ? "attempt to divide by zero" : "attempt to calculate the remainder with a divisor of zero");
+          }
+          const r = x % y;
+          const fix = r < 0n;
+          if (name === "rem_euclid") return fix ? r + (y < 0n ? -y : y) : r;
+          const q = x / y;
+          return fix ? (y > 0n ? q - 1n : q + 1n) : q;
+        }
+        case "abs_diff":
+          return x > arg(0) ? x - arg(0) : arg(0) - x;
+        case "count_ones":
+          return [...u.toString(2)].filter((c) => c === "1").length;
+        case "count_zeros":
+          return bits - [...u.toString(2)].filter((c) => c === "1").length;
+        case "leading_zeros":
+          return u === 0n ? bits : bits - u.toString(2).length;
+        case "trailing_zeros": {
+          if (u === 0n) return bits;
+          const s = u.toString(2);
+          return s.length - 1 - s.lastIndexOf("1");
+        }
+        case "is_power_of_two":
+          return x > 0n && (x & (x - 1n)) === 0n;
+        case "is_positive":
+          return x > 0n;
+        case "is_negative":
+          return x < 0n;
+        case "isqrt": {
+          if (x < 0n) panic("argument of integer square root cannot be negative");
+          if (x < 2n) return x;
+          let r = BigInt(Math.floor(Math.sqrt(Number(x))));
+          while (r * r > x) r--;
+          while ((r + 1n) * (r + 1n) <= x) r++;
+          return r;
+        }
+        case "ilog2":
+        case "ilog10":
+          if (x <= 0n) panic("argument of integer logarithm must be positive");
+          return x.toString(name === "ilog2" ? 2 : 10).length - 1;
+        case "to_string":
+          return x.toString();
+        default:
+          panic(`\`${name}\` isn't supported on 64- and 128-bit integers yet`);
+      }
+    },
+    // `x as i64` / `x as u128`: from a number or another BigInt. A float saturates and NaN is
+    // 0, as Rust's `as` does.
+    $to128(x, signed, bits = 128) {
+      if (typeof x === "bigint") return signed ? BigInt.asIntN(bits, x) : BigInt.asUintN(bits, x);
+      if (typeof x === "boolean") return x ? 1n : 0n;
+      const min = signed ? -(1n << BigInt(bits - 1)) : 0n;
+      const max = signed ? (1n << BigInt(bits - 1)) - 1n : (1n << BigInt(bits)) - 1n;
+      if (Number.isNaN(x)) return 0n;
+      if (x === Infinity) return max;
+      if (x === -Infinity) return min;
+      const b = BigInt(Math.trunc(x));
+      if (Number.isInteger(x) && !Number.isSafeInteger(x)) {
+        // A float past 2^53: saturate rather than wrap.
+        return b < min ? min : b > max ? max : b;
+      }
+      if (b < min || b > max) {
+        // An integer from a smaller kind can't be out of range; a float saturates.
+        return Number.isInteger(x) && Number.isSafeInteger(x) && !(x % 1)
+          ? signed
+            ? BigInt.asIntN(bits, b)
+            : BigInt.asUintN(bits, b)
+          : b < min
+            ? min
+            : max;
+      }
+      return b;
     },
     // `x as u32` from an `i128`: wrapped to the target's bits, as a number.
     $from128(x, bits, signed) {
       return Number(signed ? BigInt.asIntN(bits, x) : BigInt.asUintN(bits, x));
     },
-    $parseInt128(s, signed) {
+    $parseInt128(s, signed, bits = 128) {
       const err = (kind) => new Res(1, new ParseError("ParseIntError", kind));
       if (s === "") return err("Empty");
       if (!/^[+-]?[0-9]+$/.test(s) || s === "+" || s === "-") return err("InvalidDigit");
       if (!signed && s[0] === "-") return err("InvalidDigit");
       const v = BigInt(s);
-      const max = signed ? (1n << 127n) - 1n : (1n << 128n) - 1n;
-      const min = signed ? -(1n << 127n) : 0n;
+      const B = BigInt(bits);
+      const max = signed ? (1n << (B - 1n)) - 1n : (1n << B) - 1n;
+      const min = signed ? -(1n << (B - 1n)) : 0n;
       if (v > max) return err("PosOverflow");
       if (v < min) return err("NegOverflow");
       return new Res(0, v);
@@ -1677,6 +2075,31 @@
     Iter,
     $iter(x) {
       return new Iter(x[Symbol.iterator]());
+    },
+    Hasher,
+    // `x.hash(state)`: a type's own `hash`, else the value's key.
+    $hashInto(v, h) {
+      if (v !== null && typeof v === "object" && typeof v.hash === "function") v.hash(h);
+      else h.$write(v);
+    },
+    // `u8::try_from(x)` / `x.try_into()` between integer types: `Err` when out of range.
+    $tryInt(x, bits, signed, big) {
+      const v = BigInt(x);
+      const b = BigInt(bits);
+      const min = signed ? -(1n << (b - 1n)) : 0n;
+      const max = (signed ? 1n << (b - 1n) : 1n << b) - 1n;
+      if (v < min || v > max) return new Res(1, new ParseError("TryFromIntError", v < min ? "NegOverflow" : "PosOverflow"));
+      return new Res(0, big ? v : Number(v));
+    },
+    // `char::try_from(n)`: `Err` past U+10FFFF and for surrogates.
+    $tryChar(n) {
+      const v = Number(n);
+      if (v > 0x10ffff || (v >= 0xd800 && v <= 0xdfff)) return new Res(1, new ParseError("CharTryFromError", ""));
+      return new Res(0, String.fromCodePoint(v));
+    },
+    // An `IntoIterator` argument (a Vec, set, map or iterator) as an iterator.
+    $intoIter(x) {
+      return new Iter((x instanceof HashMap ? x.$entries() : x)[Symbol.iterator]());
     },
     // A token value's text for `quote!` (`None` is nothing).
     $tt(x) {
@@ -2009,14 +2432,16 @@
         case "char": return String.fromCodePoint(dv.getUint32(0, true));
         case "f32": return dv.getFloat32(0, true);
         case "f64": return dv.getFloat64(0, true);
-        case "i64": return Number(dv.getBigInt64(0, true));
-        case "u64": return Number(dv.getBigUint64(0, true));
+        case "i64": return dv.getBigInt64(0, true);
+        case "u64": return dv.getBigUint64(0, true);
         default: {
           const v = dv.getBigUint64(0, true) | (dv.getBigUint64(8, true) << 64n);
           return to === "i128" ? BigInt.asIntN(128, v) : v;
         }
       }
     },
+    // `f.debug_struct("P")` and friends; see `DbgBuilder`.
+    DbgBuilder,
     // `Display` impls write into a Formatter: `{ s: "" }`.
     $write(f, s, nl) {
       f.s += nl ? s + "\n" : s;
@@ -2139,7 +2564,15 @@
       return new Res(0, Number(v));
     },
     // `i32::from_str_radix(s, 16)`: digits up to the radix (either case), an optional sign.
-    $fromStrRadix(s, radix, min, max) {
+    // `u64::from_str_radix(s, 16)`: a BigInt.
+    $fromStrRadixBig(s, radix, signed, bits) {
+      const B = BigInt(bits);
+      const min = signed ? -(1n << (B - 1n)) : 0n;
+      const max = signed ? (1n << (B - 1n)) - 1n : (1n << B) - 1n;
+      const r = rt.$fromStrRadix(s, radix, min, max, true);
+      return r;
+    },
+    $fromStrRadix(s, radix, min, max, big = false) {
       const err = (kind) => new Res(1, new ParseError("ParseIntError", kind));
       if (s === "") return err("Empty");
       let body = s;
@@ -2159,7 +2592,7 @@
       if (neg) v = -v;
       if (v > BigInt(max)) return err("PosOverflow");
       if (v < BigInt(min)) return err("NegOverflow");
-      return new Res(0, Number(v));
+      return new Res(0, big ? v : Number(v));
     },
     // `s.as_bytes()`: UTF-8.
     $utf8(s) {
@@ -2698,6 +3131,13 @@
       rt.$replace(a, value);
       return old;
     },
+    // A struct's class with its const generic arguments (`Buf::<4>` as `T`, or for
+    // `Default::default()`): its associated functions read them as `this.$cargs`.
+    $cv(cls, args) {
+      const view = Object.create(cls);
+      view.$cargs = args;
+      return view;
+    },
     // A trait's default methods, added to an implementing class unless it defines its own.
     // A trait's default methods, unless the class defines its own; also as `Trait$name`, for
     // `Trait::name(&x)` calls.
@@ -2721,11 +3161,111 @@
     $prims: {
       num: { default: () => 0 },
       big: { default: () => 0n },
-      str: { default: () => "" },
-      bool: { default: () => false },
-      char: { default: () => "\0" },
+      str: { default: () => "", from_str: (s) => new Res(0, s) },
+      bool: { default: () => false, from_str: (s) => rt.$parseBool(s) },
+      char: { default: () => "\0", from_str: (s) => rt.$parseChar(s) },
       vec: { default: () => [] },
       option: { default: () => null },
+    },
+    // A number type as a type parameter's class (`T = u8`): its `default()` and kind, for
+    // generic arithmetic.
+    $numT(kind) {
+      let t = NUM_TYPES[kind];
+      if (t === undefined) {
+        const float = kind[0] === "f";
+        const big = /^[iu](64|128)$/.test(kind);
+        const bits = float ? 64 : kind.endsWith("size") ? 64 : Number(kind.slice(1));
+        const signed = kind[0] !== "u";
+        t = NUM_TYPES[kind] = {
+          kind,
+          float,
+          big,
+          bits,
+          signed,
+          default: big ? () => 0n : () => 0,
+          from_str: float
+            ? (s) => rt.$parseFloat(s)
+            : big
+              ? (s) => rt.$parseInt128(s, signed, bits)
+              : (s) => rt.$parseInt(s, signed ? -(2 ** (bits - 1)) : 0, signed ? 2 ** (bits - 1) - 1 : 2 ** bits - 1),
+        };
+      }
+      return t;
+    },
+    // `a + b` (and `-`, `*`, `/`, `%`) where `a: T`: a struct's own operator, else arithmetic
+    // as `T`'s kind does it (integer division truncates and panics on zero, results wrap).
+    $gop(op, a, b, T, loc) {
+      if (a !== null && typeof a === "object") return a["$op$" + OP_METHODS[op]](b);
+      const k = T?.kind === undefined ? null : T;
+      if (op.length === 2 || op === "&" || op === "|" || op === "^") {
+        if (typeof a === "boolean") return op === "&" ? a && b : op === "|" ? a || b : a !== b;
+        return bitOp(op, a, b, k);
+      }
+      if (typeof a === "bigint") {
+        if ((op === "/" || op === "%") && b === 0n) throw new CarciniPanic(divZero(op), loc);
+        const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "/" ? a / b : a % b;
+        return k ? rt.$w128(r, k.signed, k.bits) : r;
+      }
+      if (!k || k.float) {
+        const r = op === "+" ? a + b : op === "-" ? a - b : op === "*" ? a * b : op === "/" ? a / b : a % b;
+        return k?.kind === "f32" ? Math.fround(r) : r;
+      }
+      if (op === "/" || op === "%") {
+        if (b === 0) throw new CarciniPanic(divZero(op), loc);
+        if (k.signed && b === -1 && k.bits <= 32 && a === -(2 ** (k.bits - 1))) {
+          throw new CarciniPanic(op === "/" ? "attempt to divide with overflow" : "attempt to calculate the remainder with overflow", loc);
+        }
+        return op === "/" ? Math.trunc(a / b) : a % b;
+      }
+      const r = op === "+" ? a + b : op === "-" ? a - b : k.bits <= 32 ? Math.imul(a, b) : a * b;
+      return wrapInt(r, k);
+    },
+    // `s.parse::<T>()` with `T: FromStr`.
+    $tparse(T, s) {
+      return T.from_str(s);
+    },
+    // `T::from(x)` with `T: From<X>` (`src` names `X`): a number conversion, or the type's
+    // `From<X>` impl.
+    $tfrom(T, src, x) {
+      if (T.kind !== undefined) {
+        const v = typeof x === "string" ? x.codePointAt(0) : x;
+        return T.big ? BigInt(v) : Number(v);
+      }
+      if (T === rt.$prims.str) return String(x);
+      if (T === rt.$prims.char) return String.fromCodePoint(Number(x));
+      const f = T["$from$" + src];
+      return f ? f.call(T, x) : T.from(x);
+    },
+    // `iter.sum::<T>()` / `product` with `T: Sum`: the type's own `sum`, else by its kind.
+    $gsum(it, T, product) {
+      const own = product ? T?.product : T?.sum;
+      if (T?.kind === undefined && typeof own === "function") return own.call(T, it);
+      let acc = T?.big ? (product ? 1n : 0n) : product ? 1 : T?.float ? -0 : 0;
+      for (const x of it) acc = rt.$gop(product ? "*" : "+", acc, x, T, "<std>");
+      return acc;
+    },
+    // `a += b` where `a: T`: a struct's `add_assign` changes it in place; numbers get the result.
+    $gopAssign(op, a, b, T, loc) {
+      if (a !== null && typeof a === "object") {
+        a["$op$" + OP_METHODS[op] + "_assign"](b);
+        return a;
+      }
+      return rt.$gop(op, a, b, T, loc);
+    },
+    // `!a` where `a: T`.
+    $gnot(a, T) {
+      if (a !== null && typeof a === "object") return a.$op$not();
+      if (typeof a === "boolean") return !a;
+      if (typeof a === "bigint") return rt.$w128(~a, T.signed, T.bits);
+      if (T.bits === 64) return rt.$not64(a, T.signed);
+      return wrapInt(~a, T);
+    },
+    // `-a` where `a: T`.
+    $gneg(a, T) {
+      if (a !== null && typeof a === "object") return a.$op$neg();
+      if (typeof a === "bigint") return T?.kind ? rt.$w128(-a, T.signed, T.bits) : -a;
+      if (!T?.kind || T.float) return -a;
+      return wrapInt(-a, T);
     },
     // `Ord::max` / `Ord::min`: on ties `max` returns the second argument and `min` the first.
     $max(a, b) {
@@ -2818,6 +3358,8 @@
     return sign + out;
   }
 
+  rt.$ryu = (x) => ryu(x, false);
+
   function jsonOut(v, s, pretty, ind) {
     s = jsonSchema(s);
     const inner = ind + "  ";
@@ -2857,6 +3399,8 @@
         return obj(Array.from(v.$entries(), ([k, x]) => [String(k), sub(x, s.v)]));
       case "cell":
         return jsonOut(v.v, s.s, pretty, ind);
+      case "jsonvalue":
+        return s.out(v, pretty, ind);
       case "result":
         return obj([[v.$tag === 0 ? "Ok" : "Err", sub(v[0], v.$tag === 0 ? s.ok : s.err)]]);
       case "struct":
@@ -2913,6 +3457,646 @@
       return null;
     }
   };
+  // The bundled `rand` crate. An RNG is xoshiro128** (32-bit steps, fast in JS); `thread_rng()`
+  // is one shared generator seeded from `Math.random`, `StdRng::seed_from_u64(n)` a
+  // deterministic one (its numbers differ from rand's ChaCha). Numbers sample uniformly by the
+  // type's class (`κσ.$numT("u8")`), as `rng.gen::<T>()` and `gen_range` need.
+  class RandRng {
+    constructor(seed) {
+      // splitmix32 spreads the seed over the four words of state.
+      let x = seed >>> 0;
+      const next = () => {
+        x = (x + 0x9e3779b9) >>> 0;
+        let z = x;
+        z = Math.imul(z ^ (z >>> 16), 0x85ebca6b);
+        z = Math.imul(z ^ (z >>> 13), 0xc2b2ae35);
+        return (z ^ (z >>> 16)) >>> 0;
+      };
+      this.s = [next(), next(), next(), next()];
+      if (this.s.every((w) => w === 0)) this.s[0] = 1;
+    }
+    u32() {
+      const s = this.s;
+      const r = Math.imul(rotl(Math.imul(s[1], 5), 7), 9) >>> 0;
+      const t = s[1] << 9;
+      s[2] ^= s[0];
+      s[3] ^= s[1];
+      s[1] ^= s[2];
+      s[0] ^= s[3];
+      s[2] ^= t;
+      s[3] = rotl(s[3], 11);
+      return r;
+    }
+    // A float in [0, 1) with 53 random bits.
+    f64() {
+      return ((this.u32() >>> 5) * 67108864 + (this.u32() >>> 6)) / 9007199254740992;
+    }
+    big(bits) {
+      let r = 0n;
+      for (let b = 0; b < bits; b += 32) r = (r << 32n) | BigInt(this.u32());
+      return r;
+    }
+  }
+  function rotl(x, k) {
+    return (x << k) | (x >>> (32 - k));
+  }
+  let threadRng = null;
+  function seedOf(n) {
+    if (typeof n === "bigint") return Number(BigInt.asUintN(32, n ^ (n >> 32n)));
+    return (n >>> 0) ^ Math.floor(n / 4294967296);
+  }
+  const rand = {
+    thread() {
+      if (threadRng === null) threadRng = new RandRng(Math.floor(Math.random() * 4294967296));
+      return threadRng;
+    },
+    seeded(n) {
+      return new RandRng(seedOf(n));
+    },
+    entropy() {
+      return new RandRng(Math.floor(Math.random() * 4294967296));
+    },
+    // `rng.gen::<T>()`: integers over their whole range, floats in [0, 1), bools.
+    gen(rng, T) {
+      if (T === rt.$prims.bool) return (rng.u32() & 1) === 1;
+      if (T === rt.$prims.char) {
+        for (;;) {
+          const c = rng.u32() % 0x110000;
+          if (c < 0xd800 || c > 0xdfff) return String.fromCodePoint(c);
+        }
+      }
+      if (T?.kind === undefined || T.float) {
+        const f = rng.f64();
+        return T?.kind === "f32" ? Math.fround(f) : f;
+      }
+      if (T.big) return rt.$w128(rng.big(T.bits), T.signed, T.bits);
+      if (T.bits === 64) {
+        // (`usize` / `isize` are JS numbers: 53 bits of them.)
+        return (rng.u32() >>> 11) * 4294967296 + rng.u32();
+      }
+      return wrapInt(rng.u32(), T);
+    },
+    // `rng.gen_range(lo..hi)` / `lo..=hi`.
+    range(rng, lo, hi, inclusive, T) {
+      if (inclusive ? !(lo <= hi) : !(lo < hi)) throw new CarciniPanic("cannot sample empty range", "<rand>");
+      if (T?.float || (T?.kind === undefined && (!Number.isInteger(lo) || !Number.isInteger(hi)))) {
+        const r = lo + rng.f64() * (hi - lo);
+        const v = !inclusive && r >= hi ? lo : r;
+        return T?.kind === "f32" ? Math.fround(v) : v;
+      }
+      if (typeof lo === "bigint") {
+        const span = hi - lo + (inclusive ? 1n : 0n);
+        const bits = span.toString(2).length + 64;
+        return lo + (rng.big(Math.ceil(bits / 32) * 32) % span);
+      }
+      const span = hi - lo + (inclusive ? 1 : 0);
+      if (span <= 4294967296) {
+        // Rejection keeps it exactly uniform.
+        const zone = 4294967296 - (4294967296 % span);
+        for (;;) {
+          const x = rng.u32();
+          if (x < zone) return lo + (x % span);
+        }
+      }
+      return lo + Math.floor(rng.f64() * span);
+    },
+    range2(rng, lo, hi, T) {
+      return rand.range(rng, lo, hi, false, T);
+    },
+    // `rng.fill(&mut buf)`.
+    fill(rng, buf, T) {
+      for (let i = 0; i < buf.length; i++) buf[i] = rand.gen(rng, T);
+      return new Res(0, undefined);
+    },
+    bool(rng, p) {
+      if (!(p >= 0 && p <= 1)) throw new CarciniPanic(`p=${rt.$dbgF(p)} is outside range [0.0, 1.0]`, "<rand>");
+      return p === 1 || rng.f64() < p;
+    },
+    ratio(rng, num, den) {
+      if (den === 0 || num > den) throw new CarciniPanic(`p=${num}/${den} is outside range [0, 1]`, "<rand>");
+      return rand.range(rng, 0, den, false, null) < num;
+    },
+    // `v.shuffle(&mut rng)`: Fisher-Yates, in place.
+    shuffle(v, rng) {
+      for (let i = v.length - 1; i > 0; i--) {
+        const j = rand.range(rng, 0, i, true, null);
+        const t = v[i];
+        v[i] = v[j];
+        v[j] = t;
+      }
+    },
+    choose(v, rng) {
+      return v.length === 0 ? null : v[rand.range(rng, 0, v.length, false, null)];
+    },
+    // `v.choose_multiple(&mut rng, n)`: `n` distinct elements (all of them if fewer), as an
+    // iterator.
+    chooseMultiple(v, rng, n) {
+      const idx = v.map((_, i) => i);
+      const k = Math.min(n, v.length);
+      for (let i = 0; i < k; i++) {
+        const j = rand.range(rng, i, idx.length, false, null);
+        const t = idx[i];
+        idx[i] = idx[j];
+        idx[j] = t;
+      }
+      return rt.$iter(idx.slice(0, k).map((i) => v[i]));
+    },
+    // `iter.choose(&mut rng)`: reservoir sampling.
+    iterChoose(it, rng) {
+      let pick = null;
+      let seen = 0;
+      for (const x of it) {
+        seen++;
+        if (rand.range(rng, 0, seen, false, null) === 0) pick = x;
+      }
+      return pick;
+    },
+    iterChooseMultiple(it, rng, n) {
+      const out = [];
+      let seen = 0;
+      for (const x of it) {
+        if (out.length < n) out.push(x);
+        else {
+          const j = rand.range(rng, 0, seen + 1, false, null);
+          if (j < n) out[j] = x;
+        }
+        seen++;
+      }
+      return out;
+    },
+    nextU32(rng) {
+      return rng.u32();
+    },
+    // `rand::random::<T>()` and friends: on the thread's generator.
+    random(T) {
+      return rand.gen(rand.thread(), T);
+    },
+    randomRange(lo, hi, inclusive, T) {
+      return rand.range(rand.thread(), lo, hi, inclusive, T);
+    },
+    randomBool(p) {
+      return rand.bool(rand.thread(), p);
+    },
+    randomRatio(num, den) {
+      return rand.ratio(rand.thread(), num, den);
+    },
+    nextU64(rng) {
+      return rng.big(64);
+    },
+  };
+  rt.$rand = rand;
+  // The bundled `itertools` crate's `Itertools` methods, on the runtime's iterators: lazy where
+  // itertools is lazy, by Rust's equality (`key`) and order (`cmp`).
+  const lazy = (g) => new Iter(g());
+  const itertools = {
+    join(it, sep) {
+      let out = "";
+      let first = true;
+      for (const x of it) {
+        if (!first) out += sep;
+        out += rt.$disp(x);
+        first = false;
+      }
+      return out;
+    },
+    collectVec(it) {
+      return Array.from(it);
+    },
+    sorted(it) {
+      return rt.$iter(Array.from(it).sort(cmp));
+    },
+    sortedBy(it, f) {
+      return rt.$iter(Array.from(it).sort((a, b) => f(a, b)));
+    },
+    sortedByKey(it, f) {
+      return rt.$iter(Array.from(it).sort((a, b) => cmp(f(a), f(b))));
+    },
+    sortedByCachedKey(it, f) {
+      const ks = Array.from(it, (x) => [f(x), x]);
+      return rt.$iter(ks.sort((a, b) => cmp(a[0], b[0])).map((p) => p[1]));
+    },
+    unique(it) {
+      return itertools.uniqueBy(it, (x) => x);
+    },
+    uniqueBy(it, f) {
+      return lazy(function* () {
+        const seen = new Set();
+        for (const x of it) {
+          const k = key(f(x));
+          if (!seen.has(k)) {
+            seen.add(k);
+            yield x;
+          }
+        }
+      });
+    },
+    dedup(it) {
+      return lazy(function* () {
+        let first = true;
+        let last;
+        for (const x of it) {
+          if (first || !eq(last, x)) yield x;
+          last = x;
+          first = false;
+        }
+      });
+    },
+    // Each value seen a second time, once.
+    duplicates(it) {
+      return lazy(function* () {
+        const seen = new Map();
+        for (const x of it) {
+          const k = key(x);
+          const n = seen.get(k) ?? 0;
+          if (n === 1) yield x;
+          seen.set(k, n + 1);
+        }
+      });
+    },
+    // `tuple_windows::<(_, _)>()`: overlapping `n`-tuples (arrays).
+    tupleWindows(it, n) {
+      return lazy(function* () {
+        const w = [];
+        for (const x of it) {
+          w.push(x);
+          if (w.length > n) w.shift();
+          if (w.length === n) yield w.map(clone);
+        }
+      });
+    },
+    circularTupleWindows(it, n) {
+      return lazy(function* () {
+        const xs = Array.from(it);
+        if (xs.length === 0) return;
+        for (let i = 0; i < xs.length; i++) {
+          const t = [];
+          for (let j = 0; j < n; j++) t.push(clone(xs[(i + j) % xs.length]));
+          yield t;
+        }
+      });
+    },
+    tuples(it, n) {
+      return lazy(function* () {
+        let t = [];
+        for (const x of it) {
+          t.push(x);
+          if (t.length === n) {
+            yield t;
+            t = [];
+          }
+        }
+      });
+    },
+    // Index lists of `combinations(k)`, in itertools' (lexicographic) order.
+    combinations(it, k) {
+      const pool = Array.from(it);
+      return lazy(function* () {
+        const n = pool.length;
+        if (k > n) return;
+        const idx = Array.from({ length: k }, (_, i) => i);
+        for (;;) {
+          yield idx.map((i) => clone(pool[i]));
+          let i = k - 1;
+          while (i >= 0 && idx[i] === i + n - k) i--;
+          if (i < 0) return;
+          idx[i]++;
+          for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+        }
+      });
+    },
+    combinationsWithReplacement(it, k) {
+      const pool = Array.from(it);
+      return lazy(function* () {
+        const n = pool.length;
+        if (n === 0 && k > 0) return;
+        const idx = new Array(k).fill(0);
+        for (;;) {
+          yield idx.map((i) => clone(pool[i]));
+          let i = k - 1;
+          while (i >= 0 && idx[i] === n - 1) i--;
+          if (i < 0) return;
+          const v = idx[i] + 1;
+          for (let j = i; j < k; j++) idx[j] = v;
+        }
+      });
+    },
+    permutations(it, k) {
+      const pool = Array.from(it);
+      return lazy(function* () {
+        const n = pool.length;
+        if (k > n) return;
+        const used = new Array(n).fill(false);
+        const cur = [];
+        function* go() {
+          if (cur.length === k) {
+            yield cur.map((i) => clone(pool[i]));
+            return;
+          }
+          for (let i = 0; i < n; i++) {
+            if (used[i]) continue;
+            used[i] = true;
+            cur.push(i);
+            yield* go();
+            cur.pop();
+            used[i] = false;
+          }
+        }
+        yield* go();
+      });
+    },
+    // By size, then in combinations' order.
+    powerset(it) {
+      const pool = Array.from(it);
+      return lazy(function* () {
+        for (let k = 0; k <= pool.length; k++) yield* itertools.combinations(pool, k);
+      });
+    },
+    cartesianProduct(it, other) {
+      const ys = Array.from(items(other));
+      return lazy(function* () {
+        for (const x of it) for (const y of ys) yield [clone(x), clone(y)];
+      });
+    },
+    multiCartesianProduct(it) {
+      const pools = Array.from(it, (p) => Array.from(items(p)));
+      return lazy(function* () {
+        if (pools.length === 0 || pools.some((p) => p.length === 0)) return;
+        const idx = new Array(pools.length).fill(0);
+        for (;;) {
+          yield idx.map((i, j) => clone(pools[j][i]));
+          let j = pools.length - 1;
+          while (j >= 0 && ++idx[j] === pools[j].length) idx[j--] = 0;
+          if (j < 0) return;
+        }
+      });
+    },
+    interleave(it, other) {
+      const b = items(other)[Symbol.iterator]();
+      const a = it[Symbol.iterator]();
+      return lazy(function* () {
+        let aDone = false;
+        let bDone = false;
+        while (!aDone || !bDone) {
+          if (!aDone) {
+            const r = a.next();
+            if (r.done) aDone = true;
+            else yield r.value;
+          }
+          if (!bDone) {
+            const r = b.next();
+            if (r.done) bDone = true;
+            else yield r.value;
+          }
+        }
+      });
+    },
+    intersperse(it, sep) {
+      return lazy(function* () {
+        let first = true;
+        for (const x of it) {
+          if (!first) yield clone(sep);
+          yield x;
+          first = false;
+        }
+      });
+    },
+    merge(it, other) {
+      const xs = Array.from(it);
+      const ys = Array.from(items(other));
+      const out = [];
+      let i = 0;
+      let j = 0;
+      while (i < xs.length && j < ys.length) out.push(cmp(ys[j], xs[i]) < 0 ? ys[j++] : xs[i++]);
+      return rt.$iter(out.concat(xs.slice(i), ys.slice(j)));
+    },
+    zipEq(it, other, loc) {
+      const a = it[Symbol.iterator]();
+      const b = items(other)[Symbol.iterator]();
+      return lazy(function* () {
+        for (;;) {
+          const x = a.next();
+          const y = b.next();
+          if (x.done && y.done) return;
+          if (x.done || y.done) throw new CarciniPanic("itertools: .zip_eq() reached end of one iterator before the other", loc);
+          yield [x.value, y.value];
+        }
+      });
+    },
+    takeWhileInclusive(it, p) {
+      return lazy(function* () {
+        for (const x of it) {
+          yield x;
+          if (!p(x)) return;
+        }
+      });
+    },
+    positions(it, p) {
+      return lazy(function* () {
+        let i = 0;
+        for (const x of it) {
+          if (p(x)) yield i;
+          i++;
+        }
+      });
+    },
+    dropping(it, n) {
+      const i = it[Symbol.iterator]();
+      for (let k = 0; k < n && !i.next().done; k++);
+      return new Iter(i);
+    },
+    counts(it) {
+      return itertools.countsBy(it, (x) => x);
+    },
+    countsBy(it, f) {
+      const m = new HashMap();
+      for (const x of it) {
+        const k = f(x);
+        m.$insert(k, (m.$get(k) ?? 0) + 1);
+      }
+      return m;
+    },
+    allEqual(it) {
+      let first = true;
+      let v;
+      for (const x of it) {
+        if (first) v = x;
+        else if (!eq(v, x)) return false;
+        first = false;
+      }
+      return true;
+    },
+    allUnique(it) {
+      const seen = new Set();
+      for (const x of it) {
+        const k = key(x);
+        if (seen.has(k)) return false;
+        seen.add(k);
+      }
+      return true;
+    },
+    contains(it, v) {
+      for (const x of it) if (eq(x, v)) return true;
+      return false;
+    },
+    findPosition(it, p) {
+      let i = 0;
+      for (const x of it) {
+        if (p(x)) return [i, x];
+        i++;
+      }
+      return null;
+    },
+    kSmallest(it, k) {
+      return rt.$iter(Array.from(it).sort(cmp).slice(0, k));
+    },
+    kLargest(it, k) {
+      return rt.$iter(Array.from(it).sort((a, b) => cmp(b, a)).slice(0, k));
+    },
+    // `chunk_by(key)`: runs of equal keys, as (key, the run's iterator).
+    chunkBy(it, f) {
+      return lazy(function* () {
+        let run = null;
+        let k;
+        for (const x of it) {
+          const kx = f(x);
+          if (run !== null && eq(k, kx)) run.push(x);
+          else {
+            if (run !== null) yield [k, rt.$iter(run)];
+            run = [x];
+            k = kx;
+          }
+        }
+        if (run !== null) yield [k, rt.$iter(run)];
+      });
+    },
+    intoGroupMap(it) {
+      const m = new HashMap();
+      for (const [k, v] of it) {
+        const vs = m.$get(k);
+        if (vs === null) m.$insert(k, [v]);
+        else vs.push(v);
+      }
+      return m;
+    },
+    intoGroupMapBy(it, f) {
+      const m = new HashMap();
+      for (const x of it) {
+        const k = f(x);
+        const vs = m.$get(k);
+        if (vs === null) m.$insert(k, [x]);
+        else vs.push(x);
+      }
+      return m;
+    },
+    // `collect_tuple()`: `Some` only when there are exactly `n`.
+    collectTuple(it, n) {
+      const xs = [];
+      for (const x of it) {
+        xs.push(x);
+        if (xs.length > n) return null;
+      }
+      return xs.length === n ? xs : null;
+    },
+    nextTuple(it, n) {
+      const i = it[Symbol.iterator]();
+      const xs = [];
+      while (xs.length < n) {
+        const r = i.next();
+        if (r.done) return null;
+        xs.push(r.value);
+      }
+      return xs;
+    },
+    repeatN(x, n) {
+      return lazy(function* () {
+        for (let i = 0; i < n; i++) yield clone(x);
+      });
+    },
+  };
+  rt.$itertools = itertools;
+  // The bundled `anyhow` crate: an `anyhow::Error` is a message and the error it was caused by
+  // (another one, a std error, or your `impl Error` type, whose `source()` continues the chain).
+  // `{}` shows the message; `{:?}` (what `main` prints) adds the chain as anyhow does.
+  class AnyhowError {
+    constructor(msg, cause, inner) {
+      this.msg = msg;
+      this.cause = cause ?? null;
+      // The error it wraps as is (`?` on a `ParseIntError`), for `root_cause()`.
+      this.inner = inner;
+    }
+    toString() {
+      return this.msg;
+    }
+    // Every error in the chain, as values that display themselves.
+    $chain() {
+      const out = [this];
+      let cur = this.cause;
+      while (cur != null) {
+        out.push(cur);
+        cur = cur instanceof AnyhowError ? cur.cause : typeof cur.source === "function" ? cur.source() : null;
+      }
+      return out;
+    }
+    $dbg() {
+      const causes = this.$chain()
+        .slice(1)
+        .map((c) => rt.$disp(c));
+      if (causes.length === 0) return this.msg;
+      const lines = causes.length === 1 ? [`    ${causes[0]}`] : causes.map((c, i) => `    ${i}: ${c}`);
+      return `${this.msg}\n\nCaused by:\n${lines.join("\n")}`;
+    }
+    $eq(o) {
+      return this === o;
+    }
+  }
+  const anyhow = {
+    // `anyhow!("..")` / `Error::msg(..)`.
+    msg(m) {
+      return new AnyhowError(typeof m === "string" ? m : rt.$disp(m));
+    },
+    // `anyhow!(e)`: a string becomes the message, an error is wrapped.
+    wrap(x) {
+      return typeof x === "string" ? new AnyhowError(x) : anyhow.from(x);
+    },
+    // `?` (and `Error::new` / `Error::from`): a std error or your error type, wrapped.
+    from(e) {
+      if (e instanceof AnyhowError) return e;
+      const cause = e != null && typeof e.source === "function" ? e.source() : null;
+      return new AnyhowError(rt.$disp(e), cause, e);
+    },
+    // `result.context(c)` on a `Result<T, E>`, or on a `Result<T, anyhow::Error>`.
+    context(r, c) {
+      return r.$tag === 0 ? r : new Res(1, new AnyhowError(rt.$disp(c), anyhow.from(r[0])));
+    },
+    withContext(r, f) {
+      return r.$tag === 0 ? r : new Res(1, new AnyhowError(rt.$disp(f()), anyhow.from(r[0])));
+    },
+    // `option.context(c)`: `None` becomes an error with the message.
+    optContext(o, c) {
+      return o == null ? new Res(1, new AnyhowError(rt.$disp(c))) : new Res(0, o);
+    },
+    optWithContext(o, f) {
+      return o == null ? new Res(1, new AnyhowError(rt.$disp(f()))) : new Res(0, o);
+    },
+    // `err.context(c)` on an `anyhow::Error`.
+    errContext(e, c) {
+      return new AnyhowError(rt.$disp(c), e);
+    },
+    chain(e) {
+      return rt.$iter(e.$chain());
+    },
+    rootCause(e) {
+      const c = e.$chain();
+      const last = c[c.length - 1];
+      return last instanceof AnyhowError && last.inner !== undefined ? last.inner : last;
+    },
+  };
+  rt.$anyhow = anyhow;
+  // A `dyn Error`'s methods: any error value (a std error, yours, an `anyhow::Error`).
+  rt.$err = {
+    toString: (e) => rt.$disp(e),
+    source: (e) => (e instanceof AnyhowError ? e.cause : typeof e?.source === "function" ? e.source() : null),
+  };
   rt.$randomBytes = (n) => Array.from(globalThis.crypto.getRandomValues(new Uint8Array(n)));
   rt.$sleep = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
   // `js::structured_clone`: a deep copy. Rust values copy by their `Clone` (keeping their
@@ -2933,8 +4117,13 @@
   // as serde_json does), with serde_json's syntax errors.
   function jsonLex(text) {
     let i = 0;
-    const fail = (msg) => {
-      throw new JsonError(msg);
+    // (`at`: how far serde_json has read when it fails: past the offending character, or the
+    // end. Values carry their end, `e`, for the errors found while converting them.)
+    const fail = (msg, at = i) => {
+      const e = new JsonError(msg);
+      e.at = at < text.length ? at + 1 : text.length;
+      e.kind = msg.startsWith("EOF") ? "eof" : "syntax";
+      throw e;
     };
     const ws = () => {
       while (i < text.length && " \t\n\r".includes(text[i])) i++;
@@ -2949,7 +4138,7 @@
         ws();
         if (text[i] === "}") {
           i++;
-          return { k: "obj", v: pairs };
+          return { k: "obj", v: pairs, e: i };
         }
         for (;;) {
           ws();
@@ -2969,7 +4158,7 @@
           }
           if (text[i] === "}") {
             i++;
-            return { k: "obj", v: pairs };
+            return { k: "obj", v: pairs, e: i };
           }
           fail("expected `,` or `}`");
         }
@@ -2980,7 +4169,7 @@
         ws();
         if (text[i] === "]") {
           i++;
-          return { k: "arr", v: items };
+          return { k: "arr", v: items, e: i };
         }
         for (;;) {
           ws();
@@ -2994,12 +4183,15 @@
           }
           if (text[i] === "]") {
             i++;
-            return { k: "arr", v: items };
+            return { k: "arr", v: items, e: i };
           }
           fail("expected `,` or `]`");
         }
       }
-      if (c === '"') return { k: "str", v: string() };
+      if (c === '"') {
+        const v = string();
+        return { k: "str", v, e: i };
+      }
       for (const [word, node] of [
         ["true", { k: "bool", v: true }],
         ["false", { k: "bool", v: false }],
@@ -3007,17 +4199,17 @@
       ]) {
         if (c === word[0]) {
           for (let j = 0; j < word.length; j++) {
-            if (i + j >= text.length) fail(`EOF while parsing ${what}`);
-            if (text[i + j] !== word[j]) fail("expected ident");
+            if (i + j >= text.length) fail(`EOF while parsing ${what}`, i + j);
+            if (text[i + j] !== word[j]) fail("expected ident", i + j);
           }
           i += word.length;
-          return node;
+          return { ...node, e: i };
         }
       }
       const m = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/.exec(text.slice(i));
       if (!m || m[0] === "-") fail(c === "-" ? "invalid number" : "expected value");
       i += m[0].length;
-      return { k: "num", raw: m[0], int: !m[2] && !m[3] };
+      return { k: "num", raw: m[0], int: !m[2] && !m[3], e: i };
     };
     const string = () => {
       i++;
@@ -3116,6 +4308,8 @@
         return `struct ${s.name}`;
       case "enum":
         return `enum ${s.name}`;
+      case "jsonvalue":
+        return "any valid JSON value";
       default:
         return "any value";
     }
@@ -3149,13 +4343,56 @@
     }
   }
 
+  // serde_json reads an integer past both `u64` and `i64` as a float.
+  function jsonPast64(n, big, s) {
+    if (big > 18446744073709551615n || big < -9223372036854775808n) {
+      throw new JsonError(`invalid type: floating point \`${ryu(Number(n.raw), false)}\`, expected ${s.name}`);
+    }
+  }
+
   function jsonIn(n, s) {
+    try {
+      return jsonIn0(n, s);
+    } catch (e) {
+      if (e instanceof JsonError && e.at === undefined) {
+        e.at = n.e;
+        e.kind = "data";
+      }
+      throw e;
+    }
+  }
+
+  // A JSON value as a `serde_json::Value`, made by the prelude's functions (`s.mk`).
+  function jsonValue(n, s) {
+    switch (n.k) {
+      case "null":
+        return s.mk.nul();
+      case "bool":
+        return s.mk.bool(n.v);
+      case "num":
+        return s.mk.num(n.raw, n.int);
+      case "str":
+        return s.mk.str(n.v);
+      case "arr":
+        return s.mk.arr(n.v.map((x) => jsonValue(x, s)));
+      default:
+        return s.mk.obj(
+          n.v.map((p) => p[0]),
+          n.v.map((p) => jsonValue(p[1], s)),
+        );
+    }
+  }
+
+  function jsonIn0(n, s) {
     s = jsonSchema(s);
     switch (s.t) {
+      case "jsonvalue":
+        return jsonValue(n, s);
       case "int": {
         if (n.k !== "num") throw jsonInvalid(n, s);
         if (!n.int) throw jsonInvalid(n, s);
         const big = BigInt(n.raw);
+        jsonPast64(n, big, s);
         if (big < BigInt(s.min) || big > BigInt(s.max)) {
           throw new JsonError(`invalid value: integer \`${n.raw}\`, expected ${s.name}`);
         }
@@ -3163,7 +4400,12 @@
       }
       case "big": {
         if (n.k !== "num" || !n.int) throw jsonInvalid(n, s);
-        return BigInt(n.raw);
+        const big = BigInt(n.raw);
+        if (s.min != null) jsonPast64(n, big, s);
+        if (s.min != null && (big < BigInt(s.min) || big > BigInt(s.max))) {
+          throw new JsonError(`invalid value: integer \`${n.raw}\`, expected ${s.name}`);
+        }
+        return big;
       }
       case "float": {
         if (n.k !== "num") throw jsonInvalid(n, s);
@@ -3298,13 +4540,270 @@
     );
   }
 
-  rt.$jsonParse = (text, schema) => {
+  // `mode`: undefined for `js::JSON` (its `JsonError`), "pos" for `serde_json::from_str` (a
+  // `serde_json::Error` at a line and column), "nopos" for `serde_json::from_value`.
+  rt.$jsonParse = (text, schema, mode) => {
     try {
       return rt.Ok(jsonIn(jsonLex(text), schema));
     } catch (e) {
-      if (e instanceof JsonError) return rt.Err(e);
-      throw e;
+      if (!(e instanceof JsonError)) throw e;
+      if (mode === undefined) return rt.Err(e);
+      let line = 0;
+      let col = 0;
+      if (mode === "pos") {
+        const before = text.slice(0, e.at ?? text.length);
+        const nl = before.lastIndexOf("\n");
+        line = before.split("\n").length;
+        col = utf8Len(before.slice(nl + 1));
+      }
+      return rt.Err(new SerdeJsonError(e.msg, line, col, e.kind ?? "data"));
     }
+  };
+
+  const utf8Len = (str) => {
+    let n = 0;
+    for (const ch of str) {
+      const c = ch.codePointAt(0);
+      n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    }
+    return n;
+  };
+
+  /// `serde_json::Error`: the message, and where in the text (`{}` adds "at line L column C").
+  class SerdeJsonError extends JsonError {
+    constructor(msg, line, col, kind) {
+      super(msg);
+      this.ln = line;
+      this.col = col;
+      this.kind = kind;
+    }
+    toString() {
+      return this.ln === 0 ? this.msg : `${this.msg} at line ${this.ln} column ${this.col}`;
+    }
+    $dbg() {
+      return `Error(${rt.$dbgStr(this.msg)}, line: ${this.ln}, column: ${this.col})`;
+    }
+  }
+  rt.SerdeJsonError = SerdeJsonError;
+  rt.$serde_json = {
+    line: (e) => e.ln,
+    column: (e) => e.col,
+    isEof: (e) => e.kind === "eof",
+    isSyntax: (e) => e.kind === "syntax",
+    isData: (e) => e.kind === "data",
+    isIo: () => false,
+    toString: (e) => e.toString(),
+  };
+
+  // ---- the bundled `regex`: Rust's syntax as a JS `RegExp` (the `u` flag; `\d` and `\w` as
+  // Unicode, as Rust has them), with byte offsets in the haystack, as Rust has them.
+  const regexCache = new Map();
+  const POSIX = {
+    alnum: "0-9A-Za-z",
+    alpha: "A-Za-z",
+    ascii: "\\x00-\\x7F",
+    blank: "\\t ",
+    cntrl: "\\x00-\\x1F\\x7F",
+    digit: "0-9",
+    graph: "!-~",
+    lower: "a-z",
+    print: " -~",
+    punct: "!-\\/:-@\\[-`{-~",
+    space: "\\t\\n\\v\\f\\r ",
+    upper: "A-Z",
+    word: "0-9A-Za-z_",
+    xdigit: "0-9A-Fa-f",
+  };
+  const WORD = "\\p{Alphabetic}\\p{M}\\p{Nd}\\p{Pc}\\p{Join_Control}";
+  const regexFail = (pat, msg) => {
+    throw `regex parse error:\n    ${pat}\nerror: ${msg}`;
+  };
+  // `\p{Greek}` is a script in Rust (`Script=Greek` in JS); categories stay.
+  const uniProp = (name) =>
+    /^(L[ultmo]?|M[nce]?|N[dlo]?|P[cdseifo]?|S[mcko]?|Z[slp]?|C[cfson]?|Letter|Number|Alphabetic|White_Space|Uppercase|Lowercase|Emoji|Any|ASCII|Script=.*|sc=.*|gc=.*)$/.test(name)
+      ? name
+      : `Script=${name}`;
+  function regexCompile(pat) {
+    let hit = regexCache.get(pat);
+    if (hit) return hit;
+    let i = 0;
+    let flags = "";
+    // Leading flags: `(?i)`, `(?ms)`.
+    const lead = /^\(\?([imsxU]+)\)/.exec(pat);
+    if (lead) {
+      for (const f of lead[1]) {
+        if (f === "x" || f === "U") regexFail(pat, `the flag \`${f}\` is not supported here`);
+        flags += f;
+      }
+      i = lead[0].length;
+    }
+    let out = "";
+    let inClass = 0;
+    const names = [""];
+    while (i < pat.length) {
+      const c = pat[i];
+      if (c === "\\") {
+        const e = pat[i + 1];
+        if (e === undefined) regexFail(pat, "incomplete escape sequence, reached end of pattern prematurely");
+        if (e === "d") out += "\\p{Nd}";
+        else if (e === "D") out += "\\P{Nd}";
+        else if (e === "w") out += inClass ? WORD : `[${WORD}]`;
+        else if (e === "W") out += inClass ? "\\W" : `[^${WORD}]`;
+        else if (e === "A") out += "^";
+        else if (e === "z") out += "$";
+        else if (e === "p" || e === "P") {
+          if (pat[i + 2] === "{") {
+            const end = pat.indexOf("}", i + 3);
+            if (end < 0) regexFail(pat, "unclosed Unicode class");
+            out += `\\${e}{${uniProp(pat.slice(i + 3, end))}}`;
+            i = end + 1;
+            continue;
+          }
+          out += `\\${e}{${uniProp(pat[i + 2])}}`;
+          i += 3;
+          continue;
+        } else if (e === "x" && pat[i + 2] === "{") {
+          const end = pat.indexOf("}", i + 3);
+          out += `\\u{${pat.slice(i + 3, end)}}`;
+          i = end + 1;
+          continue;
+        } else if (/[1-9]/.test(e)) regexFail(pat, "backreferences are not supported");
+        else if ("tnrfvbBsSx0".includes(e)) out += c + e;
+        else if (/[a-zA-Z0-9]/.test(e)) regexFail(pat, "unrecognized escape sequence");
+        else if ("\\^$.|?*+()[]{}/-".includes(e)) out += c + e;
+        // (Other punctuation Rust lets you escape is itself; JS's `u` mode rejects the escape.)
+        else out += e;
+        i += 2;
+        continue;
+      }
+      if (inClass) {
+        const posix = /^\[:(\^?)([a-z]+):\]/.exec(pat.slice(i));
+        if (posix) {
+          const set = POSIX[posix[2]];
+          if (!set) regexFail(pat, "invalid ASCII class");
+          if (posix[1]) regexFail(pat, "negated ASCII classes are not supported here");
+          out += set;
+          i += posix[0].length;
+          continue;
+        }
+        if (c === "[") {
+          // (A nested class, `[a[bc]]`: its members.)
+          inClass++;
+          i++;
+          continue;
+        }
+        if (c === "]") {
+          inClass--;
+          if (inClass === 0) out += "]";
+          i++;
+          continue;
+        }
+        if (c === "&" && pat[i + 1] === "&") regexFail(pat, "class intersections are not supported here");
+        out += c === "/" ? "\\/" : c;
+        i++;
+        continue;
+      }
+      if (c === "[") {
+        inClass = 1;
+        out += "[";
+        i++;
+        if (pat[i] === "^") {
+          out += "^";
+          i++;
+        }
+        // (A `]` first is a member.)
+        if (pat[i] === "]") {
+          out += "\\]";
+          i++;
+        }
+        continue;
+      }
+      if (c === "(") {
+        if (pat[i + 1] === "?") {
+          const rest = pat.slice(i + 2);
+          if (/^(=|!|<=|<!)/.test(rest)) regexFail(pat, "look-around, including look-ahead and look-behind, is not supported");
+          const named = /^P?<([A-Za-z_][A-Za-z0-9_.\[\]]*)>/.exec(rest);
+          if (named) {
+            names.push(named[1]);
+            out += `(?<${named[1]}>`;
+            i += 2 + named[0].length;
+            continue;
+          }
+          if (rest[0] === ":") {
+            out += "(?:";
+            i += 3;
+            continue;
+          }
+          regexFail(pat, "inline flags are only supported at the start of the pattern here");
+        }
+        names.push("");
+        out += "(";
+        i++;
+        continue;
+      }
+      out += c === "/" ? "\\/" : c;
+      i++;
+    }
+    if (inClass) regexFail(pat, "unclosed character class");
+    let re;
+    try {
+      re = new RegExp(out, `gdu${flags}`);
+    } catch (e) {
+      regexFail(pat, String(e?.message ?? e).replace(/^Invalid regular expression: /, ""));
+    }
+    hit = { re, names };
+    if (regexCache.size > 256) regexCache.clear();
+    regexCache.set(pat, hit);
+    return hit;
+  }
+  // UTF-16 index <-> UTF-8 byte offset in `s`.
+  const isAscii = (s) => /^[\x00-\x7F]*$/.test(s);
+  function u16ToByte(s, k) {
+    return isAscii(s) ? k : utf8Len(s.slice(0, k));
+  }
+  function byteToU16(s, b) {
+    if (isAscii(s)) return b;
+    let n = 0;
+    let k = 0;
+    while (k < s.length && n < b) {
+      const c = s.codePointAt(k);
+      n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+      k += c >= 0x10000 ? 2 : 1;
+    }
+    return k;
+  }
+  rt.$regex = {
+    // "" for a pattern that compiles, else the error.
+    check(pat) {
+      try {
+        regexCompile(pat);
+        return "";
+      } catch (e) {
+        if (typeof e === "string") return e;
+        throw e;
+      }
+    },
+    // The group names ("" unnamed), the whole match's first.
+    names: (pat) => regexCompile(pat).names.slice(),
+    // The first match at or after byte `start`: start and end bytes of each group (-1 if it
+    // didn't take part), or nothing.
+    find(pat, hay, start) {
+      const { re } = regexCompile(pat);
+      re.lastIndex = byteToU16(hay, start);
+      const m = re.exec(hay);
+      if (!m) return [];
+      const out = [];
+      for (const span of m.indices) {
+        if (span === undefined) out.push(-1, -1);
+        else out.push(u16ToByte(hay, span[0]), u16ToByte(hay, span[1]));
+      }
+      return out;
+    },
+    // The bytes of the character at byte `at` (to step past an empty match).
+    charLen(hay, at) {
+      const c = hay.codePointAt(byteToU16(hay, at));
+      return c === undefined ? 1 : c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    },
   };
 
   globalThis.κσ = rt;

@@ -7,6 +7,7 @@ mod adt;
 mod alias;
 mod bindings;
 mod borrows;
+mod bundled;
 mod codegen;
 mod fmt;
 mod json;

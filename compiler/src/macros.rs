@@ -296,3 +296,161 @@ fn quote_walk(elems: &[SyntaxElement], base: usize, out: &mut Vec<QuotePart>, ga
         i += 1;
     }
 }
+
+/// What `stringify!(..)` gives: the tokens as rustc prints them. Tokens written together stay
+/// together (`a+b`); between tokens written apart there's one space, except before `,` `;` `.`,
+/// after `.`, between a name and its `(..)`, and between `#` and `[..]`. `{ .. }` gets spaces
+/// inside.
+pub fn stringify(mc: &ast::MacroCall) -> String {
+    match mc.token_tree() {
+        Some(tt) => tts_text(&tt),
+        None => String::new(),
+    }
+}
+
+/// A token tree's inner tokens.
+fn tts_text(tt: &ast::TokenTree) -> String {
+    #[derive(PartialEq)]
+    enum Kind {
+        Punct(String),
+        /// A name that may take `(..)` without a space: a non-keyword, `fn`, `Self`, `pub`.
+        Callee,
+        Other,
+        Group(char),
+    }
+    let elems: Vec<SyntaxElement> = tt.syntax().children_with_tokens().collect();
+    // (Skip the delimiters.)
+    let inner = &elems[1..elems.len().saturating_sub(1).max(1)];
+    let mut out = String::new();
+    let mut prev: Option<Kind> = None;
+    let mut gap = false;
+    for e in inner {
+        let (text, kind) = match e {
+            NodeOrToken::Token(t)
+                if t.kind() == SyntaxKind::WHITESPACE || t.kind() == SyntaxKind::COMMENT =>
+            {
+                gap = true;
+                continue;
+            }
+            NodeOrToken::Token(t) => {
+                let k = t.kind();
+                let kind = if k.is_punct() {
+                    Kind::Punct(t.text().to_string())
+                } else if k == SyntaxKind::IDENT || matches!(t.text(), "fn" | "Self" | "pub") {
+                    Kind::Callee
+                } else {
+                    Kind::Other
+                };
+                (t.text().to_string(), kind)
+            }
+            NodeOrToken::Node(n) => {
+                let Some(sub) = ast::TokenTree::cast(n.clone()) else {
+                    continue;
+                };
+                let open = sub
+                    .syntax()
+                    .first_token()
+                    .map(|t| t.text().chars().next().unwrap_or('('))
+                    .unwrap_or('(');
+                let body = tts_text(&sub);
+                let text = match open {
+                    '{' if body.is_empty() => "{}".to_string(),
+                    '{' => format!("{{ {body} }}"),
+                    '[' => format!("[{body}]"),
+                    _ => format!("({body})"),
+                };
+                (text, Kind::Group(open))
+            }
+        };
+        if let Some(p) = &prev
+            && gap
+        {
+            let is_punct = |k: &Kind| matches!(k, Kind::Punct(_));
+            let space = match (p, &kind) {
+                (Kind::Punct(d), k) if d == "." && !is_punct(k) => false,
+                (Kind::Punct(d), Kind::Callee) if d == "$" => false,
+                (p, Kind::Punct(c)) if !is_punct(p) && matches!(c.as_str(), "," | ";" | ".") => {
+                    false
+                }
+                (Kind::Callee, Kind::Group('(')) => false,
+                (Kind::Punct(h), Kind::Group('[')) if h == "#" => false,
+                _ => true,
+            };
+            if space {
+                out.push(' ');
+            }
+        }
+        out.push_str(&text);
+        prev = Some(kind);
+        gap = false;
+    }
+    out
+}
+
+/// `cfg!(..)`'s predicate: `debug_assertions` (on in debug builds), `test` and `feature = ".."`
+/// (off), and `not` / `all` / `any` of those. Anything about the platform is an error: the
+/// script runs in JS, where rustc's answer for its own target wouldn't hold.
+pub fn eval_cfg(mc: &ast::MacroCall, debug: bool) -> Result<bool, String> {
+    let tt = mc.token_tree().ok_or("`cfg!` needs a predicate")?;
+    let toks: Vec<String> = tt
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != SyntaxKind::WHITESPACE && t.kind() != SyntaxKind::COMMENT)
+        .map(|t| t.text().to_string())
+        .collect();
+    // (Without the outer parentheses.)
+    let toks = &toks[1..toks.len().saturating_sub(1).max(1)];
+    let mut i = 0;
+    let v = cfg_pred(toks, &mut i, debug)?;
+    if i != toks.len() {
+        return Err("`cfg!` takes one predicate".into());
+    }
+    Ok(v)
+}
+
+fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String> {
+    let name = toks.get(*i).ok_or("`cfg!` needs a predicate")?.clone();
+    *i += 1;
+    match name.as_str() {
+        "not" | "all" | "any" => {
+            if toks.get(*i).map(String::as_str) != Some("(") {
+                return Err(format!("`{name}` takes a list: `{name}(..)`"));
+            }
+            *i += 1;
+            let mut vals = Vec::new();
+            while toks.get(*i).map(String::as_str) != Some(")") {
+                vals.push(cfg_pred(toks, i, debug)?);
+                if toks.get(*i).map(String::as_str) == Some(",") {
+                    *i += 1;
+                }
+                if *i >= toks.len() {
+                    return Err("unclosed `(` in `cfg!`".into());
+                }
+            }
+            *i += 1;
+            match name.as_str() {
+                "not" if vals.len() == 1 => Ok(!vals[0]),
+                "not" => Err("`not(..)` takes one predicate".into()),
+                "all" => Ok(vals.iter().all(|v| *v)),
+                _ => Ok(vals.iter().any(|v| *v)),
+            }
+        }
+        _ => {
+            let value = if toks.get(*i).map(String::as_str) == Some("=") {
+                *i += 2;
+                toks.get(*i - 1).cloned()
+            } else {
+                None
+            };
+            match (name.as_str(), value) {
+                ("debug_assertions", None) => Ok(debug),
+                ("test", None) => Ok(false),
+                ("feature", Some(_)) => Ok(false),
+                (n, _) => Err(format!(
+                    "`cfg!({n})` isn't supported: scripts run in JS, not on rustc's target (`debug_assertions`, `test`, `feature = \"..\"` and `not`/`all`/`any` are)"
+                )),
+            }
+        }
+    }
+}

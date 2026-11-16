@@ -117,7 +117,15 @@ impl Checker<'_> {
     ) -> Option<Ty> {
         let [.., ty, ctor] = segs else { return None };
         let kind = Coll::from_name(ty)?;
-        let t = self.coll_type(kind, vec![]);
+        // (`VecDeque::<u8>::new()` names the type arguments.)
+        let path_segs: Vec<ast::PathSegment> = match c.expr() {
+            Some(ast::Expr::PathExpr(p)) => {
+                p.path().map(|p| p.segments().collect()).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let targs = self.segment_targs(&path_segs, ty);
+        let t = self.coll_type(kind, targs);
         let Ty::Coll(_, view) = &t else {
             unreachable!()
         };

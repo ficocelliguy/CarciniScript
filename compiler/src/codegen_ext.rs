@@ -188,6 +188,113 @@ impl Codegen<'_> {
         }
     }
 
+    /// `{:?}` of an argument, by its type (so `Some(..)` and whole floats print as in Rust).
+    fn debug_text(&mut self, a: &ast::Expr) -> Frag {
+        let (f, _) = self.emit_expr(a, None);
+        let ty = self.ty_of(a.syntax()).unwrap_or(Ty::Unknown);
+        super::format_value(f, &ty, &Self::debug_spec(), None, None)
+    }
+
+    fn debug_spec() -> crate::fmt::Spec {
+        crate::fmt::Spec {
+            debug: true,
+            ..Default::default()
+        }
+    }
+
+    /// A builder's `.field(..)` / `.entry(..)` / `.entries(..)` / `.key(..)` / `.value(..)` /
+    /// `.finish()`: the runtime's `κσ.DbgBuilder`, given each value's `{:?}` text.
+    fn emit_fmt_builder(
+        &mut self,
+        rf: &Frag,
+        kind: &str,
+        method: &str,
+        args: &[ast::Expr],
+    ) -> Frag {
+        let mut parts: Vec<Frag> = Vec::new();
+        let js = match method {
+            "finish" => "$finish",
+            "finish_non_exhaustive" => {
+                parts.push(Frag::text("true"));
+                "$finish"
+            }
+            "field" if kind == "DebugStruct" => {
+                if let [n, v] = args {
+                    parts.push(self.emit_expr(n, None).0);
+                    parts.push(self.debug_text(v));
+                }
+                "$field"
+            }
+            "field" => {
+                parts.push(Frag::text("null"));
+                if let [v] = args {
+                    parts.push(self.debug_text(v));
+                }
+                "$field"
+            }
+            "entry" | "key" | "value" => {
+                for a in args {
+                    parts.push(self.debug_text(a));
+                }
+                match method {
+                    "entry" => "$entry",
+                    "key" => "$key",
+                    _ => "$value",
+                }
+            }
+            "entries" => {
+                let arg = args.first().cloned();
+                let ty = arg
+                    .as_ref()
+                    .and_then(|a| self.ty_of(a.syntax()))
+                    .unwrap_or(Ty::Unknown);
+                let elem = fn_elem(&ty);
+                let x = Frag::text("$x");
+                let spec = Self::debug_spec();
+                let fmt = match (kind, &elem) {
+                    ("DebugMap", Ty::Tuple(kv)) if kv.len() == 2 => {
+                        let mut f = Frag::text("(($x) => ");
+                        f.append(super::format_value(
+                            Frag::text("$x[0]"),
+                            &kv[0],
+                            &spec,
+                            None,
+                            None,
+                        ))
+                        .push(" + \": \" + ")
+                        .append(super::format_value(
+                            Frag::text("$x[1]"),
+                            &kv[1],
+                            &spec,
+                            None,
+                            None,
+                        ))
+                        .push(")");
+                        f
+                    }
+                    ("DebugMap", _) => {
+                        Frag::text("(($x) => κσ.$dbg($x[0]) + \": \" + κσ.$dbg($x[1]))")
+                    }
+                    _ => {
+                        let mut f = Frag::text("(($x) => ");
+                        f.append(super::format_value(x, &elem, &spec, None, None))
+                            .push(")");
+                        f
+                    }
+                };
+                parts.push(self.iterable_arg(arg));
+                parts.push(fmt);
+                "$entries"
+            }
+            _ => "$finish",
+        };
+        let mut f = rf.clone();
+        f.push(format!(".{js}("))
+            .append(Frag::join(parts, ", "))
+            .push(")");
+        f
+    }
+
     /// An argument that's iterable in JS: maps iterate their entries, options yield 0 or 1 items.
     pub(super) fn iterable_arg(&mut self, arg: Option<ast::Expr>) -> Frag {
         let Some(a) = arg else {
@@ -318,6 +425,8 @@ impl Codegen<'_> {
             return Some(r);
         }
         match (rt, method) {
+            // (Already the runtime's iterator: see `enter_consts`.)
+            (Ty::IntoIter(_), "into_iter") => return Some((rf.clone(), result_ty.clone())),
             (Ty::Result(t, e), m2) => return self.emit_result_method(m, rf, t, e, m2),
             (Ty::Option(_), "ok_or" | "ok_or_else") => return Some(self.emit_ok_or(m, rf, method)),
             (Ty::Str, "parse") => return Some(self.emit_parse(m, rf)),
@@ -326,6 +435,35 @@ impl Codegen<'_> {
                 let mut f = Frag::text("κσ.$write(");
                 f.append(rf.clone()).push(", ").append(s).push(", false)");
                 return Some((f, result_ty.clone()));
+            }
+            (Ty::Formatter, "write_char") => {
+                let c = self.fn_arg(a0.clone());
+                let mut f = Frag::text("κσ.$write(");
+                f.append(rf.clone()).push(", ").append(c).push(", false)");
+                return Some((f, result_ty.clone()));
+            }
+            // `f.debug_struct("P")` → `new κσ.DbgBuilder(f, "struct", "P")`.
+            (
+                Ty::Formatter,
+                "debug_struct" | "debug_tuple" | "debug_list" | "debug_set" | "debug_map",
+            ) => {
+                let kind = &method["debug_".len()..];
+                let name = match a0.clone() {
+                    Some(_) => self.fn_arg(a0.clone()),
+                    None => Frag::text("null"),
+                };
+                let mut f = Frag::mapped(name_off, "new κσ.DbgBuilder(");
+                f.append(rf.clone())
+                    .push(format!(", \"{kind}\", "))
+                    .append(name)
+                    .push(")");
+                return Some((f, result_ty.clone()));
+            }
+            (Ty::FmtBuilder(kind), _) => {
+                return Some((
+                    self.emit_fmt_builder(rf, kind, method, &args),
+                    result_ty.clone(),
+                ));
             }
             (Ty::Formatter, "pad" | "__pad_whole") => {
                 let s = self.fn_arg(m.arg_list().and_then(|a| a.args().next()));
@@ -615,6 +753,16 @@ impl Codegen<'_> {
                 "find_map" => "findMap",
                 "reduce" => "reduce",
                 "for_each" => "forEach",
+                "peekable" => "peekable",
+                "peek" => "peek",
+                "next_if" => "nextIf",
+                "next_back" => "nextBack",
+                "nth_back" => "nthBack",
+                "len" => "len",
+                "rfind" => "rfind",
+                "is_sorted" => "isSorted",
+                "is_sorted_by_key" => "isSortedByKey",
+                "is_sorted_by" => "isSortedBy",
                 _ => "",
             }
         };
@@ -653,10 +801,58 @@ impl Codegen<'_> {
                 let other = self.iterable_arg(a0);
                 call(method, vec![other])
             }
-            "fold" => {
+            "fold" | "rfold" => {
                 let init = self.fn_arg(a0);
                 let f = self.fn_arg(a1);
-                call("fold", vec![init, f])
+                call(method, vec![init, f])
+            }
+            // The same iterator: JS iterators stay done, and `by_ref()` adapters advance it.
+            // (`into_iter()` of an iterator is itself.)
+            "fuse" | "by_ref" | "into_iter" => rf.clone(),
+            "next_if_eq" => {
+                let x = self.fn_arg(a0);
+                call(
+                    "nextIf",
+                    vec![Frag::text("(y) => κσ.$eq(y, ").append(x).push(")").clone()],
+                )
+            }
+            "try_fold" | "try_for_each" => {
+                let (init, f) = if method == "try_fold" {
+                    (self.fn_arg(a0), self.fn_arg(a1))
+                } else {
+                    (Frag::text("undefined"), self.fn_arg(a0))
+                };
+                let option = matches!(result_ty, Ty::Option(_));
+                let fold = method == "try_fold";
+                call(
+                    "tryFold",
+                    vec![init, f, Frag::text(format!("{option}, {fold}"))],
+                )
+            }
+            "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "cmp" | "partial_cmp" => {
+                let other = self.iterable_arg(a0);
+                let op = match method {
+                    "eq" => "=== 0",
+                    "ne" => "!== 0",
+                    "lt" => "< 0",
+                    "le" => "<= 0",
+                    "gt" => "> 0",
+                    "ge" => ">= 0",
+                    _ => "",
+                };
+                let c = call(
+                    "cmpWith",
+                    vec![
+                        other,
+                        Frag::text((method == "eq" || method == "ne").to_string()),
+                    ],
+                );
+                if op.is_empty() {
+                    // (`partial_cmp`'s `Some(ordering)` is the ordering itself.)
+                    c
+                } else {
+                    c.wrap("(", &format!(" {op})"))
+                }
             }
             "scan" => {
                 let boxed = a0
@@ -675,6 +871,14 @@ impl Codegen<'_> {
                 };
                 let mut f = Frag::text(format!("{}.{method}(", self.class(n)));
                 f.append(rf.clone()).push(")");
+                f
+            }
+            // `T: Sum`: by `T`'s class (a number kind, or the type's own `sum`).
+            "sum" | "product" if matches!(result_ty, Ty::Param(_)) => {
+                let dict = self.dict_of(result_ty);
+                let mut f = Frag::text("κσ.$gsum(");
+                f.append(rf.clone())
+                    .push(format!(", {dict}, {})", method == "product"));
                 f
             }
             "sum" | "product" => {
@@ -715,6 +919,12 @@ impl Codegen<'_> {
                         "collectOption",
                         vec![Frag::text(format!("\"${}\"", into(c)))],
                     ),
+                    // `impl FromIterator<T> for Bag`: `Bag.from_iter(it)`.
+                    Ty::Adt(n, _) if self.types.adts.method(n, "from_iter").is_some() => {
+                        let mut f = Frag::text(format!("{}.from_iter(", self.class(n)));
+                        f.append(rf.clone()).push(")");
+                        f
+                    }
                     t => call(into(t), vec![]),
                 }
             }
@@ -745,12 +955,12 @@ fn arith_fold(method: &str, ty: &Ty) -> (String, &'static str) {
         None => e.to_string(),
     };
     match (method, ty) {
-        ("sum", Ty::Int(k @ (IntKind::I128 | IntKind::U128))) => (
-            format!("(a, b) => κσ.$w128(a + b, {})", k.is_signed()),
+        ("sum", Ty::Int(k)) if k.is_big() => (
+            format!("(a, b) => κσ.$w128(a + b, {}, {})", k.is_signed(), k.bits()),
             "0n",
         ),
-        ("product", Ty::Int(k @ (IntKind::I128 | IntKind::U128))) => (
-            format!("(a, b) => κσ.$w128(a * b, {})", k.is_signed()),
+        ("product", Ty::Int(k)) if k.is_big() => (
+            format!("(a, b) => κσ.$w128(a * b, {}, {})", k.is_signed(), k.bits()),
             "1n",
         ),
         // (`f32`: each step rounded to f32, as the hardware does.)
@@ -763,5 +973,16 @@ fn arith_fold(method: &str, ty: &Ty) -> (String, &'static str) {
             (format!("(a, b) => {}", wrap("Math.imul(a, b)")), "1")
         }
         _ => ("(a, b) => a * b".into(), "1"),
+    }
+}
+
+/// The items' type of something `.entries(..)` takes.
+fn fn_elem(t: &Ty) -> Ty {
+    match t {
+        Ty::Vec(e) | Ty::Set(e) | Ty::Option(e) => (**e).clone(),
+        Ty::Iter { elem, .. } => (**elem).clone(),
+        Ty::Coll(_, v) => fn_elem(v),
+        Ty::Map(k, v) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
+        _ => Ty::Unknown,
     }
 }

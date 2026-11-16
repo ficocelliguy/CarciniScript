@@ -56,6 +56,19 @@ impl Codegen<'_> {
             ["js", rest @ ..] => rest,
             all => all,
         };
+        // (`use serde_json::from_str;` then `from_str(..)`.)
+        let imported;
+        let tail = match tail {
+            [f @ ("to_string" | "to_string_pretty" | "to_value" | "from_str" | "from_value")]
+                if crate::typeck::crates::crate_imports(self.src)
+                    .get(*f)
+                    .is_some_and(|(k, i)| k == "serde_json" && i == f) =>
+            {
+                imported = ["serde_json", *f];
+                &imported[..]
+            }
+            other => other,
+        };
         let start = self.off(c.syntax());
         // (Keeping `BTreeMap` & co. as themselves: the schema builds the right collection.)
         let ty = self.raw_ty_of(c.syntax()).unwrap_or(Ty::Unknown);
@@ -98,6 +111,52 @@ impl Codegen<'_> {
                 let schema = self.json_schema_expr(&target);
                 let mut parts = emitted(self);
                 parts.push(Frag::text(schema));
+                call("κσ.$jsonParse", parts)
+            }
+            // The bundled serde_json: the same, in `Result`s of `serde_json::Error`.
+            [
+                "serde_json",
+                f @ ("to_string" | "to_string_pretty" | "to_value"),
+            ] => {
+                let a = args.first()?;
+                let t = self.raw_ty_of(a.syntax()).unwrap_or(Ty::Unknown);
+                let (v, _) = self.emit_expr(a, None);
+                let schema = self.json_schema_expr(&t);
+                let text = call(
+                    "κσ.$jsonStringify",
+                    vec![
+                        v,
+                        Frag::text(schema),
+                        Frag::text((*f == "to_string_pretty").to_string()),
+                    ],
+                );
+                if *f == "to_value" {
+                    let value = self.json_schema_expr(&Ty::Adt("Value".into(), vec![]));
+                    let mut out = Frag::mapped(start, "κσ.$jsonParse(");
+                    out.append(text).push(format!(", {value}, \"nopos\")"));
+                    out
+                } else {
+                    text.wrap("κσ.Ok(", ")")
+                }
+            }
+            ["serde_json", f @ ("from_str" | "from_value")] => {
+                let target = match &ty {
+                    Ty::Result(t, _) => (**t).clone(),
+                    _ => Ty::Unknown,
+                };
+                let schema = self.json_schema_expr(&target);
+                let mut parts = emitted(self);
+                let mode = if *f == "from_str" {
+                    "\"pos\""
+                } else {
+                    // (A `Value` as its text first.)
+                    if let Some(p) = parts.pop() {
+                        parts.push(p.wrap("__sj_write(", ", false, \"\")"));
+                    }
+                    "\"nopos\""
+                };
+                parts.push(Frag::text(schema));
+                parts.push(Frag::text(mode));
                 call("κσ.$jsonParse", parts)
             }
             _ => return None,
@@ -145,8 +204,17 @@ impl Codegen<'_> {
 
     fn json_schema(&self, t: &Ty, stack: &mut Vec<String>) -> String {
         match t {
-            Ty::Int(k @ (IntKind::I128 | IntKind::U128)) => {
-                format!("{{t:\"big\",name:\"{}\"}}", int_name(*k))
+            Ty::Int(k) if k.is_big() => {
+                let (min, max): (i128, u128) = match k {
+                    IntKind::I64 => (i64::MIN.into(), i64::MAX as u128),
+                    IntKind::U64 => (0, u64::MAX.into()),
+                    IntKind::I128 => (i128::MIN, i128::MAX as u128),
+                    _ => (0, u128::MAX),
+                };
+                format!(
+                    "{{t:\"big\",name:\"{}\",min:\"{min}\",max:\"{max}\"}}",
+                    int_name(*k)
+                )
             }
             Ty::Int(k) => {
                 // Exact bounds (as BigInt text): JSON numbers can be any 64-bit integer.
@@ -204,6 +272,10 @@ impl Codegen<'_> {
                 self.json_schema(a, stack),
                 self.json_schema(e, stack)
             ),
+            // The bundled serde_json's `Value`: made and written by its prelude's functions.
+            Ty::Adt(n, _) if n == "Value" && self.types.adts.traits.contains_key("__SjIndex") => {
+                "{t:\"jsonvalue\",mk:{nul:__sj_null,bool:__sj_bool,num:__sj_num,str:__sj_str,arr:__sj_arr,obj:__sj_obj},out:__sj_write}".into()
+            }
             Ty::Adt(n, args) => {
                 let key = format!("{n}{args:?}");
                 if stack.contains(&key) {
@@ -254,10 +326,12 @@ impl Codegen<'_> {
                             } else {
                                 "null".into()
                             };
+                            // (The property the class has: `ram` is `ram$` where Bitburner
+                            // charges for the name.)
                             let js = if v.shape == Shape::Tuple {
                                 f.name.clone()
                             } else {
-                                f.js.clone()
+                                super::adt_gen::prop(&f.js)
                             };
                             format!(
                                 "{{key:{},js:{},s:{},def:{def},skipOut:{},skipIn:{}}}",

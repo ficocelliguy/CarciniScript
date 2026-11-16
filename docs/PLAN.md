@@ -61,8 +61,8 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 
 - **Borrows and lifetimes** are erased in codegen. Exceptions: `&mut` taken on a primitive local
   boxes that local into a cell; `Copy` structs are cloned on assignment and by-value passing.
-- **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). `i64`/`u64`/`usize`/`isize` are JS
-  numbers (exact to 2^53; gap). `i128`/`u128` are BigInt. Integer `/` truncates and panics on zero;
+- **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). `usize`/`isize` are JS numbers
+  (exact to 2^53). `i64`/`u64` and `i128`/`u128` are BigInt, wrapped to their width. Integer `/` truncates and panics on zero;
   JS `%` already matches Rust's truncated remainder.
 - **Option:** `None` is `null`, `Some(x)` is `x`. `Option<Option<T>>` and `Option<()>` are rejected.
   The NS boundary is free: `undefined` results read as `None`.
@@ -202,6 +202,48 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      history, screen, console, Math, performance, crypto, URL, fetch, base64, timers,
      `js::sleep`, `Promise::all` / `race`, `js::global`. Node tests (`test/js-node/`), a
      browser-check DOM scenario, and a Bitburner RAM test for `document` / `window`
+   - [x] Fixed-size arrays of `Copy` values are `Copy`; exact 64-bit integers (`i64` / `u64` as
+     BigInt); associated types, generic traits and blanket impls; `impl FromStr`; `Into` /
+     `AsRef` parameters and bounds; operators on references; iterator-bounded struct parameters;
+     one trait-impl registry per script (impls on built-in types no longer leak between scripts)
+   - [x] `{:?}` in generic code by the caller's type (a hidden formatter per type parameter and
+     projection, like the classes for `T::make()`); associated types and generic trait arguments
+     checked through function type parameters (`S::Unit`, `S: Shape<Unit = f64>`)
+   - [x] Const generics on functions, structs, impls and methods (hidden `$N` arguments like the
+     classes for `T::make()`; struct values keep theirs as `$N`; read off `[T; N]` arguments when
+     the call doesn't say them); enums and traits ⬜
+   - [x] Hand-written `Debug` through `f.debug_struct(..)` and the other builders (also `{:#?}`,
+     and generic types' formatters); `debug_assert!` family, `cfg!`, `stringify!`; hand-written
+     `Hash` (with `Hasher` / `DefaultHasher`), `Copy`, `TryFrom` (and integer `try_from` /
+     `try_into`), `FromIterator`, `Extend`, `IntoIterator` parameters; or-patterns that bind
+     variables
+   - [x] Iterator adapters: `peekable` (`peek`, `next_if`, `next_if_eq`), `fuse`, `by_ref`,
+     `try_fold`, `try_for_each`, `next_back`, `nth_back`, `rfind`, `rfold`, `len`, iterator
+     comparisons, `is_sorted*`; std iterator types in signatures (`&mut Peekable<Chars>`)
+   - [x] Trait bounds: `Div` / `Rem` / `Neg` / `*Assign` and every operator on a `T` by the caller's
+     class (exact integer division and wrapping; your types' `impl Add`); `IntoIterator` (and
+     `I::Item`), `FromStr`, `From<X>`, `Sum` / `Product`, `Send` / `Sync`
+   - [x] Bitwise bounds: `BitAnd` / `BitOr` / `BitXor` / `Not` / `Shl` / `Shr` and their `*Assign`
+     forms on a `T` (bools, every integer width, masked shifts; your types' `impl BitOr` / `Not`);
+     `impl BitAndAssign` etc. for your types
+   - [x] An `impl<T>`'s `T` in methods with `self` (structs): values carry `T`'s class
+     (`this.$T`) when a method needs it, for operators, `parse::<T>()`, `T::default()` and
+     generic calls; derived `Default` of a generic struct is typed `S<T>`
+   - [x] rustc's "type annotations needed for `Vec<_>`" on `let` bindings nothing types
+   - [x] Bundled crates `rand` (RNGs, `gen_range`, `shuffle`, `choose`, ..) and `itertools` (the
+     common `Itertools` methods), typed in `typeck_crates.rs` and run by runtime helpers; tests
+     build natively against the real crates (`tools/native-build.mjs`, cargo offline)
+   - [x] More bundled crates, picked from the crates that alone block the most registry files:
+     `anyhow` (runtime error class with the cause chain), `thiserror`, `bitflags!`, `cfg_if!` and
+     `lazy_static!` (source rewrites, `bundled.rs`), `once_cell` / std's `LazyLock` / `OnceLock`
+     and `either` (Rust-source preludes), `hashbrown` (std's maps); `HashMap::<K, V>::new()` and
+     the other collections' turbofish; `{:?}` of `Ok(())`
+   - [x] The next crates real programs reach for: `serde_json` (typed like `js::JSON`, with
+     serde_json's error positions; `Value` / `Number` as a Rust-source prelude reached from the
+     runtime's JSON reader, `json!` as a token-tree rewrite), `regex` (a Rust-source prelude on a
+     small runtime engine that translates Rust's syntax to `RegExp`, byte offsets), `rayon`
+     (sequential, a rewrite) and `extern crate`; `?` checks an error type that `parse()` settles
+     later; JSON schemas use the class's property names (`ram$`)
    - [x] `std::time` (`Duration`, `Instant`, `SystemTime`) as a Rust-source prelude compiled in
      when used, diff-tested against rustc; `js::structured_clone`; Formatter specs for
      hand-written `Display` / `Debug` (`f.width()`, `f.precision()`, `f.pad(..)`); `impl Sum` /

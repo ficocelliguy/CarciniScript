@@ -10,6 +10,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { initCarciniScriptSync, compile, setOverflowChecks } from "../index.js";
 import "../runtime/rt.js";
+import { buildNative } from "./native-build.mjs";
 
 const file = process.argv[2];
 const showJs = process.argv.includes("--js");
@@ -41,11 +42,10 @@ try {
 κσ.$flush();
 
 const exe = path.join(tmp, "prog.exe");
-const rc = spawnSync("rustc", [...(debug ? [] : ["-O"]), "--edition", "2024", "-A", "warnings", file, "-o", exe], {
-  encoding: "utf8",
-});
-if (rc.status !== 0) {
-  console.log(rc.stderr);
+try {
+  buildNative(file, exe, { debug });
+} catch (e) {
+  console.log(String(e.stderr ?? e));
   process.exit(1);
 }
 const native = spawnSync(exe, [], { encoding: "utf8" });

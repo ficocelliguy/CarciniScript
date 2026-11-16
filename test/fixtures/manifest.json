@@ -6,6 +6,12 @@
     "panic": null
   },
   {
+    "file": "array_copy.rs",
+    "stdout": "[1, 2, 3] [9, 2, 3]\n[1, 2, 3] [101, 2, 3]\n[\"x\", \"y\"] [\"x\", \"z\"]\n[[0, 0, 0], [0, 0, 0], [0, 0, 0]] [[0, 0, 0], [0, 5, 0], [0, 0, 0]] [7, 0, 0]\nBoard { cells: [[0, 0, 0], [0, 0, 0], [0, 0, 0]], turn: 1 }\nBoard { cells: [[4, 0, 0], [0, 0, 0], [0, 0, 0]], turn: 2 } [[4, 0, 0], [0, 0, 0], [0, 0, 8]]\n[4, 6, 0] [4, 0, 0]\n[0.5, 1.5] [2.0, 1.5] [Some(3), Some(1)] [None, Some(1)]\n[[0, 1], [2, 1], [2, 4]]\n[1, 2]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "assert_msg.rs",
     "stdout": "tri(10) = 55\n",
     "exitCode": 101,
@@ -14,6 +20,12 @@
   {
     "file": "assoc_consts.rs",
     "stdout": "4 3 12\n....\n.#..\n....\n1 m 3.048 ft\n[Low, High] 20\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "assoc_generic.rs",
+    "stdout": "1.5 13\n4.5 48\n(\"square\", 2.25) (\"grid\", 12)\n22.5 square 2.25 grid 12\n3C 1.5\n16\nsquare 4.0 <square 9.0> (\"square\", 9.0)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -60,8 +72,32 @@
     "panic": null
   },
   {
+    "file": "collection_turbofish.rs",
+    "stdout": "true 0 0 0 0 0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "combinators.rs",
     "stdout": "None -> Ok(None)\nNone\nSome(Ok(12)) -> Ok(Some(12))\nSome(Ok(12))\nSome(Err(\"invalid digit found in string\")) -> Err(\"invalid digit found in string\")\nSome(Err(\"invalid digit found in string\"))\nOk(3) Err(\"bad\") Some(5) None [\"ok 3\", \"err bad\", \"some 5\"]\n[Some(0), None, Some(20), None] calls=2\n[0, 1, 2]\nmany\n[\"r\", \"g\", \"b\", \"r\", \"g\", \"b\", \"r\"]\n[(1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a')]\n[]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "const_generics.rs",
+    "stdout": "6\n30\n20\n4\n[0.0, 0.0, 0.0, 0.0]\n3\non off\nx\ntrue false\n7\n2 3 2x3\nMatrix { data: [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]] } 3x2\nMatrix { data: [[14.0, 32.0], [32.0, 77.0]] }\ntrue 2\n2 5\n1x1\n[4, 5, 3] of 3 3 Ring<3>\n2\n7 Tag\n4\n8\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "const_generics_alias.rs",
+    "stdout": "16 aes\ntrue true 2\n2\ntrue 3 ,\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "const_generics_traits.rs",
+    "stdout": "3\n5 false\n5 50\n30\n50\n4 Slots { used: [], name: \"\" }\n2 [0, 2]\n2\n28 Vector { c: [2.0, 4.0, 6.0] } false\nSome(9) None\n5\n....\n..#.\n4x2\n..\n..\n..\n2x3\n5 0\n[[1, 1, 1], [1, 1, 1]]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -96,8 +132,68 @@
     "panic": null
   },
   {
+    "file": "crate_anyhow.rs",
+    "stdout": "a -> 8080\nb failed: reading b\nreading b\n\nCaused by:\n    0: port \"nope\" isn't a number\n    1: invalid digit found in string\n  0: reading b\n  1: port \"nope\" isn't a number\n  2: invalid digit found in string\n  root: invalid digit found in string\nc failed: reading c\nreading c\n\nCaused by:\n    port 70000 out of range\n  0: reading c\n  1: port 70000 out of range\n  root: port 70000 out of range\nd failed: reading d\nreading d\n\nCaused by:\n    port must be positive, got 0\n  0: reading d\n  1: port must be positive, got 0\n  root: port must be positive, got 0\ne failed: missing key\nmissing key\n  0: missing key\n  root: missing key\nSome(1)\ny not found / y not found\nCondition failed: `n % 2 == 0 && n > 0`\nouter\nz not found\ntop\n\nCaused by:\n    0: mid\n    1: deep\n",
+    "exitCode": 1,
+    "panic": null
+  },
+  {
+    "file": "crate_bitflags.rs",
+    "stdout": "Perms(READ | WRITE) Perms(0x0) Perms(READ | WRITE | EXEC)\nPerms(EXEC) Perms(READ | 0x10)\n3 rw rwx\ntrue false true\nPerms(READ | WRITE | EXEC) 7\nPerms(READ | WRITE) Perms(WRITE | EXEC)\nSome(Perms(READ | WRITE)) None\nPerms(READ | WRITE | EXEC)\nSome(Perms(EXEC)) None\n[\"READ\", \"WRITE\"]\n(Perms(WRITE), Perms(EXEC), Perms(EXEC))\nSmall(A | B) Small(A | B)\nSmall(0x0) true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_cells.rs",
+    "stdout": "[2, 3, 5, 7, 11, 13, 17, 19, 23, 29] 10\n2 None\nNone\nOk(()) Err(\"slow\")\nSome(\"fast\") fast\n7 7\nother\n42 true Some(42) None\nLeft(84)\n42\nHI false None Some(\"HI\")\nRight(2)\nHI!\nLeft('x') x\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_itertools.rs",
+    "stdout": "3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5\n[1, 1, 2, 3, 3, 4, 5, 5, 5, 6, 9]\n[9, 6, 5, 5, 5, 4, 3, 3, 2, 1, 1]\n[3, 3, 6, 9, 1, 1, 4, 2, 5, 5, 5]\n[3, 1, 4, 5, 9, 2, 6]\n[3, 1, 4, 2]\n[1, 2, 3, 1]\n[1, 5, 3]\n[-2, 3, -3, 4, 4, -7, 4, -1, -2, 2]\n123 234 345 \n[(1, 2), (3, 4), (5, 6)]\n[[1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]]\n[[1, 2], [1, 3], [2, 1], [2, 3], [3, 1], [3, 2]]\n[[1, 1], [1, 2], [1, 3], [2, 2], [2, 3], [3, 3]]\n[[], [1], [2], [3], [1, 2], [1, 3], [2, 3], [1, 2, 3]]\n[(1, 'a'), (1, 'b'), (2, 'a'), (2, 'b')]\n[[1, 3], [1, 4], [2, 3], [2, 4]]\n[1, 10, 2, 11, 3, 12, 13, 14]\n[1, 0, 2, 0, 3]\n[1, 2, 3, 4, 7, 9]\n[1, 2, 3, 4]\n[4, 8, 10]\n[(1, 2), (2, 1), (3, 2), (4, 1), (5, 3), (6, 1), (9, 1)]\ntrue false true\ntrue Some((4, 5))\n[1, 1, 2] [9, 6]\na [1, 2]\nb [3]\na [4]\na [1, 2, 4]\nb [3]\n[2, 4]\nx 5\nNone\n[8, 9]\n[\"ab\", \"ab\", \"ab\"]\n1-4-9\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_rand.rs",
+    "stdout": "ranges ok: true\nfalse true\ntrue\npermutation: true\nchoose in range: true\nNone\nthree distinct: 3\niter choose: true\npick: true\nseeded repeat: true\nfilled: true\ntrue true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_rayon.rs",
+    "stdout": "[1, 4, 9, 16, 25, 36, 49, 64, 81, 100]\nsum 55\nevens 50\nreduce 55\nfold 55\nmax Some(10)\n[1, 3, 5, 7, 9]\n[9, 7, 5, 3, 1]\n[90, 70, 50, 30, 10]\nSome(\"apple\")\nSome(2)\n[5, 3, 5, 4]\n[6, 15, 24, 10]\n[1, 1, 2, 2, 3, 3]\n3 words, any long: true\n[8, 9, 10]\n9\nfib 610\ntotal 55\nthreads true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_regex.rs",
+    "stdout": "true\n7 17 \"2024-01-15\" Match { start: 7, end: 17, string: \"2024-01-15\" }\n15/01/2024 (4)\n31/12/2025 (4)\n04/07/1999 (4)\n[\"2024\", \"2025\", \"1999\"]\nDates: 15.01.2024, 31.12.2025 and 04.07.1999.\nDates: <2024>, 2025-12-31 and 1999-07-04.\nDates: X, X and 1999-07-04.\nDates: $1, $1 and $1.\nDates: 2025-01-15, 2026-12-31 and 2000-07-04.\nSome((\"n00dles\", 4))\nNone\nSome(\"a\") Some((2, 3))\nCaptures({0: 0..3/\"a=1\", 1/\"key\": 0..1/\"a\", 2/\"val\": 2..3/\"1\"})\n[None, Some(\"key\"), Some(\"val\")] 3\n1:a two:bee\n[\"a\", \"b\", \"c\", \"d\"]\n[\"a\", \"b;c ,d\"]\n[\"HACK\", \"Grow\"]\n2\nhéllo 0..6\nwörld 7..13\n日本 14..20\nSome(Match { start: 4, end: 8, string: \"٣٤\" })\n[(0, 0), (1, 3), (4, 4)]\n-a-b-\n(\\d{4})-(\\d{2})-(\\d{2}) Regex(\"(\\\\d{4})-(\\\\d{2})-(\\\\d{2})\")\n1\\+1=2\\? \\(yes\\)\nSome(Match { start: 3, end: 6, string: \"abc\" })\ntrue\ntrue\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_serde_json.rs",
+    "stdout": "{\"name\":\"n00dles\",\"ram\":4,\"ports\":[22,80],\"root\":true,\"tags\":[],\"owner\":null}\n{\n  \"name\": \"n00dles\",\n  \"ram\": 4,\n  \"ports\": [\n    22,\n    80\n  ],\n  \"root\": true,\n  \"tags\": [],\n  \"owner\": null\n}\nServer { name: \"n00dles\", ram: 4, ports: [22, 80], root: true, tags: [], owner: None } true\nEOF while parsing a value at line 1 column 0 | line 1 col 0 eof true syntax false data false | Error(\"EOF while parsing a value\", line: 1, column: 0)\nEOF while parsing an object at line 1 column 1 | line 1 col 1 eof true syntax false data false | Error(\"EOF while parsing an object\", line: 1, column: 1)\nmissing field `ram` at line 1 column 13 | line 1 col 13 eof false syntax false data true | Error(\"missing field `ram`\", line: 1, column: 13)\ninvalid type: integer `5`, expected a string at line 1 column 10 | line 1 col 10 eof false syntax false data true | Error(\"invalid type: integer `5`, expected a string\", line: 1, column: 10)\ninvalid value: integer `70000000000`, expected u32 at line 1 column 29 | line 1 col 29 eof false syntax false data true | Error(\"invalid value: integer `70000000000`, expected u32\", line: 1, column: 29)\ninvalid value: integer `-1`, expected u32 at line 3 column 11 | line 3 col 11 eof false syntax false data true | Error(\"invalid value: integer `-1`, expected u32\", line: 3, column: 11)\nEOF while parsing a value at line 1 column 3 | line 1 col 3 eof true syntax false data false | Error(\"EOF while parsing a value\", line: 1, column: 3)\ntrailing characters at line 1 column 46 | line 1 col 46 eof false syntax true data false | Error(\"trailing characters\", line: 1, column: 46)\ntrailing comma at line 1 column 7\nboxed: invalid type: boolean `true`, expected a string at line 1 column 13\n{\"money\":1500000.0,\"name\":\"foodnstuff\",\"neg\":-3,\"nested\":{\"deep\":[true,null,\"x\"]},\"ports\":[21,22],\"ram\":16,\"ratio\":0.25}\n{\n  \"money\": 1500000.0,\n  \"name\": \"foodnstuff\",\n  \"neg\": -3,\n  \"nested\": {\n    \"deep\": [\n      true,\n      null,\n      \"x\"\n    ]\n  },\n  \"ports\": [\n    21,\n    22\n  ],\n  \"ram\": 16,\n  \"ratio\": 0.25\n}\nArray [Number(21), Number(22)]\n\"foodnstuff\" 22 null\nSome(16) Some(1500000.0) Some(\"foodnstuff\")\nSome(-3) None\nSome(Number(16)) None\nSome(String(\"x\"))\ntrue true true\nport total 43\n[\"money\", \"name\", \"neg\", \"nested\", \"ports\", \"ram\", \"ratio\"]\n{\"list\":[1,2,3],\"s\":\"n00dles\",\"server\":\"sigma\",\"threads\":14}\n[1,\"two\",null,false,{\"k\":[]}]\nnull\n{\"a\":{\"x\":\"é\\n\"},\"b\":[1,2.5,-7,1000.0]}\nObject {\"a\": Object {\"x\": String(\"é\\n\")}, \"b\": Array [Number(1), Number(2.5), Number(-7), Number(1000.0)]}\n{\"name\":\"n00dles\",\"owner\":null,\"ports\":[22,80],\"ram\":4,\"root\":true,\"tags\":[]}\nServer { name: \"n00dles\", ram: 4, ports: [22, 80], root: true, tags: [], owner: None }\ninvalid type: integer `1`, expected a string\n[1,2]\n{\"actions\":[{\"hack\":{\"target\":\"n00dles\"}},{\"grow\":\"joesguns\"},\"idle\"],\"weights\":{\"hack\":0.5},\"meta\":{\"tags\":[\"a\"],\"v\":2}}\nPlan { actions: [Hack { target: \"n00dles\" }, Grow(\"joesguns\"), Idle], weights: {\"hack\": 0.5}, meta: Object {\"tags\": Array [String(\"a\")], \"v\": Number(2)} }\n{\n  \"tags\": [\n    \"a\"\n  ],\n  \"v\": 2\n}\n{\"a\":\"s\",\"z\":1}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "crate_thiserror.rs",
+    "stdout": "missing key `port`\nbad value for mode: expected [1, 2], got 7\n4 entries is too many (max 3)\nempty config\nio failed: disk\nOk(12)\nnot a number\nempty config\nwrapped at step 2 <- not a number <- invalid digit found in string\nio failed: net\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "custom_iter.rs",
     "stdout": "[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]\n44\n3 2 1 \nSome(2) Some(1) None\n[(3, 5), (2, 8), (1, 13)] 40\n[\"ab\", \"ab\", \"ab\"] 28\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "debug_assert.rs",
+    "stdout": "5\nfalse false\n3\n",
     "exitCode": 0,
     "panic": null
   },
@@ -156,6 +252,12 @@
     "panic": null
   },
   {
+    "file": "fmt_debug_builders.rs",
+    "stdout": "Point { x: 1.0, y: -2.5, label: Some(\"home\") }\nPoint {\n    x: 1.0,\n    y: -2.5,\n    label: Some(\n        \"home\",\n    ),\n}\nMeters(3.0, 'm')\nSecret { id: 7, .. }\n[\"a\", \"b\", \"end\"]\n{\"a\": 1, \"b\": 2, \"total\": 3, \"k\": Some(1.5)}\n{3, 1}\nWrapper { inner: Some(2.0) }\nWrapper { inner: [Point { x: 1.0, y: -2.5, label: Some(\"home\") }] }\n<Empty> [Meters(1.0, 'a')]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "fmt_spec_impls.rs",
     "stdout": "[p3] [p3] [P3] [P3] [P3] [P3]\n[carcini] [   carcini] [carcini   ] [  carcini  ] [**carcini**] [car] [    ca]\n[carcini     ] [        9]\nw=None p=None fill=' ' plus=false alt=false zero=false\nw=Some(7) p=Some(3) fill=' ' plus=false alt=false zero=false\nw=Some(8) p=None fill=' ' plus=true alt=true zero=true\nw=Some(5) p=None fill='_' plus=false alt=false zero=false\n[$1234.50] [$1234] [    $1234.50] [   $1234.500]\n[Derived { x: 4 }] [Derived {\n    x: 4,\n}]\n",
     "exitCode": 0,
@@ -180,8 +282,44 @@
     "panic": null
   },
   {
+    "file": "generic_bitwise.rs",
+    "stdout": "(8, 14, 6)\n(0, -2, -2)\n(4026593280, 4293984240, 267390960)\n(5, 1099511627783, 1099511627778)\n(4, -1, -5)\n(4294901760, 137438953471, 133144051711)\n(false, true, true)\nFlags(7)\n250 -6 4294967295 18446744073709551608 0\nfalse 5 Flags(240)\n(32, 50) (-64, -4) (9223372036854775808, 0)\n(0, 134217728) (-32768, -1)\n(3298534883328, 0) (-8192, -128)\n3\ntrue\n124 -20\n239 Flags(5)\nFlags(5) Flags(11) 257\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_bounds.rs",
+    "stdout": "[1, 2, 3] [1.5, 2.0] [true, false] [Cents(125), Cents(5)]\nok 255 error ok 'x' error\n7 7 200 A Cents(9)\nhi Cents(250)\n6 0.75 Cents(12)\n250 24 3\n5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_debug.rs",
+    "stdout": "Some(\"a\") 1.0 [Some(2)] 'x'\nNone (2.0, \"s\", true)\n(Some(1.5), [None, Some('c')])\n[Some(4.0)] [Some(4.0), Some(4.0)]\nSome(1.0) [(1.0, 1), (2.5, 1)]\ndbg: Some(\"s\") dbg: [0.5, 1.0]\nPair { a: 1.0, b: Some(2.0) } Pair { a: 1.0, b: Some(2.0) }\nPair { a: 1.0, b: Some(2.0) }\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_impl_methods.rs",
+    "stdout": "[3, -4] -2\n[3.5, 1.5]\n[V2(4, 3), V2(1, 2)] V2(10, 10)\n44 [66, 33]\n1 2 1\n0\n-1 -39\ntrue false [200]\n[1.5, 2.25]\n250 64 10 -2\n[4, 2] [4.5]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_impl_traits.rs",
+    "stdout": "3 3.5 -3 \n3 r 1 | 3 r 2 | 2\nNum { v: 9, d: 2 } 4\n[333, 111, 37, 12] [0.25, 0.0625]\n5 5.5\n1 true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "generic_method_statics.rs",
     "stdout": "2m 15ft\n2 values in m / 2 values in ft\n6ft 15ft\nMeters(0) Feet(0)\n[\"3ft\", \"6ft\"] 4m m ft\n3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_ops.rs",
+    "stdout": "3 3.5 -3 4\n(3, 2) (-3, -2) (3.75, 1.5)\n(3, 2) (25, 5)\nMoney(4) Money(15)\n6 0.75 Money(3)\n-5 -2\n244 1410065409 1\n3 3.5\n6 12 1\n6 30\n[\"Some(1)\", \"None\"] [\"\\\"a\\\"\", \"\\\"b\\\"\"]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -258,8 +396,26 @@
     "panic": null
   },
   {
+    "file": "int64_exact.rs",
+    "stdout": "[8748534153485358512, 3040900993826735515, 3453997556048239312]\n13679457532755275413 2949826092126892291\na430d84680aabd0b CBF29CE484222325 360\n18446744073709551615 -9223372036854775808 9223372036854775807 1\n9223372036854775807 9223372036854775805\nNone Some(18446744073709551614) None\nNone None None\n18446744073709551615 -9223372036854775808 9223372036854775807\n18446744073709551614 -9223372036854775808 -9223372036854775808\nSome(12157665459056928801) None 18026252303461234787\n9223372036854775807 -9223372036854775808\n-9223372036854775808 0\n1234567890123 -1 -1234567890123 -27\n-1234567890123 5 -10\n6 -176366841447 -1\n1234567891123 4\n64 62 63 3\n64 true false\n1000000 63 13\ntrue false\n1085102592571150095 1085102592571150080 1085102592571150095 240\n-4 -9223372036854775808 -9223372036854775807\n1152921504606847000 0 0\n-1 18446744073709551615 18446744073709551616\n3 0 9223372036854775807\n0 300 true\n8 -10\n9 \t\n4609434218613702656 1.5\nOk(18446744073709551615) true\nOk(-9223372036854775808) Ok(18446744073709551615)\n[  18446744073709551615] [7    ] [+5] [0b101] [100]\n20 Some(-9223372036854775808)\nzero digit round other max \ntrue true Less\n9 -3\nSome(\"big\") None\n2\n[-9223372036854775808, -3, 0, 5, 9223372036854775807]\nSome(9223372036854775807) Some(-9223372036854775808) Some(9223372036854775807)\n2432902008176640000 5050 [0, 3, 6, 9]\n[16, 9, 4, 1, 0]\n1\n[Stamp { secs: 0, delta: 0 }, Stamp { secs: 5, delta: 9 }, Stamp { secs: 1099511627776, delta: -2 }]\n3 Some(1099511627776)\nSome(1) 0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "int_exhaustive.rs",
     "stdout": "zero low high\n-1 0 1\n1 2 3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_clone.rs",
+    "stdout": "[2, 3] [2, 3]\nSome((1, 'é')) Some((3, 'l'))\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_more.rs",
+    "stdout": "[Ident(\"x1\"), Op('='), Num(42), Op('+'), Ident(\"y\"), Op('*'), Num(7)]\n[(1, 2), (2, 1), (3, 3)]\nSome(1) Some(1) Some(2) [2, 3]\n[\"a\", \"b\"] [\"c\", \"d\", \"e\"]\nSome(1) Some(2) None None\nSome(250) None\nOk(6) Err(\"x: invalid digit found in string\")\nErr(5)\nSome(5) Some(1) Some(3) [2]\ntrue\nSome(9) 321\n5 4\ntrue true\nLess true true\nfalse true false\ntrue\n",
     "exitCode": 0,
     "panic": null
   },
@@ -366,6 +522,12 @@
     "panic": null
   },
   {
+    "file": "once_lock_traits.rs",
+    "stdout": "Env { cached: OnceLock(<uninit>) }\nEnv { cached: OnceLock(\"x\") } OnceLock(<uninit>)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "operators.rs",
     "stdout": "Vec2 { x: 4.0, y: 1.0 } Vec2 { x: -2.0, y: 3.0 } a unchanged: Vec2 { x: 1.0, y: 2.0 }\nVec2 { x: 2.0, y: 4.0 } 1 Vec2 { x: -1.0, y: -2.0 }\nVec2 { x: 3.5, y: 3.5 }\nVec2 { x: 2.5, y: 5.5 } a still Vec2 { x: 1.0, y: 2.0 }\nVec2 { x: 8.0, y: 2.0 } [Vec2 { x: 10.0, y: 20.0 }, Vec2 { x: 30.0, y: -10.0 }, Vec2 { x: 40.0, y: 10.0 }]\nOff On true\nMoney(42)\n",
     "exitCode": 0,
@@ -376,6 +538,12 @@
     "stdout": "Some(1) None\ntrue false false true\n4 -1 0\nSome(4) None Some(\"text\")\ntrue true\nSome(10) None\nNone Some(20)\nholds 9 | empty\ndigits: 113\nSome(1) Some(3) Some(2) None\n[30, 20, 10] None None\nlast word bb has 2 bytes\n[Some(\"x\"), None]\n",
     "exitCode": 101,
     "panic": "thread 'main' panicked at option.rs:76:23:\nthe reading should exist"
+  },
+  {
+    "file": "or_pattern_bindings.rs",
+    "stdout": "Circle(1.5) -> 1.5\nSquare(2.0) -> 2\nRect(3.0, 4.0) -> 12\nRect(2.0, 150.0) -> 150\nDot -> 0\nSome(1) Some(5) None\nsmall, picked 7\nsmall, picked 1\nsmall, picked 3\n1..4\nempty\n(1, 2) (4, 3) (0, 0)\n1\nb\n3\n42\n6 []\n",
+    "exitCode": 0,
+    "panic": null
   },
   {
     "file": "panic.rs",
@@ -468,6 +636,12 @@
     "panic": null
   },
   {
+    "file": "rust_tour.rs",
+    "stdout": "== 4 items, first is hammer ($12.50) ==\nItem { name: \"yo-yo\", price_cents: 450, category: Toy }\n  hammer    12.50 Tool\n  apple      0.99 Food\n  yo-yo      4.50 Toy\n  wrench     8.75 Tool\n== sales ==\n  sold 2 hammer for 2500 cents\n  error: wanted 20 apple, only 10 left\n  error: no such item: laser\n  sold 1 yo-yo for 450 cents\n  yo-yo: sold out\nwrench 875, laser 0\ntotal stock 112, low: [\"wrench\", \"yo-yo\"]\n  SOMETHING TO EAT -> apple\n  A TOOL -> hammer, wrench\n  A TOY -> yo-yo\n[\"a toy\", \"something to eat\"]\n1000 twice marked up: 1210\nlonger: hammer\nsame? false / true\nmoved: hammer ($12.50)\nparsed 7, bad is_err: true\nplenty, big shop\n  log: closed for the day\n  log: restocked hammer +200\n  log: sold 1 x yo-yo\n  log: sold 2 x hammer\n2 sales\n3 2 1 \nfirst power of 3 over 1000: 2187\ndone: apple ($0.99)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "shared.rs",
     "stdout": "[1, 2, 3, 4] 4\n20\n120 [\"+25\", \"+-5\"] 2\n120 [\"+25\", \"+-5\"] Account { balance: RefCell { value: 0 }, log: RefCell { value: [] }, visits: Cell { value: 2 } }\n14\nroot [\"leaf\", \"leaf\"]\n",
     "exitCode": 0,
@@ -546,6 +720,18 @@
     "panic": null
   },
   {
+    "file": "std_trait_impls.rs",
+    "stdout": "2 false\n[2]\n2\nBob\nPoint { x: 1, y: 2 } Point { x: 10, y: 2 }\nOk(Even(8)) Err(\"7 is not a non-negative even number\")\nOk(Even(12))\nOk(255) Err(TryFromIntError(PosOverflow))\nErr(TryFromIntError(NegOverflow)) Err(TryFromIntError(NegOverflow))\n300 5\nerror: number too large to fit in target type\nErr(TryFromIntError(PosOverflow))\nOk('A') Ok('😀') Err(CharTryFromError(()))\nconverted integer out of range for `char`\nBag { items: [1, 2, 3, 4], total: 10 }\n[50, 60, 1, 2, 100, 101, 102] 416\n6 30\n4\n2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "stringify_cfg.rs",
+    "stdout": "[a + b]\n[a + b]\n[Vec<i32>]\n[foo(x, y).bar]\n[x]\n[\"s\" 'c' 1.5]\n[if a { b } else { c }]\n[a, b]\n[&mut x[0]]\n[let y = 2;]\n[a::b::<T>()]\n[#[derive(Debug)] struct S;]\n[false true]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "strings.rs",
     "stdout": "Some(2)\nSome(17)\nSome((\"Hello\", \"World! hello\"))\nSome(\", World! hello\")\nNone\nello, World! hello\nlo, World! hello\n[(0, 'H'), (7, 'W')]\n[72, 101, 108]\n19\ntrue\ntrue\nHeLLo, WorLd! heLLo\n[\"Hello,\", \"World! hello\"]\n[\"hello\", \"World!\", \"Hello,\"]\nHello, World! hello!\nHello, World! helloHello, World! hello\nSome(5)\nfalse\nxyzab Some('c')\n[]\nabc\na-b-c\n17 289 -1 3\n2147483647 255\nNone None\n255 4\n7\n[\"a\", \"b\"]\nSome(1) true\n[3, 2, 1] Ok(1)\n\"3,1,2\"\nSome(3)\n6\n97 b\nSome('7')\n9\n3\n",
     "exitCode": 0,
@@ -572,6 +758,12 @@
   {
     "file": "traits.rs",
     "stdout": "circle with area 3.00 / big: false\n2x3 rect with area 6.00 / big: false\nsplat with area 4.50 / big: false\ndot with area 0.00 / big: false\n13.5\n45.0\ncircle with area 27.00\n1X1 RECT CIRCLE\n(r=1) Circle { r: 1.0 }\ndot\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "traits_more.rs",
+    "stdout": "square with area 2.25 | 3x4 grid with area 12\n2.25 / square with area 2.25 | 12 / 3x4 grid with area 12\n2.25 13\n[\"a\", \"b\"] 2\n21.5C (\"21.5C\", \"21.5C\") 21.5C\n3 (3.0, 3.0)\n5! hey! 2.5!\n$30! $7! $7!\nc! c! $1! $1!\n<Pt { x: 3 }> <[1, 2]> <Some(1.0)>\nann! <\"ann\">\nOk(Point { x: 1, y: 2 })\nOk(Point { x: 3, y: 4 })\nerror: missing a comma\nOk([Point { x: 1, y: 1 }, Point { x: 2, y: 3 }])\nErr(\"bad number \\\"x\\\"\")\nhi ann hi bob\nABC BOB\n6 9\nDune [\"scifi\", \"classic\"]\n[(\"a\", 2), (\"b\", 2), (\"c\", 1)]\nV2(11, 22) V2(11, 22) true\n[(1, 2), (3, 4)]\n[0, 24]\n",
     "exitCode": 0,
     "panic": null
   },

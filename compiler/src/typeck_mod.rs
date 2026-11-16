@@ -430,6 +430,23 @@ impl Checker<'_> {
             {
                 self.check_use_tree(&tree, &[]);
             }
+            // `extern crate rand;` (2015-edition style): std and the bundled crates are always
+            // there; others are as unavailable as their `use`.
+            if let ast::Item::ExternCrate(e) = &item
+                && let Some(n) = e.name_ref()
+            {
+                let name = n.text().to_string();
+                let known = matches!(name.as_str(), "std" | "core" | "alloc" | "self")
+                    || super::crates::BUNDLED.contains(&name.as_str());
+                if !known {
+                    let msg = format!(
+                        "unresolved import `{name}` (load a module with `mod {name};`; crates other than std aren't available)"
+                    );
+                    self.error(e.syntax(), msg);
+                } else if e.rename().is_some_and(|r| r.name().is_some()) && name != "self" {
+                    self.error(e.syntax(), "renaming crates isn't supported yet");
+                }
+            }
         }
     }
 
@@ -532,9 +549,27 @@ impl Checker<'_> {
                     self.js_imports.insert(f.clone(), f.clone());
                 }
             }
-            // The `js` crate (`use js::{Date, JSON};`), and serde's derives (accepted; `JSON`
-            // goes by types, not traits).
-            ["std" | "core" | "alloc" | "js" | "serde", ..] | [] => {}
+            // The bundled `rand`: its functions by name (`use rand::thread_rng;`, and the ones
+            // `use rand::prelude::*;` brings in).
+            ["rand", .., f] if super::crates::RAND_FNS.contains(f) => {
+                let alias = tree
+                    .rename()
+                    .and_then(|r| r.name())
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_else(|| f.to_string());
+                self.std_fns
+                    .insert(alias, vec!["rand".to_string(), f.to_string()]);
+            }
+            ["rand", ..] if tree.star_token().is_some() => {
+                for f in super::crates::RAND_FNS {
+                    self.std_fns
+                        .insert(f.to_string(), vec!["rand".to_string(), f.to_string()]);
+                }
+            }
+            // The `js` crate (`use js::{Date, JSON};`), serde's derives (accepted; `JSON` goes
+            // by types, not traits), and the bundled crates' traits and types.
+            [first, ..] if *first == "std" || super::crates::BUNDLED.contains(first) => {}
+            ["core" | "alloc", ..] | [] => {}
             [first, rest @ ..] if self.module_exports.contains_key(*first) => {
                 // `use geo::shapes::area`: down through `pub mod`s first.
                 let mut module = first.to_string();

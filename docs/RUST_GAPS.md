@@ -8,20 +8,22 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **Overflow wraps by default.** Arithmetic follows rustc's release-mode semantics (two's-complement
   wrapping). With overflow checks on (`setOverflowChecks(true)`, or Bitburner's "Rust: panic on
-  integer overflow" option) it panics like a debug build; `i64`/`u64` overflow past 2^53 is
-  detected, though the values themselves are inexact there (see below).
-- **64-bit integers are JS numbers.** `i64`, `u64`, `isize` and `usize` are exact only up to 2^53.
-  They don't wrap at 2^64, and casting a negative value to an unsigned 64-bit type keeps the sign.
-  Literals above 2^53 that a double can't hold exactly produce a warning. Their bitwise operators are exact (through BigInt) for
-  values that fit, but a result above 2^53, such as `!0u64`, is rounded like any other.
-- **Unconstrained types aren't errors.** rustc reports "type annotations needed" for a value
-  whose type nothing determines (e.g. an empty `Vec::new()` that's never used). CarciniScript
-  treats it as untyped instead.
+  integer overflow" option) it panics like a debug build.
+- **`usize` and `isize` are JS numbers**, exact up to 2^53 (lengths and indexes never get near).
+  They don't wrap at 2^64, and casting a negative value to `usize` keeps the sign. `i64` and `u64`
+  are exact BigInts, which makes their arithmetic several times slower than `i32`'s or `f64`'s.
+- **"Type annotations needed" is reported for `let` bindings only.** `let v = Vec::new();` that
+  nothing types is rustc's error (also `HashMap<_, _>`, `Option<_>`, `Stack<_>`), but a value
+  that's never bound (`Vec::new().len()`) or an unused closure parameter is treated as untyped.
+  The check runs only when nothing else is wrong, and skips struct arguments no field's type
+  uses (const parameters, iterator-bounded ones).
 
 ## Vec, arrays and slices
 
 - **Fixed-size arrays are growable.** `[T; N]` and `&[T]` are the same JS array as `Vec<T>`, so
-  the length isn't fixed by the type.
+  the length isn't fixed by the type. They copy like rustc's (`Copy` elements) when read from a
+  local, parameter, field or row into a new place; a copy made through a type parameter or a
+  closure capture isn't tracked.
 - **`for x in &mut v` needs a stable name for `v`.** The loop variable aliases `v[i]`. When `v` is
   a more complex expression, it's evaluated once into a temporary first.
 - **Index panics on underflowed `usize`s show a negative index.** `usize` arithmetic doesn't wrap
@@ -56,7 +58,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **`rev()` collects first.** JS iterators only go forward, so `.rev()` drains what's before it.
   The output is the same unless the earlier adapters have side effects (`inspect`) or the
-  iterator is endless.
+  iterator is endless. `next_back`, `nth_back`, `rfind`, `rfold` and `len` collect what's left
+  the same way (so a `next()` / `next_back()` loop is quadratic), and `len()` works on any
+  iterator, not only `ExactSizeIterator`s.
+- **`peek` works on any iterator**, not only one from `peekable()`: the lookahead is added on the
+  first `peek` / `next_if`. `size_hint()` and `peek_mut()` aren't supported. Cloning an iterator collects what's left (so the two go on independently, as in Rust).
 - **Closure parameters are lenient about references.** `|x| ..`, `|&x| ..` and `|&&x| ..` all bind
   the element itself; numbers and strings are values in JS either way. Rust's own type check
   still applies to what you write, but CarciniScript accepts some forms rustc would reject.
@@ -89,20 +95,34 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   since JS can't rebind the caller's variable. The result is the same as Rust's.
 - **`From` impls must be for a struct or enum declared in your code.** `impl From<MyErr> for
   String` (a std target) isn't supported; `?` converts error types only into your own types.
-  `Into` bounds on generic parameters (`fn f<T: Into<Meters>>(x: T)`) aren't supported either:
-  a generic function can't pick the `from` method at run time (types are erased).
+- **`Into<X>` / `AsRef<X>` parameters and bounds take `X` itself.** `impl Into<String>` accepts
+  `&str` and `String`; a type that converts through your own `From` impl (`fn f<T:
+  Into<Meters>>(x: T)` given a `Feet`) doesn't, since a generic function can't pick the `from`
+  method at run time.
 - **`{:>10}` on a type with a `Display` impl ignores the width**, which matches Rust for impls
   that use `write!` (rather than `f.pad`).
 - **Exhaustiveness checking gives up on very large matches** (it assumes they're covered).
-- **64-bit integers parse only within JS's safe integer range**; larger values report overflow.
 
 ## Generics and slices
 
 - **Generic functions are erased, not monomorphized.** A `T` allows only operations from its
-  bounds; `/` and `%` on a `T` are rejected, because erased code can't tell integer division
-  from float division. `+`, `-` and `*` on a `T` don't wrap integer overflow.
-- **`{:?}` of a generic value prints whole-number floats without `.0`**, and one-character
-  strings and chars the same way, since the type is gone at run time.
+  bounds. Operators on a `T` (`+ - * / % & | ^ << >>`, `+=` etc., unary `-` and `!`) go by the
+  class the caller passes for `T`, which knows its number kind (integer division truncates,
+  results wrap, shift amounts are masked to the width) or calls a struct's own operator; so do
+  `parse::<T>()`, `T::from(x)` and `sum::<T>()`. In a struct's `impl<T> S<T>`, methods with
+  `self` read `T`'s class off the value (`this.$T`), which each construction stores when some
+  method needs it. An enum's `impl<T>` (and `impl<T> S<Vec<T>>`) can't: there `/`, `%`, `<<`,
+  `>>`, `!` and `parse::<T>()` are errors, and `+`, `-`, `*` are JS arithmetic (no wrapping).
+  A struct built where its `T` isn't known (an unannotated empty `Vec` field nothing settles)
+  carries no class, and its `/` divides like a float. Overflow on a `T` wraps even in a debug
+  build (`--debug` comparisons), where Rust panics. `T::Err` of a `T: FromStr` is unchecked.
+  `impl Shl` / `impl Shr` for your own types isn't supported.
+- **`{:?}` of a generic value is guessed from the run-time value where no caller says its type.**
+  A generic function or method that prints a `T` with `{:?}` takes a formatter for `T` from each
+  call (so `Some(..)`, `1.0` and `'c'` print as in Rust), and so does a blanket impl's method
+  called on a known type. Where nothing passes one (a type parameter of an `impl<T>` in a method
+  with `self`, a generic function used as a value, a call through `dyn`), `Some(x)` prints as
+  `x` and a whole float without `.0`.
 - **A width on a derived `{:?}` pads the whole value.** Rust passes the width to each field
   (`{:>8?}` of `P { x: 1 }` is `P { x:        1 }`, and of `vec![1]` is `[       1]`); here the
   result is padded as one string. Hand-written `Debug` / `Display` impls get the width through
@@ -114,16 +134,33 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Generics are erased, so a few things need help at run time.** `T::new()`, `T::CONST` and
   `T::default()` work in free functions, on a method's own type parameters and on an `impl<T>`'s
   in its associated functions, which get `T`'s class as a hidden argument, but not on an
-  `impl<T>`'s in methods with `self` (the class would have to travel with the value). Generic
-  traits (`trait Convert<T>`) and associated types
-  declared in your traits aren't supported.
+  `impl<T>`'s in methods with `self` (the class would have to travel with the value).
+- **A hand-written `Hash` sets map keys only with a hand-written `PartialEq`.** Keys are
+  structural (every field) for a derived `PartialEq`, and what `hash` writes for a hand-written
+  one, so the two should use the same fields (as Rust requires anyway). `DefaultHasher::finish()`
+  is FNV-1a, not SipHash: its values differ from rustc's (which aren't specified).
+- **`v.try_into()` from a slice to an array is always `Ok`**, since array lengths aren't in
+  the types; rustc returns `Err` (or panics at `unwrap`) for the wrong length.
+- **One `TryFrom`, `FromIterator` and `Extend` impl per type.** A second one is an error.
+- **Array lengths aren't part of types, so const generics lean on arguments.** A const parameter
+  is inferred from a written argument or a struct's type (`Matrix<2, 3>`), or read at run time off
+  an argument (`[T; N]`'s length), but not from an array type alone: `let z: [f64; 4] = zeros();`
+  needs `zeros::<4>()` (it's a "type annotations needed" error, not a wrong value). For the same
+  reason a mismatched length (`sum::<2>([1, 2, 3])`) isn't an error. A const argument can be a
+  literal, integer arithmetic on literals (`{ 128 / 8 }`), a const parameter or a `const` item,
+  not a `const fn` call. Const parameters on enums and traits, and 64/128-bit ones, aren't
+  supported.
+- **Associated types are checked through function type parameters, not `impl<T>`'s or `dyn`.**
+  In `fn f<S: Shape>`, `S::Unit` is its own type with the bounds the trait declares, as in
+  rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
+  type. A generic trait can be implemented once per type. An associated type a `where` clause
+  constrains (`where S::Unit: PartialEq<T>`), or one of a trait with a blanket impl, is unchecked
+  rather than given those bounds.
 - **`&mut` to a number, string or bool inside a struct, tuple or Vec can't be passed to a
   function** (the value would be copied). Pass the struct, or a `&mut` to a local and write it back.
 - **`RefCell` doesn't track borrows**, so a `borrow_mut` while another borrow is alive doesn't
   panic. `Rc` is erased: `Rc::strong_count` and `Weak` aren't available, and `.clone()` on a
   struct without `#[derive(Clone)]` is taken to be an `Rc` clone (it shares the value).
-- **A generic type's arguments can stay unknown** (`let s = Stack::new();` with no use), which
-  rustc rejects; nothing depends on them at run time.
 - **Shared slices are copies.** `&v[1..3]` reads like Rust; `&mut v[a..b]` is a view instead (see
   above), and `&mut s[a..b]` of a string is rejected.
 
@@ -160,6 +197,52 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `Server & { isOnline?: boolean }` is typed as the named interface; its extra fields are dropped.
 - **Without bindings** (`setNsBindings` not called), `NS` is entirely untyped and snake_case names
   map to camelCase.
+
+## Bundled crates
+
+- **The bundled crates are `rand`, `itertools`, `anyhow`, `thiserror`, `bitflags`, `once_cell`,
+  `lazy_static`, `either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex` and `rayon`**;
+  any other crate is an error.
+- **rayon runs on one thread.** Results are what one thread gives, so they match rayon's except
+  where rayon's own order isn't fixed (`par_bridge`, `for_each` side effects). There's no
+  `ThreadPoolBuilder`, `rayon::scope` or `par_iter().update(..)`, and rayon's method names
+  inside other macros' arguments are rewritten only for the plain ones (`par_iter`, ..), not
+  `reduce(|| id, op)`.
+- **serde_json reads the whole text before converting it**, so when a document has both a
+  syntax error and, earlier, a value of the wrong type, the syntax error is reported where
+  serde_json (which streams) reports the type error. A `Value` keeps object keys sorted (no
+  `preserve_order`), and has no `IndexMut` (`v["k"] = ..`): use `as_object_mut()` /
+  `get_mut`. `PartialEq` between a `Value` and a number or string (`v["n"] == 1`) is missing;
+  compare `v["n"].as_i64() == Some(1)`. `to_writer` / `from_reader` / `to_vec` / `from_slice`
+  aren't there.
+- **regex runs on JS regular expressions.** Inline flags work only at the start of the pattern
+  (`(?i)abc`, not `a(?i:b)c`), `x` (verbose) mode, class set operations (`[a&&b]`) and negated
+  POSIX classes are errors, `\b` is an ASCII word boundary, and `regex::Error`'s text isn't
+  regex's exact report (no caret line). `replace` and friends give a `String` where regex gives
+  a `Cow<str>` (`into_owned()` isn't there; `to_string()` is), `Match::range()` is missing, and
+  there's no `RegexBuilder`, `RegexSet` or `regex::bytes`.
+- **A lazy value is computed when it's created**, so a `LazyLock` / `Lazy` / `lazy_static!`
+  static is initialized when the script loads, not on first use (only the order of side effects
+  in the initializer differs). `OnceLock` / `OnceCell` have no `take` / `into_inner`.
+- **`ensure!(a == b)` without a message** reports `Condition failed: `a == b``; anyhow 1.0.104
+  also appends the two values (`(1 vs 0)`).
+- **`cfg_if!` decides for a script**: features and every OS are off, so code that picks
+  `#[cfg(windows)]` natively takes another branch here.
+- **Only their common surface of `rand` and `itertools`** (see FEATURES.md):
+  no `rand::distributions` (`Uniform`, `WeightedIndex`), `fill`, `sample_iter`; no
+  `itertools::iproduct!` / `izip!` macros, `minmax`, `exactly_one`, `fold_while`, `kmerge`.
+- **Random numbers differ from rand's.** The generator is xoshiro128**, not ChaCha12, so a
+  seeded `StdRng` repeats its own sequence but not rand's, and `shuffle` / `choose` pick
+  differently for the same seed.
+- **`tuple_windows()` / `collect_tuple()` sizes are read from the code nearby** (a turbofish,
+  `|(a, b)|`, `for (a, b, c) in`, `let (a, b) = ..`); anywhere else they are pairs.
+
+## Formatting
+
+- **`{:#?}` of a value holding a hand-written `Debug`** spreads that impl's own parentheses and
+  braces over lines too (the pretty form is made from the compact one), where Rust prints what
+  the impl wrote: a serde_json `Value` in `{:#?}` shows `Bool(` / `true,` / `)` for
+  `Bool(true)`.
 
 ## Proc macros
 
@@ -198,8 +281,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   (`JSON::stringify(&x)` with `x: T` gives JS's `JSON.stringify`). The serde derives aren't
   needed, and only the `#[serde(..)]` attributes listed in FEATURES apply (no `flatten`,
   `tag`/`untagged` enums, `with`, or custom `Serialize` impls).
-- **64-bit integers past 2^53** are JS numbers here, so `u64::MAX` reads in and writes out
-  inexactly (`i128`/`u128` are exact).
+- **Integers past `u64` / `i64` are floats to serde_json**, so they're rejected with its "invalid
+  type: floating point" error (`i128` / `u128` read them exactly).
 - **`JsonError` has no position.** serde_json says `missing field `x` at line 1 column 8`; here
   it's `missing field `x``. Some syntax errors are worded differently.
 - **`HashMap` keys come out in insertion order** (serde_json's follow its hash order, which
@@ -225,8 +308,6 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`Instant` has the browser's resolution**: `performance.now()` is microseconds or coarser
   (browsers round it), and it counts from page load, so `{:?}` of an `Instant` isn't rustc's.
   `SystemTime::now()` is `Date.now()`, whole milliseconds; its `{:?}` is Linux's form.
-- **`u64` seconds are JS numbers**, exact up to 2^53 seconds; `Duration::MAX` is inexact.
-  `as_millis` / `as_micros` / `as_nanos` are `u128`, exact.
 - **Panics inside these types are located in `<std>`.** rustc reports the caller's line for
   `Duration / 0` and `Instant ± Duration` overflow (`#[track_caller]`, which user code can't use
   here either); the messages match.
@@ -267,8 +348,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **A trait implemented for both an integer type and a float type**, called through a generic
   `T: Trait` or `dyn Trait`, picks the impl by the value: a whole number (`2.0f64` included) goes
-  to the integer impl. Called on a value of known type (`x.money()` with `x: f64`), the right
-  impl is chosen at compile time.
+  to the integer impl (`i64` / `u64` / `i128` / `u128` values are BigInts and always reach their
+  own impl). Called on a value of known type (`x.money()` with `x: f64`), the right impl is
+  chosen at compile time.
+- **A trait of yours named like a std trait** (`trait Write`) is the one `impl fmt::Write for X`
+  is checked against, since traits are matched by their last path segment.
 
 ## Macros
 

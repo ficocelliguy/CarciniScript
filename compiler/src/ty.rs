@@ -56,8 +56,13 @@ impl IntKind {
         )
     }
 
-    pub fn is_wide_unsupported(self) -> bool {
-        matches!(self, IntKind::I128 | IntKind::U128)
+    /// The kinds that are JS BigInts: `i64` / `u64` (exact over all 64 bits, which hashes and
+    /// random number generators rely on) and `i128` / `u128`. `isize` / `usize` stay numbers.
+    pub fn is_big(self) -> bool {
+        matches!(
+            self,
+            IntKind::I64 | IntKind::U64 | IntKind::I128 | IntKind::U128
+        )
     }
 
     /// Prefix/suffix that wrap a JS integer-valued number into this kind, or None for wide kinds,
@@ -187,12 +192,27 @@ pub enum Ty {
     Result(Box<Ty>, Box<Ty>),
     /// `fmt::Formatter`: the buffer a `Display` impl writes into.
     Formatter,
+    /// What `f.debug_struct(..)` and friends return: `DebugStruct`, `DebugTuple`, `DebugList`,
+    /// `DebugSet` or `DebugMap`. The runtime's `κσ.DbgBuilder`.
+    FmtBuilder(String),
+    /// A `std::hash::Hasher` (`H: Hasher` in an `impl Hash`, `DefaultHasher`): the runtime's
+    /// `κσ.Hasher`, collecting what's written to it.
+    Hasher,
+    /// A random number generator of the bundled `rand` crate (`ThreadRng`, `StdRng`, `R: Rng`):
+    /// the runtime's `RandRng`.
+    Rng,
     /// A generic function's type parameter, inside its body. Erased in JS.
     Param(String),
+    /// A const generic argument (`3` in `Buf<3>`, or a `const` item's name), as written in Rust.
+    ConstVal(String),
     /// `dyn Trait` / `impl Trait` / `Box<dyn Trait>`: any value whose type implements the trait.
     Dyn(String),
     /// `RefCell<T>` / `Cell<T>`: a `κσ.RefCell` holding the value at `.v`. (`Rc<T>` is erased.)
     RefCell(Box<Ty>),
+    /// An `I: IntoIterator<Item = T>` parameter (or `impl IntoIterator<Item = T>`): any iterable
+    /// of `T` (a Vec, set, map or iterator) is passed; the function turns it into the runtime's
+    /// iterator on entry (`κσ.$intoIter`).
+    IntoIter(Box<Ty>),
     /// What `v.iter()` / `v.iter_mut()` / `v.into_iter()` return. Only usable as a `for` loop
     /// source until iterator adapters land.
     Iter {
@@ -234,6 +254,7 @@ impl Ty {
                 elem: b(elem),
                 mutable: *mutable,
             },
+            Ty::IntoIter(e) => Ty::IntoIter(b(e)),
             other => other.clone(),
         }
     }
@@ -278,7 +299,7 @@ impl Ty {
     /// JS expression for `T::default()`, for `unwrap_or_default`.
     pub fn default_js(&self) -> Option<&'static str> {
         Some(match self {
-            Ty::Int(IntKind::I128 | IntKind::U128) => "0n",
+            Ty::Int(k) if k.is_big() => "0n",
             Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => "0",
             Ty::Bool => "false",
             Ty::Str => "\"\"",
@@ -318,7 +339,12 @@ impl Ty {
 
     pub fn inner_types(&self) -> Vec<Ty> {
         match self {
-            Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Future(e) | Ty::RefCell(e) => {
+            Ty::Vec(e)
+            | Ty::Option(e)
+            | Ty::Set(e)
+            | Ty::Future(e)
+            | Ty::RefCell(e)
+            | Ty::IntoIter(e) => {
                 vec![(**e).clone()]
             }
             Ty::Iter { elem, .. } => vec![(**elem).clone()],
@@ -423,7 +449,11 @@ impl Ty {
             ),
             Ty::Result(t, e) => format!("Result<{}, {}>", t.describe(), e.describe()),
             Ty::Formatter => "Formatter<'_>".into(),
+            Ty::FmtBuilder(k) => format!("{k}<'_, '_>"),
+            Ty::Hasher => "impl Hasher".into(),
+            Ty::Rng => "ThreadRng".into(),
             Ty::Param(n) => n.clone(),
+            Ty::ConstVal(v) => v.clone(),
             Ty::Dyn(n) => format!("dyn {n}"),
             Ty::RefCell(t) => format!("RefCell<{}>", t.describe()),
             Ty::Iter {
@@ -434,6 +464,7 @@ impl Ty {
                 elem,
                 mutable: true,
             } => format!("std::slice::IterMut<'_, {}>", elem.describe()),
+            Ty::IntoIter(e) => format!("impl IntoIterator<Item = {}>", e.describe()),
             Ty::Var(_) => "_".into(),
             Ty::Unknown => "{unknown}".into(),
         }
@@ -478,6 +509,8 @@ pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
                     "170141183460469231731687303715884105727n",
                 ),
                 IntKind::U128 => ("0n", "340282366920938463463374607431768211455n"),
+                IntKind::I64 => ("-9223372036854775808n", "9223372036854775807n"),
+                IntKind::U64 => ("0n", "18446744073709551615n"),
                 _ => k.min_max(),
             };
             match *konst {

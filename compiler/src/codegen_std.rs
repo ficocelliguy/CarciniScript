@@ -150,7 +150,40 @@ impl Codegen<'_> {
                 f
             }
 
+            (Ty::Str | Ty::Vec(_), "as_ref" | "borrow") => rf.clone(),
             // ---- integers
+            // BigInt kinds: one runtime dispatcher, exact at the type's width.
+            (Ty::Int(k), m2)
+                if k.is_big()
+                    && (m2.starts_with("checked_")
+                        || m2.starts_with("saturating_")
+                        || m2.starts_with("wrapping_")
+                        || matches!(
+                            m2,
+                            "abs_diff"
+                                | "count_ones"
+                                | "count_zeros"
+                                | "leading_zeros"
+                                | "trailing_zeros"
+                                | "is_power_of_two"
+                                | "div_euclid"
+                                | "isqrt"
+                                | "ilog2"
+                                | "ilog10"
+                                | "is_positive"
+                                | "is_negative"
+                        )) =>
+            {
+                let mut all = vec![
+                    Frag::text(js_string(m2)),
+                    rf.clone(),
+                    Frag::text(format!("{}, {}", k.bits(), k.is_signed())),
+                ];
+                all.extend(self.arg_frags(m));
+                let mut f = Frag::mapped(name_off, "κσ.$big(");
+                f.append(Frag::join(all, ", ")).push(")");
+                f
+            }
             (Ty::Int(k), m2)
                 if m2.starts_with("checked_")
                     || m2.starts_with("saturating_")
@@ -469,6 +502,14 @@ impl Codegen<'_> {
                 let _ = emit(self, 0);
                 Frag::mapped(start, "\"\"")
             }
+            [t, "from_str_radix"] if matches!(Ty::from_name(t), Ty::Int(k) if k.is_big()) => {
+                let (s, r) = (emit(self, 0), emit(self, 1));
+                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I64);
+                call(
+                    "fromStrRadixBig",
+                    vec![s, r, Frag::text(format!("{}, {}", k.is_signed(), k.bits()))],
+                )
+            }
             [t, "from_str_radix"] if matches!(Ty::from_name(t), Ty::Int(_)) => {
                 let (s, r) = (emit(self, 0), emit(self, 1));
                 let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I32);
@@ -486,6 +527,15 @@ impl Codegen<'_> {
                 let b = emit(self, 0);
                 call("fromUtf8Lossy", vec![b])
             }
+            // `u64::from(x)`: a BigInt from a smaller kind.
+            [t, "from"] if matches!(Ty::from_name(t), Ty::Int(k) if k.is_big()) => {
+                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I64);
+                let x = emit(self, 0);
+                let mut f = Frag::text("κσ.$to128(");
+                f.append(x)
+                    .push(format!(", {}, {})", k.is_signed(), k.bits()));
+                f
+            }
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(_) | Ty::Float { .. }) => {
                 emit(self, 0)
             }
@@ -500,6 +550,21 @@ impl Codegen<'_> {
                 let mut f = Frag::mapped(start, "(");
                 f.append(a).push(" === ").append(b).push(")");
                 f
+            }
+            ["DefaultHasher", "new" | "default"] => Frag::mapped(start, "new κσ.Hasher()"),
+            ["char", "try_from"] => call("tryChar", vec![emit(self, 0)]),
+            [t, "try_from"] if matches!(Ty::from_name(t), Ty::Int(_)) => {
+                let Ty::Int(k) = Ty::from_name(t) else {
+                    return None;
+                };
+                let v = emit(self, 0);
+                call(
+                    "tryInt",
+                    vec![
+                        v,
+                        Frag::text(format!("{}, {}, {}", k.bits(), k.is_signed(), k.is_big())),
+                    ],
+                )
             }
             [t, "default"] if Ty::from_name(t) != Ty::Unknown => Frag::mapped(
                 start,

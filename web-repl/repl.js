@@ -329,6 +329,7 @@ async function populateExamples() {
   manifest = await (await fetch("../test/fixtures/manifest.json")).json();
   const options = [
     ["playground", "Playground"],
+    ["fixtures/rust_tour.rs", "Rust tour for JS devs"],
     ["unsupported", "Unsupported features (diagnostics)"],
     ["ns/hack.rs", "ns/hack.rs"],
     ...manifest.map((m) => [`fixtures/${m.file}`, `fixtures/${m.file}`]),
@@ -406,7 +407,7 @@ ${p.message}` : null;
     const maps = decodeMappings(JSON.parse(out.sourceMap).mappings);
     const gen = out.code.split("\n");
     const rs = src.split(/\r?\n/);
-    const gl = gen.findIndex((l) => l.includes("return fib("));
+    const gl = gen.findIndex((l) => l.includes("return κσ.$w128(fib("));
     const sl = rs.findIndex((l) => l.includes("fib(n - 1) + fib(n - 2)"));
     const pos = originalPosition(maps, gl, gen[gl].lastIndexOf("fib("));
     const ok = pos && pos.srcLine === sl && pos.srcCol === rs[sl].lastIndexOf("fib(");

@@ -75,6 +75,8 @@ struct Walker<'a> {
     src: &'a str,
     types: &'a HashMap<(usize, usize), Ty>,
     adts: &'a Adts,
+    /// Bindings of fixed-size arrays of `Copy` values: copied, never moved.
+    copy_arrays: &'a HashSet<Decl>,
     /// Functions declared in the file, by impl type (`None` for free functions) and name: whether
     /// they certainly return an owned value (no references anywhere in the return type).
     fns: HashMap<(Option<String>, String), bool>,
@@ -107,6 +109,7 @@ pub fn check(
     src: &str,
     types: &HashMap<(usize, usize), Ty>,
     adts: &Adts,
+    copy_arrays: &HashSet<Decl>,
 ) -> Vec<RawDiag> {
     let mut fns = HashMap::new();
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
@@ -123,6 +126,7 @@ pub fn check(
         src,
         types,
         adts,
+        copy_arrays,
         fns,
         cur_impl: None,
         base: 0,
@@ -197,6 +201,7 @@ impl Walker<'_> {
     }
 
     fn declare(&mut self, n: &ast::Name, decl: Decl, owned: bool) {
+        let owned = owned && !self.copy_arrays.contains(&decl);
         self.scopes
             .last_mut()
             .unwrap()

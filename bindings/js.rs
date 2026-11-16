@@ -272,6 +272,24 @@ pub fn prompt(message: &str, #[optional] default: &str) -> Option<String>;
 
 // ---- text encoding
 
+/// (The bundled `regex`'s engine: "" if `pattern` compiles, else why not.)
+#[js = "κσ.$regex.check"]
+pub fn __regex_check(pattern: &str) -> String;
+/// (The names of `pattern`'s groups, "" for unnamed ones, the whole match first.)
+#[js = "κσ.$regex.names"]
+pub fn __regex_names(pattern: &str) -> Vec<String>;
+/// (The first match at or after byte `start`: each group's start and end bytes, -1 for a group
+/// that didn't take part; empty for no match.)
+#[js = "κσ.$regex.find"]
+pub fn __regex_find(pattern: &str, hay: &str, start: usize) -> Vec<i32>;
+/// (How many bytes the character at byte `at` takes.)
+#[js = "κσ.$regex.charLen"]
+pub fn __regex_char_len(hay: &str, at: usize) -> usize;
+
+/// A float as serde_json writes it (for the bundled `serde_json`).
+#[js = "κσ.$ryu"]
+pub fn __json_float(x: f64) -> String;
+
 /// Base64 of a string of Latin-1 characters.
 #[js = "globalThis.btoa"]
 pub fn btoa(data: &str) -> String;

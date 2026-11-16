@@ -74,7 +74,13 @@ impl Checker<'_> {
             );
         }
         // Names first, so fields can refer to any type in the file.
+        let mut const_structs: Vec<(String, ast::Struct)> = Vec::new();
         for item in crate::adt::all_items(file) {
+            if let ast::Item::Struct(s) = &item
+                && let Some(n) = s.name()
+            {
+                const_structs.push((n.text().to_string(), s.clone()));
+            }
             let (name, is_enum, attrs_of): (Option<ast::Name>, bool, Vec<String>) = match &item {
                 ast::Item::Struct(s) => (s.name(), false, derives_of(s)),
                 ast::Item::Enum(e) => (e.name(), true, derives_of(e)),
@@ -115,12 +121,74 @@ impl Checker<'_> {
                 },
             );
         }
+        // Const parameters (`struct Buf<T, const N: usize = 4>`), then how each is read off
+        // the fields (`data: [T; N]`).
+        for (n, s) in &const_structs {
+            let mut cps = Vec::new();
+            for p in s
+                .generic_param_list()
+                .into_iter()
+                .flat_map(|l| l.generic_params())
+            {
+                if let ast::GenericParam::ConstParam(cp) = p
+                    && let Some(name) = cp.name()
+                {
+                    self.const_param_ty(&cp, true);
+                    let default = match cp.default_val().and_then(|d| d.expr()) {
+                        Some(e) => match self.lower_const_arg(&e) {
+                            Ty::ConstVal(v) => Some(v),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    cps.push(crate::adt::ConstParam {
+                        name: name.text().to_string(),
+                        default,
+                        derive: None,
+                    });
+                }
+            }
+            if !cps.is_empty() {
+                self.adts.const_params.insert(n.clone(), cps);
+            }
+        }
+        for (n, s) in &const_structs {
+            let Some(mut cps) = self.adts.const_params.get(n).cloned() else {
+                continue;
+            };
+            let fields: Vec<Option<ast::Type>> = match s.field_list() {
+                Some(ast::FieldList::RecordFieldList(l)) => l.fields().map(|f| f.ty()).collect(),
+                Some(ast::FieldList::TupleFieldList(l)) => l.fields().map(|f| f.ty()).collect(),
+                None => Vec::new(),
+            };
+            for cp in &mut cps {
+                cp.derive = fields.iter().enumerate().find_map(|(k, t)| {
+                    Some((
+                        k,
+                        crate::adt::const_path(t.as_ref()?, &cp.name, &self.adts)?,
+                    ))
+                });
+            }
+            self.adts.const_params.insert(n.clone(), cps);
+        }
         for item in crate::adt::all_items(file) {
             match &item {
                 ast::Item::Struct(s) => {
                     let Some(name) = s.name() else { continue };
-                    self.reject_const_generics(s.generic_param_list());
                     self.enter_type_params(&type_param_names(&item));
+                    // `struct Pairs<I: Iterator<Item = T>> { it: I }`: the runtime's iterator.
+                    for tp in s
+                        .generic_param_list()
+                        .into_iter()
+                        .flat_map(|l| l.type_or_const_params())
+                    {
+                        if let ast::TypeOrConstParam::Type(tp) = tp
+                            && let Some(n) = tp.name()
+                            && let Some(it) = self.iter_param(&tp)
+                        {
+                            self.generics.insert(n.text().to_string(), it);
+                        }
+                    }
                     let variant =
                         self.lower_variant(name.text().to_string().as_str(), s.field_list());
                     self.generics.clear();
@@ -275,6 +343,12 @@ impl Checker<'_> {
             .map(|d| d.name.clone())
             .collect();
         for n in derived {
+            // (`Parser::<u8>::default()`: generic like an `impl<T> Parser<T>`'s function.)
+            let args: Vec<Ty> = self.adts.defs[&n]
+                .type_params
+                .iter()
+                .map(|p| Ty::Param(p.clone()))
+                .collect();
             self.adts
                 .methods
                 .entry(n.clone())
@@ -282,14 +356,27 @@ impl Checker<'_> {
                 .entry("default".into())
                 .or_insert(Method {
                     params: vec![],
-                    ret: Ty::Adt(n, vec![]),
+                    ret: Ty::Adt(n, args.clone()),
                     is_async: false,
                     receiver: None,
                     cell_params: vec![],
-                    impl_args: vec![],
+                    impl_args: args,
                     type_params: vec![],
                 });
         }
+    }
+
+    /// A type parameter bounded by `Iterator<Item = T>`, as the runtime's iterator over `T`.
+    fn iter_param(&mut self, tp: &ast::TypeParam) -> Option<Ty> {
+        let item = super::bounds_iterator_item(&tp.type_bound_list()?)?;
+        let elem = match item {
+            Some(t) => self.lower_type(&t),
+            None => self.fresh(super::VarKind::General),
+        };
+        Some(Ty::Iter {
+            elem: Box::new(elem),
+            mutable: false,
+        })
     }
 
     /// `T`, `U` as type parameters for lowering field and signature types.
@@ -308,7 +395,7 @@ impl Checker<'_> {
         {
             self.error(
                 gp.syntax(),
-                "const generic parameters are not supported yet (planned for phase 4)",
+                "const generic parameters on enums are not supported yet (they are on structs, functions and impls)",
             );
         }
     }
@@ -385,17 +472,25 @@ impl Checker<'_> {
     }
 
     /// Add a method's own type parameters (and bounds) to the impl's; returns their names.
+    /// (See `where_bounds` for the `where` clause.)
     fn enter_method_generics(&mut self, f: &ast::Fn) -> Vec<String> {
         let mut own = Vec::new();
+        // `where A::Item: PartialEq` on the method.
+        self.note_where_projections(f.where_clause());
         if let Some(gp) = f.generic_param_list() {
             for p in gp.generic_params() {
                 match p {
                     ast::GenericParam::TypeParam(tp) => {
                         let Some(n) = tp.name() else { continue };
                         let n = n.text().to_string();
-                        let bounds: Vec<String> = tp
+                        // Inline bounds and the `where` clause's.
+                        let lists: Vec<ast::TypeBoundList> = tp
                             .type_bound_list()
                             .into_iter()
+                            .chain(where_bounds(f, &n))
+                            .collect();
+                        let bounds: Vec<String> = lists
+                            .iter()
                             .flat_map(|l| l.bounds())
                             .filter_map(|b| match b.ty()? {
                                 ast::Type::PathType(pt) => {
@@ -406,11 +501,30 @@ impl Checker<'_> {
                             .collect();
                         // An `F: Fn(..)` parameter is a closure type; an `I: Iterator<Item = T>`
                         // one, the runtime's iterator.
-                        let closure = tp.type_bound_list().and_then(|l| {
-                            if let Some(t) = self.lower_fn_bounds(&l) {
+                        let closure = lists.iter().find_map(|l| {
+                            if let Some(t) = self.lower_fn_bounds(l) {
                                 return Some(t);
                             }
-                            let item = super::bounds_iterator_item(&l)?;
+                            // `S: Into<String>` / `S: AsRef<str>`: the target type.
+                            if let Some(target) = super::conversion_target(l) {
+                                return Some(self.lower_type(&target));
+                            }
+                            // `H: Hasher` in an `impl Hash`.
+                            if super::bounds_hasher(l) {
+                                return Some(Ty::Hasher);
+                            }
+                            if super::crates::bounds_rng(l) {
+                                return Some(Ty::Rng);
+                            }
+                            // `I: IntoIterator<Item = T>`: any iterable of `T`.
+                            if let Some(item) = super::bounds_into_iter_item(l) {
+                                let elem = match item {
+                                    Some(t) => self.lower_type(&t),
+                                    None => self.fresh(super::VarKind::General),
+                                };
+                                return Some(Ty::IntoIter(Box::new(elem)));
+                            }
+                            let item = super::bounds_iterator_item(l)?;
                             let elem = match item {
                                 Some(t) => self.lower_type(&t),
                                 None => self.fresh(super::VarKind::General),
@@ -427,15 +541,20 @@ impl Checker<'_> {
                             None => {
                                 self.generics.insert(n.clone(), Ty::Param(n.clone()));
                                 self.param_bounds.insert(n.clone(), bounds);
+                                self.record_bound_args(&n, &lists);
+                                self.record_from_bound(&n, &lists);
+                                self.note_where_projections(f.where_clause());
                                 own.push(n);
                             }
                         }
                     }
-                    ast::GenericParam::ConstParam(_) => {
-                        self.error(
-                            p.syntax(),
-                            "const generic parameters are not supported yet (planned for phase 4)",
-                        );
+                    ast::GenericParam::ConstParam(cp) => {
+                        let Some(n) = cp.name() else { continue };
+                        let n = n.text().to_string();
+                        let ty = self.const_param_ty(&cp, true);
+                        self.generics.insert(n.clone(), Ty::Param(n.clone()));
+                        self.const_tys.insert(n.clone(), ty);
+                        own.push(n);
                     }
                     ast::GenericParam::LifetimeParam(_) => {}
                 }
@@ -449,8 +568,23 @@ impl Checker<'_> {
     fn enter_impl(&mut self, imp: &ast::Impl, type_name: &str) -> Ty {
         self.generics.clear();
         self.param_bounds.clear();
+        self.param_trait_args.clear();
+        self.lenient_projs.clear();
+        self.const_tys.clear();
+        self.from_args.clear();
+        let mut impl_params: Vec<(String, Option<ast::TypeBoundList>)> = Vec::new();
         if let Some(gp) = imp.generic_param_list() {
             for p in gp.generic_params() {
+                // `impl<const N: usize> Buf<N>`: a value in the methods.
+                if let ast::GenericParam::ConstParam(cp) = &p
+                    && let Some(n) = cp.name()
+                {
+                    let n = n.text().to_string();
+                    let ty = self.const_param_ty(cp, false);
+                    self.generics.insert(n.clone(), Ty::Param(n.clone()));
+                    self.const_tys.insert(n, ty);
+                    continue;
+                }
                 if let ast::GenericParam::TypeParam(tp) = p
                     && let Some(n) = tp.name()
                 {
@@ -466,11 +600,57 @@ impl Checker<'_> {
                             _ => None,
                         })
                         .collect();
+                    // `impl<T> .. where T: Debug`.
+                    let mut bounds = bounds;
+                    if let Some(wc) = imp.where_clause() {
+                        for pred in wc.predicates() {
+                            if let Some(ast::Type::PathType(pt)) = pred.ty()
+                                && pt
+                                    .path()
+                                    .and_then(|p| p.as_single_name_ref())
+                                    .is_some_and(|x| x.text() == n.as_str())
+                            {
+                                bounds.extend(pred.type_bound_list().into_iter().flat_map(|l| {
+                                    l.bounds()
+                                        .filter_map(|b| match b.ty()? {
+                                            ast::Type::PathType(p) => Some(
+                                                p.path()?.segment()?.name_ref()?.text().to_string(),
+                                            ),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                }));
+                            }
+                        }
+                    }
+                    // `impl<I: Iterator<Item = T>> .. for Pairs<I>`: the runtime's iterator.
+                    if let Some(it) = self.iter_param(&tp) {
+                        self.generics.insert(n, it);
+                        continue;
+                    }
                     self.generics.insert(n.clone(), Ty::Param(n.clone()));
-                    self.param_bounds.insert(n, bounds);
+                    self.param_bounds.insert(n.clone(), bounds);
+                    impl_params.push((n, tp.type_bound_list()));
                 }
             }
         }
+        // The bounds' arguments, inline and in the `where` clause (`where I: Iter<Item = &T>`).
+        for (n, inline) in impl_params {
+            let mut lists: Vec<ast::TypeBoundList> = inline.into_iter().collect();
+            for pred in imp.where_clause().into_iter().flat_map(|w| w.predicates()) {
+                if let Some(ast::Type::PathType(pt)) = pred.ty()
+                    && pt
+                        .path()
+                        .and_then(|p| p.as_single_name_ref())
+                        .is_some_and(|x| x.text() == n.as_str())
+                    && let Some(l) = pred.type_bound_list()
+                {
+                    lists.push(l);
+                }
+            }
+            self.record_bound_args(&n, &lists);
+        }
+        self.note_where_projections(imp.where_clause());
         match imp.self_ty() {
             Some(t) => self.lower_type(&t),
             None => Ty::Adt(type_name.to_string(), vec![]),
@@ -478,6 +658,7 @@ impl Checker<'_> {
     }
 
     fn lower_variant(&mut self, name: &str, fields: Option<ast::FieldList>) -> Variant {
+        let variant_name = name;
         match fields {
             Some(ast::FieldList::RecordFieldList(l)) => Variant {
                 discr: 0,
@@ -488,6 +669,9 @@ impl Checker<'_> {
                     .map(|f| {
                         let name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
                         let ty = f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                        if self.copy_array(f.ty().as_ref(), None, &ty) {
+                            self.array_fields.insert((variant_name.to_string(), name.clone()));
+                        }
                         if let Some(t) = f.ty()
                             && super::is_ptr_type(&t)
                         {
@@ -548,7 +732,7 @@ impl Checker<'_> {
             ("Ord", "PartialOrd"),
             ("Ord", "Eq"),
         ] {
-            if def.derives(t) && !def.derives(needs) {
+            if def.derives(t) && !def.implements(needs) {
                 self.error(
                     node,
                     format!("the trait bound `{name}: {needs}` is not satisfied (`{t}` requires `{needs}`; add it to the derive)"),
@@ -569,7 +753,12 @@ impl Checker<'_> {
                 .collect();
             for v in &def.variants {
                 for f in &v.fields {
-                    if !self.implements(&subst(&f.ty, &unknowns), d) {
+                    // A `[T; N]` of `Copy` values is `Copy` (a `Vec` isn't).
+                    let copy_array = d == "Copy"
+                        && self
+                            .array_fields
+                            .contains(&(v.name.clone(), f.name.clone()));
+                    if !copy_array && !self.implements(&subst(&f.ty, &unknowns), d) {
                         self.error(
                             node,
                             format!("the trait `{d}` is not implemented for `{}` (field `{}` of `{name}`)", f.ty.describe(), f.name),
@@ -620,6 +809,8 @@ impl Checker<'_> {
                 !matches!(t, "Copy" | "Hash")
                     && ty.inner_types().iter().all(|i| self.implements(i, t))
             }
+            // (An iterator clones what's left: `κσ.Iter.$clone`.)
+            Ty::Iter { mutable: false, .. } if t == "Clone" => true,
             Ty::Closure { .. } | Ty::Iter { .. } | Ty::Future(_) | Ty::Entry(..) => false,
             Ty::Param(n) => self.param_has(n, t),
             Ty::Dyn(tr) => self.trait_includes(tr, t),
@@ -636,6 +827,14 @@ impl Checker<'_> {
             .self_ty()
             .map(|t| t.syntax().clone())
             .unwrap_or_else(|| imp.syntax().clone());
+        // `impl<T: Display> Shout for T`: for every type meeting the bounds.
+        if let Some((tr, _, bounds)) = crate::adt::blanket_impl(imp)
+            && self.adts.traits.contains_key(&tr)
+        {
+            type_name = format!("{tr}$all");
+            self.adts.ext_types.insert(type_name.clone());
+            self.adts.blankets.insert(tr, bounds);
+        }
         // `impl Money for f64`: a user trait for a built-in type.
         if !self.adts.defs.contains_key(&type_name)
             && let Some(key) = crate::adt::ext_key(&type_name)
@@ -676,6 +875,24 @@ impl Checker<'_> {
             Some("Iterator" | "IntoIterator" | "Send" | "Sync" | "Unpin") => {}
             // `deref` / `deref_mut` are ordinary methods; auto-deref calls them.
             Some("Deref") => {}
+            // `from_str` is an associated function; `s.parse::<T>()` calls it.
+            Some("FromStr") => {}
+            // `x.try_into()` / `T::try_from(x)`, `collect()` into the type, `t.extend(..)`.
+            Some("TryFrom" | "FromIterator" | "Extend") => {}
+            // `impl Copy for P {}`: as `#[derive(Copy)]`.
+            Some("Copy") => {
+                if let Some(d) = self.adts.defs.get_mut(&type_name)
+                    && !d.derives("Copy")
+                {
+                    d.derives.push("Copy".into());
+                }
+            }
+            // Its `hash` feeds the type's `HashMap` / `HashSet` keys (with a hand-written `Eq`).
+            Some("Hash") => {
+                if let Some(d) = self.adts.defs.get_mut(&type_name) {
+                    d.manual.push("Hash".into());
+                }
+            }
             Some("DerefMut") => {
                 self.adts.deref_mut.insert(type_name.clone());
             }
@@ -686,7 +903,7 @@ impl Checker<'_> {
                 let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
                 self.error(
                     &node,
-                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Default`, `From`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Clone`, `Debug` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
+                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Iterator` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
                 );
                 return;
             }
@@ -778,6 +995,20 @@ impl Checker<'_> {
             self.adts.iter_items.insert(type_name.clone(), item);
         }
         let saved_output = std::mem::replace(&mut self.assoc_output, output);
+        // Every `type X = ..;` of the impl, for `Self::X`.
+        let assoc: HashMap<String, Ty> = imp
+            .assoc_item_list()
+            .into_iter()
+            .flat_map(|l| l.assoc_items())
+            .filter_map(|i| match i {
+                ast::AssocItem::TypeAlias(ta) => Some((ta.name()?.text().to_string(), ta.ty()?)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(n, t)| (n, self.lower_type(&t)))
+            .collect();
+        let saved_assoc = std::mem::replace(&mut self.impl_assoc, assoc);
         for item in imp
             .assoc_item_list()
             .into_iter()
@@ -785,7 +1016,12 @@ impl Checker<'_> {
         {
             let ast::AssocItem::Fn(f) = item else {
                 let is_deref = trait_name.as_deref() == Some("Deref");
-                if (op.is_some() || is_iter || is_deref)
+                // (`type Err` / `type Error`.)
+                let from_str = matches!(trait_name.as_deref(), Some("FromStr" | "TryFrom"));
+                let user_trait = trait_name
+                    .as_deref()
+                    .is_some_and(|t| self.adts.traits.contains_key(t));
+                if (op.is_some() || is_iter || is_deref || from_str || user_trait)
                     && matches!(item, ast::AssocItem::TypeAlias(_))
                 {
                     continue;
@@ -869,13 +1105,30 @@ impl Checker<'_> {
                 );
                 continue;
             }
+            // (Their methods share a name per type: one impl of each.)
+            if let Some(t @ ("TryFrom" | "FromIterator" | "Extend")) = trait_name.as_deref()
+                && methods.contains_key(name.text().to_string().as_str())
+            {
+                self.error(
+                    name.syntax(),
+                    format!(
+                        "implementing `{t}` more than once for `{type_name}` isn't supported yet"
+                    ),
+                );
+                continue;
+            }
             // Trait methods (`fmt`, `default`) live alongside inherent ones under their own name.
             methods.insert(name.text().to_string(), method);
         }
         self.self_ty = saved;
         self.assoc_output = saved_output;
+        self.impl_assoc = saved_assoc;
         self.generics.clear();
         self.param_bounds.clear();
+        self.param_trait_args.clear();
+        self.lenient_projs.clear();
+        self.const_tys.clear();
+        self.from_args.clear();
     }
 
     /// A method's signature (without `self`), with `Self` lowered per `self.self_ty`.
@@ -931,6 +1184,7 @@ impl Checker<'_> {
         for p in &own {
             self.generics.remove(p);
             self.param_bounds.remove(p);
+            self.const_tys.remove(p);
         }
         method
     }
@@ -951,6 +1205,11 @@ impl Checker<'_> {
             {
                 type_name = key.to_string();
             }
+            if let Some((tr, _, _)) = crate::adt::blanket_impl(imp)
+                && self.adts.blankets.contains_key(&tr)
+            {
+                type_name = format!("{tr}$all");
+            }
             if !(self.adts.defs.contains_key(&type_name)
                 || self.adts.ext_types.contains(&type_name))
                 || trait_name.as_deref().is_some_and(|t| {
@@ -967,6 +1226,13 @@ impl Checker<'_> {
                             | "Debug"
                             | "Error"
                             | "Iterator"
+                            | "FromStr"
+                            | "TryFrom"
+                            | "FromIterator"
+                            | "Extend"
+                            | "Hash"
+                            | "Sum"
+                            | "Product"
                     ) && crate::adt::op_method(t).is_none()
                         && !self.adts.traits.contains_key(t)
                 })
@@ -1023,17 +1289,40 @@ impl Checker<'_> {
                         Some((n, local))
                     });
                 let own = self.enter_method_generics(&f);
+                // (An associated function takes its `impl`'s const parameters too; a method
+                // reads them off `self`.)
+                let impl_consts: Vec<String> = if m.receiver.is_none() {
+                    imp.generic_param_list()
+                        .into_iter()
+                        .flat_map(|l| l.generic_params())
+                        .filter_map(|p| match p {
+                            ast::GenericParam::ConstParam(cp) => {
+                                Some(cp.name()?.text().to_string())
+                            }
+                            _ => None,
+                        })
+                        .filter(|n| m.impl_args.contains(&Ty::Param(n.clone())))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                self.note_const_params(&format!("{type_name}::{key}"), &f, impl_consts);
                 let saved_fn = self.cur_fn.replace(format!("{type_name}::{key}"));
                 self.check_body(&f, m.params.clone(), m.ret.clone(), m.is_async, self_local);
                 self.cur_fn = saved_fn;
                 for p in own {
                     self.generics.remove(&p);
                     self.param_bounds.remove(&p);
+                    self.const_tys.remove(&p);
                 }
             }
             self.self_ty = saved;
             self.generics.clear();
             self.param_bounds.clear();
+            self.param_trait_args.clear();
+            self.lenient_projs.clear();
+            self.const_tys.clear();
+            self.from_args.clear();
         }
     }
 
@@ -1047,6 +1336,14 @@ impl Checker<'_> {
         self.adts.resolve(self_ty, segs)
     }
 
+    /// A generic struct's construction, for the classes its values may carry.
+    fn note_ctor(&mut self, adt: &str, targs: &[Ty]) {
+        if !targs.is_empty() && !self.adts.defs[adt].is_enum {
+            self.ctor_sites
+                .push((self.cur_fn.clone(), adt.to_string(), targs.to_vec()));
+        }
+    }
+
     pub(super) fn ctor_name(&self, adt: &str, v: usize) -> String {
         self.adts.ctor_name(adt, v)
     }
@@ -1057,6 +1354,12 @@ impl Checker<'_> {
         match self.resolve(segs)? {
             Resolved::Ctor(adt, v) => {
                 let args = self.fresh_args(&adt);
+                self.ctor_turbofish(p.path(), &args);
+                if self.adts.const_params.contains_key(&adt) {
+                    let r = self.range(p.syntax());
+                    self.const_lits.push((r, adt.clone(), args.clone()));
+                }
+                self.note_ctor(&adt, &args);
                 let variant = self.variant_inst(&adt, v, &args);
                 Some(match variant.shape {
                     Shape::Unit => Ty::Adt(adt, args),
@@ -1126,22 +1429,25 @@ impl Checker<'_> {
     /// Type arguments written on an associated function's path: `Type::<A>::f::<B>`. `vars`
     /// holds the function's own type variables, then its `impl`'s (by `impl_args` order).
     fn dict_turbofish(&mut self, p: &ast::PathExpr, vars: &[Ty], own: usize, impl_args: &[Ty]) {
-        let args_of = |seg: Option<ast::PathSegment>| -> Vec<ast::Type> {
+        let args_of = |seg: Option<ast::PathSegment>| -> Vec<ast::GenericArg> {
             seg.and_then(|s| s.generic_arg_list())
                 .map(|l| {
                     l.generic_args()
-                        .filter_map(|g| match g {
-                            ast::GenericArg::TypeArg(ta) => ta.ty(),
-                            _ => None,
+                        .filter(|g| {
+                            matches!(
+                                g,
+                                ast::GenericArg::TypeArg(_) | ast::GenericArg::ConstArg(_)
+                            )
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         };
         let Some(path) = p.path() else { return };
-        for (v, t) in vars.iter().take(own).zip(args_of(path.segment())) {
-            let t = self.lower_type(&t);
-            self.unify(v, &t);
+        for (v, g) in vars.iter().take(own).zip(args_of(path.segment())) {
+            if let Some(t) = self.generic_arg_ty(&g) {
+                self.unify(v, &t);
+            }
         }
         // `Punctuated::<Ident, Comma>::f`: the type's arguments, for the `impl`'s parameters.
         let type_args = args_of(path.qualifier().and_then(|q| q.segment()));
@@ -1152,12 +1458,29 @@ impl Checker<'_> {
                 && !seen.contains(u)
             {
                 seen.push(u.clone());
-                if let (Some(v), Some(t)) = (vars.get(k), type_args.get(i)) {
-                    let t = self.lower_type(t);
+                if let (Some(v), Some(g)) = (vars.get(k), type_args.get(i))
+                    && let Some(t) = self.generic_arg_ty(g)
+                {
                     self.unify(v, &t);
                 }
                 k += 1;
             }
+        }
+    }
+
+    /// `Tag::<7>`, `Buf::<u8, 4> { .. }`: a struct path's own arguments.
+    fn ctor_turbofish(&mut self, path: Option<ast::Path>, targs: &[Ty]) {
+        let given: Vec<ast::GenericArg> = path
+            .and_then(|p| p.segment())
+            .and_then(|s| s.generic_arg_list())
+            .map(|l| l.generic_args().collect())
+            .unwrap_or_default();
+        let given: Vec<Ty> = given
+            .iter()
+            .filter_map(|g| self.generic_arg_ty(g))
+            .collect();
+        for (v, t) in targs.iter().zip(given) {
+            self.unify(v, &t);
         }
     }
 
@@ -1188,6 +1511,14 @@ impl Checker<'_> {
         match self.resolve(segs)? {
             Resolved::Ctor(adt, v) => {
                 let targs = self.fresh_args(&adt);
+                if let Some(ast::Expr::PathExpr(p)) = c.expr() {
+                    self.ctor_turbofish(p.path(), &targs);
+                }
+                if self.adts.const_params.contains_key(&adt) {
+                    let r = self.range(c.syntax());
+                    self.const_lits.push((r, adt.clone(), targs.clone()));
+                }
+                self.note_ctor(&adt, &targs);
                 let variant = self.variant_inst(&adt, v, &targs);
                 let name = self.ctor_name(&adt, v);
                 if variant.shape != Shape::Tuple {
@@ -1296,6 +1627,12 @@ impl Checker<'_> {
             return Ty::Unknown;
         };
         let targs = self.fresh_args(&adt);
+        self.ctor_turbofish(r.path(), &targs);
+        if self.adts.const_params.contains_key(&adt) {
+            let r = self.range(r.syntax());
+            self.const_lits.push((r, adt.clone(), targs.clone()));
+        }
+        self.note_ctor(&adt, &targs);
         let variant = self.variant_inst(&adt, v, &targs);
         let name = self.ctor_name(&adt, v);
         let kind = if self.adts.defs[&adt].is_enum {
@@ -1423,15 +1760,13 @@ impl Checker<'_> {
                 let own = std::mem::take(&mut self.last_type_args);
                 // `x.parse_args::<LitStr>()`
                 if let Some(gal) = m.generic_arg_list() {
-                    let given: Vec<ast::Type> = gal
+                    let given: Vec<Ty> = gal
                         .generic_args()
-                        .filter_map(|g| match g {
-                            ast::GenericArg::TypeArg(ta) => ta.ty(),
-                            _ => None,
-                        })
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .filter_map(|g| self.generic_arg_ty(g))
                         .collect();
                     for (v, t) in own.iter().zip(given) {
-                        let t = self.lower_type(&t);
                         self.unify(v, &t);
                     }
                 }
@@ -1923,7 +2258,25 @@ fn type_param_names(item: &ast::Item) -> Vec<String> {
         .flat_map(|l| l.generic_params())
         .filter_map(|p| match p {
             ast::GenericParam::TypeParam(tp) => tp.name().map(|n| n.text().to_string()),
+            ast::GenericParam::ConstParam(cp) => cp.name().map(|n| n.text().to_string()),
             _ => None,
         })
+        .collect()
+}
+
+/// The bound lists a `where` clause gives the type parameter `name` (`where S: Into<String>`).
+fn where_bounds(f: &ast::Fn, name: &str) -> Vec<ast::TypeBoundList> {
+    let Some(wc) = f.where_clause() else {
+        return Vec::new();
+    };
+    wc.predicates()
+        .filter(|p| match p.ty() {
+            Some(ast::Type::PathType(pt)) => pt
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .is_some_and(|n| n.text() == name),
+            _ => false,
+        })
+        .filter_map(|p| p.type_bound_list())
         .collect()
 }

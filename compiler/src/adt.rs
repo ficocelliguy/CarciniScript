@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::{AstNode, SyntaxKind, ast, ast::HasAttrs};
+use ra_ap_syntax::{
+    AstNode, SyntaxKind, ast, ast::HasAttrs, ast::HasGenericParams, ast::HasName,
+    ast::HasTypeBounds,
+};
 
 use crate::ty::Ty;
 
@@ -72,7 +75,9 @@ impl AdtDef {
 
     /// Derived or implemented by hand.
     pub fn implements(&self, t: &str) -> bool {
-        self.derives(t) || self.manual.iter().any(|m| m == t)
+        self.derives(t)
+            || self.manual.iter().any(|m| m == t)
+            || (self.display && matches!(t, "Display" | "ToString"))
     }
 
     pub fn has_default(&self) -> bool {
@@ -156,11 +161,30 @@ pub struct TraitDef {
     pub const_tys: HashMap<String, Ty>,
     /// The module it was imported from; None when declared in this file.
     pub module: Option<String>,
+    /// Associated types (`type Unit;`), which each impl names (`type Unit = f64;`).
+    pub assoc_types: Vec<String>,
+    /// Type parameters (`trait Convert<T>`).
+    pub type_params: Vec<String>,
+    /// Each associated type's bounds (`type Unit: Debug + Copy;`).
+    pub assoc_bounds: HashMap<String, Vec<String>>,
+}
+
+/// A struct's const generic parameter (`struct Buf<const N: usize>`). Instances keep its value
+/// as `$N`, which the constructor takes last (or reads off a field, `[T; N]`'s length).
+#[derive(Clone, Debug)]
+pub struct ConstParam {
+    pub name: String,
+    /// `const N: usize = 4`: the default, as written.
+    pub default: Option<String>,
+    /// The field it can be read from, and how (see `const_path`).
+    pub derive: Option<(usize, String)>,
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct Adts {
     pub defs: HashMap<String, AdtDef>,
+    /// Structs' const generic parameters, in order, by struct.
+    pub const_params: HashMap<String, Vec<ConstParam>>,
     /// Enum variants under a `#[cfg(..)]` (by enum, then variant index): they may not exist, so
     /// exhaustiveness checking never asks for them.
     pub cfg_variants: std::collections::HashSet<(String, usize)>,
@@ -173,6 +197,11 @@ pub struct Adts {
     pub methods: HashMap<String, HashMap<String, Method>>,
     /// User-defined traits.
     pub traits: HashMap<String, TraitDef>,
+    /// Blanket impls (`impl<T: Display> Shout for T`): the trait's bounds on `T`, by trait. Their
+    /// methods are under the key `Shout$all`.
+    pub blankets: HashMap<String, Vec<String>>,
+    /// Each impl's associated types (`type Unit = f64;`), by (type, trait).
+    pub impl_assoc: HashMap<(String, String), HashMap<String, Ty>>,
     /// The user traits each type implements.
     pub trait_impls: HashMap<String, Vec<String>>,
     /// Names of loaded modules (`mod name;`), which paths may start with.
@@ -296,6 +325,9 @@ pub fn op_method(trait_name: &str) -> Option<&'static str> {
         "MulAssign" => "mul_assign",
         "DivAssign" => "div_assign",
         "RemAssign" => "rem_assign",
+        "BitAndAssign" => "bitand_assign",
+        "BitOrAssign" => "bitor_assign",
+        "BitXorAssign" => "bitxor_assign",
         "Index" => "index",
         "IndexMut" => "index_mut",
         _ => return None,
@@ -322,6 +354,16 @@ pub enum Conv {
     Method { key: String },
     /// A user trait method on a built-in type: `$ext$key.prototype.method.call(recv, ..)`.
     Ext { key: String },
+    /// `x.try_into()` to an integer type: `κσ.$tryInt(x, bits, signed, big)`.
+    TryInt { bits: u32, signed: bool, big: bool },
+    /// `x.try_into()` through an `impl TryFrom<X> for Y`: `Y.try_from(x)`.
+    TryFrom { adt: String },
+    /// `v.try_into()` from a slice to an array: `Ok` of a copy (lengths aren't in the types).
+    TryVec,
+    /// `n.try_into()` to a `char`: `κσ.$tryChar(n)`.
+    TryChar,
+    /// A runtime function of the value (`?` into an `anyhow::Error`: `κσ.$anyhow.from(e)`).
+    Wrap { js: String },
 }
 
 impl Adts {
@@ -469,6 +511,49 @@ pub fn impl_parts(imp: &ast::Impl) -> (Option<String>, Option<String>) {
     (name_of(imp.trait_()), name_of(imp.self_ty()))
 }
 
+/// `impl<T: Bound> Trait for T`: (the trait, `T`, `T`'s bounds from the parameter list and the
+/// `where` clause).
+pub fn blanket_impl(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
+    let (Some(tr), Some(self_name)) = impl_parts(imp) else {
+        return None;
+    };
+    let tp = imp
+        .generic_param_list()?
+        .generic_params()
+        .find_map(|p| match p {
+            ast::GenericParam::TypeParam(tp)
+                if tp.name().is_some_and(|n| n.text() == self_name.as_str()) =>
+            {
+                Some(tp)
+            }
+            _ => None,
+        })?;
+    // (`impl<T> Trait for T` through a reference too, `for &T`.)
+    let names = |l: ast::TypeBoundList| -> Vec<String> {
+        l.bounds()
+            .filter_map(|b| match b.ty()? {
+                ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut bounds: Vec<String> = tp.type_bound_list().map(names).unwrap_or_default();
+    if let Some(wc) = imp.where_clause() {
+        for pred in wc.predicates() {
+            if let Some(ast::Type::PathType(pt)) = pred.ty()
+                && pt
+                    .path()
+                    .and_then(|p| p.as_single_name_ref())
+                    .is_some_and(|n| n.text() == self_name.as_str())
+                && let Some(l) = pred.type_bound_list()
+            {
+                bounds.extend(names(l));
+            }
+        }
+    }
+    Some((tr, self_name, bounds))
+}
+
 /// Whether `node` is (inside) an item that only exists in test builds: `#[cfg(test)]` or
 /// `#[test]`. Like `rustc` without `--test`, the compiler leaves those out.
 pub fn test_only(node: &ra_ap_syntax::SyntaxNode) -> bool {
@@ -518,4 +603,82 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
         *last.borrow_mut() = Some((file.syntax().clone(), items.clone()));
         items
     })
+}
+
+/// How to read the const parameter `n` back from a value of type `ty` at run time: a JS suffix
+/// for the value's expression (`?.length` for `[T; N]`, `?.[0]?.length` for `[[T; N]; M]`,
+/// `?.$N` for a struct `Buf<N>`). None when the type doesn't hold it.
+pub fn const_path(ty: &ast::Type, n: &str, adts: &Adts) -> Option<String> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    match ty {
+        ast::Type::RefType(r) => const_path(&r.ty()?, n, adts),
+        ast::Type::ParenType(p) => const_path(&p.ty()?, n, adts),
+        ast::Type::ArrayType(a) => {
+            if a.const_arg()
+                .and_then(|c| c.expr())
+                .is_some_and(|e| names_const(&e, n))
+            {
+                return Some("?.length".into());
+            }
+            Some(format!("?.[0]{}", const_path(&a.ty()?, n, adts)?))
+        }
+        ast::Type::SliceType(s) => Some(format!("?.[0]{}", const_path(&s.ty()?, n, adts)?)),
+        ast::Type::TupleType(t) => t
+            .fields()
+            .enumerate()
+            .find_map(|(i, f)| Some(format!("?.[{i}]{}", const_path(&f, n, adts)?))),
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            let name = seg.name_ref()?.text().to_string();
+            let args: Vec<ast::GenericArg> = seg
+                .generic_arg_list()
+                .into_iter()
+                .flat_map(|l| l.generic_args())
+                .filter(|g| !matches!(g, ast::GenericArg::LifetimeArg(_)))
+                .collect();
+            let inner = |g: &ast::GenericArg| match g {
+                ast::GenericArg::TypeArg(t) => const_path(&t.ty()?, n, adts),
+                _ => None,
+            };
+            if let Some(cps) = adts.const_params.get(&name) {
+                let def = adts.defs.get(&name)?;
+                return args.iter().enumerate().find_map(|(i, g)| {
+                    let pn = def.type_params.get(i)?;
+                    (cps.iter().any(|c| &c.name == pn) && generic_arg_names(g, n))
+                        .then(|| format!("?.${pn}"))
+                });
+            }
+            match name.as_str() {
+                // (Erased: the value itself, or null.)
+                "Box" | "Rc" | "Arc" | "Option" => args.iter().find_map(inner),
+                "Vec" => Some(format!("?.[0]{}", args.iter().find_map(inner)?)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a const argument is just the const parameter `n` (`N` or `{ N }`).
+pub fn names_const(e: &ast::Expr, n: &str) -> bool {
+    match e {
+        ast::Expr::PathExpr(p) => p
+            .path()
+            .and_then(|p| p.as_single_name_ref())
+            .is_some_and(|x| x.text() == n),
+        ast::Expr::BlockExpr(b) if b.statements().next().is_none() => {
+            b.tail_expr().is_some_and(|t| names_const(&t, n))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a generic argument is the const parameter `n` (`Buf<N>` parses `N` as a type).
+pub fn generic_arg_names(g: &ast::GenericArg, n: &str) -> bool {
+    match g {
+        ast::GenericArg::TypeArg(t) => matches!(t.ty(), Some(ast::Type::PathType(p))
+            if p.path().and_then(|p| p.as_single_name_ref()).is_some_and(|x| x.text() == n)),
+        ast::GenericArg::ConstArg(c) => c.expr().is_some_and(|e| names_const(&e, n)),
+        _ => false,
+    }
 }

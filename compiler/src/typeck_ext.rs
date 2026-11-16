@@ -137,6 +137,101 @@ impl Checker<'_> {
 
     // ------------------------------------------------------------ helpers
 
+    /// `.field(..)`, `.entry(..)`, `.entries(..)`, `.key(..)`, `.value(..)`, `.finish()` on a
+    /// `DebugStruct` / `DebugTuple` / `DebugList` / `DebugSet` / `DebugMap`.
+    fn fmt_builder_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        kind: &str,
+        method: &str,
+        args: &[ast::Expr],
+    ) -> Ty {
+        let fmt_result = Ty::Result(
+            Box::new(Ty::Unit),
+            Box::new(Ty::Extern("fmt::Error".into())),
+        );
+        let builder = Ty::FmtBuilder(kind.to_string());
+        let value = |c: &mut Self, a: &ast::Expr| {
+            let t = c.infer(a, None);
+            c.check_debug_value(a.syntax(), &t);
+        };
+        let ok = match (kind, method) {
+            (_, "finish" | "finish_non_exhaustive") => {
+                self.arg_count(m.syntax(), "method", 0, args.len());
+                return fmt_result;
+            }
+            ("DebugStruct", "field") => {
+                self.arg_count(m.syntax(), "method", 2, args.len());
+                if let [n, v] = args {
+                    self.check(n, &Ty::Str);
+                    value(self, v);
+                }
+                true
+            }
+            ("DebugTuple", "field") | ("DebugList" | "DebugSet", "entry") => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let [v] = args {
+                    value(self, v);
+                }
+                true
+            }
+            ("DebugMap", "entry") => {
+                self.arg_count(m.syntax(), "method", 2, args.len());
+                for a in args {
+                    value(self, a);
+                }
+                true
+            }
+            ("DebugMap", "key" | "value") => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let [v] = args {
+                    value(self, v);
+                }
+                true
+            }
+            ("DebugList" | "DebugSet" | "DebugMap", "entries") => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let [a] = args {
+                    let t = self.infer(a, None);
+                    match self.iter_elem(&t) {
+                        Some(e) => match (kind, self.shallow(&e)) {
+                            ("DebugMap", Ty::Tuple(kv)) if kv.len() == 2 => {
+                                self.check_debug_value(a.syntax(), &kv[0]);
+                                self.check_debug_value(a.syntax(), &kv[1]);
+                            }
+                            ("DebugMap", Ty::Unknown) => {}
+                            ("DebugMap", other) => {
+                                let msg = format!(
+                                    "`DebugMap::entries` needs an iterator of `(key, value)` pairs, found items of type `{}`",
+                                    self.describe(&other)
+                                );
+                                self.error(a.syntax(), msg);
+                            }
+                            _ => self.check_debug_value(a.syntax(), &e),
+                        },
+                        None => {
+                            let msg = format!("`{}` is not an iterator", self.describe(&t));
+                            self.error(a.syntax(), msg);
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            for a in args {
+                self.infer(a, None);
+            }
+            let msg = format!(
+                "no method named `{method}` found for struct `{kind}` in the current scope"
+            );
+            self.error(m.syntax(), msg);
+            return Ty::Unknown;
+        }
+        builder
+    }
+
     /// The element type of something a `for` loop / `zip` / `extend` / `flat_map` accepts.
     pub(super) fn iter_elem(&self, t: &Ty) -> Option<Ty> {
         match self.shallow(t) {
@@ -146,7 +241,7 @@ impl Checker<'_> {
             }
             Ty::Coll(_, view) => self.iter_elem(&view),
             Ty::Vec(e) | Ty::Set(e) | Ty::Option(e) => Some(*e),
-            Ty::Iter { elem, .. } => Some(*elem),
+            Ty::Iter { elem, .. } | Ty::IntoIter(elem) => Some(*elem),
             Ty::Map(k, v) => Some(Ty::Tuple(vec![*k, *v])),
             Ty::Unknown => Some(Ty::Unknown),
             _ => None,
@@ -202,6 +297,15 @@ impl Checker<'_> {
             // `trees.collect::<TokenStream>()` in a proc-macro crate.
             Ty::Adt(n, _) if n == "TokenStream" && self.adts.method(&n, "__push").is_some() => {
                 self.tokens_like(&Ty::Vec(Box::new(elem.clone())))
+            }
+            // `impl FromIterator<T> for Bag`
+            Ty::Adt(n, args) if self.adts.method(&n, "from_iter").is_some() => {
+                let m = self.adts.method(&n, "from_iter").cloned().unwrap();
+                let m = self.method_inst(&m, Some(&args));
+                match m.params.first().map(|p| self.shallow(p)) {
+                    Some(Ty::IntoIter(item)) => self.unify(&item, elem),
+                    _ => true,
+                }
             }
             Ty::Unknown => true,
             Ty::Var(_) => return None,
@@ -273,6 +377,38 @@ impl Checker<'_> {
                     Box::new(Ty::Extern("fmt::Error".into())),
                 ));
             }
+            Ty::Formatter if method == "write_char" => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let Some(a) = args.first() {
+                    self.check(a, &Ty::Char);
+                }
+                return Some(Ty::Result(
+                    Box::new(Ty::Unit),
+                    Box::new(Ty::Extern("fmt::Error".into())),
+                ));
+            }
+            // `f.debug_struct("P")`, `f.debug_list()`, ..: a builder writing `P { x: 1 }`.
+            Ty::Formatter
+                if matches!(
+                    method,
+                    "debug_struct" | "debug_tuple" | "debug_list" | "debug_set" | "debug_map"
+                ) =>
+            {
+                let named = matches!(method, "debug_struct" | "debug_tuple");
+                self.arg_count(m.syntax(), "method", usize::from(named), args.len());
+                if named && let Some(a) = args.first() {
+                    self.check(a, &Ty::Str);
+                }
+                let kind = match method {
+                    "debug_struct" => "DebugStruct",
+                    "debug_tuple" => "DebugTuple",
+                    "debug_list" => "DebugList",
+                    "debug_set" => "DebugSet",
+                    _ => "DebugMap",
+                };
+                return Some(Ty::FmtBuilder(kind.into()));
+            }
+            Ty::FmtBuilder(kind) => return Some(self.fmt_builder_method(m, &kind, method, args)),
             // The spec the value is formatted with (`{:>8.2}`).
             Ty::Formatter
                 if matches!(
@@ -572,6 +708,13 @@ impl Checker<'_> {
 
             // ---- iterators
             (Ty::Iter { elem, mutable }, m2) => {
+                // (These advance the iterator, or may: `let mut it`.)
+                if matches!(
+                    m2,
+                    "peek" | "next_if" | "next_if_eq" | "next_back" | "nth_back" | "by_ref"
+                ) {
+                    self.check_mutable(recv, super::Mutation::Borrow);
+                }
                 if m2 == "next" {
                     // Advancing an iterator held in a variable needs `let mut`.
                     self.check_mutable(recv, super::Mutation::Borrow);
@@ -724,9 +867,109 @@ impl Checker<'_> {
                 self.extend_arg(a0, &e);
                 keep(e)
             }
-            "rev" | "cycle" => {
+            // `peekable()` is the same iterator: `peek` works on any (it buffers one item).
+            "rev" | "cycle" | "peekable" | "fuse" | "by_ref" | "into_iter" => {
                 count(self, 0);
                 keep(e)
+            }
+            "peek" | "next_back" => {
+                count(self, 0);
+                opt(e)
+            }
+            "nth_back" => {
+                usize_arg(self);
+                opt(e)
+            }
+            "next_if" => {
+                count(self, 1);
+                self.closure_arg(a0, vec![e.clone()], Ty::Bool);
+                opt(e)
+            }
+            "next_if_eq" => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &e);
+                }
+                opt(e)
+            }
+            // `ExactSizeIterator::len`: what's left.
+            "len" => {
+                count(self, 0);
+                USIZE
+            }
+            "rfind" => {
+                count(self, 1);
+                self.closure_arg(a0, vec![e.clone()], Ty::Bool);
+                opt(e)
+            }
+            "rfold" => {
+                count(self, 2);
+                let acc = args
+                    .first()
+                    .map(|a| self.infer(a, expected))
+                    .unwrap_or(Ty::Unknown);
+                self.closure_arg(args.get(1), vec![acc.clone(), e], acc)
+            }
+            // `try_fold(init, |acc, x| ..)` / `try_for_each(|x| ..)`: the closure returns a
+            // `Result` or `Option`; the first `Err` / `None` ends it.
+            "try_fold" | "try_for_each" => {
+                let fold = method == "try_fold";
+                count(self, if fold { 2 } else { 1 });
+                let (acc, params, f) = if fold {
+                    let acc = args
+                        .first()
+                        .map(|a| self.infer(a, None))
+                        .unwrap_or(Ty::Unknown);
+                    (acc.clone(), vec![acc, e], args.get(1))
+                } else {
+                    (Ty::Unit, vec![e], a0)
+                };
+                let r = fresh(self);
+                let r = self.closure_arg(f, params, r);
+                let ok = match self.shallow(&r) {
+                    Ty::Result(t, _) | Ty::Option(t) => self.unify(&t, &acc),
+                    Ty::Unknown => true,
+                    // (Not known yet: a closure calling something unchecked.)
+                    Ty::Var(_) => self.var_kind(&r) == Some(VarKind::General),
+                    _ => false,
+                };
+                if !ok {
+                    let msg = format!(
+                        "`{method}` needs a closure returning `Result<{0}, E>` or `Option<{0}>`, found `{1}`",
+                        self.describe(&acc),
+                        self.describe(&r)
+                    );
+                    self.error(m.syntax(), msg);
+                }
+                r
+            }
+            // Comparing what two iterators yield.
+            "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "cmp" | "partial_cmp" => {
+                count(self, 1);
+                self.extend_arg(a0, &e);
+                match method {
+                    "cmp" => {
+                        self.require_ord(m.syntax(), &e, "sort");
+                        Ty::Ordering
+                    }
+                    "partial_cmp" => opt(Ty::Ordering),
+                    _ => Ty::Bool,
+                }
+            }
+            "is_sorted" => {
+                count(self, 0);
+                Ty::Bool
+            }
+            "is_sorted_by_key" => {
+                count(self, 1);
+                let k = fresh(self);
+                self.closure_arg(a0, vec![e], k);
+                Ty::Bool
+            }
+            "is_sorted_by" => {
+                count(self, 1);
+                self.closure_arg(a0, vec![e.clone(), e], Ty::Bool);
+                Ty::Bool
             }
             "cloned" | "copied" => {
                 count(self, 0);
@@ -768,6 +1011,15 @@ impl Checker<'_> {
                     self.error(m.syntax(), msg);
                 }
                 let z = self.zonk(&target);
+                // `T: Sum` / `T: Product`: by `T`'s class.
+                if let Ty::Param(p) = &z {
+                    let b = if method == "sum" { "Sum" } else { "Product" };
+                    if self.param_has(p, b) {
+                        let p = p.clone();
+                        self.param_class(&p, m.syntax(), None);
+                        return Some(target);
+                    }
+                }
                 let own = matches!(&z, Ty::Adt(n, _) if self.adts.method(n, method).is_some());
                 if !(own || z.is_numeric() || z == Ty::Unknown || self.var_kind(&target).is_some())
                 {

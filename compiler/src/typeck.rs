@@ -18,6 +18,8 @@ mod adt_check;
 mod coll;
 #[path = "typeck_conv.rs"]
 mod conv;
+#[path = "typeck_crates.rs"]
+pub(crate) mod crates;
 #[path = "typeck_ext.rs"]
 mod ext;
 #[path = "typeck_gen.rs"]
@@ -36,6 +38,7 @@ mod res;
 mod std_lib;
 #[path = "typeck_trait.rs"]
 mod traits;
+pub use crates::CrateCall;
 pub use ext::{char_predicate, is_option_closure_method};
 pub use modules::{Imported, ModuleRef, Resolver, module_path, use_leaves};
 pub use ptr::{Ptrs, cellable as ptr_cellable, is_ptr_type, transmute_name};
@@ -45,8 +48,8 @@ pub use res::{is_std_error, result_ctor_call, result_variant};
 use ra_ap_syntax::{
     AstNode, SyntaxNode,
     ast::{
-        self, ArithOp, BinaryOp, CmpOp, ElseBranch, HasArgList, HasGenericArgs, HasLoopBody,
-        HasName, LiteralKind, RangeItem, UnaryOp,
+        self, ArithOp, BinaryOp, CmpOp, ElseBranch, HasArgList, HasGenericArgs, HasGenericParams,
+        HasLoopBody, HasName, LiteralKind, RangeItem, UnaryOp,
     },
 };
 
@@ -85,6 +88,9 @@ pub struct Types {
     pub slot_calls: std::collections::HashSet<(usize, usize)>,
     /// Bindings of such a slot (`Some(x)` in `if let`/`match`): `x` reads and writes `x[1]`.
     pub slot_bindings: std::collections::HashSet<(usize, usize)>,
+    /// Reads of a fixed-size array of `Copy` values (a local or a struct field), which copy in
+    /// by-value positions like rustc's `[T; N]: Copy`.
+    pub array_reads: std::collections::HashSet<(usize, usize)>,
     /// `&mut place` results of `index_mut` bodies: a cell over the place (`κσ.$cell`).
     pub cell_returns: std::collections::HashSet<(usize, usize)>,
     /// `grid[i] = v` / `grid[i] += v` through `impl IndexMut`: written as `cell[0]`.
@@ -101,6 +107,12 @@ pub struct Types {
     pub dict_params: HashMap<String, Vec<String>>,
     /// Calls of those functions: the types to pass a class for, in order, by the call's range.
     pub dict_args: HashMap<(usize, usize), Vec<Ty>>,
+    /// The type parameters each function takes a `{:?}` formatter for (`$dbg$T`): those it
+    /// prints with `{:?}` (or hands to a function that does), so `Some(..)` and whole floats
+    /// print as the caller's type says.
+    pub dbg_params: HashMap<String, Vec<String>>,
+    /// Each generic call's types for those formatters.
+    pub dbg_args: HashMap<(usize, usize), Vec<Ty>>,
     /// `mod name;` modules, in order.
     pub modules: Vec<ModuleRef>,
     /// Functions and constants from other modules.
@@ -119,6 +131,14 @@ pub struct Types {
     /// Calls of the `js` crate's bound functions, by the call's range: (type for an associated
     /// function, function name).
     pub js_calls: HashMap<(usize, usize), (Option<String>, String)>,
+    /// `T::from(x)` with `T: From<X>`: `X`'s name, by the call's range (the class's
+    /// `$from$X`, or the number conversion).
+    pub param_froms: HashMap<(usize, usize), String>,
+    /// Structs whose values carry classes for some of their type parameters (`this.$T`), by
+    /// position: what an `impl<T>`'s methods with `self` use for `T` (`a / b`, `s.parse::<T>()`).
+    pub stored: HashMap<String, Vec<usize>>,
+    /// Calls of the bundled crates' functions and methods (`rng.gen_range(..)`), by range.
+    pub crate_calls: HashMap<(usize, usize), CrateCall>,
 }
 
 impl Types {
@@ -151,6 +171,10 @@ enum VarState {
     Unbound(VarKind),
     Bound(Ty),
 }
+
+/// A type parameter's user-trait bounds with their arguments, by trait: (positional,
+/// associated types given as `Unit = X`).
+pub(super) type BoundArgs = HashMap<String, (Vec<Ty>, HashMap<String, Ty>)>;
 
 #[derive(Clone)]
 struct Local {
@@ -202,6 +226,9 @@ impl<'a> Checker<'a> {
             slot_args: Default::default(),
             slot_calls: Default::default(),
             slot_bindings: Default::default(),
+            copy_arrays: Default::default(),
+            array_fields: Default::default(),
+            array_reads: Default::default(),
             cell_returns: Default::default(),
             index_places: Default::default(),
             slice_views: Default::default(),
@@ -210,6 +237,19 @@ impl<'a> Checker<'a> {
             pending_qualified: Vec::new(),
             cur_fn: None,
             dict_uses: Default::default(),
+            dbg_uses: Default::default(),
+            const_tys: HashMap::new(),
+            from_args: HashMap::new(),
+            const_needs: Default::default(),
+            const_derivable: Default::default(),
+            const_lits: Vec::new(),
+            ctor_sites: Vec::new(),
+            let_types: Vec::new(),
+            crate_calls: HashMap::new(),
+            crate_items: crates::crate_imports(src),
+            stored_uses: Default::default(),
+            param_froms: HashMap::new(),
+            unbound_targs: Default::default(),
             generic_calls: Vec::new(),
             last_type_args: Vec::new(),
             borrow_events: Default::default(),
@@ -217,6 +257,7 @@ impl<'a> Checker<'a> {
             quote_vars: Default::default(),
             quote_reps: Default::default(),
             pending_json: Vec::new(),
+            pending_tries: Vec::new(),
             js_calls: HashMap::new(),
             js_imports: HashMap::new(),
             opaque_index_mut: Default::default(),
@@ -226,8 +267,13 @@ impl<'a> Checker<'a> {
             module_exports: HashMap::new(),
             imported: Vec::new(),
             pending_intos: Vec::new(),
+            pending_try_intos: Vec::new(),
             std_fns: HashMap::new(),
             assoc_output: None,
+            impl_assoc: HashMap::new(),
+            param_trait_args: HashMap::new(),
+            lenient_projs: Default::default(),
+            pending_projections: Vec::new(),
             conversions: HashMap::new(),
         }
     }
@@ -391,7 +437,7 @@ pub fn check(
     }
     // Moves are only checked in programs that type-check: they rely on the types.
     if c.diags.iter().all(|d| d.severity != "error") {
-        let moves = crate::moves::check(file, src, &map, &c.adts);
+        let moves = crate::moves::check(file, src, &map, &c.adts, &c.copy_arrays);
         c.diags.extend(moves);
         let borrows = crate::borrows::check(file, src, 0, &c.borrow_events);
         c.diags.extend(borrows);
@@ -412,7 +458,18 @@ pub fn check(
         });
     }
     // (Before the definitions move out: methods' type parameters are looked up there.)
-    let (dict_params, dict_args) = c.finish_dicts();
+    c.check_const_args();
+    let dict_uses = std::mem::take(&mut c.dict_uses);
+    let (dict_params, dict_args) = c.finish_needs(dict_uses, true);
+    let dbg_uses = std::mem::take(&mut c.dbg_uses);
+    let (dbg_params, dbg_args) = c.finish_needs(dbg_uses, false);
+    let mut stored: HashMap<String, Vec<usize>> = HashMap::new();
+    for (adt, i) in std::mem::take(&mut c.stored_uses) {
+        stored.entry(adt).or_default().push(i);
+    }
+    for v in stored.values_mut() {
+        v.sort();
+    }
     let adts = std::mem::take(&mut c.adts);
     let mut_bindings = std::mem::take(&mut c.mut_bindings);
     let boxed = std::mem::take(&mut c.boxed);
@@ -420,6 +477,7 @@ pub fn check(
     let slot_args = std::mem::take(&mut c.slot_args);
     let slot_calls = std::mem::take(&mut c.slot_calls);
     let slot_bindings = std::mem::take(&mut c.slot_bindings);
+    let array_reads = std::mem::take(&mut c.array_reads);
     let cell_returns = std::mem::take(&mut c.cell_returns);
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
@@ -433,6 +491,11 @@ pub fn check(
     let quote_vars = std::mem::take(&mut c.quote_vars);
     let quote_reps = std::mem::take(&mut c.quote_reps);
     let js_calls = std::mem::take(&mut c.js_calls);
+    let param_froms = std::mem::take(&mut c.param_froms);
+    let mut crate_calls = std::mem::take(&mut c.crate_calls);
+    for cc in crate_calls.values_mut() {
+        cc.tys = cc.tys.iter().map(|t| c.zonk(t)).collect();
+    }
     (
         Types {
             map,
@@ -443,6 +506,7 @@ pub fn check(
             slot_args,
             slot_calls,
             slot_bindings,
+            array_reads,
             cell_returns,
             index_places,
             slice_views,
@@ -450,6 +514,8 @@ pub fn check(
             qualified_calls,
             dict_params,
             dict_args,
+            dbg_params,
+            dbg_args,
             modules,
             imported,
             conversions,
@@ -458,6 +524,9 @@ pub fn check(
             quote_vars,
             quote_reps,
             js_calls,
+            param_froms,
+            stored,
+            crate_calls,
         },
         c.diags,
     )
@@ -486,7 +555,8 @@ struct Checker<'a> {
     self_ty: Option<Ty>,
     mut_bindings: std::collections::HashSet<(usize, usize)>,
     /// `parse()` calls whose target type is checked at the end of the function.
-    pending_parses: Vec<(Ty, SyntaxNode)>,
+    /// `parse()` calls: the target, the call, and its error type when it waits for the target.
+    pending_parses: Vec<(Ty, SyntaxNode, Option<Ty>)>,
     /// Work done by the current exhaustiveness check.
     missing_steps: std::cell::Cell<usize>,
     /// `const` and `static` items.
@@ -494,12 +564,17 @@ struct Checker<'a> {
     /// Bounds of the current function's type parameters.
     param_bounds: HashMap<String, Vec<String>>,
     /// Bounds to check once a generic call's type arguments are known.
-    pending_bounds: Vec<(Ty, String, SyntaxNode)>,
+    pending_bounds: Vec<(Ty, String, SyntaxNode, usize)>,
     boxed: std::collections::HashSet<(usize, usize)>,
     cell_args: std::collections::HashSet<(usize, usize)>,
     slot_args: std::collections::HashSet<(usize, usize)>,
     slot_calls: std::collections::HashSet<(usize, usize)>,
     slot_bindings: std::collections::HashSet<(usize, usize)>,
+    /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
+    copy_arrays: std::collections::HashSet<(usize, usize)>,
+    /// Struct fields declared as fixed-size arrays of `Copy` values: (struct, field).
+    pub(super) array_fields: std::collections::HashSet<(String, String)>,
+    array_reads: std::collections::HashSet<(usize, usize)>,
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
@@ -511,6 +586,8 @@ struct Checker<'a> {
     /// `JSON::stringify(&v)` / `JSON::parse::<T>(s)` types to check once settled: (type, node,
     /// whether parsing).
     pending_json: Vec<(Ty, SyntaxNode, bool)>,
+    /// `?`s whose error type wasn't known yet: (the `?`, its error, the function's).
+    pending_tries: Vec<(ast::TryExpr, Ty, Ty)>,
     js_calls: HashMap<(usize, usize), (Option<String>, String)>,
     /// `use js::set_timeout as later;`: local name → the `js` crate's function.
     js_imports: HashMap<String, String>,
@@ -521,6 +598,35 @@ struct Checker<'a> {
     cur_fn: Option<String>,
     /// (function, type parameter) pairs where the body calls `T::f()` or reads `T::CONST`.
     dict_uses: std::collections::HashSet<(String, String)>,
+    /// (function, type parameter) pairs whose values the function prints with `{:?}`.
+    dbg_uses: std::collections::HashSet<(String, String)>,
+    /// `T: From<X>` bounds in scope: `X` by parameter.
+    pub(super) from_args: HashMap<String, Ty>,
+    /// The const generic parameters in scope (`const N: usize`), with their types.
+    pub(super) const_tys: HashMap<String, Ty>,
+    /// (function, const parameter) pairs: each is passed like a class (`$N`)...
+    const_needs: std::collections::HashSet<(String, String)>,
+    /// ...unless the function can read it off an argument (`a: [T; N]` gives `a.length`).
+    const_derivable: std::collections::HashSet<(String, String)>,
+    /// `T::from(x)` calls: `X`'s name by range.
+    param_froms: HashMap<(usize, usize), String>,
+    /// Struct literals of structs with const parameters: (range, struct, type arguments).
+    const_lits: Vec<((usize, usize), String, Vec<Ty>)>,
+    /// Calls of the bundled crates (`rand`), by range.
+    crate_calls: HashMap<(usize, usize), CrateCall>,
+    /// Names the bundled crates' `use`s bring in (`use anyhow::Result;`): alias -> (crate, item).
+    crate_items: HashMap<String, (String, String)>,
+    /// `let` bindings without a written type: (the name's range, its type). One nothing settles
+    /// (`let v = Vec::new();` never used) is rustc's "type annotations needed".
+    let_types: Vec<((usize, usize), Ty)>,
+    /// Every construction of a generic struct: (the function it's in, struct, type arguments).
+    /// A struct that carries a class for its `T` gets it there (`$T`, or `this.$T`).
+    ctor_sites: Vec<(Option<String>, String, Vec<Ty>)>,
+    /// (struct, type parameter position): its values carry that parameter's class.
+    stored_uses: std::collections::HashSet<(String, usize)>,
+    /// Generic calls' type arguments nothing settled (by call range and position), as opposed
+    /// to ones left unknown by an unchecked type.
+    unbound_targs: std::collections::HashSet<((usize, usize), usize)>,
     /// Generic calls: (call, caller, callee, the callee's type arguments).
     generic_calls: Vec<GenericCall>,
     /// The type variables the last `instantiate` made, in order.
@@ -542,10 +648,21 @@ struct Checker<'a> {
     imported: Vec<Imported>,
     /// `.into()` calls, settled at the end of the function: (source, target, call node).
     pending_intos: Vec<(Ty, Ty, SyntaxNode, usize)>,
+    /// `x.try_into()` calls: (source, target, error type, call, base).
+    pending_try_intos: Vec<(Ty, Ty, Ty, SyntaxNode, usize)>,
     /// std functions imported by name (`use std::cmp::max;`): name -> path after `std`.
     std_fns: HashMap<String, Vec<String>>,
     /// `type Output = ..;` of the operator impl being declared.
     assoc_output: Option<Ty>,
+    /// The `impl`'s associated types (`type Err = String;`), for `Self::Err` in its signatures.
+    pub(super) impl_assoc: HashMap<String, Ty>,
+    /// Each type parameter's user-trait bounds with their arguments: (positional, `Unit = X`).
+    pub(super) param_trait_args: HashMap<String, BoundArgs>,
+    /// Projections a `where` clause constrains (`where I::Item: PartialEq<T>`): unchecked.
+    pub(super) lenient_projs: std::collections::HashSet<String>,
+    /// Generic calls' projections waiting for their type argument: (`S`'s variable, trait,
+    /// associated type, the projection's variable).
+    pub(super) pending_projections: Vec<(Ty, String, String, Ty)>,
     conversions: HashMap<(usize, usize), crate::adt::Conv>,
 }
 
@@ -610,6 +727,30 @@ impl<'a> Checker<'a> {
         t
     }
 
+    /// Whether a variable nothing settled is left in `t` (number literals' take defaults).
+    fn has_unbound(&self, t: &Ty) -> bool {
+        match self.shallow(t) {
+            Ty::Var(_) => self.var_kind(t) == Some(VarKind::General),
+            // (Only the arguments its fields' types use: a const parameter or one lowered to
+            // an iterator never settles here.)
+            Ty::Adt(n, args) => {
+                let Some(def) = self.adts.defs.get(&n) else {
+                    return false;
+                };
+                args.iter().zip(&def.type_params).any(|(a, p)| {
+                    let param = Ty::Param(p.clone());
+                    let used = def.variants.iter().flat_map(|v| &v.fields).any(|f| {
+                        let mut hit = false;
+                        f.ty.walk(&mut |t| hit |= *t == param);
+                        hit
+                    });
+                    used && self.has_unbound(a)
+                })
+            }
+            s => s.inner_types().iter().any(|i| self.has_unbound(i)),
+        }
+    }
+
     fn var_kind(&self, t: &Ty) -> Option<VarKind> {
         match self.shallow(t) {
             Ty::Var(v) => match self.vars[v as usize] {
@@ -648,6 +789,7 @@ impl<'a> Checker<'a> {
                 elem: Box::new(self.zonk(&elem)),
                 mutable,
             },
+            Ty::IntoIter(e) => Ty::IntoIter(Box::new(self.zonk(&e))),
             other => other,
         }
     }
@@ -682,6 +824,7 @@ impl<'a> Checker<'a> {
                 crate::ty::describe_tuple(es.iter().map(|e| self.describe(e)).collect())
             }
             Ty::Future(e) => format!("impl Future<Output = {}>", self.describe(&e)),
+            Ty::IntoIter(e) => format!("impl IntoIterator<Item = {}>", self.describe(&e)),
             Ty::Iter { elem, mutable } => {
                 format!(
                     "std::slice::Iter{}<'_, {}>",
@@ -695,8 +838,13 @@ impl<'a> Checker<'a> {
 
     fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
         let (a, b) = (self.shallow(a), self.shallow(b));
+        // `B::Item` where `B: Array<Item = A::Item>`: compare as `A::Item`.
+        let (a, b) = (self.normalize_proj(a), self.normalize_proj(b));
         match (&a, &b) {
             (Ty::Never, _) | (_, Ty::Never) | (Ty::Unknown, _) | (_, Ty::Unknown) => true,
+            // A trait's own associated type or type parameter (`Shape::Unit`, in its declared
+            // signatures): whatever the impl says, so it matches any type.
+            (Ty::Param(p), _) | (_, Ty::Param(p)) if self.is_template(p) => true,
             (Ty::Var(x), Ty::Var(y)) if x == y => true,
             (Ty::Var(x), Ty::Var(y)) => {
                 let (kx, ky) = (self.var_kind(&a).unwrap(), self.var_kind(&b).unwrap());
@@ -725,6 +873,23 @@ impl<'a> Checker<'a> {
             | (Ty::RefCell(x), Ty::RefCell(y))
             | (Ty::Set(x), Ty::Set(y)) => self.unify(x, y),
             (Ty::Coll(a, x), Ty::Coll(b, y)) if a == b => self.unify(x, y),
+            (Ty::IntoIter(x), Ty::IntoIter(y)) => {
+                let (x, y) = (x.clone(), y.clone());
+                self.unify(&x, &y)
+            }
+            // An `IntoIterator<Item = T>` parameter takes any iterable of `T` but an `Option`
+            // (`Some(x)` is `x` at run time).
+            (Ty::IntoIter(e), other) | (other, Ty::IntoIter(e))
+                if !matches!(other, Ty::Var(_) | Ty::Option(_) | Ty::Param(_)) =>
+            {
+                let e = e.clone();
+                match self.iter_elem(other) {
+                    Some(item) => self.unify(&e, &item),
+                    None => false,
+                }
+            }
+            // (A `const` item's value isn't known here: it matches any value.)
+            (Ty::ConstVal(x), Ty::ConstVal(y)) => x == y || !(const_literal(x) && const_literal(y)),
             (Ty::Adt(a, xs), Ty::Adt(b, ys)) if a == b && xs.len() == ys.len() => {
                 let (xs, ys) = (xs.clone(), ys.clone());
                 xs.iter().zip(ys.iter()).all(|(x, y)| self.unify(x, y))
@@ -738,6 +903,12 @@ impl<'a> Checker<'a> {
                 };
                 let tr = tr.clone();
                 self.implements_user_trait(&adt, &tr)
+            }
+            // A std error (`ParseIntError`) is a `dyn Error`.
+            (Ty::Dyn(tr), Ty::Extern(n)) | (Ty::Extern(n), Ty::Dyn(tr))
+                if tr == "Error" && is_std_error(n) =>
+            {
+                true
             }
             (Ty::Map(k1, v1), Ty::Map(k2, v2))
             | (Ty::Entry(k1, v1), Ty::Entry(k2, v2))
@@ -852,6 +1023,52 @@ impl<'a> Checker<'a> {
             {
                 self.lower_fn_type(t).unwrap()
             }
+            // `impl Into<String>` / `impl AsRef<str>` / `impl Borrow<T>`: the target type itself
+            // (strings and references are erased, so `&str` and `String` both pass).
+            ast::Type::ImplTraitType(i)
+                if i.type_bound_list()
+                    .and_then(|l| conversion_target(&l))
+                    .is_some() =>
+            {
+                let target = i
+                    .type_bound_list()
+                    .and_then(|l| conversion_target(&l))
+                    .unwrap();
+                self.lower_type(&target)
+            }
+            // `state: &mut impl Hasher`
+            ast::Type::ImplTraitType(i)
+                if i.type_bound_list().is_some_and(|l| bounds_hasher(&l)) =>
+            {
+                Ty::Hasher
+            }
+            // `rng: &mut impl Rng`, `&mut dyn RngCore`
+            ast::Type::ImplTraitType(i)
+                if i.type_bound_list().is_some_and(|l| crates::bounds_rng(&l)) =>
+            {
+                Ty::Rng
+            }
+            ast::Type::DynTraitType(d)
+                if d.type_bound_list().is_some_and(|l| crates::bounds_rng(&l)) =>
+            {
+                Ty::Rng
+            }
+            // `impl IntoIterator<Item = T>`: any iterable of `T`.
+            ast::Type::ImplTraitType(i)
+                if i.type_bound_list()
+                    .and_then(|l| bounds_into_iter_item(&l))
+                    .is_some() =>
+            {
+                let item = i
+                    .type_bound_list()
+                    .and_then(|l| bounds_into_iter_item(&l))
+                    .unwrap();
+                let elem = match item {
+                    Some(t) => self.lower_type(&t),
+                    None => self.fresh(VarKind::General),
+                };
+                Ty::IntoIter(Box::new(elem))
+            }
             // `impl Iterator<Item = T>` / `Box<dyn Iterator<Item = T>>`: the runtime's iterator.
             ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_)
                 if iterator_item(t).is_some() =>
@@ -936,6 +1153,50 @@ impl<'a> Checker<'a> {
                 // `std::cmp::Ordering` (in `fn cmp(&self, o: &Self) -> Ordering`)
                 if name == "Ordering" && !self.adts.defs.contains_key("Ordering") {
                     return Ty::Ordering;
+                }
+                // `anyhow::Error`, and `anyhow::Result<T>` (its error by default).
+                if (name == "Error" || name == "Result")
+                    && self.uses_crate("anyhow")
+                    && p.path()
+                        .is_some_and(|path| self.names_crate_item(&path, "anyhow", &name))
+                {
+                    if name == "Error" {
+                        return crates::anyhow_error();
+                    }
+                    let mut it = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .map(|l| l.generic_args().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                        .into_iter();
+                    let mut next = |c: &mut Self| match it.next() {
+                        Some(ast::GenericArg::TypeArg(ta)) => ta.ty().map(|t| c.lower_type(&t)),
+                        _ => None,
+                    };
+                    let t = next(self).unwrap_or(Ty::Unit);
+                    let e = next(self).unwrap_or_else(crates::anyhow_error);
+                    return Ty::Result(Box::new(t), Box::new(e));
+                }
+                // `serde_json::Error`, and `serde_json::Result<T>`.
+                if (name == "Error" || name == "Result")
+                    && self.uses_crate("serde_json")
+                    && p.path()
+                        .is_some_and(|path| self.names_crate_item(&path, "serde_json", &name))
+                {
+                    if name == "Error" {
+                        return crates::serde_json_error();
+                    }
+                    let t = seg
+                        .clone()
+                        .and_then(|s| s.generic_arg_list())
+                        .and_then(|l| l.generic_args().next())
+                        .and_then(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .map(|t| self.lower_type(&t))
+                        .unwrap_or(Ty::Unit);
+                    return Ty::Result(Box::new(t), Box::new(crates::serde_json_error()));
                 }
                 if name == "Result" {
                     let args: Vec<ast::GenericArg> = seg
@@ -1042,25 +1303,32 @@ impl<'a> Checker<'a> {
                     return g.clone();
                 }
                 if self.adts.defs.contains_key(&name) {
-                    // `Stack<i32>`; missing arguments are inferred.
+                    // `Stack<i32>`, `Buf<4>`; missing arguments are inferred (or a const
+                    // parameter's default).
                     let given: Vec<Ty> = seg
                         .clone()
                         .and_then(|s| s.generic_arg_list())
-                        .map(|l| {
-                            l.generic_args()
-                                .filter_map(|g| match g {
-                                    ast::GenericArg::TypeArg(ta) => ta.ty(),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                        })
+                        .map(|l| l.generic_args().collect::<Vec<_>>())
                         .unwrap_or_default()
                         .iter()
-                        .map(|t| self.lower_type(t))
+                        .filter_map(|g| self.generic_arg_ty(g))
                         .collect();
+                    let n_given = given.len();
                     let mut args = self.fresh_args(&name);
                     for (a, g) in args.iter_mut().zip(given) {
                         *a = g;
+                    }
+                    let params = self.adts.defs[&name].type_params.clone();
+                    if let Some(cps) = self.adts.const_params.get(&name) {
+                        for (i, p) in params.iter().enumerate().skip(n_given) {
+                            if let Some(d) = cps
+                                .iter()
+                                .find(|c| &c.name == p)
+                                .and_then(|c| c.default.clone())
+                            {
+                                args[i] = Ty::ConstVal(d);
+                            }
+                        }
                     }
                     return Ty::Adt(name, args);
                 }
@@ -1068,6 +1336,39 @@ impl<'a> Checker<'a> {
                     && let Some(t) = &self.self_ty
                 {
                     return t.clone();
+                }
+                // `Self::Err` / `Self::Unit`: the impl's `type Err = ..;`.
+                if p.path()
+                    .and_then(|p| p.qualifier())
+                    .is_some_and(|q| q.syntax().text() == "Self")
+                    && let Some(t) = self.impl_assoc.get(&name)
+                {
+                    return t.clone();
+                }
+                // `T::Err` of a `T: FromStr`: unchecked.
+                if name == "Err"
+                    && let Some(q) = p.path().and_then(|p| p.qualifier())
+                    && let Some(qn) = q.as_single_name_ref()
+                    && self.param_has(qn.text().to_string().as_str(), "FromStr")
+                {
+                    return Ty::Unknown;
+                }
+                // `I::Item` of an `I: IntoIterator` (its own type parameter).
+                if let Some(q) = p.path().and_then(|p| p.qualifier())
+                    && let Some(qn) = q.as_single_name_ref()
+                    && let Some(t) = self.generics.get(&format!("{}::{name}", qn.text()))
+                {
+                    return t.clone();
+                }
+                // `S::Unit` of a type parameter bounded by a trait with `type Unit;`.
+                if let Some(q) = p.path().and_then(|p| p.qualifier())
+                    && let Some(qn) = q.as_single_name_ref()
+                    && self
+                        .param_bounds
+                        .contains_key(qn.text().to_string().as_str())
+                    && let Some(t) = self.projection(qn.text().to_string().as_str(), &name)
+                {
+                    return t;
                 }
                 // `Self::Output` in an operator impl, `Self::Item` in an iterator.
                 if (name == "Output" || name == "Item")
@@ -1085,6 +1386,22 @@ impl<'a> Checker<'a> {
                 // `js::JsValue`: any JS value, unchecked (what `js::global(..)` returns).
                 if name == "JsValue" {
                     return Ty::Unknown;
+                }
+                if name == "DefaultHasher" {
+                    return Ty::Hasher;
+                }
+                if crates::is_rng_type(&name) && self.uses_crate("rand") {
+                    return Ty::Rng;
+                }
+                // `Peekable<Chars<'_>>`, `std::slice::Iter<'_, T>`: the runtime's iterator.
+                if let Some(t) = self.std_iter_type(&name, seg.as_ref()) {
+                    return t;
+                }
+                // `Buf<SIZE>`: a `const` item as a const argument.
+                if self.consts.contains_key(&name)
+                    && p.path().is_some_and(|p| p.qualifier().is_none())
+                {
+                    return Ty::ConstVal(name);
                 }
                 let ty = Ty::from_name(&name);
                 if ty == Ty::Unknown {
@@ -1130,6 +1447,7 @@ impl<'a> Checker<'a> {
         };
         let (params, ret, is_async) = (sig.params.clone(), sig.ret.clone(), sig.is_async);
         self.enter_generics(f, false);
+        self.note_const_params(name.text(), f, Vec::new());
         self.cur_fn = Some(name.text().to_string());
         self.check_body(f, params, ret, is_async, None);
         self.cur_fn = None;
@@ -1148,6 +1466,17 @@ impl<'a> Checker<'a> {
         self.ret_ty = ret.clone();
         self.in_async = is_async;
         self.scopes = vec![HashMap::new()];
+        // Const generic parameters: values in the body.
+        for (n, ty) in self.const_tys.clone() {
+            let local = Local {
+                ty,
+                mutable: false,
+                deferred: false,
+                reference: None,
+                decl: None,
+            };
+            self.scopes[0].insert(n, local);
+        }
         if let Some((n, local)) = self_local {
             self.declare(&n, local);
         }
@@ -1164,6 +1493,10 @@ impl<'a> Checker<'a> {
                     if p.ty().is_some_and(|t| is_ptr_type(&t)) {
                         let r = self.range(n.syntax());
                         self.ptrs.locals.insert(r);
+                    }
+                    if self.copy_array(p.ty().as_ref(), None, &ty) {
+                        let r = self.range(n.syntax());
+                        self.copy_arrays.insert(r);
                     }
                     let local = Local {
                         ty,
@@ -1194,16 +1527,72 @@ impl<'a> Checker<'a> {
             self.error(&node, msg);
         }
         self.resolve_intos();
+        self.resolve_try_intos();
         self.resolve_collects();
         self.resolve_parses();
+        self.resolve_tries();
         self.resolve_json();
+        self.resolve_projections(true);
         self.resolve_bounds();
         self.resolve_qualified();
         let mut calls = std::mem::take(&mut self.generic_calls);
         for call in &mut calls {
+            for (i, t) in call.3.iter().enumerate() {
+                if matches!(self.shallow(t), Ty::Var(_)) {
+                    self.unbound_targs.insert((call.0, i));
+                }
+            }
             call.3 = call.3.iter().map(|t| self.zonk(t)).collect();
         }
         self.generic_calls = calls;
+        let mut sites = std::mem::take(&mut self.ctor_sites);
+        for s in &mut sites {
+            s.2 = s.2.iter().map(|t| self.zonk(t)).collect();
+        }
+        self.ctor_sites = sites;
+        // (An error elsewhere can leave them unsettled.)
+        let errors = self.diags.iter().any(|d| d.severity == "error");
+        for (r, t) in std::mem::take(&mut self.let_types) {
+            if errors {
+                break;
+            }
+            if !self.has_unbound(&t) {
+                continue;
+            }
+            let shown = self.describe(&t);
+            let message = if shown == "_" {
+                "type annotations needed".to_string()
+            } else {
+                format!("type annotations needed for `{shown}`")
+            };
+            self.diags.push(RawDiag {
+                start: r.0,
+                end: r.1,
+                message,
+                severity: "error",
+            });
+        }
+        for (r, adt, targs) in std::mem::take(&mut self.const_lits) {
+            if errors {
+                break;
+            }
+            let params = self.adts.defs[&adt].type_params.clone();
+            let cps = self.adts.const_params[&adt].clone();
+            for (p, t) in params.iter().zip(&targs) {
+                // (Only a variable nothing settled: an unchecked type leaves it unknown.)
+                if let Some(cp) = cps.iter().find(|c| &c.name == p)
+                    && cp.derive.is_none()
+                    && matches!(self.shallow(t), Ty::Var(_))
+                {
+                    self.diags.push(RawDiag {
+                        start: r.0,
+                        end: r.1,
+                        message: format!("type annotations needed: cannot infer the value of the const parameter `{p}` declared on the struct `{adt}`"),
+                        severity: "error",
+                    });
+                }
+            }
+        }
     }
 
     /// Settle each qualified call's `Self`: a local struct or enum gets its `Trait$method`.
@@ -1316,6 +1705,52 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether a binding of type `ty`, declared as `ann` or made from `init`, is a fixed-size
+    /// array of `Copy` values (`[i32; 3]`, `[[u8; 8]; 8]`, `["a", "b"]`), which copies like
+    /// rustc's `[T; N]` where a `Vec` would move.
+    pub(super) fn copy_array(
+        &mut self,
+        ann: Option<&ast::Type>,
+        init: Option<&ast::Expr>,
+        ty: &Ty,
+    ) -> bool {
+        let Ty::Vec(elem) = self.zonk(ty) else {
+            return false;
+        };
+        match (ann, init.map(strip_parens)) {
+            (Some(ast::Type::ArrayType(a)), _) => match a.ty() {
+                Some(ast::Type::RefType(r)) => r.mut_token().is_none(),
+                Some(inner @ ast::Type::ArrayType(_)) => self.copy_array(Some(&inner), None, &elem),
+                _ => self.copy_elem(&elem),
+            },
+            (Some(_), _) => false,
+            (None, Some(ast::Expr::ArrayExpr(arr))) => {
+                let items: Vec<ast::Expr> = arr.exprs().collect();
+                // `[x; n]`: the first expression is the value.
+                let items = if arr.semicolon_token().is_some() {
+                    items.into_iter().take(1).collect()
+                } else {
+                    items
+                };
+                if items.is_empty() {
+                    return self.copy_elem(&elem);
+                }
+                items.iter().all(|e| match strip_parens(e) {
+                    inner @ ast::Expr::ArrayExpr(_) => self.copy_array(None, Some(&inner), &elem),
+                    ast::Expr::Literal(_) => true,
+                    _ => self.copy_elem(&elem),
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// `Copy` for an array's elements (`String`s aren't; string literals are checked above).
+    fn copy_elem(&self, t: &Ty) -> bool {
+        let z = self.zonk(t);
+        !matches!(z, Ty::Str | Ty::Unknown) && self.implements(&z, "Copy")
+    }
+
     fn let_stmt(&mut self, l: &ast::LetStmt) {
         let declared = l.ty().map(|t| self.lower_type(&t));
         let declared_ref = l.ty().as_ref().and_then(Self::ref_kind);
@@ -1379,7 +1814,15 @@ impl<'a> Checker<'a> {
                 decl: None,
             };
             let ty = local.ty.clone();
+            if l.ty().is_none() {
+                let r = self.range(name.syntax());
+                self.let_types.push((r, ty.clone()));
+            }
             self.declare(&name, local);
+            if self.copy_array(l.ty().as_ref(), l.initializer().as_ref(), &ty) {
+                let r = self.range(name.syntax());
+                self.copy_arrays.insert(r);
+            }
             // A raw pointer doesn't borrow.
             if self.ptr_let(l, &name, &ty) {
                 return;
@@ -1412,7 +1855,7 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-        } else if !self.irrefutable_pat(&pat) {
+        } else if !self.irrefutable_pat(&pat) && !self.or_pat_covers(&pat, &ty) {
             self.error(
                 pat.syntax(),
                 "refutable pattern in local binding (use `let ... else { ... }` or `if let`)",
@@ -1638,20 +2081,61 @@ impl<'a> Checker<'a> {
                     self.error(p.syntax(), msg);
                 }
             }
+            // `(Some(x), _) | (_, Some(x))`: every alternative binds the same names, with the
+            // same types; the first alternative's bindings are the variables.
             ast::Pat::OrPat(op) => {
-                if op
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::IdentPat::cast)
-                    .any(|ip| !is_none_pat(&ip))
-                {
-                    self.error(
-                        p.syntax(),
-                        "bindings inside `|` patterns are not supported yet",
-                    );
-                }
+                let mut first: Option<Vec<(String, Local)>> = None;
                 for alt in op.pats() {
                     self.pat(&alt, expected);
+                    let bound: Vec<(String, Local)> = alt
+                        .syntax()
+                        .descendants()
+                        .filter_map(ast::IdentPat::cast)
+                        .filter_map(|ip| {
+                            let n = ip.name()?;
+                            // (`A | B` naming variants of another crate: not bindings.)
+                            if n.text().starts_with(|c: char| c.is_ascii_uppercase()) {
+                                return None;
+                            }
+                            let r = self.range(n.syntax());
+                            let local = self.lookup(n.text().to_string().as_str())?.clone();
+                            (local.decl == Some(r)).then(|| (n.text().to_string(), local))
+                        })
+                        .collect();
+                    match &first {
+                        None => first = Some(bound),
+                        Some(f) => {
+                            for (n, l) in f {
+                                match bound.iter().find(|(m, _)| m == n) {
+                                    Some((_, other)) => {
+                                        if !self.unify(&l.ty, &other.ty) {
+                                            let msg = format!(
+                                                "mismatched types: `{n}` is `{}` in one alternative and `{}` in another",
+                                                self.describe(&l.ty),
+                                                self.describe(&other.ty)
+                                            );
+                                            self.error(alt.syntax(), msg);
+                                        }
+                                    }
+                                    None => self.error(
+                                        alt.syntax(),
+                                        format!("variable `{n}` is not bound in all patterns"),
+                                    ),
+                                }
+                            }
+                            for (m, _) in &bound {
+                                if !f.iter().any(|(n, _)| n == m) {
+                                    self.error(
+                                        op.pats().next().unwrap().syntax(),
+                                        format!("variable `{m}` is not bound in all patterns"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for (n, l) in first.unwrap_or_default() {
+                    self.scopes.last_mut().unwrap().insert(n, l);
                 }
             }
             ast::Pat::TuplePat(tp) => self.tuple_pat(p, tp, expected),
@@ -1832,6 +2316,24 @@ impl<'a> Checker<'a> {
                 format!("non-exhaustive patterns: `{}` not covered", witness[0]),
             );
         }
+    }
+
+    /// Whether a pattern with `|` alternatives covers every value (`let (Ok(n) | Err(n)) = r;`).
+    fn or_pat_covers(&self, p: &ast::Pat, ty: &Ty) -> bool {
+        if !p
+            .syntax()
+            .descendants()
+            .any(|n| ast::OrPat::can_cast(n.kind()))
+        {
+            return false;
+        }
+        let rows: Vec<Vec<Ap>> = self
+            .abstract_pat(p)
+            .into_iter()
+            .map(|ap| vec![ap])
+            .collect();
+        self.missing_steps.set(0);
+        self.missing(&rows, &[self.zonk(ty)]).is_none()
     }
 
     /// A pattern as constructors, one entry per `|` alternative.
@@ -2283,11 +2785,12 @@ impl<'a> Checker<'a> {
     /// `x`'s type through `impl Deref`, when `x` is such a struct or enum.
     fn deref_target(&self, t: &Ty) -> Option<(String, Ty)> {
         match self.shallow(t) {
-            Ty::Adt(n, _) => self
-                .adts
-                .deref_targets
-                .get(&n)
-                .map(|t| (n.clone(), t.clone())),
+            // (A generic struct's target in its type arguments: `LazyLock<Vec<u32>>` derefs to
+            // `Vec<u32>`.)
+            Ty::Adt(n, targs) => self.adts.deref_targets.get(&n).map(|t| {
+                let map = self.adt_subst(&n, &targs);
+                (n.clone(), generic::subst(t, &map))
+            }),
             _ => None,
         }
     }
@@ -2475,7 +2978,16 @@ impl<'a> Checker<'a> {
                 let rt = self.infer(&recv, None);
                 match self.shallow(&rt) {
                     Ty::Extern(name) => self.extern_field(f, &name),
-                    Ty::Adt(name, targs) => self.adt_field(f, &name, &targs),
+                    Ty::Adt(name, targs) => {
+                        let field = f.name_ref().map(|n| n.text().to_string());
+                        if let Some(field) = field
+                            && self.array_fields.contains(&(name.clone(), field))
+                        {
+                            let r = self.range(f.syntax());
+                            self.array_reads.insert(r);
+                        }
+                        self.adt_field(f, &name, &targs)
+                    }
                     Ty::Unknown | Ty::Var(_) => Ty::Unknown,
                     Ty::Tuple(es) if f.name_ref().is_some_and(|n| n.as_tuple_field().is_some()) => {
                         let i = f.name_ref().and_then(|n| n.as_tuple_field()).unwrap_or(0);
@@ -2637,7 +3149,20 @@ impl<'a> Checker<'a> {
                         .collect(),
                 )
             }
-            ast::Expr::IndexExpr(ix) => self.index(ix),
+            ast::Expr::IndexExpr(ix) => {
+                let t = self.index(ix);
+                // A row of a `[[T; N]; M]` of `Copy` values is a copy too.
+                if let Some(base) = ix.base()
+                    && self
+                        .array_reads
+                        .contains(&self.range(strip_parens(&base).syntax()))
+                    && matches!(self.zonk(&t), Ty::Vec(_))
+                {
+                    let r = self.range(ix.syntax());
+                    self.array_reads.insert(r);
+                }
+                t
+            }
             ast::Expr::TryExpr(t) => self.try_expr(t),
             ast::Expr::ArrayExpr(a) => {
                 let elem = match expected.map(|t| self.shallow(t)) {
@@ -2702,6 +3227,9 @@ impl<'a> Checker<'a> {
                 if let Some(d) = local.decl {
                     let r = self.range(p.syntax());
                     self.borrow_events.uses.push((d, r));
+                    if self.copy_arrays.contains(&d) {
+                        self.array_reads.insert(r);
+                    }
                 }
                 return local.ty;
             }
@@ -2840,6 +3368,23 @@ impl<'a> Checker<'a> {
         }
         match p.op_kind() {
             Some(UnaryOp::Deref) | None => t,
+            Some(UnaryOp::Neg) if matches!(resolved, Ty::Param(_)) => {
+                let Ty::Param(n) = resolved.clone() else {
+                    unreachable!()
+                };
+                self.require_param_bound(p.syntax(), &t, "Neg", "`-`");
+                self.param_class(&n, p.syntax(), None);
+                t
+            }
+            // (`!` on an unsigned number depends on its width.)
+            Some(UnaryOp::Not) if matches!(resolved, Ty::Param(_)) => {
+                let Ty::Param(n) = resolved.clone() else {
+                    unreachable!()
+                };
+                self.require_param_bound(p.syntax(), &t, "Not", "`!`");
+                self.param_class(&n, p.syntax(), Some("`!`"));
+                t
+            }
             Some(UnaryOp::Neg) => {
                 let ok = match &resolved {
                     Ty::Int(k) => k.is_signed(),
@@ -3049,6 +3594,12 @@ impl<'a> Checker<'a> {
                 );
                 let lt = self.infer(&lhs, None);
                 match op {
+                    Some(op) if matches!(self.shallow(&lt), Ty::Param(_)) => {
+                        let Ty::Param(n) = self.shallow(&lt) else {
+                            unreachable!()
+                        };
+                        self.param_arith(b, op, &n, &lt, &rhs, true);
+                    }
                     Some(ArithOp::Shl | ArithOp::Shr) => {
                         self.infer(&rhs, None);
                     }
@@ -3093,6 +3644,9 @@ impl<'a> Checker<'a> {
             }
             BinaryOp::ArithOp(op @ (ArithOp::Shl | ArithOp::Shr)) => {
                 let lt = self.infer(&lhs, expected);
+                if let Ty::Param(n) = self.shallow(&lt) {
+                    return self.param_arith(b, op, &n, &lt, &rhs, false);
+                }
                 let rt = self.infer(&rhs, None);
                 for (t, side) in [(&lt, &lhs), (&rt, &rhs)] {
                     if !self.is_integer(t) {
@@ -3110,11 +3664,31 @@ impl<'a> Checker<'a> {
             BinaryOp::ArithOp(op) => {
                 let lt = self.infer(&lhs, expected);
                 if let Ty::Param(n) = self.shallow(&lt) {
-                    return self.param_arith(b, op, &n, &lt, &rhs);
+                    return self.param_arith(b, op, &n, &lt, &rhs, false);
                 }
                 self.arith_operands(b, op, &lt, &rhs)
             }
         }
+    }
+
+    /// The type arguments a path's segment `name` gives (`HashMap::<u8, u8>::new()`); `_` is a
+    /// fresh variable.
+    fn segment_targs(&mut self, segs: &[ast::PathSegment], name: &str) -> Vec<Ty> {
+        let args: Vec<ast::GenericArg> = segs
+            .iter()
+            .find(|s| s.name_ref().is_some_and(|n| n.text() == name))
+            .and_then(|s| s.generic_arg_list())
+            .map(|l| l.generic_args().collect())
+            .unwrap_or_default();
+        args.into_iter()
+            .map(|g| match g {
+                ast::GenericArg::TypeArg(ta) => ta
+                    .ty()
+                    .map(|t| self.lower_type(&t))
+                    .unwrap_or_else(|| self.fresh(VarKind::General)),
+                _ => self.fresh(VarKind::General),
+            })
+            .collect()
     }
 
     fn is_integer(&self, t: &Ty) -> bool {
@@ -3313,6 +3887,15 @@ impl<'a> Checker<'a> {
             if let Some(t) = self.js_bound_call(c, &ns, &args) {
                 return t;
             }
+            if let Some(t) = self.crate_call(c, &ns, &args) {
+                return t;
+            }
+            if let Some(t) = self.itertools_call(c, &ns, &args) {
+                return t;
+            }
+            if let Some(t) = self.anyhow_call(c, &ns, &args) {
+                return t;
+            }
             if let Some(t) = self.std_call(c, &ns, &args) {
                 return t;
             }
@@ -3355,7 +3938,11 @@ impl<'a> Checker<'a> {
                 ))
             }
             [.., "HashMap", ctor @ ("new" | "with_capacity" | "from")] => {
-                let (k, v) = (self.fresh(VarKind::General), self.fresh(VarKind::General));
+                // (`HashMap::<K, V>::new()` names them.)
+                let named = self.segment_targs(&segs, "HashMap");
+                let mut named = named.into_iter();
+                let k = named.next().unwrap_or_else(|| self.fresh(VarKind::General));
+                let v = named.next().unwrap_or_else(|| self.fresh(VarKind::General));
                 if *ctor == "from" {
                     self.arg_count(c.syntax(), "function", 1, args.len());
                     if let Some(a) = args.first() {
@@ -3377,7 +3964,11 @@ impl<'a> Checker<'a> {
             }
             [.., "HashSet", ctor @ ("new" | "with_capacity" | "from")] => {
                 let ctor = *ctor;
-                let elem = self.fresh(VarKind::General);
+                let elem = self
+                    .segment_targs(&segs, "HashSet")
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| self.fresh(VarKind::General));
                 match ctor {
                     "from" => {
                         self.arg_count(c.syntax(), "function", 1, args.len());
@@ -3573,6 +4164,30 @@ impl<'a> Checker<'a> {
     }
 
     /// `expr?` on an `Option`: the value, or an early `return None`.
+    /// `?`'s error `e` into the function's `re`: the same, or converted.
+    fn check_try_error(&mut self, t: &ast::TryExpr, e: &Ty, re: &Ty) {
+        if !self.try_convert(t, e, re) && !self.unify(e, re) {
+            let msg = format!(
+                "`?` couldn't convert the error to `{}` (add `impl From<{}> for {}`, or convert with `.map_err(..)?`)",
+                self.describe(re),
+                self.describe(e),
+                self.describe(re)
+            );
+            self.error(t.syntax(), msg);
+        }
+    }
+
+    /// The `?`s whose error wasn't known when they were checked.
+    fn resolve_tries(&mut self) {
+        for (t, e, re) in std::mem::take(&mut self.pending_tries) {
+            if matches!(self.shallow(&e), Ty::Var(_)) {
+                self.unify(&e, &re);
+            } else {
+                self.check_try_error(&t, &e, &re);
+            }
+        }
+    }
+
     fn try_expr(&mut self, t: &ast::TryExpr) -> Ty {
         let Some(inner) = t.expr() else {
             return Ty::Unknown;
@@ -3589,17 +4204,16 @@ impl<'a> Checker<'a> {
         }
         if let Ty::Result(x, e) = self.shallow(&it) {
             match self.shallow(&ret) {
-                Ty::Result(_, re) => {
-                    if !self.try_convert(t, &e, &re) && !self.unify(&e, &re) {
-                        let msg = format!(
-                            "`?` couldn't convert the error to `{}` (add `impl From<{}> for {}`, or convert with `.map_err(..)?`)",
-                            self.describe(&re),
-                            self.describe(&e),
-                            self.describe(&re)
-                        );
-                        self.error(t.syntax(), msg);
-                    }
+                // (An error not known yet, like a `parse()`'s whose target comes later: checked
+                // once the types are settled.)
+                Ty::Result(_, re)
+                    if matches!(self.shallow(&e), Ty::Var(_))
+                        && self.var_kind(&e) == Some(VarKind::General)
+                        && !matches!(self.shallow(&re), Ty::Var(_)) =>
+                {
+                    self.pending_tries.push((t.clone(), *e, *re));
                 }
+                Ty::Result(_, re) => self.check_try_error(t, &e, &re),
                 Ty::Unknown => {}
                 other => {
                     let msg = format!(
@@ -3668,17 +4282,10 @@ impl<'a> Checker<'a> {
             let turbofish: Vec<Ty> = path
                 .segment()
                 .and_then(|s| s.generic_arg_list())
-                .map(|l| {
-                    l.generic_args()
-                        .filter_map(|g| match g {
-                            ast::GenericArg::TypeArg(ta) => ta.ty(),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .map(|l| l.generic_args().collect::<Vec<_>>())
                 .unwrap_or_default()
                 .iter()
-                .map(|t| self.lower_type(t))
+                .filter_map(|g| self.generic_arg_ty(g))
                 .collect();
             let inst = self.instantiate(c.syntax(), &type_params, &params, &ret, &turbofish);
             if let Some(caller) = self.cur_fn.clone() {
@@ -3708,6 +4315,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.resolve_projections(false);
         if is_async {
             Ty::Future(Box::new(ret))
         } else {
@@ -3930,6 +4538,24 @@ impl<'a> Checker<'a> {
                 sig.ret
             };
         }
+        // A blanket impl's method (`5.shout()` with `impl<T: Display> Shout for T`), when the
+        // receiver has no method of that name itself and meets the impl's bounds.
+        if let Some((key, sig)) = self.blanket_method(&rt, &method) {
+            if sig.receiver == Some(crate::adt::Receiver::MutRef) {
+                self.check_mutable(&recv, Mutation::Borrow);
+            }
+            let sig = self.method_inst(&sig, None);
+            self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
+            for (a, p) in args.iter().zip(&sig.params) {
+                self.check(a, p);
+            }
+            self.record_ext(m.syntax(), &key);
+            return if sig.is_async {
+                Ty::Future(Box::new(sig.ret))
+            } else {
+                sig.ret
+            };
+        }
         let resolved = match self.shallow(&rt) {
             // A custom iterator (`impl Iterator for Fib`): adapters and consumers work on it.
             Ty::Adt(n, targs)
@@ -3953,6 +4579,10 @@ impl<'a> Checker<'a> {
             }
             other => other,
         };
+        // The bundled crates' methods (`rng.gen_range(..)`, `v.shuffle(&mut rng)`).
+        if let Some(t) = self.crate_method(m, &recv, &resolved, &method, &args) {
+            return t;
+        }
 
         // Infer remaining arguments without constraints, for paths that don't type them.
         let loose = |c: &mut Self| {
@@ -3961,8 +4591,15 @@ impl<'a> Checker<'a> {
             }
         };
         let no_method = |c: &mut Self, ty: &Ty| {
+            let hint = if matches!(method.as_str(), "context" | "with_context")
+                && matches!(ty, Ty::Result(..) | Ty::Option(_))
+            {
+                "if you meant `anyhow::Context`'s, add `use anyhow::Context;`"
+            } else {
+                "the std surface is still small; see docs/FEATURES.md"
+            };
             let msg = format!(
-                "no method named `{method}` found for `{}` (the std surface is still small; see docs/FEATURES.md)",
+                "no method named `{method}` found for `{}` ({hint})",
                 c.describe(ty)
             );
             c.error(m.syntax(), msg);
@@ -3974,6 +4611,56 @@ impl<'a> Checker<'a> {
             && !matches!(&resolved, Ty::Adt(n, _) if self.adts.method(n, "into").is_some())
         {
             return self.conv_into_call(m, rt);
+        }
+        // `self.id.hash(state)` in an `impl Hash` (or with a `DefaultHasher`).
+        if method == "hash"
+            && args.len() == 1
+            && !matches!(&resolved, Ty::Adt(n, _) if self.adts.method(n, "hash").is_some())
+            && self.hasher_arg(&args[0])
+        {
+            self.infer(&args[0], None);
+            let z = self.zonk(&rt);
+            let lacks = match &z {
+                Ty::Float { .. } => Some(z.describe()),
+                _ => first_adt_of(&z)
+                    .filter(|n| !self.implements(&Ty::Adt(n.clone(), vec![]), "Hash")),
+            };
+            if let Some(n) = lacks {
+                self.error(
+                    m.syntax(),
+                    format!("the trait bound `{n}: Hash` is not satisfied"),
+                );
+            }
+            return Ty::Unit;
+        }
+        if let Ty::Hasher = resolved {
+            return match method.as_str() {
+                "finish" => {
+                    self.arg_count(m.syntax(), "method", 0, args.len());
+                    Ty::Int(IntKind::U64)
+                }
+                "write" | "write_str" | "write_u8" | "write_u16" | "write_u32" | "write_u64"
+                | "write_u128" | "write_usize" | "write_i8" | "write_i16" | "write_i32"
+                | "write_i64" | "write_i128" | "write_isize" => {
+                    self.arg_count(m.syntax(), "method", 1, args.len());
+                    for a in &args {
+                        self.infer(a, None);
+                    }
+                    Ty::Unit
+                }
+                _ => {
+                    for a in &args {
+                        self.infer(a, None);
+                    }
+                    no_method(self, &resolved)
+                }
+            };
+        }
+        if method == "try_into"
+            && args.is_empty()
+            && !matches!(&resolved, Ty::Adt(n, _) if self.adts.method(n, "try_into").is_some())
+        {
+            return self.conv_try_into_call(m, rt);
         }
         if matches!(method.as_str(), "cmp" | "partial_cmp")
             && matches!(resolved, Ty::Var(_))
@@ -4162,6 +4849,17 @@ impl<'a> Checker<'a> {
                 _ => no_method(self, &t),
             },
             (Ty::Bool | Ty::Char, "to_string") => sig(self, &[], Ty::Str),
+            (Ty::IntoIter(elem), "into_iter") => {
+                let elem = (**elem).clone();
+                sig(
+                    self,
+                    &[],
+                    Ty::Iter {
+                        elem: Box::new(elem),
+                        mutable: false,
+                    },
+                )
+            }
             (Ty::Vec(elem), m2) => {
                 let elem = (**elem).clone();
                 let mutating = matches!(
@@ -4492,6 +5190,14 @@ impl<'a> Checker<'a> {
                     },
                 )
             }
+            (Ty::Iter { .. }, _) if crates::ITERTOOLS_METHODS.contains(&method.as_str()) => {
+                self.error(
+                    m.syntax(),
+                    format!("no method named `{method}` found for iterator `{}` (it's an `Itertools` method: add `use itertools::Itertools;`)", self.describe(&t)),
+                );
+                loose(self);
+                Ty::Unknown
+            }
             (Ty::Iter { .. }, _) => {
                 self.error(
                     m.syntax(),
@@ -4687,6 +5393,7 @@ impl<'a> Checker<'a> {
                     Ty::Vec(e) | Ty::Set(e) => (*e, by_ref),
                     Ty::Map(k, v) => (Ty::Tuple(vec![*k, *v]), by_ref),
                     Ty::Iter { elem, mutable } => (*elem, Some(mutable)),
+                    Ty::IntoIter(e) => (*e, None),
                     Ty::Unknown | Ty::Var(_) => (Ty::Unknown, None),
                     other_ty => {
                         let msg = format!("`{}` is not an iterator", self.describe(&other_ty));
@@ -4790,6 +5497,20 @@ impl<'a> Checker<'a> {
                 .unwrap_or_else(|| "compile_error! invoked".into());
             self.error(mc.syntax(), msg);
             return Ty::Never;
+        }
+        // `debug_assert!` / `debug_assert_eq!` / `debug_assert_ne!`: checked like `assert!`.
+        let name = match name.strip_prefix("debug_") {
+            Some(n @ ("assert" | "assert_eq" | "assert_ne")) => n.to_string(),
+            _ => name,
+        };
+        if name == "stringify" {
+            return Ty::Str;
+        }
+        if name == "cfg" {
+            if let Err(e) = macros::eval_cfg(mc, false) {
+                self.error(mc.syntax(), e);
+            }
+            return Ty::Bool;
         }
         let args = macros::split_args(self.src, self.base, mc);
         match name.as_str() {
@@ -4970,6 +5691,13 @@ impl<'a> Checker<'a> {
             let ty = self.format_arg_ty(&arg, &mut next, &tys, args);
             let Some(ty) = ty else { continue };
             let resolved = self.shallow(&ty);
+            if spec.debug {
+                let mut ps = Vec::new();
+                Self::params_in(&self.zonk(&ty), &mut ps);
+                for p in ps {
+                    self.note_dbg(&p);
+                }
+            }
             // `{:x}` / `{:b}` / `{:o}` need an integer, `{:e}` a number.
             if let Some(k) = spec.kind {
                 let ok = match k {
@@ -5005,46 +5733,7 @@ impl<'a> Checker<'a> {
                 }
                 continue;
             }
-            let bad = match &resolved {
-                Ty::Vec(_)
-                | Ty::Option(_)
-                | Ty::Unit
-                | Ty::Tuple(_)
-                | Ty::Set(_)
-                | Ty::Map(..)
-                | Ty::Coll(..) => !spec.debug,
-                Ty::Entry(..) | Ty::Closure { .. } => true,
-                Ty::Ordering | Ty::Result(..) => !spec.debug,
-                Ty::Formatter => true,
-                Ty::RefCell(_) => !spec.debug,
-                Ty::Param(n) => !self.param_has(n, if spec.debug { "Debug" } else { "Display" }),
-                Ty::Dyn(tr) if tr == "Error" => false,
-                Ty::Dyn(tr) => {
-                    !self.trait_includes(tr, if spec.debug { "Debug" } else { "Display" })
-                }
-                // (A JS type prints with `{}` when it declares `to_string`: `Date`, `Url`, ..)
-                Ty::Extern(n)
-                    if is_std_error(n)
-                        || (bindings::is_js_type(n)
-                            && self
-                                .bindings
-                                .types
-                                .get(n)
-                                .is_some_and(|t| t.methods.contains_key("to_string"))) =>
-                {
-                    false
-                }
-                Ty::Adt(n, _) => match self.adts.defs.get(n) {
-                    Some(d) if spec.debug => !d.implements("Debug"),
-                    Some(d) => !d.display,
-                    None => false,
-                },
-                // `{}` of `c.to_uppercase()`: its chars.
-                Ty::Iter { elem, .. } if !spec.debug && self.shallow(elem) == Ty::Char => false,
-                Ty::Iter { .. } | Ty::Future(_) | Ty::Fn => true,
-                Ty::Extern(_) => !spec.debug,
-                _ => false,
-            };
+            let bad = self.lacks_fmt(&resolved, spec.debug);
             if bad {
                 let trait_name = if spec.debug { "Debug" } else { "Display" };
                 let hint = if matches!(resolved, Ty::Vec(_)) {
@@ -5064,6 +5753,69 @@ impl<'a> Checker<'a> {
                     severity: "error",
                 });
             }
+        }
+    }
+}
+
+impl Checker<'_> {
+    /// Whether a value of type `resolved` can't be printed with `{:?}` (`debug`) or `{}`.
+    pub(super) fn lacks_fmt(&self, resolved: &Ty, debug: bool) -> bool {
+        match &resolved {
+            Ty::Vec(_)
+            | Ty::Option(_)
+            | Ty::Unit
+            | Ty::Tuple(_)
+            | Ty::Set(_)
+            | Ty::Map(..)
+            | Ty::Coll(..) => !debug,
+            Ty::Entry(..) | Ty::Closure { .. } => true,
+            Ty::Ordering | Ty::Result(..) => !debug,
+            Ty::Formatter => true,
+            Ty::RefCell(_) => !debug,
+            Ty::Param(n) => !self.param_has(n, if debug { "Debug" } else { "Display" }),
+            Ty::Dyn(tr) if tr == "Error" => false,
+            Ty::Dyn(tr) => !self.trait_includes(tr, if debug { "Debug" } else { "Display" }),
+            // (A JS type prints with `{}` when it declares `to_string`: `Date`, `Url`, ..)
+            Ty::Extern(n)
+                if is_std_error(n)
+                    || n == "anyhow::Error"
+                    || (bindings::is_js_type(n)
+                        && self
+                            .bindings
+                            .types
+                            .get(n)
+                            .is_some_and(|t| t.methods.contains_key("to_string"))) =>
+            {
+                false
+            }
+            Ty::Adt(n, _) => match self.adts.defs.get(n) {
+                Some(d) if debug => !d.implements("Debug"),
+                Some(d) => !d.display,
+                None => false,
+            },
+            // `{}` of `c.to_uppercase()`: its chars.
+            Ty::Iter { elem, .. } if !debug && self.shallow(elem) == Ty::Char => false,
+            Ty::Iter { .. } | Ty::Future(_) | Ty::Fn => true,
+            Ty::Extern(_) => !debug,
+            _ => false,
+        }
+    }
+
+    /// `.field("x", &v)` and friends: `v` must be `Debug`; a type parameter's formatter is
+    /// passed in.
+    pub(super) fn check_debug_value(&mut self, node: &SyntaxNode, ty: &Ty) {
+        let mut ps = Vec::new();
+        Self::params_in(&self.zonk(ty), &mut ps);
+        for p in ps {
+            self.note_dbg(&p);
+        }
+        let resolved = self.shallow(ty);
+        if self.lacks_fmt(&resolved, true) {
+            let msg = format!(
+                "`{}` doesn't implement `std::fmt::Debug`",
+                self.describe(ty)
+            );
+            self.error(node, msg);
         }
     }
 }
@@ -5389,7 +6141,61 @@ fn iterator_item(t: &ast::Type) -> Option<Option<ast::Type>> {
     bounds_iterator_item(&list)
 }
 
+/// The `X` of an `Into<X>`, `AsRef<X>` or `Borrow<X>` bound (`impl Into<String>`,
+/// `S: AsRef<str>`): values of those types are taken as `X` itself.
+pub(super) fn conversion_target(list: &ast::TypeBoundList) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    list.bounds().find_map(|b| match b.ty()? {
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            let n = seg.name_ref()?.text().to_string();
+            if !matches!(n.as_str(), "Into" | "AsRef" | "Borrow") {
+                return None;
+            }
+            seg.generic_arg_list()?
+                .generic_args()
+                .find_map(|g| match g {
+                    ast::GenericArg::TypeArg(ta) => ta.ty(),
+                    _ => None,
+                })
+        }
+        _ => None,
+    })
+}
+
 /// `iterator_item` of a bound list (`I: Iterator<Item = T>`).
+/// `Hasher` among bounds (`H: Hasher` in an `impl Hash`).
+pub(super) fn bounds_hasher(list: &ast::TypeBoundList) -> bool {
+    list.bounds().any(|b| {
+        matches!(b.ty(), Some(ast::Type::PathType(p))
+            if p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()).is_some_and(|n| n.text() == "Hasher"))
+    })
+}
+
+/// `IntoIterator<Item = T>` among bounds: Some(the `Item` type, if given).
+pub(super) fn bounds_into_iter_item(list: &ast::TypeBoundList) -> Option<Option<ast::Type>> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    list.bounds().find_map(|b| match b.ty()? {
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            if seg.name_ref()?.text() != "IntoIterator" {
+                return None;
+            }
+            Some(seg.generic_arg_list().and_then(|l| {
+                l.generic_args().find_map(|g| match g {
+                    ast::GenericArg::AssocTypeArg(a)
+                        if a.name_ref().is_some_and(|n| n.text() == "Item") =>
+                    {
+                        a.ty()
+                    }
+                    _ => None,
+                })
+            }))
+        }
+        _ => None,
+    })
+}
+
 pub(super) fn bounds_iterator_item(list: &ast::TypeBoundList) -> Option<Option<ast::Type>> {
     use ra_ap_syntax::ast::HasGenericArgs;
     list.bounds().find_map(|b| match b.ty()? {
@@ -5438,7 +6244,7 @@ fn simple_place(e: &ast::Expr) -> bool {
     }
 }
 
-fn strip_parens(e: &ast::Expr) -> ast::Expr {
+pub(crate) fn strip_parens(e: &ast::Expr) -> ast::Expr {
     match e {
         ast::Expr::ParenExpr(p) => p
             .expr()
@@ -5687,6 +6493,71 @@ impl Checker<'_> {
         out
     }
 
+    /// Ask for `param`'s class where the function can take it (for an operator on a `T`). With
+    /// `need` (the operator), an `impl<T>`'s parameter in a method with `self` is an error.
+    pub(super) fn param_class(&mut self, param: &str, node: &SyntaxNode, need: Option<&str>) {
+        if param == "Self" || param.contains("::") {
+            return;
+        }
+        let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
+            Some((ty, m)) => self
+                .adts
+                .method(ty, m)
+                .is_some_and(|s| s.dict_names().iter().any(|p| p == param)),
+            None => true,
+        });
+        match (own, need) {
+            (Some(f), _) => {
+                self.dict_uses.insert((f, param.to_string()));
+            }
+            // An `impl<T>`'s parameter in a method with `self`: the struct's values carry it.
+            (None, _) if self.store_class(param) => {}
+            (None, Some(op)) => self.error(
+                node,
+                format!("{op} on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum or a trait (it works in a struct's `impl<T> S<T>`, on a function's or method's own type parameters, and in associated functions)"),
+            ),
+            (None, None) => {}
+        }
+    }
+
+    /// In a method with `self` of `impl<T> S<T>`: `S`'s values carry `T`'s class (`this.$T`).
+    /// False where they can't (an enum, `impl<T> S<Vec<T>>`, a trait's default method).
+    fn store_class(&mut self, param: &str) -> bool {
+        let Some(k) = self
+            .cur_fn
+            .as_deref()
+            .and_then(|f| self.stored_pos(f, param))
+        else {
+            return false;
+        };
+        self.stored_uses.insert(k);
+        true
+    }
+
+    /// (struct, position) of `param` when `f` is a method with `self` of `impl<.., param, ..>
+    /// S<.., param, ..>` for a struct `S`.
+    fn stored_pos(&self, f: &str, param: &str) -> Option<(String, usize)> {
+        let (ty, m) = f.split_once("::")?;
+        let def = self.adts.defs.get(ty)?;
+        if def.is_enum {
+            return None;
+        }
+        let sig = self.adts.method(ty, m)?;
+        sig.receiver.as_ref()?;
+        let i = sig
+            .impl_args
+            .iter()
+            .position(|a| *a == Ty::Param(param.to_string()))?;
+        // (Const parameters are carried as values already: `this.$N`.)
+        let name = def.type_params.get(i)?;
+        let is_const = self
+            .adts
+            .const_params
+            .get(ty)
+            .is_some_and(|cps| cps.iter().any(|c| &c.name == name));
+        (!is_const).then(|| (ty.to_string(), i))
+    }
+
     /// Note that the function being checked needs `param`'s class (not for `Self` in a trait's
     /// default method, which is `this`).
     fn note_dict(&mut self, param: &str, node: &SyntaxNode) {
@@ -5706,9 +6577,10 @@ impl Checker<'_> {
             Some(f) => {
                 self.dict_uses.insert((f, param.to_string()));
             }
+            None if self.store_class(param) => {}
             None => self.error(
                 node,
-                format!("`{param}::..` on a type parameter of an `impl` isn't supported yet in methods with `self` (it works on a function's or method's own type parameters, and in associated functions)"),
+                format!("`{param}::..` on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum or a trait (it works in a struct's `impl<T> S<T>`, on a function's or method's own type parameters, and in associated functions)"),
             ),
         }
     }
@@ -5723,6 +6595,19 @@ impl Checker<'_> {
     ) -> Option<Ty> {
         let pty = Ty::Param(param.to_string());
         let bounds = self.bound_traits(param);
+        // `T::from(x)` with `T: From<X>`.
+        if f == "from" && self.param_has(param, "From") {
+            self.arg_count(c.syntax(), "function", 1, args.len());
+            let x = self.from_args.get(param).cloned().unwrap_or(Ty::Unknown);
+            if let Some(a) = args.first() {
+                self.check(a, &x);
+            }
+            let r = self.range(c.syntax());
+            let name = self.zonk(&x).describe();
+            self.param_froms.insert(r, name);
+            self.note_dict(param, c.syntax());
+            return Some(pty);
+        }
         if f == "default" && bounds.iter().any(|b| b == "Default") {
             self.arg_count(c.syntax(), "function", 0, args.len());
             self.note_dict(param, c.syntax());
@@ -5759,38 +6644,288 @@ impl Checker<'_> {
         Some(t)
     }
 
-    /// Which type parameters each function takes a class for: those its body uses statically,
-    /// and those it hands to a function that does (to a fixpoint). Then each call's classes.
-    fn finish_dicts(&mut self) -> Dicts {
-        let mut needs: std::collections::HashSet<(String, String)> =
-            std::mem::take(&mut self.dict_uses);
-        let param_names = |c: &Self, f: &str| -> Vec<String> {
-            match f.split_once("::") {
-                // A method: `Type::name`.
-                Some((ty, m)) => c
-                    .adts
-                    .method(ty, m)
-                    .map(|s| s.dict_names())
-                    .unwrap_or_default(),
-                None => c
-                    .fns
-                    .get(f)
-                    .map(|s| s.type_params.iter().map(|(n, _)| n.clone()).collect())
-                    .unwrap_or_default(),
+    /// Note that the function being checked prints values of `param` with `{:?}` (a function's
+    /// or method's own type parameter; others print as their run-time value says).
+    fn note_dbg(&mut self, param: &str) {
+        // (`S::Unit` takes one too; a trait's own template doesn't.)
+        if param == "Self" || param.starts_with("Self::") || self.is_template(param) {
+            return;
+        }
+        let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
+            Some((ty, m)) => self
+                .adts
+                .method(ty, m)
+                .is_some_and(|s| s.dict_names().iter().any(|p| p == param)),
+            None => true,
+        });
+        if let Some(f) = own {
+            self.dbg_uses.insert((f, param.to_string()));
+        }
+    }
+
+    /// The type parameters inside `t` (`Vec<Option<T>>` → `T`).
+    fn params_in(t: &Ty, out: &mut Vec<String>) {
+        match t {
+            Ty::Param(p) => out.push(p.clone()),
+            other => {
+                for i in other.inner_types() {
+                    Self::params_in(&i, out);
+                }
             }
-        };
+        }
+    }
+
+    /// The type parameters a function or method can take classes, formatters or const values
+    /// for, in the order of its type arguments: a function's type parameters then their
+    /// projections (`S::Unit`), in the order `instantiate` gives them variables; a method's
+    /// `dict_names`.
+    fn need_names(&self, f: &str) -> Vec<String> {
+        match f.split_once("::") {
+            // A method: `Type::name`.
+            Some((ty, m)) => self
+                .adts
+                .method(ty, m)
+                .map(|s| s.dict_names())
+                .unwrap_or_default(),
+            // A function: its type parameters, then their projections (`S::Unit`), in the
+            // order `instantiate` gives them variables.
+            None => self
+                .fns
+                .get(f)
+                .map(|s| {
+                    let mut names: Vec<String> =
+                        s.type_params.iter().map(|(n, _)| n.clone()).collect();
+                    names.extend(
+                        self.proj_names(&s.type_params)
+                            .into_iter()
+                            .map(|(p, _, a)| format!("{p}::{a}")),
+                    );
+                    names
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// A function's const parameters (and an associated function's `impl`'s, `extra`): passed
+    /// as `$N` unless an argument holds them.
+    fn note_const_params(&mut self, key: &str, f: &ast::Fn, extra: Vec<String>) {
+        let mut names: Vec<String> = f
+            .generic_param_list()
+            .into_iter()
+            .flat_map(|l| l.generic_params())
+            .filter_map(|p| match p {
+                ast::GenericParam::ConstParam(cp) => Some(cp.name()?.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        names.extend(extra);
+        for n in names {
+            let k = (key.to_string(), n.clone());
+            self.dict_uses.insert(k.clone());
+            self.const_needs.insert(k.clone());
+            if f.param_list()
+                .into_iter()
+                .flat_map(|pl| pl.params())
+                .any(|p| {
+                    p.ty()
+                        .is_some_and(|t| crate::adt::const_path(&t, &n, &self.adts).is_some())
+                })
+            {
+                self.const_derivable.insert(k);
+            }
+        }
+    }
+
+    /// Each generic call's const arguments must be known, or readable off an argument.
+    fn check_const_args(&mut self) {
+        // (An error elsewhere, like a bad const argument, leaves arguments unknown.)
+        if self.diags.iter().any(|d| d.severity == "error") {
+            return;
+        }
+        let mut errs = Vec::new();
+        for (r, _, callee, targs) in &self.generic_calls {
+            for (i, n) in self.need_names(callee).iter().enumerate() {
+                let k = (callee.clone(), n.clone());
+                if !self.const_needs.contains(&k) || self.const_derivable.contains(&k) {
+                    continue;
+                }
+                if matches!(targs.get(i), Some(Ty::ConstVal(_) | Ty::Param(_)))
+                    || !self.unbound_targs.contains(&(*r, i))
+                {
+                    continue;
+                }
+                let on = match callee.split_once("::") {
+                    Some((ty, m))
+                        if self
+                            .adts
+                            .method(ty, m)
+                            .is_some_and(|s| s.type_params.contains(n)) =>
+                    {
+                        format!("the associated function `{m}`")
+                    }
+                    Some((ty, _)) => format!("the struct `{ty}`"),
+                    None => format!("the function `{callee}`"),
+                };
+                errs.push(RawDiag {
+                    start: r.0,
+                    end: r.1,
+                    message: format!("type annotations needed: cannot infer the value of the const parameter `{n}` declared on {on} (give it with `::<..>`: array lengths in types don't inform it here)"),
+                    severity: "error",
+                });
+            }
+        }
+        self.diags.extend(errs);
+    }
+
+    /// A type or const generic argument (`i32`, `3`, `{ N }`); None for lifetimes and bindings.
+    pub(super) fn generic_arg_ty(&mut self, g: &ast::GenericArg) -> Option<Ty> {
+        match g {
+            ast::GenericArg::TypeArg(ta) => {
+                Some(ta.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown))
+            }
+            ast::GenericArg::ConstArg(c) => Some(
+                c.expr()
+                    .map(|e| self.lower_const_arg(&e))
+                    .unwrap_or(Ty::Unknown),
+            ),
+            _ => None,
+        }
+    }
+
+    /// A const argument: a literal (`3`, `true`, `'a'`, `-1`), a const parameter or a `const`
+    /// item (`N`, `{ N }`).
+    pub(super) fn lower_const_arg(&mut self, e: &ast::Expr) -> Ty {
+        match e {
+            ast::Expr::Literal(l) => match l.kind() {
+                ast::LiteralKind::IntNumber(n) if n.value().is_ok() => {
+                    Ty::ConstVal(n.value().unwrap().to_string())
+                }
+                ast::LiteralKind::Bool(b) => Ty::ConstVal(b.to_string()),
+                // `b'A'`: a `u8`.
+                ast::LiteralKind::Byte(b) if b.value().is_ok() => {
+                    Ty::ConstVal(b.value().unwrap().to_string())
+                }
+                ast::LiteralKind::Char(_) => Ty::ConstVal(l.syntax().text().to_string()),
+                _ => {
+                    self.error(
+                        e.syntax(),
+                        "a const argument must be an integer, `bool` or `char`",
+                    );
+                    Ty::Unknown
+                }
+            },
+            ast::Expr::BlockExpr(b)
+                if b.statements().next().is_none() && b.tail_expr().is_some() =>
+            {
+                self.lower_const_arg(&b.tail_expr().unwrap())
+            }
+            ast::Expr::PathExpr(p) if p.path().and_then(|p| p.as_single_name_ref()).is_some() => {
+                let n = p
+                    .path()
+                    .unwrap()
+                    .as_single_name_ref()
+                    .unwrap()
+                    .text()
+                    .to_string();
+                if self.const_tys.contains_key(&n) {
+                    Ty::Param(n)
+                } else if self.consts.contains_key(&n) {
+                    Ty::ConstVal(n)
+                } else {
+                    self.error(e.syntax(), format!("cannot find value `{n}` in this scope"));
+                    Ty::Unknown
+                }
+            }
+            // `{ N + 1 }`: rustc's error too (on stable).
+            _ if e
+                .syntax()
+                .descendants()
+                .filter_map(ast::PathExpr::cast)
+                .any(|p| {
+                    p.path()
+                        .and_then(|p| p.as_single_name_ref())
+                        .is_some_and(|n| self.const_tys.contains_key(n.text()))
+                }) =>
+            {
+                self.error(
+                    e.syntax(),
+                    "generic parameters may not be used in const operations (a const argument is a literal, a const parameter or a `const` item)",
+                );
+                Ty::Unknown
+            }
+            // `{ 128 / 8 }`
+            _ if const_int(e).is_some() => Ty::ConstVal(const_int(e).unwrap().to_string()),
+            _ => {
+                self.error(
+                    e.syntax(),
+                    "this const argument isn't supported yet (a literal, integer arithmetic on literals, a const parameter or a `const` item is)",
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// A const parameter's type: an integer (up to 32 bits, or `usize`/`isize`), `bool` or
+    /// `char`.
+    pub(super) fn const_param_ty(&mut self, cp: &ast::ConstParam, report: bool) -> Ty {
+        let ty = cp.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+        let ok = matches!(ty, Ty::Bool | Ty::Char | Ty::Unknown)
+            || matches!(&ty, Ty::Int(k) if !k.is_big());
+        if !ok && report {
+            self.error(
+                cp.syntax(),
+                format!(
+                    "const parameters of type `{}` aren't supported (integers up to 32 bits, `usize`, `isize`, `bool` and `char` are)",
+                    ty.describe()
+                ),
+            );
+        }
+        ty
+    }
+
+    /// Which type parameters each function takes a class (or formatter) for: those its body
+    /// uses (`needs`), and those it hands to a function that does (to a fixpoint). Then each
+    /// call's types for them.
+    /// With `stored` (classes, not `{:?}` formatters), an `impl<T>`'s method with `self` that
+    /// passes `T` on gets it off its struct's values, which then carry it (`stored_uses`), as do
+    /// the values each construction of such a struct makes.
+    fn finish_needs(
+        &mut self,
+        needs: std::collections::HashSet<(String, String)>,
+        stored: bool,
+    ) -> Dicts {
+        let mut needs = needs;
+        let param_names = |c: &Self, f: &str| c.need_names(f);
         loop {
             let mut grew = false;
+            let mut uses: Vec<(String, String)> = Vec::new();
             for (_, caller, callee, targs) in &self.generic_calls {
                 let names = param_names(self, callee);
                 for (i, n) in names.iter().enumerate() {
                     if needs.contains(&(callee.clone(), n.clone()))
                         && let Some(Ty::Param(p)) = targs.get(i)
-                        && param_names(self, caller).contains(p)
-                        && needs.insert((caller.clone(), p.clone()))
                     {
-                        grew = true;
+                        uses.push((caller.clone(), p.clone()));
                     }
+                }
+            }
+            if stored {
+                for (f, adt, targs) in &self.ctor_sites {
+                    let Some(f) = f else { continue };
+                    for (i, t) in targs.iter().enumerate() {
+                        if let Ty::Param(p) = t
+                            && self.stored_uses.contains(&(adt.clone(), i))
+                        {
+                            uses.push((f.clone(), p.clone()));
+                        }
+                    }
+                }
+            }
+            for (f, p) in uses {
+                if param_names(self, &f).contains(&p) {
+                    grew |= needs.insert((f, p));
+                } else if stored && let Some(k) = self.stored_pos(&f, &p) {
+                    grew |= self.stored_uses.insert(k);
                 }
             }
             if !grew {
@@ -5857,5 +6992,147 @@ impl Checker<'_> {
             return None;
         }
         Some((local.decl?, mutable))
+    }
+}
+
+/// Whether a const argument is a literal (not a `const` item's name).
+fn const_literal(v: &str) -> bool {
+    v.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '\'')
+        || v == "true"
+        || v == "false"
+}
+
+/// Integer arithmetic on literals in a const argument (`{ 128 / 8 }`); None for anything else.
+fn const_int(e: &ast::Expr) -> Option<i128> {
+    match e {
+        ast::Expr::Literal(l) => match l.kind() {
+            ast::LiteralKind::IntNumber(n) => i128::try_from(n.value().ok()?).ok(),
+            _ => None,
+        },
+        ast::Expr::ParenExpr(p) => const_int(&p.expr()?),
+        ast::Expr::BlockExpr(b) if b.statements().next().is_none() => const_int(&b.tail_expr()?),
+        ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Neg) => {
+            const_int(&p.expr()?)?.checked_neg()
+        }
+        ast::Expr::BinExpr(b) => {
+            let (l, r) = (const_int(&b.lhs()?)?, const_int(&b.rhs()?)?);
+            match b.op_kind()? {
+                BinaryOp::ArithOp(ArithOp::Add) => l.checked_add(r),
+                BinaryOp::ArithOp(ArithOp::Sub) => l.checked_sub(r),
+                BinaryOp::ArithOp(ArithOp::Mul) => l.checked_mul(r),
+                BinaryOp::ArithOp(ArithOp::Div) => l.checked_div(r),
+                BinaryOp::ArithOp(ArithOp::Rem) => l.checked_rem(r),
+                BinaryOp::ArithOp(ArithOp::Shl) => l.checked_shl(u32::try_from(r).ok()?),
+                BinaryOp::ArithOp(ArithOp::Shr) => l.checked_shr(u32::try_from(r).ok()?),
+                BinaryOp::ArithOp(ArithOp::BitAnd) => Some(l & r),
+                BinaryOp::ArithOp(ArithOp::BitOr) => Some(l | r),
+                BinaryOp::ArithOp(ArithOp::BitXor) => Some(l ^ r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The first struct or enum in a type (`Vec<P>` → `P`).
+fn first_adt_of(t: &Ty) -> Option<String> {
+    let mut found = None;
+    t.walk(&mut |x| {
+        if let Ty::Adt(n, _) = x
+            && found.is_none()
+        {
+            found = Some(n.clone());
+        }
+    });
+    found
+}
+
+impl Checker<'_> {
+    /// Whether `x.hash(arg)` is `Hash::hash`: `arg` is a `Hasher` local (`state`, `&mut h`).
+    fn hasher_arg(&self, arg: &ast::Expr) -> bool {
+        let arg = match arg {
+            ast::Expr::RefExpr(r) => r.expr(),
+            other => Some(other.clone()),
+        };
+        match arg {
+            Some(ast::Expr::PathExpr(p)) => p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .and_then(|n| self.lookup(n.text().to_string().as_str()))
+                .is_some_and(|l| matches!(l.ty, Ty::Hasher)),
+            _ => false,
+        }
+    }
+}
+
+impl Checker<'_> {
+    /// std's iterator types by name (for parameters like `chars: &mut Peekable<Chars>`).
+    fn std_iter_type(&mut self, name: &str, seg: Option<&ast::PathSegment>) -> Option<Ty> {
+        // (Names crates reuse only with their module: `slice::Iter`, `vec::IntoIter`,
+        // `str::Bytes`.)
+        let qualified = seg.and_then(|s| s.parent_path().qualifier()).is_some();
+        let known = matches!(
+            name,
+            "Peekable"
+                | "Fuse"
+                | "Rev"
+                | "Skip"
+                | "Take"
+                | "StepBy"
+                | "Cycle"
+                | "Enumerate"
+                | "Chars"
+                | "CharIndices"
+                | "SplitWhitespace"
+        ) || (qualified
+            && matches!(
+                name,
+                "Iter" | "IntoIter" | "IterMut" | "Bytes" | "Lines" | "Split"
+            ));
+        if !known {
+            return None;
+        }
+        let args: Vec<Ty> = seg
+            .and_then(|s| s.generic_arg_list())
+            .map(|l| {
+                l.generic_args()
+                    .filter_map(|g| match g {
+                        ast::GenericArg::TypeArg(t) => t.ty(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .iter()
+            .map(|t| self.lower_type(t))
+            .collect();
+        let iter = |elem: Ty, mutable: bool| Ty::Iter {
+            elem: Box::new(elem),
+            mutable,
+        };
+        let inner = |args: &[Ty]| match args.first() {
+            Some(t @ Ty::Iter { .. }) => t.clone(),
+            _ => iter(Ty::Unknown, false),
+        };
+        Some(match name {
+            "Peekable" | "Fuse" | "Rev" | "Skip" | "Take" | "StepBy" | "Cycle" => inner(&args),
+            "Enumerate" => match inner(&args) {
+                Ty::Iter { elem, mutable } => iter(Ty::Tuple(vec![USIZE, *elem]), mutable),
+                other => other,
+            },
+            "Chars" => iter(Ty::Char, false),
+            "CharIndices" => iter(Ty::Tuple(vec![USIZE, Ty::Char]), false),
+            "Bytes" => iter(Ty::Int(IntKind::U8), false),
+            "Lines" | "SplitWhitespace" | "Split" => iter(Ty::Str, false),
+            "Iter" | "IntoIter" | "IterMut" => {
+                let elem = match args.as_slice() {
+                    [t] => t.clone(),
+                    [k, v] => Ty::Tuple(vec![k.clone(), v.clone()]),
+                    _ => return None,
+                };
+                iter(elem, name == "IterMut")
+            }
+            _ => return None,
+        })
     }
 }

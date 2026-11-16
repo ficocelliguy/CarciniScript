@@ -47,7 +47,15 @@ pub fn parse_error_for(t: &Ty) -> &'static str {
 pub fn is_std_error(name: &str) -> bool {
     matches!(
         name,
-        "ParseIntError" | "ParseFloatError" | "ParseBoolError" | "ParseCharError" | "fmt::Error"
+        "ParseIntError"
+            | "ParseFloatError"
+            | "ParseBoolError"
+            | "ParseCharError"
+            | "fmt::Error"
+            | "TryFromIntError"
+            | "CharTryFromError"
+            | "TryFromSliceError"
+            | "serde_json::Error"
     )
 }
 
@@ -312,17 +320,61 @@ impl Checker<'_> {
                 _ => None,
             })
             .unwrap_or_else(|| self.fresh(VarKind::General));
-        self.pending_parses.push((t.clone(), m.syntax().clone()));
-        // The error type is fixed once `T` is known; an integer is the common case.
-        let err = Ty::Extern(parse_error_for(&self.zonk(&t)).into());
+        // A type with `impl FromStr`: its `Err`. Not known yet with such impls around: waits.
+        let z = self.shallow(&t);
+        let (err, waits) = match &z {
+            Ty::Adt(n, _) if self.adts.method(n, "from_str").is_some() => {
+                (self.parse_err_of(n), false)
+            }
+            Ty::Var(_) if self.has_from_str() => (self.fresh(VarKind::General), true),
+            // `s.parse::<T>()` with `T: FromStr`: by `T`'s class; its `Err` is unchecked.
+            Ty::Param(p) if self.param_has(p, "FromStr") => {
+                let p = p.clone();
+                self.param_class(&p, m.syntax(), Some("`parse::<T>()`"));
+                (Ty::Unknown, false)
+            }
+            _ => (Ty::Extern(parse_error_for(&z).into()), false),
+        };
+        let pending = waits.then(|| err.clone());
+        self.pending_parses
+            .push((t.clone(), m.syntax().clone(), pending));
         Ty::Result(Box::new(t), Box::new(err))
+    }
+
+    /// The `Err` of `impl FromStr for T`: the error type `from_str` returns.
+    fn parse_err_of(&self, adt: &str) -> Ty {
+        match self.adts.method(adt, "from_str").map(|m| m.ret.clone()) {
+            Some(Ty::Result(_, e)) => *e,
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// Whether any type in the program has `impl FromStr` (a `from_str` function).
+    fn has_from_str(&self) -> bool {
+        self.adts
+            .methods
+            .values()
+            .any(|ms| ms.get("from_str").is_some_and(|m| m.receiver.is_none()))
     }
 
     /// `parse()` calls must end up with a type that can be parsed.
     pub(super) fn resolve_parses(&mut self) {
-        for (t, node) in std::mem::take(&mut self.pending_parses) {
+        for (t, node, err) in std::mem::take(&mut self.pending_parses) {
+            if let Some(err) = err {
+                let z = self.zonk(&t);
+                let want = match &z {
+                    Ty::Adt(n, _) if self.adts.method(n, "from_str").is_some() => {
+                        self.parse_err_of(n)
+                    }
+                    _ => Ty::Extern(parse_error_for(&z).into()),
+                };
+                self.unify(&err, &want);
+            }
             match self.zonk(&t) {
-                Ty::Int(k) if k.is_wide_unsupported() => {}
+                // `impl FromStr for T`.
+                Ty::Adt(n, _) if self.adts.method(&n, "from_str").is_some() => {}
+                Ty::Int(k) if k.is_big() => {}
+                Ty::Param(p) if self.param_has(&p, "FromStr") => {}
                 // (`parse::<String>()` can't fail; it's how a proc macro makes a `TokenStream`.)
                 Ty::Int(_) | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str | Ty::Unknown => {}
                 // `format!(..).parse::<TokenStream>()` in a proc-macro crate.

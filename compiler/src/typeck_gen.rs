@@ -27,10 +27,33 @@ const KNOWN_BOUNDS: &[&str] = &[
     "Add",
     "Sub",
     "Mul",
+    "Div",
+    "Rem",
     "Neg",
     "AddAssign",
     "SubAssign",
     "MulAssign",
+    "DivAssign",
+    "RemAssign",
+    "BitAnd",
+    "BitOr",
+    "BitXor",
+    "Not",
+    "Shl",
+    "Shr",
+    "BitAndAssign",
+    "BitOrAssign",
+    "BitXorAssign",
+    "ShlAssign",
+    "ShrAssign",
+    "FromStr",
+    "From",
+    "Sum",
+    "Product",
+    // (Marker traits: nothing to check in JS.)
+    "Send",
+    "Sync",
+    "Unpin",
     "Sized",
     "ToString",
 ];
@@ -97,6 +120,16 @@ fn bound_names(lists: &[ast::TypeBoundList]) -> Vec<(String, SyntaxNode)> {
 pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
     let s = |x: &Ty| Box::new(subst(x, m));
     match t {
+        // `T::Item` follows `T`: `P::Item` when `T` is now the parameter `P`, unchecked when it's
+        // a concrete type or not known yet (the impl's `type Item` isn't looked up here).
+        Ty::Param(n) if !m.contains_key(n) && n.contains("::") => {
+            let (base, assoc) = n.split_once("::").unwrap_or_default();
+            match m.get(base) {
+                Some(Ty::Param(p)) => Ty::Param(format!("{p}::{assoc}")),
+                Some(_) => Ty::Unknown,
+                None => t.clone(),
+            }
+        }
         Ty::Param(n) => m.get(n).cloned().unwrap_or_else(|| t.clone()),
         Ty::Vec(e) => Ty::Vec(s(e)),
         Ty::Option(e) => Ty::Option(s(e)),
@@ -113,6 +146,7 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
             elem: s(elem),
             mutable: *mutable,
         },
+        Ty::IntoIter(e) => Ty::IntoIter(s(e)),
         Ty::Closure { params, ret } => Ty::Closure {
             params: params.iter().map(|p| subst(p, m)).collect(),
             ret: s(ret),
@@ -128,17 +162,54 @@ impl Checker<'_> {
     pub(super) fn enter_generics(&mut self, f: &ast::Fn, report: bool) -> Vec<TypeParam> {
         self.generics.clear();
         self.param_bounds.clear();
+        self.param_trait_args.clear();
+        self.lenient_projs.clear();
+        self.const_tys.clear();
+        self.from_args.clear();
         let mut params = Vec::new();
-        for (name, lists, node) in type_params(f) {
+        // (`I: IntoIterator<Item = P>` names `P`, which may come later: those go last.)
+        let mut tps = type_params(f);
+        tps.sort_by_key(|(_, lists, _)| {
+            lists.iter().any(|l| {
+                super::bounds_into_iter_item(l).is_some()
+                    || super::bounds_iterator_item(l).is_some()
+            })
+        });
+        for (name, lists, node) in tps {
             if let Some(closure) = lists.iter().find_map(|l| self.lower_fn_bounds(l)) {
                 self.generics.insert(name, closure);
+                continue;
+            }
+            // `S: Into<String>` / `S: AsRef<str>`: the target type, like `impl Into<String>`.
+            if let Some(target) = lists.iter().find_map(super::conversion_target) {
+                let t = self.lower_type(&target);
+                self.generics.insert(name, t);
+                continue;
+            }
+            // `H: Hasher` in an `impl Hash`.
+            if lists.iter().any(super::bounds_hasher) {
+                self.generics.insert(name, Ty::Hasher);
+                continue;
+            }
+            // `R: Rng` (the bundled `rand`).
+            if lists.iter().any(super::crates::bounds_rng) {
+                self.generics.insert(name, Ty::Rng);
+                continue;
+            }
+            // `I: IntoIterator<Item = T>`: any iterable of `T`.
+            if let Some(item) = lists.iter().find_map(super::bounds_into_iter_item) {
+                let elem = match item {
+                    Some(t) => self.lower_type(&t),
+                    None => self.item_param(f, &name, report, &mut params),
+                };
+                self.generics.insert(name, Ty::IntoIter(Box::new(elem)));
                 continue;
             }
             // `I: Iterator<Item = T>`: the runtime's iterator, like `impl Iterator<Item = T>`.
             if let Some(item) = lists.iter().find_map(super::bounds_iterator_item) {
                 let elem = match item {
                     Some(t) => self.lower_type(&t),
-                    None => self.fresh(VarKind::General),
+                    None => self.item_param(f, &name, report, &mut params),
                 };
                 let it = Ty::Iter {
                     elem: Box::new(elem),
@@ -154,7 +225,7 @@ impl Checker<'_> {
                 } else if report {
                     self.error(
                         &bnode,
-                        format!("the trait bound `{b}` is not supported yet on type parameters (supported: Copy, Clone, Debug, Display, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Add, Sub, Mul)"),
+                        format!("the trait bound `{b}` is not supported yet on type parameters (supported: the comparison, formatting, `Clone`/`Copy`/`Default`/`Hash`, arithmetic and bitwise operator, `From`/`FromStr`, `Sum`/`Product`, iterator and closure traits, `Send`/`Sync`, and traits declared in the file)"),
                     );
                 }
             }
@@ -163,12 +234,169 @@ impl Checker<'_> {
             self.param_bounds.insert(name.clone(), bounds.clone());
             params.push((name, bounds));
         }
+        // `const N: usize`: a value in the body, and a type argument (`Buf<N>`).
+        let mut order: Vec<String> = Vec::new();
+        for p in f
+            .generic_param_list()
+            .into_iter()
+            .flat_map(|l| l.generic_params())
+        {
+            match p {
+                ast::GenericParam::ConstParam(cp) => {
+                    let Some(n) = cp.name() else { continue };
+                    let n = n.text().to_string();
+                    let ty = self.const_param_ty(&cp, report);
+                    self.generics.insert(n.clone(), Ty::Param(n.clone()));
+                    self.const_tys.insert(n.clone(), ty);
+                    params.push((n.clone(), Vec::new()));
+                    order.push(n);
+                }
+                ast::GenericParam::TypeParam(tp) => {
+                    if let Some(n) = tp.name() {
+                        order.push(n.text().to_string());
+                    }
+                }
+                ast::GenericParam::LifetimeParam(_) => {}
+            }
+        }
+        params.sort_by_key(|(n, _)| order.iter().position(|x| x == n));
+        // The bounds' arguments (`C: Convert<String>`, `S: Shape<Unit = f64>`), once every
+        // parameter is in scope.
+        for (name, lists, _) in type_params(f) {
+            self.record_from_bound(&name, &lists);
+            if self.param_bounds.contains_key(&name) {
+                self.record_bound_args(&name, &lists);
+            }
+        }
+        self.note_where_projections(f.where_clause());
         params
+    }
+
+    /// `I: IntoIterator` / `I: Iterator` without `Item = ..`: its items are a type parameter of
+    /// their own, `I::Item` (a fresh type per call), with the bounds `where I::Item: ..` gives.
+    fn item_param(
+        &mut self,
+        f: &ast::Fn,
+        name: &str,
+        report: bool,
+        params: &mut Vec<TypeParam>,
+    ) -> Ty {
+        let item = format!("{name}::Item");
+        let mut lists = Vec::new();
+        for pred in f.where_clause().into_iter().flat_map(|w| w.predicates()) {
+            if let Some(t) = pred.ty()
+                && t.syntax().text() == item.as_str()
+                && let Some(l) = pred.type_bound_list()
+            {
+                lists.push(l);
+            }
+        }
+        let mut bounds = Vec::new();
+        for (b, bnode) in bound_names(&lists) {
+            if KNOWN_BOUNDS.contains(&b.as_str()) || self.adts.traits.contains_key(&b) {
+                bounds.push(b);
+            } else if report {
+                self.error(
+                    &bnode,
+                    format!("the trait bound `{b}` is not supported yet on type parameters"),
+                );
+            }
+        }
+        self.generics.insert(item.clone(), Ty::Param(item.clone()));
+        self.param_bounds.insert(item.clone(), bounds.clone());
+        params.push((item.clone(), bounds));
+        Ty::Param(item)
+    }
+
+    /// The associated types of each type parameter's bounds, in order: (parameter, trait,
+    /// associated type).
+    pub(super) fn proj_names(&self, type_params: &[TypeParam]) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (p, bounds) in type_params {
+            for b in bounds {
+                if let Some(d) = self.adts.traits.get(b) {
+                    for a in &d.assoc_types {
+                        out.push((p.clone(), b.clone(), a.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `T: From<X>`: `X`, for `T::from(x)`.
+    pub(super) fn record_from_bound(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        for l in lists {
+            for b in l.bounds() {
+                if let Some(ast::Type::PathType(pt)) = b.ty()
+                    && let Some(seg) = pt.path().and_then(|p| p.segment())
+                    && seg.name_ref().is_some_and(|n| n.text() == "From")
+                    && let Some(ast::GenericArg::TypeArg(ta)) =
+                        seg.generic_arg_list().and_then(|l| l.generic_args().next())
+                    && let Some(t) = ta.ty()
+                {
+                    let x = self.lower_type(&t);
+                    self.from_args.insert(name.to_string(), x);
+                }
+            }
+        }
+    }
+
+    /// Record `name`'s user-trait bounds with their arguments.
+    pub(super) fn record_bound_args(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let mut per = HashMap::new();
+        for l in lists {
+            for b in l.bounds() {
+                let Some(ast::Type::PathType(pt)) = b.ty() else {
+                    continue;
+                };
+                let Some(seg) = pt.path().and_then(|p| p.segment()) else {
+                    continue;
+                };
+                let Some(tr) = seg.name_ref().map(|n| n.text().to_string()) else {
+                    continue;
+                };
+                if !self.adts.traits.contains_key(&tr) {
+                    continue;
+                }
+                let mut pos = Vec::new();
+                let mut named = HashMap::new();
+                for g in seg
+                    .generic_arg_list()
+                    .into_iter()
+                    .flat_map(|l| l.generic_args())
+                {
+                    match g {
+                        ast::GenericArg::TypeArg(ta) => {
+                            if let Some(t) = ta.ty() {
+                                pos.push(self.lower_type(&t));
+                            }
+                        }
+                        ast::GenericArg::AssocTypeArg(a) => {
+                            if let (Some(n), Some(t)) = (a.name_ref(), a.ty()) {
+                                named.insert(n.text().to_string(), self.lower_type(&t));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                per.insert(tr, (pos, named));
+            }
+        }
+        if !per.is_empty() {
+            self.param_trait_args.insert(name.to_string(), per);
+        }
     }
 
     pub(super) fn leave_generics(&mut self) {
         self.generics.clear();
         self.param_bounds.clear();
+        self.param_trait_args.clear();
+        self.lenient_projs.clear();
+        self.const_tys.clear();
+        self.from_args.clear();
     }
 
     /// Fresh type variables for a generic function's parameters, with the bounds to check once
@@ -191,9 +419,61 @@ impl Checker<'_> {
             }
             for b in bounds {
                 self.pending_bounds
-                    .push((v.clone(), b.clone(), node.clone()));
+                    .push((v.clone(), b.clone(), node.clone(), self.base));
             }
             m.insert(name.clone(), v);
+        }
+        // Each bound's associated types (`S::Unit`): variables, settled once `S` is known; they
+        // follow the type arguments (for the `{:?}` formatters a function takes).
+        for (s, tr, a) in self.proj_names(type_params) {
+            let Some(sv) = m.get(&s).cloned() else {
+                continue;
+            };
+            let x = self.fresh(VarKind::General);
+            self.pending_projections
+                .push((sv, tr, a.clone(), x.clone()));
+            self.last_type_args.push(x.clone());
+            m.insert(format!("{s}::{a}"), x);
+        }
+        // Any other `S::Unit` in the signature.
+        let mut projs: Vec<String> = Vec::new();
+        for t in params.iter().chain(std::iter::once(ret)) {
+            t.walk(&mut |x| {
+                if let Ty::Param(p) = x
+                    && p.contains("::")
+                    && !projs.contains(p)
+                {
+                    projs.push(p.clone());
+                }
+            });
+        }
+        for p in projs {
+            if m.contains_key(&p) {
+                continue;
+            }
+            let Some((s, assoc)) = p.split_once("::") else {
+                continue;
+            };
+            let Some(sv) = m.get(s).cloned() else {
+                continue;
+            };
+            let tr = type_params
+                .iter()
+                .find(|(n, _)| n == s)
+                .and_then(|(_, bs)| {
+                    bs.iter().find(|b| {
+                        self.adts
+                            .traits
+                            .get(*b)
+                            .is_some_and(|d| d.assoc_types.iter().any(|a| a == assoc))
+                    })
+                })
+                .cloned();
+            let Some(tr) = tr else { continue };
+            let x = self.fresh(VarKind::General);
+            self.pending_projections
+                .push((sv, tr, assoc.to_string(), x.clone()));
+            m.insert(p.clone(), x);
         }
         (
             params.iter().map(|p| subst(p, &m)).collect(),
@@ -203,7 +483,10 @@ impl Checker<'_> {
 
     /// Check the bounds of every generic call in the function.
     pub(super) fn resolve_bounds(&mut self) {
-        for (t, b, node) in std::mem::take(&mut self.pending_bounds) {
+        let saved = self.base;
+        for (t, b, node, base) in std::mem::take(&mut self.pending_bounds) {
+            // (Calls inside macro arguments were parsed from the argument's text.)
+            self.base = base;
             let z = self.zonk(&t);
             if matches!(z, Ty::Var(_) | Ty::Unknown) {
                 continue;
@@ -216,13 +499,47 @@ impl Checker<'_> {
                 self.error(&node, msg);
             }
         }
+        self.base = saved;
     }
 
     /// Whether type parameter `name` (in the function being checked) has bound `b`, directly or
     /// through a subtrait (`Ord` gives `PartialOrd`, `Copy` gives `Clone`, ...).
     pub(super) fn param_has(&self, name: &str, b: &str) -> bool {
-        let Some(bounds) = self.param_bounds.get(name) else {
-            return false;
+        // A trait's own associated type or type parameter (`Shape::Unit`): unchecked.
+        if self.is_template(name) {
+            return true;
+        }
+        // `S::Unit`: what the trait declares (`type Unit: Debug;`).
+        let declared: Vec<String>;
+        let bounds = match name.split_once("::") {
+            // (`I::Item` of an `I: IntoIterator`: a parameter of its own.)
+            Some(_) if self.param_bounds.contains_key(name) => &self.param_bounds[name],
+            Some((s, a)) => {
+                let mut todo: Vec<String> = self
+                    .bound_traits(s)
+                    .iter()
+                    .filter_map(|t| self.adts.traits.get(t)?.assoc_bounds.get(a).cloned())
+                    .flatten()
+                    .collect();
+                // (A user trait's supertraits too: `type Bound: Bound;` with
+                // `trait Bound: PartialOrd`.)
+                let mut all: Vec<String> = Vec::new();
+                while let Some(t) = todo.pop() {
+                    if all.contains(&t) {
+                        continue;
+                    }
+                    if let Some(d) = self.adts.traits.get(&t) {
+                        todo.extend(d.supers.iter().cloned());
+                    }
+                    all.push(t);
+                }
+                declared = all;
+                &declared
+            }
+            None => match self.param_bounds.get(name) {
+                Some(b) => b,
+                None => return false,
+            },
         };
         bounds.iter().any(|x| {
             x == b
@@ -240,7 +557,21 @@ impl Checker<'_> {
     /// Whether a concrete type meets a bound.
     fn satisfies(&self, t: &Ty, b: &str) -> bool {
         match b {
-            "Sized" => true,
+            "Sized" | "Send" | "Sync" | "Unpin" => true,
+            "FromStr" => match t {
+                Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
+                Ty::Adt(n, _) => self.adts.method(n, "from_str").is_some(),
+                Ty::Param(n) => self.param_has(n, b),
+                _ => false,
+            },
+            "Sum" | "Product" => match t {
+                Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => true,
+                Ty::Adt(n, _) => self.adts.method(n, &b.to_lowercase()).is_some(),
+                Ty::Param(n) => self.param_has(n, b),
+                _ => false,
+            },
+            // (`From<X>`'s `X` is checked at `T::from(x)`.)
+            "From" => true,
             "Display" | "ToString" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| d.display),
@@ -248,9 +579,24 @@ impl Checker<'_> {
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
-            "Add" | "Sub" | "Mul" | "AddAssign" | "SubAssign" | "MulAssign" => match t {
+            "Add" | "Sub" | "Mul" | "Div" | "Rem" | "AddAssign" | "SubAssign" | "MulAssign"
+            | "DivAssign" | "RemAssign" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => true,
                 Ty::Str => matches!(b, "Add" | "AddAssign"),
+                Ty::Param(n) => self.param_has(n, b),
+                // `impl Add for V` (with `V` on the right, as `T: Add<Output = T>` uses it).
+                Ty::Adt(n, _) => self.has_op_impl(n, b),
+                _ => false,
+            },
+            "BitAnd" | "BitOr" | "BitXor" | "BitAndAssign" | "BitOrAssign" | "BitXorAssign"
+            | "Not" => match t {
+                Ty::Int(_) | Ty::IntLit | Ty::Bool => true,
+                Ty::Param(n) => self.param_has(n, b),
+                Ty::Adt(n, _) => self.has_op_impl(n, b),
+                _ => false,
+            },
+            "Shl" | "Shr" | "ShlAssign" | "ShrAssign" => match t {
+                Ty::Int(_) | Ty::IntLit => true,
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
@@ -258,6 +604,7 @@ impl Checker<'_> {
                 Ty::Int(k) => k.is_signed(),
                 Ty::IntLit | Ty::Float { .. } => true,
                 Ty::Param(n) => self.param_has(n, b),
+                Ty::Adt(n, _) => self.has_op_impl(n, b),
                 _ => false,
             },
             tr if self.adts.traits.contains_key(tr) => self.implements_user_trait(t, tr),
@@ -274,15 +621,31 @@ impl Checker<'_> {
         if let Ty::Param(n) = self.shallow(t)
             && !self.param_has(&n, b)
         {
-            self.error(
-                node,
-                format!("{what} on type parameter `{n}` needs a bound: add `{n}: {b}` to the function's generics"),
-            );
+            // (An associated type's bounds are the trait's: `type Unit: Add<Output = ..>;`.)
+            let msg = match n.split_once("::") {
+                Some((_, a)) => format!(
+                    "{what} on associated type `{n}` needs a bound: declare it in the trait (`type {a}: {b}`)"
+                ),
+                None => format!(
+                    "{what} on type parameter `{n}` needs a bound: add `{n}: {b}` to the function's generics"
+                ),
+            };
+            self.error(node, msg);
         }
     }
 
-    /// `a + b` with `a: T`: needs `T: Add` (etc.); the result is `T`. Integer division can't be
-    /// told from float division once types are erased, so `/` and `%` aren't allowed.
+    /// Whether `adt` has an `impl {tr} for adt` (`Add`, `Neg`, `AddAssign`, ..).
+    pub(super) fn has_op_impl(&self, adt: &str, tr: &str) -> bool {
+        self.adts
+            .op_impls
+            .get(adt)
+            .is_some_and(|v| v.iter().any(|i| i.trait_name == tr))
+    }
+
+    /// `a + b` (or `a += b`, `assign`) with `a: T`: needs `T: Add` (etc.); the result is `T`.
+    /// The function takes `T`'s class, which says what kind of number it is (integer division
+    /// truncates, results wrap) or calls a struct's own `add`: `/`, `%`, `<<` and `>>` need it;
+    /// the others fall back to JS arithmetic without it.
     pub(super) fn param_arith(
         &mut self,
         b: &ast::BinExpr,
@@ -290,21 +653,49 @@ impl Checker<'_> {
         name: &str,
         lt: &Ty,
         rhs: &ast::Expr,
+        assign: bool,
     ) -> Ty {
-        self.check(rhs, lt);
+        let shift = matches!(op, ast::ArithOp::Shl | ast::ArithOp::Shr);
+        if shift {
+            // (`T: Shl<u32>`: the amount is any integer, or a `T`.)
+            let rt = self.infer(rhs, None);
+            if !self.is_integer(&rt) && !matches!(self.shallow(&rt), Ty::Param(_)) {
+                let msg = format!(
+                    "no implementation for `{} {op} {}`",
+                    self.describe(lt),
+                    self.describe(&rt)
+                );
+                self.error(rhs.syntax(), msg);
+            }
+        } else {
+            self.check(rhs, lt);
+        }
         let bound = match op {
             ast::ArithOp::Add => "Add",
             ast::ArithOp::Sub => "Sub",
             ast::ArithOp::Mul => "Mul",
-            _ => {
-                self.error(
-                    b.syntax(),
-                    format!("`{op}` on type parameter `{name}` isn't supported (generic code can't tell integer from float division once types are erased)"),
-                );
-                return lt.clone();
-            }
+            ast::ArithOp::Div => "Div",
+            ast::ArithOp::Rem => "Rem",
+            ast::ArithOp::BitAnd => "BitAnd",
+            ast::ArithOp::BitOr => "BitOr",
+            ast::ArithOp::BitXor => "BitXor",
+            ast::ArithOp::Shl => "Shl",
+            ast::ArithOp::Shr => "Shr",
         };
-        self.require_param_bound(b.syntax(), lt, bound, &format!("`{op}`"));
+        let bound = if assign {
+            format!("{bound}Assign")
+        } else {
+            bound.to_string()
+        };
+        let sym = if assign {
+            format!("`{op}=`")
+        } else {
+            format!("`{op}`")
+        };
+        self.require_param_bound(b.syntax(), lt, &bound, &sym);
+        // Division and shifts depend on the number kind (integer division, the width).
+        let needs_kind = shift || matches!(op, ast::ArithOp::Div | ast::ArithOp::Rem);
+        self.param_class(name, b.syntax(), needs_kind.then_some(sym.as_str()));
         lt.clone()
     }
 

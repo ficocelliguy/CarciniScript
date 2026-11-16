@@ -7,7 +7,7 @@ use ra_ap_syntax::{
 };
 
 use super::{Codegen, Frag, PatCode, debug_fn, default_value, js_string};
-use crate::ty::{IntKind, Ty};
+use crate::ty::Ty;
 
 /// A formatter function for `{:?}` of `ty`.
 fn fmt_of(ty: &Ty) -> String {
@@ -195,6 +195,21 @@ impl Codegen<'_> {
             f.append(ts).push(")");
             return (f, ty);
         }
+        // `impl FromStr for T`: `T.from_str(s)`.
+        if let Ty::Adt(n, _) = &target
+            && self.types.adts.method(n, "from_str").is_some()
+        {
+            let mut f = Frag::mapped(name_off, format!("{}.from_str(", self.class(n)));
+            f.append(rf.clone()).push(")");
+            return (f, ty);
+        }
+        // `s.parse::<T>()` with `T: FromStr`: `T`'s class parses it.
+        if let Ty::Param(_) = &target {
+            let dict = self.dict_of(&target);
+            let mut f = Frag::mapped(name_off, format!("κσ.$tparse({dict}, "));
+            f.append(rf.clone()).push(")");
+            return (f, ty);
+        }
         if target == Ty::Str {
             let mut f = Frag::mapped(name_off, "κσ.Ok(");
             f.append(rf.clone()).push(")");
@@ -204,8 +219,8 @@ impl Codegen<'_> {
             Ty::Float { .. } => ("parseFloat", String::new()),
             Ty::Bool => ("parseBool", String::new()),
             Ty::Char => ("parseChar", String::new()),
-            Ty::Int(k @ (IntKind::I128 | IntKind::U128)) => {
-                ("parseInt128", format!(", {}", k.is_signed()))
+            Ty::Int(k) if k.is_big() => {
+                ("parseInt128", format!(", {}, {}", k.is_signed(), k.bits()))
             }
             Ty::Int(k) => {
                 let (min, max) = k.min_max();

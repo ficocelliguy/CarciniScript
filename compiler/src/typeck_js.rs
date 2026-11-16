@@ -29,6 +29,19 @@ impl Checker<'_> {
             ["js", rest @ ..] => rest,
             all => all,
         };
+        // (`use serde_json::from_str;` then `from_str(..)`.)
+        let imported;
+        let tail = match tail {
+            [f] if self
+                .crate_items
+                .get(*f)
+                .is_some_and(|(k, i)| k == "serde_json" && i == f) =>
+            {
+                imported = ["serde_json", *f];
+                &imported[..]
+            }
+            other => other,
+        };
         let count = |c2: &mut Self, lo: usize, hi: usize| {
             if args.len() < lo || args.len() > hi {
                 let want = if lo == hi {
@@ -107,6 +120,62 @@ impl Checker<'_> {
                 self.pending_json
                     .push((t.clone(), c.syntax().clone(), true));
                 Ty::Result(Box::new(t), Box::new(json_error()))
+            }
+            // The bundled serde_json: the same, failing with `serde_json::Error`.
+            ["serde_json", "to_string" | "to_string_pretty"] => {
+                count(self, 1, 1);
+                if let Some(a) = args.first() {
+                    let t = self.infer(a, None);
+                    self.pending_json.push((t, a.syntax().clone(), false));
+                }
+                Ty::Result(
+                    Box::new(Ty::Str),
+                    Box::new(super::crates::serde_json_error()),
+                )
+            }
+            ["serde_json", "to_value"] => {
+                count(self, 1, 1);
+                if let Some(a) = args.first() {
+                    let t = self.infer(a, None);
+                    self.pending_json.push((t, a.syntax().clone(), false));
+                }
+                Ty::Result(
+                    Box::new(super::crates::json_value()),
+                    Box::new(super::crates::serde_json_error()),
+                )
+            }
+            ["serde_json", f @ ("from_str" | "from_value")] => {
+                count(self, 1, 1);
+                if let Some(a) = args.first() {
+                    let want = if *f == "from_str" {
+                        Ty::Str
+                    } else {
+                        super::crates::json_value()
+                    };
+                    self.check(a, &want);
+                }
+                let turbofish = match c.expr() {
+                    Some(ast::Expr::PathExpr(p)) => p
+                        .path()
+                        .and_then(|p| p.segment())
+                        .and_then(|s| s.generic_arg_list())
+                        .and_then(|l| l.generic_args().next())
+                        .and_then(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                let t = match turbofish {
+                    Some(t) => self.lower_type(&t),
+                    None => match expected.map(|e| self.shallow(e)) {
+                        Some(Ty::Result(t, _)) => *t,
+                        _ => self.fresh(VarKind::General),
+                    },
+                };
+                self.pending_json
+                    .push((t.clone(), c.syntax().clone(), true));
+                Ty::Result(Box::new(t), Box::new(super::crates::serde_json_error()))
             }
             _ => return None,
         })
@@ -198,12 +267,29 @@ impl Checker<'_> {
     /// Check what `JSON` was given once types are settled: values serde could handle.
     pub(super) fn resolve_json(&mut self) {
         for (t, node, parse) in std::mem::take(&mut self.pending_json) {
-            // (`zonk` turns an unsolved variable into `Unknown`; `shallow` keeps it.)
+            // (`zonk` turns an unsolved variable into `Unknown`; `shallow` keeps it. A number
+            // literal's is its default, `i32` / `f64`.)
+            match self.var_kind(&t) {
+                Some(VarKind::Int) if matches!(self.shallow(&t), Ty::Var(_)) => {
+                    self.unify(&t, &Ty::Int(crate::ty::IntKind::I32));
+                }
+                Some(VarKind::Float) if matches!(self.shallow(&t), Ty::Var(_)) => {
+                    self.unify(&t, &Ty::Float { f32: false });
+                }
+                _ => {}
+            }
             if matches!(self.shallow(&t), Ty::Var(_)) {
-                self.error(
-                    &node,
-                    "type annotations needed: say what to parse into, e.g. `JSON::parse::<Config>(..)`",
-                );
+                let text = node.text().to_string();
+                let example = if text.contains("from_value") {
+                    "serde_json::from_value::<Config>(..)"
+                } else if text.contains("from_str") {
+                    "serde_json::from_str::<Config>(..)"
+                } else {
+                    "JSON::parse::<Config>(..)"
+                };
+                let msg =
+                    format!("type annotations needed: say what to parse into, e.g. `{example}`");
+                self.error(&node, msg);
                 continue;
             }
             let z = self.zonk(&t);

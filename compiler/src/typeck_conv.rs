@@ -51,6 +51,17 @@ impl Checker<'_> {
             .iter()
             .filter(|i| self.could_be(&i.src, src))
             .collect();
+        // (An integer literal several impls take is an `i32`, as rustc falls back to.)
+        let int_lit = matches!(self.zonk(src), Ty::IntLit)
+            || (matches!(self.shallow(src), Ty::Var(_))
+                && self.var_kind(src) == Some(super::VarKind::Int));
+        let fits = if fits.len() > 1 && int_lit {
+            fits.into_iter()
+                .filter(|i| i.src == Ty::Int(crate::ty::IntKind::I32))
+                .collect()
+        } else {
+            fits
+        };
         let [one] = fits.as_slice() else { return None };
         self.unify(&one.src, src);
         Some(one.key.clone())
@@ -120,6 +131,98 @@ impl Checker<'_> {
         self.pending_intos
             .push((recv, target.clone(), m.syntax().clone(), self.base));
         target
+    }
+
+    /// `x.try_into()`: `Result<T, E>`, with `T` from the context.
+    pub(super) fn conv_try_into_call(&mut self, m: &ast::MethodCallExpr, recv: Ty) -> Ty {
+        let target = self.fresh(VarKind::General);
+        let err = self.fresh(VarKind::General);
+        self.pending_try_intos.push((
+            recv,
+            target.clone(),
+            err.clone(),
+            m.syntax().clone(),
+            self.base,
+        ));
+        Ty::Result(Box::new(target), Box::new(err))
+    }
+
+    /// Settle each `x.try_into()`: an integer conversion (range-checked), a user `TryFrom`
+    /// impl, or a slice to an array.
+    pub(super) fn resolve_try_intos(&mut self) {
+        let saved = self.base;
+        for (src, target, err, node, base) in std::mem::take(&mut self.pending_try_intos) {
+            self.base = base;
+            let s = if self.var_kind(&src) == Some(VarKind::Int) {
+                Ty::IntLit
+            } else {
+                self.shallow(&src)
+            };
+            let t = self.shallow(&target);
+            let conv = match (&s, &t) {
+                (_, Ty::Var(_)) if self.var_kind(&t) != Some(VarKind::Int) => {
+                    // (Often a call nothing typed, already an error.)
+                    if !self.diags.iter().any(|d| d.severity == "error") {
+                        self.error(&node, "type annotations needed: say what `.try_into()` converts to (e.g. `let y: u8 = x.try_into().unwrap();`)");
+                    }
+                    continue;
+                }
+                (_, Ty::Param(p)) => {
+                    let msg =
+                        format!("`.try_into()` to a type parameter (`{p}`) isn't supported yet");
+                    self.error(&node, msg);
+                    continue;
+                }
+                (Ty::Int(_) | Ty::IntLit | Ty::Unknown | Ty::Var(_), Ty::Char) => {
+                    self.unify(&err, &Ty::Extern("CharTryFromError".into()));
+                    Some(Conv::TryChar)
+                }
+                (Ty::Int(_) | Ty::IntLit | Ty::Unknown | Ty::Var(_), Ty::Int(_) | Ty::Var(_)) => {
+                    let k = match t {
+                        Ty::Int(k) => k,
+                        _ => {
+                            self.unify(&target, &Ty::Int(IntKind::I32));
+                            IntKind::I32
+                        }
+                    };
+                    self.unify(&err, &Ty::Extern("TryFromIntError".into()));
+                    Some(Conv::TryInt {
+                        bits: k.bits(),
+                        signed: k.is_signed(),
+                        big: k.is_big(),
+                    })
+                }
+                (_, Ty::Adt(adt, args)) if self.adts.method(adt, "try_from").is_some() => {
+                    let (adt, args) = (adt.clone(), args.clone());
+                    let m = self.adts.method(&adt, "try_from").cloned().unwrap();
+                    let m = self.method_inst(&m, Some(&args));
+                    let ok = m.params.first().is_some_and(|p| self.unify(p, &src))
+                        && self.unify(
+                            &m.ret,
+                            &Ty::Result(Box::new(target.clone()), Box::new(err.clone())),
+                        );
+                    ok.then_some(Conv::TryFrom { adt })
+                }
+                (Ty::Vec(x), Ty::Vec(y)) => {
+                    let (x, y) = (x.clone(), y.clone());
+                    self.unify(&err, &Ty::Extern("TryFromSliceError".into()));
+                    self.unify(&x, &y).then_some(Conv::TryVec)
+                }
+                _ => None,
+            };
+            match conv {
+                Some(c) => self.record_conv(&node, c),
+                None => {
+                    let msg = format!(
+                        "the trait bound `{}: TryFrom<{}>` is not satisfied",
+                        self.describe(&t),
+                        self.describe(&s)
+                    );
+                    self.error(&node, msg);
+                }
+            }
+        }
+        self.base = saved;
     }
 
     pub(super) fn resolve_intos(&mut self) {
@@ -230,10 +333,18 @@ impl Checker<'_> {
             .get(adt)
             .map(|v| v.iter().filter(|i| i.trait_name == tr).cloned().collect())
             .unwrap_or_default();
-        let fits: Vec<&crate::adt::OpImpl> = impls
+        let mut fits: Vec<&crate::adt::OpImpl> = impls
             .iter()
             .filter(|i| self.could_be(&i.rhs, &rt))
             .collect();
+        // References are erased, so `impl Add for V` and `impl Add<&V> for &V` (or `Add<&V>
+        // for V`) are the same operation here: the first one serves.
+        if fits.len() > 1 {
+            let first = self.describe(&fits[0].rhs);
+            if fits.iter().all(|i| self.describe(&i.rhs) == first) {
+                fits.truncate(1);
+            }
+        }
         if let [one] = fits.as_slice() {
             self.unify(&one.rhs, &rt);
             let key = one.key.clone();
@@ -408,6 +519,30 @@ impl Checker<'_> {
     /// `?` on a `Result<_, E1>` in a function returning `Result<_, E2>`: when `E2: From<E1>`,
     /// the error is converted. Returns whether a conversion was recorded.
     pub(super) fn try_convert(&mut self, t: &ast::TryExpr, e: &Ty, re: &Ty) -> bool {
+        // Into `anyhow::Error`: any error, wrapped (`{:?}` shows it as the cause chain).
+        if self.shallow(re) == super::crates::anyhow_error() {
+            let ok = match self.shallow(e) {
+                Ty::Extern(n) => n == "anyhow::Error" || super::res::is_std_error(&n),
+                Ty::Adt(n, _) => self
+                    .adts
+                    .defs
+                    .get(&n)
+                    .is_some_and(|d| d.implements("Error")),
+                Ty::Dyn(tr) => tr == "Error",
+                _ => false,
+            };
+            if ok && self.shallow(e) != super::crates::anyhow_error() {
+                self.record_conv(
+                    t.syntax(),
+                    Conv::Wrap {
+                        js: "κσ.$anyhow.from".into(),
+                    },
+                );
+            }
+            if ok {
+                return true;
+            }
+        }
         // Into `Box<dyn Error>`: std errors and your `impl Error` types, unchanged.
         if self.shallow(re) == Ty::Dyn("Error".into()) {
             let ok = match self.shallow(e) {

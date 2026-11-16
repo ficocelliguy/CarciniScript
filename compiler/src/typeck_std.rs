@@ -208,6 +208,11 @@ impl Checker<'_> {
                 }
             }
 
+            // `s.as_ref()` / `v.borrow()` (`AsRef<str>`, `AsRef<[T]>`): the value itself.
+            (Ty::Str | Ty::Vec(_), "as_ref" | "borrow") => {
+                count(self, 0);
+                rt.clone()
+            }
             // ---- integers
             (Ty::Int(k), m2)
                 if m2.starts_with("checked_")
@@ -558,6 +563,40 @@ impl Checker<'_> {
                     self.infer(a, None);
                 }
                 USIZE
+            }
+            ["DefaultHasher", "new" | "default"] => {
+                count(self, 0);
+                Ty::Hasher
+            }
+            // `u8::try_from(300)`: `Err(TryFromIntError(()))` when out of range.
+            // `char::try_from(0x41u32)`
+            ["char", "try_from"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &U32);
+                }
+                Ty::Result(
+                    Box::new(Ty::Char),
+                    Box::new(Ty::Extern("CharTryFromError".into())),
+                )
+            }
+            [t, "try_from"] if matches!(Ty::from_name(t), Ty::Int(_)) => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    let s = self.infer(a, None);
+                    let ok = matches!(self.shallow(&s), Ty::Int(_) | Ty::Unknown | Ty::Var(_));
+                    if !ok {
+                        let msg = format!(
+                            "the trait bound `{t}: TryFrom<{}>` is not satisfied",
+                            self.describe(&s)
+                        );
+                        self.error(a.syntax(), msg);
+                    }
+                }
+                Ty::Result(
+                    Box::new(Ty::from_name(t)),
+                    Box::new(Ty::Extern("TryFromIntError".into())),
+                )
             }
             // `u32::default()`, `String::default()`
             [t, "default"] if Ty::from_name(t) != Ty::Unknown => {

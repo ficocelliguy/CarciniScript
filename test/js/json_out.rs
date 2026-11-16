@@ -47,6 +47,11 @@ fn main() {
     println!("{}", JSON::stringify(&floats));
     println!("{}", JSON::stringify(&vec![0.1f32, 1.0f32, 16777216.0f32, 3.4e38f32, 1e-7f32]));
     println!("{}", JSON::stringify(&(i32::MIN, u8::MAX, -7i64, 123456789u32)));
+    println!("{}", JSON::stringify(&(u64::MAX, i64::MIN, 9007199254740993u64)));
+    let mut ids = BTreeMap::new();
+    ids.insert(u64::MAX, "max");
+    ids.insert(1u64 << 60, "big");
+    println!("{}", JSON::stringify(&ids));
     println!("{}", JSON::stringify(&f64::NAN));
     // Strings, chars, bools, unit.
     println!("{}", JSON::stringify(&"quote \" backslash \\ newline \n tab \t bell \u{7} é ✓"));

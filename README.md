@@ -120,6 +120,18 @@ steps, is an error at the invocation. `compile` returns the crates a file used i
 `dependencies`, so a host that caches compiled scripts can recompile when one changes (Bitburner
 does).
 
+### Bundled crates
+
+A few popular crates are built in and need no `Cargo.toml`: `rand` (`rng.gen_range(1..=6)`,
+`v.shuffle(&mut rng)`), `itertools` (`iter.sorted().dedup().join(", ")`, `combinations`,
+`tuple_windows`, `counts`, ..), `anyhow` (`Result`, `bail!`, `.context(..)`), `thiserror`
+(`#[derive(Error)]`), `bitflags!`, `once_cell` / `lazy_static!` (and std's `LazyLock` /
+`OnceLock`), `either`, `cfg_if!`, `hashbrown`, `serde` + `serde_json`
+(`serde_json::to_string(&state)?`, `from_str::<Config>(&text)?`, `json!`, `Value`), `regex`
+(`Regex::new(r"(\d+)GB")`, `captures`, `replace_all`) and `rayon` (`par_iter()`, run on one
+thread). `extern crate x;` works for these. See [FEATURES.md](docs/FEATURES.md) for what each
+covers and [RUST_GAPS.md](docs/RUST_GAPS.md) for what differs (rand's seeded sequences, for one).
+
 ### JS globals
 
 The built-in `js` crate reaches JS globals with Rust types: `use js::{Date, JSON};`, then

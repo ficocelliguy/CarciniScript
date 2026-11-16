@@ -3,7 +3,7 @@
 //    (101 on panic) must match.
 //  - ns/*.rs: async NS scripts run against a mock `ns`; output must match ns/*.expected.
 //  - Source map and diagnostics checks.
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -21,6 +21,7 @@ import {
   rename,
 } from "../index.js";
 import "../runtime/rt.js";
+import { buildNative } from "../tools/native-build.mjs";
 import { nativePanic } from "../tools/native-panic.mjs";
 
 // `js::Date`'s local time is UTC in the tests (the native shim has no time zones).
@@ -84,7 +85,7 @@ async function runJs(jsPath, args = []) {
 
 function runNative(file) {
   const exe = path.join(outDir, path.basename(file, ".rs") + (process.platform === "win32" ? ".exe" : ""));
-  execFileSync("rustc", ["-O", "--edition", "2024", "-A", "warnings", "-o", exe, file], { stdio: "pipe" });
+  buildNative(file, exe);
   const r = spawnSync(exe, { encoding: "utf8" });
   return {
     stdout: r.stdout.replace(/\r\n/g, "\n"),
@@ -293,7 +294,7 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
       fs.writeFileSync(jsPath, out.code);
       const js = await runJs(jsPath);
       const exe = path.join(outDir, `debug-${path.basename(file, ".rs")}${process.platform === "win32" ? ".exe" : ""}`);
-      execFileSync("rustc", ["--edition", "2024", "-A", "warnings", "-o", exe, path.join(here, "debug", file)], { stdio: "pipe" });
+      buildNative(path.join(here, "debug", file), exe, { debug: true });
       const r = spawnSync(exe, { encoding: "utf8" });
       const nativeStdout = r.stdout.replace(/\r\n/g, "\n");
       const at = (s) => {
@@ -436,7 +437,7 @@ function decodeMappings(mappings) {
     const srcLines = src.split(/\r?\n/);
     // Each probe: a JS snippet whose line must map back to the Rust line containing the needle.
     const probes = [
-      ["return fib(", "fib(n - 1) + fib(n - 2)"],
+      ["return κσ.$w128(fib(", "fib(n - 1) + fib(n - 2)"],
       ["n = ((", "n = if n % 2 == 0"],
       ["$outer: for", "'outer: for a in 1..20"],
       ["break $outer;", "break 'outer;"],
@@ -452,7 +453,7 @@ function decodeMappings(mappings) {
       }
     }
     // Column check: the second `fib(` call maps to its exact Rust column.
-    const gl = genLines.findIndex((l) => l.includes("return fib("));
+    const gl = genLines.findIndex((l) => l.includes("return κσ.$w128(fib("));
     const genCol = genLines[gl].lastIndexOf("fib(");
     const srcLine = srcLines.findIndex((l) => l.includes("fib(n - 1) + fib(n - 2)"));
     const want = srcLines[srcLine].lastIndexOf("fib(");
@@ -581,11 +582,47 @@ const rejected = [
   ["Eq on a struct with an f64 field", "}\n#[derive(PartialEq, Eq)]\nstruct Q { a: f64 }\nfn f() {", "the trait `Eq` is not implemented for `f64` (field `a` of `Q`)"],
   ["mutating through &self", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&self) { self.a = 1; } }\nfn f() {", "4:24 cannot borrow `*self` as mutable, as it is behind a `&` reference"],
   ["&mut self method on an immutable binding", "}\nstruct Q { a: i32 }\nimpl Q { fn f(&mut self) { self.a = 1; } }\nfn g() {\n    let q = Q { a: 0 };\n    q.f();", "7:5 cannot borrow `q` as mutable, as it is not declared as mutable"],
-  ["trait impls", "}\nstruct Q;\nimpl std::hash::Hash for Q { fn hash<H: std::hash::Hasher>(&self, h: &mut H) {} }\nfn f() {", "4:6 `impl Hash for ..` is not supported yet"],
+  ["trait impls", "}\nstruct Q;\nimpl Drop for Q { fn drop(&mut self) {} }\nfn f() {", "4:6 `impl Drop for ..` is not supported yet"],
+  ["peek on an iterator not declared mut", "let v = vec![1, 2];\n    let it = v.iter().peekable();\n    let p = it.peek();", "4:13 cannot borrow `it` as mutable"],
+  ["try_fold with a closure returning a plain value", "let s = (1..4).try_fold(0, |a, x| a + x);", "2:13 `try_fold` needs a closure returning `Result<{integer}, E>` or `Option<{integer}>`"],
+  ["an or-pattern binding a name in one alternative only","let p = (Some(1), 2);\n    match p {\n        (Some(x), _) | (None, _) => {}\n    }", "4:24 variable `x` is not bound in all patterns"],
+  ["an or-pattern binding a name at two types", "let r: Result<i32, String> = Ok(1);\n    match r {\n        Ok(x) | Err(x) => {}\n    }", "4:17 mismatched types: `x` is `i32` in one alternative and `String` in another"],
+  ["a struct builder method on a list builder", "}\nstruct P;\nimpl std::fmt::Debug for P {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        f.debug_list().field(\"a\", &1).finish()\n    }\n}\nfn g() {", "6:9 no method named `field` found for struct `DebugList` in the current scope"],
+  ["a builder value without Debug", "}\nstruct Q;\nstruct P {\n    q: Q,\n}\nimpl std::fmt::Debug for P {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        f.debug_struct(\"P\").field(\"q\", &self.q).finish()\n    }\n}\nfn g() {", "9:40 `Q` doesn't implement `std::fmt::Debug`"],
+  ["cfg! of the target", "let w = cfg!(target_os = \"linux\");", "2:13 `cfg!(target_os)` isn't supported"],
+  ["TryFrom implemented twice", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<u8> for E {\n    type Error = ();\n    fn try_from(v: u8) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {", "12:8 implementing `TryFrom` more than once for `E` isn't supported yet"],
+  ["try_into without a target", "let x = 5i64.try_into();", "2:13 type annotations needed: say what `.try_into()` converts to"],
+  ["hash of a float", "}\nuse std::hash::{Hash, Hasher};\nstruct P(f64);\nimpl Hash for P {\n    fn hash<H: Hasher>(&self, state: &mut H) {\n        self.0.hash(state);\n    }\n}\nfn g() {", "7:9 the trait bound `f64: Hash` is not satisfied"],
   ["`<` on a type parameter without PartialOrd", "}\nfn big<T>(a: T, b: T) -> bool {\n    a > b", "4:5 comparing with `<` on type parameter `T` needs a bound: add `T: PartialOrd`"],
   ["generic call with an unsatisfied bound", "}\nfn show<T: std::fmt::Display>(x: T) {}\nfn f() {\n    show(vec![1]);", "5:5 the trait bound `Vec<i32>: Display` is not satisfied"],
-  ["division on a type parameter", "}\nfn half<T: Copy>(x: T, y: T) -> T {\n    x / y", "4:5 `/` on type parameter `T` isn't supported"],
-  ["unsupported trait bound", "}\nfn f<T: Into<f64>>(x: T) {", "3:9 the trait bound `Into` is not supported yet on type parameters"],
+  ["division on a type parameter without Div", "}\nfn half<T: Copy>(x: T, y: T) -> T {\n    x / y", "4:5 `/` on type parameter `T` needs a bound: add `T: Div` to the function's generics"],
+  ["division on an enum impl's type parameter in a method", "}\nenum E<T> {\n    A(T),\n}\nimpl<T: std::ops::Div<Output = T> + Copy> E<T> {\n    fn half(&self, d: T) -> T {\n        match self {\n            E::A(v) => *v / d,\n        }\n    }\n}\nfn g() {", "9:24 `/` on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum"],
+  ["T::from with the wrong argument type", "}\nfn w<T: From<u8>>(s: String) -> T {\n    T::from(s)", "4:13 mismatched types: expected `u8`, found `String`"],
+  ["shift on a type parameter without Shl", "}\nfn up<T: Copy>(x: T) -> T {\n    x << 1", "4:5 `<<` on type parameter `T` needs a bound: add `T: Shl` to the function's generics"],
+  ["! on a type parameter without Not", "}\nfn inv<T: Copy>(x: T) -> T {\n    !x", "4:5 `!` on type parameter `T` needs a bound: add `T: Not` to the function's generics"],
+  ["shift of a type parameter by a string", "}\nfn up<T: std::ops::Shl<Output = T>>(x: T) -> T {\n    x << \"a\"", "4:10 no implementation for `T << String`"],
+  ["a float where a bitwise bound is needed", "}\nfn and<T: std::ops::BitAnd<Output = T>>(x: T, y: T) -> T {\n    x & y\n}\nfn g() {\n    and(1.5, 2.0);", "7:5 the trait bound `f64: BitAnd` is not satisfied"],
+  ["! on an enum impl's type parameter in a method", "}\nenum E<T> {\n    A(T),\n}\nimpl<T: std::ops::Not<Output = T> + Copy> E<T> {\n    fn inv(&self) -> T {\n        match self {\n            E::A(v) => !*v,\n        }\n    }\n}\nfn g() {", "9:24 `!` on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum"],
+  ["an empty Vec nothing types", "let v = Vec::new();\n    println!(\"hi\");", "2:9 type annotations needed for `Vec<_>`"],
+  ["a HashMap nothing types", "let m = std::collections::HashMap::new();\n    println!(\"{}\", m.len());", "2:9 type annotations needed for `HashMap<_, _>`"],
+  ["a None nothing types", "let x = None;\n    println!(\"{}\", x.is_some());", "2:9 type annotations needed for `Option<_>`"],
+  ["a generic struct nothing types", "}\nstruct Stack<T> { items: Vec<T> }\nimpl<T> Stack<T> { fn new() -> Self { Stack { items: Vec::new() } } }\nfn g() {\n    let s = Stack::new();\n    println!(\"{}\", s.items.len());", "6:9 type annotations needed for `Stack<_>`"],
+  ["an Itertools method without the import", "let s = (1..3).map(|x| x * 2).join(\",\");", "2:13 no method named `join` found for iterator"],
+  ["gen_range of a range in a variable", "}\nuse rand::Rng;\nfn g() {\n    let mut rng = rand::thread_rng();\n    let r = 0..5;\n    let x = rng.gen_range(r);", "7:13 `gen_range` takes a range written out here (`lo..hi` or `lo..=hi`)"],
+  ["an RNG that isn't mut", "}\nuse rand::Rng;\nfn g() {\n    let rng = rand::thread_rng();\n    let x: u8 = rng.gen_range(0..5);", "6:17 cannot borrow `rng` as mutable, as it is not declared as mutable"],
+  ["sorted() on floats", "}\nuse itertools::Itertools;\nfn g() {\n    let v = vec![1.5, 0.5];\n    let s: Vec<f64> = v.into_iter().sorted().collect();", "6:23 the trait bound `{float}: Ord` is not satisfied"],
+  [".context() without anyhow", "let r: Result<i32, String> = Ok(1);\n    let x = r.context(\"x\");", "3:13 no method named `context` found for `Result<i32, String>` (if you meant `anyhow::Context`'s, add `use anyhow::Context;`)"],
+  ["a thiserror message naming no field", "}\nuse thiserror::Error;\n#[derive(Error, Debug)]\nenum E {\n    #[error(\"bad {nope}\")]\n    A { x: i32 },\n}\nfn g() {", "6:5 there is no field `nope` here"],
+  ["an unknown bitflags flag", "}\nbitflags::bitflags! {\n    struct F: u8 {\n        const A = 1;\n    }\n}\nfn g() {\n    let f = F::B;", "9:13 no function or associated item named `B` found for struct `F`"],
+  ["serde_json::from_str with nothing to parse into", "let v = serde_json::from_str(\"1\");", "2:13 type annotations needed: say what to parse into, e.g. `serde_json::from_str::<Config>(..)`"],
+  ["serde_json::to_string of a closure", "let f = |x: i32| x;\n    let s = serde_json::to_string(&f);", "3:35 the trait bound"],
+  ["an extern crate that isn't bundled", "}\nextern crate tokio;\nfn g() {", "3:1 unresolved import `tokio`"],
+  ["a regex::Error of the wrong kind", "}\nfn g() -> Result<(), regex::Error> {\n    let x: i32 = \"a\".parse()?;\n    Ok(())", "4:18 `?` couldn't convert the error to `RegexError`"],
+  ["parse()? into an error without From, beside a FromStr impl", "}\nstruct E;\nstruct P;\nimpl std::str::FromStr for P {\n    type Err = E;\n    fn from_str(s: &str) -> Result<P, E> { Ok(P) }\n}\nfn g() -> Result<(), E> {\n    let x: i32 = \"a\".parse()?;\n    Ok(())", "10:18 `?` couldn't convert the error to `E` (add `impl From<ParseIntError> for E`"],
+  ["bail! in a function that doesn't return a Result", "}\nuse anyhow::bail;\nfn g() -> i32 {\n    bail!(\"no\");", "5:5 mismatched types"],
+  ["parse into a type parameter without FromStr", "}\nfn p<T: Copy>(s: &str) -> T {\n    s.parse::<T>().unwrap()", "4:5 the trait bound `T: FromStr` is not satisfied"],
+  ["a user type without the operator a bound needs","}\n#[derive(Clone, Copy)]\nstruct M(i32);\nfn dbl<T: std::ops::Add<Output = T> + Copy>(x: T) -> T {\n    x + x\n}\nfn g() {\n    let m = dbl(M(1));", "9:13 the trait bound `M: Add` is not satisfied"],
+  ["unsupported trait bound", "}\nfn f<T: Read>(x: T) {", "3:9 the trait bound `Read` is not supported yet on type parameters"],
   ["method outside a type parameter's bounds", "}\nfn f<T>(x: T) -> usize {\n    x.len()", "4:5 no method named `len` found for type parameter `T`"],
   ["mutable string slice", "let mut s = String::from(\"abc\");\n    let t = &mut s[1..];", "3:13 mutable string slices (`&mut s[a..b]`) are not supported"],
   ["trait impl missing a method", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S {}\nfn f() {", "5:12 not all trait items implemented, missing: `a`"],
@@ -593,7 +630,7 @@ const rejected = [
   ["generic call with an unimplemented user trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn g<X: T>(x: X) -> i32 { x.a() }\nfn f() {\n    g(5);", "7:5 the trait bound `i32: T` is not satisfied"],
   ["unknown method on dyn Trait", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 0 } }\nfn f() {\n    let d: Box<dyn T> = Box::new(S);\n    d.c();", "8:5 no method named `c` found for `dyn T`"],
   ["Box<dyn Trait> of a type without the impl", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn f() {\n    let d: Box<dyn T> = Box::new(S);", "6:34 the trait bound `S: T` is not satisfied"],
-  ["`T::make()` on an impl's type parameter", "}\ntrait M { fn make() -> Self; }\nstruct S<T> { t: T }\nimpl<T: M> S<T> {\n    fn g(&self) -> T {\n        T::make()\n    }\n}\nfn f() {", "7:9 `T::..` on a type parameter of an `impl` isn't supported yet"],
+  ["`T::make()` on an enum impl's type parameter", "}\ntrait M { fn make() -> Self; }\nenum S<T> { A(T) }\nimpl<T: M> S<T> {\n    fn g(&self) -> T {\n        T::make()\n    }\n}\nfn f() {", "7:9 `T::..` on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum"],
   ["calling a function the bound doesn't have", "}\ntrait M { fn make() -> Self; }\nfn g<T: M>() -> T {\n    T::build()\n}\nfn f() {", "5:5 no function or associated item named `build` found for type parameter `T`"],
   ["non-exhaustive slice match names the missing length", "let v = vec![1];\n    match v.as_slice() { [] => {}, [x] => {} }", "3:11 non-exhaustive patterns: `[_, _, ..]` not covered"],
   ["break with a value from a while loop", "while true { break 5; }", "2:18 `break` with value from a `while` or `for` loop"],
@@ -679,6 +716,26 @@ const rejected = [
   ["a timer handler that isn't a closure", "js::set_timeout(5, 10.0);", "2:21 mismatched types"],
   ["Promise::all of plain values", "let x = js::Promise::all(vec![1, 2]);", "2:30 `Promise::all` takes a `Vec` of futures (unawaited async calls), found `Vec<{integer}>`"],
   ["a js function that isn't imported", "let s = btoa(\"a\");", "2:13 cannot find function `btoa` in this scope"],
+  ["an associated type used as a concrete type", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nfn f<S: Shape>(s: &S) -> f64 {\n    s.area()", "8:5 mismatched types: expected `f64`, found `S::Unit`"],
+  ["a method an associated type's bounds don't have", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nfn f<S: Shape>(s: &S) {\n    let y = s.area().sqrt();", "8:13 no method named `sqrt` found for type parameter `S::Unit`"],
+  ["{:?} of an associated type without Debug", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nfn f<S: Shape>(s: &S) {\n    println!(\"{:?}\", s.area());", "8:14 `S::Unit` doesn't implement `std::fmt::Debug`"],
+  ["arithmetic on an associated type without Add", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nfn f<S: Shape>(s: &S) {\n    let a = s.area();\n    let b = a + a;", "9:13 `+` on associated type `S::Unit` needs a bound: declare it in the trait (`type Unit: Add`)"],
+  ["two type parameters' associated types", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nfn f<S: Shape, T: Shape>(s: &S, t: &T) -> S::Unit {\n    t.area()", "8:5 mismatched types: expected `S::Unit`, found `T::Unit`"],
+  ["a generic trait's argument through a bound", "}\ntrait Convert<T> {\n    fn convert(&self) -> T;\n}\nfn f<C: Convert<String>>(c: &C) -> i32 {\n    c.convert()", "7:5 mismatched types: expected `i32`, found `String`"],
+  ["an impl missing an associated type", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nstruct Sq;\nimpl Shape for Sq {\n    fn area(&self) -> f64 {\n        1.0\n    }\n}\nfn f() {", "8:16 not all trait items implemented, missing: `Unit`"],
+  ["an associated type the trait doesn't have", "}\ntrait Named {\n    fn name(&self) -> String;\n}\nstruct A;\nimpl Named for A {\n    type Extra = i32;\n    fn name(&self) -> String {\n        String::new()\n    }\n}\nfn f() {", "8:5 type `Extra` is not a member of trait `Named`"],
+  ["an associated type default", "}\ntrait Shape {\n    type Unit = f64;\n}\nfn f() {", "4:5 associated type defaults are unstable"],
+  ["a generic trait implemented twice for one type", "}\ntrait Convert<T> {\n    fn convert(&self) -> T;\n}\nstruct A;\nimpl Convert<i32> for A {\n    fn convert(&self) -> i32 {\n        1\n    }\n}\nimpl Convert<String> for A {\n    fn convert(&self) -> String {\n        String::new()\n    }\n}\nfn f() {", "12:6 implementing the generic trait `Convert` more than once for `A` isn't supported yet"],
+  ["a blanket impl's method on a type without the bound", "}\ntrait Shout {\n    fn shout(&self) -> String;\n}\nimpl<T: std::fmt::Display> Shout for T {\n    fn shout(&self) -> String {\n        format!(\"{}!\", self)\n    }\n}\nstruct P;\nfn f() {\n    let s = P.shout();", "13:13 no method named `shout` found for struct `P`"],
+  ["a const argument nothing gives", "}\nfn zeros<const N: usize>() -> [f64; N] {\n    [0.0; N]\n}\nfn f() {\n    let z = zeros();", "7:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the function `zeros`"],
+  ["mismatched const arguments", "}\nstruct M<const R: usize> {\n    d: [i32; R],\n}\nimpl<const R: usize> M<R> {\n    fn z() -> Self {\n        M { d: [0; R] }\n    }\n}\nfn f() {\n    let m: M<2> = M::<3>::z();", "12:19 mismatched types: expected `M<2>`, found `M<3>`"],
+  ["an expression as a const argument", "}\nfn one<const N: usize>() -> usize {\n    N\n}\nfn two<const N: usize>() -> usize {\n    one::<{ N + 1 }>()\n}\nfn f() {", "7:13 generic parameters may not be used in const operations"],
+  ["a const fn call as a const argument", "}\nconst fn words(bits: usize) -> usize {\n    bits / 8\n}\nfn mk<const N: usize>() -> [u8; N] {\n    [1; N]\n}\nfn f() {\n    let a = mk::<{ words(64) }>();", "10:20 this const argument isn't supported yet"],
+  ["a 64-bit const parameter","}\nfn big<const N: u64>() -> u64 {\n    N\n}\nfn f() {", "3:8 const parameters of type `u64` aren't supported"],
+  ["a struct's const argument nothing gives", "}\nstruct S<const N: usize> {\n    v: Vec<i32>,\n}\nfn f() {\n    let s = S { v: vec![] };", "7:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the struct `S`"],
+  ["const parameters on an enum", "}\nenum E<const N: usize> {\n    A,\n}\nfn f() {", "3:7 const generic parameters on enums are not supported yet"],
+  ["parse into a type without FromStr","}\nstruct P;\nfn f() {\n    let p = \"1\".parse::<P>();", "5:13 the trait bound `P: FromStr` is not satisfied"],
+  ["using an array of Strings after moving it", "let a = [String::from(\"x\")];\n    let b = a;\n    println!(\"{:?} {:?}\", a, b);", "4:27 use of moved value: `a`"],
   ["structured_clone of a type without Clone", "}\nstruct P {\n    x: i32,\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = js::structured_clone(&p);", "8:34 the trait bound `P: Clone` is not satisfied (`structured_clone` copies Rust values by their `Clone`)"],
   ["a pointer cast to an integer", "let x = 1;\n    let p = &x as *const i32;\n    let a = p as usize;", "4:13 casting a raw pointer to an integer isn't supported"],
   ["an integer cast to a pointer", "let p = 0x1000 as *const i32;", "2:13 casting an integer to a raw pointer isn't supported"],
@@ -809,7 +866,7 @@ const rejectedFiles = [
     { "main.rs": "mod a;\nfn main() {}", "a.rs": "mod main;\npub fn f() {}" },
     "1:1 circular modules",
   ],
-  ["crates other than std", { "main.rs": "use rand::Rng;\nfn main() {}" }, "1:5 unresolved import `rand`"],
+  ["crates other than std", { "main.rs": "use tokio::time;\nfn main() {}" }, "1:5 unresolved import `tokio`"],
 ];
 for (const [label, files, want] of rejectedFiles) {
   const name = `rejects: ${label}`;

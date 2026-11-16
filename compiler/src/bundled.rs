@@ -1,0 +1,1578 @@
+//! The bundled crates that are source rewrites: `#[derive(thiserror::Error)]` (a `Display`, an
+//! `Error` and the `From` impls), `bitflags!` (a struct of bits with consts, set operations and
+//! bitflags' `{:?}`), `cfg_if!` (the first branch whose predicate holds), `lazy_static!`
+//! (`LazyLock` statics), serde_json's `json!` (the `Value` it makes) and rayon (run
+//! sequentially: `par_iter()` is `iter()`). A pre-pass over
+//! the text, like the proc macros': each rewrite keeps the `OffsetMap` in step, so positions
+//! still point into the original.
+
+use ra_ap_syntax::{
+    AstNode, SourceFile, TextRange,
+    ast::{self, HasArgList, HasAttrs, HasGenericParams, HasName},
+};
+
+use crate::macros::EDITION;
+use crate::mbe::OffsetMap;
+
+/// Whether `text` uses any of these crates (a cheap test before parsing).
+pub fn uses_bundled(text: &str) -> bool {
+    text.contains("thiserror")
+        || text.contains("bitflags!")
+        || text.contains("cfg_if!")
+        || text.contains("lazy_static!")
+        || text.contains("rayon")
+        || text.contains("serde_json")
+        || text.contains("regex")
+}
+
+/// An error in the original text: (start, end, message).
+pub type Error = (usize, usize, String);
+
+/// Rewrite every use in `text`; returns whether anything changed.
+pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>> {
+    let file = SourceFile::parse(text, EDITION).tree();
+    let thiserror = text.contains("thiserror");
+    let rayon_used = text.contains("rayon");
+    let json_used = text.contains("serde_json");
+    // (Not where `regex` is the file's own module.)
+    let regex_used =
+        (text.contains("regex::") || text.contains("use regex")) && !text.contains("mod regex");
+    let json_map_imported = json_used
+        && crate::typeck::crates::crate_imports(text)
+            .get("Map")
+            .is_some_and(|(k, i)| k == "serde_json" && i == "Map");
+    let mut edits: Vec<(TextRange, String)> = Vec::new();
+    let mut errors: Vec<(TextRange, String)> = Vec::new();
+    for node in file.syntax().descendants() {
+        if thiserror && let Some(adt) = ast::Adt::cast(node.clone()) {
+            derive_error(&adt, &mut edits, &mut errors);
+            continue;
+        }
+        if json_used {
+            if let Some(mc) = ast::MacroCall::cast(node.clone())
+                && is_json_call(&mc)
+                && let Some(tt) = mc.token_tree()
+            {
+                edits.push((mc.syntax().text_range(), json_of(&tt_items(&tt), text)));
+                continue;
+            }
+            // (Calls in other macros' tokens; a `json!`'s own are its.)
+            if let Some(tt) = ast::TokenTree::cast(node.clone())
+                && let Some(parent) = tt.syntax().parent()
+                && !ast::TokenTree::can_cast(parent.kind())
+                && !ast::MacroCall::cast(parent).is_some_and(|mc| is_json_call(&mc))
+            {
+                json_in_tokens(&tt, text, &mut edits);
+            }
+        }
+        // `serde_json::Map` (and `Map` imported from it) is a `BTreeMap`.
+        if json_used
+            && let Some(path) = ast::Path::cast(node.clone())
+            && path.qualifier().is_none()
+            && !path
+                .syntax()
+                .ancestors()
+                .any(|a| ast::Use::can_cast(a.kind()))
+            && let Some(parent) = path.parent_path()
+            && path.syntax().text() == "serde_json"
+            && parent
+                .segment()
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "Map")
+        {
+            let r = path.syntax().text_range().cover(
+                parent
+                    .segment()
+                    .and_then(|s| s.name_ref().map(|n| n.syntax().text_range()))
+                    .unwrap_or(path.syntax().text_range()),
+            );
+            edits.push((r, "std::collections::BTreeMap".into()));
+        } else if json_map_imported
+            && let Some(path) = ast::Path::cast(node.clone())
+            && path.qualifier().is_none()
+            && !path
+                .syntax()
+                .ancestors()
+                .any(|a| ast::Use::can_cast(a.kind()))
+            && path
+                .segment()
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "Map")
+        {
+            let r = path
+                .segment()
+                .and_then(|s| s.name_ref())
+                .map(|n| n.syntax().text_range());
+            if let Some(r) = r {
+                edits.push((r, "std::collections::BTreeMap".into()));
+            }
+        }
+        if regex_used {
+            regex(&node, &mut edits);
+            if let Some(tt) = ast::TokenTree::cast(node.clone())
+                && !tt
+                    .syntax()
+                    .parent()
+                    .is_some_and(|p| ast::TokenTree::can_cast(p.kind()))
+            {
+                regex_tokens(&tt, &mut edits);
+            }
+        }
+        if rayon_used {
+            rayon(&node, &mut edits);
+            if let Some(tt) = ast::TokenTree::cast(node.clone())
+                && !tt
+                    .syntax()
+                    .parent()
+                    .is_some_and(|p| ast::TokenTree::can_cast(p.kind()))
+            {
+                rayon_tokens(&tt, &mut edits);
+            }
+        }
+        let Some(mc) = ast::MacroCall::cast(node) else {
+            continue;
+        };
+        let Some(name) = mc
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|s| s.name_ref())
+            .map(|n| n.text().to_string())
+        else {
+            continue;
+        };
+        if !matches!(name.as_str(), "bitflags" | "cfg_if" | "lazy_static") {
+            continue;
+        }
+        let Some(tt) = mc.token_tree() else { continue };
+        let tt_text = tt.syntax().text().to_string();
+        // (Without its delimiters; an unfinished one has no closing one.)
+        let Some(body) = tt_text
+            .strip_prefix(['{', '(', '['])
+            .and_then(|b| b.strip_suffix(['}', ')', ']']))
+        else {
+            continue;
+        };
+        let out = match name.as_str() {
+            "bitflags" => bitflags(body),
+            "cfg_if" => cfg_if(body),
+            "lazy_static" => lazy_static(body),
+            _ => None,
+        };
+        if let Some(out) = out {
+            // (An item macro's trailing `;` goes too.)
+            let mut r = mc.syntax().text_range();
+            if let Some(semi) = mc.semicolon_token() {
+                r = r.cover(semi.text_range());
+            }
+            edits.push((r, out));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors
+            .into_iter()
+            .map(|(r, m)| {
+                let (a, b) = (usize::from(r.start()), usize::from(r.end()));
+                (map.orig(a, false), map.orig(b, true), m)
+            })
+            .collect());
+    }
+    if edits.is_empty() {
+        return Ok(false);
+    }
+    edits.sort_by_key(|(r, _)| std::cmp::Reverse((r.start(), r.end())));
+    let mut last_start = usize::MAX;
+    for (r, new) in edits {
+        let (a, b) = (usize::from(r.start()), usize::from(r.end()));
+        if b > last_start {
+            continue;
+        }
+        text.replace_range(a..b, &new);
+        map.replace(a, b, new.len());
+        last_start = a;
+    }
+    Ok(true)
+}
+
+// ---------------------------------------------------------------- thiserror
+
+/// One field: its binding in a pattern (`_0` or its name), its type, and whether it's the
+/// error's source (`#[from]`, `#[source]`, or named `source`) and has `#[from]`.
+struct Field {
+    bind: String,
+    ty: String,
+    source: bool,
+    from: bool,
+}
+
+/// A variant (or the struct): its path and pattern, the `#[error(..)]` arguments, its fields
+/// (named or not, or none).
+struct Case {
+    path: String,
+    pattern: String,
+    error: Option<(String, TextRange)>,
+    fields: Vec<Field>,
+    named: Option<bool>,
+}
+
+fn attr_name(a: &ast::Attr) -> Option<String> {
+    Some(a.path()?.syntax().text().to_string())
+}
+
+/// What's inside an attribute's parentheses (`#[error("x {0}")]` → `"x {0}"`).
+fn attr_args(a: &ast::Attr) -> Option<String> {
+    let t = a.syntax().text().to_string();
+    let open = t.find('(')?;
+    let close = t.rfind(')')?;
+    (close > open).then(|| t[open + 1..close].to_string())
+}
+
+/// `#[error("..", args)]`'s inside (and where it is), and the helper attributes to drop (their
+/// ranges).
+fn helper_attrs(
+    node: &impl HasAttrs,
+    edits: &mut Vec<(TextRange, String)>,
+) -> Option<(String, TextRange)> {
+    let mut error = None;
+    for a in node.attrs() {
+        match attr_name(&a).as_deref() {
+            Some("error") => {
+                error = Some((attr_args(&a)?, a.syntax().text_range()));
+                edits.push((a.syntax().text_range(), String::new()));
+            }
+            Some("from" | "source" | "backtrace") => {
+                edits.push((a.syntax().text_range(), String::new()));
+            }
+            _ => {}
+        }
+    }
+    error
+}
+
+fn fields_of(
+    list: Option<ast::FieldList>,
+    edits: &mut Vec<(TextRange, String)>,
+) -> (Vec<Field>, Option<bool>) {
+    let has =
+        |n: &dyn HasAttrs, name: &str| n.attrs().any(|a| attr_name(&a).as_deref() == Some(name));
+    let mut out = Vec::new();
+    let named = match list {
+        Some(ast::FieldList::RecordFieldList(l)) => {
+            for f in l.fields() {
+                let name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
+                let from = has(&f, "from");
+                out.push(Field {
+                    source: from || has(&f, "source") || name == "source",
+                    bind: name,
+                    ty: f
+                        .ty()
+                        .map(|t| t.syntax().text().to_string())
+                        .unwrap_or_default(),
+                    from,
+                });
+                helper_attrs(&f, edits);
+            }
+            Some(true)
+        }
+        Some(ast::FieldList::TupleFieldList(l)) => {
+            for (i, f) in l.fields().enumerate() {
+                let from = has(&f, "from");
+                out.push(Field {
+                    source: from || has(&f, "source"),
+                    bind: format!("_{i}"),
+                    ty: f
+                        .ty()
+                        .map(|t| t.syntax().text().to_string())
+                        .unwrap_or_default(),
+                    from,
+                });
+                helper_attrs(&f, edits);
+            }
+            Some(false)
+        }
+        None => None,
+    };
+    (out, named)
+}
+
+fn pattern(path: &str, fields: &[Field], named: Option<bool>) -> String {
+    let binds: Vec<&str> = fields.iter().map(|f| f.bind.as_str()).collect();
+    match named {
+        Some(true) => format!("{path} {{ {} }}", binds.join(", ")),
+        Some(false) => format!("{path}({})", binds.join(", ")),
+        None => path.to_string(),
+    }
+}
+
+/// `#[error("{0} at {pos:?}", .1.len())]` as `write!`'s arguments: positional fields become
+/// their bindings (`{_0}`), and `.0` / `.field` in the extra arguments too.
+fn error_args(spec: &str) -> String {
+    let spec = spec.trim();
+    let end = string_end(spec).unwrap_or(spec.len());
+    let (lit, rest) = spec.split_at(end);
+    let mut lit_out = String::new();
+    let chars: Vec<char> = lit.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        lit_out.push(c);
+        if c == '{' {
+            if chars.get(i + 1) == Some(&'{') {
+                lit_out.push('{');
+                i += 2;
+                continue;
+            }
+            if chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
+                lit_out.push('_');
+            }
+        }
+        i += 1;
+    }
+    let mut rest_out = String::new();
+    let rc: Vec<char> = rest.chars().collect();
+    for (j, &c) in rc.iter().enumerate() {
+        if c == '.' {
+            let prev = rc[..j].iter().rev().find(|c| !c.is_whitespace());
+            let shorthand = match prev {
+                None => true,
+                Some(p) => matches!(
+                    p,
+                    ',' | '('
+                        | '['
+                        | '{'
+                        | '&'
+                        | '!'
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '/'
+                        | '='
+                        | '<'
+                        | '>'
+                        | '|'
+                ),
+            };
+            if shorthand {
+                if rc.get(j + 1).is_some_and(|d| d.is_ascii_digit()) {
+                    rest_out.push('_');
+                }
+                continue;
+            }
+        }
+        rest_out.push(c);
+    }
+    format!("{lit_out}{rest_out}")
+}
+
+/// The names a message's literal refers to inline (`{key}`, `{key:?}`; not `{0}` or `{}`).
+fn inline_names(spec: &str) -> Vec<String> {
+    let spec = spec.trim();
+    let lit = &spec[..string_end(spec).unwrap_or(spec.len())];
+    let mut out = Vec::new();
+    let chars: Vec<char> = lit.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if chars.get(i + 1) == Some(&'{') {
+                i += 2;
+                continue;
+            }
+            let name: String = chars[i + 1..]
+                .iter()
+                .take_while(|c| c.is_alphanumeric() || **c == '_')
+                .collect();
+            // (`{r#type}` and `{self}`-like names are left to the compile.)
+            let keyword = matches!(
+                name.as_str(),
+                "self" | "Self" | "r" | "fn" | "type" | "struct" | "enum" | "match" | "loop"
+            );
+            if !name.is_empty() && !keyword && !name.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push(name);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The end of the string literal `s` starts with (`"..."` or `r#"..."#`).
+fn string_end(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if let Some(raw) = s.strip_prefix('r') {
+        let hashes = raw.bytes().take_while(|&c| c == b'#').count();
+        let close = format!("\"{}", "#".repeat(hashes));
+        let start = 2 + hashes;
+        return s
+            .get(start..)?
+            .find(&close)
+            .map(|k| start + k + close.len());
+    }
+    if b.first() != Some(&b'"') {
+        return None;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn derive_error(
+    adt: &ast::Adt,
+    edits: &mut Vec<(TextRange, String)>,
+    errors: &mut Vec<(TextRange, String)>,
+) {
+    // `#[derive(Error)]` / `#[derive(thiserror::Error)]`, dropped from the derive list.
+    let mut found = false;
+    for a in adt.attrs() {
+        if attr_name(&a).as_deref() != Some("derive") {
+            continue;
+        }
+        let Some(inner) = attr_args(&a) else {
+            continue;
+        };
+        let names: Vec<&str> = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let kept: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| !matches!(*n, "Error" | "thiserror::Error"))
+            .collect();
+        if kept.len() == names.len() {
+            continue;
+        }
+        found = true;
+        let new = if kept.is_empty() {
+            String::new()
+        } else {
+            format!("#[derive({})]", kept.join(", "))
+        };
+        edits.push((a.syntax().text_range(), new));
+    }
+    if !found {
+        return;
+    }
+    let Some(name) = adt.name().map(|n| n.text().to_string()) else {
+        return;
+    };
+    let (gp, args) = match adt.generic_param_list() {
+        Some(l) => {
+            let names: Vec<String> = l
+                .generic_params()
+                .filter_map(|p| match p {
+                    ast::GenericParam::TypeParam(t) => t.name().map(|n| n.text().to_string()),
+                    ast::GenericParam::LifetimeParam(l) => {
+                        l.lifetime().map(|l| l.text().to_string())
+                    }
+                    ast::GenericParam::ConstParam(c) => c.name().map(|n| n.text().to_string()),
+                })
+                .collect();
+            (
+                l.syntax().text().to_string(),
+                format!("<{}>", names.join(", ")),
+            )
+        }
+        None => (String::new(), String::new()),
+    };
+    let top = helper_attrs(adt, edits);
+    let mut cases: Vec<Case> = Vec::new();
+    match adt {
+        ast::Adt::Enum(e) => {
+            for v in e.variant_list().into_iter().flat_map(|l| l.variants()) {
+                let vname = v.name().map(|n| n.text().to_string()).unwrap_or_default();
+                let error = helper_attrs(&v, edits).or_else(|| top.clone());
+                let (fields, named) = fields_of(v.field_list(), edits);
+                let path = format!("{name}::{vname}");
+                cases.push(Case {
+                    pattern: pattern(&path, &fields, named),
+                    path,
+                    error,
+                    fields,
+                    named,
+                });
+            }
+        }
+        ast::Adt::Struct(s) => {
+            let (fields, named) = fields_of(s.field_list(), edits);
+            cases.push(Case {
+                pattern: pattern(&name, &fields, named),
+                path: name.clone(),
+                error: top,
+                fields,
+                named,
+            });
+        }
+        ast::Adt::Union(_) => return,
+    }
+    // A `{name}` in a message must be a field (or a named argument after it).
+    for c in &cases {
+        let Some((spec, at)) = &c.error else { continue };
+        if spec.trim() == "transparent" {
+            continue;
+        }
+        for name in inline_names(spec) {
+            let known = c.fields.iter().any(|f| f.bind == name)
+                || spec.contains(&format!("{name} ="))
+                || spec.contains(&format!("{name}="));
+            if !known {
+                errors.push((
+                    *at,
+                    format!("there is no field `{name}` here (an `#[error(..)]` message can name the fields of its variant)"),
+                ));
+            }
+        }
+    }
+    let mut out = String::new();
+    // Display, from `#[error(..)]`.
+    out.push_str(&format!(
+        "\nimpl{gp} ::std::fmt::Display for {name}{args} {{\n    fn fmt(&self, __f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {{\n        match self {{\n"
+    ));
+    for c in &cases {
+        let body = match c.error.as_ref().map(|(s, _)| s.trim()) {
+            Some("transparent") => match c.fields.first() {
+                Some(f) => format!("write!(__f, \"{{}}\", {})", f.bind),
+                None => "Ok(())".into(),
+            },
+            Some(spec) => format!("write!(__f, {})", error_args(spec)),
+            None => "Ok(())".into(),
+        };
+        out.push_str(&format!("            {} => {body},\n", c.pattern));
+    }
+    out.push_str("        }\n    }\n}\n");
+    // Error, with `source()` when a field is one.
+    // (`#[error(transparent)]` forwards to its field's own `source()`.)
+    let transparent = |c: &Case| c.error.as_ref().map(|(s, _)| s.trim()) == Some("transparent");
+    let sources: Vec<(&Case, &Field)> = cases
+        .iter()
+        .filter_map(|c| {
+            let f = if transparent(c) {
+                c.fields.first()
+            } else {
+                c.fields.iter().find(|f| f.source)
+            };
+            f.map(|f| (c, f))
+        })
+        .collect();
+    if sources.is_empty() {
+        out.push_str(&format!(
+            "impl{gp} ::std::error::Error for {name}{args} {{}}\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "impl{gp} ::std::error::Error for {name}{args} {{\n    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {{\n        match self {{\n"
+        ));
+        for (c, f) in &sources {
+            let value = if transparent(c) {
+                "__s.source()"
+            } else {
+                "Some(__s)"
+            };
+            out.push_str(&format!(
+                "            {} => {{\n                let __s: &(dyn ::std::error::Error + 'static) = {};\n                {value}\n            }}\n",
+                c.pattern, f.bind
+            ));
+        }
+        if sources.len() < cases.len() {
+            out.push_str("            _ => None,\n");
+        }
+        out.push_str("        }\n    }\n}\n");
+    }
+    // `From` for each `#[from]` field (the variant's only field, or with the others defaulted).
+    for c in &cases {
+        let Some(f) = c.fields.iter().find(|f| f.from) else {
+            continue;
+        };
+        // (The other fields, a backtrace say, by `Default`.)
+        let vals: Vec<String> = c
+            .fields
+            .iter()
+            .map(|o| {
+                let v = if o.bind == f.bind {
+                    "__source"
+                } else {
+                    "Default::default()"
+                };
+                match c.named {
+                    Some(true) => format!("{}: {v}", o.bind),
+                    _ => v.to_string(),
+                }
+            })
+            .collect();
+        let value = match c.named {
+            Some(true) => format!("{} {{ {} }}", c.path, vals.join(", ")),
+            _ => format!("{}({})", c.path, vals.join(", ")),
+        };
+        out.push_str(&format!(
+            "impl{gp} ::std::convert::From<{}> for {name}{args} {{\n    fn from(__source: {}) -> Self {{\n        {value}\n    }}\n}}\n",
+            f.ty, f.ty
+        ));
+    }
+    let end = adt.syntax().text_range().end();
+    edits.push((TextRange::new(end, end), out));
+}
+
+// ---------------------------------------------------------------- bitflags
+
+/// Comments out, for the hand parsers below.
+fn strip_comments(s: &str) -> String {
+    let mut out = String::new();
+    for line in s.lines() {
+        let l = match line.find("//") {
+            Some(i) if !line[..i].contains('"') => &line[..i],
+            _ => line,
+        };
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// Split `s` at top-level occurrences of `sep` (outside brackets and strings).
+fn split_top(s: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut prev = ' ';
+    for c in s.chars() {
+        if in_str {
+            cur.push(c);
+            if c == '"' && prev != '\\' {
+                in_str = false;
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if c == sep && depth == 0 {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+        prev = c;
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Leading `#[..]` attributes of `s`, and the rest.
+fn take_attrs(s: &str) -> (Vec<String>, &str) {
+    let mut attrs = Vec::new();
+    let mut rest = s.trim_start();
+    while rest.starts_with("#[") {
+        let mut depth = 0;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        attrs.push(rest[..end].to_string());
+        rest = rest[end..].trim_start();
+    }
+    (attrs, rest)
+}
+
+/// `bitflags! { #[derive(..)] pub struct Flags: u32 { const A = 1; .. } .. }`.
+fn bitflags(body: &str) -> Option<String> {
+    let body = strip_comments(body);
+    let mut out = String::new();
+    let mut rest = body.as_str();
+    while !rest.trim().is_empty() {
+        let (attrs, after) = take_attrs(rest);
+        let open = after.find('{')?;
+        let head = after[..open].trim();
+        let (decl, bits) = head.split_once(':')?;
+        let decl = decl.trim();
+        let name = decl.rsplit(' ').next()?.trim().to_string();
+        let vis = decl
+            .strip_suffix(&name)?
+            .trim()
+            .strip_suffix("struct")?
+            .trim();
+        let bits = bits.trim().to_string();
+        // The matching `}`.
+        let mut depth = 0;
+        let mut close = None;
+        for (i, c) in after[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        let mut flags: Vec<(String, String)> = Vec::new();
+        for item in split_top(&after[open + 1..close], ';') {
+            let (_, item) = take_attrs(&item);
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let decl = item.strip_prefix("const")?.trim();
+            let (fname, value) = decl.split_once('=')?;
+            let fname = fname.trim().to_string();
+            if fname == "_" {
+                continue;
+            }
+            flags.push((fname, value.trim().to_string()));
+        }
+        out.push_str(&bitflags_struct(vis, &name, &bits, &attrs, &flags));
+        rest = &after[close + 1..];
+    }
+    Some(out)
+}
+
+fn bitflags_struct(
+    vis: &str,
+    name: &str,
+    bits: &str,
+    attrs: &[String],
+    flags: &[(String, String)],
+) -> String {
+    let mut debug = false;
+    let mut out = String::new();
+    for a in attrs {
+        let compact: String = a.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Some(list) = compact
+            .strip_prefix("#[derive(")
+            .and_then(|r| r.strip_suffix(")]"))
+        {
+            let kept: Vec<&str> = list
+                .split(',')
+                .filter(|d| {
+                    let is_debug = matches!(*d, "Debug" | "std::fmt::Debug" | "core::fmt::Debug");
+                    debug |= is_debug;
+                    !is_debug && !d.is_empty()
+                })
+                .collect();
+            if !kept.is_empty() {
+                out.push_str(&format!("#[derive({})]\n", kept.join(", ")));
+            }
+        } else {
+            out.push_str(a);
+            out.push('\n');
+        }
+    }
+    let vis_sp = if vis.is_empty() {
+        String::new()
+    } else {
+        format!("{vis} ")
+    };
+    out.push_str(&format!("{vis_sp}struct {name}({bits});\n"));
+    out.push_str(&format!("impl {name} {{\n"));
+    for (f, v) in flags {
+        out.push_str(&format!("    pub const {f}: Self = Self({v});\n"));
+    }
+    let all: Vec<String> = flags.iter().map(|(f, _)| format!("Self::{f}.0")).collect();
+    let all = if all.is_empty() {
+        "0".to_string()
+    } else {
+        all.join(" | ")
+    };
+    let names: String = flags
+        .iter()
+        .map(|(f, _)| format!("            \"{f}\" => Some(Self::{f}),\n"))
+        .collect();
+    let list: String = flags
+        .iter()
+        .map(|(f, _)| format!("(\"{f}\", Self::{f})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        r#"    pub const fn empty() -> Self {{
+        Self(0)
+    }}
+    pub const fn all() -> Self {{
+        Self({all})
+    }}
+    pub const fn bits(&self) -> {bits} {{
+        self.0
+    }}
+    pub const fn from_bits(bits: {bits}) -> Option<Self> {{
+        if bits & !Self::all().0 == 0 {{ Some(Self(bits)) }} else {{ None }}
+    }}
+    pub const fn from_bits_truncate(bits: {bits}) -> Self {{
+        Self(bits & Self::all().0)
+    }}
+    pub const fn from_bits_retain(bits: {bits}) -> Self {{
+        Self(bits)
+    }}
+    pub fn from_name(name: &str) -> Option<Self> {{
+        match name {{
+{names}            _ => None,
+        }}
+    }}
+    pub const fn is_empty(&self) -> bool {{
+        self.0 == 0
+    }}
+    pub const fn is_all(&self) -> bool {{
+        Self::all().0 | self.0 == self.0
+    }}
+    pub const fn intersects(&self, other: Self) -> bool {{
+        self.0 & other.0 != 0
+    }}
+    pub const fn contains(&self, other: Self) -> bool {{
+        self.0 & other.0 == other.0
+    }}
+    pub fn insert(&mut self, other: Self) {{
+        self.0 = self.0 | other.0;
+    }}
+    pub fn remove(&mut self, other: Self) {{
+        self.0 = self.0 & !other.0;
+    }}
+    pub fn toggle(&mut self, other: Self) {{
+        self.0 = self.0 ^ other.0;
+    }}
+    pub fn set(&mut self, other: Self, value: bool) {{
+        if value {{ self.insert(other) }} else {{ self.remove(other) }}
+    }}
+    pub const fn intersection(self, other: Self) -> Self {{
+        Self(self.0 & other.0)
+    }}
+    pub const fn union(self, other: Self) -> Self {{
+        Self(self.0 | other.0)
+    }}
+    pub const fn difference(self, other: Self) -> Self {{
+        Self(self.0 & !other.0)
+    }}
+    pub const fn symmetric_difference(self, other: Self) -> Self {{
+        Self(self.0 ^ other.0)
+    }}
+    pub const fn complement(self) -> Self {{
+        Self(!self.0 & Self::all().0)
+    }}
+    /// The named flags set (each once, as bitflags' `iter_names` gives them), and what's left.
+    fn __names(&self) -> (Vec<(&'static str, Self)>, {bits}) {{
+        let mut out = Vec::new();
+        let mut rest = self.0;
+        for (n, f) in [{list}] {{
+            if f.0 != 0 && self.0 & f.0 == f.0 && rest & f.0 != 0 {{
+                rest = rest & !f.0;
+                out.push((n, f));
+            }}
+        }}
+        (out, rest)
+    }}
+    pub fn iter_names(&self) -> std::vec::IntoIter<(&'static str, Self)> {{
+        self.__names().0.into_iter()
+    }}
+    pub fn iter(&self) -> std::vec::IntoIter<Self> {{
+        let (names, rest) = self.__names();
+        let mut out: Vec<Self> = names.into_iter().map(|(_, f)| f).collect();
+        if rest != 0 {{
+            out.push(Self(rest));
+        }}
+        out.into_iter()
+    }}
+}}
+impl std::ops::BitOr for {name} {{
+    type Output = Self;
+    fn bitor(self, o: Self) -> Self {{
+        Self(self.0 | o.0)
+    }}
+}}
+impl std::ops::BitAnd for {name} {{
+    type Output = Self;
+    fn bitand(self, o: Self) -> Self {{
+        Self(self.0 & o.0)
+    }}
+}}
+impl std::ops::BitXor for {name} {{
+    type Output = Self;
+    fn bitxor(self, o: Self) -> Self {{
+        Self(self.0 ^ o.0)
+    }}
+}}
+impl std::ops::Sub for {name} {{
+    type Output = Self;
+    fn sub(self, o: Self) -> Self {{
+        Self(self.0 & !o.0)
+    }}
+}}
+impl std::ops::Not for {name} {{
+    type Output = Self;
+    fn not(self) -> Self {{
+        self.complement()
+    }}
+}}
+impl std::ops::BitOrAssign for {name} {{
+    fn bitor_assign(&mut self, o: Self) {{
+        self.0 = self.0 | o.0;
+    }}
+}}
+impl std::ops::BitAndAssign for {name} {{
+    fn bitand_assign(&mut self, o: Self) {{
+        self.0 = self.0 & o.0;
+    }}
+}}
+impl std::ops::BitXorAssign for {name} {{
+    fn bitxor_assign(&mut self, o: Self) {{
+        self.0 = self.0 ^ o.0;
+    }}
+}}
+impl std::ops::SubAssign for {name} {{
+    fn sub_assign(&mut self, o: Self) {{
+        self.0 = self.0 & !o.0;
+    }}
+}}
+"#
+    ));
+    if debug {
+        out.push_str(&format!(
+            r#"impl std::fmt::Debug for {name} {{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {{
+        if self.0 == 0 {{
+            return write!(f, "{name}({{:#x}})", self.0);
+        }}
+        let (names, rest) = self.__names();
+        let mut text = String::new();
+        for (n, _) in names {{
+            if !text.is_empty() {{
+                text.push_str(" | ");
+            }}
+            text.push_str(n);
+        }}
+        if rest != 0 {{
+            if !text.is_empty() {{
+                text.push_str(" | ");
+            }}
+            text.push_str(&format!("{{:#x}}", rest));
+        }}
+        write!(f, "{name}({{}})", text)
+    }}
+}}
+"#
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------- cfg_if
+
+/// `cfg_if! { if #[cfg(a)] { .. } else if #[cfg(b)] { .. } else { .. } }`: the first branch
+/// whose predicate holds in a script (no OS or target, features off, `debug_assertions` off).
+fn cfg_if(body: &str) -> Option<String> {
+    let mut rest = body.trim();
+    loop {
+        if let Some(r) = rest.strip_prefix("if") {
+            let r = r.trim_start().strip_prefix("#[cfg(")?;
+            let close = matching(r, 0)?;
+            let pred = &r[..close];
+            let r = r[close + 1..].trim_start().strip_prefix(']')?.trim_start();
+            let (items, after) = braced(r)?;
+            if cfg_holds(pred) {
+                return Some(items.to_string());
+            }
+            rest = after.trim_start();
+            match rest.strip_prefix("else") {
+                Some(r) => rest = r.trim_start(),
+                None => return Some(String::new()),
+            }
+        } else {
+            let (items, _) = braced(rest)?;
+            return Some(items.to_string());
+        }
+    }
+}
+
+/// The index of the `)` closing an already-open `(` in `s` (`depth` more are open).
+fn matching(s: &str, depth: i32) -> Option<usize> {
+    let mut d = depth;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => d += 1,
+            ')' => {
+                if d == 0 {
+                    return Some(i);
+                }
+                d -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `{ .. } rest` → (the inside, rest).
+fn braced(s: &str) -> Option<(&str, &str)> {
+    let s = s.strip_prefix('{')?;
+    let mut d = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => d += 1,
+            '}' => {
+                if d == 0 {
+                    return Some((&s[..i], &s[i + 1..]));
+                }
+                d -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn cfg_holds(pred: &str) -> bool {
+    let p = pred.trim();
+    for (f, all) in [("all(", true), ("any(", false)] {
+        if let Some(inner) = p.strip_prefix(f).and_then(|r| r.strip_suffix(')')) {
+            let parts = split_top(inner, ',');
+            return if all {
+                parts.iter().all(|x| cfg_holds(x))
+            } else {
+                parts.iter().any(|x| cfg_holds(x))
+            };
+        }
+    }
+    if let Some(inner) = p.strip_prefix("not(").and_then(|r| r.strip_suffix(')')) {
+        return !cfg_holds(inner);
+    }
+    // A JS target: `target_arch = "wasm32"` / `target_family = "wasm"` hold, nothing else does.
+    let compact: String = p.chars().filter(|c| !c.is_whitespace()).collect();
+    matches!(
+        compact.as_str(),
+        "target_arch=\"wasm32\"" | "target_family=\"wasm\"" | "target_os=\"unknown\""
+    )
+}
+
+// ---------------------------------------------------------------- lazy_static
+
+/// `lazy_static! { static ref NAME: T = expr; }` as `static NAME: LazyLock<T> = ..`.
+fn lazy_static(body: &str) -> Option<String> {
+    let mut out = String::new();
+    for item in split_top(&strip_comments(body), ';') {
+        let (attrs, item) = take_attrs(&item);
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let at = item.find("static")?;
+        let vis = item[..at].trim();
+        let decl = item[at + "static".len()..]
+            .trim()
+            .strip_prefix("ref")?
+            .trim();
+        let (head, value) = decl.split_once('=')?;
+        let (n, ty) = head.split_once(':')?;
+        for a in attrs {
+            out.push_str(&a);
+            out.push('\n');
+        }
+        let vis = if vis.is_empty() {
+            String::new()
+        } else {
+            format!("{vis} ")
+        };
+        out.push_str(&format!(
+            "{vis}static {}: std::sync::LazyLock<{}> = std::sync::LazyLock::new(|| {});\n",
+            n.trim(),
+            ty.trim(),
+            value.trim()
+        ));
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------- rayon
+
+/// rayon's parallel methods and their sequential twins (what one thread does).
+const RAYON_METHODS: &[(&str, &str)] = &[
+    ("par_iter", "iter"),
+    ("par_iter_mut", "iter_mut"),
+    ("into_par_iter", "into_iter"),
+    ("par_chunks", "chunks"),
+    ("par_chunks_mut", "chunks_mut"),
+    ("par_chunks_exact", "chunks_exact"),
+    ("par_rchunks", "rchunks"),
+    ("par_windows", "windows"),
+    ("par_sort", "sort"),
+    ("par_sort_unstable", "sort_unstable"),
+    ("par_sort_by", "sort_by"),
+    ("par_sort_by_key", "sort_by_key"),
+    ("par_sort_unstable_by", "sort_unstable_by"),
+    ("par_sort_unstable_by_key", "sort_unstable_by_key"),
+    ("par_sort_by_cached_key", "sort_by_cached_key"),
+    ("par_extend", "extend"),
+    ("par_drain", "drain"),
+    ("par_lines", "lines"),
+    ("par_chars", "chars"),
+    ("par_char_indices", "char_indices"),
+    ("par_bytes", "bytes"),
+    ("par_split", "split"),
+    ("par_split_whitespace", "split_whitespace"),
+    ("par_split_terminator", "split_terminator"),
+    ("par_split_mut", "split_mut"),
+    ("par_bridge", ""),
+    ("flat_map_iter", "flat_map"),
+    ("flatten_iter", "flatten"),
+    ("reduce_with", "reduce"),
+    ("find_any", "find"),
+    ("find_first", "find"),
+    ("find_map_any", "find_map"),
+    ("find_map_first", "find_map"),
+    ("position_any", "position"),
+    ("position_first", "position"),
+    ("with_min_len", ""),
+    ("with_max_len", ""),
+    ("by_exponential_blocks", ""),
+    ("by_uniform_blocks", ""),
+];
+
+/// rayon's traits as std's.
+const RAYON_TRAITS: &[(&str, &str)] = &[
+    ("ParallelIterator", "Iterator"),
+    ("IndexedParallelIterator", "Iterator"),
+    ("IntoParallelIterator", "IntoIterator"),
+    ("ParallelBridge", "Iterator"),
+];
+
+/// rayon, sequentially: `v.par_iter()` is `v.iter()` (and the other `par_` methods theirs),
+/// `.reduce(|| id, op)` folds from `id`, `.fold(|| init, op)` is one accumulator,
+/// `rayon::join(a, b)` calls `a` then `b`, and `with_min_len(..)` / `par_bridge()` go away.
+fn rayon(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, String)>) {
+    if let Some(mc) = ast::MethodCallExpr::cast(node.clone()) {
+        let Some(name) = mc.name_ref() else { return };
+        let n = name.text().to_string();
+        let args: Vec<ast::Expr> = mc
+            .arg_list()
+            .map(|l| l.args().collect())
+            .unwrap_or_default();
+        if let Some((_, to)) = RAYON_METHODS.iter().find(|(p, _)| *p == n) {
+            if to.is_empty() {
+                // `.with_min_len(64)`: the whole call, from its `.`.
+                let (Some(dot), Some(end)) = (mc.dot_token(), mc.arg_list()) else {
+                    return;
+                };
+                edits.push((
+                    dot.text_range().cover(end.syntax().text_range()),
+                    String::new(),
+                ));
+            } else {
+                edits.push((name.syntax().text_range(), to.to_string()));
+            }
+            return;
+        }
+        // `.reduce(|| 0, |a, b| a + b)` / `.fold(|| 0, |acc, x| ..)` (std's take one argument
+        // or a value): the identity called once.
+        let zero_arg_closure = |e: &ast::Expr| {
+            matches!(e, ast::Expr::ClosureExpr(c)
+                if c.param_list().is_some_and(|p| p.params().next().is_none()))
+        };
+        if (n == "reduce" && args.len() == 2)
+            || (n == "fold" && args.len() == 2 && zero_arg_closure(&args[0]))
+        {
+            let r = args[0].syntax().text_range();
+            edits.push((TextRange::empty(r.start()), "(".into()));
+            edits.push((TextRange::empty(r.end()), ")()".into()));
+            if n == "reduce" {
+                edits.push((name.syntax().text_range(), "fold".into()));
+            } else {
+                let whole = mc.syntax().text_range();
+                edits.push((TextRange::empty(whole.start()), "std::iter::once(".into()));
+                edits.push((TextRange::empty(whole.end()), ")".into()));
+            }
+        }
+        return;
+    }
+    if let Some(call) = ast::CallExpr::cast(node.clone()) {
+        let Some(ast::Expr::PathExpr(p)) = call.expr() else {
+            return;
+        };
+        let Some(path) = p.path() else { return };
+        let text = path.syntax().text().to_string();
+        let args: Vec<ast::Expr> = call
+            .arg_list()
+            .map(|l| l.args().collect())
+            .unwrap_or_default();
+        match text.as_str() {
+            // `rayon::join(|| a(), || b())`: both, in order.
+            // (Inserts around the arguments, which may have their own rewrites.)
+            "rayon::join" if args.len() == 2 => {
+                edits.push((path.syntax().text_range(), String::new()));
+                for a in &args {
+                    let r = a.syntax().text_range();
+                    edits.push((TextRange::empty(r.start()), "(".into()));
+                    edits.push((TextRange::empty(r.end()), ")()".into()));
+                }
+            }
+            "rayon::current_num_threads" => {
+                edits.push((call.syntax().text_range(), "1usize".into()));
+            }
+            _ => {}
+        }
+        return;
+    }
+    if let Some(nr) = ast::NameRef::cast(node.clone())
+        && let Some((_, to)) = RAYON_TRAITS.iter().find(|(p, _)| nr.text() == *p)
+        && !nr
+            .syntax()
+            .ancestors()
+            .any(|a| ast::Use::can_cast(a.kind()))
+    {
+        edits.push((nr.syntax().text_range(), to.to_string()));
+    }
+}
+
+/// rayon's method renames in a macro's tokens (`println!("{}", v.par_iter().sum::<u32>())`),
+/// where there's no syntax tree: `.par_iter` and the like by name, `.with_min_len(..)` and
+/// `.par_bridge()` up to their closing parenthesis, `rayon::current_num_threads()`.
+fn rayon_tokens(tt: &ast::TokenTree, edits: &mut Vec<(TextRange, String)>) {
+    use ra_ap_syntax::SyntaxKind::{COLON, COLON2, DOT, IDENT, L_PAREN, R_PAREN, WHITESPACE};
+    let toks: Vec<_> = tt
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != WHITESPACE)
+        .collect();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        if t.kind() == IDENT
+            && i > 0
+            && toks[i - 1].kind() == DOT
+            && let Some((_, to)) = RAYON_METHODS.iter().find(|(p, _)| *p == t.text())
+        {
+            if !to.is_empty() {
+                edits.push((t.text_range(), to.to_string()));
+            } else if toks.get(i + 1).is_some_and(|p| p.kind() == L_PAREN) {
+                let mut depth = 0;
+                let mut j = i + 1;
+                while j < toks.len() {
+                    match toks[j].kind() {
+                        L_PAREN => depth += 1,
+                        R_PAREN => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j < toks.len() {
+                    let r = toks[i - 1].text_range().cover(toks[j].text_range());
+                    edits.push((r, String::new()));
+                    i = j;
+                }
+            }
+        } else if t.kind() == IDENT && t.text() == "rayon" {
+            // (`::` is one token or two.)
+            let mut j = i + 1;
+            while toks
+                .get(j)
+                .is_some_and(|c| matches!(c.kind(), COLON | COLON2))
+            {
+                j += 1;
+            }
+            if j > i + 1
+                && toks
+                    .get(j)
+                    .is_some_and(|f| f.text() == "current_num_threads")
+                && toks.get(j + 1).is_some_and(|p| p.kind() == L_PAREN)
+                && toks.get(j + 2).is_some_and(|p| p.kind() == R_PAREN)
+            {
+                edits.push((
+                    t.text_range().cover(toks[j + 2].text_range()),
+                    "1usize".into(),
+                ));
+                i = j + 2;
+            }
+        }
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------- serde_json's json!
+
+/// The tokens and token trees of `tt` without its delimiters, whitespace and comments.
+fn tt_items(tt: &ast::TokenTree) -> Vec<ra_ap_syntax::SyntaxElement> {
+    use ra_ap_syntax::SyntaxKind::{COMMENT, R_BRACK, R_CURLY, R_PAREN, WHITESPACE};
+    let mut items: Vec<_> = tt
+        .syntax()
+        .children_with_tokens()
+        .filter(|e| !matches!(e.kind(), WHITESPACE | COMMENT))
+        .collect();
+    if !items.is_empty() {
+        items.remove(0);
+    }
+    if items
+        .last()
+        .is_some_and(|e| matches!(e.kind(), R_PAREN | R_BRACK | R_CURLY))
+    {
+        items.pop();
+    }
+    items
+}
+
+/// The delimiter a token tree opens with.
+fn tt_open(tt: &ast::TokenTree) -> Option<ra_ap_syntax::SyntaxKind> {
+    tt.syntax().first_token().map(|t| t.kind())
+}
+
+/// `items` split at their top-level commas (a trailing one ends the list).
+fn split_commas(items: &[ra_ap_syntax::SyntaxElement]) -> Vec<Vec<ra_ap_syntax::SyntaxElement>> {
+    let mut out = vec![Vec::new()];
+    for e in items {
+        if e.kind() == ra_ap_syntax::SyntaxKind::COMMA {
+            out.push(Vec::new());
+        } else if let Some(last) = out.last_mut() {
+            last.push(e.clone());
+        }
+    }
+    if out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+/// The source of `items` (from the first's start to the last's end).
+fn items_text(items: &[ra_ap_syntax::SyntaxElement], text: &str) -> String {
+    match (items.first(), items.last()) {
+        (Some(a), Some(b)) => {
+            let (s, e) = (
+                usize::from(a.text_range().start()),
+                usize::from(b.text_range().end()),
+            );
+            text.get(s..e).unwrap_or("").to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// When `items[i..]` start with `json!(..)` (or `serde_json::json!(..)`): how many items it
+/// spans, and its token tree.
+fn json_call_at(
+    items: &[ra_ap_syntax::SyntaxElement],
+    i: usize,
+) -> Option<(usize, ast::TokenTree)> {
+    use ra_ap_syntax::SyntaxKind::{BANG, COLON, COLON2, IDENT};
+    let is_ident = |e: &ra_ap_syntax::SyntaxElement, s: &str| {
+        e.kind() == IDENT && e.as_token().is_some_and(|t| t.text() == s)
+    };
+    let mut j = i;
+    if items.get(j).is_some_and(|e| is_ident(e, "serde_json")) {
+        j += 1;
+        let colons = j;
+        while items
+            .get(j)
+            .is_some_and(|e| matches!(e.kind(), COLON | COLON2))
+        {
+            j += 1;
+        }
+        if j == colons {
+            return None;
+        }
+    }
+    if !items.get(j).is_some_and(|e| is_ident(e, "json")) || items.get(j + 1)?.kind() != BANG {
+        return None;
+    }
+    let tt = items
+        .get(j + 2)?
+        .as_node()
+        .cloned()
+        .and_then(ast::TokenTree::cast)?;
+    Some((j + 3 - i, tt))
+}
+
+/// A `json!` value (`null`, `[..]`, `{ key: value, .. }`, or an expression) as Rust that makes
+/// the `serde_json::Value`.
+fn json_of(items: &[ra_ap_syntax::SyntaxElement], text: &str) -> String {
+    use ra_ap_syntax::SyntaxKind::{COLON, COLON2, FALSE_KW, IDENT, L_BRACK, L_CURLY, TRUE_KW};
+    if let [one] = items {
+        if one.kind() == IDENT && one.as_token().is_some_and(|t| t.text() == "null") {
+            return "serde_json::Value::Null".into();
+        }
+        if matches!(one.kind(), TRUE_KW | FALSE_KW) {
+            return format!("serde_json::Value::Bool({one})");
+        }
+        if let Some(tt) = one.as_node().cloned().and_then(ast::TokenTree::cast) {
+            let inner = tt_items(&tt);
+            match tt_open(&tt) {
+                Some(L_BRACK) => {
+                    let parts: Vec<String> = split_commas(&inner)
+                        .iter()
+                        .map(|p| json_of(p, text))
+                        .collect();
+                    return format!("serde_json::Value::Array(vec![{}])", parts.join(", "));
+                }
+                Some(L_CURLY) => {
+                    let mut out = String::from(
+                        "serde_json::Value::Object({ let mut __m = std::collections::BTreeMap::new(); ",
+                    );
+                    for entry in split_commas(&inner) {
+                        // The key's `:` (not a path's `::`).
+                        let at = (0..entry.len()).find(|&k| {
+                            entry[k].kind() == COLON
+                                && !entry
+                                    .get(k + 1)
+                                    .is_some_and(|n| matches!(n.kind(), COLON | COLON2))
+                                && !(k > 0 && matches!(entry[k - 1].kind(), COLON | COLON2))
+                        });
+                        let Some(at) = at else { continue };
+                        out.push_str(&format!(
+                            "__m.insert(String::from({}), {}); ",
+                            items_text(&entry[..at], text),
+                            json_of(&entry[at + 1..], text)
+                        ));
+                    }
+                    out.push_str("__m })");
+                    return out;
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some((n, tt)) = json_call_at(items, 0)
+        && n == items.len()
+    {
+        return json_of(&tt_items(&tt), text);
+    }
+    format!(
+        "serde_json::to_value(&({})).unwrap()",
+        items_text(items, text)
+    )
+}
+
+/// The `json!(..)` calls among a macro's tokens (`println!("{}", json!({ "a": 1 }))`).
+fn json_in_tokens(tt: &ast::TokenTree, text: &str, edits: &mut Vec<(TextRange, String)>) {
+    let items = tt_items(tt);
+    let mut i = 0;
+    while i < items.len() {
+        if let Some((n, body)) = json_call_at(&items, i) {
+            let r = items[i].text_range().cover(items[i + n - 1].text_range());
+            edits.push((r, json_of(&tt_items(&body), text)));
+            i += n;
+            continue;
+        }
+        if let Some(sub) = items[i].as_node().cloned().and_then(ast::TokenTree::cast) {
+            json_in_tokens(&sub, text, edits);
+        }
+        i += 1;
+    }
+}
+
+/// Whether `mc` is `json!(..)`.
+fn is_json_call(mc: &ast::MacroCall) -> bool {
+    mc.path()
+        .and_then(|p| p.segment())
+        .and_then(|s| s.name_ref())
+        .is_some_and(|n| n.text() == "json")
+}
+
+// ---------------------------------------------------------------- regex
+
+/// The bundled regex's spellings: `regex::Error` is the prelude's `RegexError` and
+/// `regex::escape` its `__regex_escape`; a closure replacer (`re.replace_all(s, |caps:
+/// &Captures| ..)`) calls `__replace_fn` with how many to replace.
+fn regex(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, String)>) {
+    if let Some(path) = ast::Path::cast(node.clone())
+        && path.qualifier().is_none()
+        && path.syntax().text() == "regex"
+        && !path
+            .syntax()
+            .ancestors()
+            .any(|a| ast::Use::can_cast(a.kind()))
+        && let Some(parent) = path.parent_path()
+        && let Some(name) = parent.segment().and_then(|s| s.name_ref())
+    {
+        let to = match name.text() {
+            "Error" => "RegexError",
+            "escape" => "__regex_escape",
+            _ => return,
+        };
+        edits.push((
+            path.syntax().text_range().cover(name.syntax().text_range()),
+            to.into(),
+        ));
+        return;
+    }
+    let Some(mc) = ast::MethodCallExpr::cast(node.clone()) else {
+        return;
+    };
+    let Some(name) = mc.name_ref() else { return };
+    let args: Vec<ast::Expr> = mc
+        .arg_list()
+        .map(|l| l.args().collect())
+        .unwrap_or_default();
+    let closure_last = args
+        .last()
+        .is_some_and(|a| matches!(a, ast::Expr::ClosureExpr(_)));
+    let limit = match (name.text(), args.len()) {
+        ("replace", 2) if closure_last => "1usize, ",
+        ("replace_all", 2) if closure_last => "usize::MAX, ",
+        ("replacen", 3) if closure_last => {
+            // (0 is all of them.)
+            let n = args[1].syntax().text_range();
+            edits.push((TextRange::empty(n.start()), "match ".into()));
+            edits.push((
+                TextRange::empty(n.end()),
+                " { 0 => usize::MAX, __n => __n }".into(),
+            ));
+            ""
+        }
+        _ => return,
+    };
+    edits.push((name.syntax().text_range(), "__replace_fn".into()));
+    if !limit.is_empty() {
+        let f = args[1].syntax().text_range();
+        edits.push((TextRange::empty(f.start()), limit.into()));
+    }
+}
+
+/// `regex::escape` / `regex::Error` among a macro's tokens.
+fn regex_tokens(tt: &ast::TokenTree, edits: &mut Vec<(TextRange, String)>) {
+    use ra_ap_syntax::SyntaxKind::{COLON, COLON2, IDENT, WHITESPACE};
+    let toks: Vec<_> = tt
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != WHITESPACE)
+        .collect();
+    for i in 0..toks.len() {
+        if toks[i].kind() != IDENT || toks[i].text() != "regex" {
+            continue;
+        }
+        let mut j = i + 1;
+        while toks
+            .get(j)
+            .is_some_and(|c| matches!(c.kind(), COLON | COLON2))
+        {
+            j += 1;
+        }
+        let to = match toks.get(j).map(|t| t.text().to_string()).as_deref() {
+            Some("escape") if j > i + 1 => "__regex_escape",
+            Some("Error") if j > i + 1 => "RegexError",
+            _ => continue,
+        };
+        edits.push((toks[i].text_range().cover(toks[j].text_range()), to.into()));
+    }
+}

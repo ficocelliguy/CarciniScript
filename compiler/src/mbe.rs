@@ -757,6 +757,25 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
                     out.push(' ');
                 }
             }
+            // `stringify!($e)` of an expression: its text as written, without the parentheses
+            // that keep its precedence elsewhere.
+            Tpl::Group(o, c, inner, spaced)
+                if out.trim_end().ends_with("stringify!")
+                    && matches!(inner.as_slice(), [Tpl::Var(n, _)]
+                        if matches!(b.get(n), Some(Bound::One(_, true)))) =>
+            {
+                let [Tpl::Var(n, _)] = inner.as_slice() else {
+                    unreachable!()
+                };
+                if let Some(Bound::One(text, _)) = b.get(n) {
+                    out.push_str(o);
+                    out.push_str(text);
+                    out.push_str(c);
+                }
+                if *spaced {
+                    out.push(' ');
+                }
+            }
             Tpl::Group(o, c, inner, spaced) => {
                 out.push_str(o);
                 transcribe(inner, b, out)?;
@@ -862,6 +881,39 @@ fn rules_of(def: &ast::MacroRules) -> Result<Vec<Rule>, String> {
     }
     Ok(rules)
 }
+
+/// The bundled crates' macros a file uses, as `macro_rules!` (`anyhow!`, `bail!`, `ensure!`).
+fn bundled_macros(src: &str) -> String {
+    let mut out = String::new();
+    if src.contains("anyhow") {
+        out.push_str(ANYHOW_MACROS);
+    }
+    out
+}
+
+/// `anyhow!("{x}")` / `anyhow!(err)`, `bail!(..)` and `ensure!(cond, ..)`, as anyhow defines them.
+const ANYHOW_MACROS: &str = r#"
+macro_rules! anyhow {
+    ($msg:literal $(,)?) => { anyhow::Error::msg(format!($msg)) };
+    ($err:expr $(,)?) => { anyhow::__wrap($err) };
+    ($fmt:literal, $($arg:tt)*) => { anyhow::Error::msg(format!($fmt, $($arg)*)) };
+}
+macro_rules! bail {
+    ($($t:tt)*) => { return Err(anyhow!($($t)*)) };
+}
+macro_rules! ensure {
+    ($cond:expr, $($t:tt)+) => {
+        if !$cond {
+            return Err(anyhow!($($t)*));
+        }
+    };
+    ($cond:expr $(,)?) => {
+        if !$cond {
+            return Err(anyhow::Error::msg(format!("Condition failed: `{}`", stringify!($cond))));
+        }
+    };
+}
+"#;
 
 /// An invocation of a file macro.
 struct Site {
@@ -1080,6 +1132,10 @@ pub fn preprocess_with(
     if let Some((filename, resolver)) = procs {
         changed |= crate::procmacro::expand(&mut text, &mut map, filename, resolver)?;
     }
+    // The bundled crates written as rewrites (`#[derive(thiserror::Error)]`, `bitflags!`, ..).
+    if crate::bundled::uses_bundled(&text) {
+        changed |= crate::bundled::expand(&mut text, &mut map)?;
+    }
     if text.contains("macro_rules!")
         && let Some(e) = expand_with(&text, map.clone())?
     {
@@ -1119,11 +1175,11 @@ pub fn preprocess_with(
 /// `#[macro_export]`, and all of a module's when its `mod` has `#[macro_use]`.
 pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resolver) -> String {
     use ra_ap_syntax::ast::{HasAttrs, HasModuleItem};
+    let mut out = bundled_macros(src);
     if !src.contains("mod ") {
-        return String::new();
+        return out;
     }
     let file = SourceFile::parse(src, EDITION).tree();
-    let mut out = String::new();
     for item in file.items() {
         let ast::Item::Module(m) = item else { continue };
         if m.item_list().is_some() {
