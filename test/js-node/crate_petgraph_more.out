@@ -1,0 +1,33 @@
+CSEC Host { name: "CSEC", ram: 64 } Some(109)
+[8, 16, 64, 65, 128]
+[(1, 2), (0, 4)]
+Some(11)
+false
+Some(4)
+[(0, 0, 1, 1), (1, 1, 4, 109), (2, 1, 2, 2), (3, 2, 3, 3), (4, 3, 4, 5)]
+Some("n00dles")
+4 2
+["home", "I.I.I.I", "CSEC", "avmnite-02h"]
+[(2, 3, 3), (3, 1, 5)]
+[]
+None None
+[NodeIndex(3)]
+topo Ok([0, 1, 3, 2])
+EdgeIndex(2) Some((NodeIndex(0), NodeIndex(2))) 3
+4 0 [NodeIndex(0), NodeIndex(1), NodeIndex(2), NodeIndex(3)]
+["home", "foodnstuff", "CSEC", "run4theh111z", "n00dles"]
+["CSEC", "run4theh111z"]
+true false
+Ok(["home", "n00dles", "foodnstuff", "CSEC", "run4theh111z"])
+[("home", "n00dles", 1), ("home", "foodnstuff", 1)]
+[("n00dles", "CSEC", 1), ("foodnstuff", "CSEC", 1)]
+Some(5)
+Some(1)
+true ["home", "n00dles", "foodnstuff", "run4theh111z"]
+[("home", "n00dles", 5)] 1
+[]
+[(1, 3), (1, 2), (2, 3), (4, 4)]
+[3, 2] [4]
+true 2
+[3, 2, 1]
+false true

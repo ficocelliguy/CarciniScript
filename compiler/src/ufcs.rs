@@ -5,9 +5,8 @@
 //! traits (`.map(Vec::len)`, `.map(Into::into)`, `std::error::Error::source(&e)`). An `OffsetMap`
 //! keeps positions pointing at the original text.
 
-use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, SyntaxToken};
+use ra_ap_syntax::{AstNode, SyntaxKind, SyntaxToken};
 
-use crate::macros::EDITION;
 use crate::mbe::OffsetMap;
 
 const PRIMS: &[&str] = &[
@@ -106,7 +105,7 @@ pub fn has_prim_paths(text: &str) -> bool {
 /// Rewrite path calls and method values of built-in types in `text`, recording the edits in
 /// `map`. Whether anything changed.
 pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let toks: Vec<SyntaxToken> = file
         .syntax()
         .descendants_with_tokens()
@@ -313,7 +312,7 @@ pub fn has_type_anchors(text: &str) -> bool {
 /// `Vec::<u8>::new()`. Types that aren't paths (`<[u8]>::len`, `<&str>::..`) stay. Whether
 /// anything changed.
 pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let toks: Vec<SyntaxToken> = file
         .syntax()
         .descendants_with_tokens()
@@ -410,6 +409,23 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
             continue;
         };
         let first = at(i + 1);
+        // `<(Comma)>::default()` (what `<Token![,]>` expands to): one parenthesized path, not a
+        // tuple, is that path.
+        if first == "("
+            && c > i + 3
+            && at(c - 1) == ")"
+            && toks[i + 2].kind() == SyntaxKind::IDENT
+            && colons(c + 1)
+            && !(i + 2..c - 1).any(|k| matches!(at(k).as_str(), "," | "(" | ")"))
+        {
+            edits.push((start(i), end(i + 1), String::new()));
+            for o in nested_opens {
+                edits.push((start(o), start(o), "::".to_string()));
+            }
+            edits.push((start(c - 1), end(c), String::new()));
+            i = c + 1;
+            continue;
+        }
         let path_like = c > i + 1
             && (toks[i + 1].kind() == SyntaxKind::IDENT
                 || matches!(first.as_str(), "Self" | "crate" | "self" | "super" | "$")

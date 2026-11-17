@@ -36,6 +36,10 @@ fn main() {
     }));
     let (mut ok, mut rejected, mut panics, mut bytes) = (0, 0, Vec::new(), 0usize);
     let mut slowest = Vec::new();
+    // `SWEEP_STRICT=1`: borrow conflicts are errors (files with one count as rejected).
+    carciniscript::set_strict_borrows(std::env::var_os("SWEEP_STRICT").is_some());
+    // `SWEEP_LIST=1`: print each file's outcome and first error (to diff two sweeps).
+    let list = std::env::var_os("SWEEP_LIST").is_some();
     let start = std::time::Instant::now();
     for f in &files {
         let Ok(src) = std::fs::read_to_string(f) else {
@@ -77,6 +81,14 @@ fn main() {
             let pat = pat.to_string_lossy();
             for d in out.diagnostics.iter().filter(|d| d.message.contains(&*pat)) {
                 eprintln!("{}:{}:{} {}", f.display(), d.line, d.column, d.message);
+            }
+        }
+        if let (Ok(out), true) = (&result, list) {
+            match out.diagnostics.iter().find(|d| d.severity == "error") {
+                Some(d) if out.code.is_none() => {
+                    println!("REJ {} {}:{} {}", f.display(), d.line, d.column, d.message)
+                }
+                _ => println!("OK {}", f.display()),
             }
         }
         match result {

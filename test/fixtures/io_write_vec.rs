@@ -28,4 +28,8 @@ fn main() {
     println!("{} {:?}", buf.len(), &buf[buf.len() - 4..]);
     emit(&mut io::stdout(), 3).unwrap();
     println!("{}", render(&[(1, "a"), (22, "bb")]).unwrap());
+    // A `Vec::new()` that only the generic writer call makes a `Vec<u8>`.
+    let mut out = Vec::new();
+    emit(&mut out, 4).unwrap();
+    println!("{:?}", out);
 }

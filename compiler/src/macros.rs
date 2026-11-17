@@ -10,6 +10,58 @@ use ra_ap_syntax::{
 
 pub const EDITION: Edition = Edition::Edition2021;
 
+thread_local! {
+    /// The last few whole-file parses, by their text (most recent last): the preprocessing
+    /// passes, their gates, the type checker and codegen each parse the same text.
+    static PARSES: std::cell::RefCell<Vec<(String, ra_ap_syntax::Parse<ast::SourceFile>, ast::SourceFile)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many parses `PARSES` keeps.
+const PARSES_KEPT: usize = 8;
+
+/// `SourceFile::parse(text, EDITION)`, from the parses kept when `text` was parsed recently
+/// (the tree is then the same one, so caches keyed by its root hit too).
+pub(crate) fn parse_file(text: &str) -> ra_ap_syntax::Parse<ast::SourceFile> {
+    PARSES.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(i) = p.iter().position(|(t, _, _)| t == text) {
+            if i + 1 != p.len() {
+                let e = p.remove(i);
+                p.push(e);
+            }
+            return p.last().unwrap().1.clone();
+        }
+        let parse = ra_ap_syntax::SourceFile::parse(text, EDITION);
+        if p.len() >= PARSES_KEPT {
+            p.remove(0);
+        }
+        p.push((text.to_string(), parse.clone(), parse.tree()));
+        parse
+    })
+}
+
+/// `SourceFile::parse(text, EDITION).tree()`, from the parses kept (see `parse_file`).
+pub(crate) fn parse_tree(text: &str) -> ast::SourceFile {
+    PARSES.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(i) = p.iter().position(|(t, _, _)| t == text) {
+            if i + 1 != p.len() {
+                let e = p.remove(i);
+                p.push(e);
+            }
+            return p.last().unwrap().2.clone();
+        }
+        let parse = ra_ap_syntax::SourceFile::parse(text, EDITION);
+        let tree = parse.tree();
+        if p.len() >= PARSES_KEPT {
+            p.remove(0);
+        }
+        p.push((text.to_string(), parse, tree.clone()));
+        tree
+    })
+}
+
 pub struct MacroArg {
     /// Absolute byte offset of the argument text in the original source.
     pub start: usize,
@@ -546,7 +598,7 @@ pub fn strip_cfg(text: &mut String) -> bool {
     if !text.contains("cfg(") {
         return false;
     }
-    let file = ra_ap_syntax::SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let debug = crate::codegen::overflow_checks();
     let mut cuts: Vec<(usize, usize)> = Vec::new();
     for attr in file.syntax().descendants().filter_map(ast::Attr::cast) {
@@ -557,7 +609,28 @@ pub fn strip_cfg(text: &mut String) -> bool {
             continue;
         };
         let mut i = 0;
-        if !matches!(cfg_pred3(&toks, &mut i, debug, true), Ok(Some(false)) if i == toks.len()) {
+        let val = cfg_pred3(&toks, &mut i, debug, true);
+        let off = matches!(val, Ok(Some(false)) if i == toks.len());
+        // `#[cfg(feature = "x")] impl A {..}` next to `#[cfg(not(feature = "x"))] impl A {..}`:
+        // a script has no features, so the `not(..)` one stays.
+        let negated_twin = matches!(val, Ok(None)) && {
+            let mut negated = vec!["not".to_string(), "(".to_string()];
+            negated.extend(toks.iter().cloned());
+            negated.push(")".to_string());
+            attr.syntax()
+                .parent()
+                .and_then(|item| item.parent())
+                .is_some_and(|scope| {
+                    scope
+                        .descendants()
+                        .filter_map(ast::Attr::cast)
+                        .filter(|a| {
+                            a.syntax().parent().and_then(|p| p.parent()).as_ref() == Some(&scope)
+                        })
+                        .any(|a| attr_cfg_tokens(&a).is_some_and(|t| t == negated))
+                })
+        };
+        if !off && !negated_twin {
             continue;
         }
         let Some(node) = attr.syntax().parent() else {

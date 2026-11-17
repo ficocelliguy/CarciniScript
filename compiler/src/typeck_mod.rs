@@ -6,13 +6,12 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
-    AstNode, SourceFile,
+    AstNode,
     ast::{self, HasGenericParams, HasModuleItem, HasName, HasVisibility},
 };
 
 use super::{Checker, FnSig};
 use crate::adt::Adts;
-use crate::macros::EDITION;
 use crate::ty::Ty;
 
 /// Reads another source file by path (relative to the project root, like `lib/util.rs`).
@@ -69,6 +68,9 @@ fn export_type_extras(c: &Checker, out: &mut Exports, name: &str) {
     }
     if a.into_iters.contains(name) {
         out.adts.into_iters.insert(name.to_string());
+    }
+    if let Some(t) = a.future_outputs.get(name) {
+        out.adts.future_outputs.insert(name.to_string(), c.zonk(t));
     }
     if let Some(cp) = a.const_params.get(name) {
         out.adts.const_params.insert(name.to_string(), cp.clone());
@@ -167,7 +169,7 @@ fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
 
 /// The public signatures of the module in `text`.
 fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String>) -> Exports {
-    let parse = SourceFile::parse(text, EDITION);
+    let parse = crate::macros::parse_file(text);
     let file = parse.tree();
     let mut c = Checker::new(text);
     c.declare_items(&file, path, resolver, stack);
@@ -529,6 +531,7 @@ impl Checker<'_> {
         self.adts.deref_mut.extend(ex.adts.deref_mut);
         self.adts.iter_items.extend(ex.adts.iter_items);
         self.adts.into_iters.extend(ex.adts.into_iters);
+        self.adts.future_outputs.extend(ex.adts.future_outputs);
         self.adts.const_params.extend(ex.adts.const_params);
         self.adts.impl_assoc.extend(ex.adts.impl_assoc);
         for (n, t) in ex.aliases {

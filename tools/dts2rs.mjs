@@ -19,6 +19,8 @@
 //   inline object types in results and fields → a struct named after where they appear
 //   (`GoMakeMoveResult`); `Named & { extra }` → `NamedWithExtra`, extending `Named`; a
 //   `type X = A & { .. }` alias → struct `X`
+//   ReactNode / ReactElement (Bitburner's stand-ins for React's) → `ReactNode` (`react::Node`, from
+//   the `js` crate); a parameter of it takes what a `jsx!` child may be (text, numbers, ..)
 //   anything else (other unions, generics, callbacks, inline types in parameters) → JsValue
 //   (untyped; a `JsValue` parameter takes any value)
 import fs from "node:fs";
@@ -72,6 +74,9 @@ export function dtsToRust(text) {
       aliases.set(st.name.text, st);
     }
   }
+  // (React's types are `react::Node`, not structs of their own.)
+  interfaces.delete("ReactElement");
+  aliases.delete("ReactNode");
   // Object-literal aliases (`type X = { ... }`) are emitted like interfaces.
   const objectAliases = new Map(
     [...aliases].filter(([, a]) => !a.typeParameters && ts.isTypeLiteralNode(a.type)).map(([n, a]) => [n, a]),
@@ -176,6 +181,10 @@ export function dtsToRust(text) {
       const tys = [...new Set(parts.filter((p) => !(p.optional && p.ty === "()")).map((p) => p.ty))];
       if (tys.length === 0) return { ty: "()", optional };
       if (tys.length === 1) return { ty: tys[0], optional };
+      // `string | ReactElement`: a node (text is one).
+      if (tys.includes("ReactNode") && tys.every((t) => ["ReactNode", "String", "f64", "bool", "Vec<ReactNode>"].includes(t))) {
+        return { ty: "ReactNode", optional };
+      }
       return { ty: "JsValue", optional };
     }
     // `Server & { isOnline?: boolean }`: `ServerWithIsOnline`, extending `Server` (without a
@@ -200,6 +209,7 @@ export function dtsToRust(text) {
       if (!ts.isIdentifier(node.typeName)) return { ty: "JsValue", optional: false };
       const name = node.typeName.text;
       const args = node.typeArguments ?? [];
+      if (name === "ReactNode" || name === "ReactElement") return { ty: "ReactNode", optional: name === "ReactNode" };
       if ((name === "Array" || name === "ReadonlyArray") && args.length === 1) {
         return { ty: `Vec<${map(args[0], hint).ty}>`, optional: false };
       }
@@ -344,6 +354,8 @@ export function dtsToRust(text) {
         if (used.has(rust)) continue;
         used.add(rust);
         const t = map(m.type, `${name}${pascal(js)}`);
+        // (A field that may hold a node, like a script's `title`, is read as any JS value.)
+        if (t.ty === "ReactNode") t.ty = "JsValue";
         const ty = rustType({ ...t, optional: t.optional || !!m.questionToken }, true);
         fields.push(`${docLines(m, "    ")}    #[js = ${JSON.stringify(js)}]\n    pub ${rust}: ${ty},\n`);
       }

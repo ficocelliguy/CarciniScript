@@ -56,6 +56,7 @@ const KNOWN_BOUNDS: &[&str] = &[
     "Unpin",
     "Sized",
     "BuildHasher",
+    "Allocator",
     "ToString",
     // (`T: Into<f64>`: its target is recorded; serde's bounds are checked where JSON is read.)
     "Into",
@@ -544,7 +545,32 @@ impl Checker<'_> {
             if matches!(z, Ty::Var(_) | Ty::Unknown) {
                 continue;
             }
+            // `emit(&mut Vec::new())` with `W: io::Write`: the one `Vec` impl of the trait
+            // (`impl Write for Vec<u8>`) names the element type, as rustc infers it.
+            // (`shallow`, not `zonk`: an unsettled element type stays a variable.)
+            let s = self.shallow(&t);
+            if let Some(key) = crate::adt::ext_key_of(&s)
+                && let Some(tr) = self.adts.traits.get(&b)
+                && let Some(impl_args) = tr.methods.iter().find_map(|tm| {
+                    self.adts
+                        .method(key, &tm.name)
+                        .map(|s| s.impl_args.clone())
+                        .filter(|a| !a.is_empty())
+                })
+            {
+                for (arg, want) in crate::adt::ext_args(&s).iter().zip(&impl_args) {
+                    if matches!(self.shallow(arg), Ty::Var(_)) && !matches!(want, Ty::Param(_)) {
+                        self.unify(arg, want);
+                    }
+                }
+            }
+            let z = self.zonk(&t);
             if !self.satisfies(&z, &b) {
+                // (The react prelude's bounds say what a `jsx!` child or attribute takes.)
+                if let Some((at, msg)) = self.react_bound_error(&z, &b, &node) {
+                    self.error(&at, msg);
+                    continue;
+                }
                 let msg = format!(
                     "the trait bound `{}: {b}` is not satisfied",
                     self.describe(&z)
@@ -640,8 +666,11 @@ impl Checker<'_> {
     }
 
     fn satisfies(&self, t: &Ty, b: &str) -> bool {
+        if let Some(ok) = self.react_bound(t, b) {
+            return ok;
+        }
         match b {
-            "Sized" | "Send" | "Sync" | "Unpin" | "BuildHasher" => true,
+            "Sized" | "Send" | "Sync" | "Unpin" | "BuildHasher" | "Allocator" => true,
             "FromStr" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.method(n, "from_str").is_some(),
@@ -696,7 +725,10 @@ impl Checker<'_> {
             "IoRead" | "IoBufRead" if self.is_bytes(t) => true,
             tr if self.adts.traits.contains_key(tr) => self.implements_user_trait(t, tr),
             "Copy" => match t {
-                Ty::Vec(_) | Ty::Str | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) => false,
+                // (`&str` is `Copy`, and the two string types are one here: a JS string is a
+                // value either way, so `T: Copy` takes it, as `GraphMap<&str, _>`'s nodes.)
+                Ty::Str => true,
+                Ty::Vec(_) | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) => false,
                 other => self.implements(other, "Copy"),
             },
             other => self.implements(t, other),

@@ -5,9 +5,8 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::{AstNode, SourceFile, SyntaxKind, SyntaxToken, TextRange, ast, ast::HasName};
+use ra_ap_syntax::{AstNode, SyntaxKind, SyntaxToken, TextRange, ast, ast::HasName};
 
-use crate::macros::EDITION;
 use crate::mbe::OffsetMap;
 
 /// True if some `fn` name appears twice (a cheap check before parsing).
@@ -33,7 +32,7 @@ pub(crate) fn has_duplicate_fns(text: &str) -> bool {
 }
 
 pub(crate) fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     // Every function that shares the file's namespace: top-level ones and those in blocks.
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut nested: Vec<(String, TextRange, TextRange)> = Vec::new();

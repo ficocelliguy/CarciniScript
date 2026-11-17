@@ -125,7 +125,7 @@ impl NS {
     /// Prints a ReactNode to the script logs.
     /// RAM cost: 0 GB
     #[js = "printRaw"]
-    pub fn print_raw(&self, #[optional] node: JsValue);
+    pub fn print_raw(&self, #[optional] node: ReactNode);
     /// Prints a formatted string to the script’s logs.
     /// RAM cost: 0 GB
     #[js = "printf"]
@@ -137,7 +137,7 @@ impl NS {
     /// Prints a ReactNode to the terminal.
     /// RAM cost: 0 GB
     #[js = "tprintRaw"]
-    pub fn tprint_raw(&self, #[optional] node: JsValue);
+    pub fn tprint_raw(&self, #[optional] node: ReactNode);
     /// Prints a raw value or a variable to the Terminal.
     /// RAM cost: 0 GB
     #[js = "tprintf"]
@@ -4877,15 +4877,6 @@ pub struct ProgramNameEnumType {
     pub storm_seed: String,
 }
 
-pub struct ReactElement {
-    #[js = "type"]
-    pub r#type: JsValue,
-    #[js = "props"]
-    pub props: JsValue,
-    #[js = "key"]
-    pub key: Option<JsValue>,
-}
-
 #[extends = "RunningScript"]
 pub struct RecentScript {
     /// Arguments the script was called with
@@ -6067,7 +6058,7 @@ impl UserInterface {
     /// Set the title of the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailTitle"]
-    pub fn set_tail_title(&self, #[optional] title: JsValue, #[optional] pid: f64);
+    pub fn set_tail_title(&self, #[optional] title: ReactNode, #[optional] pid: f64);
     /// Set the font size of the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailFontSize"]
@@ -6131,11 +6122,11 @@ impl UserInterface {
     /// Renders a ReactNode in the main content area.
     /// RAM cost: 0 GB
     #[js = "renderPage"]
-    pub fn render_page(&self, #[optional] node: JsValue);
+    pub fn render_page(&self, #[optional] node: ReactNode);
     /// Allows programmatic use of AutoLink.exe.
     /// RAM cost: 5 GB
     #[js = "createConnectLink"]
-    pub fn create_connect_link(&self, connect_path: Vec<String>, #[optional] link_text: String) -> ReactElement;
+    pub fn create_connect_link(&self, connect_path: Vec<String>, #[optional] link_text: String) -> ReactNode;
 }
 
 /// Interface Theme

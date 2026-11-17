@@ -10,7 +10,6 @@ use serde::Serialize;
 
 use crate::bindings;
 use crate::lineindex::LineIndex;
-use crate::macros::EDITION;
 use crate::ty::Ty;
 use crate::typeck::{self, Resolver, Types};
 
@@ -80,7 +79,18 @@ impl Analysis {
     }
 }
 
-pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis {
+/// `analyze_uncached`, kept for the next request on the same text (hover, completions and
+/// signature help each ask).
+pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> std::rc::Rc<Analysis> {
+    thread_local! {
+        static ANALYSES: crate::memo::Cache<std::rc::Rc<Analysis>> = Default::default();
+    }
+    crate::memo::cached(&ANALYSES, src, filename, resolver, |resolver| {
+        std::rc::Rc::new(analyze_uncached(src, filename, resolver))
+    })
+}
+
+fn analyze_uncached(src: &str, filename: &str, resolver: Resolver) -> Analysis {
     // (A proc-macro crate as it compiles; positions are unchanged.)
     let prepared;
     let src = if crate::procmacro::is_proc_crate(src) {
@@ -90,10 +100,14 @@ pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis
         src
     };
     let macros = crate::mbe::imported_macros(src, filename, resolver);
-    if let Ok(Some(exp)) = crate::mbe::preprocess_with(src, &macros, Some((filename, resolver))) {
+    // (A `jsx!` call being typed doesn't stop the rest of the file being analyzed.)
+    let pre = crate::jsx::leniently(|| {
+        crate::mbe::preprocess_with(src, &macros, Some((filename, resolver)))
+    });
+    if let Ok(Some(exp)) = pre {
         // (`std::time`'s prelude after the program, as it compiles.)
         let text = crate::stdtime::with_prelude(&exp.text).unwrap_or(exp.text);
-        let file = SourceFile::parse(&text, EDITION).tree();
+        let file = crate::macros::parse_tree(&text);
         let (types, _) = typeck::check(&file, &text, filename, resolver);
         return Analysis {
             file,
@@ -103,7 +117,7 @@ pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> Analysis
     }
     let with_time = crate::stdtime::with_prelude(src);
     let src = with_time.as_deref().unwrap_or(src);
-    let file = SourceFile::parse(src, EDITION).tree();
+    let file = crate::macros::parse_tree(src);
     let (types, _) = typeck::check(&file, src, filename, resolver);
     Analysis {
         file,
@@ -163,6 +177,22 @@ pub fn hover(
     column: u32,
     resolver: Resolver,
 ) -> Option<Hover> {
+    // `jsx!` markup: a tag or an attribute.
+    if src.contains("jsx!")
+        && let Some((r, contents)) =
+            crate::jsx_service::hover(src, offset_of(src, line, column), resolver)
+    {
+        let idx = LineIndex::new(src);
+        let (l0, c0) = idx.line_col(usize::from(r.start()));
+        let (l1, c1) = idx.line_col(usize::from(r.end()));
+        return Some(Hover {
+            contents,
+            line: l0 + 1,
+            column: c0 + 1,
+            end_line: l1 + 1,
+            end_column: c1 + 1,
+        });
+    }
     let an = analyze(src, filename, resolver);
     let offset = an.at(offset_of(src, line, column))?;
     let (file, types) = (&an.file, &an.types);
@@ -352,6 +382,12 @@ pub fn completions(
     resolver: Resolver,
 ) -> Vec<Completion> {
     let offset = offset_of(src, line, column);
+    // `jsx!` markup: tag names and attributes.
+    if src.contains("jsx!")
+        && let Some(out) = crate::jsx_service::completions(src, offset, resolver)
+    {
+        return out;
+    }
     // Back over the partial name being typed to the `.`.
     let before = &src[..offset];
     let word_start = before
@@ -1120,7 +1156,7 @@ pub fn std_methods(t: &Ty) -> &'static [&'static str] {
 }
 
 /// The `///` doc comment of an item, as markdown (empty when there is none).
-fn docs_of(item: &impl HasAttrs) -> String {
+pub(crate) fn docs_of(item: &impl HasAttrs) -> String {
     item.doc_comments()
         .filter_map(|c| {
             let text = c.syntax().text().to_string();

@@ -12,11 +12,10 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
-    AstNode, NodeOrToken, SourceFile, SyntaxKind, SyntaxNode, TextRange,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange,
     ast::{self, HasAttrs, HasName},
 };
 
-use crate::macros::EDITION;
 use crate::mbe::OffsetMap;
 use crate::typeck::Resolver;
 
@@ -234,7 +233,7 @@ pub(crate) fn is_proc_crate(text: &str) -> bool {
 
 /// The proc macros `text` defines.
 fn read_crate(file: String, text: String) -> Crate {
-    let parsed = SourceFile::parse(&text, EDITION).tree();
+    let parsed = crate::macros::parse_tree(&text);
     let mut c = Crate {
         text: String::new(),
         file,
@@ -281,7 +280,7 @@ fn read_crate(file: String, text: String) -> Crate {
 /// the prelude (`TokenStream`, `Ident`, `Span`, `Literal`) and a `String`-to-`String` entry
 /// point `__pm_name` for each macro, which the runner calls.
 pub(crate) fn prepared(text: &str) -> String {
-    let parsed = SourceFile::parse(text, EDITION).tree();
+    let parsed = crate::macros::parse_tree(text);
     let mut out = text.to_string();
     let blank = |out: &mut String, r: TextRange| {
         let (a, b) = (usize::from(r.start()), usize::from(r.end()));
@@ -593,7 +592,7 @@ pub fn expand(
     // `use`s are gone after the first).
     let mut imported: HashMap<String, (String, String)> = HashMap::new();
     for _round in 0..8 {
-        let file = SourceFile::parse(text, EDITION).tree();
+        let file = crate::macros::parse_tree(text);
         // Names a path could start with that are other crates (`mac::show!`, `use mac::Show`).
         let mut local_mods: HashSet<String> = HashSet::new();
         for m in file.syntax().descendants().filter_map(ast::Module::cast) {
@@ -976,7 +975,7 @@ fn compile_error_in(out: &str) -> Option<String> {
     if !out.contains("compile_error") {
         return None;
     }
-    let file = SourceFile::parse(out, EDITION).tree();
+    let file = crate::macros::parse_tree(out);
     let toks: Vec<ra_ap_syntax::SyntaxToken> = file
         .syntax()
         .descendants_with_tokens()

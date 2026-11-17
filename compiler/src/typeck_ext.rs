@@ -25,6 +25,8 @@ impl Checker<'_> {
             _ => None,
         };
         self.scopes.push(HashMap::new());
+        // (Slot items for this closure's parameters; nested closures get none.)
+        let slot_params = std::mem::take(&mut self.closure_slots);
         let mut ptys = Vec::new();
         for (i, p) in params.iter().enumerate() {
             let annotated = p.ty().map(|t| self.lower_type(&t));
@@ -39,6 +41,9 @@ impl Checker<'_> {
             };
             if let Some(pat) = p.pat() {
                 self.pat(&pat, &t);
+                if let Some((_, shape)) = slot_params.iter().find(|(j, _)| *j == i) {
+                    self.bind_slot_shape(&pat, shape);
+                }
             }
             ptys.push(t);
         }
@@ -838,25 +843,41 @@ impl Checker<'_> {
                 .and_then(|f| f.iterable())
                 .is_some_and(|it| it.syntax() == m.syntax());
         // Slots (see `typeck_slots.rs`) pass through adapters that don't look at the items.
-        let slots = matches!(
-            method,
-            "skip"
-                | "take"
-                | "rev"
-                | "step_by"
-                | "peekable"
-                | "by_ref"
-                | "fuse"
-                | "zip"
-                | "collect"
-                | "count"
-                | "nth"
-                | "nth_back"
-                | "last"
-                | "next_back"
-        ) && m
-            .receiver()
-            .is_some_and(|r| self.iter_slot_shape(&r).is_some());
+        let recv_shape = m.receiver().and_then(|r| self.iter_slot_shape(&r));
+        // Adapters with closures: the parameter that gets an item binds a slot.
+        let closure_params: &[usize] = match method {
+            "filter" | "find" | "position" | "any" | "all" | "map" | "filter_map" | "inspect"
+            | "skip_while" | "take_while" | "max_by_key" | "min_by_key" | "for_each" => &[0],
+            "fold" => &[1],
+            "max_by" | "min_by" => &[0, 1],
+            _ => &[],
+        };
+        if let Some(shape) = &recv_shape
+            && !closure_params.is_empty()
+        {
+            self.closure_slots = closure_params.iter().map(|i| (*i, shape.clone())).collect();
+        }
+        let slots = recv_shape.is_some()
+            && (!closure_params.is_empty()
+                || matches!(
+                    method,
+                    "skip"
+                        | "take"
+                        | "rev"
+                        | "step_by"
+                        | "peekable"
+                        | "by_ref"
+                        | "fuse"
+                        | "zip"
+                        | "collect"
+                        | "count"
+                        | "nth"
+                        | "nth_back"
+                        | "last"
+                        | "next_back"
+                        | "max"
+                        | "min"
+                ));
         if mutable && !objects && !matches!(method, "for_each" | "enumerate") && !for_zip && !slots
         {
             self.error(

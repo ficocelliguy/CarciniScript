@@ -163,16 +163,57 @@ const cases = [
   ['jsx! { <gauge label="x" value={1.0} size={2} /> }', "`gauge` has no parameter `size` (it takes: `label`, `value`)"],
   ["jsx! { <gauge label={3} value={1.0} /> }", "mismatched types"],
   ['jsx! { <div><p>"a"</div> }', "`</div>` closes `<p>`"],
-  ['jsx! { <p on_click={|e: i32| {}}>"x"</p> }', "mismatched types: expected `impl Fn(JsValue)`"],
+  ['jsx! { <p on_click={|e: i32| {}}>"x"</p> }', "mismatched types: expected `impl Fn(Event)`"],
   ['jsx! { <gauge label="x" value={1.0}>"kid"</gauge> }', "`gauge` takes no children"],
   ['{ let ticker = 3; jsx! { <ticker /> } }', "`ticker` is bound here, but not to a fn or closure"],
   ["jsx! { <p>{nope}</p> }", "cannot find value `nope`"],
+  // Typed children, attributes and events; `ns.print_raw`'s argument.
+  ["jsx! { <p>{Some(vec![true])}</p> }", "React can't show a `Option<Vec<bool>>`: a `jsx!` child is"],
+  ["jsx! { <p>{(1, 2)}</p> }", "React can't show a `(i32, i32)`"],
+  ["(1, 2)", "React can't show a `(i32, i32)`: this takes a `react::Node`"],
+  ['jsx! { <div colour="red">"x"</div> }', "`<div>` has no attribute `colour` (did you mean `color`?)"],
+  ['jsx! { <div onclick={|| {}}>"x"</div> }', "`<div>` has no attribute `onclick` (did you mean `onClick`?)"],
+  ['jsx! { <div tab_indx={1}>"x"</div> }', "`<div>` has no attribute `tab_indx` (did you mean `tab_index`?)"],
+  ['jsx! { <button disabled="yes">"x"</button> }', "this attribute takes a `bool`, not `String`"],
+  ['jsx! { <div class={3}>"x"</div> }', "this attribute takes text (`&str` or `String`), not `i32`"],
+  ['jsx! { <div style={5}>"x"</div> }', "`style` takes a CSS string"],
+  ['jsx! { <div key={vec![1]}>"x"</div> }', "`key` takes text or a number, not `Vec<i32>`"],
+  ['jsx! { <p on_click="x">"x"</p> }', "`on_click` takes a closure"],
+  ['jsx! { <p on_click={|e: js::Event| e.nope}>"x"</p> }', "no field `nope` on type `Event`"],
+  ['jsx! { <div {..3}>"x"</div> }', "`{..spread}` on an HTML element takes `(name, value)` pairs"],
+  ['jsx! { <p>{..vec![("a", 1)]}</p> }', "`{..spread}` goes among an element's attributes"],
+  ['{ let c = react::create_context(1); jsx! { <c.Provider>"x"</c.Provider> } }', "`<c.Provider>` needs `value=..`"],
+  ['{ let c = react::create_context(1); jsx! { <c.Provider value={"a"}>"x"</c.Provider> } }', "mismatched types"],
+  ["jsx! { <a.b /> }", "`<a.b>`: a dotted tag is a context's provider"],
 ];
 for (const [body, want] of cases) {
   const name = `react rejects: ${body}`;
   const src = `${prelude}pub async fn main(ns: NS) { ns.print_raw(${body}); }\n`;
   const msgs = compile(src, "bad.rs").diagnostics.filter((d) => d.severity === "error").map((d) => d.message);
   if (!msgs.some((m) => m.startsWith(want))) fail(name, `want: ${want}\ngot:\n${msgs.join("\n")}`);
+  else pass(name);
+}
+
+// Typed attributes and children point at the value written.
+{
+  const name = "react: positions of attribute and child type errors";
+  const src = [
+    "use react::{jsx, Node};",
+    "pub async fn main(ns: NS) {",
+    "    let node: Node = jsx! {",
+    '        <div class={3} hidden="no">',
+    "            {(1, 2)}",
+    "        </div>",
+    "    };",
+    "    ns.print_raw(node);",
+    "}",
+    "",
+  ].join("\n");
+  const got = compile(src, "pos.rs")
+    .diagnostics.filter((d) => d.severity === "error")
+    .map((d) => `${d.line}:${d.column}`);
+  const want = ["4:21", "4:31", "5:14"];
+  if (got.join(" ") !== want.join(" ")) fail(name, `want ${want.join(" ")}\ngot  ${got.join(" ")}`);
   else pass(name);
 }
 

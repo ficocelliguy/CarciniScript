@@ -130,6 +130,40 @@ pub trait IoWrite {
     fn __write_str(&mut self, s: &str) -> Result<(), IoError> {
         self.write_all(s.as_bytes())
     }
+    // (Every buffer is written, as `Vec<u8>` and `Stdout` do.)
+    fn write_vectored(&mut self, bufs: &[IoIoSlice]) -> Result<usize, IoError> {
+        let mut n = 0;
+        for b in bufs {
+            self.write_all(&b.__b)?;
+            n += b.__b.len();
+        }
+        Ok(n)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+}
+
+/// `std::io::IoSlice`: a byte slice for `write_vectored`.
+#[derive(Clone, Debug)]
+pub struct IoIoSlice {
+    __b: Vec<u8>,
+}
+
+impl IoIoSlice {
+    pub fn new(buf: &[u8]) -> IoIoSlice {
+        IoIoSlice { __b: buf.to_vec() }
+    }
+    pub fn advance(&mut self, n: usize) {
+        self.__b = self.__b[n..].to_vec();
+    }
+}
+
+impl std::ops::Deref for IoIoSlice {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.__b
+    }
 }
 
 /// A `Vec<u8>` is a writer: the bytes are appended.

@@ -155,7 +155,17 @@ pub fn current() -> Rc<Bindings> {
 pub fn set(text: &str) -> Vec<String> {
     let (bindings, errors) = parse(text);
     CURRENT.with(|c| *c.borrow_mut() = Rc::new(with_js(bindings)));
+    GENERATION.with(|g| g.set(g.get() + 1));
     errors
+}
+
+thread_local! {
+    /// How many times bindings were installed (results kept across calls name the one they used).
+    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn generation() -> u64 {
+    GENERATION.with(|g| g.get())
 }
 
 /// Rust identifiers may be raw (`r#type`); lookups use the bare name.
@@ -281,6 +291,9 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
                 // (A parameter of this type takes any value: see `loosen`.)
                 "JsValue" => Ty::Extern("JsValue".into()),
                 "JsAny" => Ty::Unknown,
+                // (The `js` crate's, always loaded: `react::Node`. A parameter of it takes what
+                // a `jsx!` child may be.)
+                "ReactNode" => Ty::Extern("ReactNode".into()),
                 n if structs.contains(n) => Ty::Extern(n.to_string()),
                 n => Ty::from_name(n),
             }

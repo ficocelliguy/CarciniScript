@@ -481,7 +481,7 @@ function decodeMappings(mappings) {
     const srcLines = src.split(/\r?\n/);
     // Each probe: a JS snippet whose line must map back to the Rust line containing the needle.
     const probes = [
-      ["return κσ.$w128(fib(", "fib(n - 1) + fib(n - 2)"],
+      ["return BigInt.asUintN(64, fib(", "fib(n - 1) + fib(n - 2)"],
       ["n = ((", "n = if n % 2 == 0"],
       ["$outer: for", "'outer: for a in 1..20"],
       ["break $outer;", "break 'outer;"],
@@ -497,7 +497,7 @@ function decodeMappings(mappings) {
       }
     }
     // Column check: the second `fib(` call maps to its exact Rust column.
-    const gl = genLines.findIndex((l) => l.includes("return κσ.$w128(fib("));
+    const gl = genLines.findIndex((l) => l.includes("return BigInt.asUintN(64, fib("));
     const genCol = genLines[gl].lastIndexOf("fib(");
     const srcLine = srcLines.findIndex((l) => l.includes("fib(n - 1) + fib(n - 2)"));
     const want = srcLines[srcLine].lastIndexOf("fib(");
@@ -606,7 +606,6 @@ const rejected = [
   ["sort_by without an Ordering", "let mut v = vec![1, 2];\n    v.sort_by(|a, b| a < b);", "3:22 mismatched types: expected `Ordering`, found `bool`"],
   ["max of floats", "let v = vec![1.5, 2.0];\n    let m = v.iter().max();", "3:13 the trait bound `{float}: Ord` is not satisfied"],
   ["collect without a target", "let v = vec![1, 2];\n    let w = v.iter().map(|x| x * 2).collect();", "3:13 type annotations needed"],
-  ["map over iter_mut", "let mut v = vec![1, 2];\n    let w: Vec<i32> = v.iter_mut().map(|x| *x).collect();", "`iter_mut()` followed by `.map()` isn't supported yet"],
   ["Display of an Ordering", 'println!("{}", 1.cmp(&2));', "2:14 `Ordering` doesn't implement `std::fmt::Display`"],
   ["missing struct field", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P { x: 1 };", "9:13 missing field `y` in initializer of `P`"],
   ["unknown struct field", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P { x: 1, y: 2, z: 3 };", "9:29 struct `P` has no field named `z`"],
@@ -636,7 +635,6 @@ const rejected = [
   ["a required trait const next to a default one", "}\ntrait T { const N: usize = 1; const M: usize; }\nstruct S;\nimpl T for S {}\nfn g() {", "5:12 not all trait items implemented, missing: `M`"],
   ["a trait const default of the wrong type", "}\ntrait T { const N: usize = \"x\"; }\nfn g() {", "3:28 mismatched types: expected `usize`, found `String`"],
   ["get_or_insert on an immutable binding", "let o: Option<i32> = None;\n    *o.get_or_insert(1) += 1;", "3:6 cannot borrow `o` as mutable, as it is not declared as mutable"],
-  ["iter_mut of numbers through a closure adapter", "let mut v = vec![1, 2];\n    let mut it = v.iter_mut().filter(|x| **x > 1);", "3:18 `iter_mut()` followed by `.filter()` isn't supported yet"],
   ["TryFrom implemented twice", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<u8> for E {\n    type Error = ();\n    fn try_from(v: u8) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {", "12:8 implementing `TryFrom` more than once for `E` isn't supported yet"],
   ["try_into without a target", "let x = 5i64.try_into();", "2:13 type annotations needed: say what `.try_into()` converts to"],
   ["hash of a float", "}\nuse std::hash::{Hash, Hasher};\nstruct P(f64);\nimpl Hash for P {\n    fn hash<H: Hasher>(&self, state: &mut H) {\n        self.0.hash(state);\n    }\n}\nfn g() {", "7:9 the trait bound `f64: Hash` is not satisfied"],
@@ -692,8 +690,7 @@ const rejected = [
   ["break outside a loop", "break;", "2:5 `break` outside of a loop"],
   ["loop breaking with different types", "let x = loop { if true { break 1; } break \"s\"; };", "2:47 mismatched types: expected `{integer}`, found `String`"],
   ["`&mut` to a number field of a call's result", "}\nstruct P { x: i32 }\nfn make() -> P { P { x: 1 } }\nfn bump(v: &mut i32) { *v += 1; }\nfn f() {\n    bump(&mut make().x);", "7:15 passing a `&mut` to a number, string or bool inside a struct, tuple or Vec isn't supported yet"],
-  ["keeping a `&mut` to an `Option` field in a variable", "}\nstruct T { root: Option<i32> }\nfn f() {\n    let mut t = T { root: None };\n    let cur = &mut t.root;\n    *cur = Some(1);", "6:15 keeping a `&mut` to a `Option<i32>` inside a struct, tuple or Vec in a variable isn't supported yet"],
-  ["two nested functions with the same name", "}\nfn b() { fn h() {} }\nfn c() { fn h() {} }\nfn d() {", "4:13 the name `h` is defined multiple times"],
+  ["re-pointing a `&mut` variable at an `Option` field", "}\nstruct T { root: Option<i32>, other: Option<i32> }\nfn f() {\n    let mut t = T { root: None, other: None };\n    let mut cur = &mut t.other;\n    cur = &mut t.root;\n    *cur = Some(1);", "7:11 keeping a `&mut` to a `Option<i32>` inside a struct, tuple or Vec in a variable isn't supported yet"],
   ["wrong type into a Stack<i32>", "}\nstruct Stack<T> { items: Vec<T> }\nimpl<T> Stack<T> { fn new() -> Self { Stack { items: Vec::new() } } fn push(&mut self, x: T) { self.items.push(x); } }\nfn f() {\n    let mut s: Stack<i32> = Stack::new();\n    s.push(\"x\");", "7:12 mismatched types: expected `i32`, found `String`"],
   ["a generic struct's type inferred from first use", "}\nstruct Stack<T> { items: Vec<T> }\nimpl<T> Stack<T> { fn new() -> Self { Stack { items: Vec::new() } } fn push(&mut self, x: T) { self.items.push(x); } }\nfn f() {\n    let mut s = Stack::new();\n    s.push(1);\n    s.push(2.5);", "8:12 mismatched types: expected `{integer}`, found `{float}`"],
   ["use after `let b = a`", "let a = vec![1];\n    let b = a;\n    println!(\"{:?} {:?}\", a, b);", "4:27 use of moved value: `a` (moved on line 3:13 by `let`"],
@@ -781,7 +778,6 @@ const rejected = [
   ["an impl missing an associated type", "}\ntrait Shape {\n    type Unit;\n    fn area(&self) -> Self::Unit;\n}\nstruct Sq;\nimpl Shape for Sq {\n    fn area(&self) -> f64 {\n        1.0\n    }\n}\nfn f() {", "8:16 not all trait items implemented, missing: `Unit`"],
   ["an associated type the trait doesn't have", "}\ntrait Named {\n    fn name(&self) -> String;\n}\nstruct A;\nimpl Named for A {\n    type Extra = i32;\n    fn name(&self) -> String {\n        String::new()\n    }\n}\nfn f() {", "8:5 type `Extra` is not a member of trait `Named`"],
   ["an associated type default", "}\ntrait Shape {\n    type Unit = f64;\n}\nfn f() {", "4:5 associated type defaults are unstable"],
-  ["a generic trait implemented twice for one type", "}\ntrait Convert<T> {\n    fn convert(&self) -> T;\n}\nstruct A;\nimpl Convert<i32> for A {\n    fn convert(&self) -> i32 {\n        1\n    }\n}\nimpl Convert<String> for A {\n    fn convert(&self) -> String {\n        String::new()\n    }\n}\nfn f() {", "12:6 implementing the generic trait `Convert` more than once for `A` isn't supported yet"],
   ["a blanket impl's method on a type without the bound", "}\ntrait Shout {\n    fn shout(&self) -> String;\n}\nimpl<T: std::fmt::Display> Shout for T {\n    fn shout(&self) -> String {\n        format!(\"{}!\", self)\n    }\n}\nstruct P;\nfn f() {\n    let s = P.shout();", "13:13 no method named `shout` found for struct `P`"],
   ["a const argument nothing gives", "}\nfn zeros<const N: usize>() -> [f64; N] {\n    [0.0; N]\n}\nfn f() {\n    let z = zeros();", "7:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the function `zeros`"],
   ["mismatched const arguments", "}\nstruct M<const R: usize> {\n    d: [i32; R],\n}\nimpl<const R: usize> M<R> {\n    fn z() -> Self {\n        M { d: [0; R] }\n    }\n}\nfn f() {\n    let m: M<2> = M::<3>::z();", "12:19 mismatched types: expected `M<2>`, found `M<3>`"],
@@ -789,7 +785,7 @@ const rejected = [
   ["a const fn call as a const argument", "}\nconst fn words(bits: usize) -> usize {\n    bits / 8\n}\nfn mk<const N: usize>() -> [u8; N] {\n    [1; N]\n}\nfn f() {\n    let a = mk::<{ words(64) }>();", "10:20 this const argument isn't supported yet"],
   ["a 64-bit const parameter","}\nfn big<const N: u64>() -> u64 {\n    N\n}\nfn f() {", "3:8 const parameters of type `u64` aren't supported"],
   ["a struct's const argument nothing gives", "}\nstruct S<const N: usize> {\n    v: Vec<i32>,\n}\nfn f() {\n    let s = S { v: vec![] };", "7:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the struct `S`"],
-  ["const parameters on an enum", "}\nenum E<const N: usize> {\n    A,\n}\nfn f() {", "3:7 const generic parameters on enums are not supported yet"],
+  ["an enum's const argument nothing gives", "}\nenum E<const N: usize> {\n    A,\n    B([u8; N]),\n}\nfn f() {\n    let e = E::A;", "8:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the enum `E`"],
   ["parse into a type without FromStr","}\nstruct P;\nfn f() {\n    let p = \"1\".parse::<P>();", "5:13 the trait bound `P: FromStr` is not satisfied"],
   ["using an array of Strings after moving it", "let a = [String::from(\"x\")];\n    let b = a;\n    println!(\"{:?} {:?}\", a, b);", "4:27 use of moved value: `a`"],
   ["structured_clone of a type without Clone", "}\nstruct P {\n    x: i32,\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = js::structured_clone(&p);", "8:34 the trait bound `P: Clone` is not satisfied (`structured_clone` copies Rust values by their `Clone`)"],
@@ -834,6 +830,7 @@ const rejected = [
   ],
   ["`resize` with the wrong fill value", 'let mut v = vec![1u8];\n    v.resize(3, "x");', "3:17 mismatched types: expected `u8`, found `String`"],
   ["`next_power_of_two` on a signed integer", "let x = 5i32.next_power_of_two();", "2:13 no method named `next_power_of_two`"],
+  ["`get_index_mut` on an `IndexMap` of numbers, not matched", "let mut m: indexmap::IndexMap<&str, i32> = indexmap::IndexMap::new();\n    m.insert(\"a\", 1);\n    *m.get_index_mut(0).unwrap().1 += 1;", "4:6 `IndexMap::get_index_mut` on a map of `i32` isn't supported here"],
 ];
 for (const [label, body, want] of rejected) {
   const name = `rejects: ${label}`;
@@ -848,9 +845,9 @@ for (const [label, body, want] of rejected) {
 // Modules: each case is a set of files; the first is compiled.
 const rejectedFiles = [
   [
-    "a `&mut self` trait method on `String`",
-    { "main.rs": "trait Sink {\n    fn put(&mut self, s: &str);\n}\nimpl Sink for String {\n    fn put(&mut self, s: &str) {\n        self.push_str(s);\n    }\n}\nfn main() {}\n" },
-    "5:8 `&mut self` methods of a trait implemented for `String` aren't supported yet",
+    "a generic trait implemented twice, called through a type parameter",
+    { "main.rs": "trait Conv<T> {\n    fn conv(&self) -> T;\n}\nimpl Conv<u8> for u32 {\n    fn conv(&self) -> u8 {\n        1\n    }\n}\nimpl Conv<u16> for u32 {\n    fn conv(&self) -> u16 {\n        2\n    }\n}\nfn go<X: Conv<u16>>(x: X) -> u16 {\n    x.conv()\n}\nfn main() {\n    println!(\"{}\", go(5u32));\n}\n" },
+    "15:5 `conv` comes from a generic trait implemented more than once for one type",
   ],
   [
     "importing a missing item through a nested module file",
@@ -960,6 +957,21 @@ const rejectedFiles = [
     "1:1 circular modules",
   ],
   ["crates other than std", { "main.rs": "use reqwest::blocking;\nfn main() {}" }, "1:5 unresolved import `reqwest`"],
+  [
+    "`TypeId::of` a type parameter (erased at run time)",
+    { "main.rs": "use std::any::{Any, TypeId};\nfn id<T: 'static>() -> TypeId {\n    TypeId::of::<T>()\n}\nfn main() {}\n" },
+    "3:5 the type here is a type parameter",
+  ],
+  [
+    "`type_id()` of a `dyn Any`",
+    { "main.rs": "use std::any::Any;\nfn f(x: &dyn Any) -> bool {\n    x.type_id() == std::any::TypeId::of::<i32>()\n}\nfn main() {}\n" },
+    "3:5 the type of a `dyn Any` isn't known at run time",
+  ],
+  [
+    "`is::<Option<T>>()` on a `dyn Any`",
+    { "main.rs": "use std::any::Any;\nfn f(x: &dyn Any) -> bool {\n    x.is::<Option<i32>>()\n}\nfn main() {}\n" },
+    "3:5 `is::<Option<i32>>()` can't be told apart at run time",
+  ],
 ];
 for (const [label, files, want] of rejectedFiles) {
   const name = `rejects: ${label}`;
@@ -1039,6 +1051,37 @@ for (const [label, files, want] of rejectedFiles) {
     ["hover on a binding a macro made", () => hover(withMacro, "mac.rs", 5, 10)?.contents, "nums: Vec<i32>"],
     ["hover after a macro keeps its position", () => { const h = hover(withMacro, "mac.rs", 6, 10); return h && `${h.line}:${h.column}-${h.endColumn} ${h.contents}`; }, "6:9-14 ```rust\ntotal: i32"],
     ["completions after a macro", () => completions(withMacro, "mac.rs", 7, 11).some((c) => c.label === "checked_add"), true],
+  );
+  // `jsx!`: hover on tags and attributes (markup) and in embedded expressions; completions of
+  // tags, a component's props and an element's attributes.
+  const withJsx = [
+    "use react::{jsx, Node};",
+    "/// A labelled bar.",
+    "fn gauge(label: &str, value: f64) -> Node {",
+    "    jsx! { <b>{label} {value}</b> }",
+    "}",
+    "fn main() {",
+    "    let hp = 0.5f64;",
+    '    let n: Node = jsx! { <div class="x" on_click={|e| {}}><gauge label="hp" value={hp} /></div> };',
+    "    let m: Node = jsx! { <div on_cl><gauge val /><ga </div> };",
+    "    let k: Node = jsx! { <p>{hp.}</p> };",
+    "}",
+  ].join("\n");
+  const jsxLines = withJsx.split("\n");
+  // (1-based column of `text` on `line`, plus `k`.)
+  const col = (line, text, k = 0) => jsxLines[line - 1].indexOf(text) + 1 + k;
+  checks.push(
+    ["jsx: hover on a component's tag", () => hover(withJsx, "jsx.rs", 8, col(8, "gauge", 2))?.contents, "fn gauge(label: &str, value: f64) -> Node\n```\n*component*\n\nA labelled bar."],
+    ["jsx: hover on a component's prop", () => hover(withJsx, "jsx.rs", 8, col(8, "label", 1))?.contents, "label: &str\n```\n\nA parameter of the component `gauge`."],
+    ["jsx: hover on an HTML attribute", () => hover(withJsx, "jsx.rs", 8, col(8, "class", 1))?.contents, "class: text\n```\n\nAn attribute of `<div>` (React's `className`)."],
+    ["jsx: hover on an event handler", () => hover(withJsx, "jsx.rs", 8, col(8, "on_click", 1))?.contents, "on_click: impl Fn(js::Event)"],
+    ["jsx: hover in an embedded expression", () => hover(withJsx, "jsx.rs", 8, col(8, "{hp}", 1))?.contents, "hp: f64"],
+    ["jsx: hover in a component's body", () => hover(withJsx, "jsx.rs", 4, col(4, "{value}", 1))?.contents, "value: f64"],
+    ["jsx: an event closure's parameter is the event", () => hover(withJsx, "jsx.rs", 8, col(8, "|e|", 1))?.contents, "e: Event"],
+    ["jsx: attributes of an element", () => completions(withJsx, "jsx.rs", 9, col(9, "on_cl", 5)).map((c) => c.label).join(","), "on_click,on_close"],
+    ["jsx: props of a component", () => completions(withJsx, "jsx.rs", 9, col(9, "val", 3)).map((c) => `${c.label}: ${c.detail}`).join(","), "value: f64"],
+    ["jsx: tag names", () => completions(withJsx, "jsx.rs", 9, col(9, "<ga", 3)).map((c) => c.label).join(","), "gauge"],
+    ["jsx: members in an embedded expression", () => completions(withJsx, "jsx.rs", 10, col(10, "hp.", 3)).some((c) => c.label === "sqrt"), true],
   );
   checks.push(
     ["doc comment of a method", () => hover(documented, "doc.rs", 14, 15)?.contents, "Seconds until the next hack."],
@@ -1159,6 +1202,14 @@ const warned = [
   ["changing a Vec inside a `for` over it", "let mut v = vec![1, 2, 3];\n    for x in v.iter() {\n        v.push(*x);\n    }", "4:9 cannot borrow `v` as mutable because it is also borrowed as immutable"],
   ["two `&mut` borrows at once", "let mut v = vec![1];\n    let a = &mut v;\n    let b = &mut v;\n    b.push(2);\n    a.push(3);", "4:13 cannot borrow `v` as mutable more than once at a time"],
   ["a map changed while `get`'s result is held", "let mut m = std::collections::HashMap::new();\n    m.insert(1, 2);\n    let g = m.get(&1);\n    m.insert(2, 3);\n    println!(\"{:?}\", g);", "5:5 cannot borrow `m` as mutable because it is also borrowed as immutable"],
+  // Through calls (the callee's signature says what the result borrows) and down to fields.
+  ["a push while a function's returned reference is used", "}\nfn first(v: &Vec<i32>) -> &i32 {\n    &v[0]\n}\nfn g() {\n    let mut v = vec![1, 2, 3];\n    let f = first(&v);\n    v.push(4);\n    println!(\"{}\", f);", "9:5 cannot borrow `v` as mutable because it is also borrowed as immutable"],
+  ["a `&mut self` call while a `&self` method's result is used", "}\nstruct S { name: String }\nimpl S {\n    fn name(&self) -> &str { &self.name }\n    fn set(&mut self, n: &str) { self.name = n.to_string(); }\n}\nfn g() {\n    let mut s = S { name: String::new() };\n    let r = s.name();\n    s.set(\"b\");\n    println!(\"{}\", r);", "11:5 cannot borrow `s` as mutable because it is also borrowed as immutable"],
+  ["assigning a borrowed field", "}\nstruct P { a: Vec<i32>, b: i32 }\nfn g() {\n    let mut p = P { a: vec![1], b: 2 };\n    let r = &p.a;\n    p.b = 3;\n    p.a = vec![];\n    println!(\"{:?} {}\", r, p.b);", "8:5 cannot assign to `p.a` because it is borrowed"],
+  ["printing a mutably borrowed field", "let mut t = (vec![1], 2);\n    let r = &mut t.0;\n    println!(\"{:?} {}\", t.0, t.1);\n    r.push(2);", "4:25 cannot borrow `t.0` as immutable because it is also borrowed as mutable"],
+  ["the argument a named lifetime ties the result to", "}\nfn pick<'a>(x: &'a Vec<i32>, _y: &Vec<i32>) -> &'a i32 {\n    &x[0]\n}\nfn g() {\n    let mut v = vec![1];\n    let mut w = vec![2];\n    let p = pick(&v, &w);\n    w.push(1);\n    v.push(2);\n    println!(\"{}\", p);", "11:5 cannot borrow `v` as mutable because it is also borrowed as immutable"],
+  ["a constructor keeping its argument borrowed", "}\nstruct Parser<'a> { s: &'a str }\nimpl<'a> Parser<'a> {\n    fn new(s: &'a str) -> Parser<'a> { Parser { s } }\n}\nfn g() {\n    let mut text = String::from(\"a\");\n    let p = Parser::new(&text);\n    text.push('b');\n    println!(\"{}\", p.s);", "10:5 cannot borrow `text` as mutable because it is also borrowed as immutable"],
+  ["a field changed in a `for` over a method's result", "}\nstruct S { v: Vec<i32>, n: i32 }\nimpl S { fn items(&self) -> &Vec<i32> { &self.v } }\nfn g() {\n    let mut s = S { v: vec![1], n: 0 };\n    for x in s.items() {\n        s.n += *x;\n    }", "8:9 cannot assign to `s.n` because it is borrowed"],
 ];
 for (const [label, body, want] of warned) {
   const name = `warns: ${label}`;
@@ -1185,6 +1236,12 @@ const quiet = [
   ["a borrow that ends before the push", "fn main() {\n    let mut v = vec![1, 2, 3];\n    let first = &v[0];\n    println!(\"{}\", first);\n    v.push(4);\n    println!(\"{:?}\", v);\n}\n"],
   ["a copied element", "fn main() {\n    let mut v = vec![1, 2, 3];\n    let first = v[0];\n    v.push(4);\n    println!(\"{} {:?}\", first, v);\n}\n"],
   ["a borrow used only in the other branch", "fn main() {\n    let mut v = vec![1, 2];\n    let r = &v;\n    if v.len() > 5 {\n        v.push(1);\n    } else {\n        println!(\"{:?}\", r);\n    }\n}\n"],
+  // Calls, fields and leaving a loop: only what rustc rejects.
+  ["disjoint fields", "fn main() {\n    let mut p = (vec![1], vec![2]);\n    let r = &p.0;\n    p.1.push(3);\n    let m = &mut p.1;\n    println!(\"{:?}\", p.0);\n    m.push(4);\n    println!(\"{:?} {:?}\", r, p.1);\n}\n"],
+  ["a method of your own named `get` that returns a copy", "struct S { a: Vec<i32> }\nimpl S {\n    fn get(&self, i: usize) -> i32 { self.a[i] }\n    fn add(&mut self, x: i32) { self.a.push(x); }\n}\nfn main() {\n    let mut s = S { a: vec![1] };\n    let g = s.get(0);\n    s.add(2);\n    println!(\"{} {:?}\", g, s.a);\n}\n"],
+  ["a change right before leaving the loop", "fn main() {\n    let mut v = vec![1, 2, 3];\n    for x in v.iter() {\n        if *x == 2 {\n            v.push(9);\n            break;\n        }\n    }\n    let r = &v[0];\n    if v.len() > 1 {\n        v.push(1);\n        return;\n    }\n    println!(\"{} {:?}\", r, v);\n}\n"],
+  ["an argument the result's lifetime isn't tied to", "fn pick<'a>(x: &'a Vec<i32>, _y: &Vec<i32>) -> &'a i32 {\n    &x[0]\n}\nfn main() {\n    let v = vec![1];\n    let mut w = vec![2];\n    let p = pick(&v, &w);\n    w.push(1);\n    println!(\"{} {:?}\", p, w);\n}\n"],
+  ["an iterator shadowing the Vec it borrows", "fn main() {\n    let v = vec![1, 2];\n    let mut v = v.iter();\n    let a = v.next();\n    println!(\"{:?} {:?}\", a, v.next());\n}\n"],
   ["a loop over indices that pushes", "fn main() {\n    let mut v = vec![1, 2, 3];\n    for i in 0..v.len() {\n        let x = v[i];\n        v.push(x);\n    }\n    println!(\"{}\", v.len());\n}\n"],
 ];
 for (const [label, src] of quiet) {
@@ -1292,6 +1349,64 @@ for (const [label, body, want] of rejectedNs) {
   const want = "2:5 cannot borrow `*v` as mutable, as it is behind a `&` reference";
   if (msgs.length !== 1 || !msgs[0].startsWith(want)) fail(name, `want only: ${want}\ngot:\n${msgs.join("\n")}`);
   else pass(name);
+}
+
+// --- results kept across calls: the same text compiled (or analyzed) again after a `mod` file,
+// the bindings or a setting changed must see the change.
+{
+  const check = (name, ok, detail) => (ok ? pass(`kept results: ${name}`) : fail(`kept results: ${name}`, detail));
+  const errs = (o) => o.diagnostics.filter((d) => d.severity === "error").map((d) => `${d.line}:${d.column} ${d.message}`);
+  const main = "mod util;\nfn main() {\n    let x: i32 = util::f();\n    println!(\"{} {}\", x, util::m!());\n}\n";
+  const files = { "util.rs": "pub fn f() -> i32 {\n    1\n}\n#[macro_export]\nmacro_rules! m {\n    () => {\n        \"one\"\n    };\n}\n" };
+  const read = (p) => files[p];
+  const a = compile(main, "main.rs", read);
+  const again = compile(main, "main.rs", read);
+  check("the same compile twice", a.code !== null && again.code === a.code, JSON.stringify(errs(a)));
+  files["util.rs"] = files["util.rs"].replace('"one"', '"two"');
+  const b = compile(main, "main.rs", read);
+  check("a `mod` file's macro changed", b.code !== null && b.code.includes('"two"') && !b.code.includes('"one"'), b.code ?? JSON.stringify(errs(b)));
+  files["util.rs"] = files["util.rs"].replace("pub fn f() -> i32 {\n    1\n}", 'pub fn f() -> String {\n    String::new()\n}');
+  const c = compile(main, "main.rs", read);
+  check("a `mod` file's signature changed", c.code === null && errs(c).some((e) => e.includes("mismatched types")), JSON.stringify(errs(c)));
+  const h = hover(main, "main.rs", 3, 9, read);
+  check("hover after a `mod` file changed", h?.contents.includes("i32"), JSON.stringify(h));
+  const h2 = hover(main.replace("let x: i32 =", "let x ="), "main.rs", 3, 9, read);
+  check("hover sees the `mod` file's new type", h2?.contents.includes("String"), JSON.stringify(h2));
+  files["util.rs"] = files["util.rs"].replace("pub fn f() -> String {\n    String::new()\n}", "pub fn f() -> i32 {\n    1\n}");
+  const h3 = hover(main.replace("let x: i32 =", "let x ="), "main.rs", 3, 9, read);
+  check("hover after the `mod` file changed back", h3?.contents.includes("i32"), JSON.stringify(h3));
+  delete files["util.rs"];
+  const d = compile(main, "main.rs", read);
+  check("a `mod` file removed", d.code === null, d.code);
+
+  const ovf = "fn main() {\n    let v: Vec<u8> = vec![200, 100];\n    let s: u8 = v[0] + v[1];\n    println!(\"{}\", s);\n}\n";
+  const off = compile(ovf, "ovf.rs").code;
+  setOverflowChecks(true);
+  const on = compile(ovf, "ovf.rs").code;
+  setOverflowChecks(false);
+  check("overflow checks toggled", off !== null && on !== null && on !== off && compile(ovf, "ovf.rs").code === off, on);
+
+  const conflict = "fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}\n";
+  const lax = compile(conflict, "conflict.rs");
+  setStrictBorrows(true);
+  const strict = compile(conflict, "conflict.rs");
+  setStrictBorrows(false);
+  check("strict borrows toggled", lax.code !== null && strict.code === null && compile(conflict, "conflict.rs").code !== null, JSON.stringify(strict.diagnostics));
+
+  // (Without typed bindings an NS method's result isn't checked.)
+  const ns = "pub async fn main(ns: NS) {\n    let m: String = ns.get_server_money_available(\"home\");\n    ns.tprint(&format!(\"{}\", m));\n}\n";
+  const full = compile(ns, "ns.rs");
+  const nsHover = hover(ns, "ns.rs", 2, 25);
+  setNsBindings("");
+  const bare = compile(ns, "ns.rs");
+  const bareHover = hover(ns, "ns.rs", 2, 25);
+  setNsBindings(fs.readFileSync(path.join(here, "../bindings/ns.rs"), "utf8"));
+  const back = compile(ns, "ns.rs");
+  check(
+    "NS bindings replaced",
+    full.code === null && bare.code !== null && back.code === null && nsHover?.contents !== bareHover?.contents,
+    JSON.stringify([errs(full), errs(bare), nsHover, bareHover]),
+  );
 }
 
 console.log(failures ? `\n${failures} failure(s)` : "\nall passed");

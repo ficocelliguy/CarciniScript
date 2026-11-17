@@ -31,6 +31,14 @@ fn unsigned(k: IntKind) -> IntKind {
     }
 }
 
+/// `Pin`'s methods that hand back the pinned value itself (`Pin` is erased).
+pub fn pin_identity(method: &str) -> bool {
+    matches!(
+        method,
+        "as_mut" | "get_mut" | "as_ref" | "get_ref" | "get_unchecked_mut" | "into_ref"
+    )
+}
+
 /// Whether `node` is in an `impl Debug for ..`.
 fn in_debug_impl(node: &ra_ap_syntax::SyntaxNode) -> bool {
     node.ancestors()
@@ -112,6 +120,26 @@ impl Checker<'_> {
             matches!(self.shallow(&t), Ty::Adt(n, _) if self.is_user_hasher(&n))
         };
         Some(match (self.shallow(rt), method) {
+            // ---- Futures: `Pin` is erased, so `pinned.as_mut()` / `.get_mut()` are the future
+            // itself; `fut.poll(cx)` on an async fn's or block's future (a promise) or one
+            // passed as an `F: Future`.
+            (t @ Ty::Future(_), m2) | (t @ Ty::Adt(..), m2)
+                if pin_identity(m2)
+                    && args.is_empty()
+                    && match &t {
+                        Ty::Adt(n, _) => self.adts.future_outputs.contains_key(n),
+                        _ => true,
+                    } =>
+            {
+                t
+            }
+            (Ty::Future(t), "poll") => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.infer(a, None);
+                }
+                Ty::Adt("TaskPoll".into(), vec![*t])
+            }
             // ---- `self.0.fmt(f)`: the value formatted with `f`'s spec.
             (t, "fmt") if args.len() == 1 && !matches!(t, Ty::Var(_) | Ty::Formatter) => {
                 if let Some(a) = a0 {
@@ -353,6 +381,27 @@ impl Checker<'_> {
     }
 
     /// Whether `n` is a struct you wrote `impl Hasher for` (it has `write` and `finish`).
+    /// The `Output` of a hand-written future (`impl Future for X`), with `X`'s type arguments.
+    pub(super) fn adt_future_output(&self, t: &Ty) -> Option<Ty> {
+        let Ty::Adt(n, targs) = self.shallow(t) else {
+            return None;
+        };
+        let out = self.adts.future_outputs.get(&n)?;
+        let mut map = self.adt_subst(&n, &targs);
+        // (`impl<F: Future> Future for Counted<F> { type Output = F::Output; .. }`.)
+        for (p, a) in map.clone() {
+            let inner = match self.shallow(&a) {
+                Ty::Future(t) => Some(*t),
+                a @ Ty::Adt(..) => self.adt_future_output(&a),
+                _ => None,
+            };
+            if let Some(t) = inner {
+                map.insert(format!("{p}::Output"), t);
+            }
+        }
+        Some(super::generic::subst(out, &map))
+    }
+
     pub(super) fn is_user_hasher(&self, n: &str) -> bool {
         self.adts.method(n, "write").is_some() && self.adts.method(n, "finish").is_some()
     }
@@ -429,6 +478,35 @@ impl Checker<'_> {
                 let t = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
                 let r = self.fresh(VarKind::General);
                 self.closure_arg(a1, vec![t], r)
+            }
+            // An allocator (`A: Allocator`, `Global`) isn't used: `Vec::new_in(alloc)` is a
+            // `Vec::new()`, `Box::new_in(x, alloc)` is `x`.
+            [.., "Vec", "new_in"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.infer(a, None);
+                }
+                Ty::Vec(Box::new(self.fresh(VarKind::General)))
+            }
+            [.., "Vec", "with_capacity_in"] => {
+                count(self, 2);
+                if let Some(a) = a0 {
+                    self.check(a, &USIZE);
+                }
+                if let Some(a) = a1 {
+                    self.infer(a, None);
+                }
+                Ty::Vec(Box::new(self.fresh(VarKind::General)))
+            }
+            [.., "Box", "new_in" | "pin_in"] => {
+                count(self, 2);
+                if let Some(a) = a1 {
+                    self.infer(a, None);
+                }
+                match a0 {
+                    Some(a) => self.infer(a, None),
+                    None => Ty::Unknown,
+                }
             }
             // A map with your own `BuildHasher`: the hasher isn't used (keys are compared by value).
             [

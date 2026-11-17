@@ -7,19 +7,29 @@
 //!
 //! - A tag that names a fn or a closure in scope (`fn gauge(..)`, `let cat = move || ..`) is a
 //!   component: its attributes are its arguments, by parameter name (a `children` parameter gets
-//!   the children as a `Vec<Node>`). Any other tag is an HTML element. `<>..</>` is a fragment.
-//! - Attributes: `name="text"`, `name={expr}`, or a bare `name` (`true`). `class` is `className`,
-//!   `for` `htmlFor`, `snake_case` names camelCase (`on_click` is `onClick`), and `aria-label` /
-//!   `data-x` stay as written. An `on*` attribute takes a closure of the event (`|e: JsValue|`).
-//!   `style="color: red"` becomes a style object when it renders. `key` keys the element.
+//!   the children as a `Vec<Node>`; `{..s}` fills the others from the fields of `s`). Any other
+//!   tag is an HTML element. `<>..</>` is a fragment; `<ctx.Provider value={..}>` provides a
+//!   context.
+//! - Attributes: `name="text"`, `name={expr}`, a bare `name` (`true`), or `{..pairs}` (an HTML
+//!   element's). `class` is `className`, `for` `htmlFor`, `snake_case` names camelCase
+//!   (`on_click` is `onClick`), and `aria-label` / `data-x` stay as written. Each takes what React
+//!   gives it (`jsx_attrs`): an `on*` attribute a closure of the `js::Event` (or of nothing, or of a
+//!   `JsValue`), `class` text, `disabled` a `bool`, `style` a CSS string or pairs, `ref` a
+//!   `react::Ref`; an attribute React doesn't know is an error. `key` keys the element.
 //! - Children: string literals (text is quoted: Rust's lexer drops whitespace and can't read
-//!   `don't`), `{expr}` (a node, text, a number, or an `Option` / `Vec` of them), and elements.
+//!   `don't`), `{expr}` (`impl IntoNode`: a node, text, a number, or an `Option` / `Vec` of them),
+//!   and elements.
 //! - `jsx!` calls inside `{..}` are rewritten too.
+//!
+//! Each embedded expression stays where it was written (a kept span, see `edits`), so errors,
+//! hover and completions inside it see the source.
 
 use ra_ap_syntax::{
     AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize,
     ast::{self, HasName},
 };
+
+use crate::jsx_attrs::Kind;
 
 /// Whether `mc` is `jsx!(..)` or `react::jsx!(..)`.
 pub(crate) fn is_jsx_call(mc: &ast::MacroCall) -> bool {
@@ -44,7 +54,9 @@ pub(crate) fn rewrite(tt: &ast::TokenTree, text: &str) -> Result<String, (TextRa
     };
     let mut roots = Vec::new();
     while p.i < items.len() {
-        roots.push(p.node()?);
+        if let Some(n) = p.node()? {
+            roots.push(n);
+        }
     }
     match roots.len() {
         0 => Err((
@@ -53,7 +65,7 @@ pub(crate) fn rewrite(tt: &ast::TokenTree, text: &str) -> Result<String, (TextRa
         )),
         1 => Ok(roots.pop().unwrap_or_default()),
         // (Several roots: a fragment.)
-        _ => Ok(format!("__rx_h(\"\", vec![], vec![{}])", roots.join(", "))),
+        _ => Ok(format!("__rx_el(\"\", &[], &[{}])", roots.join(", "))),
     }
 }
 
@@ -67,6 +79,26 @@ struct Parser<'a> {
 }
 
 type Res<T> = Result<T, (TextRange, String)>;
+
+/// An attribute as written.
+struct Attr {
+    /// As written (`on_click`, `aria-label`); `..` for a spread.
+    name: String,
+    at: TextRange,
+    /// Its value's Rust: a literal, `true`, or `(expr)` (a kept span).
+    value: String,
+    /// A `{expr}` value's source text.
+    expr: Option<String>,
+}
+
+/// A kept span of the source, `range` (see `edits`).
+fn keep(range: TextRange) -> String {
+    format!(
+        "{KEEP_OPEN}{}:{}{KEEP_CLOSE}",
+        u32::from(range.start()),
+        u32::from(range.end())
+    )
+}
 
 impl Parser<'_> {
     fn peek(&self) -> Option<&SyntaxElement> {
@@ -96,30 +128,35 @@ impl Parser<'_> {
         }
     }
 
-    /// One child: an element, a string literal, or `{expr}`.
-    fn node(&mut self) -> Res<String> {
+    /// One child: an element, a string literal, or `{expr}` (`None` for an empty `{}`).
+    fn node(&mut self) -> Res<Option<String>> {
         let Some(e) = self.peek().cloned() else {
             return self.err("unexpected end of `jsx!`");
         };
         if self.at("<") {
-            return self.element();
+            return self.element().map(Some);
         }
         if e.kind() == SyntaxKind::STRING {
             self.i += 1;
-            return Ok(format!("__rx_child({e})"));
+            return Ok(Some(format!("__rx_child({})", keep(e.text_range()))));
         }
-        if let Some(tt) = e.as_node().cloned().and_then(ast::TokenTree::cast)
-            && tt
-                .syntax()
-                .first_token()
-                .is_some_and(|t| t.kind() == SyntaxKind::L_CURLY)
-        {
+        if let Some(tt) = curly(&e) {
             self.i += 1;
             let inner = crate::bundled::tt_items(&tt);
+            // (`{}` or `{/* a comment */}`: nothing.)
             if inner.is_empty() {
-                return Ok("__rx_child(())".into());
+                return Ok(None);
             }
-            return Ok(format!("__rx_child({})", expr_text(&inner, self.text)?));
+            if spread_start(&inner).is_some() {
+                return Err((
+                    e.text_range(),
+                    "`{..spread}` goes among an element's attributes, not its children".into(),
+                ));
+            }
+            return Ok(Some(format!(
+                "__rx_child({})",
+                expr_text(&inner, self.text)?
+            )));
         }
         self.err(format!(
             "text in `jsx!` is written as a string literal: `\"{}\"` (Rust's lexer drops the spaces in bare text)",
@@ -127,8 +164,9 @@ impl Parser<'_> {
         ))
     }
 
-    /// A tag's or attribute's name: idents and keywords joined by `-` (`aria-label`).
-    fn name(&mut self) -> Res<String> {
+    /// A tag's or attribute's name: idents and keywords joined by `-` (`aria-label`), or by `.`
+    /// in a tag (`theme.Provider`).
+    fn name(&mut self, dots: bool) -> Res<String> {
         let mut out = String::new();
         loop {
             let Some(e) = self.peek() else {
@@ -140,12 +178,13 @@ impl Parser<'_> {
             }
             out.push_str(&e.to_string());
             self.i += 1;
-            if self.at("-")
+            let joined = self.at("-") || (dots && self.at("."));
+            if joined
                 && self
                     .peek_text(1)
                     .is_some_and(|t| t.chars().all(|c| c.is_alphanumeric() || c == '_'))
             {
-                out.push('-');
+                out.push_str(&self.peek_text(0).unwrap_or_default());
                 self.i += 1;
                 continue;
             }
@@ -160,31 +199,52 @@ impl Parser<'_> {
         if self.at(">") {
             self.i += 1;
             let children = self.children("")?;
-            return Ok(format!(
-                "__rx_h(\"\", vec![], vec![{}])",
-                children.join(", ")
-            ));
+            return Ok(format!("__rx_el(\"\", &[], &[{}])", children.join(", ")));
         }
-        let tag = self.name()?;
-        let mut attrs: Vec<(String, TextRange, String)> = Vec::new();
-        let mut key: Option<String> = None;
+        let tag_at = self.range();
+        let tag = self.name(true)?;
+        let tag_at = TextRange::new(tag_at.start(), self.items[self.i - 1].text_range().end());
+        let mut attrs: Vec<Attr> = Vec::new();
         while !self.at(">") && !self.at("/") {
             if self.peek().is_none() {
                 return Err((open, format!("`<{tag}` isn't closed")));
             }
             let at = self.range();
-            let name = self.name()?;
-            let value = if self.at("=") {
+            // `{..pairs}`
+            if let Some(tt) = self.peek().and_then(curly) {
+                let inner = crate::bundled::tt_items(&tt);
+                let Some(k) = spread_start(&inner) else {
+                    return Err((
+                        at,
+                        "an attribute is `name=value`, or `{..spread}` (an expression in braces goes among the children)".into(),
+                    ));
+                };
+                if k == inner.len() {
+                    return Err((at, "`{..}` needs a value to spread: `{..props}`".into()));
+                }
+                self.i += 1;
+                let value = expr_text(&inner[k..], self.text)?;
+                attrs.push(Attr {
+                    name: "..".into(),
+                    at,
+                    value,
+                    expr: None,
+                });
+                continue;
+            }
+            let name = self.name(false)?;
+            let (value, expr) = if self.at("=") {
                 self.i += 1;
                 self.attr_value()?
             } else {
-                "true".into()
+                ("true".into(), None)
             };
-            if name == "key" {
-                key = Some(value);
-            } else {
-                attrs.push((name, at, value));
-            }
+            attrs.push(Attr {
+                name,
+                at: TextRange::new(at.start(), self.items[self.i - 1].text_range().end()),
+                value,
+                expr,
+            });
         }
         let children = if self.at("/") {
             self.i += 1;
@@ -194,12 +254,31 @@ impl Parser<'_> {
             self.i += 1;
             self.children(&tag)?
         };
-        let key = key.map_or("__rx_attr(())".to_string(), |k| format!("__rx_attr({k})"));
+        let key = attrs
+            .iter()
+            .find(|a| a.name == "key")
+            .map_or("__rx_attr(())".to_string(), |k| {
+                format!("__rx_key({})", k.value)
+            });
 
+        if let Some(ctx) = tag.strip_suffix(".Provider") {
+            return self.provider(ctx, tag_at, open, attrs, key, children);
+        }
+        if tag.contains('.') {
+            return Err((
+                tag_at,
+                format!(
+                    "`<{tag}>`: a dotted tag is a context's provider, `<ctx.Provider value={{..}}>`"
+                ),
+            ));
+        }
         match component_params(&tag, &self.scope) {
             Lookup::Component(params) => {
-                return self.component(&tag, open, params, attrs, key, children);
+                let names = params.into_iter().map(|p| p.name).collect();
+                return self.component(&tag, tag_at, open, names, attrs, key, children);
             }
+            // (`<input>` where a local is named `input`.)
+            Lookup::Other if crate::jsx_attrs::is_html_tag(&tag) => {}
             Lookup::Other => {
                 return Err((
                     open,
@@ -218,29 +297,92 @@ impl Parser<'_> {
                 ),
             ));
         }
-        let mut props = vec![format!("(\"key\", {key})")];
-        for (name, _, value) in attrs {
-            let js = attr_name(&name);
-            let value = if is_handler(&js) {
-                format!("__rx_handler({value})")
-            } else {
-                format!("__rx_attr({value})")
+        let mut props = Vec::new();
+        for a in attrs {
+            if a.name == ".." {
+                props.push(format!("(\"...\", __rx_spread({}))", a.value));
+                continue;
+            }
+            let js = attr_name(&a.name);
+            let Some(kind) = crate::jsx_attrs::kind(&tag, &js) else {
+                return Err((a.at, unknown_attr(&tag, &a.name, &js)));
+            };
+            let value = match kind {
+                Kind::Handler => match &a.expr {
+                    Some(e) => format!("{}({})", handler_fn(e), a.value),
+                    None => {
+                        return Err((
+                            a.at,
+                            format!("`{}` takes a closure: `{}={{move |e| ..}}`", a.name, a.name),
+                        ));
+                    }
+                },
+                Kind::Text => format!("__rx_text({})", a.value),
+                Kind::TextOrNum => format!("__rx_num({})", a.value),
+                Kind::Bool => format!("__rx_bool({})", a.value),
+                Kind::Style => format!("__rx_style({})", a.value),
+                Kind::Key => format!("__rx_key({})", a.value),
+                Kind::Ref => format!("__rx_ref(&({}))", a.value),
+                Kind::Any => format!("__rx_attr({})", a.value),
             };
             props.push(format!("({js:?}, {value})"));
         }
         Ok(format!(
-            "__rx_h({tag:?}, vec![{}], vec![{}])",
+            "__rx_el({tag:?}, &[{}], &[{}])",
             props.join(", "),
             children.join(", ")
         ))
     }
 
+    /// `<ctx.Provider value={..}>children</ctx.Provider>`
+    fn provider(
+        &self,
+        ctx: &str,
+        tag_at: TextRange,
+        open: TextRange,
+        attrs: Vec<Attr>,
+        key: String,
+        children: Vec<String>,
+    ) -> Res<String> {
+        let mut value = None;
+        for a in &attrs {
+            match a.name.as_str() {
+                "value" => value = Some(a.value.clone()),
+                "key" => {}
+                _ => {
+                    return Err((
+                        a.at,
+                        format!(
+                            "`<{ctx}.Provider>` takes `value` (and `key`), not `{}`",
+                            a.name
+                        ),
+                    ));
+                }
+            }
+        }
+        let Some(value) = value else {
+            return Err((open, format!("`<{ctx}.Provider>` needs `value=..`")));
+        };
+        // (The context's name stays where it's written, for hover and errors.)
+        let ctx_code = if ctx.contains('.') {
+            ctx.to_string()
+        } else {
+            keep(TextRange::at(tag_at.start(), TextSize::of(ctx)))
+        };
+        Ok(format!(
+            "__rx_provide(&{ctx_code}, {key}, {value}, &[{}])",
+            children.join(", ")
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn component(
         &self,
         tag: &str,
+        tag_at: TextRange,
         open: TextRange,
         params: Vec<String>,
-        attrs: Vec<(String, TextRange, String)>,
+        attrs: Vec<Attr>,
         key: String,
         children: Vec<String>,
     ) -> Res<String> {
@@ -253,12 +395,14 @@ impl Parser<'_> {
                 ),
             ));
         }
-        for (name, at, _) in &attrs {
-            if !params.contains(name) {
+        let spread = attrs.iter().find(|a| a.name == "..");
+        for a in &attrs {
+            if a.name != ".." && a.name != "key" && !params.contains(&a.name) {
                 return Err((
-                    *at,
+                    a.at,
                     format!(
-                        "`{tag}` has no parameter `{name}` (it takes: {})",
+                        "`{tag}` has no parameter `{}` (it takes: {})",
+                        a.name,
                         list(&params)
                     ),
                 ));
@@ -267,9 +411,12 @@ impl Parser<'_> {
         let mut args = Vec::new();
         for p in &params {
             if p == "children" {
-                args.push(format!("__rx_children(vec![{}])", children.join(", ")));
-            } else if let Some((_, _, v)) = attrs.iter().find(|(n, _, _)| n == p) {
-                args.push(v.clone());
+                args.push(format!("__rx_children(&[{}])", children.join(", ")));
+            } else if let Some(a) = attrs.iter().find(|a| &a.name == p) {
+                args.push(a.value.clone());
+            } else if spread.is_some() {
+                // (From the spread value's field of that name.)
+                args.push(format!("__rx_s.{p}.clone()"));
             } else {
                 return Err((open, format!("`<{tag}>` needs `{p}=..`")));
             }
@@ -281,8 +428,12 @@ impl Parser<'_> {
             ));
         }
         let names: Vec<String> = params.iter().map(|p| format!("{p:?}")).collect();
+        let comp = match spread {
+            Some(_) => "__rx_f".to_string(),
+            None => keep(tag_at),
+        };
         let mut out = format!(
-            "__rx_c{}({tag}, {key}, vec![{}]",
+            "__rx_c{}({comp}, {key}, &[{}]",
             params.len(),
             names.join(", ")
         );
@@ -291,26 +442,40 @@ impl Parser<'_> {
             out.push_str(&a);
         }
         out.push(')');
+        if let Some(s) = spread {
+            // (The spread value once; the component first, as written.)
+            out = format!(
+                "{{ let __rx_f = {}; let __rx_s = {}; {out} }}",
+                keep(tag_at),
+                s.value
+            );
+        }
         Ok(out)
     }
 
-    fn attr_value(&mut self) -> Res<String> {
+    /// `="text"`, `={expr}`, or a number or `bool` literal: its Rust, and the expression's text.
+    fn attr_value(&mut self) -> Res<(String, Option<String>)> {
         let Some(e) = self.peek().cloned() else {
             return self.err("expected an attribute value");
         };
         self.i += 1;
         if let Some(tt) = e.as_node().cloned().and_then(ast::TokenTree::cast) {
             let inner = crate::bundled::tt_items(&tt);
-            if inner.is_empty() {
+            let (Some(first), Some(last)) = (inner.first(), inner.last()) else {
                 return Err((e.text_range(), "empty `{}` attribute".into()));
-            }
-            return Ok(format!("({})", expr_text(&inner, self.text)?));
+            };
+            let src = self.text
+                [usize::from(first.text_range().start())..usize::from(last.text_range().end())]
+                .to_string();
+            return Ok((expr_text(&inner, self.text)?, Some(src)));
         }
+        // (Kept where it's written, so a type error points at it.)
         match e.kind() {
-            SyntaxKind::STRING | SyntaxKind::INT_NUMBER | SyntaxKind::FLOAT_NUMBER => {
-                Ok(e.to_string())
-            }
-            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => Ok(e.to_string()),
+            SyntaxKind::STRING
+            | SyntaxKind::INT_NUMBER
+            | SyntaxKind::FLOAT_NUMBER
+            | SyntaxKind::TRUE_KW
+            | SyntaxKind::FALSE_KW => Ok((keep(e.text_range()), None)),
             _ => Err((
                 e.text_range(),
                 format!("an attribute's value is a literal or `{{expr}}`, not `{e}`"),
@@ -331,7 +496,7 @@ impl Parser<'_> {
                     self.expect(">", "to close the fragment")?;
                 } else {
                     let at = self.range();
-                    let close = self.name()?;
+                    let close = self.name(true)?;
                     if close != tag {
                         return Err((at, format!("`</{close}>` closes `<{tag}>`")));
                     }
@@ -339,9 +504,143 @@ impl Parser<'_> {
                 }
                 return Ok(out);
             }
-            out.push(self.node()?);
+            if let Some(n) = self.node()? {
+                out.push(n);
+            }
         }
     }
+}
+
+/// A `{..}` group.
+fn curly(e: &SyntaxElement) -> Option<ast::TokenTree> {
+    e.as_node()
+        .cloned()
+        .and_then(ast::TokenTree::cast)
+        .filter(|tt| {
+            tt.syntax()
+                .first_token()
+                .is_some_and(|t| t.kind() == SyntaxKind::L_CURLY)
+        })
+}
+
+/// Where the value of a `{..spread}` group's tokens starts (after its `..`).
+fn spread_start(inner: &[SyntaxElement]) -> Option<usize> {
+    match inner {
+        [a, ..] if a.kind() == SyntaxKind::DOT2 => Some(1),
+        [a, b, ..] if a.kind() == SyntaxKind::DOT && b.kind() == SyntaxKind::DOT => Some(2),
+        _ => None,
+    }
+}
+
+/// The prelude function an `on*` attribute's closure goes through: by its parameters (none, a
+/// `JsValue`, or the event).
+fn handler_fn(expr: &str) -> &'static str {
+    let file =
+        ra_ap_syntax::SourceFile::parse(&format!("fn f() {{ {expr} }}"), crate::macros::EDITION)
+            .tree();
+    let closure = file
+        .syntax()
+        .descendants()
+        .find_map(ast::Fn::cast)
+        .and_then(|f| f.body())
+        .and_then(|b| b.stmt_list())
+        .and_then(|s| s.tail_expr())
+        .and_then(|e| match e {
+            ast::Expr::ClosureExpr(c) => Some(c),
+            _ => None,
+        });
+    let Some(c) = closure else { return "__rx_on" };
+    let params: Vec<ast::Param> = c
+        .param_list()
+        .map(|l| l.params().collect())
+        .unwrap_or_default();
+    match params.as_slice() {
+        [] => "__rx_on0",
+        [p] if p.ty().is_some_and(|t| {
+            let t = t.syntax().text().to_string();
+            t == "JsValue" || t.ends_with("::JsValue")
+        }) =>
+        {
+            "__rx_on_js"
+        }
+        _ => "__rx_on",
+    }
+}
+
+/// The error for an attribute `<tag>` doesn't have (React's name `js`, written `name`).
+fn unknown_attr(tag: &str, name: &str, js: &str) -> String {
+    let names: Vec<String> = crate::jsx_attrs::names()
+        .chain(crate::jsx_attrs::events())
+        .map(str::to_string)
+        .collect();
+    let hint = match crate::bindings::suggest(js, names.iter()) {
+        Some(s) if name.contains('_') => format!(" (did you mean `{}`?)", snake(&s)),
+        Some(s) => format!(" (did you mean `{s}`?)"),
+        None => String::new(),
+    };
+    format!(
+        "`<{tag}>` has no attribute `{name}`{hint}; `data-*` and `aria-*` attributes take anything, and `{{..pairs}}` passes any"
+    )
+}
+
+/// React's `tabIndex` as `tab_index` (`dangerouslySetInnerHTML` stays as it is).
+pub(crate) fn snake(js: &str) -> String {
+    if js
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_uppercase() && w[1].is_ascii_uppercase())
+    {
+        return js.into();
+    }
+    let mut out = String::new();
+    for c in js.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    match out.as_str() {
+        "class_name" => "class".into(),
+        "html_for" => "for".into(),
+        _ => out,
+    }
+}
+
+thread_local! {
+    static LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f()`, with a `jsx!` call that has a mistake rewritten into its expressions instead of failing
+/// (the language service analyzes a file being typed).
+pub(crate) fn leniently<T>(f: impl FnOnce() -> T) -> T {
+    let was = LENIENT.with(|l| l.replace(true));
+    let out = f();
+    LENIENT.with(|l| l.set(was));
+    out
+}
+
+pub(crate) fn is_lenient() -> bool {
+    LENIENT.with(|l| l.get())
+}
+
+/// A `jsx!` call with a mistake, for the language service: the expressions in its braces, each
+/// evaluated and dropped, then an empty node.
+pub(crate) fn lenient(tt: &ast::TokenTree, text: &str) -> String {
+    let mut out = String::from("({ ");
+    for e in crate::bundled::tt_items(tt) {
+        let Some(g) = curly(&e) else { continue };
+        let inner = crate::bundled::tt_items(&g);
+        let from = spread_start(&inner).unwrap_or(0);
+        if from < inner.len()
+            && let Ok(code) = expr_text(&inner[from..], text)
+        {
+            out.push_str(&format!("let _ = {code}; "));
+        }
+    }
+    out.push_str("__rx_el(\"\", &[], &[]) })");
+    out
 }
 
 /// Opens and closes a span of the source kept as it is (`\u{E000}12:40\u{E001}`): `edits` turns a
@@ -486,16 +785,22 @@ fn jsx_in(items: &[SyntaxElement], text: &str, edits: &mut Vec<(TextRange, Strin
     Ok(())
 }
 
-enum Lookup {
-    /// A fn or closure: its parameter names.
-    Component(Vec<String>),
+/// A component's parameter: its name, and its type as written (`""` if it has none).
+pub(crate) struct Param {
+    pub(crate) name: String,
+    pub(crate) ty: String,
+}
+
+pub(crate) enum Lookup {
+    /// A fn or closure: its parameters.
+    Component(Vec<Param>),
     /// Bound to something else.
     Other,
     None,
 }
 
-/// A closure, or a block or parentheses ending in one: its parameter names.
-fn closure_params(e: ast::Expr) -> Option<Vec<String>> {
+/// A closure, or a block or parentheses ending in one: its parameters.
+fn closure_params(e: ast::Expr) -> Option<Vec<Param>> {
     match e {
         ast::Expr::ClosureExpr(c) => Some(fn_params(c.param_list())),
         ast::Expr::BlockExpr(b) => b.stmt_list()?.tail_expr().and_then(closure_params),
@@ -504,13 +809,17 @@ fn closure_params(e: ast::Expr) -> Option<Vec<String>> {
     }
 }
 
-/// A component's parameter names: a fn of the file or a block around `at`, or a closure bound
-/// by a `let` before it.
-fn component_params(tag: &str, at: &SyntaxNode) -> Lookup {
-    if tag.contains("::") || tag.contains('-') {
-        return Lookup::None;
-    }
+/// A fn or `let` a tag may name.
+pub(crate) enum Def {
+    Fn(ast::Fn),
+    Let(ast::LetStmt),
+}
+
+/// The fns and `let`s visible at `at`, by name: the innermost block's first (within a block,
+/// later ones first: they shadow), then the file's, then the `pub fn`s of the `mod` files.
+pub(crate) fn defs_in_scope(at: &SyntaxNode) -> Vec<(String, Def)> {
     let pos: TextSize = at.text_range().start();
+    let mut out = Vec::new();
     for anc in at.ancestors() {
         let stmts: Vec<SyntaxNode> = if let Some(sl) = ast::StmtList::cast(anc.clone()) {
             sl.syntax().children().collect()
@@ -519,45 +828,63 @@ fn component_params(tag: &str, at: &SyntaxNode) -> Lookup {
         } else {
             continue;
         };
-        let mut found = None;
+        let mut scope = Vec::new();
         for s in stmts {
             if let Some(f) = ast::Fn::cast(s.clone())
-                && f.name().is_some_and(|n| n.text() == tag)
+                && let Some(n) = f.name()
             {
-                found = Some(Lookup::Component(fn_params(f.param_list())));
+                scope.push((n.text().to_string(), Def::Fn(f)));
             }
             if s.text_range().start() >= pos {
                 continue;
             }
             if let Some(l) = ast::LetStmt::cast(s.clone())
                 && let Some(ast::Pat::IdentPat(ip)) = l.pat()
-                && ip.name().is_some_and(|n| n.text() == tag)
+                && let Some(n) = ip.name()
             {
-                found = Some(match l.initializer().and_then(closure_params) {
-                    Some(params) => Lookup::Component(params),
-                    None => Lookup::Other,
-                });
+                scope.push((n.text().to_string(), Def::Let(l)));
             }
         }
-        if let Some(found) = found {
-            return found;
-        }
+        scope.reverse();
+        out.extend(scope);
     }
     // A `pub fn` component of a `mod` file (`use ui::Gauge;`).
     MOD_SOURCES.with(|m| {
         for src in m.borrow().iter() {
-            let file = ra_ap_syntax::SourceFile::parse(src, crate::macros::EDITION).tree();
-            if let Some(f) = file
-                .syntax()
-                .descendants()
-                .filter_map(ast::Fn::cast)
-                .find(|f| f.name().is_some_and(|n| n.text() == tag))
-            {
-                return Lookup::Component(fn_params(f.param_list()));
+            let file = crate::macros::parse_tree(src);
+            for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
+                if let Some(n) = f.name() {
+                    out.push((n.text().to_string(), Def::Fn(f)));
+                }
             }
         }
-        Lookup::None
-    })
+    });
+    out
+}
+
+impl Def {
+    /// A component's parameters, or `None` for a `let` of something other than a closure.
+    pub(crate) fn params(&self) -> Option<Vec<Param>> {
+        match self {
+            Def::Fn(f) => Some(fn_params(f.param_list())),
+            Def::Let(l) => l.initializer().and_then(closure_params),
+        }
+    }
+}
+
+/// A component's parameters: a fn of the file or a block around `at`, or a closure bound by a
+/// `let` before it.
+pub(crate) fn component_params(tag: &str, at: &SyntaxNode) -> Lookup {
+    if tag.contains("::") || tag.contains('-') {
+        return Lookup::None;
+    }
+    match defs_in_scope(at).into_iter().find(|(n, _)| n == tag) {
+        Some((_, d)) => match d.params() {
+            Some(params) => Lookup::Component(params),
+            None => Lookup::Other,
+        },
+        None => Lookup::None,
+    }
 }
 
 thread_local! {
@@ -567,7 +894,7 @@ thread_local! {
 
 /// The `mod name;` files of `text` (read with `resolver`), for components defined in them.
 pub(crate) fn set_mod_sources(text: &str, resolver: crate::typeck::Resolver) {
-    let file = ra_ap_syntax::SourceFile::parse(text, crate::macros::EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let mut out = Vec::new();
     for m in file.syntax().descendants().filter_map(ast::Module::cast) {
         if m.item_list().is_some() {
@@ -585,21 +912,27 @@ pub(crate) fn set_mod_sources(text: &str, resolver: crate::typeck::Resolver) {
     MOD_SOURCES.with(|m| *m.borrow_mut() = out);
 }
 
-fn fn_params(pl: Option<ast::ParamList>) -> Vec<String> {
+fn fn_params(pl: Option<ast::ParamList>) -> Vec<Param> {
     let Some(pl) = pl else { return Vec::new() };
     pl.params()
         .enumerate()
-        .map(|(i, p)| match p.pat() {
-            Some(ast::Pat::IdentPat(ip)) => {
-                ip.name().map_or(format!("_{i}"), |n| n.text().to_string())
-            }
-            _ => format!("_{i}"),
+        .map(|(i, p)| Param {
+            name: match p.pat() {
+                Some(ast::Pat::IdentPat(ip)) => {
+                    ip.name().map_or(format!("_{i}"), |n| n.text().to_string())
+                }
+                _ => format!("_{i}"),
+            },
+            ty: p
+                .ty()
+                .map(|t| t.syntax().text().to_string())
+                .unwrap_or_default(),
         })
         .collect()
 }
 
 /// An attribute's React name.
-fn attr_name(name: &str) -> String {
+pub(crate) fn attr_name(name: &str) -> String {
     match name {
         "class" => return "className".into(),
         "for" => return "htmlFor".into(),
@@ -621,11 +954,6 @@ fn attr_name(name: &str) -> String {
         }
     }
     out
-}
-
-/// `onClick`, `onChange`, ..
-fn is_handler(js: &str) -> bool {
-    js.len() > 2 && js.starts_with("on") && js[2..].starts_with(|c: char| c.is_uppercase())
 }
 
 fn list(names: &[String]) -> String {

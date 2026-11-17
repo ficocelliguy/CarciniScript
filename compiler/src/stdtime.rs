@@ -20,6 +20,33 @@ const CHRONO: &str = include_str!("chrono_prelude.rs");
 const CLAP: &str = include_str!("clap_prelude.rs");
 const ENTRY: &str = include_str!("entry_prelude.rs");
 const REACT: &str = include_str!("react_prelude.rs");
+const TASK: &str = include_str!("task_prelude.rs");
+const OS: &str = include_str!("os_prelude.rs");
+const NET: &str = include_str!("net_prelude.rs");
+const ORDERED_FLOAT: &str = include_str!("ordered_float_prelude.rs");
+const PETGRAPH: &str = include_str!("petgraph_prelude.rs");
+
+/// Whether `text` has `name` as a whole word: not inside a longer identifier (`Cow` isn't in
+/// `Cowboy`, `time::` isn't in `realtime::`). A `name` that starts or ends in a non-identifier
+/// character is open on that side.
+pub(crate) fn has_word(text: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let (first, last) = (
+        name.chars().next().is_some_and(ident),
+        name.chars().next_back().is_some_and(ident),
+    );
+    let mut from = 0;
+    while let Some(i) = text[from..].find(name) {
+        let at = from + i;
+        let before = first && text[..at].chars().next_back().is_some_and(ident);
+        let after = last && text[at + name.len()..].chars().next().is_some_and(ident);
+        if !before && !after {
+            return true;
+        }
+        from = at + name.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
 
 /// `text` with the preludes it needs after it, when it names their types and doesn't declare
 /// them itself.
@@ -55,7 +82,7 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
     .any(|n| text.contains(n))
         && !text.contains("// (chrono prelude)")
         && !declares("ChronoNaiveDate");
-    if (text.contains("time::") || chrono)
+    if (has_word(text, "time::") || chrono)
         && !text.contains("// (std::time prelude)")
         && !["Duration", "Instant", "SystemTime"]
             .iter()
@@ -65,14 +92,14 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         out.push_str(TIME);
     }
     let cells = ["LazyLock", "LazyCell", "Lazy", "OnceLock", "OnceCell"];
-    if cells.iter().any(|n| text.contains(n))
+    if cells.iter().any(|n| has_word(text, n))
         && !text.contains("// (sync prelude)")
         && !cells.iter().any(|n| declares(n))
     {
         out.push('\n');
         out.push_str(SYNC);
     }
-    if text.contains("Either")
+    if has_word(text, "Either")
         && text.contains("either")
         && !text.contains("// (either prelude)")
         && !declares("Either")
@@ -99,7 +126,7 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         out.push('\n');
         out.push_str(REGEX);
     }
-    if text.contains("Cow") && !text.contains("// (cow prelude)") && !declares("Cow") {
+    if has_word(text, "Cow") && !text.contains("// (cow prelude)") && !declares("Cow") {
         out.push('\n');
         out.push_str(COW);
     }
@@ -107,8 +134,25 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
     let io_names = [
         "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor", "FmtWrite",
     ];
+    // (After the rewrite: `std::fs::File` is `FsFile`, `process::Command` `ProcCommand`, ..)
+    let os_names = [
+        "FsFile",
+        "FsOpenOptions",
+        "FsMetadata",
+        "FsDirEntry",
+        "__fs_",
+        "ProcCommand",
+        "ProcStdio",
+        "ProcExitStatus",
+        "ProcOutput",
+        "ProcChild",
+    ];
+    let os = os_names.iter().any(|n| text.contains(n))
+        && !text.contains("// (os prelude)")
+        && !declares("FsFile");
     // (`use std::io::Write;` alone stays as written: its methods on a `Vec<u8>` need the impl.)
-    if (io_names.iter().any(|n| text.contains(n))
+    if (os
+        || io_names.iter().any(|n| text.contains(n))
         || text.contains("io::Write")
         || text.contains("io::prelude"))
         && !text.contains("// (io prelude)")
@@ -177,9 +221,15 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         out.push_str(CHRONO);
     }
     // (After the rewrites: `jsx!` makes `__rx_h(..)` calls, `react::Node` is `ReactNode`, ..)
-    if (text.contains("__rx_") || text.contains("ReactSetState") || text.contains("ReactRef"))
-        && !text.contains("// (react prelude)")
-    {
+    let react_names = [
+        "__rx_",
+        "ReactSetState",
+        "ReactRef",
+        "ReactContext",
+        "ReactDispatch",
+        "ReactIntoNode",
+    ];
+    if react_names.iter().any(|n| text.contains(n)) && !text.contains("// (react prelude)") {
         out.push('\n');
         out.push_str(REACT);
     }
@@ -204,6 +254,58 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
     {
         out.push('\n');
         out.push_str(CLAP);
+    }
+    // (`use ordered_float::OrderedFloat as OF;` / `ordered_float::NotNan` are the names here.)
+    if text.contains("ordered_float")
+        && ["OrderedFloat", "NotNan", "FloatIsNan"]
+            .iter()
+            .any(|n| text.contains(n))
+        && !text.contains("// (ordered_float prelude)")
+        && !declares("OrderedFloat")
+    {
+        out.push('\n');
+        out.push_str(ORDERED_FLOAT);
+    }
+    // (After the rewrites: `petgraph::Graph` is `PgGraph`, `dijkstra(&g, ..)` `(&g).__pg_dijkstra(..)`.)
+    if (text.contains("Pg") || text.contains("__pg_"))
+        && crate::bundled::PETGRAPH_NAMES
+            .iter()
+            .any(|(_, n)| text.contains(n))
+        && !text.contains("// (petgraph prelude)")
+    {
+        out.push('\n');
+        out.push_str(PETGRAPH);
+    }
+    if os {
+        out.push('\n');
+        out.push_str(OS);
+    }
+    // (After the rewrite: `std::net::IpAddr` is `NetIpAddr`, ..)
+    if ["NetIp", "NetSocketAddr", "NetAddrParseError"]
+        .iter()
+        .any(|n| text.contains(n))
+        && !text.contains("// (net prelude)")
+        && !declares("NetIpAddr")
+    {
+        out.push('\n');
+        out.push_str(NET);
+    }
+    // (After the rewrite: `std::task::Poll` is `TaskPoll`, `std::future::ready` `__future_ready`.)
+    let task_names = [
+        "TaskPoll",
+        "TaskContext",
+        "TaskWaker",
+        "__future_",
+        "FutureReady",
+        "FuturePending",
+        "FuturePollFn",
+    ];
+    if task_names.iter().any(|n| text.contains(n))
+        && !text.contains("// (task prelude)")
+        && !declares("TaskPoll")
+    {
+        out.push('\n');
+        out.push_str(TASK);
     }
     // (`PhantomData`, `std::path`.)
     out.push_str(&crate::stdgaps::preludes(text));

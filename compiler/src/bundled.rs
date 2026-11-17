@@ -37,7 +37,7 @@ pub type Error = (usize, usize, String);
 
 /// Rewrite every use in `text`; returns whether anything changed.
 pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>> {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let thiserror = text.contains("thiserror");
     let rayon_used = text.contains("rayon");
     let json_used = text.contains("serde_json");
@@ -52,6 +52,9 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     let mut edits: Vec<(TextRange, String)> = Vec::new();
     let mut errors: Vec<(TextRange, String)> = Vec::new();
     rename_crate_items(&file, text, &mut edits);
+    if text.contains("petgraph") && !text.contains("mod petgraph") {
+        petgraph_edits(&file, &mut edits);
+    }
     if text.contains("SmallVec") || text.contains("smallvec!") {
         smallvec_edits(&file, &mut edits);
     }
@@ -127,6 +130,14 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
                     &format!("({code})"),
                     text,
                 )),
+                // (For the language service: the expressions in it, still analyzed.)
+                Err(_) if crate::jsx::is_lenient() => {
+                    edits.extend(crate::jsx::edits(
+                        mc.syntax().text_range(),
+                        &crate::jsx::lenient(&tt, text),
+                        text,
+                    ));
+                }
                 Err((r, msg)) => errors.push((r, msg)),
             }
             continue;
@@ -238,12 +249,36 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
         else {
             continue;
         };
+        // (The edits already made inside, `std::io::stdout()` renamed, go into the rewrite: as
+        // edits of their own they'd overlap it.)
+        let body_start = usize::from(tt.syntax().text_range().start()) + 1;
+        let inside = |r: &TextRange| {
+            usize::from(r.start()) >= body_start && usize::from(r.end()) <= body_start + body.len()
+        };
+        let mut inner: Vec<(TextRange, String)> =
+            edits.iter().filter(|(r, _)| inside(r)).cloned().collect();
+        inner.sort_by_key(|(r, _)| std::cmp::Reverse((r.start(), r.end())));
+        let mut edited = body.to_string();
+        let mut last = usize::MAX;
+        for (r, new) in &inner {
+            let (a, b) = (
+                usize::from(r.start()) - body_start,
+                usize::from(r.end()) - body_start,
+            );
+            if b <= last {
+                edited.replace_range(a..b, new);
+                last = a;
+            }
+        }
         let out = match name.as_str() {
-            "bitflags" => bitflags(body),
-            "cfg_if" => cfg_if(body),
-            "lazy_static" => lazy_static(body),
+            "bitflags" => bitflags(&edited),
+            "cfg_if" => cfg_if(&edited),
+            "lazy_static" => lazy_static(&edited),
             _ => None,
         };
+        if out.is_some() {
+            edits.retain(|(r, _)| !inside(r));
+        }
         if let Some(out) = out {
             // (An item macro's trailing `;` goes too.)
             let mut r = mc.syntax().text_range();
@@ -1835,6 +1870,251 @@ fn indexmap_macros(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
     }
 }
 
+// ---------------------------------------------------------------- petgraph
+
+/// petgraph's functions and walkers, which the prelude has as methods: `dijkstra(&g, a, ..)`
+/// (also `algo::dijkstra` / `petgraph::algo::dijkstra`) is `(&g).__pg_dijkstra(a, ..)`, so it's
+/// `Graph`'s or `GraphMap`'s by the graph's type; `bfs.next(&g)` (a walker's: an iterator's
+/// `next` takes no argument) is `bfs.__pg_next(|__pg_n| (&g).neighbors(__pg_n).collect::<..>())`;
+/// `from_edges(&[(0, 1), ..])` / `extend_with_edges` with pairs are their `__pg_..2` forms (with
+/// `E::default()` weights); and `Outgoing` / `Incoming` from `use petgraph::Direction::..`
+/// are `PgDirection`'s.
+fn petgraph_edits(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
+    let cx = PgCtx {
+        algos: renamed_imports(file, &PETGRAPH_ALGO_IMPORTS),
+        root: renamed_imports(file, &PETGRAPH_ROOT_IMPORTS),
+        dirs: renamed_imports(file, &PETGRAPH_DIRECTION_IMPORTS),
+        types: renamed_imports(file, &PETGRAPH_RENAMES),
+        text: file.syntax().text().to_string(),
+    };
+    petgraph_walk(file.syntax(), &cx, 0, edits);
+}
+
+/// What the file's `use`s bring in from petgraph.
+struct PgCtx {
+    algos: std::collections::HashMap<String, String>,
+    root: std::collections::HashMap<String, String>,
+    dirs: std::collections::HashMap<String, String>,
+    types: std::collections::HashMap<String, String>,
+    text: String,
+}
+
+/// `petgraph_edits` over `root`, whose positions are `offset` before the file's (a macro's
+/// arguments, parsed on their own).
+fn petgraph_walk(
+    root: &ra_ap_syntax::SyntaxNode,
+    cx: &PgCtx,
+    offset: i64,
+    out: &mut Vec<(TextRange, String)>,
+) {
+    use ra_ap_syntax::SyntaxKind::{COMMA, R_PAREN};
+    let mut edits: Vec<(TextRange, String)> = Vec::new();
+    let edits = &mut edits;
+    let (algos, root_imports, dirs, types) = (&cx.algos, &cx.root, &cx.dirs, &cx.types);
+    let declares_fn = |n: &str| cx.text.contains(&format!("fn {n}"));
+    // The algorithm a call's path names, if any.
+    let algo_of = |path: &ast::Path| -> Option<String> {
+        let name = path.segment()?.name_ref()?.text().to_string();
+        match path.qualifier() {
+            Some(q) => {
+                let qt = q.syntax().text().to_string();
+                let algo_mod = qt == "petgraph::algo"
+                    || qt == "::petgraph::algo"
+                    || (qt == "algo" && root_imports.get("algo").is_some_and(|i| i == "algo"));
+                (algo_mod && PETGRAPH_ALGOS.contains(&name.as_str())).then_some(name)
+            }
+            None => {
+                let item = algos.get(&name)?;
+                (PETGRAPH_ALGOS.contains(&item.as_str()) && !declares_fn(&name))
+                    .then(|| item.clone())
+            }
+        }
+    };
+    // `(f)(a, b)` -> `(a).__pg_f(b)`: the path goes, the first comma (or the closing paren) opens
+    // the method call.
+    let as_method = |path_range: TextRange,
+                     algo: &str,
+                     args: &ra_ap_syntax::SyntaxNode,
+                     edits: &mut Vec<(TextRange, String)>| {
+        let toks: Vec<_> = args
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .collect();
+        let call = format!(").__pg_{algo}(");
+        if let Some(comma) = toks.iter().find(|t| t.kind() == COMMA) {
+            edits.push((path_range, String::new()));
+            edits.push((comma.text_range(), call));
+        } else if let Some(close) = toks.iter().find(|t| t.kind() == R_PAREN) {
+            edits.push((path_range, String::new()));
+            edits.push((TextRange::empty(close.text_range().start()), call));
+        }
+    };
+    for node in root.descendants() {
+        if let Some(c) = ast::CallExpr::cast(node.clone())
+            && let Some(ast::Expr::PathExpr(pe)) = c.expr()
+            && let Some(path) = pe.path()
+            && let Some(args) = c.arg_list()
+        {
+            if let Some(algo) = algo_of(&path)
+                && args.args().next().is_some()
+            {
+                as_method(path.syntax().text_range(), &algo, args.syntax(), edits);
+                continue;
+            }
+            // `UnGraph::<i32, ()>::from_edges(&[(0, 1), ..])`.
+            if let Some(seg) = path.segment()
+                && let Some(name) = seg.name_ref()
+                && name.text() == "from_edges"
+                && path.qualifier().is_some_and(|q| {
+                    q.segments().any(|s| {
+                        s.name_ref().is_some_and(|n| {
+                            PETGRAPH_NAMES
+                                .iter()
+                                .any(|(p, _)| *p == n.text() && p.contains("Graph"))
+                        })
+                    })
+                })
+                && args
+                    .args()
+                    .next()
+                    .is_some_and(|a| edge_tuple_arity(&a) == Some(2))
+            {
+                edits.push((name.syntax().text_range(), "__pg_from_edges2".into()));
+            }
+            continue;
+        }
+        if let Some(m) = ast::MethodCallExpr::cast(node.clone())
+            && let Some(name) = m.name_ref()
+            && let Some(args) = m.arg_list()
+        {
+            let list: Vec<ast::Expr> = args.args().collect();
+            if name.text() == "next" && list.len() == 1 {
+                let r = list[0].syntax().text_range();
+                edits.push((name.syntax().text_range(), "__pg_next".into()));
+                edits.push((TextRange::empty(r.start()), "|__pg_n| (".into()));
+                edits.push((
+                    TextRange::empty(r.end()),
+                    ").neighbors(__pg_n).collect::<Vec<_>>()".into(),
+                ));
+            } else if name.text() == "extend_with_edges"
+                && list.len() == 1
+                && edge_tuple_arity(&list[0]) == Some(2)
+            {
+                edits.push((name.syntax().text_range(), "__pg_extend_with_edges2".into()));
+            }
+            continue;
+        }
+        // The edge type, as an argument: `Graph<N, E>` / `DiGraph<N, E>` are `PgGraph<N, E,
+        // PgDirected>`, `UnGraph::new_undirected()` is `PgGraph::<_, _, PgUndirected>::..`.
+        if let Some(seg) = ast::PathSegment::cast(node.clone())
+            && let Some(name) = seg.name_ref()
+            && !seg
+                .syntax()
+                .ancestors()
+                .any(|a| ast::Use::can_cast(a.kind()))
+        {
+            let item = match seg.parent_path().qualifier() {
+                Some(q) => PETGRAPH_RENAMES
+                    .roots
+                    .contains(&q.syntax().text().to_string().as_str())
+                    .then(|| name.text().to_string()),
+                None => types.get(&name.text().to_string()).cloned(),
+            };
+            let ty = match item.as_deref() {
+                Some("Graph" | "GraphMap" | "DiGraph" | "DiGraphMap") => "PgDirected",
+                Some("UnGraph" | "UnGraphMap") => "PgUndirected",
+                _ => "",
+            };
+            let alias = matches!(
+                item.as_deref(),
+                Some("DiGraph" | "UnGraph" | "DiGraphMap" | "UnGraphMap")
+            );
+            match seg.generic_arg_list() {
+                Some(gl) if !ty.is_empty() && gl.generic_args().count() == 2 => {
+                    if let Some(close) = gl.r_angle_token() {
+                        edits.push((
+                            TextRange::empty(close.text_range().start()),
+                            format!(", {ty}"),
+                        ));
+                    }
+                }
+                // (`UnGraph::new_undirected()`, `DiGraphMap::new()`.)
+                None if alias && seg.parent_path().parent_path().is_some() => {
+                    edits.push((
+                        TextRange::empty(name.syntax().text_range().end()),
+                        format!("::<_, _, {ty}>"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // `Outgoing` after `use petgraph::Direction::Outgoing;`.
+        if let Some(path) = ast::Path::cast(node.clone())
+            && path.qualifier().is_none()
+            && !path
+                .syntax()
+                .ancestors()
+                .any(|a| ast::Use::can_cast(a.kind()))
+            && let Some(name) = path.segment().and_then(|s| s.name_ref())
+            && let Some(item) = dirs.get(&name.text().to_string())
+            && matches!(item.as_str(), "Outgoing" | "Incoming")
+        {
+            edits.push((name.syntax().text_range(), format!("PgDirection::{item}")));
+        }
+        // The same in a macro's arguments (`println!("{:?}", toposort(&g, None))`), parsed as
+        // a call's.
+        if let Some(mc) = ast::MacroCall::cast(node.clone())
+            && let Some(tt) = mc.token_tree()
+        {
+            let t = tt.syntax().text().to_string();
+            if t.len() >= 2 && t.is_char_boundary(1) && t.is_char_boundary(t.len() - 1) {
+                let prefix = "fn __pg_f() { __pg_f";
+                let inner = &t[1..t.len() - 1];
+                let sub = format!("{prefix}({inner}); }}");
+                let parsed = SourceFile::parse(&sub, EDITION).tree();
+                let start = i64::from(u32::from(tt.syntax().text_range().start()));
+                petgraph_walk(parsed.syntax(), cx, start - prefix.len() as i64, edits);
+            }
+        }
+    }
+    // (Positions in the file.)
+    for (r, new) in std::mem::take(edits) {
+        let at = |x: ra_ap_syntax::TextSize| {
+            ra_ap_syntax::TextSize::from((i64::from(u32::from(x)) + offset).max(0) as u32)
+        };
+        out.push((TextRange::new(at(r.start()), at(r.end())), new));
+    }
+}
+
+/// How many parts the first edge of `&[(0, 1), ..]` / `vec![(a, b, w), ..]` has.
+fn edge_tuple_arity(e: &ast::Expr) -> Option<usize> {
+    let t = e.syntax().text().to_string();
+    let t = t.trim_start_matches('&').trim_start();
+    let t = t.strip_prefix("vec!").unwrap_or(t).trim_start();
+    let t = t.strip_prefix('[')?.trim_start();
+    if !t.starts_with('(') {
+        return None;
+    }
+    let (mut depth, mut commas, mut last_comma) = (0, 0, false);
+    for ch in t.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(if last_comma { commas } else { commas + 1 });
+                }
+            }
+            ',' if depth == 1 => commas += 1,
+            _ => {}
+        }
+        if !ch.is_whitespace() {
+            last_comma = ch == ',';
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------- crate items as prelude items
 
 /// A crate (or std module) whose items are a prelude's under other names (so they can't collide
@@ -1870,6 +2150,7 @@ const IO_RENAMES: Renames = Renames {
         ("StdinLock", "IoStdin"),
         ("BufWriter", "IoBufWriter"),
         ("BufReader", "IoBufReader"),
+        ("IoSlice", "IoIoSlice"),
     ],
     star: &["Write", "Error", "ErrorKind", "stdout", "stderr", "stdin"],
     result_err: Some("IoError"),
@@ -1894,6 +2175,124 @@ const FMT_RENAMES: Renames = Renames {
     roots: &["fmt", "std::fmt", "::std::fmt", "core::fmt", "::core::fmt"],
     names: &[("Write", "FmtWrite")],
     star: &["Write"],
+    result_err: None,
+};
+
+// `std::task` / `std::future`: the task prelude's (hand-written futures).
+const TASK_RENAMES: Renames = Renames {
+    roots: &[
+        "task",
+        "std::task",
+        "::std::task",
+        "core::task",
+        "::core::task",
+        "futures::task",
+    ],
+    names: &[
+        ("Poll", "TaskPoll"),
+        ("Context", "TaskContext"),
+        ("Waker", "TaskWaker"),
+    ],
+    star: &["Poll", "Context", "Waker"],
+    result_err: None,
+};
+
+// `std::alloc::Global` (and `System`): the marker prelude's `AllocGlobal`; an `A: Allocator`
+// parameter is accepted and ignored.
+const ALLOC_RENAMES: Renames = Renames {
+    roots: &[
+        "alloc",
+        "std::alloc",
+        "::std::alloc",
+        "core::alloc",
+        "alloc::alloc",
+    ],
+    names: &[("Global", "AllocGlobal"), ("System", "AllocGlobal")],
+    star: &["Global", "System"],
+    result_err: None,
+};
+
+// `std::fs` and `std::process::Command`: the os prelude's (every operation fails).
+const FS_RENAMES: Renames = Renames {
+    roots: &["fs", "std::fs", "::std::fs"],
+    names: &[
+        ("File", "FsFile"),
+        ("OpenOptions", "FsOpenOptions"),
+        ("Metadata", "FsMetadata"),
+        ("DirEntry", "FsDirEntry"),
+        ("read_to_string", "__fs_read_to_string"),
+        ("read", "__fs_read"),
+        ("metadata", "__fs_metadata"),
+        ("read_dir", "__fs_read_dir"),
+        ("exists", "__fs_exists"),
+        ("write", "__fs_write"),
+        ("create_dir", "__fs_create_dir"),
+        ("create_dir_all", "__fs_create_dir_all"),
+        ("remove_file", "__fs_remove_file"),
+        ("remove_dir", "__fs_remove_dir"),
+        ("remove_dir_all", "__fs_remove_dir_all"),
+        ("copy", "__fs_copy"),
+        ("rename", "__fs_rename"),
+    ],
+    star: &["File", "OpenOptions", "Metadata", "DirEntry"],
+    result_err: None,
+};
+
+// `std::net`'s addresses: the net prelude's (parsing and formatting).
+const NET_RENAMES: Renames = Renames {
+    roots: &["net", "std::net", "::std::net", "core::net", "::core::net"],
+    names: &[
+        ("IpAddr", "NetIpAddr"),
+        ("Ipv4Addr", "NetIpv4Addr"),
+        ("Ipv6Addr", "NetIpv6Addr"),
+        ("SocketAddr", "NetSocketAddr"),
+        ("SocketAddrV4", "NetSocketAddrV4"),
+        ("SocketAddrV6", "NetSocketAddrV6"),
+        ("AddrParseError", "NetAddrParseError"),
+    ],
+    star: &[
+        "IpAddr",
+        "Ipv4Addr",
+        "Ipv6Addr",
+        "SocketAddr",
+        "SocketAddrV4",
+        "SocketAddrV6",
+        "AddrParseError",
+    ],
+    result_err: None,
+};
+
+const PROCESS_RENAMES: Renames = Renames {
+    roots: &["process", "std::process", "::std::process"],
+    names: &[
+        ("Command", "ProcCommand"),
+        ("Stdio", "ProcStdio"),
+        ("ExitStatus", "ProcExitStatus"),
+        ("Output", "ProcOutput"),
+        ("Child", "ProcChild"),
+    ],
+    star: &["Command", "Stdio", "ExitStatus", "Output", "Child"],
+    result_err: None,
+};
+
+const FUTURE_RENAMES: Renames = Renames {
+    roots: &[
+        "future",
+        "std::future",
+        "::std::future",
+        "core::future",
+        "::core::future",
+        "futures::future",
+    ],
+    names: &[
+        ("ready", "__future_ready"),
+        ("pending", "__future_pending"),
+        ("poll_fn", "__future_poll_fn"),
+        ("Ready", "FutureReady"),
+        ("Pending", "FuturePending"),
+        ("PollFn", "FuturePollFn"),
+    ],
+    star: &[],
     result_err: None,
 };
 
@@ -2169,6 +2568,14 @@ const REACT_RENAMES: Renames = Renames {
         ("use_state", "__rx_use_state"),
         ("use_effect", "__rx_use_effect"),
         ("use_ref", "__rx_use_ref"),
+        ("use_memo", "__rx_use_memo"),
+        ("use_callback", "__rx_use_callback"),
+        ("use_reducer", "__rx_use_reducer"),
+        ("create_context", "__rx_create_context"),
+        ("use_context", "__rx_use_context"),
+        ("Context", "ReactContext"),
+        ("Dispatch", "ReactDispatch"),
+        ("IntoNode", "ReactIntoNode"),
     ],
     star: &[
         "Node",
@@ -2178,6 +2585,14 @@ const REACT_RENAMES: Renames = Renames {
         "use_state",
         "use_effect",
         "use_ref",
+        "use_memo",
+        "use_callback",
+        "use_reducer",
+        "create_context",
+        "use_context",
+        "Context",
+        "Dispatch",
+        "IntoNode",
     ],
     result_err: None,
 };
@@ -2254,21 +2669,140 @@ const RAND_DISTR09_RENAMES: Renames = Renames {
     result_err: None,
 };
 
+/// `ordered_float`'s names are the prelude's own (this resolves `ordered_float::OrderedFloat` and
+/// `use ordered_float::OrderedFloat as OF;`).
+const ORDERED_FLOAT_RENAMES: Renames = Renames {
+    roots: &["ordered_float", "::ordered_float"],
+    names: &[
+        ("OrderedFloat", "OrderedFloat"),
+        ("NotNan", "NotNan"),
+        ("FloatIsNan", "FloatIsNan"),
+    ],
+    star: &["OrderedFloat", "NotNan", "FloatIsNan"],
+    result_err: None,
+};
+
+/// `petgraph`'s types as the petgraph prelude's (its functions are `petgraph_edits`').
+const PETGRAPH_RENAMES: Renames = Renames {
+    roots: &[
+        "petgraph",
+        "::petgraph",
+        "petgraph::graph",
+        "petgraph::graphmap",
+        "petgraph::visit",
+        "petgraph::prelude",
+        "petgraph::algo",
+        "petgraph::algo::bellman_ford",
+        "petgraph::data",
+    ],
+    names: PETGRAPH_NAMES,
+    star: &[
+        "Graph",
+        "DiGraph",
+        "UnGraph",
+        "GraphMap",
+        "DiGraphMap",
+        "UnGraphMap",
+        "NodeIndex",
+        "EdgeIndex",
+        "EdgeReference",
+        "Directed",
+        "Undirected",
+        "Direction",
+        "Outgoing",
+        "Incoming",
+        "Bfs",
+        "Dfs",
+        "DfsPostOrder",
+    ],
+    result_err: None,
+};
+
+/// petgraph's names and the prelude's.
+pub(crate) const PETGRAPH_NAMES: &[(&str, &str)] = &[
+    ("Graph", "PgGraph"),
+    ("DiGraph", "PgGraph"),
+    ("UnGraph", "PgGraph"),
+    ("GraphMap", "PgGraphMap"),
+    ("DiGraphMap", "PgGraphMap"),
+    ("UnGraphMap", "PgGraphMap"),
+    ("NodeIndex", "PgNodeIndex"),
+    ("EdgeIndex", "PgEdgeIndex"),
+    ("EdgeReference", "PgEdgeReference"),
+    ("Directed", "PgDirected"),
+    ("Undirected", "PgUndirected"),
+    ("Direction", "PgDirection"),
+    ("Outgoing", "PgDirection::Outgoing"),
+    ("Incoming", "PgDirection::Incoming"),
+    ("Bfs", "PgBfs"),
+    ("Dfs", "PgDfs"),
+    ("DfsPostOrder", "PgDfsPostOrder"),
+    ("Cycle", "PgCycle"),
+    ("NegativeCycle", "PgNegativeCycle"),
+    ("Paths", "PgPaths"),
+    ("DfsSpace", "PgDfsSpace"),
+    ("Element", "PgElement"),
+    ("node_index", "__pg_node_index"),
+    ("edge_index", "__pg_edge_index"),
+];
+
+/// `petgraph::algo`'s functions: methods of the graph here (`(&g).__pg_dijkstra(..)`).
+const PETGRAPH_ALGOS: &[&str] = &[
+    "dijkstra",
+    "astar",
+    "bellman_ford",
+    "toposort",
+    "is_cyclic_directed",
+    "is_cyclic_undirected",
+    "connected_components",
+    "kosaraju_scc",
+    "tarjan_scc",
+    "has_path_connecting",
+    "min_spanning_tree",
+];
+
+const PETGRAPH_ALGO_IMPORTS: Renames = Renames {
+    roots: &["petgraph::algo", "::petgraph::algo"],
+    names: &[],
+    star: PETGRAPH_ALGOS,
+    result_err: None,
+};
+
+const PETGRAPH_ROOT_IMPORTS: Renames = Renames {
+    roots: &["petgraph", "::petgraph"],
+    names: &[],
+    star: &[],
+    result_err: None,
+};
+
+const PETGRAPH_DIRECTION_IMPORTS: Renames = Renames {
+    roots: &["petgraph::Direction", "::petgraph::Direction"],
+    names: &[],
+    star: &["Outgoing", "Incoming"],
+    result_err: None,
+};
+
 /// The crates of `text` that are renamed, and the names its `use`s bring in from each.
 fn renamed_crates(text: &str) -> Vec<&'static Renames> {
     let mut out: Vec<&'static Renames> = Vec::new();
+    // (A use of `std::io`'s items names `io::` somewhere, `std::io::Error`, `use std::{io::Write}`,
+    // or is `use std::io;` itself; `std::` alone says nothing.)
     let has = |root: &str| {
-        let first = root
-            .trim_start_matches("::")
-            .split("::")
-            .next()
-            .unwrap_or(root);
-        (text.contains(&format!("{first}::")) || text.contains(&format!("use {first}")))
+        let root = root.trim_start_matches("::");
+        let first = root.split("::").next().unwrap_or(root);
+        let last = root.rsplit("::").next().unwrap_or(root);
+        (text.contains(&format!("{last}::")) || text.contains(&format!("use {root}")))
             && !text.contains(&format!("mod {first}"))
     };
     for r in [
         &IO_RENAMES,
         &FMT_RENAMES,
+        &TASK_RENAMES,
+        &FUTURE_RENAMES,
+        &ALLOC_RENAMES,
+        &FS_RENAMES,
+        &PROCESS_RENAMES,
+        &NET_RENAMES,
         &RUSTC_HASH_RENAMES,
         &LOG_RENAMES,
         &ENV_LOGGER_RENAMES,
@@ -2282,6 +2816,8 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
         &ENTRY_RENAMES,
         &CHRONO_TZ_RENAMES,
         &REACT_RENAMES,
+        &ORDERED_FLOAT_RENAMES,
+        &PETGRAPH_RENAMES,
     ] {
         if r.roots.iter().any(|root| has(root)) {
             out.push(r);

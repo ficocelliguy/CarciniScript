@@ -75,11 +75,17 @@ impl Checker<'_> {
         }
         // Names first, so fields can refer to any type in the file.
         let mut const_structs: Vec<(String, ast::Struct)> = Vec::new();
+        let mut const_enums: Vec<(String, Option<ast::GenericParamList>)> = Vec::new();
         for item in crate::adt::all_items(file) {
             if let ast::Item::Struct(s) = &item
                 && let Some(n) = s.name()
             {
                 const_structs.push((n.text().to_string(), s.clone()));
+            }
+            if let ast::Item::Enum(e) = &item
+                && let Some(n) = e.name()
+            {
+                const_enums.push((n.text().to_string(), e.generic_param_list()));
             }
             let (name, is_enum, attrs_of): (Option<ast::Name>, bool, Vec<String>) = match &item {
                 ast::Item::Struct(s) => (s.name(), false, derives_of(s)),
@@ -123,13 +129,14 @@ impl Checker<'_> {
         }
         // Const parameters (`struct Buf<T, const N: usize = 4>`), then how each is read off
         // the fields (`data: [T; N]`).
-        for (n, s) in &const_structs {
+        // (An enum's values keep theirs too; none is read off a field.)
+        let lists = const_structs
+            .iter()
+            .map(|(n, s)| (n, s.generic_param_list()))
+            .chain(const_enums.iter().map(|(n, l)| (n, l.clone())));
+        for (n, list) in lists {
             let mut cps = Vec::new();
-            for p in s
-                .generic_param_list()
-                .into_iter()
-                .flat_map(|l| l.generic_params())
-            {
+            for p in list.into_iter().flat_map(|l| l.generic_params()) {
                 if let ast::GenericParam::ConstParam(cp) = p
                     && let Some(name) = cp.name()
                 {
@@ -200,7 +207,6 @@ impl Checker<'_> {
                 }
                 ast::Item::Enum(e) => {
                     let Some(name) = e.name() else { continue };
-                    self.reject_const_generics(e.generic_param_list());
                     self.enter_type_params(&type_param_names(&item));
                     let mut variants = Vec::new();
                     let mut default_variant = None;
@@ -378,19 +384,6 @@ impl Checker<'_> {
         self.generics.clear();
         for n in names {
             self.generics.insert(n.clone(), Ty::Param(n.clone()));
-        }
-    }
-
-    fn reject_const_generics(&mut self, gp: Option<ast::GenericParamList>) {
-        if let Some(gp) = gp
-            && gp
-                .generic_params()
-                .any(|p| matches!(p, ast::GenericParam::ConstParam(_)))
-        {
-            self.error(
-                gp.syntax(),
-                "const generic parameters on enums are not supported yet (they are on structs, functions and impls)",
-            );
         }
     }
 
@@ -648,6 +641,19 @@ impl Checker<'_> {
             // parameter it names is declared).
             if let Some(closure) = lists.iter().find_map(|l| self.lower_fn_bounds(l)) {
                 self.generics.insert(n, closure);
+            } else if let Some(out) = lists.iter().find_map(super::bounds_future_output) {
+                // `impl<F: Future> Future for Counted<F>`: a future of `F::Output` (`F`'s own
+                // parameter, which a value's type argument settles).
+                let out = match out {
+                    Some(t) => self.lower_type(&t),
+                    None => {
+                        let o = format!("{n}::Output");
+                        self.generics.insert(o.clone(), Ty::Param(o.clone()));
+                        self.param_bounds.insert(o.clone(), Vec::new());
+                        Ty::Param(o)
+                    }
+                };
+                self.generics.insert(n, Ty::Future(Box::new(out)));
             }
         }
         self.note_where_projections(imp.where_clause());
@@ -671,6 +677,10 @@ impl Checker<'_> {
                         let ty = f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
                         if self.copy_array(f.ty().as_ref(), None, &ty) {
                             self.array_fields.insert((variant_name.to_string(), name.clone()));
+                        }
+                        if f.ty().as_ref().is_some_and(shared_ref_type) {
+                            self.shared_ref_fields
+                                .insert((variant_name.to_string(), name.clone()));
                         }
                         if let Some(t) = f.ty()
                             && super::is_ptr_type(&t)
@@ -703,6 +713,10 @@ impl Checker<'_> {
                         // (`struct Threads([u32; 4])`: a `Copy` array, as a named field would be.)
                         if self.copy_array(f.ty().as_ref(), None, &ty) {
                             self.array_fields
+                                .insert((variant_name.to_string(), i.to_string()));
+                        }
+                        if f.ty().as_ref().is_some_and(shared_ref_type) {
+                            self.shared_ref_fields
                                 .insert((variant_name.to_string(), i.to_string()));
                         }
                         Field {
@@ -766,7 +780,12 @@ impl Checker<'_> {
                         && self
                             .array_fields
                             .contains(&(v.name.clone(), f.name.clone()));
-                    if !copy_array && !self.implements(&subst(&f.ty, &unknowns), d) {
+                    // A shared reference is `Copy` and `Clone` whatever it points at.
+                    let shared_ref = matches!(d.as_str(), "Copy" | "Clone")
+                        && self
+                            .shared_ref_fields
+                            .contains(&(v.name.clone(), f.name.clone()));
+                    if !copy_array && !shared_ref && !self.implements(&subst(&f.ty, &unknowns), d) {
                         self.error(
                             node,
                             format!("the trait `{d}` is not implemented for `{}` (field `{}` of `{name}`)", f.ty.describe(), f.name),
@@ -821,6 +840,10 @@ impl Checker<'_> {
             Ty::Iter { mutable: false, .. } if t == "Clone" => true,
             Ty::Closure { .. } | Ty::Iter { .. } | Ty::Future(_) | Ty::Entry(..) => false,
             Ty::Param(n) => self.param_has(n, t),
+            // (`std::error::Error`'s supertraits: `Box<dyn Error>` fields derive `Debug`.)
+            Ty::Dyn(tr) if tr == "Error" && !self.adts.traits.contains_key("Error") => {
+                matches!(t, "Debug" | "Display" | "Error")
+            }
             Ty::Dyn(tr) => self.trait_includes(tr, t),
             _ => true,
         }
@@ -846,9 +869,11 @@ impl Checker<'_> {
         // `impl Money for f64`: a user trait for a built-in type (and `impl From<Id> for String`).
         if !self.adts.defs.contains_key(&type_name)
             && let Some(key) = crate::adt::ext_key(&type_name)
-            && trait_name
-                .as_deref()
-                .is_some_and(|t| self.adts.traits.contains_key(t) || t == "From")
+            && trait_name.as_deref().is_some_and(|t| {
+                self.adts.traits.contains_key(t)
+                    || matches!(t, "From" | "PartialEq")
+                    || crate::adt::op_method(t).is_some()
+            })
         {
             type_name = key.to_string();
             self.adts.ext_types.insert(type_name.clone());
@@ -887,6 +912,8 @@ impl Checker<'_> {
             Some("Sum" | "Product") => {}
             // Marker traits (`unsafe impl Send for T {}`): nothing to do in JS.
             Some("Iterator" | "IntoIterator" | "Send" | "Sync" | "Unpin") => {}
+            // A hand-written future: `poll` is an ordinary method; `.await` polls it.
+            Some("Future") => {}
             // More markers: `len()` comes from `size_hint`, `next_back` is an ordinary method
             // (`.rev()` calls it), unwinding isn't a thing in JS, and a hasher's `write` /
             // `finish` (a builder's `build_hasher`) are ordinary methods too.
@@ -1007,6 +1034,7 @@ impl Checker<'_> {
         });
         let into_iter = trait_name.as_deref() == Some("IntoIterator");
         let is_iter = trait_name.as_deref() == Some("Iterator") || into_iter;
+        let is_future = trait_name.as_deref() == Some("Future");
         let output = imp
             .assoc_item_list()
             .into_iter()
@@ -1015,7 +1043,8 @@ impl Checker<'_> {
                 // (`IntoIterator`'s `type IntoIter` isn't needed: `into_iter()` says it.)
                 ast::AssocItem::TypeAlias(ta)
                     if op.is_some()
-                        || (is_iter && ta.name().is_some_and(|n| n.text() == "Item")) =>
+                        || (is_iter && ta.name().is_some_and(|n| n.text() == "Item"))
+                        || (is_future && ta.name().is_some_and(|n| n.text() == "Output")) =>
                 {
                     ta.ty()
                 }
@@ -1029,6 +1058,10 @@ impl Checker<'_> {
         if is_iter {
             let item = output.clone().unwrap_or(Ty::Unknown);
             self.adts.iter_items.insert(type_name.clone(), item);
+        }
+        if is_future {
+            let out = output.clone().unwrap_or(Ty::Unknown);
+            self.adts.future_outputs.insert(type_name.clone(), out);
         }
         let saved_output = std::mem::replace(&mut self.assoc_output, output);
         // Every `type X = ..;` of the impl, for `Self::X`.
@@ -1060,7 +1093,7 @@ impl Checker<'_> {
                 let user_trait = trait_name
                     .as_deref()
                     .is_some_and(|t| self.adts.traits.contains_key(t));
-                if (op.is_some() || is_iter || is_deref || from_str || user_trait)
+                if (op.is_some() || is_iter || is_future || is_deref || from_str || user_trait)
                     && matches!(item, ast::AssocItem::TypeAlias(_))
                 {
                     continue;
@@ -1087,20 +1120,8 @@ impl Checker<'_> {
             };
             let Some(name) = f.name() else { continue };
             let mut method = self.lower_method(&f);
-            // A string, number, bool, char or `Option` is a JS value `this` can't change.
-            if method.receiver == Some(crate::adt::Receiver::MutRef)
-                && self.adts.ext_types.contains(&type_name)
-                && !matches!(
-                    type_name.as_str(),
-                    "Vec" | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "Result"
-                )
-                && !type_name.ends_with("$all")
-            {
-                self.error(
-                    name.syntax(),
-                    format!("`&mut self` methods of a trait implemented for `{type_name}` aren't supported yet (a JS string, number or bool can't be changed in place); take `self` and return the new value"),
-                );
-            }
+            // (A `&mut self` method on a string, number, bool, char or `Option` takes a cell as
+            // `this`: see `codegen_adt::cell_self`.)
             method.impl_args = impl_args.clone();
             if let (Some(op), Some(rhs)) = (op, &op_rhs)
                 && name.text() == op
@@ -1150,6 +1171,37 @@ impl Checker<'_> {
                     .insert(key, method);
                 continue;
             }
+            // A generic trait's second impl for this type (`impl IntoS<u16> for Vec<u8>` after
+            // `impl IntoS<u8> for Vec<u8>`): its methods under keys of their own.
+            if let Some(tr) = trait_name.as_deref()
+                && self
+                    .adts
+                    .traits
+                    .get(tr)
+                    .is_some_and(|d| !d.type_params.is_empty())
+                && self
+                    .adts
+                    .methods
+                    .get(&type_name)
+                    .is_some_and(|ms| ms.contains_key(name.text().to_string().as_str()))
+            {
+                let n = name.text().to_string();
+                let alts = self
+                    .adts
+                    .method_alts
+                    .entry(format!("{type_name}::{n}"))
+                    .or_insert_with(|| vec![n.clone()]);
+                let key = format!("{n}${}", alts.len());
+                alts.push(key.clone());
+                let at = self.range(name.syntax()).0;
+                self.adts.alt_keys_at.insert(at, key.clone());
+                self.adts
+                    .methods
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(key, method);
+                continue;
+            }
             let methods = self.adts.methods.entry(type_name.clone()).or_default();
             if trait_name.is_none() && methods.contains_key(name.text().to_string().as_str()) {
                 self.error(
@@ -1189,7 +1241,15 @@ impl Checker<'_> {
         // The method's own type parameters join the impl's while its signature is lowered.
         let own = self.enter_method_generics(f);
         let receiver = f.param_list().and_then(|pl| pl.self_param()).map(|sp| {
-            if sp.amp_token().is_some() {
+            // (`self: Pin<&mut Self>`, a future's `poll`: as `&mut self`.)
+            let typed = sp.ty().map(|t| t.syntax().text().to_string());
+            if let Some(t) = typed.filter(|t| t.contains('&')) {
+                if t.contains("&mut") {
+                    Receiver::MutRef
+                } else {
+                    Receiver::Ref
+                }
+            } else if sp.amp_token().is_some() {
                 if sp.mut_token().is_some() {
                     Receiver::MutRef
                 } else {
@@ -1280,6 +1340,7 @@ impl Checker<'_> {
                             | "Debug"
                             | "Error"
                             | "Iterator"
+                            | "Future"
                             | "FromStr"
                             | "TryFrom"
                             | "FromIterator"
@@ -1524,9 +1585,13 @@ impl Checker<'_> {
 
     /// `Tag::<7>`, `Buf::<u8, 4> { .. }`: a struct path's own arguments.
     fn ctor_turbofish(&mut self, path: Option<ast::Path>, targs: &[Ty]) {
+        // (On the variant, or on its enum: `Buf::<2>::Empty`.)
         let given: Vec<ast::GenericArg> = path
-            .and_then(|p| p.segment())
-            .and_then(|s| s.generic_arg_list())
+            .and_then(|p| {
+                p.segment()
+                    .and_then(|s| s.generic_arg_list())
+                    .or_else(|| p.qualifier()?.segment()?.generic_arg_list())
+            })
             .map(|l| l.generic_args().collect())
             .unwrap_or_default();
         let given: Vec<Ty> = given
@@ -2284,6 +2349,26 @@ impl Checker<'_> {
             }
         });
         found
+    }
+}
+
+/// A shared reference type (`&'a [u8]`, `Option<&T>`): `Copy` whatever it points at.
+fn shared_ref_type(t: &ast::Type) -> bool {
+    match t {
+        ast::Type::RefType(r) => r.mut_token().is_none(),
+        ast::Type::ParenType(p) => p.ty().is_some_and(|t| shared_ref_type(&t)),
+        // `Option<&T>`
+        ast::Type::PathType(p) => p
+            .path()
+            .and_then(|p| p.segment())
+            .filter(|s| s.name_ref().is_some_and(|n| n.text() == "Option"))
+            .and_then(|s| s.generic_arg_list())
+            .and_then(|l| l.generic_args().next())
+            .is_some_and(|a| match a {
+                ast::GenericArg::TypeArg(ta) => ta.ty().is_some_and(|t| shared_ref_type(&t)),
+                _ => false,
+            }),
+        _ => false,
     }
 }
 

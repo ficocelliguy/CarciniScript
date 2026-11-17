@@ -9,6 +9,78 @@ use super::{Checker, VarKind};
 use crate::adt::{Conv, FromImpl};
 use crate::ty::{IntKind, Ty};
 
+/// The `X` of `.into()`'s receiver when it's a parameter of the enclosing function declared
+/// `impl Into<X>`, or `T` with a `T: Into<X>` bound (inline or in `where`).
+fn into_bound_target(m: &ast::MethodCallExpr) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::{HasGenericArgs, HasGenericParams, HasName, HasTypeBounds};
+    let ast::Expr::PathExpr(p) = crate::typeck::strip_parens(&m.receiver()?) else {
+        return None;
+    };
+    let name = p.path()?.as_single_name_ref()?;
+    let f = m.syntax().ancestors().find_map(ast::Fn::cast)?;
+    let ty = f.param_list()?.params().find_map(|p| {
+        let named = matches!(p.pat(), Some(ast::Pat::IdentPat(ip)) if ip.name().is_some_and(|n| n.text() == name.text()));
+        if named { p.ty() } else { None }
+    })?;
+    // `Into<X>` among a bound list: `X`.
+    let target = |l: ast::TypeBoundList| {
+        l.bounds().find_map(|b| {
+            let ast::Type::PathType(pt) = b.ty()? else {
+                return None;
+            };
+            let seg = pt.path()?.segment()?;
+            if seg.name_ref()?.text() != "Into" {
+                return None;
+            }
+            match seg.generic_arg_list()?.generic_args().next()? {
+                ast::GenericArg::TypeArg(a) => a.ty(),
+                _ => None,
+            }
+        })
+    };
+    match ty {
+        ast::Type::ImplTraitType(i) => target(i.type_bound_list()?),
+        ast::Type::PathType(pt) => {
+            let t = pt.path()?.as_single_name_ref()?.text().to_string();
+            let inline = f
+                .generic_param_list()
+                .into_iter()
+                .flat_map(|l| l.type_or_const_params())
+                .filter_map(|p| match p {
+                    ast::TypeOrConstParam::Type(tp) => Some(tp),
+                    _ => None,
+                })
+                .find(|tp| tp.name().is_some_and(|n| n.text() == t))
+                .and_then(|tp| tp.type_bound_list())
+                .and_then(target);
+            inline.or_else(|| {
+                f.where_clause()?.predicates().find_map(|pred| {
+                    if pred.ty()?.syntax().text() != t.as_str() {
+                        return None;
+                    }
+                    target(pred.type_bound_list()?)
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The `std::ops` trait of an operator: `Add` for `+`, ..
+fn op_trait(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "Add",
+        ArithOp::Sub => "Sub",
+        ArithOp::Mul => "Mul",
+        ArithOp::Div => "Div",
+        ArithOp::Rem => "Rem",
+        ArithOp::BitAnd => "BitAnd",
+        ArithOp::BitOr => "BitOr",
+        ArithOp::BitXor => "BitXor",
+        _ => "",
+    }
+}
+
 impl Checker<'_> {
     /// Whether `a` and `b` could be the same type once inference finishes (no side effects).
     pub(super) fn could_be(&self, a: &Ty, b: &Ty) -> bool {
@@ -46,7 +118,30 @@ impl Checker<'_> {
 
     /// The `impl From<X> for adt` that converts a `src`, if exactly one can; unifies `X` with it.
     fn pick_from(&mut self, adt: &str, src: &Ty) -> Option<String> {
-        let impls: Vec<FromImpl> = self.adts.from_impls.get(adt).cloned().unwrap_or_default();
+        self.pick_from_inst(adt, src).map(|(key, _)| key)
+    }
+
+    /// `pick_from`, with the impl's result type: `impl<T> From<T> for Wrap<T>` takes any `T`
+    /// (its parameters fresh), and makes a `Wrap` of it.
+    fn pick_from_inst(&mut self, adt: &str, src: &Ty) -> Option<(String, Option<Ty>)> {
+        let mut impls: Vec<FromImpl> = self.adts.from_impls.get(adt).cloned().unwrap_or_default();
+        let mut rets: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+        for i in &mut impls {
+            if let Some(sig) = self.adts.method(adt, &i.key).cloned()
+                && sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                && sig
+                    .impl_args
+                    .iter()
+                    .any(|a| matches!(a, Ty::Param(p) if i.src.mentions_param(p)))
+            {
+                let sig = self.method_inst(&sig, None);
+                self.last_type_args.clear();
+                if let Some(p) = sig.params.first() {
+                    i.src = p.clone();
+                }
+                rets.insert(i.key.clone(), sig.ret);
+            }
+        }
         let fits: Vec<&FromImpl> = impls
             .iter()
             .filter(|i| self.could_be(&i.src, src))
@@ -72,7 +167,54 @@ impl Checker<'_> {
         };
         let [one] = fits.as_slice() else { return None };
         self.unify(&one.src, src);
-        Some(one.key.clone())
+        Some((one.key.clone(), rets.remove(&one.key)))
+    }
+
+    /// `v.into_s()` where a generic trait is implemented more than once for `ty`
+    /// (`impl IntoS<u8> for Vec<u8>`, `impl IntoS<u16> for Vec<u8>`): the key of the impl whose
+    /// signature fits the arguments and the expected type (the first that fits when several do),
+    /// recorded for codegen.
+    pub(super) fn pick_method_alt(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        ty: &str,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<&Ty>,
+    ) -> Option<String> {
+        let keys = self
+            .adts
+            .method_alts
+            .get(&format!("{ty}::{method}"))?
+            .clone();
+        // (The arguments' types decide between `Scale<u32>` and `Scale<&str>`; a closure is left
+        // to the impl's own check.)
+        let arg_tys: Vec<Ty> = args
+            .iter()
+            .map(|a| match crate::typeck::strip_parens(a) {
+                ast::Expr::ClosureExpr(_) => Ty::Unknown,
+                _ => self.infer(a, None),
+            })
+            .collect();
+        let fits = |c: &Self, k: &String| {
+            c.adts.method(ty, k).is_some_and(|sig| {
+                sig.params.len() == args.len()
+                    && sig
+                        .params
+                        .iter()
+                        .zip(&arg_tys)
+                        .all(|(p, a)| matches!(a, Ty::Unknown) || c.could_be(p, a))
+                    && expected.is_none_or(|e| c.could_be(&sig.ret, e))
+            })
+        };
+        let key = keys
+            .iter()
+            .find(|k| fits(self, k))
+            .cloned()
+            .unwrap_or_else(|| keys[0].clone());
+        let r = self.range(m.syntax());
+        self.method_keys.insert(r, key.clone());
+        Some(key)
     }
 
     /// A call of a user trait method on a built-in type, for codegen.
@@ -85,7 +227,7 @@ impl Checker<'_> {
         );
     }
 
-    fn record_conv(&mut self, node: &SyntaxNode, conv: Conv) {
+    pub(super) fn record_conv(&mut self, node: &SyntaxNode, conv: Conv) {
         let r = self.range(node);
         self.conversions.insert(r, conv);
     }
@@ -111,14 +253,19 @@ impl Checker<'_> {
             return Ty::Unknown;
         };
         let at = self.infer(a, None);
-        match self.pick_from(adt, &at) {
-            Some(key) => self.record_conv(
-                c.syntax(),
-                Conv::From {
-                    adt: adt.to_string(),
-                    key,
-                },
-            ),
+        match self.pick_from_inst(adt, &at) {
+            Some((key, ret)) => {
+                self.record_conv(
+                    c.syntax(),
+                    Conv::From {
+                        adt: adt.to_string(),
+                        key,
+                    },
+                );
+                if let Some(ret) = ret {
+                    return ret;
+                }
+            }
             None => {
                 let msg = format!(
                     "the trait bound `{adt}: From<{}>` is not satisfied (`{adt}` implements {})",
@@ -135,6 +282,12 @@ impl Checker<'_> {
     /// `x.into()`: the target type usually comes from the context, so it is settled at the end
     /// of the function.
     pub(super) fn conv_into_call(&mut self, m: &ast::MethodCallExpr, recv: Ty) -> Ty {
+        // `h.into()` with `h: impl Into<Host>` / `h: H` where `H: Into<Host>`: the parameter is a
+        // `Host` here already, and the bound says that's what it converts to.
+        if let Some(x) = into_bound_target(m) {
+            self.record_conv(m.syntax(), Conv::Identity);
+            return self.lower_type(&x);
+        }
         let target = self.fresh(VarKind::General);
         self.pending_intos
             .push((recv, target.clone(), m.syntax().clone(), self.base));
@@ -303,7 +456,12 @@ impl Checker<'_> {
                     if self.adts.from_impls.contains_key(adt) && !self.could_be(&s, &t) =>
                 {
                     let adt = adt.clone();
-                    self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
+                    self.pick_from_inst(&adt, &s).map(|(key, ret)| {
+                        if let Some(ret) = ret {
+                            self.unify(&ret, &t);
+                        }
+                        Conv::From { adt, key }
+                    })
                 }
                 // `id.into()` as a `String` (or a number) through your `impl From<Id> for String`.
                 (Ty::Adt(..), _)
@@ -312,6 +470,13 @@ impl Checker<'_> {
                 {
                     let adt = crate::adt::ext_key_of(&t).unwrap_or_default().to_string();
                     self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
+                }
+                // `"x".into()` / `format!(..).into()` as a `Box<dyn Error>`: the string itself (its
+                // `{}` is the text and its `{:?}` the quoted text, like std's string error's).
+                (Ty::Str, Ty::Dyn(tr))
+                    if tr == "Error" && !self.adts.traits.contains_key("Error") =>
+                {
+                    Some(Conv::Identity)
                 }
                 // `"x".into()` / `2.5.into()` / `true.into()` as a `JsValue`: the JS value itself.
                 (
@@ -342,7 +507,7 @@ impl Checker<'_> {
                     };
                     self.unify(e, &items);
                     let js = match kind {
-                        Coll::VecDeque => "Array.from",
+                        Coll::VecDeque => "κσ.Deque.from",
                         Coll::BinaryHeap => "κσ.$heapFrom",
                         Coll::BTreeSet => "κσ.BTreeSet.from",
                         Coll::BTreeMap => "κσ.BTreeMap.from",
@@ -420,7 +585,44 @@ impl Checker<'_> {
         }
     }
 
+    /// The number type whose `impl Mul<V> for f64` (or `Add`, ..) applies to `lt op rt`, with `rt`
+    /// your type: `lt`'s own, or for a literal (`2.0 * v`) the first number type with one.
+    pub(super) fn prim_op_key(
+        &mut self,
+        op: ArithOp,
+        assign: bool,
+        lt: &Ty,
+        rt: &Ty,
+    ) -> Option<String> {
+        if !matches!(self.shallow(rt), Ty::Adt(..)) {
+            return None;
+        }
+        let tr = format!("{}{}", op_trait(op), if assign { "Assign" } else { "" });
+        let has = |c: &Self, k: &str| {
+            c.adts
+                .op_impls
+                .get(k)
+                .is_some_and(|v| v.iter().any(|i| i.trait_name == tr))
+        };
+        if let Some(k) = crate::adt::ext_key_of(&self.shallow(lt)) {
+            return has(self, k).then(|| k.to_string());
+        }
+        let candidates: &[&str] = match self.var_kind(lt) {
+            Some(VarKind::Float) => &["f64", "f32"],
+            Some(VarKind::Int) => &[
+                "i32", "i64", "u32", "u64", "usize", "isize", "u8", "i8", "u16", "i16", "f64",
+                "f32",
+            ],
+            _ => &[],
+        };
+        let k = candidates.iter().find(|k| has(self, k))?.to_string();
+        self.unify(lt, &Ty::from_name(&k));
+        Some(k)
+    }
+
     /// `a + b` (or `a += b`) where `a` is a struct or enum: its `impl Add<R>` for `b`'s type.
+    /// (`pre`: `b`'s type, already inferred.)
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn op_overload(
         &mut self,
         node: &SyntaxNode,
@@ -429,24 +631,18 @@ impl Checker<'_> {
         adt: &str,
         lt: &Ty,
         rhs: &ast::Expr,
+        pre: Option<Ty>,
     ) -> Ty {
-        let base = match op {
-            ArithOp::Add => "Add",
-            ArithOp::Sub => "Sub",
-            ArithOp::Mul => "Mul",
-            ArithOp::Div => "Div",
-            ArithOp::Rem => "Rem",
-            ArithOp::BitAnd => "BitAnd",
-            ArithOp::BitOr => "BitOr",
-            ArithOp::BitXor => "BitXor",
-            _ => "",
-        };
+        let base = op_trait(op);
         let tr = if assign {
             format!("{base}Assign")
         } else {
             base.to_string()
         };
-        let rt = self.infer(rhs, None);
+        let rt = match pre {
+            Some(t) => t,
+            None => self.infer(rhs, None),
+        };
         let mut impls: Vec<crate::adt::OpImpl> = self
             .adts
             .op_impls
@@ -468,6 +664,27 @@ impl Checker<'_> {
                     }
                     rets.insert(i.key.clone(), sig.ret);
                 }
+            }
+        }
+        // `impl Mul for Wrapping<u32>` next to `impl Mul for Wrapping<u64>`: only the impls for the
+        // left operand's own type arguments apply.
+        if let Ty::Adt(_, targs) = self.shallow(lt) {
+            let own: Vec<crate::adt::OpImpl> = impls
+                .iter()
+                .filter(|i| {
+                    self.adts.method(adt, &i.key).is_none_or(|sig| {
+                        sig.impl_args.len() != targs.len()
+                            || sig
+                                .impl_args
+                                .iter()
+                                .zip(&targs)
+                                .all(|(a, t)| matches!(a, Ty::Param(_)) || self.could_be(a, t))
+                    })
+                })
+                .cloned()
+                .collect();
+            if !own.is_empty() {
+                impls = own;
             }
         }
         let mut fits: Vec<&crate::adt::OpImpl> = impls
@@ -547,6 +764,21 @@ impl Checker<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        // (`impl<N> Index<(N, N)> for GraphMap<N>`: the index type in the base's type arguments.)
+        let mut impls = impls;
+        if let Ty::Adt(_, targs) = self.shallow(bt) {
+            for i in &mut impls {
+                if let Some(sig) = self.adts.method(adt, &i.key).cloned()
+                    && sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                {
+                    let sig = self.method_inst(&sig, Some(&targs));
+                    self.last_type_args.clear();
+                    if let Some(p) = sig.params.first() {
+                        i.rhs = p.clone();
+                    }
+                }
+            }
+        }
         let fits: Vec<&crate::adt::OpImpl> = impls
             .iter()
             .filter(|i| self.could_be(&i.rhs, &it))
@@ -563,6 +795,19 @@ impl Checker<'_> {
         };
         self.unify(&one.rhs, &it);
         let key = one.key.clone();
+        // (`graph[n]` with `impl<N, E> Index<NodeIndex> for Graph<N, E>`: the element type in the
+        // base's type arguments.)
+        let ret = match self.adts.method(adt, &key).cloned() {
+            Some(sig) => match self.shallow(bt) {
+                Ty::Adt(_, targs) if sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_))) => {
+                    let sig = self.method_inst(&sig, Some(&targs));
+                    self.last_type_args.clear();
+                    sig.ret
+                }
+                _ => sig.ret,
+            },
+            None => Ty::Unknown,
+        };
         let assigned = ix
             .syntax()
             .parent()
@@ -572,10 +817,7 @@ impl Checker<'_> {
                     && b.lhs().is_some_and(|l| l.syntax() == ix.syntax())
             });
         // `names[i].push('!')`: a string element is a JS value, so a method on it needs the place.
-        let elem_is_str = self
-            .adts
-            .method(adt, &key)
-            .is_some_and(|m| self.shallow(&m.ret) == Ty::Str);
+        let elem_is_str = self.shallow(&ret) == Ty::Str;
         let receiver = elem_is_str
             && ix
                 .syntax()
@@ -590,9 +832,20 @@ impl Checker<'_> {
         let assigned = assigned || (receiver && has_index_mut);
         if assigned {
             // `grid[i] = v`: `impl IndexMut<I>` for the same index type hands out the place.
+            // (The `IndexMut` beside the `Index` picked: its index type, as instantiated.)
+            let index_rhs = one.rhs.clone();
             let index_mut = self.adts.op_impls.get(adt).and_then(|v| {
                 v.iter()
-                    .find(|i| i.trait_name == "IndexMut" && self.could_be(&i.rhs, &it))
+                    .find(|i| {
+                        i.trait_name == "IndexMut"
+                            && (self.could_be(&i.rhs, &it)
+                                || self.describe(&i.rhs) == self.describe(&index_rhs)
+                                || matches!(&i.rhs, Ty::Param(_))
+                                || i.rhs
+                                    .inner_types()
+                                    .iter()
+                                    .any(|t| matches!(t, Ty::Param(_))))
+                    })
                     .cloned()
             });
             match index_mut {
@@ -611,11 +864,7 @@ impl Checker<'_> {
                             key: im.key.clone(),
                         },
                     );
-                    return self
-                        .adts
-                        .method(adt, &key)
-                        .map(|m| m.ret.clone())
-                        .unwrap_or(Ty::Unknown);
+                    return ret;
                 }
                 None => {
                     let msg = format!(
@@ -628,28 +877,54 @@ impl Checker<'_> {
             }
         }
         self.record_conv(ix.syntax(), Conv::Method { key: key.clone() });
-        self.adts
-            .method(adt, &key)
-            .map(|m| m.ret.clone())
-            .unwrap_or(Ty::Unknown)
+        ret
     }
 
     /// `-a` / `!a` where `a` is a struct or enum: its `impl Neg` / `impl Not`.
     pub(super) fn unary_overload(&mut self, node: &SyntaxNode, neg: bool, adt: &str, t: &Ty) -> Ty {
         let tr = if neg { "Neg" } else { "Not" };
-        let found = self
+        // (`impl Neg for Wrapping<i32>` next to `impl Neg for Wrapping<i8>`: the operand's own.)
+        let targs = match self.shallow(t) {
+            Ty::Adt(_, a) => a,
+            _ => Vec::new(),
+        };
+        let impls: Vec<crate::adt::OpImpl> = self
             .adts
             .op_impls
             .get(adt)
-            .and_then(|v| v.iter().find(|i| i.trait_name == tr))
+            .map(|v| v.iter().filter(|i| i.trait_name == tr).cloned().collect())
+            .unwrap_or_default();
+        let found = impls
+            .iter()
+            .find(|i| {
+                self.adts.method(adt, &i.key).is_some_and(|sig| {
+                    sig.impl_args.len() == targs.len()
+                        && sig
+                            .impl_args
+                            .iter()
+                            .zip(&targs)
+                            .all(|(a, t)| matches!(a, Ty::Param(_)) || self.could_be(a, t))
+                })
+            })
+            .or_else(|| impls.first())
             .map(|i| i.key.clone());
         match found {
             Some(key) => {
                 self.record_conv(node, Conv::Method { key: key.clone() });
-                self.adts
-                    .method(adt, &key)
-                    .map(|m| m.ret.clone())
-                    .unwrap_or(Ty::Unknown)
+                let Some(sig) = self.adts.method(adt, &key).cloned() else {
+                    return Ty::Unknown;
+                };
+                // (`impl<T: Neg> Neg for Wrap<T>`: its result in the operand's type arguments.)
+                match self.shallow(t) {
+                    Ty::Adt(_, targs)
+                        if sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_))) =>
+                    {
+                        let sig = self.method_inst(&sig, Some(&targs));
+                        self.last_type_args.clear();
+                        sig.ret
+                    }
+                    _ => sig.ret,
+                }
             }
             None => {
                 let msg = format!(

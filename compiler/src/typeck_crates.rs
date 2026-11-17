@@ -82,7 +82,13 @@ const RAND_METHODS: &str = "`gen`, `gen_range`, `gen_bool`, `gen_ratio` (or thei
 impl Checker<'_> {
     /// Whether the file uses the bundled crate `name` (`use rand::Rng;`, `rand::random()`).
     pub(super) fn uses_crate(&self, name: &str) -> bool {
-        self.src.contains(&format!("{name}::")) || self.src.contains(&format!("use {name}"))
+        if let Some(&b) = self.crate_uses.borrow().get(name) {
+            return b;
+        }
+        let b =
+            self.src.contains(&format!("{name}::")) || self.src.contains(&format!("use {name}"));
+        self.crate_uses.borrow_mut().insert(name.to_string(), b);
+        b
     }
 
     fn note_crate(&mut self, node: &SyntaxNode, js: &str, tys: Vec<Ty>) {
@@ -920,6 +926,8 @@ pub(crate) const BUNDLED: &[&str] = &[
     "rustc_hash",
     "smallvec",
     "indexmap",
+    "ordered_float",
+    "petgraph",
     "rayon",
     "regex",
     "log",

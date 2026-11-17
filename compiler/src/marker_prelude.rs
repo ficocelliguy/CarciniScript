@@ -1,6 +1,7 @@
 // (marker prelude)
-// `std::marker::PhantomData`, compiled in when a program names it: a value with nothing in it,
-// so `PhantomData`, `PhantomData::<T>` and `Default::default()` all make one.
+// `std::marker::PhantomData` (and `Infallible`, `alloc::Global`), compiled in when a program
+// names it: a value with nothing in it, so `PhantomData`, `PhantomData::<T>` and
+// `Default::default()` all make one.
 
 /// `std::marker::PhantomData<T>`: zero-size, every one equal to every other.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -25,3 +26,14 @@ impl std::fmt::Display for Infallible {
 }
 
 impl std::error::Error for Infallible {}
+
+/// `std::alloc::Global` / `System`: the allocator, which nothing here uses (an `A: Allocator`
+/// parameter is ignored, `Vec::new_in(Global)` is `Vec::new()`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct AllocGlobal;
+
+impl std::fmt::Debug for AllocGlobal {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Global")
+    }
+}

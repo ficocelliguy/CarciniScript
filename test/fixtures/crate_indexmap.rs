@@ -1,8 +1,9 @@
 // The bundled `indexmap`: `IndexMap` / `IndexSet` keep insertion order (so a stats table prints the
 // same way every run), with positions (`get_index`, `get_index_of`, `get_full`, `insert_full`),
 // `swap_remove` / `shift_remove` (and `remove`, which is `swap_remove`), `first` / `last` /
-// `pop`, sorting, `reverse`, `truncate`, `entry`, collecting, `indexmap! {..}` / `indexset! {..}`
-// and `{:?}`.
+// `pop`, sorting, `reverse`, `truncate`, `entry`, collecting, `indexmap! {..}` / `indexset! {..}`,
+// `{:?}`, and indexing: `map[i]` / `set[i]` by position, `map[&k]` by key, both as places
+// (`map[0] += 1`), and `get_index_mut`.
 use indexmap::{indexmap, indexset, IndexMap, IndexSet};
 
 fn main() {
@@ -64,4 +65,52 @@ fn main() {
     let empty: IndexMap<u8, u8> = indexmap! {};
     let tags = indexset! { "x", "y", "x" };
     println!("{:?} {:?} {:?} {:?}", lit, lit.get_index(2), empty, tags);
+
+    // Indexing: a number is a position, a reference a key.
+    let mut ram: IndexMap<&str, u32> = indexmap! { "home" => 32, "n00dles" => 4, "CSEC" => 8 };
+    println!("{} {} {} {}", ram[0], ram[2], ram[&"n00dles"], ram["CSEC"]);
+    ram[1] *= 4;
+    ram[&"home"] += 64;
+    ram["CSEC"] = 16;
+    let i = ram.len() - 1;
+    ram[i] -= 1;
+    println!("{:?}", ram);
+    if let Some((host, gb)) = ram.get_index_mut(0) {
+        *gb *= 2;
+        println!("{host} {gb}");
+    }
+    while let Some((_, gb)) = ram.get_index_mut(2) {
+        if *gb > 60 {
+            break;
+        }
+        *gb += 20;
+    }
+    match ram.get_index_mut(9) {
+        Some((h, _)) => println!("? {h}"),
+        None => println!("no host 9"),
+    }
+    println!("{:?}", ram);
+    let mut ids: IndexMap<u32, String> = IndexMap::new();
+    ids.insert(7, "seven".to_string());
+    ids.insert(3, "three".to_string());
+    // (A number indexes by position even when the keys are numbers; `&k` by key.)
+    println!("{} {}", ids[0], ids[&3]);
+    ids[1].push_str("!");
+    ids[&7] += "?";
+    if let Some((k, v)) = ids.get_index_mut(1) {
+        v.insert(0, '>');
+        println!("{k} {v}");
+    }
+    println!("{:?}", ids);
+    let mut jobs: IndexMap<&str, Vec<u32>> = IndexMap::new();
+    jobs.insert("hack", vec![1]);
+    jobs.insert("grow", vec![]);
+    jobs[1].push(5);
+    jobs[&"hack"].push(2);
+    if let Some((_, v)) = jobs.get_index_mut(0) {
+        v.retain(|&x| x > 1);
+    }
+    println!("{:?} {}", jobs, jobs[0].len());
+    let order: IndexSet<&str> = ["weaken", "grow", "hack"].into_iter().collect();
+    println!("{} {} {:?}", order[0], order[2], (0..order.len()).map(|i| order[i].len()).collect::<Vec<_>>());
 }

@@ -212,6 +212,12 @@ pub struct Adts {
     pub modules: std::collections::HashSet<String>,
     /// `impl From<X> for Y` blocks, by `Y`.
     pub from_impls: HashMap<String, Vec<FromImpl>>,
+    /// A generic trait implemented more than once for a type (`impl IntoS<u8> for Vec<u8>` and
+    /// `impl IntoS<u16> for Vec<u8>`): each method's keys by `"Type::method"`, the first impl's
+    /// under its own name, the others' as `method$1`, ..
+    pub method_alts: HashMap<String, Vec<String>>,
+    /// Those keys by the absolute offset of the method's name.
+    pub alt_keys_at: HashMap<usize, String>,
     /// `impl Add<R> for T` and the other `std::ops` traits, by `T`.
     pub op_impls: HashMap<String, Vec<OpImpl>>,
     /// Associated constants (`impl Grid { const W: usize = 3; }`), by type then name.
@@ -226,6 +232,9 @@ pub struct Adts {
     pub iter_items: HashMap<String, Ty>,
     /// Types with `impl IntoIterator` (iterated through their `into_iter()`, not `next()`).
     pub into_iters: std::collections::HashSet<String>,
+    /// `impl Future for T { type Output = X; .. }`: `X`, by `T`. Such a value is awaited (and
+    /// passed as an `F: Future`) by polling it (`κσ.$drive`).
+    pub future_outputs: HashMap<String, Ty>,
 }
 
 /// Methods every struct or enum has (derived or from the runtime), which a custom iterator's
@@ -320,11 +329,39 @@ pub fn impl_self_name(imp: &ast::Impl) -> Option<String> {
         t = r.ty()?;
     }
     match t {
+        // `impl Tr for Box<str>` (or `Rc<[u8]>`, `Arc<String>`): a box is its contents in JS, so
+        // the impl is the built-in type's.
+        ast::Type::PathType(p)
+            if p.path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| matches!(n.text().to_string().as_str(), "Box" | "Rc" | "Arc"))
+                && boxed_builtin(&p).is_some() =>
+        {
+            boxed_builtin(&p)
+        }
         ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
         // `impl<const N: usize> Tr for [u8; N]`: arrays and slices are `Vec`s in JS.
         ast::Type::ArrayType(_) | ast::Type::SliceType(_) => Some("Vec".into()),
         _ => None,
     }
+}
+
+/// The built-in type in `Box<str>` / `Rc<[T]>` / `Arc<String>`: its extension key's name.
+fn boxed_builtin(p: &ast::PathType) -> Option<String> {
+    let seg = p.path()?.segment()?;
+    let ast::GenericArg::TypeArg(a) = ast::HasGenericArgs::generic_arg_list(&seg)?
+        .generic_args()
+        .next()?
+    else {
+        return None;
+    };
+    let name = match a.ty()? {
+        ast::Type::ArrayType(_) | ast::Type::SliceType(_) => "Vec".to_string(),
+        ast::Type::PathType(inner) => inner.path()?.segment()?.name_ref()?.text().to_string(),
+        _ => return None,
+    };
+    ext_key(&name).map(|_| name)
 }
 
 /// One `impl Add<R> for T` (or `Sub`, `Neg`, `AddAssign`, ..): its method is `key` (`add$0`).
@@ -423,6 +460,9 @@ impl Adts {
         }
         if name == "fmt" && self.debug_fmt.get(ty) == Some(&at) {
             return "fmt$dbg".into();
+        }
+        if let Some(k) = self.alt_keys_at.get(&at) {
+            return k.clone();
         }
         name.to_string()
     }
@@ -540,7 +580,19 @@ pub fn impl_parts(imp: &ast::Impl) -> (Option<String>, Option<String>) {
         ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
         _ => None,
     };
-    (name_of(imp.trait_()), name_of(imp.self_ty()))
+    // (`Box<str>`: the built-in type, see `impl_self_name`.)
+    let self_name = match imp.self_ty() {
+        Some(ast::Type::PathType(p))
+            if p.path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| matches!(n.text().to_string().as_str(), "Box" | "Rc" | "Arc")) =>
+        {
+            boxed_builtin(&p).or_else(|| name_of(Some(ast::Type::PathType(p))))
+        }
+        t => name_of(t),
+    };
+    (name_of(imp.trait_()), self_name)
 }
 
 /// `impl<T: Bound> Trait for T`: (the trait, `T`, `T`'s bounds from the parameter list and the
@@ -899,6 +951,50 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
                 _ => true,
             })
             .cloned()
+            .collect();
+        // `impl Tr for String` next to `impl Tr for str` (or `Vec<T>` next to `[T]`): one type in
+        // JS, so the borrowed type's impl serves and the owned one (which usually hands on to it,
+        // `self.as_str().f()`) goes.
+        let twin = |imp: &ast::Impl| -> Option<(String, bool)> {
+            let tr = imp.trait_()?.syntax().text().to_string();
+            let mut t = imp.self_ty()?;
+            while let ast::Type::RefType(r) = t {
+                t = r.ty()?;
+            }
+            let owned = match &t {
+                ast::Type::PathType(p) => {
+                    let n = p.path()?.segment()?.name_ref()?.text().to_string();
+                    match n.as_str() {
+                        "String" | "Vec" => true,
+                        "str" => false,
+                        _ => return None,
+                    }
+                }
+                ast::Type::SliceType(_) | ast::Type::ArrayType(_) => false,
+                _ => return None,
+            };
+            let kind = match &t {
+                ast::Type::PathType(p) if p.syntax().text().to_string().starts_with("Vec") => "seq",
+                ast::Type::SliceType(_) | ast::Type::ArrayType(_) => "seq",
+                _ => "str",
+            };
+            Some((format!("{tr}:{kind}"), owned))
+        };
+        let borrowed: Vec<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                ast::Item::Impl(imp) => twin(imp).filter(|(_, owned)| !owned).map(|(k, _)| k),
+                _ => None,
+            })
+            .collect();
+        let items: Vec<ast::Item> = items
+            .into_iter()
+            .filter(|i| match i {
+                ast::Item::Impl(imp) => {
+                    !twin(imp).is_some_and(|(k, owned)| owned && borrowed.contains(&k))
+                }
+                _ => true,
+            })
             .collect();
         *last.borrow_mut() = Some((file.syntax().clone(), items.clone()));
         items

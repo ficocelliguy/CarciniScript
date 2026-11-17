@@ -77,7 +77,7 @@ fn find<'a>(table: &'a [Alias], name: &str, n: &SyntaxNode) -> Option<&'a Alias>
 }
 
 pub fn has_aliases(text: &str) -> bool {
-    text.contains("type ") && !aliases(&SourceFile::parse(text, EDITION).tree()).is_empty()
+    text.contains("type ") && !aliases(&crate::macros::parse_tree(text)).is_empty()
 }
 
 /// The alias's type with `args` (source text) for its parameters.
@@ -169,7 +169,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) {
     // Each round replaces the uses outside the aliases; one alias's body may name another, so
     // repeat until nothing changes, then drop the alias items.
     for round in 0..16 {
-        let file = SourceFile::parse(text, EDITION).tree();
+        let file = crate::macros::parse_tree(text);
         let table = aliases(&file);
         if table.is_empty() {
             return;
@@ -266,7 +266,7 @@ pub fn has_use_renames(text: &str) -> bool {
 /// stands for, `std::collections::HashMap`, which the compiler knows. (Renames of the file's own
 /// items and of crates are resolved elsewhere.) Whether anything changed.
 pub fn expand_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let mut renames: std::collections::HashMap<String, String> = Default::default();
     let mut uses = Vec::new();
     for u in file.syntax().descendants().filter_map(ast::Use::cast) {

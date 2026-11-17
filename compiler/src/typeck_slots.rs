@@ -88,7 +88,21 @@ impl Checker<'_> {
                     // A collected `Vec<&mut T>`.
                     "iter" | "iter_mut" | "into_iter" => self.vec_slot_shape(&recv),
                     "skip" | "take" | "rev" | "step_by" | "peekable" | "by_ref" | "fuse"
-                    | "cycle" => self.iter_slot_shape(&recv),
+                    | "cycle" | "filter" | "skip_while" | "take_while" | "inspect" => {
+                        self.iter_slot_shape(&recv)
+                    }
+                    // `rows.iter_mut().flat_map(|row| row.iter_mut())`: the closure's slots.
+                    "flat_map" => {
+                        let arg = m.arg_list()?.args().next()?;
+                        let ast::Expr::ClosureExpr(c) = strip_parens(&arg) else {
+                            return None;
+                        };
+                        let mut body = c.body()?;
+                        while let ast::Expr::BlockExpr(b) = &body {
+                            body = b.tail_expr()?;
+                        }
+                        self.iter_slot_shape(&body)
+                    }
                     "enumerate" => Some(SlotShape::Tuple(vec![
                         None,
                         Some(self.iter_slot_shape(&recv)?),
@@ -137,11 +151,17 @@ impl Checker<'_> {
 
     /// The shape of what an `Option` of an item holds: `it.next()`, `.nth(n)`, `.last()`, ..
     pub(super) fn option_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
+        // A local that holds one (`let big = it.find(..);`).
+        if let ast::Expr::PathExpr(p) = strip_parens(e) {
+            let n = p.path()?.as_single_name_ref()?.text().to_string();
+            return self.slot_options.get(&n).cloned();
+        }
         let ast::Expr::MethodCallExpr(m) = strip_parens(e) else {
             return None;
         };
         match m.name_ref()?.text().to_string().as_str() {
-            "next" | "next_back" | "nth" | "nth_back" | "last" => {
+            "next" | "next_back" | "nth" | "nth_back" | "last" | "find" | "max" | "min"
+            | "max_by_key" | "min_by_key" | "max_by" | "min_by" => {
                 self.iter_slot_shape(&m.receiver()?)
             }
             _ => None,
@@ -164,7 +184,12 @@ impl Checker<'_> {
     pub(super) fn note_slot_let(&mut self, name: &ast::Name, init: Option<&ast::Expr>) {
         let n = name.text().to_string();
         self.slot_locals.remove(&n);
+        self.slot_options.remove(&n);
         let Some(init) = init else { return };
+        if let Some(s) = self.option_slot_shape(init) {
+            self.slot_options.insert(n, s);
+            return;
+        }
         if self.value_slot_shape(init) == Some(SlotShape::Slot) {
             let r = self.range(name.syntax());
             self.slot_bindings.insert(r);

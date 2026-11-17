@@ -19,8 +19,6 @@ use ra_ap_syntax::{
     ast::{self, HasName},
 };
 
-use crate::macros::EDITION;
-
 /// A span of the expanded text and where it came from.
 #[derive(Clone, Debug)]
 struct Seg {
@@ -49,17 +47,19 @@ impl OffsetMap {
 
     /// The original offset of `off`; `end` picks the end of an expansion's invocation.
     pub fn orig(&self, off: usize, end: bool) -> usize {
-        for s in &self.segs {
-            if off < s.cur.1 || (off == s.cur.1 && s.cur.0 == s.cur.1) {
-                if off < s.cur.0 {
-                    continue;
-                }
-                return if s.synthetic {
-                    if end { s.orig.1 } else { s.orig.0 }
-                } else {
-                    s.orig.0 + (off - s.cur.0)
-                };
-            }
+        // (The segments are sorted by `cur` and don't overlap: the first one that reaches past
+        // `off`, or is empty at it, holds it unless it starts later.)
+        let i = self
+            .segs
+            .partition_point(|s| !(off < s.cur.1 || (off == s.cur.1 && s.cur.0 == s.cur.1)));
+        if let Some(s) = self.segs.get(i)
+            && off >= s.cur.0
+        {
+            return if s.synthetic {
+                if end { s.orig.1 } else { s.orig.0 }
+            } else {
+                s.orig.0 + (off - s.cur.0)
+            };
         }
         self.segs
             .last()
@@ -999,6 +999,12 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
                     if t.get(j).and_then(text) == Some("mut") {
                         j += 1;
                     }
+                    // (A loop is `for pat in ..`; `impl Tr for Vec<T>` and `for<'a>` bind
+                    // nothing.)
+                    if k == "for" && t.get(j + 1).and_then(text) != Some("in") {
+                        i += 1;
+                        continue;
+                    }
                     match t.get(j) {
                         // (Not a pattern's constructor: `if let Some(x) = ..`, `let Point { .. }`.)
                         Some(Tpl::Tok(name, _))
@@ -1238,8 +1244,21 @@ fn bundled_macros(src: &str) -> String {
     if src.contains("tokio::") || src.contains("use tokio") {
         out.push_str(&own_macros_left_out(TOKIO_MACROS, src));
     }
+    // `std::pin::pin!(fut)` / `futures::pin_mut!(fut)`: pinning is nothing in JS.
+    if src.contains("pin!") || src.contains("pin_mut!") {
+        out.push_str(&own_macros_left_out(PIN_MACROS, src));
+    }
     out
 }
+
+const PIN_MACROS: &str = r#"
+macro_rules! pin {
+    ($e:expr $(,)?) => { $e };
+}
+macro_rules! pin_mut {
+    ($($x:ident),* $(,)?) => {};
+}
+"#;
 
 /// `macros` without the ones `src` defines itself (`macro_rules! debug { .. }` of its own).
 fn own_macros_left_out(macros: &str, src: &str) -> String {
@@ -1336,6 +1355,10 @@ struct Site {
 /// Whether a macro path names another crate's macro (`std::assert!`, `$crate::__priv::mem::
 /// offset_of!` in a macro that is itself `offset_of!`), not one of the file's.
 fn foreign_path(segs: &[String]) -> bool {
+    // (`std::pin::pin!` is the bundled `pin!`.)
+    if segs.ends_with(&["pin".to_string(), "pin".to_string()]) {
+        return false;
+    }
     segs.split_last().is_some_and(|(_, quals)| {
         quals
             .iter()
@@ -1578,7 +1601,7 @@ fn expand_with(
     let mut rounds = 0;
     let mut changed = false;
     loop {
-        let file = SourceFile::parse(&text, EDITION).tree();
+        let file = crate::macros::parse_tree(&text);
         // Every definition of each name, in source order (`#[cfg]`-gated alternatives, or a
         // macro defined again further down).
         let mut all: HashMap<String, Vec<ast::MacroRules>> = HashMap::new();
@@ -1625,6 +1648,8 @@ fn expand_with(
         rounds += 1;
         // Expand them all against this text, then splice from the last so offsets stay valid.
         let mut edits: Vec<((usize, usize), String)> = Vec::new();
+        // (Each definition's rules once per round, by where it starts.)
+        let mut rule_sets: HashMap<usize, std::rc::Rc<Vec<Rule>>> = HashMap::new();
         for site in &sites {
             let (a, b) = site.range;
             let err = |msg: String| vec![(map.orig(a, false), map.orig(b, true), msg)];
@@ -1634,12 +1659,22 @@ fn expand_with(
                 ));
             }
             let name = site.name.clone();
-            let rules = rules_of(&pick_def(&all[&name], a))
-                .map_err(|m| err(format!("in `macro_rules! {name}`: {m}")))?;
+            let def = pick_def(&all[&name], a);
+            let rules = match rule_sets.get(&usize::from(def.syntax().text_range().start())) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = std::rc::Rc::new(
+                        rules_of(&def)
+                            .map_err(|m| err(format!("in `macro_rules! {name}`: {m}")))?,
+                    );
+                    rule_sets.insert(usize::from(def.syntax().text_range().start()), r.clone());
+                    r
+                }
+            };
             let (_, _, toks) = token_tree(&site.tt);
             let m = Matcher { src: &text };
             let mut out = None;
-            for rule in &rules {
+            for rule in rules.iter() {
                 let mut bind = Bindings::new();
                 if m.seq(&rule.matcher, &toks, 0, &[], &mut bind) == Some(toks.len()) {
                     let mut s = String::new();
@@ -1850,10 +1885,13 @@ pub fn preprocess_with(
 pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resolver) -> String {
     use ra_ap_syntax::ast::{HasAttrs, HasModuleItem};
     let mut out = bundled_macros(src);
+    // The macros in scope where the file's `mod` item is (Rust's textual scoping), and the
+    // crate's `#[macro_export]` ones.
+    out.push_str(&inherited_macros(filename, resolver, 0));
     if !src.contains("mod ") {
         return out;
     }
-    let file = SourceFile::parse(src, EDITION).tree();
+    let file = crate::macros::parse_tree(src);
     for item in file.items() {
         let ast::Item::Module(m) = item else { continue };
         if m.item_list().is_some() {
@@ -1882,7 +1920,7 @@ pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resol
         if !text.contains("macro_rules!") {
             continue;
         }
-        let module = SourceFile::parse(&text, EDITION).tree();
+        let module = crate::macros::parse_tree(&text);
         for d in module.items().filter_map(|i| match i {
             ast::Item::MacroRules(d) => Some(d),
             _ => None,
@@ -1894,6 +1932,137 @@ pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resol
                 out.push_str(&d.syntax().text().to_string());
                 out.push('\n');
             }
+        }
+    }
+    out
+}
+
+/// The file that declares module file `filename` with `mod name;` (`main.rs`, `lib.rs` or
+/// `mod.rs` next to it, or `dir.rs` for `dir/name.rs`), with its text and the module's name.
+fn declaring_file(
+    filename: &str,
+    resolver: crate::typeck::Resolver,
+) -> Option<(String, String, String)> {
+    let (dir, base) = match filename.rfind('/') {
+        Some(i) => (&filename[..i], &filename[i + 1..]),
+        None => ("", filename),
+    };
+    let stem = base.strip_suffix(".rs")?;
+    if matches!(stem, "main" | "lib") {
+        return None;
+    }
+    // (`dir/mod.rs` is the module `dir`, declared next to `dir`.)
+    let (name, search) = if stem == "mod" {
+        let (up, last) = match dir.rfind('/') {
+            Some(i) => (&dir[..i], &dir[i + 1..]),
+            None => ("", dir),
+        };
+        (last.to_string(), up.to_string())
+    } else {
+        (stem.to_string(), dir.to_string())
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let join = |d: &str, f: &str| {
+        if d.is_empty() {
+            f.to_string()
+        } else {
+            format!("{d}/{f}")
+        }
+    };
+    let mut candidates = vec![
+        join(&search, "main.rs"),
+        join(&search, "lib.rs"),
+        join(&search, "mod.rs"),
+    ];
+    if !search.is_empty() {
+        let (up, last) = match search.rfind('/') {
+            Some(i) => (&search[..i], &search[i + 1..]),
+            None => ("", search.as_str()),
+        };
+        candidates.push(join(up, &format!("{last}.rs")));
+    }
+    let decl = format!("mod {name};");
+    candidates.into_iter().find_map(|p| {
+        let text = resolver(&p)?;
+        text.contains(&decl).then(|| (p, text, name.clone()))
+    })
+}
+
+/// The `macro_rules!` a module file inherits from where it's declared: the declaring file's
+/// macros above its `mod name;` and those of the `#[macro_use] mod` files above it (and so on up
+/// to the crate root), plus every `#[macro_export]` macro of the files the root loads.
+fn inherited_macros(filename: &str, resolver: crate::typeck::Resolver, depth: usize) -> String {
+    use ra_ap_syntax::ast::{HasAttrs, HasModuleItem};
+    if depth > 16 {
+        return String::new();
+    }
+    let Some((parent, text, name)) = declaring_file(filename, resolver) else {
+        return String::new();
+    };
+    if !text.contains("macro_rules!") && !text.contains("macro_use") && depth > 0 {
+        return inherited_macros(&parent, resolver, depth + 1);
+    }
+    let mut out = inherited_macros(&parent, resolver, depth + 1);
+    let file = crate::macros::parse_tree(&text);
+    let module_text = |n: &str| {
+        let stem = parent
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".rs"))
+            .filter(|s| !matches!(*s, "mod" | "main" | "lib"));
+        let mut candidates = vec![
+            crate::typeck::module_path(&parent, n),
+            crate::typeck::module_path(&parent, &format!("{n}/mod")),
+        ];
+        if let Some(st) = stem {
+            candidates.push(crate::typeck::module_path(&parent, &format!("{st}/{n}")));
+        }
+        candidates.iter().find_map(|p| resolver(p))
+    };
+    let mut before = true;
+    for item in file.items() {
+        match &item {
+            ast::Item::Module(m) if m.item_list().is_none() => {
+                let Some(n) = m.name().map(|n| n.text().to_string()) else {
+                    continue;
+                };
+                if n == name {
+                    before = false;
+                    continue;
+                }
+                let macro_use = m
+                    .attrs()
+                    .any(|a| a.syntax().text().to_string().contains("macro_use"));
+                let Some(mt) = module_text(&n).filter(|t| t.contains("macro_rules!")) else {
+                    continue;
+                };
+                let module = crate::macros::parse_tree(&mt);
+                for d in module.items().filter_map(|i| match i {
+                    ast::Item::MacroRules(d) => Some(d),
+                    _ => None,
+                }) {
+                    let exported = d
+                        .attrs()
+                        .any(|a| a.syntax().text().to_string().contains("macro_export"));
+                    if (macro_use && before) || exported {
+                        out.push_str(&d.syntax().text().to_string());
+                        out.push('\n');
+                    }
+                }
+            }
+            // The declaring file's own macros: those above the `mod`, and exported ones.
+            ast::Item::MacroRules(d) => {
+                let exported = d
+                    .attrs()
+                    .any(|a| a.syntax().text().to_string().contains("macro_export"));
+                if before || exported {
+                    out.push_str(&d.syntax().text().to_string());
+                    out.push('\n');
+                }
+            }
+            _ => {}
         }
     }
     out

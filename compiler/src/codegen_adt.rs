@@ -41,7 +41,7 @@ fn access(v: &Variant, i: usize) -> String {
 }
 
 /// The segment names of a path (`Shape::Circle` → `["Shape", "Circle"]`).
-fn path_segments(path: Option<ast::Path>) -> Vec<String> {
+pub(super) fn path_segments(path: Option<ast::Path>) -> Vec<String> {
     path.map(|p| {
         p.segments()
             .filter_map(|s| s.name_ref())
@@ -72,6 +72,24 @@ fn dbg_of(ty: &Ty, e: &str, params: &HashMap<String, String>) -> String {
         Some(f) => format!("{f}({e})"),
         None => format!("String({e})"),
     }
+}
+
+/// The `self` type of an extension class's methods (`String` for `$ext$String`).
+pub(super) fn ext_self_ty(key: &str) -> Ty {
+    match key {
+        "String" => Ty::Str,
+        "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+        "Option" => Ty::Option(Box::new(Ty::Unknown)),
+        "bool" => Ty::Bool,
+        "char" => Ty::Char,
+        k => Ty::from_name(k),
+    }
+}
+
+/// A `&mut self` method of a trait implemented for a string, number, bool, char or `Option`: JS
+/// can't change those through `this`, so `this` is a cell (`this[0]` is `self`).
+pub(super) fn cell_self(sig: &crate::adt::Method, self_ty: &Ty) -> bool {
+    sig.receiver == Some(crate::adt::Receiver::MutRef) && crate::typeck::ptr_cellable(self_ty)
 }
 
 impl Codegen<'_> {
@@ -161,6 +179,26 @@ impl Codegen<'_> {
             self.line(Frag::text("constructor($tag) {"));
             self.line(Frag::text("  this.$tag = $tag;"));
             self.line(Frag::text("}"));
+            // Const parameters (`enum Buf<const N: usize>`) are kept as `$N`, passed after the
+            // fields (`$with` gives a unit variant's).
+            let carried = self.carried_names(&def.name);
+            let set_carried: Vec<String> = carried
+                .iter()
+                .enumerate()
+                .map(|(k, n)| format!("  $v.${n} = $c{k};"))
+                .collect();
+            let cs: Vec<String> = (0..carried.len()).map(|k| format!("$c{k}")).collect();
+            if !carried.is_empty() {
+                self.line(Frag::text(format!(
+                    "static $with($v, {}) {{",
+                    cs.join(", ")
+                )));
+                for l in &set_carried {
+                    self.line(Frag::text(l.clone()));
+                }
+                self.line(Frag::text("  return $v;"));
+                self.line(Frag::text("}"));
+            }
             for (i, v) in def.variants.iter().enumerate() {
                 if v.shape == Shape::Unit {
                     // A fresh instance each time: `*self = ..` replaces contents in place.
@@ -173,11 +211,19 @@ impl Codegen<'_> {
                 self.line(Frag::text(format!(
                     "static {}({}) {{",
                     v.name,
-                    params.join(", ")
+                    params
+                        .iter()
+                        .chain(&cs)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )));
                 self.line(Frag::text(format!("  const $v = new {cls}({i});")));
                 for (k, p) in params.iter().enumerate() {
                     self.line(Frag::text(format!("  $v{} = {p};", access(v, k))));
+                }
+                for l in &set_carried {
+                    self.line(Frag::text(l.clone()));
                 }
                 self.line(Frag::text("  return $v;"));
                 self.line(Frag::text("}"));
@@ -317,17 +363,23 @@ impl Codegen<'_> {
             .and_then(|k| self.types.dict_params.get(&k).cloned())
             .unwrap_or_default();
         let saved_tmp = self.tmp;
-        let saved_names = self.used_names.clone();
+        let saved_names = self.name_log.len();
         self.tmp = 0;
         self.ret_ty = sig.ret.clone();
         self.in_async = sig.is_async;
         self.scopes.push(HashMap::new());
         if sig.receiver.is_some() {
+            // (A `&mut self` method on a string or number: `this` is a cell.)
+            let js = if cell_self(&sig, &self_ty) {
+                "this[0]"
+            } else {
+                "this"
+            };
             self.declare(
                 "self",
                 None,
                 Local {
-                    js: "this".into(),
+                    js: js.into(),
                     ty: self_ty.clone(),
                 },
             );
@@ -562,7 +614,7 @@ impl Codegen<'_> {
         super::set_const_scope(Some(saved_consts));
         super::set_dbg_scope(saved_dbgs);
         self.tmp = saved_tmp;
-        self.used_names = saved_names;
+        self.undo_names(saved_names);
     }
 
     /// Whether a method taking `self` by value drops it at its end: its type has a value to drop.
@@ -631,6 +683,32 @@ impl Codegen<'_> {
                 .into_iter()
                 .flat_map(|l| l.assoc_items())
             {
+                // A generic trait's second impl for this type: its methods under their keys.
+                if let ast::AssocItem::Fn(f) = &item
+                    && let Some(n) = f.name()
+                    && let Some(k) = self
+                        .types
+                        .adts
+                        .alt_keys_at
+                        .get(&self.off(n.syntax()))
+                        .cloned()
+                    && let Some(sig) = self.types.adts.method(key, &k).cloned()
+                {
+                    self.emit_method_fn(f, sig, self_ty.clone(), "}", Some(k));
+                    continue;
+                }
+                // `impl Mul<V> for f64`'s `mul`, as its `mul$N`.
+                if let ast::AssocItem::Fn(f) = &item
+                    && let Some(n) = f.name()
+                    && let Some(oi) = self.types.adts.op_impls.get(key).and_then(|v| {
+                        let at = self.off(n.syntax());
+                        v.iter().find(|i| i.at == at).cloned()
+                    })
+                    && let Some(sig) = self.types.adts.method(key, &oi.key).cloned()
+                {
+                    self.emit_method_fn(f, sig, self_ty.clone(), "}", Some(oi.key.clone()));
+                    continue;
+                }
                 // `impl From<Id> for String`'s `from`, as its `from$N`.
                 if let ast::AssocItem::Fn(f) = &item
                     && let Some(n) = f.name()
@@ -683,6 +761,28 @@ impl Codegen<'_> {
         }
         self.out.indent -= 1;
         self.line(Frag::text("}"));
+        // The `&mut self` methods, which `κσ.$dcallMut` calls with the receiver's cell.
+        let muts: Vec<String> = self
+            .types
+            .adts
+            .methods
+            .get(key)
+            .map(|ms| {
+                let mut v: Vec<String> = ms
+                    .iter()
+                    .filter(|(_, s)| cell_self(s, &self_ty))
+                    .map(|(n, _)| super::js_string(&prop(n)))
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        if !muts.is_empty() {
+            self.line(Frag::text(format!(
+                "$ext${key}.$mut = new Set([{}]);",
+                muts.join(", ")
+            )));
+        }
         // A blanket impl's class: `κσ.$dcall` tries it for any value.
         if key.ends_with("$all") {
             self.line(Frag::text(format!("κσ.$blanketReg($extRegs, $ext${key});")));
@@ -888,6 +988,17 @@ impl Codegen<'_> {
                 )],
             );
         }
+        // `impl Future`: awaiting it (JS's `await` takes any thenable) polls it until it's ready,
+        // with a context whose waker resumes the polling (the task prelude's).
+        if self.types.adts.future_outputs.contains_key(&def.name) {
+            lines(
+                self,
+                vec![format!(
+                    "then(ok, err) {{ return κσ.$drive(this, \"{}\", __task_context).then(ok, err); }}",
+                    prop("poll")
+                )],
+            );
+        }
         // A hand-written `Hash` with a hand-written `PartialEq`: `HashMap` / `HashSet` keys are
         // what `hash` writes (`JSON.stringify` uses `toJSON`), so values `eq` calls equal (by
         // the same fields) are one key.
@@ -997,6 +1108,12 @@ impl Codegen<'_> {
                             if v.shape == Shape::Unit {
                                 "return this;".to_string()
                             } else {
+                                let mut fields = fields;
+                                fields.extend(
+                                    self.carried_names(&def.name)
+                                        .iter()
+                                        .map(|n| format!("this.${n}")),
+                                );
                                 format!("return {cls}.{}({});", v.name, fields.join(", "))
                             }
                         } else {
@@ -1111,7 +1228,20 @@ impl Codegen<'_> {
         }
         if def.derives("Default") {
             let body = if def.is_enum {
+                let carried: Vec<String> = self
+                    .carried_names(&def.name)
+                    .iter()
+                    .map(|c| {
+                        let i = def.type_params.iter().position(|p| p == c).unwrap_or(0);
+                        format!("this?.$cargs?.[{i}]")
+                    })
+                    .collect();
                 match def.default_variant {
+                    Some(i) if !carried.is_empty() => format!(
+                        "return {cls}.$with({cls}.{}, {});",
+                        def.variants[i].name,
+                        carried.join(", ")
+                    ),
                     Some(i) => format!("return {cls}.{};", def.variants[i].name),
                     None => "return undefined;".into(),
                 }
@@ -1155,6 +1285,12 @@ impl Codegen<'_> {
         let variant = &def.variants[v];
         if def.is_enum {
             if variant.shape == Shape::Unit {
+                if !args.is_empty() {
+                    // (Its const parameters: `Buf.$with(Buf.Empty, 4)`.)
+                    let mut f = Frag::text(format!("{cls}.$with({cls}.{}, ", variant.name));
+                    f.append(Frag::join(args, ", ")).push(")");
+                    return f;
+                }
                 return Frag::text(format!("{cls}.{}", variant.name));
             }
             let mut f = Frag::text(format!("{cls}.{}(", variant.name));
@@ -1449,9 +1585,37 @@ impl Codegen<'_> {
         method: &str,
     ) -> Option<(Frag, Ty)> {
         let name_off = m.name_ref().map(|n| self.off(n.syntax())).unwrap_or(0);
+        // (One of several impls of a generic trait: its key.)
+        let picked = self
+            .types
+            .method_keys
+            .get(&self.range_of(m.syntax()))
+            .cloned();
+        let method = picked.as_deref().unwrap_or(method);
         if let Some(sig) = self.types.adts.method(adt, method).cloned()
             && sig.receiver.is_some()
         {
+            // `c.bump(&mut self.n)` with a method that can't keep the borrow: the place goes in
+            // a write-back temp (`write_back_call`; the receiver is evaluated inside, so it
+            // must be pure).
+            if self
+                .wb_methods
+                .contains(&(adt.to_string(), method.to_string()))
+                && m.receiver().is_some_and(|r| is_pure(&strip_refs(&r)))
+                && let Some(places) = self.write_back_places(m.arg_list())
+            {
+                let mut callee = rf.clone();
+                callee
+                    .push(".")
+                    .append(Frag::mapped(name_off, prop(method)));
+                let f = self.write_back_call(m.syntax(), m.arg_list(), callee, &sig.params, places);
+                let ret = if sig.is_async {
+                    Ty::Future(Box::new(sig.ret))
+                } else {
+                    sig.ret
+                };
+                return Some((f, ret));
+            }
             let mut args = self.emit_args(m.arg_list(), &sig.params);
             // The classes for the method's `T::make()` calls.
             if let Some(tys) = self
@@ -1489,6 +1653,11 @@ impl Codegen<'_> {
             f
         };
         let t = Ty::Adt(adt.to_string(), vec![]);
+        // (`Pin` is erased: `pinned.as_mut()` is the future itself.)
+        if crate::typeck::pin_identity(method) && self.types.adts.future_outputs.contains_key(adt) {
+            let t = self.ty_of(m.syntax()).unwrap_or(t);
+            return Some((rf.clone(), t));
+        }
         Some(match method {
             // Without `#[derive(Clone)]` the value must be an `Rc` (erased): clones share it.
             "clone" if self.adt(adt).is_some_and(|d| !d.derives("Clone")) => (rf.clone(), t),

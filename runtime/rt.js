@@ -194,9 +194,41 @@
   }
 
   // Map key for a HashSet element: primitives as themselves, composite values (tuples, Vecs)
-  // structurally. A set holds one element type, so the two kinds never mix.
+  // structurally: the text `JSON.stringify(x, bigKey)` gives. A set holds one element type, so
+  // the two kinds never mix. Arrays of primitives (tuple keys) are written by hand, which is
+  // many times faster than `JSON.stringify` with a replacer, and gives the same text.
   function key(x) {
-    return typeof x === "object" && x !== null ? JSON.stringify(x, bigKey) : x;
+    if (typeof x !== "object" || x === null) return x;
+    return Array.isArray(x) ? arrayKey(x) : JSON.stringify(x, bigKey);
+  }
+  function arrayKey(a) {
+    let s = "[";
+    for (let i = 0; i < a.length; i++) {
+      const v = a[i];
+      if (i !== 0) s += ",";
+      switch (typeof v) {
+        case "number":
+          // (JSON writes NaN and the infinities as `null`; `-0` as `0`, like `String`.)
+          s += v - v === 0 ? v : "null";
+          break;
+        case "string":
+          s += JSON.stringify(v);
+          break;
+        case "boolean":
+          s += v;
+          break;
+        case "bigint":
+          s += `"${v}n"`;
+          break;
+        case "object":
+          s += v === null ? "null" : Array.isArray(v) ? arrayKey(v) : JSON.stringify(v, bigKey);
+          break;
+        default:
+          // (`undefined` — `()` — is `null` in a JSON array.)
+          s += "null";
+      }
+    }
+    return s + "]";
   }
   // (`JSON.stringify` can't write a BigInt; a key only needs to be distinct.)
   function bigKey(_, v) {
@@ -267,6 +299,300 @@
       this.f.s += s;
       return new Res(0, undefined);
     }
+  }
+
+  // Rust's VecDeque<T>: a ring buffer. `b` is the backing array, `h` the head's position in it and
+  // `n` the length; element `i` is at `b[(h + i) % b.length]`, so `pop_front` and `push_front`
+  // are O(1). The compiler indexes a deque through `$i` (checked) / `$p`; everything a `Vec`
+  // shares with it (its view type) reaches the deque as the Array methods a `Vec` would get, so
+  // those are here too, running on `$arr()`: the contents made contiguous (head at 0, `b` trimmed
+  // to the length), which IS `b`, so in-place changes through it stay in the deque.
+  class Deque {
+    constructor() {
+      this.b = [];
+      this.h = 0;
+      this.n = 0;
+    }
+    static from(items) {
+      const d = new Deque();
+      d.b = Array.from(items);
+      d.n = d.b.length;
+      return d;
+    }
+    get length() {
+      return this.n;
+    }
+    // (`length = m`: `truncate` / `clear` from the back; growing isn't reached from Rust.)
+    set length(m) {
+      if (m < this.n) {
+        if (m === 0) {
+          this.b.length = 0;
+          this.h = 0;
+        } else {
+          for (let i = m; i < this.n; i++) this.b[this.$p(i)] = undefined;
+        }
+        this.n = m;
+      } else if (m > this.n) {
+        this.$arr().length = m;
+        this.n = m;
+      }
+    }
+    // The backing index of element `i` (in range).
+    $p(i) {
+      const j = this.h + i;
+      return j < this.b.length ? j : j - this.b.length;
+    }
+    // `$p` with a Vec's bounds check and panic (`loc`: the `[`).
+    $i(i, loc) {
+      if (i >= 0 && i < this.n) {
+        const j = this.h + i;
+        return j < this.b.length ? j : j - this.b.length;
+      }
+      return rt.$oob(this, i, loc);
+    }
+    $at(i) {
+      return this.b[this.$p(i)];
+    }
+    $arr() {
+      if (this.h !== 0) {
+        const a = [];
+        for (let i = 0; i < this.n; i++) a.push(this.$at(i));
+        this.b = a;
+        this.h = 0;
+      } else if (this.b.length !== this.n) {
+        this.b.length = this.n;
+      }
+      return this.b;
+    }
+    // After a helper changed the length of `$arr()`.
+    $sync() {
+      this.n = this.b.length;
+    }
+    // Contiguous, with room for as many again (a full ring whose head isn't at 0).
+    $grow() {
+      const a = [];
+      for (let i = 0; i < this.n; i++) a.push(this.$at(i));
+      for (let i = Math.max(8, 2 * this.n); i > this.n; i--) a.push(undefined);
+      this.b = a;
+      this.h = 0;
+    }
+    push(x) {
+      const b = this.b;
+      if (this.n === b.length) {
+        if (this.h !== 0) {
+          this.$grow();
+          this.b[this.n] = x;
+        } else {
+          b.push(x);
+        }
+      } else {
+        let j = this.h + this.n;
+        if (j >= b.length) j -= b.length;
+        b[j] = x;
+      }
+      this.n++;
+    }
+    pop() {
+      if (this.n === 0) return undefined;
+      const j = this.$p(--this.n);
+      const x = this.b[j];
+      this.b[j] = undefined;
+      if (this.n === 0) this.h = 0;
+      return x;
+    }
+    shift() {
+      if (this.n === 0) return undefined;
+      const b = this.b;
+      const x = b[this.h];
+      b[this.h] = undefined;
+      this.h = this.h + 1 === b.length ? 0 : this.h + 1;
+      if (--this.n === 0) this.h = 0;
+      return x;
+    }
+    unshift(x) {
+      if (this.n === this.b.length) this.$grow();
+      this.h = this.h === 0 ? this.b.length - 1 : this.h - 1;
+      this.b[this.h] = x;
+      this.n++;
+    }
+    [Symbol.iterator]() {
+      return new DequeIt(this);
+    }
+    values() {
+      return new DequeIt(this);
+    }
+    keys() {
+      return this.$arr().keys();
+    }
+    entries() {
+      return this.$arr().entries();
+    }
+    toJSON() {
+      return this.$arr();
+    }
+    toString() {
+      return this.$arr().toString();
+    }
+    // (The result of `splice` is the removed part: a `VecDeque` for `split_off`, see `$splitOff`.)
+    splice(...args) {
+      const out = this.$arr().splice(...args);
+      this.$sync();
+      return out;
+    }
+    reverse() {
+      this.$arr().reverse();
+      return this;
+    }
+    sort(f) {
+      this.$arr().sort(f);
+      return this;
+    }
+    fill(x, a, b) {
+      this.$arr().fill(x, a, b);
+      return this;
+    }
+    copyWithin(t, a, b) {
+      this.$arr().copyWithin(t, a, b);
+      return this;
+    }
+    $eq(o) {
+      if (o instanceof Deque) o = o.$arr();
+      if (!Array.isArray(o) || o.length !== this.n) return false;
+      for (let i = 0; i < this.n; i++) if (!eq(this.$at(i), o[i])) return false;
+      return true;
+    }
+    $cmp(o) {
+      return cmp(this.$arr(), o instanceof Deque ? o.$arr() : o);
+    }
+    $clone() {
+      const d = new Deque();
+      for (let i = 0; i < this.n; i++) d.b.push(clone(this.$at(i)));
+      d.n = this.n;
+      return d;
+    }
+    $dbg() {
+      return rt.$dbgAny(this.$arr());
+    }
+  }
+  // The rest of the Array surface runs on the contiguous contents.
+  for (const name of [
+    "slice", "at", "map", "filter", "some", "every", "find", "findIndex", "findLast", "findLastIndex",
+    "forEach", "reduce", "reduceRight", "includes", "indexOf", "lastIndexOf", "join", "concat", "flat",
+    "flatMap", "toSorted", "toReversed", "with",
+  ]) {
+    if (typeof Array.prototype[name] === "function") {
+      Deque.prototype[name] = function (...args) {
+        return this.$arr()[name](...args);
+      };
+    }
+  }
+  class DequeIt {
+    constructor(d) {
+      this.d = d;
+      this.i = 0;
+    }
+    [Symbol.iterator]() {
+      return this;
+    }
+    next() {
+      const d = this.d;
+      if (this.i < d.n) return { value: d.b[d.$p(this.i++)], done: false };
+      return { value: undefined, done: true };
+    }
+  }
+  // A plain array with `v`'s elements: `v` itself unless it's a deque.
+  function arr(v) {
+    return v instanceof Deque ? v.$arr() : v;
+  }
+
+  // `&mut v[lo..hi]`: a Proxy over `v[lo..lo + len)`, so index reads and writes reach `v`. Its
+  // `[VIEW]` is the base and offset, for helpers and views of views. Array methods run on the
+  // base rather than through the traps: `slice` and iteration directly, the other read-only ones
+  // on a copy of the range, and the in-place ones (`sort`, `reverse`, ..) on a copy written back.
+  const VIEW = Symbol("view");
+  const VIEW_COPY = new Set([
+    "at", "map", "filter", "some", "every", "find", "findIndex", "findLast", "findLastIndex", "forEach",
+    "reduce", "reduceRight", "includes", "indexOf", "lastIndexOf", "join", "concat", "flat", "flatMap",
+    "toSorted", "toReversed", "with", "keys", "entries", "toString",
+  ]);
+  const VIEW_INPLACE = new Set(["sort", "reverse", "fill", "copyWithin"]);
+  // The index a property name is (`"0"`, `"12"`; not `"01"` or `"x"`), or -1.
+  function indexName(k) {
+    if (typeof k !== "string") return -1;
+    const n = k.length;
+    if (n === 0 || n > 15) return -1;
+    let c = k.charCodeAt(0);
+    if (c < 48 || c > 57 || (c === 48 && n > 1)) return -1;
+    let i = c - 48;
+    for (let j = 1; j < n; j++) {
+      c = k.charCodeAt(j);
+      if (c < 48 || c > 57) return -1;
+      i = i * 10 + (c - 48);
+    }
+    return i;
+  }
+  // `slice(a, b)` arguments relative to a view of `len`, as `[from, to)` in its base.
+  function viewRange(a, b, lo, len) {
+    let from = a === undefined ? 0 : Math.trunc(a);
+    from = from < 0 ? Math.max(0, len + from) : Math.min(from, len);
+    let to = b === undefined ? len : Math.trunc(b);
+    to = to < 0 ? Math.max(0, len + to) : Math.min(to, len);
+    return [lo + from, lo + Math.max(from, to)];
+  }
+  // (The target is an empty array, so `Array.isArray` holds; it carries the base `v`, offset `lo`
+  // and length `len`, and one handler serves every view.)
+  const viewHandler = {
+    get(t, k, proxy) {
+      const { v, lo, len } = t;
+      if (typeof k === "string") {
+        if (k === "length") return len;
+        const i = indexName(k);
+        if (i !== -1) return i < len ? v[lo + i] : undefined;
+        if (k === "slice") return (a, b) => v.slice(...viewRange(a, b, lo, len));
+        if (k === "values") return () => new ArrayIt(v, lo, lo + len);
+        if (VIEW_COPY.has(k)) return (...args) => v.slice(lo, lo + len)[k](...args);
+        if (VIEW_INPLACE.has(k)) {
+          return (...args) => {
+            const c = v.slice(lo, lo + len);
+            c[k](...args);
+            for (let j = 0; j < len; j++) v[lo + j] = c[j];
+            return proxy;
+          };
+        }
+        return Array.prototype[k];
+      }
+      if (k === VIEW) return t;
+      if (k === Symbol.iterator) return () => new ArrayIt(v, lo, lo + len);
+      return Array.prototype[k];
+    },
+    set(t, k, x) {
+      const i = indexName(k);
+      if (i !== -1 && i < t.len) t.v[t.lo + i] = x;
+      return true;
+    },
+    has(t, k) {
+      const i = indexName(k);
+      return i !== -1 ? i < t.len : k in Array.prototype;
+    },
+    deleteProperty() {
+      return true;
+    },
+    ownKeys(t) {
+      return [...Array(t.len).keys()].map(String).concat("length");
+    },
+    getOwnPropertyDescriptor(t, k) {
+      if (k === "length") return { value: t.len, writable: true, enumerable: false, configurable: false };
+      const i = indexName(k);
+      if (i !== -1 && i < t.len) return { value: t.v[t.lo + i], writable: true, enumerable: true, configurable: true };
+      return undefined;
+    },
+  };
+  function sliceView(v, lo, len) {
+    const t = [];
+    t.v = v;
+    t.lo = lo;
+    t.len = len;
+    return new Proxy(t, viewHandler);
   }
 
   // Rust's HashSet<T>. Methods are `$`-prefixed so Bitburner's RAM calculator never mistakes them
@@ -509,12 +835,63 @@
       this.n = n;
     }
     next() {
+      // (Over an array: jump.)
+      if (this.n > 0 && this.src instanceof ArrayIt) {
+        const src = this.src;
+        src.i = Math.min(src.end, src.i + this.n);
+        this.n = 0;
+      }
       while (this.n > 0) {
         this.n--;
         const r = this.src.next();
         if (r.done) return r;
       }
       return this.src.next();
+    }
+  }
+  // A Vec's `iter()`: `a[i..end)`, by index.
+  class ArrayIt extends AdapterIt {
+    constructor(a, i, end) {
+      super();
+      this.a = a;
+      this.i = i;
+      this.end = end;
+    }
+    next() {
+      if (this.i < this.end) return { value: this.a[this.i++], done: false };
+      return DONE;
+    }
+  }
+  // `iter().rev()` of an `ArrayIt`: its items from the back (`next_back`: the source keeps the
+  // front, as `by_ref().rev()` needs).
+  class ArrayRevIt extends AdapterIt {
+    constructor(src) {
+      super();
+      this.src = src;
+    }
+    next() {
+      const src = this.src;
+      if (src.end > src.i) return { value: src.a[--src.end], done: false };
+      return DONE;
+    }
+  }
+  // `windows(n)` / `chunks(n)` / `chunks_exact(n)`: each item is a copy of `a[i..i + n)`, `step`
+  // apart; `exact` drops a short last one.
+  class SlicesIt extends AdapterIt {
+    constructor(a, n, step, exact) {
+      super();
+      this.a = a;
+      this.n = n;
+      this.step = step;
+      this.exact = exact;
+      this.i = 0;
+    }
+    next() {
+      const i = this.i;
+      const end = i + this.n;
+      if (i >= this.a.length || (this.exact && end > this.a.length)) return DONE;
+      this.i += this.step;
+      return { value: this.a.slice(i, end), done: false };
     }
   }
   class StepByIt extends AdapterIt {
@@ -528,6 +905,12 @@
       if (this.first) {
         this.first = false;
         return this.src.next();
+      }
+      // (Over an array: jump.)
+      if (this.src instanceof ArrayIt) {
+        const src = this.src;
+        src.i = Math.min(src.end, src.i + this.n - 1);
+        return src.next();
       }
       // (Over a range: jump, so `(0..1e12).step_by(1e9)` takes 1000 steps, not 1e12.)
       if (this.src instanceof RangeIt) {
@@ -705,6 +1088,9 @@
     // Collects first: JS iterators only go forward. (A custom iterator with its own
     // `next_back` runs backwards through it.)
     $rev() {
+      const it = this.it;
+      if (it instanceof ArrayIt) return new Iter(new ArrayRevIt(it));
+      if (it instanceof ArrayRevIt) return new Iter(it.src);
       const back = ownMethod(this.src, "next_back");
       if (back !== null) {
         this.src = null;
@@ -901,22 +1287,44 @@
       return true;
     }
     $count() {
+      const it = this.it;
+      if (it instanceof ArrayIt) {
+        const n = it.end - it.i;
+        it.i = it.end;
+        return n;
+      }
       let n = 0;
-      for (const _ of iterable(this.it)) n++;
+      for (const _ of iterable(it)) n++;
       return n;
     }
     $last() {
+      const it = this.it;
+      if (it instanceof ArrayIt) {
+        if (it.i >= it.end) return null;
+        it.i = it.end;
+        return some(it.a[it.end - 1]);
+      }
       let last = null;
       let any = false;
-      for (const x of iterable(this.it)) {
+      for (const x of iterable(it)) {
         last = x;
         any = true;
       }
       return any ? some(last) : null;
     }
     $nth(n) {
+      const it = this.it;
+      if (it instanceof ArrayIt) {
+        const j = it.i + n;
+        if (j >= it.end) {
+          it.i = it.end;
+          return null;
+        }
+        it.i = j + 1;
+        return some(it.a[j]);
+      }
       let i = 0;
-      for (const x of iterable(this.it)) if (i++ === n) return some(x);
+      for (const x of iterable(it)) if (i++ === n) return some(x);
       return null;
     }
     $sum(op, start) {
@@ -1031,7 +1439,16 @@
       for (const x of iterable(this.it)) f(x);
     }
     $collectVec() {
-      return Array.from(iterable(this.it));
+      const it = this.it;
+      if (it instanceof ArrayIt) {
+        const out = it.a.slice(it.i, it.end);
+        it.i = it.end;
+        return out;
+      }
+      return Array.from(iterable(it));
+    }
+    $collectDeque() {
+      return Deque.from(iterable(this.it));
     }
     $collectSet() {
       return HashSet.from(iterable(this.it));
@@ -1312,6 +1729,24 @@
         const s = this.$slotAt(i);
         return s === undefined ? null : out(s);
       }
+      // `map[i]` / `set[i]` (indexmap panics like a slice), and `map[i]` as a place.
+      $at(i) {
+        const s = this.$slotAt(i);
+        if (s === undefined) throw new CarciniPanic(`index out of bounds: the len is ${this.m.size} but the index is ${i}`);
+        return keyOfSlot === null ? s : s[1];
+      }
+      $atMut(i) {
+        const s = this.$slotAt(i);
+        if (s === undefined) throw new CarciniPanic(`index out of bounds: the len is ${this.m.size} but the index is ${i}`);
+        return {
+          get 0() {
+            return s[1];
+          },
+          set 0(v) {
+            s[1] = v;
+          },
+        };
+      }
       $getIndexOf(k) {
         const kk = key(k);
         let j = 0;
@@ -1357,6 +1792,26 @@
     };
   }
   class IndexMap extends indexed(HashMap, (slot) => slot[0], (s) => [s[0], s[1]]) {
+    // `get_index_mut(i)`: `[k, v]`, or `[k, slot]` (`asSlot`) for a number, string or bool value,
+    // whose `[1]` reads and writes the map's.
+    $getIndexMut(i, asSlot) {
+      const s = this.$slotAt(i);
+      if (s === undefined) return null;
+      return asSlot ? [s[0], s] : [s[0], s[1]];
+    }
+    // `map[&k]` as a place.
+    $keyMut(k) {
+      const s = this.m.get(key(k));
+      if (!s) throw new CarciniPanic("no entry found for key");
+      return {
+        get 0() {
+          return s[1];
+        },
+        set 0(v) {
+          s[1] = v;
+        },
+      };
+    }
     $getFull(k) {
       const i = this.$getIndexOf(k);
       if (i === null) return null;
@@ -1403,40 +1858,113 @@
     }
   }
 
-  // Rust's BTreeSet / BTreeMap: the hash classes, re-sorted by key whenever they are read in order.
-  // `n` is the size when the map was last sorted: a new key (from `$insert` or an `entry` slot)
-  // grows the map past it. Removals keep the order, so they sort first and then record the size.
-  function btreeSorting(Base, keyOf) {
+  // Rust's BTreeSet / BTreeMap: the hash classes (for `get` / `contains`) plus `s`, what the Map
+  // holds (elements, or `[k, v]` slots) in key order from index `h` on: `pop_first` moves `h`
+  // instead of shifting. A single new key goes in by binary search; after `BTREE_BULK` of those
+  // between ordered reads (a bulk load) the rest are appended and `s` is sorted at the next read.
+  // `out` is what iteration yields for a stored item.
+  const BTREE_BULK = 512;
+  function btreeSorting(Base, keyOf, out) {
     return class extends Base {
       constructor() {
         super();
-        this.n = 0;
+        this.s = [];
+        this.h = 0;
+        this.sorted = true;
+        this.pending = 0;
       }
       $sort() {
-        if (this.m.size === this.n) return;
-        this.m = new Map([...this.m].sort((a, b) => cmp(keyOf(a[1]), keyOf(b[1]))));
-        this.n = this.m.size;
+        if (this.sorted) return;
+        if (this.h !== 0) {
+          this.s = this.s.slice(this.h);
+          this.h = 0;
+        }
+        this.s.sort((a, b) => cmp(keyOf(a), keyOf(b)));
+        this.sorted = true;
+        this.pending = 0;
       }
-      $synced(f) {
+      // The stored items in order, from index 0.
+      $items() {
         this.$sort();
-        const r = f();
-        this.n = this.m.size;
-        return r;
+        if (this.h !== 0) {
+          this.s = this.s.slice(this.h);
+          this.h = 0;
+        }
+        return this.s;
       }
-      $remove(x) {
-        return this.$synced(() => super.$remove(x));
+      // The index in `s` of the first item whose key is `>= k` (`> k` when `after`).
+      $bound(k, after) {
+        const s = this.s;
+        let lo = this.h;
+        let hi = s.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          const c = cmp(keyOf(s[mid]), k);
+          if (c < 0 || (after && c === 0)) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      }
+      // A new item, just put in the Map.
+      $added(x) {
+        const s = this.s;
+        if (!this.sorted) {
+          s.push(x);
+          return;
+        }
+        const k = keyOf(x);
+        if (s.length === this.h || cmp(keyOf(s[s.length - 1]), k) < 0) {
+          s.push(x);
+        } else if (this.h !== 0 && cmp(k, keyOf(s[this.h])) < 0) {
+          s[--this.h] = x;
+        } else if (++this.pending > BTREE_BULK) {
+          this.sorted = false;
+          s.push(x);
+        } else {
+          s.splice(this.$bound(k, false), 0, x);
+        }
+      }
+      // A stored item, just deleted from the Map.
+      $removed(x) {
+        this.$sort();
+        const s = this.s;
+        let i = this.$bound(keyOf(x), false);
+        if (s[i] !== x) i = s.indexOf(x, this.h);
+        if (i === this.h) {
+          s[i] = undefined;
+          this.h++;
+          if (this.h > 64 && this.h * 2 > s.length) {
+            this.s = s.slice(this.h);
+            this.h = 0;
+          }
+        } else if (i >= 0) {
+          s.splice(i, 1);
+        }
       }
       $retain(p) {
-        this.$synced(() => super.$retain(p));
+        const s = this.$items();
+        let j = 0;
+        for (let i = 0; i < s.length; i++) {
+          const x = s[i];
+          if (p(x)) s[j++] = x;
+          else this.m.delete(key(keyOf(x)));
+        }
+        s.length = j;
       }
       $clear() {
-        this.$synced(() => super.$clear());
+        super.$clear();
+        this.s = [];
+        this.h = 0;
+        this.sorted = true;
+        this.pending = 0;
       }
       $clone() {
-        this.$sort();
         const c = new this.constructor();
-        c.m = super.$clone().m;
-        c.n = c.m.size;
+        for (const x of this.$items()) {
+          const y = clone(x);
+          c.m.set(key(keyOf(y)), y);
+          c.s.push(y);
+        }
         return c;
       }
       $append(other) {
@@ -1446,19 +1974,18 @@
       // The first / last entry, as stored (an element, or a `[k, v]` slot).
       $firstSlot() {
         this.$sort();
-        for (const x of this.m.values()) return x;
-        return null;
+        return this.h < this.s.length ? this.s[this.h] : null;
       }
       $lastSlot() {
         this.$sort();
-        let last = null;
-        for (const x of this.m.values()) last = x;
-        return last;
+        return this.h < this.s.length ? this.s[this.s.length - 1] : null;
       }
       $popSlot(first) {
-        const x = first ? this.$firstSlot() : this.$lastSlot();
-        if (x === null) return null;
-        this.$synced(() => this.m.delete(key(keyOf(x))));
+        this.$sort();
+        if (this.h >= this.s.length) return null;
+        const x = first ? this.s[this.h] : this.s[this.s.length - 1];
+        this.m.delete(key(keyOf(x)));
+        this.$removed(x);
         return x;
       }
       // `range(lo..hi)` / `range(lo..=hi)` / `range(lo..)` / `range(..hi)`: the entries with
@@ -1468,28 +1995,41 @@
           throw new CarciniPanic(`range start is greater than range end in ${this.constructor.name}`, "<std>");
         }
         this.$sort();
-        const all = Array.from(this.m.values());
-        return Iter.of(function* () {
-          for (const x of all) {
-            const k = keyOf(x);
-            if (lo !== undefined && cmp(k, lo) < 0) continue;
-            if (hi !== undefined && (inclusive ? cmp(k, hi) > 0 : cmp(k, hi) >= 0)) return;
-            yield k === x ? x : [x[0], x[1]];
-          }
-        });
+        const i = lo === undefined ? this.h : this.$bound(lo, false);
+        const j = hi === undefined ? this.s.length : this.$bound(hi, inclusive);
+        const part = i < j ? this.s.slice(i, j) : [];
+        return new Iter(new MapIt(part[Symbol.iterator](), out));
+      }
+      // Iteration, in key order.
+      [Symbol.iterator]() {
+        return new MapIt(this.$items()[Symbol.iterator](), out);
       }
     };
   }
 
-  class BTreeSet extends btreeSorting(HashSet, (x) => x) {
+  class BTreeSet extends btreeSorting(HashSet, (x) => x, (x) => x) {
     static from(items) {
       const s = new BTreeSet();
       for (const x of items) s.$insert(x);
       return s;
     }
+    $insert(x) {
+      const k = key(x);
+      if (this.m.has(k)) return false;
+      this.m.set(k, x);
+      this.$added(x);
+      return true;
+    }
+    $remove(x) {
+      const k = key(x);
+      if (!this.m.has(k)) return false;
+      const stored = this.m.get(k);
+      this.m.delete(k);
+      this.$removed(stored);
+      return true;
+    }
     [Symbol.iterator]() {
-      this.$sort();
-      return super[Symbol.iterator]();
+      return this.$items()[Symbol.iterator]();
     }
     $first() {
       return this.$firstSlot();
@@ -1523,27 +2063,44 @@
     return new Iter(all[Symbol.iterator]());
   }
 
-  class BTreeMap extends btreeSorting(HashMap, (slot) => slot[0]) {
+  class BTreeMap extends btreeSorting(HashMap, (slot) => slot[0], (slot) => [slot[0], slot[1]]) {
     static from(pairs) {
       const h = new BTreeMap();
       for (const [k, v] of pairs) h.$insert(k, v);
       return h;
     }
+    $insert(k, v) {
+      const kk = key(k);
+      const slot = this.m.get(kk);
+      if (slot) {
+        const old = slot[1];
+        slot[1] = v;
+        return some(old);
+      }
+      const s = [k, v];
+      this.m.set(kk, s);
+      this.$added(s);
+      return null;
+    }
+    $remove(k) {
+      const kk = key(k);
+      const slot = this.m.get(kk);
+      if (!slot) return null;
+      this.m.delete(kk);
+      this.$removed(slot);
+      return some(slot[1]);
+    }
     $slots() {
-      this.$sort();
-      return super.$slots();
+      return this.$items()[Symbol.iterator]();
     }
     $entries() {
-      this.$sort();
-      return super.$entries();
+      return new Iter(this[Symbol.iterator]());
     }
     $keys() {
-      this.$sort();
-      return super.$keys();
+      return new Iter(new MapIt(this.$items()[Symbol.iterator](), (slot) => slot[0]));
     }
     $values() {
-      this.$sort();
-      return super.$values();
+      return new Iter(new MapIt(this.$items()[Symbol.iterator](), (slot) => slot[1]));
     }
     $append(other) {
       this.$extend(Array.from(other.$entries()));
@@ -1633,6 +2190,50 @@
       start < tail ? true : a.length <= 2048 ? 2 * a.length < tail * log2(start) : 2 * a.length < tail * 11;
     if (rebuild) heapRebuild(a);
     else for (let i = start; i < a.length; i++) siftUp(a, 0, i);
+  }
+
+  // UTF-8 byte offsets of a JS (UTF-16) string. A string's UTF-8 length counts each unit below
+  // 0x80 as 1, below 0x800 as 2, a surrogate pair as 4 and any other unit (a lone surrogate too,
+  // as `for (const c of s)` sees it) as 3.
+  function utf8Len(s) {
+    const n = s.length;
+    let b = n;
+    for (let i = 0; i < n; i++) {
+      const c = s.charCodeAt(i);
+      if (c < 0x80) continue;
+      if (c < 0x800) b += 1;
+      else if (c >= 0xd800 && c < 0xdc00 && i + 1 < n && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+        b += 2;
+        i++;
+      } else b += 2;
+    }
+    return b;
+  }
+  // What `s.len()`, `s.as_bytes()[i]`, `&s[a..b]` and `is_char_boundary` need to know about a
+  // string, for the last two long strings seen (strings are values, so a loop over one string
+  // passes the same one each time): its UTF-8 length, whether it's ASCII (byte offsets are then
+  // UTF-16 offsets), and its bytes once asked for.
+  const strInfoMin = 32;
+  let strInfoA = { s: "", len: 0, ascii: true, bytes: null };
+  let strInfoB = strInfoA;
+  function strInfo(s) {
+    if (strInfoA.s === s) return strInfoA;
+    if (strInfoB.s === s) {
+      const t = strInfoA;
+      strInfoA = strInfoB;
+      strInfoB = t;
+      return strInfoA;
+    }
+    const len = utf8Len(s);
+    const info = { s, len, ascii: len === s.length, bytes: null };
+    if (s.length >= strInfoMin) {
+      strInfoB = strInfoA;
+      strInfoA = info;
+    }
+    return info;
+  }
+  function strBytes(info) {
+    return (info.bytes ??= new TextEncoder().encode(info.s));
   }
 
 
@@ -1872,7 +2473,7 @@
       throw new CarciniPanic(`index out of bounds: the len is ${v.length} but the index is ${i}`, location);
     },
     $get(v, i, location) {
-      return v[rt.$ix(v, i, location)];
+      return arr(v)[rt.$ix(v, i, location)];
     },
     // The failing side of an inline bounds check.
     $oob(v, i, location) {
@@ -1896,8 +2497,18 @@
       return v.splice(i, 1)[0];
     },
     $vecSwap(v, a, b, location) {
-      const x = v[rt.$ix(v, a, location)];
-      v[a] = v[rt.$ix(v, b, location)];
+      rt.$ix(v, a, location);
+      rt.$ix(v, b, location);
+      const view = v[VIEW];
+      if (view !== undefined) {
+        v = view.v;
+        a += view.lo;
+        b += view.lo;
+      } else {
+        v = arr(v);
+      }
+      const x = v[a];
+      v[a] = v[b];
       v[b] = x;
     },
     $vecTruncate(v, n) {
@@ -1917,13 +2528,13 @@
       return v.length ? some(v.pop()) : null;
     },
     $first(v) {
-      return v.length ? some(v[0]) : null;
+      return v.length ? some(v instanceof Deque ? v.$at(0) : v[0]) : null;
     },
     $last(v) {
-      return v.length ? some(v[v.length - 1]) : null;
+      return v.length ? some(v instanceof Deque ? v.$at(v.n - 1) : v[v.length - 1]) : null;
     },
     $vget(v, i) {
-      return i >= 0 && i < v.length ? some(v[i]) : null;
+      return i >= 0 && i < v.length ? some(v instanceof Deque ? v.$at(i) : v[i]) : null;
     },
     $some: some,
     $unsome: unsome,
@@ -1933,6 +2544,7 @@
     },
     $eq: eq,
     HashSet,
+    Deque,
     HashMap,
     BTreeSet,
     BTreeMap,
@@ -1996,12 +2608,16 @@
     },
     // `<<` masks the shift amount to 6 bits, as Rust does in release builds.
     $shl64(a, n, signed) {
+      // (A product by a power of two is exact while it stays within ±2^53, where it can't wrap.)
+      const p = a * 2 ** (n & 63);
+      if (Number.isSafeInteger(p)) return p;
       const r = BigInt(a) << BigInt(n & 63);
       return Number(signed ? BigInt.asIntN(64, r) : BigInt.asUintN(64, r));
     },
     $shr64(a, n) {
       if (a >= 0 && a <= 0x7fffffff) return (n & 63) > 31 ? 0 : a >> (n & 63);
-      return Number(BigInt(a) >> BigInt(n & 63));
+      // (A quotient by a power of two is exact; `floor` is the arithmetic shift of a negative.)
+      return Math.floor(a / 2 ** (n & 63));
     },
     $not64(a, signed) {
       return signed ? -a - 1 : Number(BigInt.asUintN(64, ~BigInt(a)));
@@ -2060,6 +2676,7 @@
     // `chunks_mut(n)` / `chunks_exact_mut(n)` / `rchunks_mut(n)`: views, so writes reach `v`.
     $chunksMut(v, n, exact, rev, location) {
       if (n === 0) throw new CarciniPanic("chunk size must be non-zero", location);
+      v = arr(v);
       const out = [];
       if (rev) {
         for (let hi = v.length; hi > 0; hi -= n) out.push(rt.$sliceMut(v, Math.max(0, hi - n), hi, false, location));
@@ -2072,18 +2689,21 @@
       return new Iter(out[Symbol.iterator]());
     },
     $copyWithin(v, lo, hi, inclusive, dest, location) {
+      v = arr(v);
       const part = rt.$slice(v, lo, hi, inclusive, location);
       if (dest + part.length > v.length) throw new CarciniPanic("dest is out of bounds", location);
       for (let i = 0; i < part.length; i++) v[dest + i] = part[i];
     },
     // `retain_mut(f)`: `f` gets a cell holding each item.
     $retainMut(v, f) {
+      const a = arr(v);
       let j = 0;
-      for (let i = 0; i < v.length; i++) {
-        const cell = [v[i]];
-        if (f(cell)) v[j++] = cell[0];
+      for (let i = 0; i < a.length; i++) {
+        const cell = [a[i]];
+        if (f(cell)) a[j++] = cell[0];
       }
-      v.length = j;
+      a.length = j;
+      if (a !== v) v.$sync();
     },
     $splice(v, lo, hi, inclusive, src, location) {
       const out = rt.$slice(v, lo, hi, inclusive, location);
@@ -2092,6 +2712,7 @@
     },
     // `[1, 2].strip_prefix(&[1])` (`suffix`: `strip_suffix`).
     $vecStrip(v, p, suffix) {
+      v = arr(v);
       if (p.length > v.length) return null;
       const at = suffix ? v.length - p.length : 0;
       for (let i = 0; i < p.length; i++) if (!eq(v[at + i], p[i])) return null;
@@ -2178,11 +2799,31 @@
     $blanketReg(regs, cls) {
       regs.blankets.push(cls);
     },
+    // `w.put(..)` for a `w: &mut W` (its cell `c`): an impl's `&mut self` method on a string or
+    // number (listed in its class's `$mut`) gets the cell as `this`, others the value.
+    $dcallMut(regs, c, name, ...args) {
+      const x = c[0];
+      if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
+        return x[name](...args);
+      }
+      const kind = Array.isArray(x) || x instanceof Deque ? "array" : typeof x;
+      for (const r of regs.kinds[kind] ?? []) {
+        if (typeof r.cls.prototype[name] !== "function") continue;
+        if (kind === "number" && r.integral !== Number.isInteger(x) && (regs.kinds[kind] ?? []).some((o) => o !== r && o.integral === Number.isInteger(x) && typeof o.cls.prototype[name] === "function")) continue;
+        return r.cls.prototype[name].call(r.cls.$mut?.has(name) ? c : x, ...args);
+      }
+      for (const r of regs.kinds.option ?? []) {
+        if (typeof r.cls.prototype[name] === "function") {
+          return r.cls.prototype[name].call(r.cls.$mut?.has(name) ? c : x, ...args);
+        }
+      }
+      return rt.$dcall(regs, x, name, ...args);
+    },
     $dcall(regs, x, name, ...args) {
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
-      const kind = Array.isArray(x)
+      const kind = Array.isArray(x) || x instanceof Deque
         ? "array"
         : x instanceof BTreeMap
           ? "btreemap"
@@ -2206,6 +2847,11 @@
         }
       }
       if (pick) return pick.cls.prototype[name].call(x, ...args);
+      // An `Option` is `null` or its value: its impl serves what no other impl takes (`None`
+      // always; `Some(x)` unless `x`'s own type has the method).
+      for (const r of regs.kinds.option ?? []) {
+        if (typeof r.cls.prototype[name] === "function") return r.cls.prototype[name].call(x, ...args);
+      }
       for (const cls of regs.blankets) {
         if (typeof cls.prototype[name] === "function") return cls.prototype[name].call(x, ...args);
       }
@@ -2241,9 +2887,11 @@
     // overflow.
     // `n.is_multiple_of(m)` (unsigned): `m == 0` only for `n == 0`.
     $splitFirst(v) {
+      v = arr(v);
       return v.length === 0 ? null : [v[0], v.slice(1)];
     },
     $splitLast(v) {
+      v = arr(v);
       return v.length === 0 ? null : [v[v.length - 1], v.slice(0, -1)];
     },
     // `serde_json::from_str::<T>()` in a function generic over `T: DeserializeOwned`: the
@@ -2392,7 +3040,15 @@
     // 0, as Rust's `as` does.
     $to128(x, signed, bits = 128) {
       if (typeof x === "bigint") return signed ? BigInt.asIntN(bits, x) : BigInt.asUintN(bits, x);
+      // An integer within ±2^53 (every number kind's value): in range, unless negative into an
+      // unsigned kind, which wraps.
+      if (Number.isSafeInteger(x)) {
+        const b = BigInt(x);
+        return signed || x >= 0 ? b : BigInt.asUintN(bits, b);
+      }
       if (typeof x === "boolean") return x ? 1n : 0n;
+      // (`'A' as u64`: the code point.)
+      if (typeof x === "string") return BigInt(x.codePointAt(0));
       const min = signed ? -(1n << BigInt(bits - 1)) : 0n;
       const max = signed ? (1n << BigInt(bits - 1)) - 1n : (1n << BigInt(bits)) - 1n;
       if (Number.isNaN(x)) return 0n;
@@ -2432,6 +3088,17 @@
       if (v < min) return err("NegOverflow");
       return new Res(0, v);
     },
+    // `v[a..b].sort()` and friends: the changed copy of the range, written back.
+    $writeBack(v, lo, c) {
+      for (let i = 0; i < c.length; i++) v[lo + i] = c[i];
+    },
+    // `q[i]` of a deque whose expression isn't safe to evaluate twice.
+    $dqGet(d, i, location) {
+      return d instanceof Deque ? d.b[d.$i(i, location)] : rt.$get(d, i, location);
+    },
+    // `sort()` comparators for integers that are JS numbers, and for strings / chars.
+    $cmpNum: (a, b) => a - b,
+    $cmpStr: (a, b) => (a < b ? -1 : a > b ? 1 : 0),
     $dqRemove(a, i) {
       return i < a.length ? some(a.splice(i, 1)[0]) : null;
     },
@@ -2448,6 +3115,7 @@
       if (!slot) {
         slot = [k, lazy ? v(k) : v];
         map.m.set(kk, slot);
+        if (map.$added !== undefined) map.$added(slot);
       } else if (modify) {
         modify(slot);
       }
@@ -2477,9 +3145,30 @@
     },
     // `v.get_mut(i)` / `first_mut` (0) / `last_mut` (-1) of numbers, strings or bools: a slot whose
     // `[1]` reads and writes the element, or null.
+    // `let r = &mut v[i];` / `&mut s.count`: a slot over that element or field (`loc`: the
+    // index is checked once, here, as Rust does when it makes the reference).
+    $placeSlot(o, k, loc) {
+      if (loc !== null && !(k >= 0 && k < o.length)) rt.$oob(o, k, loc);
+      if (o instanceof Deque) {
+        k = o.$p(k);
+        o = o.b;
+      }
+      return {
+        get 1() {
+          return o[k];
+        },
+        set 1(v) {
+          o[k] = v;
+        },
+      };
+    },
     $vecSlot(a, i) {
-      const j = i < 0 ? a.length + i : i;
+      let j = i < 0 ? a.length + i : i;
       if (j < 0 || j >= a.length) return null;
+      if (a instanceof Deque) {
+        j = a.$p(j);
+        a = a.b;
+      }
       return {
         get 1() {
           return a[j];
@@ -2487,11 +3176,19 @@
         set 1(v) {
           a[j] = v;
         },
+        // (`max()` / `min()` of slots compare the elements.)
+        $cmp(o) {
+          return cmp(a[j], o[1]);
+        },
+        $eq(o) {
+          return eq(a[j], o[1]);
+        },
       };
     },
     // `v.iter_mut()` of numbers, strings or bools outside a loop by index: each item is a slot
     // whose `[1]` reads and writes the element.
     $iterMutSlots(a) {
+      a = arr(a);
       return Iter.of(function* () {
         for (let i = 0; i < a.length; i++) yield rt.$vecSlot(a, i);
       });
@@ -2611,7 +3308,7 @@
     // Iterator sources.
     Iter,
     $iter(x) {
-      return new Iter(x[Symbol.iterator]());
+      return new Iter(Array.isArray(x) && x[VIEW] === undefined ? new ArrayIt(x, 0, x.length) : x[Symbol.iterator]());
     },
     Hasher,
     // `x.hash(state)`: a type's own `hash`, else the value's key.
@@ -2763,15 +3460,11 @@
     },
     $windows(v, n) {
       if (n === 0) throw new CarciniPanic("window size must be non-zero", "<std>");
-      return Iter.of(function* () {
-        for (let i = 0; i + n <= v.length; i++) yield v.slice(i, i + n);
-      });
+      return new Iter(new SlicesIt(arr(v), n, 1, true));
     },
     $chunksExact(v, n) {
       if (n === 0) throw new CarciniPanic("chunk size must be non-zero", "<std>");
-      return Iter.of(function* () {
-        for (let i = 0; i + n <= v.length; i += n) yield v.slice(i, i + n);
-      });
+      return new Iter(new SlicesIt(arr(v), n, n, true));
     },
     // `s.split_at(mid)`, with slicing's panics.
     $splitAt(s, mid, location) {
@@ -2779,9 +3472,7 @@
     },
     $chunks(v, n) {
       if (n === 0) throw new CarciniPanic("chunk size must be non-zero", "<std>");
-      return Iter.of(function* () {
-        for (let i = 0; i < v.length; i += n) yield v.slice(i, i + n);
-      });
+      return new Iter(new SlicesIt(arr(v), n, n, false));
     },
 
     // Vec methods taking closures.
@@ -2789,40 +3480,50 @@
       for (let i = 0; i < v.length; i++) f(i);
     },
     $sortByKey(v, f) {
+      v = arr(v);
       const keyed = v.map((x) => [f(x), x]);
       keyed.sort((a, b) => cmp(a[0], b[0]));
       for (let i = 0; i < v.length; i++) v[i] = keyed[i][1];
     },
     $retain(v, p) {
+      const a = arr(v);
       let j = 0;
-      for (let i = 0; i < v.length; i++) if (p(v[i])) v[j++] = v[i];
-      v.length = j;
+      for (let i = 0; i < a.length; i++) if (p(a[i])) a[j++] = a[i];
+      a.length = j;
+      if (a !== v) v.$sync();
     },
     $dedup(v) {
       rt.$dedupByKey(v, (x) => x);
     },
     $dedupByKey(v, f) {
-      if (v.length === 0) return;
+      const a = arr(v);
+      if (a.length === 0) return;
       let j = 1;
-      let last = f(v[0]);
-      for (let i = 1; i < v.length; i++) {
-        const k = f(v[i]);
+      let last = f(a[0]);
+      for (let i = 1; i < a.length; i++) {
+        const k = f(a[i]);
         if (!eq(k, last)) {
-          v[j++] = v[i];
+          a[j++] = a[i];
           last = k;
         }
       }
-      v.length = j;
+      a.length = j;
+      if (a !== v) v.$sync();
     },
 
     // Strings.
     $utf8len(s) {
-      let n = 0;
-      for (const c of s) {
-        const cp = c.codePointAt(0);
-        n += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+      return s.length < strInfoMin ? utf8Len(s) : strInfo(s).len;
+    },
+    // `s.as_bytes()[i]`, without building the bytes when `s` is ASCII.
+    $byteAt(s, i, location) {
+      const info = strInfo(s);
+      if (info.ascii) {
+        if (i >= 0 && i < s.length) return s.charCodeAt(i);
+        return rt.$oob(s, i, location);
       }
-      return n;
+      const b = strBytes(info);
+      return i >= 0 && i < b.length ? b[i] : rt.$oob(b, i, location);
     },
     $truncChars(s, n) {
       return Array.from(s).slice(0, n).join("");
@@ -3031,6 +3732,46 @@
       if (w !== null && typeof w === "object" && typeof w[method] === "function") return w[method](s);
       return rt.$write(w, s, false);
     },
+    // Awaiting a hand-written future (`impl Future for X`, whose class's `then` calls this):
+    // poll it with a context from `mkCx` (the task prelude's `__task_context`), and after each
+    // `Pending` wait until its waker is woken (a future that never wakes it never finishes).
+    async $drive(fut, method, mkCx) {
+      for (;;) {
+        let wake;
+        const woken = new Promise((r) => (wake = r));
+        const r = fut[method](mkCx(() => wake()));
+        if (r.$tag === 0) return r[0];
+        await woken;
+      }
+    },
+    // `fut.poll(cx)` on a future that may be a promise (an async fn's or block's): `Pending`
+    // until it settles (then the context's waker is woken), then `Ready` with its value. A
+    // hand-written future's own `poll` is called.
+    $poll(fut, cx, method, Poll) {
+      if (fut !== null && typeof fut === "object" && typeof fut[method] === "function") {
+        return fut[method](cx);
+      }
+      let st = fut.$pollState;
+      if (st === undefined) {
+        st = fut.$pollState = { done: false, failed: false, value: undefined, wakers: [] };
+        Promise.resolve(fut).then(
+          (v) => {
+            st.done = true;
+            st.value = v;
+            for (const w of st.wakers.splice(0)) w.wake_by_ref();
+          },
+          (e) => {
+            st.failed = true;
+            st.value = e;
+            for (const w of st.wakers.splice(0)) w.wake_by_ref();
+          },
+        );
+      }
+      if (st.failed) throw st.value;
+      if (st.done) return Poll.Ready(st.value);
+      st.wakers.push(cx.waker());
+      return Poll.Pending;
+    },
     // `Display` impls write into a Formatter: `{ s: "" }`.
     $write(f, s, nl) {
       f.s += nl ? s + "\n" : s;
@@ -3185,7 +3926,11 @@
     },
     // `s.as_bytes()`: UTF-8.
     $utf8(s) {
-      return Array.from(new TextEncoder().encode(s));
+      const info = strInfo(s);
+      if (!info.ascii) return Array.from(strBytes(info));
+      const a = new Array(s.length);
+      for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+      return a;
     },
     $fromUtf8(bytes) {
       try {
@@ -3238,37 +3983,10 @@
       if (hi === null && lo > n) throw new CarciniPanic(`range start index ${lo} out of range for slice of length ${n}`, location);
       if (lo > end) throw new CarciniPanic(`slice index starts at ${lo} but ends at ${end}`, location);
       if (end > n) throw new CarciniPanic(`range end index ${hi} out of range for slice of length ${n}`, location);
-      const len = end - lo;
-      const index = (k) => (typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) ? +k : -1);
-      return new Proxy([], {
-        get(_, k) {
-          if (k === "length") return len;
-          const i = index(k);
-          if (i !== -1) return i < len ? v[lo + i] : undefined;
-          return Array.prototype[k];
-        },
-        set(_, k, x) {
-          const i = index(k);
-          if (i !== -1 && i < len) v[lo + i] = x;
-          return true;
-        },
-        has(_, k) {
-          const i = index(k);
-          return i !== -1 ? i < len : k in Array.prototype;
-        },
-        deleteProperty() {
-          return true;
-        },
-        ownKeys() {
-          return [...Array(len).keys()].map(String).concat("length");
-        },
-        getOwnPropertyDescriptor(_, k) {
-          if (k === "length") return { value: len, writable: true, enumerable: false, configurable: false };
-          const i = index(k);
-          if (i !== -1 && i < len) return { value: v[lo + i], writable: true, enumerable: true, configurable: true };
-          return undefined;
-        },
-      });
+      // A view of a view is a view of its base; a deque's contents are its backing array.
+      const base = v[VIEW];
+      if (base !== undefined) return sliceView(base.v, base.lo + lo, end - lo);
+      return sliceView(arr(v), lo, end - lo);
     },
     // `v.split_at_mut(mid)`: views of both halves.
     $splitAtMut(v, mid, location) {
@@ -3277,6 +3995,15 @@
     },
     // `&s[lo..hi]` with UTF-8 byte offsets, panicking like `str` indexing does.
     $strSlice(s, lo, hi, inclusive, location) {
+      // ASCII: byte offsets are UTF-16 offsets.
+      if (strInfo(s).ascii) {
+        const len = s.length;
+        const end = hi === null ? len : inclusive ? hi + 1 : hi;
+        if (lo > len) throw new CarciniPanic(`start byte index ${lo} is out of bounds for string of length ${len}`, location);
+        if (end > len) throw new CarciniPanic(`end byte index ${end} is out of bounds for string of length ${len}`, location);
+        if (lo > end) throw new CarciniPanic(`byte range starts at ${lo} but ends at ${end}`, location);
+        return s.slice(lo, end);
+      }
       // UTF-8 offset of each code point, and the matching UTF-16 offset.
       const bytes = [];
       const units = [];
@@ -3330,7 +4057,7 @@
       } else {
         at = rev ? s.lastIndexOf(p) : s.indexOf(p);
       }
-      return at < 0 ? null : rt.$utf8len(s.slice(0, at));
+      return at < 0 ? null : strInfo(s).ascii ? at : utf8Len(s.slice(0, at));
     },
     // Where pattern `p` matches in `s`: [start, end] in UTF-16 units, first or last.
     $splitOnce(s, p, rev) {
@@ -3512,6 +4239,13 @@
     },
     $isCharBoundary(s, i) {
       if (i === 0) return true;
+      const info = strInfo(s);
+      if (info.ascii) return i <= s.length;
+      if (s.length >= strInfoMin) {
+        // Not a UTF-8 continuation byte (0b10xxxxxx).
+        const bytes = strBytes(info);
+        return i === bytes.length || (i < bytes.length && (bytes[i] & 0xc0) !== 0x80);
+      }
       let b = 0;
       for (const c of s) {
         if (b === i) return true;
@@ -3523,6 +4257,7 @@
     },
     // The UTF-16 offset of byte offset `i`, or -1 if it isn't on a char boundary.
     $unitOf(s, i) {
+      if (strInfo(s).ascii) return i <= s.length ? i : -1;
       let b = 0;
       let u = 0;
       for (const c of s) {
@@ -3626,6 +4361,7 @@
     // ---- std surface: Vec
     // std's binary search: `f` compares an element with the target.
     $binarySearchBy(v, f) {
+      v = arr(v);
       let size = v.length;
       if (size === 0) return new Res(1, 0);
       let base = 0;
@@ -3643,9 +4379,11 @@
       return [v.slice(0, n), v.slice(n)];
     },
     $vecStartsWith(v, p) {
+      v = arr(v);
       return p.length <= v.length && p.every((x, i) => eq(x, v[i]));
     },
     $vecEndsWith(v, p) {
+      v = arr(v);
       const off = v.length - p.length;
       return off >= 0 && p.every((x, i) => eq(x, v[off + i]));
     },
@@ -3655,6 +4393,7 @@
       return out;
     },
     $isSorted(v) {
+      v = arr(v);
       for (let i = 1; i < v.length; i++) if (!(cmp(v[i - 1], v[i]) <= 0)) return false;
       return true;
     },
@@ -3667,16 +4406,19 @@
       if (at > v.length) {
         throw new CarciniPanic(`\`at\` split index (is ${at}) should be <= len (is ${v.length})`, location);
       }
-      return v.splice(at);
+      const out = v.splice(at);
+      return v instanceof Deque ? Deque.from(out) : out;
     },
     $append(v, other) {
       for (const x of other) v.push(x);
       other.length = 0;
     },
     $fill(v, x) {
+      v = arr(v);
       for (let i = 0; i < v.length; i++) v[i] = clone(x);
     },
     $copyFromSlice(v, src, location) {
+      v = arr(v);
       if (src.length !== v.length) {
         throw new CarciniPanic(
           `source slice length (${src.length}) does not match destination slice length (${v.length})`,
@@ -3690,6 +4432,12 @@
         throw new CarciniPanic(left ? "assertion failed: mid <= self.len()" : "assertion failed: k <= self.len()", location);
       }
       const n = left ? k : v.length - k;
+      // (A view can't grow or shrink: rotate a copy and write it back.)
+      if (v[VIEW] !== undefined) {
+        const c = v.slice();
+        rt.$writeBack(v, 0, c.slice(n).concat(c.slice(0, n)));
+        return;
+      }
       const moved = v.splice(0, n);
       for (const x of moved) v.push(x);
     },
@@ -3697,6 +4445,7 @@
       if (i >= v.length) {
         throw new CarciniPanic(`swap_remove index (is ${i}) should be < len (is ${v.length})`, location);
       }
+      v = arr(v);
       const x = v[i];
       const last = v.pop();
       if (i < v.length) v[i] = last;
@@ -3756,6 +4505,7 @@
       char: { default: () => "\0", from_str: (s) => rt.$parseChar(s) },
       vec: { default: () => [] },
       option: { default: () => null },
+      unit: { default: () => undefined },
     },
     // A number type as a type parameter's class (`T = u8`): its `default()` and kind, for
     // generic arithmetic.
@@ -5204,7 +5954,8 @@
         return n.k === "null" ? null : some(jsonIn(n, s.s));
       case "vec": {
         if (n.k !== "arr") throw jsonInvalid(n, s);
-        return n.v.map((x) => jsonIn(x, s.s));
+        const items = n.v.map((x) => jsonIn(x, s.s));
+        return s.cls === "Deque" ? Deque.from(items) : items;
       }
       case "set": {
         if (n.k !== "arr") throw jsonInvalid(n, s);
@@ -5349,15 +6100,6 @@
       }
       return rt.Err(new SerdeJsonError(e.msg, line, col, e.kind ?? "data"));
     }
-  };
-
-  const utf8Len = (str) => {
-    let n = 0;
-    for (const ch of str) {
-      const c = ch.codePointAt(0);
-      n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
-    }
-    return n;
   };
 
   /// `serde_json::Error`: the message, and where in the text (`{}` adds "at line L column C").
@@ -5600,15 +6342,39 @@
     }
     return out;
   };
+  // A `{..spread}` or a `style`'s entries: a `Vec` of pairs, a `HashMap`, or an object.
+  const reactPairs = (v) => {
+    if (v == null) return [];
+    if (Array.isArray(v) || (typeof v === "object" && typeof v[Symbol.iterator] === "function")) {
+      return [...v];
+    }
+    return Object.entries(v);
+  };
+  const reactStyleOf = (v) => {
+    if (typeof v === "string") return reactStyle(v);
+    const out = {};
+    for (const [k, x] of reactPairs(v)) {
+      if (x == null) continue;
+      const key = k.startsWith("--") || !k.includes("-") ? k : k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      out[key] = typeof x === "bigint" ? String(x) : x;
+    }
+    return out;
+  };
+  const reactDeps = (deps) => (deps === undefined || deps === null ? [] : Array.isArray(deps) ? deps : [deps]);
   const reactComponents = new WeakMap();
   rt.$react = {
     // `React.createElement(tag, props, ...children)`; `props` is a list of `[name, value]`
     // (a `None` value leaves the prop out).
     h(tag, props, children) {
       const p = {};
+      const put = (k, v) => {
+        if (v == null) return;
+        p[k] = k === "style" ? reactStyleOf(v) : typeof v === "bigint" ? String(v) : v;
+      };
       for (const [k, v] of props ?? []) {
-        if (v == null) continue;
-        p[k] = k === "style" && typeof v === "string" ? reactStyle(v) : v;
+        // `{..spread}`: a list of pairs, a map, or an object.
+        if (k === "...") for (const [k2, v2] of reactPairs(v)) put(k2, v2);
+        else put(k, v);
       }
       const R = reactOf();
       return R.createElement(tag === "" ? R.Fragment : tag, p, ...(children ?? []).map(reactChild));
@@ -5638,14 +6404,29 @@
     useState: (init) => reactOf().useState(init),
     // `()` deps: once, after the first render. A cleanup closure is returned as is.
     useEffect(f, deps) {
-      const list = deps === undefined || deps === null ? [] : Array.isArray(deps) ? deps : [deps];
       reactOf().useEffect(() => {
         const r = f();
         return typeof r === "function" ? r : undefined;
-      }, list);
+      }, reactDeps(deps));
     },
     useRef: (init) => reactOf().useRef(init),
+    useMemo: (f, deps) => reactOf().useMemo(f, reactDeps(deps)),
+    useCallback: (f, deps) => reactOf().useCallback(f, reactDeps(deps)),
+    // The reducer gets a copy of the state: a Rust reducer may change it in place and return it,
+    // and React only renders again for a new object.
+    useReducer: (reducer, init) => reactOf().useReducer((s, a) => reducer(rt.$clone(s), a), init),
+    createContext: (dflt) => reactOf().createContext(dflt),
+    useContext: (ctx) => reactOf().useContext(ctx),
+    provide(ctx, key, value, children) {
+      const p = { value };
+      if (key != null) p.key = typeof key === "bigint" ? String(key) : key;
+      return reactOf().createElement(ctx.Provider, p, ...(children ?? []).map(reactChild));
+    },
     call: (f, a) => f(a),
+    // `set(v)`: a closure `v` is the new state, not an updater.
+    setState: (f, v) => f(typeof v === "function" ? () => v : v),
+    // `update(|old| new)`: the updater gets a copy, which it may change in place and return.
+    updateState: (f, g) => f((old) => g(rt.$clone(old))),
     get: (r) => r.current,
     set(r, v) {
       r.current = v;

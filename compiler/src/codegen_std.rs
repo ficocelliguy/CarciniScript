@@ -11,6 +11,34 @@ use super::{Codegen, Frag, default_value, is_pure, js_string, strip_refs};
 use crate::ty::{IntKind, Ty};
 
 impl Codegen<'_> {
+    /// Whether the one argument of `x.wrapping_add(y)` on a BigInt kind is surely a BigInt:
+    /// typed as the kind, or an integer literal (`big_arg` emits it with the `n` suffix).
+    fn big_arg_ok(&self, m: &ast::MethodCallExpr, k: IntKind) -> bool {
+        let Some(list) = m.arg_list() else {
+            return false;
+        };
+        let mut args = list.args();
+        let Some(x) = args.next() else { return false };
+        if args.next().is_some() {
+            return false;
+        }
+        matches!(&x, ast::Expr::Literal(l)
+            if matches!(l.kind(), ast::LiteralKind::IntNumber(n) if n.value().is_ok()))
+            || matches!(self.ty_of(x.syntax()), Some(Ty::Int(k2)) if k2 == k)
+    }
+
+    fn big_arg(&mut self, m: &ast::MethodCallExpr) -> Option<Frag> {
+        let x = m.arg_list()?.args().next()?;
+        if let ast::Expr::Literal(l) = &x
+            && let ast::LiteralKind::IntNumber(n) = l.kind()
+            && let Ok(v) = n.value()
+        {
+            return Some(Frag::text(format!("{v}n")));
+        }
+        let (f, t) = self.emit_expr(&x, None);
+        Some(self.by_value(&x, f, &t))
+    }
+
     fn arg_frags(&mut self, m: &ast::MethodCallExpr) -> Vec<Frag> {
         let args: Vec<ast::Expr> = m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
         args.iter()
@@ -153,6 +181,21 @@ impl Codegen<'_> {
             (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow") => rf.clone(),
             (Ty::Int(_), "is_multiple_of") => helper("isMultipleOf", self.arg_frags(m)),
             // ---- integers
+            // `h.wrapping_mul(k)` on a BigInt kind with a BigInt argument: inline, wrapped to
+            // the width (hash loops; `κσ.$big` parses the method name per call).
+            (Ty::Int(k), m2 @ ("wrapping_add" | "wrapping_sub" | "wrapping_mul"))
+                if k.is_big() && self.big_arg_ok(m, *k) =>
+            {
+                let b = self.big_arg(m)?;
+                let op = match m2 {
+                    "wrapping_add" => " + ",
+                    "wrapping_sub" => " - ",
+                    _ => " * ",
+                };
+                let mut f = rf.clone();
+                f.push(op).append(b.wrap("(", ")"));
+                super::wrap_big(f, *k)
+            }
             // BigInt kinds: one runtime dispatcher, exact at the type's width.
             (Ty::Int(k), m2)
                 if k.is_big()

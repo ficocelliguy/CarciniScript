@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use ra_ap_syntax::{
-    AstNode, SourceFile, SyntaxKind,
+    AstNode, SyntaxKind,
     ast::{self, HasAttrs, HasName},
 };
 
@@ -117,7 +117,7 @@ pub fn collect(src: &str) -> HashMap<String, SerdeInfo> {
     if !src.contains("serde") {
         return out;
     }
-    let file = SourceFile::parse(src, crate::macros::EDITION).tree();
+    let file = crate::macros::parse_tree(src);
     for item in file.syntax().descendants().filter_map(ast::Item::cast) {
         let mut info = SerdeInfo::default();
         let name = match &item {

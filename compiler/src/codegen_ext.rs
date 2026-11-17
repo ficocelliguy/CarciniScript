@@ -938,6 +938,7 @@ impl Codegen<'_> {
                     Ty::Set(_) => "collectSet",
                     Ty::Map(..) => "collectMap",
                     Ty::Str => "collectString",
+                    Ty::Coll(crate::ty::Coll::VecDeque, _) => "collectDeque",
                     Ty::Coll(crate::ty::Coll::BTreeSet, _) => "collectBTreeSet",
                     Ty::Coll(crate::ty::Coll::BTreeMap, _) => "collectBTreeMap",
                     Ty::Coll(crate::ty::Coll::IndexSet, _) => "collectIndexSet",
@@ -996,11 +997,17 @@ fn arith_fold(method: &str, ty: &Ty) -> (String, &'static str) {
     };
     match (method, ty) {
         ("sum", Ty::Int(k)) if k.is_big() => (
-            format!("(a, b) => κσ.$w128(a + b, {}, {})", k.is_signed(), k.bits()),
+            format!(
+                "(a, b) => {}",
+                super::wrap_big(Frag::text("a + b"), *k).plain()
+            ),
             "0n",
         ),
         ("product", Ty::Int(k)) if k.is_big() => (
-            format!("(a, b) => κσ.$w128(a * b, {}, {})", k.is_signed(), k.bits()),
+            format!(
+                "(a, b) => {}",
+                super::wrap_big(Frag::text("a * b"), *k).plain()
+            ),
             "1n",
         ),
         // (`f32`: each step rounded to f32, as the hardware does.)

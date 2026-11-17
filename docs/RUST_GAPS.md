@@ -47,10 +47,13 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `*map.entry(k).or_insert(..) += ..`. `iter_mut()` / `values_mut()` loops do write through.
 - **`HashSet` and `HashMap` iterate in insertion order.** Rust's order is unspecified (and randomized), so code
   that depended on CarciniScript's order would already be wrong in Rust.
-- **`BTreeMap` and `BTreeSet` re-sort when read after new keys arrive** (they are the hash classes
-  kept in key order), so a loop that alternates inserts and ordered reads costs O(n log n) per
-  read instead of O(log n). `VecDeque::pop_front` / `push_front` shift a JS array: O(n), fast enough
-  for queues of a few thousand servers.
+- **`BTreeMap` and `BTreeSet` are the hash classes plus a sorted array** of their entries: a
+  single insert or remove is a binary search plus a memmove (O(n), but a fast one), `pop_first`
+  / `first` / `last` / `range` are O(1) or O(log n) to find; a bulk load (more than 512 inserts
+  between ordered reads) is appended and sorted at the next ordered read. `VecDeque` is a ring
+  buffer (`κσ.Deque`): `pop_front` / `push_front` are O(1); `q[i]` goes through its index method,
+  and the `Vec` methods it shares run on its contents made contiguous (`make_contiguous()` is that
+  array).
 - **`VecDeque::insert` past the end appends instead of panicking**, and `BTreeMap::range` isn't
   supported yet.
 
@@ -92,7 +95,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   next to a `name` field), so the instance property doesn't hide the method. This only shows when
   JS code reads the object directly.
 - **A `&mut` to a number, string, bool or `Option` inside a struct, tuple or Vec** works as an
-  argument (`insert(&mut node.left, v)`: the callee gets a cell over that slot), but can't be kept
+  argument (`insert(&mut node.left, v)`: the callee gets a cell over that slot, or a temp that is
+  written back after the call when its signature can't keep the borrow), but can't be kept
   in a local (`let cur = &mut self.root;` walking a tree, `let n = &mut self.count;`): that's a
   compile error, since writes through it would be lost. Recursion, or assigning through the place
   itself, does the same job.
@@ -159,8 +163,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   needs `zeros::<4>()` (it's a "type annotations needed" error, not a wrong value). For the same
   reason a mismatched length (`sum::<2>([1, 2, 3])`) isn't an error. A const argument can be a
   literal, integer arithmetic on literals (`{ 128 / 8 }`), a const parameter or a `const` item,
-  not a `const fn` call. Const parameters on enums, a trait's const parameter read in the
-  trait's default methods, and 64/128-bit ones, aren't supported.
+  not a `const fn` call. A trait's const parameter read in the trait's default methods, and
+  64/128-bit ones, aren't supported.
 - **Associated types are checked through function type parameters, not `impl<T>`'s or `dyn`.**
   In `fn f<S: Shape>`, `S::Unit` is its own type with the bounds the trait declares, as in
   rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
@@ -172,8 +176,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`RefCell` doesn't track borrows**, so a `borrow_mut` while another borrow is alive doesn't
   panic. `Rc` is erased: `Rc::strong_count` and `Weak` aren't available, and `.clone()` on a
   struct without `#[derive(Clone)]` is taken to be an `Rc` clone (it shares the value).
-- **Shared slices are copies.** `&v[1..3]` reads like Rust; `&mut v[a..b]` is a view instead (see
-  above), and `&mut s[a..b]` of a string is rejected.
+- **Shared slices are copies**, except as the argument of one of the file's own functions whose
+  `&[T]` parameter only reads a little of it (its length, elements outside loops, sub-slices for
+  such calls, iteration): that call gets a view, so recursion over `&v[1..]` is linear. `&v[1..3]`
+  reads like Rust either way; `&mut v[a..b]` is always a view (see above), and `&mut s[a..b]` of a
+  string is rejected.
 
 ## Option and patterns
 
@@ -231,7 +238,27 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **The bundled crates are `rand`, `itertools`, `anyhow`, `thiserror`, `bitflags`, `once_cell`,
   `lazy_static`, `either`, `cfg_if`, `hashbrown`, `serde`, `serde_json`, `regex`, `rayon`, `log`
   (with `env_logger` / `simple_logger`), `num` (`num-traits`, `num-integer`), `tokio`,
-  `futures`, `rand_distr`, `chrono` and `clap`**; any other crate is an error.
+  `futures`, `rand_distr`, `chrono`, `clap`, `rustc_hash`, `smallvec`, `indexmap`, `ordered_float` and
+  `petgraph`**; any other crate is an error.
+- **`ordered-float`:** `{}` of an `OrderedFloat<f32>` / `NotNan<f32>` prints the `f64` digits
+  (`0.10000000149011612`; `{:?}` is right): the generic `Display` can't tell an `f32` in JS.
+  Float methods go through `Deref` (`x.sqrt()` is an `f64`, as without `use num_traits::Float`);
+  `Sum` / `Product`, `NotNan` with plain floats (`n + 1.0`), comparisons with plain floats
+  (`OrderedFloat(1.0) == 1.0`), `NotNan::try_from` and serde aren't there.
+- **`petgraph`:** `Graph`'s index type is always `u32` (no `Graph<N, E, Ty, Ix>` / `NodeIndex<Ix>`),
+  and there's no `StableGraph`, `MatrixGraph`, `Csr`, `Dot`, `Graph`'s `{:?}`, `map` /
+  `filter_map` / `retain_*`, `Topo`, `Reversed`, `Walker::iter` or the other `algo` functions
+  (`all_simple_paths`, `floyd_warshall`, `condensation`, ..). `neighbors(..)` and the other
+  iterators are collected when called (no `detach()`). `node_weight_mut` / `edge_weight_mut` /
+  `GraphMap::edge_weight_mut` write through for struct weights only; for numbers and strings use
+  `g[n] = ..` / `g[n] += ..`. `from_edges` / `extend_with_edges` take pairs (`E::default()`
+  weights) only when the list is written out (`&[(0, 1), ..]`, `vec![..]`); anything else is
+  read as `(a, b, w)` triples. A `GraphMap` algorithm's cost closure gets the edge as a tuple
+  struct (`e.weight()`, `*e.2`), so `|(a, b, w)|` doesn't destructure it. `DfsSpace` is accepted
+  and unused. Walkers' `next(&g)` is recognized by its argument (an iterator's `next` has none),
+  so your own `fn next(&mut self, x)` in a file that uses petgraph is rewritten too.
+- **`indexmap`:** a number index is a position and a reference a key, by how it's written (the
+  types don't keep references), so `map[k]` with `k: &u32` indexes by position here.
 - **`log` writes `[LEVEL] message`** to stderr, without env_logger's timestamp and target, and
   there's no `RUST_LOG`: `env_logger::init()` logs errors only; set a level with
   `Builder::filter_level` or `Env::default().default_filter_or("info")`.
@@ -322,7 +349,14 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   and a `&str` are one type here), and `is_borrowed` / `is_owned` (unstable in Rust) aren't
   there.
 - **`stdin()` is always at its end**, as a script has no input stream: read input from
-  `ns.args`, a file or `ns.prompt` instead. Files aren't there.
+  `ns.args`, a file or `ns.prompt` instead.
+- **`std::fs` and `process::Command` always fail**: there's no filesystem or process to reach.
+  Reading (`File::open`, `fs::read_to_string`, `fs::read`, `fs::metadata`, `fs::read_dir`) gives
+  `ErrorKind::NotFound`, anything else (`File::create`, `fs::write`, `create_dir`, `remove_*`,
+  `copy`, `rename`, `Command::output` / `status` / `spawn`) `Unsupported`, so programs that handle
+  the error run; their messages say so (Rust's are the OS's). Use `ns.read` / `ns.write`.
+- **`write_vectored` writes every buffer** (as a `Vec<u8>` does in Rust; std's default, and
+  Windows' stdout, write only the first).
 - **`Read` / `BufRead` are the io prelude's traits.** `BufRead::fill_buf` gives a copy of the
   buffer (a `Vec<u8>`), and `lines()` / `split()` / `bytes()` read everything up front rather
   than lazily. `Seek` isn't there. `Cursor::new(Vec::new())` is a `Cursor<Vec<u8>>` (as its
@@ -334,6 +368,24 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   a `Cursor`. `get_ref()` of a `BufReader` over bytes gives that `Cursor`.
 
 ## Std types and traits filled in
+
+- **Awaiting a hand-written future polls it from the event loop**: after `Pending` it waits for
+  its waker (a future that never wakes it never finishes, as in Rust). Async fns and blocks are
+  JS promises, which start when called and can't be polled to completion synchronously: `poll`
+  on one is `Pending` until it settles (then the waker is woken), so a hand-written `block_on`
+  loop over an async fn never ends; drive those with `.await` (an `async fn main`). A
+  hand-written future's class can be awaited because it has a `then` method, so an async fn
+  returning one (unawaited) resolves to its output. `std::task::Wake` (`Waker::from(Arc<W>)`)
+  and `RawWaker` aren't there.
+- **`dyn Any` tests values at run time**: a struct or enum by its class (not its type
+  arguments), numbers by their JS type and the target's range (so a boxed `5u8` is also an
+  `i32` and an `f64`; `i64` / `u64` are BigInts and tell apart), a `String` and a `&str` alike
+  (also a one-char string and a `char`). `Option` / `Result` / closures can't be told apart (an
+  error). `type_id()` of a `dyn Any` isn't known (use `is::<T>()`); `TypeId`'s `{:?}` is the
+  type's name, not a hash, and `String` / `&str` share one. `type_name` puts the file's name as
+  the crate (`my_script::Point`), ignoring the `mod` a type is in.
+- **A `&mut dyn fmt::Write` parameter is a type parameter**, so the function is generic over
+  its writer; a `&mut dyn Write` struct field or closure parameter isn't supported.
 
 - **`PhantomData`'s `{:?}` is `PhantomData<_>`**: Rust names the type (`PhantomData<i32>`), whose
   name isn't known at run time.
@@ -459,9 +511,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 ## Checking
 
 - **A partial borrow checker.** Lifetimes are erased. The common conflicts (changing a Vec while a
-  reference into it is used later, or inside a `for` over it) are reported, as warnings unless
-  strict borrows are on; borrows that flow through function calls, struct fields or closures
-  aren't tracked, so other programs rustc rejects still run.
+  reference into it is used later, or inside a `for` over it, also when the reference came from
+  a call of the file's own function or method, or borrows one field of a struct) are reported,
+  as warnings unless strict borrows are on. It errs toward silence: borrows through closures,
+  struct literals, other modules' functions, trait default methods, or a reference handed on from
+  local to local aren't tracked, and a borrow taken in one loop iteration and used in the next
+  isn't seen, so other programs rustc rejects still run.
 - **Use after move is checked only where the checker is sure a local owns its value** (see
   FEATURES). It misses moves out of fields (`let v = s.items;` then `s.items`), out of pattern
   bindings, and into closures without `move`; those run with the JS value still shared.
@@ -478,6 +533,16 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   to the integer impl (`i64` / `u64` / `i128` / `u128` values are BigInts and always reach their
   own impl). Called on a value of known type (`x.money()` with `x: f64`), the right impl is
   chosen at compile time.
+- **An `Option` through a generic `T: Trait`** is `null` or its value at run time, so the
+  `Option` impl serves `None` and any `Some(x)` whose value's own type has no impl of that
+  method; when both `Option<u8>` and `u8` implement it, `Some(3u8)` reaches `u8`'s. A nested
+  `Option<Option<T>>` there doesn't print its inner value with `{:?}`.
+- **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`, `Path` and `PathBuf`): one
+  type in JS, so the borrowed type's impl serves both and the owned one's body isn't used (it
+  usually hands on to the borrowed one anyway).
+- **`Box<dyn Error>` from a string** (`"x".into()`, `format!(..).into()`) is the string itself:
+  `{}`, `{:?}` and `to_string()` match std, but `downcast_ref::<String>()` style checks see a
+  plain string.
 - **A trait of yours named like a std trait** (`trait Write`) is the one `impl fmt::Write for X`
   is checked against, since traits are matched by their last path segment.
 - **`impl Tr for &T` / `&mut T` / `Box<T>` must forward to `T`'s impl.** References and boxes are

@@ -1,0 +1,23 @@
+          broken NaN
+      foodnstuff 2500000.0
+ sigma-cosmetics 2421052.6
+        joesguns 2083333.3
+         n00dles 700000.0
+Some(Reverse(OrderedFloat(-1.0)))
+[-1.0, 2.0, 3.5, 10.25]
+[OrderedFloat(-0.5), OrderedFloat(0.0), OrderedFloat(2.5), OrderedFloat(7.0), OrderedFloat(NaN)]
+broken 700000 Some(OrderedFloat(NaN))
+true true
+Greater
+Some(OrderedFloat(NaN))
+["joesguns", "sigma-cosmetics", "foodnstuff", "broken"]
+[(OrderedFloat(-0.0), 2), (OrderedFloat(1.5), 2), (OrderedFloat(2.0), 1), (OrderedFloat(inf), 1), (OrderedFloat(NaN), 2)]
+{OrderedFloat(1.0), OrderedFloat(2.0), OrderedFloat(3.0)}
+13 OrderedFloat(-13.0) 13 3.25 3.606
+0.6666666666666666 1
+OrderedFloat(0.1) OrderedFloat(0.3)
+OrderedFloat(0.0)
+4.5 NotNan(0.5) 5.5 5
+Err(FloatIsNan) Ok(NotNan(3.0))
+error: NotNan constructed with NaN
+[NotNan(-1.0), NotNan(2.0), NotNan(3.0)] Some(NotNan(3.0))

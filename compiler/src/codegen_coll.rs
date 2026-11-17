@@ -29,7 +29,7 @@ impl Codegen<'_> {
                     .next()
                     .unwrap_or_else(|| Frag::text("[]"));
                 match kind {
-                    Coll::VecDeque => arg.wrap("[...", "]"),
+                    Coll::VecDeque => arg.wrap("κσ.Deque.from(", ")"),
                     Coll::BinaryHeap => arg.wrap("κσ.$heapFrom([...", "])"),
                     Coll::BTreeMap => arg.wrap("κσ.BTreeMap.from(", ")"),
                     Coll::BTreeSet => arg.wrap("κσ.BTreeSet.from(", ")"),
@@ -82,6 +82,12 @@ impl Codegen<'_> {
                 let (f, t) = self.emit_expr(a, None);
                 vals.push(self.by_value(a, f, &t));
             }
+            // (`get_index_mut` of numbers: `[k, slot]`, whose slot `Some((k, v))` binds.)
+            if method == "get_index_mut"
+                && self.types.slot_calls.contains(&self.range_of(m.syntax()))
+            {
+                vals.push(Frag::text("true"));
+            }
             let mut f = rf.clone();
             f.push(format!(".${js}("))
                 .append(Frag::join(vals, ", "))
@@ -95,7 +101,7 @@ impl Codegen<'_> {
             (Coll::VecDeque, "pop_front") => "shift",
             (
                 Coll::VecDeque,
-                "front" | "back" | "insert" | "remove" | "make_contiguous" | "append",
+                "front" | "back" | "insert" | "remove" | "make_contiguous" | "append" | "clone",
             ) => method,
             (
                 Coll::BinaryHeap,
@@ -151,12 +157,10 @@ impl Codegen<'_> {
                 method_call("splice", vec![arg(0), Frag::text("0"), arg(1)])
             }
             (Coll::VecDeque, "remove") => call("dqRemove", vec![arg(0)]),
-            (Coll::VecDeque, "make_contiguous") => rf.clone(),
-            (Coll::VecDeque, "append") => {
-                let mut f = rf.clone();
-                f.push(".push(...").append(arg(0)).push(".splice(0))");
-                f
-            }
+            // (The deque's contents made contiguous: its backing array, so writes reach it.)
+            (Coll::VecDeque, "make_contiguous") => method_call("$arr", vec![]),
+            (Coll::VecDeque, "append") => call("append", vec![arg(0)]),
+            (Coll::VecDeque, "clone") => method_call("$clone", vec![]),
             (Coll::BinaryHeap, "push") => call("heapPush", vec![arg(0)]),
             (Coll::BinaryHeap, "pop") => call("heapPop", vec![]),
             (Coll::BinaryHeap, "peek") => rf.clone().wrap("(", "[0] ?? null)"),
@@ -217,7 +221,8 @@ impl Codegen<'_> {
 /// A new, empty collection of `kind`.
 pub(super) fn new_coll(kind: Coll) -> &'static str {
     match kind {
-        Coll::VecDeque | Coll::BinaryHeap => "[]",
+        Coll::VecDeque => "new κσ.Deque()",
+        Coll::BinaryHeap => "[]",
         Coll::BTreeMap => "new κσ.BTreeMap()",
         Coll::BTreeSet => "new κσ.BTreeSet()",
         Coll::IndexMap => "new κσ.IndexMap()",

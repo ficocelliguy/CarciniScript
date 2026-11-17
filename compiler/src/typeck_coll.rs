@@ -72,6 +72,7 @@ pub(crate) fn index_method(method: &str) -> bool {
     matches!(
         method,
         "get_index"
+            | "get_index_mut"
             | "get_index_of"
             | "get_full"
             | "insert_full"
@@ -155,13 +156,46 @@ impl Checker<'_> {
             }
             _ => Vec::new(),
         };
-        let targs = self.segment_targs(&path_segs, ty);
+        // (A trailing hasher argument, `IndexSet::<K, S>::default()`, is ignored.)
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let keep = if matches!(kind, Coll::BTreeMap | Coll::IndexMap) {
+            2
+        } else {
+            1
+        };
+        let trimmed: Vec<ast::PathSegment> = path_segs
+            .iter()
+            .map(|s| match s.generic_arg_list() {
+                Some(gl)
+                    if s.name_ref().is_some_and(|n| n.text() == *ty)
+                        && gl.generic_args().count() > keep =>
+                {
+                    let kept: Vec<String> = gl
+                        .generic_args()
+                        .take(keep)
+                        .map(|g| g.syntax().text().to_string())
+                        .collect();
+                    let text = format!("{}::<{}>", ty, kept.join(", "));
+                    ra_ap_syntax::SourceFile::parse(
+                        &format!("fn f() {{ {text}; }}"),
+                        crate::macros::EDITION,
+                    )
+                    .tree()
+                    .syntax()
+                    .descendants()
+                    .find_map(ast::PathSegment::cast)
+                    .unwrap_or_else(|| s.clone())
+                }
+                _ => s.clone(),
+            })
+            .collect();
+        let targs = self.segment_targs(&trimmed, ty);
         let t = self.coll_type(kind, targs);
         let Ty::Coll(_, view) = &t else {
             unreachable!()
         };
         match *ctor {
-            "new" => self.arg_count(c.syntax(), "function", 0, args.len()),
+            "new" | "default" => self.arg_count(c.syntax(), "function", 0, args.len()),
             "with_capacity" if kind != Coll::BTreeMap && kind != Coll::BTreeSet => {
                 self.arg_count(c.syntax(), "function", 1, args.len());
                 if let Some(a) = args.first() {
@@ -195,6 +229,76 @@ impl Checker<'_> {
         Some(t)
     }
 
+    /// `map[i]` / `set[i]` (a number that isn't a reference: indexmap's `Index<usize>`) by
+    /// position, and `map[&k]` / `map[i]` as a place (`IndexMut`): a `Conv::Method` of the
+    /// runtime's (`$at` / `$atMut` / `$keyMut`), with `index_places` for a place. None leaves
+    /// a read by key to the maps' indexing.
+    pub(super) fn index_coll_index(
+        &mut self,
+        ix: &ast::IndexExpr,
+        kind: Coll,
+        view: &Ty,
+        index: &ast::Expr,
+    ) -> Option<Ty> {
+        use crate::adt::Conv;
+        let by_ref = matches!(super::strip_parens(index), ast::Expr::RefExpr(_));
+        let (key, value) = match view {
+            Ty::Map(k, v) => ((**k).clone(), (**v).clone()),
+            Ty::Set(e) => (USIZE, (**e).clone()),
+            _ => return None,
+        };
+        let parent = ix.syntax().parent();
+        let assigned = parent
+            .clone()
+            .and_then(ast::BinExpr::cast)
+            .is_some_and(|b| {
+                matches!(b.op_kind(), Some(ast::BinaryOp::Assignment { .. }))
+                    && b.lhs().is_some_and(|l| l.syntax() == ix.syntax())
+            });
+        // (`map[0].push_str(..)`: a string value needs the place too.)
+        let str_receiver = self.shallow(&value) == Ty::Str
+            && parent
+                .and_then(ast::MethodCallExpr::cast)
+                .is_some_and(|m| m.receiver().is_some_and(|r| r.syntax() == ix.syntax()));
+        let place = (assigned || str_receiver) && kind == Coll::IndexMap;
+        let positional = if kind == Coll::IndexSet || by_ref {
+            kind == Coll::IndexSet
+        } else {
+            let it = self.infer(index, None);
+            let int = matches!(self.shallow(&it), Ty::Int(_) | Ty::IntLit)
+                || (matches!(self.shallow(&it), Ty::Var(_))
+                    && self.var_kind(&it) == Some(VarKind::Int));
+            if int {
+                self.unify(&it, &USIZE);
+            } else {
+                self.expect(index.syntax(), &it, &key);
+            }
+            int
+        };
+        if positional && kind == Coll::IndexSet {
+            self.check(index, &USIZE);
+        }
+        if by_ref && kind == Coll::IndexMap {
+            self.check(index, &key);
+        }
+        if place {
+            if let Some(recv) = ix.base() {
+                self.check_mutable(&recv, Mutation::Borrow);
+            }
+            let r = self.range(ix.syntax());
+            self.index_places.insert(r);
+        }
+        let js = match (positional, place) {
+            (true, false) => "$at",
+            (true, true) => "$atMut",
+            (false, true) => "$keyMut",
+            // (Read by key: `κσ.$mapIndex`.)
+            (false, false) => return Some(value),
+        };
+        self.record_conv(ix.syntax(), Conv::Method { key: js.into() });
+        Some(value)
+    }
+
     /// An `IndexMap` / `IndexSet` method about positions (see `index_method`).
     fn index_coll_method(
         &mut self,
@@ -217,6 +321,29 @@ impl Checker<'_> {
                 let kv = Ty::Tuple(vec![k.clone(), v.clone()]);
                 match method {
                     "get_index" => sig(self, &[USIZE], opt(kv)),
+                    // (Numbers, strings and bools are copies: the value comes as a slot that
+                    // `Some((k, v))` binds, so `*v += 1` reaches the map.)
+                    "get_index_mut" => {
+                        if let Some(recv) = m.receiver() {
+                            self.check_mutable(&recv, Mutation::Borrow);
+                        }
+                        let resolved = self.zonk(&v);
+                        if resolved.is_js_primitive() || resolved == Ty::Unknown {
+                            if super::matched_position(m) {
+                                let r = self.range(m.syntax());
+                                self.slot_calls.insert(r);
+                            } else {
+                                self.error(
+                                    m.syntax(),
+                                    format!(
+                                        "`IndexMap::get_index_mut` on a map of `{}` isn't supported here (the value would be copied, so changes wouldn't stick); use it in `if let Some((k, v)) = ..` / `match`, or index with `map[i]`",
+                                        self.describe(&v)
+                                    ),
+                                );
+                            }
+                        }
+                        sig(self, &[USIZE], opt(kv))
+                    }
                     "get_index_of" => sig(self, &[k], opt(USIZE)),
                     "get_full" => sig(self, &[k.clone()], opt(Ty::Tuple(vec![USIZE, k, v]))),
                     "insert_full" => sig(self, &[k, v.clone()], Ty::Tuple(vec![USIZE, opt(v)])),

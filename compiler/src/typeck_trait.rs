@@ -395,7 +395,7 @@ impl Checker<'_> {
             .trait_impls
             .entry(type_name.to_string())
             .or_default();
-        if impls.iter().any(|t| t == tr) {
+        if impls.iter().any(|t| t == tr) && def.type_params.is_empty() {
             let node = imp
                 .trait_()
                 .map(|t| t.syntax().clone())

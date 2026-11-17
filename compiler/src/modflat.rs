@@ -12,11 +12,10 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
-    AstNode, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken,
+    AstNode, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, HasModuleItem, HasName, HasVisibility},
 };
 
-use crate::macros::EDITION;
 use crate::mbe::OffsetMap;
 
 /// What a `use` brings into a module: an item of some module, or a whole module.
@@ -457,7 +456,7 @@ pub fn has_inline_modules(text: &str) -> bool {
     if !text.contains("mod ") && !text.contains("super::") && !text.contains("self::") {
         return false;
     }
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     file.syntax()
         .descendants()
         .filter_map(ast::Module::cast)
@@ -471,7 +470,7 @@ pub fn has_inline_modules(text: &str) -> bool {
 
 /// Flatten `text` in place, recording the edits in `map`.
 pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
-    let parsed = SourceFile::parse(text, EDITION);
+    let parsed = crate::macros::parse_file(text);
     // In a file that doesn't parse, module errors would only be noise.
     let broken = !parsed.errors().is_empty();
     let file = parsed.tree();

@@ -10,11 +10,11 @@ use ra_ap_syntax::{
     ast::{self, HasArgList},
 };
 
-use crate::macros::EDITION;
 use crate::mbe::OffsetMap;
 
 const MARKER: &str = include_str!("marker_prelude.rs");
 const PATH: &str = include_str!("path_prelude.rs");
+const WRAPPING: &str = include_str!("wrapping_prelude.rs");
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
 fn declares(text: &str, name: &str) -> bool {
@@ -30,7 +30,10 @@ pub(crate) fn preludes(text: &str) -> String {
         && !text.contains("// (path prelude)")
         && !declares(text, "PathBuf");
     // (The path prelude's `FromStr` names `Infallible`.)
-    if (text.contains("PhantomData") || text.contains("Infallible") || path)
+    if (text.contains("PhantomData")
+        || text.contains("Infallible")
+        || text.contains("AllocGlobal")
+        || path)
         && !text.contains("// (marker prelude)")
         && !declares(text, "PhantomData")
         && !declares(text, "Infallible")
@@ -42,29 +45,48 @@ pub(crate) fn preludes(text: &str) -> String {
         out.push('\n');
         out.push_str(PATH);
     }
+    if text.contains("Wrapping")
+        && !text.contains("// (wrapping prelude)")
+        && !declares(text, "Wrapping")
+    {
+        out.push('\n');
+        out.push_str(WRAPPING);
+    }
     out
 }
 
 /// Whether the pre-pass has anything to do in `text`.
 pub(crate) fn has_rewrites(text: &str) -> bool {
+    // (The names `std_module` knows, as whole words: `Ref` isn't in `RefCell`.)
     [
         "Path",
+        "PathBuf",
         "OsStr",
         "OsString",
         "Arguments",
-        "format_args",
-        "env!",
-        "include!",
-        "fmt::format",
-        "write_fmt",
-        "NonZero",
         "Ref",
+        "RefMut",
         "Infallible",
         "Read",
+        "BufRead",
         "Cursor",
     ]
     .iter()
-    .any(|n| text.contains(n))
+    .any(|n| crate::stdtime::has_word(text, n))
+        || [
+            "format_args",
+            "env!",
+            "include!",
+            "fmt::format",
+            "write_fmt",
+            "NonZero",
+            "dyn FmtWrite",
+            "dyn IoWrite",
+            "impl FmtWrite",
+            "impl IoWrite",
+        ]
+        .iter()
+        .any(|n| text.contains(n))
 }
 
 /// The std module a name this pass rewrites lives in.
@@ -152,7 +174,7 @@ pub(crate) fn expand(
     map: &mut OffsetMap,
     resolver: Option<crate::typeck::Resolver>,
 ) -> Result<bool, Vec<(usize, usize, String)>> {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let imports = std_imports(&file);
     // `include!("items.in");` among the items: its `;` goes too.
     let item_includes: Vec<usize> = file
@@ -175,6 +197,7 @@ pub(crate) fn expand(
         .collect();
     let toks = tokens(&file, &uses);
     let mut edits: Vec<(usize, usize, String)> = write_fmt_calls(&file);
+    edits.extend(writer_params(&file));
     let txt = |i: usize| toks.get(i).map(|t| t.text.clone()).unwrap_or_default();
     let mut errors = Vec::new();
     let mut i = 0;
@@ -335,6 +358,12 @@ pub(crate) fn expand(
     if !errors.is_empty() {
         return Err(errors);
     }
+    // `impl Tr for PathBuf` next to `impl Tr for Path` (both the path prelude's `PathBuf` here,
+    // as `OsString` and `OsStr` are both `String`): the borrowed type's impl serves, the owned
+    // one (which usually hands on to it) goes.
+    let dropped = owned_twin_impls(&file);
+    edits.retain(|(a, b, _)| !dropped.iter().any(|(x, y)| x <= a && b <= y));
+    edits.extend(dropped.iter().map(|(x, y)| (*x, *y, String::new())));
     // (From the end; at one offset, a replacement before an insertion.)
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
     edits.dedup();
@@ -344,6 +373,46 @@ pub(crate) fn expand(
         map.replace(a, b, new.len());
     }
     Ok(changed)
+}
+
+/// The ranges of `impl Tr for PathBuf` / `impl Tr for OsString` blocks whose trait the file also
+/// implements for `Path` / `OsStr`.
+fn owned_twin_impls(file: &SourceFile) -> Vec<(usize, usize)> {
+    let self_name = |imp: &ast::Impl| {
+        let mut t = imp.self_ty()?;
+        while let ast::Type::RefType(r) = t {
+            t = r.ty()?;
+        }
+        match t {
+            ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+            _ => None,
+        }
+    };
+    let impls: Vec<(ast::Impl, String, String)> = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Impl::cast)
+        .filter_map(|imp| {
+            let tr = imp.trait_()?.syntax().text().to_string();
+            let s = self_name(&imp)?;
+            Some((imp, tr, s))
+        })
+        .collect();
+    impls
+        .iter()
+        .filter(|(_, tr, s)| {
+            let borrowed = match s.as_str() {
+                "PathBuf" => "Path",
+                "OsString" => "OsStr",
+                _ => return false,
+            };
+            impls.iter().any(|(_, t2, s2)| t2 == tr && s2 == borrowed)
+        })
+        .map(|(imp, _, _)| {
+            let r = imp.syntax().text_range();
+            (r.start().into(), r.end().into())
+        })
+        .collect()
 }
 
 /// `NonZero*`, `Ref` / `RefMut` and `Infallible` (the std name at `toks[i]`, its path starting at
@@ -509,6 +578,80 @@ fn tokens(file: &SourceFile, uses: &[TextRange]) -> Vec<Tok> {
             in_use: uses.iter().any(|u| u.contains_range(r)),
             string,
         });
+    }
+    out
+}
+
+/// `fn put(w: &mut dyn fmt::Write)` (after the rename, `dyn FmtWrite`; also `io::Write` and
+/// `impl ..`) as `fn put<__W0: FmtWrite>(w: &mut __W0)`: the writer is passed as a generic
+/// one is (a `String` or a `Formatter` through its cell, your own writer, a `Vec<u8>`).
+fn writer_params(file: &SourceFile) -> Vec<(usize, usize, String)> {
+    use ast::{HasGenericParams, HasName};
+    let mut out = Vec::new();
+    for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
+        let Some(pl) = f.param_list() else { continue };
+        let mut added: Vec<String> = Vec::new();
+        for p in pl.params() {
+            let Some(ast::Type::RefType(r)) = p.ty() else {
+                continue;
+            };
+            let Some(mut inner) = r.ty().filter(|_| r.mut_token().is_some()) else {
+                continue;
+            };
+            if let ast::Type::ParenType(pt) = &inner
+                && let Some(t) = pt.ty()
+            {
+                inner = t;
+            }
+            let bounds = match &inner {
+                ast::Type::DynTraitType(d) => d.type_bound_list(),
+                ast::Type::ImplTraitType(i) => i.type_bound_list(),
+                _ => None,
+            };
+            let Some(tr) = bounds.into_iter().flat_map(|l| l.bounds()).find_map(|b| {
+                let n = match b.ty()? {
+                    ast::Type::PathType(pt) => pt.path()?.segment()?.name_ref()?.text().to_string(),
+                    _ => return None,
+                };
+                matches!(n.as_str(), "FmtWrite" | "IoWrite").then_some(n)
+            }) else {
+                continue;
+            };
+            let name = format!("__W{}", added.len());
+            let range = r
+                .ty()
+                .map(|t| t.syntax().text_range())
+                .unwrap_or(inner.syntax().text_range());
+            out.push((
+                usize::from(range.start()),
+                usize::from(range.end()),
+                name.clone(),
+            ));
+            added.push(format!("{name}: {tr}"));
+        }
+        if added.is_empty() {
+            continue;
+        }
+        let list = added.join(", ");
+        match f.generic_param_list() {
+            Some(gl) => {
+                let Some(close) = gl.r_angle_token() else {
+                    continue;
+                };
+                let at = usize::from(close.text_range().start());
+                let sep = if gl.generic_params().next().is_some() {
+                    ", "
+                } else {
+                    ""
+                };
+                out.push((at, at, format!("{sep}{list}")));
+            }
+            None => {
+                let Some(n) = f.name() else { continue };
+                let at = usize::from(n.syntax().text_range().end());
+                out.push((at, at, format!("<{list}>")));
+            }
+        }
     }
     out
 }

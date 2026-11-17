@@ -11,7 +11,6 @@ use ra_ap_syntax::{
     ast::{self, HasGenericArgs, HasModuleItem, HasName},
 };
 
-use crate::macros::EDITION;
 use crate::mbe::OffsetMap;
 
 /// Each file-level enum's variant names.
@@ -36,7 +35,7 @@ pub fn has_variant_imports(text: &str) -> bool {
     if !text.contains("use ") {
         return false;
     }
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let enums = enums(&file);
     !enums.is_empty()
         && file
@@ -76,7 +75,7 @@ fn imports(u: &ast::Use, enums: &HashMap<String, Vec<String>>) -> Option<HashMap
 
 /// Rewrite the imported variants in `text`, recording the edits in `map`.
 pub fn expand(text: &mut String, map: &mut OffsetMap) {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let enums = enums(&file);
     // (scope, names) for each `use`, and the `use`s to drop.
     let mut scopes: Vec<(TextRange, HashMap<String, String>)> = Vec::new();

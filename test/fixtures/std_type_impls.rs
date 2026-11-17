@@ -47,6 +47,9 @@ impl Total for u128 {
         (*self % 1000) as i64
     }
 }
+fn describe_it<T: Describe>(x: &T) -> String {
+    x.describe()
+}
 fn sum_all<T: Total>(xs: &[T]) -> i64 {
     xs.iter().map(|x| x.total()).sum()
 }
@@ -95,4 +98,8 @@ fn main() {
     let d: u64 = Id(3).into();
     let e = String::from("plain");
     println!("{a} {b} {c} {d} {e} {}", show(Id(9)));
+    // An `Option` through a generic `T: Describe` (`None` and `Some(x)`).
+    let some: Option<i32> = Some(3);
+    let none: Option<i32> = None;
+    println!("{} {}", describe_it(&some), describe_it(&none));
 }

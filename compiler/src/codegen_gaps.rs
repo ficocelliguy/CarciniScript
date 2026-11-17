@@ -134,6 +134,16 @@ impl Codegen<'_> {
                 let t = t.clone();
                 self.fmt_delegate(rf.clone(), &t, f, debug)
             }
+            // ---- Futures (`Pin` is erased): `fut.as_mut()`, and `fut.poll(cx)` on an async fn's
+            // future (a promise) or a hand-written one passed as an `F: Future`.
+            (Ty::Future(_), m2) if crate::typeck::pin_identity(m2) && args.is_empty() => rf.clone(),
+            (Ty::Future(_), "poll") => {
+                let cx = self.gap_arg(a0);
+                helper(
+                    "poll",
+                    vec![cx, Frag::text(format!("\"{}\", TaskPoll", prop("poll")))],
+                )
+            }
             // ---- `OsStr` / `OsString`, `str::get(range)`
             (Ty::Str, "to_str") => rf.clone(),
             (
@@ -279,6 +289,57 @@ impl Codegen<'_> {
         Some((f, ty))
     }
 
+    /// `x.type_id()`, and `is::<T>()` / `downcast_ref::<T>()` / `downcast_mut` / `downcast` on a
+    /// `dyn Any`: a test of the value at run time (`typeck_any`).
+    pub(super) fn emit_any_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        recv: &ast::Expr,
+        method: &str,
+    ) -> Option<(Frag, Ty)> {
+        let range = self.range_of(m.syntax());
+        let name_off = m.name_ref().map(|n| self.off(n.syntax())).unwrap_or(0);
+        if let Some(s) = self.types.any_strs.get(&range).cloned() {
+            return Some((Frag::mapped(name_off, js_string(&s)), Ty::Str));
+        }
+        let t = self.types.any_checks.get(&range).cloned()?;
+        let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+        let (rf, _) = self.emit_expr(recv, None);
+        let test = self.any_test(&t, "v");
+        let body = match method {
+            "is" => test,
+            "downcast_ref" | "downcast_mut" => format!("{test} ? v : null"),
+            _ => format!("{test} ? κσ.Ok(v) : κσ.Err(v)"),
+        };
+        let mut f = Frag::mapped(name_off, format!("((v) => {body})("));
+        f.append(rf).push(")");
+        Some((f, ty))
+    }
+
+    /// A JS test of whether `v` holds a `t`.
+    fn any_test(&self, t: &Ty, v: &str) -> String {
+        match t {
+            Ty::Adt(n, _) => format!("{v} instanceof {}", self.class(n)),
+            Ty::Int(k) if k.is_big() => format!("typeof {v} === \"bigint\""),
+            Ty::Int(k) => {
+                let (lo, hi) = k.min_max();
+                format!(
+                    "(typeof {v} === \"number\" && Number.isInteger({v}) && {v} >= {lo} && {v} <= {hi})"
+                )
+            }
+            Ty::Float { .. } => format!("typeof {v} === \"number\""),
+            Ty::Bool => format!("typeof {v} === \"boolean\""),
+            Ty::Char => format!("(typeof {v} === \"string\" && [...{v}].length === 1)"),
+            Ty::Str => format!("typeof {v} === \"string\""),
+            Ty::Unit => format!("{v} === undefined"),
+            Ty::Vec(_) => format!("Array.isArray({v})"),
+            Ty::Tuple(es) => format!("(Array.isArray({v}) && {v}.length === {})", es.len()),
+            Ty::Map(..) => format!("{v} instanceof κσ.HashMap"),
+            Ty::Set(_) => format!("{v} instanceof κσ.HashSet"),
+            _ => "false".into(),
+        }
+    }
+
     /// Associated functions from `typeck_gaps`.
     pub(super) fn emit_gaps_call(
         &mut self,
@@ -349,6 +410,16 @@ impl Codegen<'_> {
             [.., "RandomState" | "BuildHasherDefault", "new" | "default"] => {
                 Frag::mapped(start, "undefined")
             }
+            [.., "Vec", "new_in" | "with_capacity_in"] => Frag::mapped(start, "[]"),
+            // `TypeId::of::<T>()`, `type_name::<T>()`: the type's name (`typeck_any`).
+            [.., "TypeId", "of"] | ["any", "type_name" | "type_name_of_val"] => {
+                // (Without one, the checker has reported the type parameter.)
+                match self.types.any_strs.get(&self.range_of(c.syntax())) {
+                    Some(s) => Frag::mapped(start, js_string(s)),
+                    None => Frag::mapped(start, "undefined"),
+                }
+            }
+            [.., "Box", "new_in" | "pin_in"] => self.gap_arg(a0),
             [
                 ..,
                 "HashMap",

@@ -333,12 +333,36 @@ pub fn __react_static(nodes: Vec<ReactNode>) -> Vec<ReactNode>;
 /// (`f(arg)` for a JS function value.)
 #[js = "κσ.$react.call"]
 pub fn __react_call(f: JsAny, arg: JsAny) -> JsAny;
+/// (A `useState` setter called with the new state.)
+#[js = "κσ.$react.setState"]
+pub fn __react_set_state(f: JsAny, v: JsAny);
+/// (A `useState` setter called with an updater of the state.)
+#[js = "κσ.$react.updateState"]
+pub fn __react_update_state(f: JsAny, g: JsAny);
 /// (`r.current`.)
 #[js = "κσ.$react.get"]
 pub fn __react_get(r: JsAny) -> JsAny;
 /// (`r.current = v`.)
 #[js = "κσ.$react.set"]
 pub fn __react_set(r: JsAny, v: JsAny);
+/// (`React.useMemo(f, deps)`.)
+#[js = "κσ.$react.useMemo"]
+pub fn __react_use_memo(f: JsAny, deps: JsAny) -> JsAny;
+/// (`React.useCallback(f, deps)`.)
+#[js = "κσ.$react.useCallback"]
+pub fn __react_use_callback(f: JsAny, deps: JsAny) -> JsAny;
+/// (`React.useReducer(reducer, init)`: `[state, dispatch]`.)
+#[js = "κσ.$react.useReducer"]
+pub fn __react_use_reducer(reducer: JsAny, init: JsAny) -> JsAny;
+/// (`React.createContext(default)`.)
+#[js = "κσ.$react.createContext"]
+pub fn __react_create_context(default: JsAny) -> JsAny;
+/// (`React.useContext(ctx)`.)
+#[js = "κσ.$react.useContext"]
+pub fn __react_use_context(ctx: JsAny) -> JsAny;
+/// (`<ctx.Provider value={value}>children</ctx.Provider>`.)
+#[js = "κσ.$react.provide"]
+pub fn __react_provide(ctx: JsAny, key: JsAny, value: JsAny, children: JsAny) -> ReactNode;
 
 /// An IANA zone's offset from UTC, in seconds, at `ms` (for the bundled `chrono-tz`).
 #[js = "κσ.$tzOffset"]

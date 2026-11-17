@@ -10,7 +10,6 @@ use ra_ap_syntax::{
 use serde::Serialize;
 
 use crate::lineindex::LineIndex;
-use crate::macros::EDITION;
 use crate::service::{Analysis, analyze, offset_of, type_at};
 use crate::ty::Ty;
 use crate::typeck::Resolver;
@@ -265,7 +264,7 @@ fn file_module(
 
 /// `segs` (after a `mod x;` name) in that file: an item, or a type's associated item.
 fn in_file(path: String, text: &str, segs: &[String]) -> Option<Def> {
-    let file = SourceFile::parse(text, EDITION).tree();
+    let file = crate::macros::parse_tree(text);
     let root = file.syntax();
     let r = match segs {
         [name] => item_named(root, name),
@@ -497,7 +496,7 @@ pub fn definition(
 /// An item of `src` itself named by the identifier at (line, column), for names the analysis
 /// rewrote away (`type` aliases).
 fn raw_item(src: &str, filename: &str, line: u32, column: u32) -> Option<Location> {
-    let file = SourceFile::parse(src, EDITION).tree();
+    let file = crate::macros::parse_tree(src);
     let offset = offset_of(src, line, column);
     let token = file
         .syntax()

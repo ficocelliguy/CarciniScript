@@ -60,7 +60,9 @@ impl Codegen<'_> {
         let imported;
         let tail = match tail {
             [f @ ("to_string" | "to_string_pretty" | "to_value" | "from_str" | "from_value")]
-                if crate::typeck::crates::crate_imports(self.src)
+                if self
+                    .crate_imports
+                    .get_or_init(|| crate::typeck::crates::crate_imports(self.src))
                     .get(*f)
                     .is_some_and(|(k, i)| k == "serde_json" && i == f) =>
             {
@@ -253,6 +255,10 @@ impl Codegen<'_> {
                 self.json_schema(v, stack)
             ),
             Ty::Coll(kind, view) => match (kind, &**view) {
+                (Coll::VecDeque, Ty::Vec(e)) => format!(
+                    "{{t:\"vec\",s:{},cls:\"Deque\"}}",
+                    self.json_schema(e, stack)
+                ),
                 (Coll::BTreeSet, Ty::Set(e)) => format!(
                     "{{t:\"set\",s:{},cls:\"BTreeSet\"}}",
                     self.json_schema(e, stack)

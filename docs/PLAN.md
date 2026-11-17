@@ -88,8 +88,10 @@ Erasing them only means programs rustc would reject still run. Tiers:
    `Copy`-ness.
 2. **NLL-lite** (done, `borrows.rs`): borrows bound by `let` and borrowing `for` loops, live to
    the holder's last use, conflicts reported with rustc's messages. Shown as warnings; strict
-   borrows make them errors. Not yet: borrows through calls (elided/annotated signatures) and
-   fields.
+   borrows make them errors. Also through calls of the file's own functions and methods (elided
+   and named lifetimes in their signatures), down to fields (disjoint fields don't conflict), and
+   ended by a `break` / `return` right after the change. Not yet: closures, struct literals,
+   references handed between locals, loop-carried borrows, `mod` files' functions.
 3. **Polonius** (not planned): would need MIR-like lowering and region inference.
 
 Optional debug mode: RefCell-style runtime guards on collections (e.g. mutate-while-iterating
@@ -196,8 +198,8 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      and `i32::max`-style method values (`ufcs.rs`)
    - [x] Performance: bounds checks inline when the Vec and index are simple (a DP loop ran 1.6x
      faster), iterator adapters and ranges as iterator classes instead of generators (2-3x on
-     adapter chains), `x % 7` / `x / 7` without the divide-by-zero helper. Compile time is linear
-     (about 1 ms per KB)
+     adapter chains), `x % 7` / `x / 7` without the divide-by-zero helper. Compile time was linear
+     (about 1 ms per KB); it no longer is, see "Performance scan", below
    - [x] JS globals, first `js::Date` and `js::JSON` (serde_json's format and errors, by the
      static type; `#[serde(..)]` renames), tested against serde_json through a native shim
      crate (`test/js/`)
@@ -215,7 +217,7 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
      checked through function type parameters (`S::Unit`, `S: Shape<Unit = f64>`)
    - [x] Const generics on functions, structs, impls and methods (hidden `$N` arguments like the
      classes for `T::make()`; struct values keep theirs as `$N`; read off `[T; N]` arguments when
-     the call doesn't say them); enums and traits ⬜
+     the call doesn't say them); traits and enums ✅
    - [x] Hand-written `Debug` through `f.debug_struct(..)` and the other builders (also `{:#?}`,
      and generic types' formatters); `debug_assert!` family, `cfg!`, `stringify!`; hand-written
      `Hash` (with `Hasher` / `DefaultHasher`), `Copy`, `TryFrom` (and integer `try_from` /
@@ -316,11 +318,46 @@ hide later errors, so this is a fair per-file check.
   works and pulls in a `macro_rules!` in an unsupported place. Counts below are from this run.
   Most "std type" hits that remain (`Path`, `Ref`, `Cursor`, `Output`) are the crate's own types
   with std names, such as `syn::Path` or chrono's private `Cursor`, not std gaps.
-- [ ] **Regressions in `3c15b78`**, both in files that compiled before:
+- **Re-run after `db63e10`**: language features all supported in **74.5%** (3,888 of 5,220);
+  counting std gaps, 61.5%; by lines, 52.2%. Files with a language gap fell from 1,594 to 1,242
+  (of which 611 are unsafe/memory, not planned), std-only files rose from 594 to 678 as language
+  fixes uncovered them. Gone from the table: nested `fn` shadowing, target `cfg`, `gen`, block
+  operands, trait default consts, enum discriminants; "macro_rules matching" fell 67 → 10. std
+  source: 60.0% (from 55.5%). 35 crates pass in every file (from 25). Of the plan's language repros, all pass except those listed below.
+  The leading "impl on a std type" rows (273 files) are now mostly std traits on std types
+  (`impl<T> Index<Id> for Vec<T>`, `impl PartialEq<N> for str`, `impl Default for Box<..>`), a
+  trait on `Box<str>`, or the crate's own types named like std ones (anyhow's `Chain`).
+- [x] **Regressions in `3c15b78`**, both in files that compiled before:
   - a user `enum Ordering` in a pattern is taken as `std::cmp::Ordering`: "expected `Ordering`,
-    found `Ordering`" (`ra_ap_syntax` `ast/operators.rs`)
+    found `Ordering`" (`ra_ap_syntax` `ast/operators.rs`); a file's own `Ordering` now shadows
+    std's in patterns too (`cmp::Ordering::Less` still means std's)
   - `#[derive(Clone, Copy)] struct W<'a> { s: &'a [u8] }` gives "the trait `Copy` is not
-    implemented for `Vec<u8>`" (`miniz_oxide`)
+    implemented for `Vec<u8>`" (`miniz_oxide`); a shared-reference field (`&'a T`,
+    `Option<&T>`) is `Copy` / `Clone` whatever it points at. 10 more registry/std files with
+    `&'static str` / `&[u8]` fields in `Copy` types compile (`fixtures/shadowed_std_names.rs`)
+- [x] **Found in the `db63e10` re-run** (all done):
+  - Nested `fn` renaming in files with no other pre-pass trigger: the gate in `codegen.rs` checks
+    `nested::has_duplicate_fns` now (`fixtures/nested_fns_plain.rs`).
+  - One generic trait implemented more than once for a type (`impl IntoS<u8> for Vec<u8>` and
+    `impl IntoS<u16> for Vec<u8>`): the later impls' methods get keys of their own (`into_s$1`),
+    and a call on the concrete type picks the impl from its arguments or the expected type
+    (`fixtures/generic_trait_twice.rs`); calling one through a type parameter or `dyn` is an
+    error (it couldn't be told apart at run time). The same impl twice under opposite feature
+    gates (`#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]`): the `not(..)` one stays, as a
+    script has no features (`fixtures/cfg_feature_twins.rs`).
+  - Hygiene names leaking (`Vec__h1`): the hygiene pass took `impl Tr for Vec<T>` in a macro body
+    for a `for` loop and renamed `Vec`; only `for pat in` binds now (`fixtures/macro_impl_for.rs`).
+  - `#[derive(Debug)]` on a struct holding `Box<dyn Error>` (`dyn Error` is `Debug` and
+    `Display`), and `"x".into()` / `format!(..).into()` as a `Box<dyn Error>` (the string itself)
+    (`fixtures/box_dyn_error.rs`).
+  - `<Token![,]>::default()`: one parenthesized path in a qualified path (`<(Comma)>::default`)
+    is that path (`fixtures/macro_type_qualified_path.rs`).
+  - `indexmap`: `get_index_mut` (see the crates section).
+  - From the Bitburner corpus: `.into()` on an `impl Into<H>` / `H: Into<Host>` parameter with no
+    other hint is the bound's target (and `.into()` no longer looks through `Deref`); `let r =
+    &mut <element or field>` of a number, string, bool or `Option` is a slot over that place,
+    made once (`κσ.$placeSlot`; `fixtures/place_refs_into.rs`). Re-pointing an existing `&mut`
+    variable at such a place is still an error.
 
 ### Language gaps
 
@@ -331,10 +368,16 @@ done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
   `HashMap` / `BTreeMap`, `HashSet` / `BTreeSet` and `u128` / `i128` (generic impls too, through a
   generic `T: Tr` for all but `Option`), and `impl From<A> for String` / for a number type
   (`String::from(a)`, `a.into()`, `impl Into<String>`). `fixtures/std_type_impls.rs`.
-  - [ ] Still open: `Box<str>`, `Path`, `File`, `Wrapping<u32>`; std traits other than `From`
-    (`impl PartialEq<Id> for &str`); an `Option` reached through a generic `T: Tr` (an `Option` is
-    `null` or its value, so `κσ.$dcall` can't tell it apart); `&mut self` methods of your traits on
-    a `String`, number, bool or `Option` (JS can't write those through `this`).
+  - [x] The rest: your traits on `Box<str>` / `Rc<[u8]>` / `Arc<String>` (a box is its contents),
+    `Path` and `PathBuf` (or `str` and `String`, `[T]` and `Vec<T>`) implemented together (the
+    borrowed type's impl serves; `fixtures/owned_borrowed_impls.rs`), `std::num::Wrapping` (a
+    prelude, `fixtures/std_wrapping.rs`), operator traits on numbers with your type as the other
+    operand (`impl Mul<V2> for f64`, `2.0 * v`) and `impl PartialEq<Id> for &str` / `for String`
+    / `impl PartialEq<u32> for Id` (`"home" == h`, `id != 3`; `fixtures/std_trait_builtins.rs`),
+    an `Option` through a generic `T: Tr` (`None` always, `Some(x)` unless `x`'s own type has the
+    method; a nested `Option<Option<_>>` there doesn't print its inner value right), and `&mut
+    self` methods of your traits on a `String`, number, bool, char or `Option` (`this` is a cell;
+    `fixtures/ext_mut_self.rs`). `File` is the no-OS prelude's (see Std-library gaps).
 - [x] **`where` clauses with Fn bounds over type parameters** (200 / 85): `fn run<F, T>(f: F) -> T
   where F: FnOnce() -> T` and `<F: FnOnce() -> T, T>` (a bound naming a parameter declared after
   it), and `impl<F, T> Memo<F, T> where F: Fn(u64) -> T` (an impl's closure parameters).
@@ -360,11 +403,15 @@ done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
     and reported as "`macro_rules!` is not supported"), and a macro defined again
   - [x] `pub(crate) use my_macro;` re-exports in the defining file
   - [x] `std::name!` / `$crate::__priv::name!` aren't the file's `name!` (memoffset recursed)
-  - Left: macros of other files that aren't `mod`-loaded (`#[macro_use] mod macros;` in `lib.rs`
-    used from a sibling file), bundled `log!` / `bail!` / `anyhow!` shadowing a crate's own
-    cross-file macros, and rules relying on finer fragment parsing.
-- [ ] **Generic bounds on std traits** (49, down from 82): left: `A: Allocator`,
-  `impl Future for ..`. Done: `W: fmt::Write` (given a `String`, a `Formatter` or your own
+  - [x] Macros of other files, by Rust's textual scoping: a module file sees the macros above its
+    `mod` line in the file that declares it (and that file's `#[macro_use] mod`s), up to the
+    crate root, and every `#[macro_export]` one (`crate::m!`, `use crate::m;`); a crate's own
+    `info!` then beats the bundled `log`'s (`modules/macro_scope`).
+  - Left: rules relying on finer fragment parsing.
+- [x] **Generic bounds on std traits** (49, down from 82): `A: Allocator` (ignored, with
+  `Vec<T, A>`, `Global`, `Vec::new_in`; `fixtures/allocator_params.rs`, built natively with
+  `RUSTC_BOOTSTRAP` for its `#![feature(allocator_api)]`) and `impl Future for ..` (hand-written
+  futures, `fixtures/hand_written_futures.rs`). Before: `W: fmt::Write` (given a `String`, a `Formatter` or your own
   writer) and `Vec<u8>: io::Write` (`put(&mut vec)`); `&[u8]` (`"abc".as_bytes()`, `&data[..]`)
   satisfies `R: Read` / `R: BufRead` / `impl Read` / `Box<dyn Read>` parameters and
   `BufReader::new`, read through a `Cursor` the function makes (a `&mut &[u8]` argument, whose
@@ -387,8 +434,10 @@ done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
 - [x] **`write!` into anything but a `String` or `Formatter`** (63 / 42): `write!(vec_u8, ..)`
   (`io::Write`), `write!(w, ..)` for a generic `W: fmt::Write` or `io::Write`, and a type with its
   own `impl fmt::Write` (`write_str` / `write_char`, `Err(fmt::Error)`). `fixtures/fmt_write.rs`,
-  `fixtures/io_write_vec.rs`. Not yet: `&mut dyn fmt::Write`, and a `Vec::new()` with no element
-  type that only a generic writer call would make a `Vec<u8>`.
+  `fixtures/io_write_vec.rs`. `&mut dyn fmt::Write` / `&mut dyn io::Write` parameters (written
+  as type parameters by a pre-pass) and `Box<dyn io::Write>` (`fixtures/dyn_writers.rs`). A
+  `Vec::new()` that only a generic writer call types is a `Vec<u8>` (the trait's one `Vec` impl
+  names it). Not yet: a `&mut dyn Write` struct field.
 - [x] **Pre-2024 editions** (42 / 37): files parse as the 2021 edition, so `rng.gen()` and
   `let gen = ..` work (gen blocks are unstable anyway). A fixture's `// edition: 2021` line builds
   its native side as 2021 (`fixtures/rand_gen_2021.rs`).
@@ -397,8 +446,9 @@ done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
   parameters now take a cell like `&mut i32` does (a getter/setter cell over a struct, field or
   element). `fixtures/generic_mut_refs.rs`.
 - [x] Smaller ones (12 to 39 files each). Done: `iter_mut()` outside a `for` (slots over numbers
-  and strings, `fixtures/iter_mut_outside_for.rs`; closure adapters such as `filter` on them are
-  still an error), `use x as y` renames of std types and modules (crates already worked;
+  and strings, `fixtures/iter_mut_outside_for.rs`; closure adapters too: `filter`, `map`, `find`
+  (also kept in a local), `fold`, `max_by_key`, `skip_while`, `flat_map(|row| row.iter_mut())`, a
+  `for` over a filtered one, `max()` / `min()` by value; `fixtures/iter_mut_adapters.rs`), `use x as y` renames of std types and modules (crates already worked;
   `fixtures/use_renames.rs`), default associated consts in traits
   (`fixtures/trait_default_consts.rs`), non-literal enum discriminants (`A = B as isize`, a
   constant evaluator; `fixtures/enum_const_discriminants.rs`), `{ .. }` blocks on the right of `&&` / `||`
@@ -420,9 +470,12 @@ without a script meaning, or crate types named like std ones.
   prelude's `PathBuf` (`path_prelude.rs`: Unix-style, `exists()` is `false`), and `OsStr` /
   `OsString` are `String`, by a pre-pass (`stdgaps.rs`) that also writes `Ref<'_, T>` as `T`,
   `NonZeroU32` as `u32` (`NonZeroU32::new` gives an `Option<u32>`) and `fmt::Arguments` as
-  `String`; `Cursor` is in the io prelude. Still open: `fs::File` / `Metadata` (41 / 16),
-  hand-written futures (`Pin` 39, `task::Context` 37, `Poll` 20, `Waker` 14), `process::Command`
-  (25), `TypeId` (16), `IoSlice` (12), `SocketAddr` (16): none of them means much in a script.
+  `String`; `Cursor` is in the io prelude. Since then: `fs::File` / `Metadata` (41 / 16) and
+  `process::Command` (25) compile and fail with `NotFound` / `Unsupported` (`os_prelude.rs`,
+  `fixtures/no_os_std.rs`), hand-written futures (`Pin` 39, `task::Context` 37, `Poll` 20,
+  `Waker` 14; `task_prelude.rs`), `TypeId` / `type_name` / `dyn Any` (16; `typeck_any.rs`,
+  `fixtures/any_type_ids.rs`), `IoSlice` (12) and `SocketAddr` / `IpAddr` (16;
+  `net_prelude.rs`, `fixtures/net_addrs.rs`).
 - [x] **Implementing std traits:** `ExactSizeIterator` (87), `FusedIterator` (84),
   `DoubleEndedIterator` (65), `io::Read` (72), `io::Write` (39), `Hasher` (17), `BuildHasher` /
   `BufRead` (11 each), and the markers `UnwindSafe` / `RefUnwindSafe` (20 / 17), accepted and
@@ -430,8 +483,8 @@ without a script meaning, or crate types named like std ones.
   traits of the io prelude with std's provided methods (`read_to_end`, `read_to_string`,
   `read_exact`, `bytes`, `read_line`, `read_until`, `lines`, `split`), which `BufReader` and
   `Cursor` implement; a `Hasher` gets `write_u8` .. `write_i128`, a `BuildHasher` `hash_one`, and
-  `HashMap::with_hasher` / `default` take one (keys still compare by value). Still open: `Future`
-  (51).
+  `HashMap::with_hasher` / `default` take one (keys still compare by value). `Future` (51) too:
+  `impl Future for X` (see above).
 - [x] **Methods:**
   - `Vec`: `into_boxed_slice` (43), `resize` (32), `capacity` / `reserve` / `reserve_exact` /
     `shrink_to_fit` (24 / 18 / 7 / 13, no-ops), `chunks_mut` / `chunks_exact_mut` (18 / 9, views),
@@ -474,13 +527,24 @@ cheapest first:
   (`get_index`, `get_index_of`, `get_full`, `insert_full`), `swap_remove` (what `remove` is) and
   `shift_remove`, `first` / `last` / `pop`, `sort_keys` / `sort_by` / `sort`, `reverse`,
   `truncate`, collecting, and `indexmap! {..}` / `indexset! {..}`. `fixtures/crate_indexmap.rs`.
-  (`map[i]` by position isn't there yet.)
+  Indexing by position (`map[0]`, `set[1]`) and by key (`map[&k]`), both as places (`map[0] += 1`),
+  and `get_index_mut` (a slot for number, string and bool values where it's matched).
 
 Not in the corpus (it's library internals), but likely to matter more to players:
 
-- [ ] **`ordered-float`**: `OrderedFloat<f64>` / `NotNan` make `f64` scores usable as `BinaryHeap` and
-  `BTreeMap` keys, for ranking targets by money/sec without a hand-written `Ord`.
-- [ ] **`petgraph`**: `Graph` / `DiGraph` with its algorithms (shortest paths, components, toposort).
+- [x] **`ordered-float`**: `OrderedFloat<f64>` / `NotNan` make `f64` scores usable as `BinaryHeap` and
+  `BTreeMap` keys, for ranking targets by money/sec without a hand-written `Ord`. A Rust-source
+  prelude (`ordered_float_prelude.rs`); `js-node/crate_ordered_float.rs` (the crate isn't in the
+  cargo cache, so the expected output is rustc's on the program with the prelude).
+- [x] **`petgraph`**: `Graph` / `DiGraph` / `UnGraph`, `GraphMap` / `DiGraphMap` / `UnGraphMap`,
+  `Bfs` / `Dfs` / `DfsPostOrder` and `algo`'s `dijkstra`, `astar`, `bellman_ford`, `toposort`,
+  `is_cyclic_*`, `connected_components`, `kosaraju_scc`, `tarjan_scc`, `has_path_connecting`,
+  `min_spanning_tree`: a Rust-source prelude (`petgraph_prelude.rs`) that follows petgraph's
+  code, plus a rewrite in `bundled.rs` (algorithms become methods of the graph, so one name
+  serves both graph kinds; a walker's `next(&g)` takes the graph's neighbors as a closure).
+  `js-node/crate_petgraph.rs` and `crate_petgraph_more.rs`, checked against rustc on the
+  rewritten program with the prelude (not in the cargo cache either). Left: `StableGraph`,
+  `Topo` / `Reversed`, more `algo` functions, `Dot`, a `Graph` index type other than `u32`.
 
 Marginal: `static_assertions`, `tap`, `strsim`, a `base64` alias over `js::btoa` / `js::atob`, and a
 `js_sys` alias over the `js` crate. Not useful in a script: proc-macro, test and bench tooling
@@ -546,8 +610,12 @@ into the main tree):
   closure and fn components (a `let` of a closure or of a block ending in one), `children`,
   fragments, `key`, `jsx!` inside `{..}`; errors for unquoted text, unknown components, missing or
   unknown props, mismatched closing tags.
-- [ ] Bindings: `print_raw` / `tprint_raw` take a `Node` (they take a `JsValue` today, which
-  already accepts one).
+- [x] Bindings: `dts2rs` maps `ReactNode` / `ReactElement` to `ReactNode` (`react::Node`), so
+  `print_raw` / `tprint_raw` / `ui.set_tail_title` / `ui.render_page` take a node, and
+  `ui.create_connect_link` returns one; such a parameter takes whatever a `jsx!` child may be
+  (`ns.print_raw("text")`, a number, a `JsValue`, `Option` / `Vec`), converted for React
+  (`κσ.$react.node`: an `i64` as text). A field that may hold one (a script's `title`) stays a
+  `JsValue`.
 - [x] Tests (`test/react/run.mjs`, `npm run test:react`): each fixture has a `.jsx` twin compiled by
   TypeScript; both run against a mock `ns` and what they print is rendered with React 17: static
   markup, mounted in jsdom with 60 ms of a fake clock, then each button clicked; the transcripts must
@@ -559,11 +627,269 @@ into the main tree):
   written and edits the markup around it (`jsx::edits`).
 - [x] Components from `mod` files (`pub fn` components, found through the module resolver).
 - [x] `React` missing outside Bitburner: a panic that says how to load it.
-- [ ] Still open: typed children (`IntoNode` needs trait impls for `&str` / `Option<T>` / `Vec<T>`,
-  which the compiler only allows for the file's own types today), hover and completions inside
-  `jsx!`.
-- [ ] Later: typed intrinsic attributes and DOM events, `use_context` / `use_reducer` / `use_memo`,
-  `{..spread}` props, class components (not planned).
+- [x] Typed children: `{expr}` is `__rx_child<T: ReactIntoNode>` (`react::IntoNode`). Which types
+  meet it is decided by the checker by shape (`typeck_react.rs`: `Node`, text, numbers,
+  `JsValue`, and `Option` / `Vec` of those, nested), not by trait impls: the impls for
+  `Option<T: IntoNode>` would need the inner bound checked, which extension-trait impls on std
+  types don't do. The same check serves the NS bindings' node parameters. Errors point at the
+  expression ("React can't show a `(i32, i32)`").
+- [x] Hover and completions inside `jsx!` (`jsx_service.rs`, on the source): a component's
+  signature and docs on its tag, a prop's type or an HTML attribute's kind on its name;
+  completions of tag names (components in scope, HTML tags), a component's props not given yet,
+  an element's attributes (`on_click`, or `onClick` once a capital is typed). Embedded
+  expressions use the ordinary service (each is a kept span; HTML children and props are slices,
+  `&[..]`, not `vec![..]`, whose tokens the service can't see into). A `jsx!` call with a
+  mistake (being typed) no longer stops the rest of the file being analyzed: the service
+  rewrites it into its expressions.
+- [x] Typed intrinsic attributes and DOM events (`jsx_attrs.rs`, React 17's `possibleStandardNames`
+  and event names): handlers take a closure of `js::Event`, of nothing, or of a `JsValue` (by
+  the closure's parameters); text, `bool`, number-or-text, `style` (string, pairs or map), `key`,
+  `ref` (a `use_ref`'s box, set to the element); unknown attributes are errors with a suggestion.
+  Literal values are kept spans too, so type errors point at them.
+- [x] `use_memo`, `use_callback`, `use_reducer` (`Dispatch<A>`), `create_context` /
+  `use_context` with `<ctx.Provider value={..}>` (`Context<T>`, also `ctx.provide(..)`);
+  `use_state`'s `update` and the reducer get a copy of the state (a Rust closure may change it in
+  place and return it); `set` of a closure value isn't taken for an updater.
+- [x] `{..spread}` props: on an HTML element, `(name, value)` pairs, a map or a `JsValue` object;
+  on a component, the parameters not given come from the fields of a struct.
+- Class components: not planned.
+
+## Performance scan (2026-11-16)
+
+Measured on the build of `db63e10` plus the working tree, with node 24: compile times from
+`compile()` calls (warm, averaged) and `--cpu-prof` (the wasm keeps function names), run times of
+compiled probe programs against `runtime/rt.js`. Ranked by impact within each part.
+
+### Compile time
+
+Today: 3 to 30 ms for most corpus scripts, but `darknet.rs` (784 lines) takes 146 ms,
+`batcher.rs` / `contracts.rs` about 95 ms, and `use chrono` alone costs 186 ms (`clap` 99 ms;
+`std::time`, `regex`, `io`, `Wrapping`, `serde` 14 to 20 ms each). N small functions: 100 → 28 ms,
+400 → 160 ms, 800 → 460 ms, so it's superlinear. Hover, completions and signature help each
+re-run all of it (`service.rs` `analyze`).
+
+- [x] **`Checker::uses_crate` scans the whole source per call** (`typeck_crates.rs:84`: two
+  `format!`s and two `src.contains` per `Vec` / iterator method call, unresolved path call and
+  some `lower_type`s). 28-48% of all compile time in the profiles (865 of 2,043 ms for 800
+  functions; 441 of 920 ms for the chrono script, whose prelude text is scanned too). Done: the
+  answers are kept per crate name in the checker (`crate_uses`), and codegen reads
+  `crate_imports` once (`Codegen.crate_imports`). 800 functions 243 → 107 ms, `use chrono` 184
+  → 67 ms (this machine; see the table below).
+- [x] **`{CONST}` captured in a format string re-parses the file** (`codegen_consts.rs:18`, from
+  `codegen.rs` `captured_const`): a full `SourceFile::parse` with the preludes plus `all_items`
+  per capture, which also evicts `all_items`' one-tree cache. 400 `println!("{LIMIT} ..")`: 615
+  ms, against 27 ms with `println!("{} ..", LIMIT)`. Done: `Codegen.const_bodies` (name → the
+  value's range, from `emit_file`'s const pass) and the checker's type at that range: 317 →
+  6.5 ms.
+- [x] **Preludes are parsed, checked and emitted in full on every compile** (`stdtime.rs`,
+  `stdgaps.rs`: chrono 2.7k lines, num 1.9k, clap 1.2k, wrapping 1.2k, rand_distr 1.1k, io
+  0.6k), behind loose substring gates (`"Cow"`, `"Lazy"`, `"time::"`). Done in part: the gates
+  match whole words (`stdtime::has_word`: `Cow`, `Either`, the lazy / once cells, `time::`; and
+  `stdgaps::has_rewrites` names exactly what the pass rewrites, so `RefCell`, `Ready` or
+  `Pathfinder` no longer run it), and the prelude's parse is shared (next item). The cache of a
+  prelude's declarations and JS is skipped: a prelude's output depends on the program it's
+  compiled with (its locals are renamed around the program's globals by `fresh`, its impls for
+  built-in types join the program's `$ext$i32` class, its generic bodies are checked against
+  the program's impls), so a cache keyed by the prelude text alone would change output, and
+  emitting per reached item is a larger refactor than its gain now (`use chrono` 186 → 68 ms
+  after `uses_crate`).
+- [x] **The source is re-parsed 6 to 10 times per compile**: nearly every program goes through
+  `preprocess_with` (the `codegen.rs:555` gate includes `"::"` and `"use "`), and each pass
+  parses the whole text, several in their gate and again in `expand` (`variants`, `alias`,
+  `modflat`), `procmacro::expand` always, `expand_with` once per macro round, plus the final
+  parse. In `darknet.rs`, `preprocess_with` is 27% and parsing 21%. Done: every whole-file
+  parse goes through `macros::parse_file` / `parse_tree`, which keep the last 8 parses by text
+  and hand out the same tree (so `adt::all_items`' root-keyed cache hits too): a pass re-parses
+  only after it edited the text, and a `mod` file read for macros, exports and `jsx` components
+  is parsed once. `bundled::renamed_crates` gates on the root's last segment (`io::`), not its
+  first (`std::`, which made every program walk the tree twice per std module); `rules_of`
+  runs once per definition per macro round. darknet.rs 106 → 78 ms (`preprocess_with` was 42%
+  of it). Merging the read-only rewrites into one walk is left: each pass's edits feed the next
+  one's parse, and the shared parse took most of the cost.
+- [x] **No caching across calls**: the IDE requests and a compile of the same text each redo
+  preprocessing, preludes, parsing and type checking. Done: `memo::cached` keeps the last 6
+  results per cache (`compile_with`'s `CompileOutput`, `service::analyze`'s `Analysis`) keyed
+  by text, file name, the bindings generation (`bindings::set` bumps it), the overflow flag and
+  strict borrows, plus every file the resolver returned, which is read again and compared on a
+  hit (a changed, added or removed `mod` file misses). Within a compile the recording resolver
+  reads each file once. The same text again: 0.7 ms; hover, completions and signature help on
+  an unchanged `darknet.rs` 150 → 0.3 ms, and after an edit one analysis serves all three.
+  `test/run.mjs` "kept results" compiles, changes a module file / the bindings / a setting, and
+  compiles again.
+- [x] Smaller ones: `OffsetMap::orig` / `replace` are linear in segments (`mbe.rs:51, 94`; called
+  per source-map mapping): binary search, one rebuild per pass. `used_names` is cloned per
+  top-level item and per method (`codegen.rs:1194`, `codegen_adt.rs:338`): an undo log.
+  `borrows::check` is uses × changes per borrow (`borrows.rs:136-185`): index by declaration.
+  Macro arguments are parsed separately by typeck, moves and codegen, and `rules_of` re-tokenizes
+  a definition per invocation. Done: `orig` is a binary search (`replace` stays: its text
+  splice is the linear part anyway); `used_names` has an undo log (`name_log`, `undo_names`;
+  the clone was 8% of the 800-function compile); `rules_of` once per round. Skipped:
+  `borrows::check` (under 1% of any profile) and the macro arguments (small per-pass snippet
+  parses; a text-keyed cache of them would thrash on the whole-file parses).
+
+Results (this machine, node 24, `compile()` warm averages; "before" is the staged tree):
+
+| case | before | after |
+| --- | --- | --- |
+| `corpus/bitburner/darknet.rs` | 195 ms | 78 ms |
+| `batcher.rs` / `contracts.rs` | 202 / 119 ms | 64 / 59 ms |
+| `use chrono` script | 184 ms | 68 ms |
+| 100 / 400 / 800 small functions | 15 / 93 / 243 ms | 11 / 43 / 85 ms |
+| 400 `println!("{LIMIT} ..")` | 317 ms | 6.5 ms |
+| the same text compiled again | 161 ms | 0.7 ms |
+| hover / completions / signature help on darknet.rs, unchanged | 150 / 145 / 144 ms | 0.3 / 0.5 / 0.3 ms |
+| the same, right after an edit (one analysis serves all three) | 150 ms each | 55 to 59 ms the first, 0.3 ms the rest |
+| crash sweep, cargo registry (5,922 files) / std (3,004) | 561 s / 88 s | 218 s / 63 s |
+
+The sweeps' outcomes (876 / 474 compiled, 0 panics) and every file's first diagnostic are the
+same before and after; `test/run.mjs` and the React tests pass; no fixture's output changed.
+
+### Run time
+
+Verified on compiled programs (Rust's time for the same work is milliseconds or less):
+
+- [x] **`VecDeque` is an array using `shift` / `unshift`** (`codegen_coll.rs:92-153`,
+  `rt.js` `$dqShift`): O(n) per `pop_front` once V8 stops shifting in place (measured: O(1) up
+  to about 16k elements, then 30 µs per shift). A BFS-shaped loop over 50k items: **12 s**. BFS
+  over the server graph is the most common Bitburner pattern. Done: `κσ.Deque`, a ring buffer
+  (backing array, head, length) that also answers the Array methods the compiler emits for a
+  `Vec` (on its contents made contiguous, which is the backing array itself, so in-place changes
+  stick); `q[i]` is emitted as `q.b[q.$i(i, loc)]` (a place, so writes, `+=` and `&mut q[i]`
+  work), index loops (`iter_mut`, `enumerate`) use `q.b[q.$p(i)]`, and the runtime helpers that
+  index arrays (`$first`, `$vecSwap`, `$retain`, `$placeSlot`, ..) take a deque. `collect`,
+  `from`, `into`, `Default`, `mem::take`, serde and `$clone` all build a `Deque`. BFS over 50k
+  nodes plus a 20k-long push/pop queue: **4,397 → 32 ms** (`fixtures/vecdeque_ring.rs`).
+- [x] **`BTreeMap` / `BTreeSet` re-sort the whole map on the first ordered read after an insert**
+  (`rt.js` `$sort`: `new Map([...m].sort(cmp))`; `$lastSlot` walks all entries, `$range`
+  copies). Insert + `pop_first` (Dijkstra, schedulers) is O(n² log n): 3k rounds, 394 ms, growing
+  quadratically. Done: the hash classes keep a sorted array `s` of their stored items from a head
+  index `h`; a new key goes in by binary search (`splice`), `pop_first` advances `h`, `range` is
+  two binary searches and a slice, `first` / `last` are O(1); after 512 binary inserts between
+  ordered reads (a bulk load) the rest are appended and sorted at the next read. The entry API
+  (`$slot`) tells the map about new slots. Dijkstra on a 120×120 grid with a `BTreeSet` queue
+  plus the PLAN's insert + `pop_first` rounds: **556 → 19 ms** (`fixtures/btree_ordered.rs`).
+- [x] **String byte offsets re-scan the string per call**: `s.len()` is `$utf8len` (a full
+  walk; only `for` ranges hoist it), `s.as_bytes()[i]` runs a `TextEncoder` and copies to an
+  Array per access, `&s[a..b]` builds three per-code-point arrays, `is_char_boundary` scans from
+  the start. A `while i < s.len() { s.as_bytes()[i] .. }` loop over 10k chars: **2.1 s**. Fix: an
+  ASCII fast path (`s.length`, `charCodeAt`, `slice`) checked once per string, and hoisting
+  `as_bytes()` out of loops.
+  Done (2026-11-16): `rt.js` `strInfo` remembers the last two long strings' UTF-8 length,
+  whether they're ASCII and (once asked) their bytes, so `$utf8len`, `$strSlice`, `$find`,
+  `$isCharBoundary` and `$unitOf` take an ASCII path (`s.length`, `slice`, `indexOf`) and
+  otherwise reuse the bytes; `s.as_bytes()[i]` is `κσ.$byteAt(s, i, loc)` (`charCodeAt` on
+  ASCII, the cached bytes otherwise; `$oob` with the byte count). The scanning loop over 10k
+  chars (`count_digits` + `tokens`, `p3-bench/b1_str.rs`): **12.7 s → 3 ms**. Unicode results,
+  the "is not a char boundary" and "index out of bounds" panics are unchanged
+  (`fixtures/str_byte_offsets.rs`, `panic_byte_index.rs`). `as_bytes()` isn't hoisted: the
+  cache makes each access O(1) already.
+- [x] **`&mut place` cells** (`rt.js` `$cell`: two closures and a get/set object per call, for
+  `&mut self.n`, `&mut v[i]`): about 35x a write-back temp (`const c = [o.n]; f(c); o.n = c[0]`),
+  which works whenever the place has no side effects.
+  Done: a call of a local function or method whose signature can't keep the borrow
+  (`writeback_safe`: not `async`, no lifetime parameters on it or its parameters, a return
+  type without `&`, lifetimes, `impl`, `dyn`, type parameters or types with lifetime
+  parameters) passes a pure `&mut place` (`&mut self.n`, `&mut v[i]`, `&mut n`) as
+  `(($wb0, x) => { try { return f($wb0, x); } finally { place = $wb0[0]; } })([place], x)`:
+  the place is read once, the callee reads and writes `$wb0[0]`, and the write-back runs on
+  return or unwind (a `Drop` running during a panic sees the written value, as in Rust). Other
+  arguments are evaluated outside the arrow, in order, so `await` and `?` stay in the caller.
+  Everything else (lifetimes, generic returns, trait-object and generic calls, std functions)
+  keeps the cell. A struct-field counter through `&mut` (`b2_cell.rs`, 2M calls): **2.0 s →
+  12 ms** (`fixtures/mut_place_writeback.rs`).
+- [x] **Slices**: `&v[a..b]` copies (`v.slice()`), so `&v[1..]` recursion is quadratic; `&mut
+  v[a..b]` is a Proxy that runs a regex per property access (130 ns per read). Done: the view
+  Proxy checks digits, flattens a view of a view to the base, and answers the Array methods on
+  the base (`slice` and iteration directly, read-only ones on a copy of the range, `sort` /
+  `reverse` / `fill` on a copy written back; `$vecSwap` and `$rotate` work on the base); views
+  share one handler with the state on the target. `f(&v[a..b])` passes a view when `f` is one of
+  the file's functions whose `&[T]` parameter only reads a little of it (`codegen_views.rs`:
+  length, elements outside loops and closures, sub-slices for such calls, iteration, slice
+  patterns; aliasing, comparing, returning, storing, or passing it to a function that isn't
+  view-safe keep the copy). `v[a..b].sort()` writes back with a loop, not a spread. Recursive
+  `sum(&v[1..])` over 4k `i64`s ×20, 100k recursive binary searches over 100k elements and 200
+  rounds of `bump(&mut a[lo..lo + 1000])` + range sorts: **19.8 s → 0.61 s**
+  (`fixtures/slice_views_ops.rs`, `slice_param_views.rs`).
+- [x] **Composite `HashMap` keys go through `JSON.stringify` per lookup** (`rt.js` `key()`): tuple
+  and struct keys are about 10x numeric ones. Done in the runtime: `key()` writes arrays of
+  primitives (tuple keys, nested too) by hand, giving exactly `JSON.stringify(x, bigKey)`'s text
+  (`-0` / NaN / strings / BigInts / `null` / `undefined` as JSON writes them), and falls back
+  to it for structs and other objects; 580 → 10 ns per pair key, the same as a compile-time key
+  function measured (20 ns), which therefore wasn't added. Grid BFS with `(i32, i32)` keys in a
+  `HashSet` + `HashMap`, 200k struct-key inserts and 50k `(String, u8)` entries: **365 → 160
+  ms** (`fixtures/hashmap_keys.rs`).
+- [x] **64-bit integers are BigInt** with a helper call per op (`$w128`, `$to128` rebuilding its
+  bounds per call; `for i in 0..n` over `u64` loops over BigInts): about 18x `u32`. Inlining
+  `BigInt.asUintN(64, ..)` alone is 4.5x faster. `usize` bit operations call `$bit64` with an
+  operator string (31 ns); an inline fast path for operands below 2^31 avoids it.
+  Done: `+ - * << ~ -` and `sum` / `product` on `i64` / `u64` / `i128` / `u128` wrap inline
+  (`BigInt.asUintN(64, a + b)`, 9x a `$w128` call), a literal shift amount is masked at compile
+  time (`h << 5n`), `wrapping_add` / `wrapping_sub` / `wrapping_mul` with a BigInt argument are
+  inline too (`$big` ran a regex on the method name per call), a number kind's value cast to a
+  BigInt kind is `BigInt(x)` (wrapped only for a negative into an unsigned kind), and `$to128`
+  takes safe integers first (also fixing `'A' as u64`, which threw). `usize` / `isize`: `x & lit`
+  with a literal below 2^31 is JS's `&`; `$shl64` / `$shr64` stay in numbers while the result is
+  a safe integer (`$bit64`'s call is 1.3 ns when V8 inlines it, so its operator string stays).
+  The u64 hashing loop (`b3_u64.rs`): **145 → 28 ms**. Debug builds still panic where rustc's
+  do (`$ckArith` runs before the inline wrap; `test/debug/overflow_u64_inline.rs`). `for i in
+  0..n` over `u64` still iterates BigInts: the representation is the cost
+  (`fixtures/u64_inline_ops.rs`).
+- [x] **Shapes**: `Result` and tuple fields are indexed properties (`this[0]`), about 30x a
+  named field (`this._0`) in a construct + tag check loop; unit enum variants allocate on each
+  `Dir::N` (`static get`), and `d == Dir::S` is a generic `κσ.$eq` (47x an int compare);
+  variants add different fields, so `$tag` reads on enums with more than 4 variants go
+  megamorphic. Fix: named fields, `d.$tag === k` for unit variants, singletons where possible,
+  one field layout per enum.
+  Done in part: `d == Dir::S` / `Dir::S != d` on an enum with a derived `PartialEq` is
+  `d.$tag === 2`, and `p == q` on a struct or enum with a derived `PartialEq` calls its own
+  `p.$eq(q)` (no `κσ.$eq` dispatch). Skipped: unit-variant singletons (`*r = Dir::E` through a
+  `&mut` is `κσ.$replace`, which rewrites the object in place, so a shared instance would change
+  every holder; an allocation is cheap next to that risk); one field layout per enum (a
+  6-shape vs 1-shape `$tag` loop measured the same, 38 vs 42 ms, so V8 handles the maps);
+  named `Result` / tuple fields (tuples are arrays everywhere, `Res` is read as `[0]` across
+  the runtime, no measured win to justify it). The interpreter `match` + `Dir` loop
+  (`b4_interp.rs`): **940 → 210 ms** with the `match` temp below.
+- [ ] Moderate:
+  - `match &prog[pc]` re-evaluates the scrutinee with its bounds check in every `else if`, and
+    `grid[i][j] += x` evaluates `grid[i]` four times: use temps, and `switch` on `$tag`.
+    Done: a `match` whose subject is an indexed struct or enum goes through a `const` (the
+    object is the same, so field bindings and `&mut` patterns still write it); a read of
+    `grid[i][j]` is `κσ.$get(grid[i'], j, loc)` (the row once instead of three times) when the
+    expression isn't a place (assignment target, `&mut`, method receiver, prefix operand), and
+    `grid[i][j] = ..` / `+= ..` hoist the row into a `const` (`recv_override`). `switch` on
+    `$tag` not done: the `else if` chain on `$t1.$tag` is cheap once the subject is a name. The
+    grid update + Copy struct + generic score loop (`b5_grid.rs`): **860 → 95 ms**
+    (`fixtures/nested_index_places.rs`, `panic_nested_index_assign.rs`,
+    `enum_tag_compare.rs`).
+  - Generic traits on numbers go through `$dcall`: spread arguments plus a registry scan.
+    Measured: a per-site cache was slower than the scan (23 vs 19 ms per 1M calls; the scan
+    is one entry), and a direct `.call` is 11 ms: the rest/spread and `.call` are the cost,
+    not the registry. Left as is.
+  - Copy structs are cloned and compared through the generic `κσ.$clone` / `κσ.$eq` instead of
+    `p.$clone()` and inline compares, and the clone isn't skipped at a value's last use.
+    Done: a `Copy` struct with a derived `Clone` read from a place is `(p).$clone()`, and `==`
+    on a derived `PartialEq` is `p.$eq(q)` (above). Last-use skipping not done.
+  - [x] `Vec::contains` is `v.some(eq)`, 4.5x `includes` for numbers and strings. Done:
+    `includes` for integers, strings, chars and bools (not floats: `includes(NaN)` is true,
+    Rust's `contains(&NAN)` false).
+  - [x] Integer `sort()` uses `κσ.$cmp` rather than `(a, b) => a - b`. Done: `κσ.$cmpNum` for
+    integers that are JS numbers and `κσ.$cmpStr` for strings and chars; BigInts and the
+    rest keep `$cmp`.
+  - [x] `.iter().rev()`, `step_by` and `windows` / `chunks` copy or allocate per item. Done:
+    `v.iter()` is an `ArrayIt` (index, end), and `rev` (an `ArrayRevIt` sharing it, so
+    `by_ref().rev()` still consumes the same iterator), `step_by`, `skip`, `nth`, `last`,
+    `count` and `collect` work on the indices; `windows` / `chunks` / `chunks_exact` are one
+    class iterator (`SlicesIt`) instead of generators. `contains` over 2k ints and 500
+    strings, 60 sorts of 20k ints, `rev` / `step_by` / `windows` / `chunks` over 200k: **319 →
+    197 ms** (`fixtures/vec_contains_sort.rs`, `iter_array_paths.rs`).
+- [x] **Correctness bug found on the way**: `for x in a.iter_mut() { bump(x); }` with `fn bump(v:
+  &mut i32)` emitted `bump(a[$t1])` and failed with "TypeError: Cannot create property '0' on
+  number '1'". The loop's `x` (the place `a[$t1]`) is now passed as a cell over that place
+  (`fixtures/iter_mut_loop_args.rs`).
+
+Already fine: `for i in 0..n` and reversed ranges are plain `for` loops, `?` and panics are
+returns and throws (try/finally only for `Drop` types), `push_str` is `+=`, and plain
+map/filter/sum chains are about 1.3x a hand loop.
 
 ## Testing
 

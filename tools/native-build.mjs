@@ -41,9 +41,11 @@ export function buildNative(file, exe, { debug = false } = {}) {
   const src = fs.readFileSync(file, "utf8");
   // A `// edition: 2021` line builds the program as that edition (e.g. for `rng.gen()`).
   const edition = /^\/\/ edition: (\d{4})\r?$/m.exec(src)?.[1] ?? "2024";
+  // (`#![feature(allocator_api)]`: unstable std APIs, on the stable toolchain.)
+  const env = /^#!\[feature\(/m.test(src) ? { ...process.env, RUSTC_BOOTSTRAP: "1" } : process.env;
   if (!usesCrates(src)) {
     const args = [...(debug ? [] : ["-O"]), "--edition", edition, "-A", "warnings", "-o", exe, file];
-    execFileSync("rustc", args, { stdio: "pipe" });
+    execFileSync("rustc", args, { stdio: "pipe", env });
     return;
   }
   const proj = path.join(os.tmpdir(), "crs-crates");

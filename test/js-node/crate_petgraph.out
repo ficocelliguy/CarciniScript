@@ -1,0 +1,57 @@
+7 nodes, 7 edges, directed: false
+NodeIndex(0) EdgeIndex(6) CSEC Some((NodeIndex(4), NodeIndex(5)))
+["sigma-cosmetics", "foodnstuff", "n00dles"]
+[NodeIndex(5), NodeIndex(2), NodeIndex(1)]
+Some(EdgeIndex(6)) None
+true Some(2.5)
+  CSEC -> neo-net (3) EdgeIndex(6)
+  CSEC -> foodnstuff (2) EdgeIndex(4)
+  CSEC -> n00dles (6) EdgeIndex(3)
+bfs ["home", "sigma-cosmetics", "foodnstuff", "n00dles", "neo-net", "CSEC"]
+dfs ["home", "n00dles", "CSEC", "foodnstuff", "neo-net", "sigma-cosmetics"]
+post [2, 3, 5, 4, 1, 0]
+              home 0.0
+           n00dles 1.0
+        foodnstuff 2.5
+   sigma-cosmetics 4.0
+              CSEC 4.5
+           neo-net 5.5
+hops Some(2) 6
+astar 4.5 ["home", "foodnstuff", "CSEC"]
+None
+[0.0, 1.0, 2.5, 4.0, 4.5, 5.5, inf]
+[None, Some(NodeIndex(0)), Some(NodeIndex(0)), Some(NodeIndex(0)), Some(NodeIndex(2)), Some(NodeIndex(3)), None]
+components 2 false
+[NodeIndex(6)]
+topo ["lib.js", "hack.js", "grow.js", "batcher.js", "ui.js"]
+false [NodeIndex(2), NodeIndex(1)]
+[NodeIndex(0)] [NodeIndex(3), NodeIndex(4)]
+true Err(NodeIndex(1))
+kosaraju [[NodeIndex(4)], [NodeIndex(0), NodeIndex(1), NodeIndex(3), NodeIndex(2)]]
+tarjan [[NodeIndex(4)], [NodeIndex(3), NodeIndex(2), NodeIndex(1), NodeIndex(0)]]
+["lib.js", "hack.js", "grow2.js", "batcher.js", "dashboard.js"]
+[(0, 1), (0, 2), (1, 3), (2, 3), (0, 4), (3, 0)]
+4 4 [NodeIndex(3), NodeIndex(0)]
+[[NodeIndex(3)], [NodeIndex(2), NodeIndex(1), NodeIndex(0)]]
+6 2 0
+None Some(9)
+["home", "n00dles", "foodnstuff", "CSEC", "darkweb"]
+["n00dles", "foodnstuff", "CSEC"]
+[("home", "n00dles", 1), ("foodnstuff", "home", 1), ("CSEC", "n00dles", 2), ("CSEC", "foodnstuff", 5), ("CSEC", "home", 3)]
+true false Some(3)
+["home", "n00dles", "foodnstuff", "CSEC"]
+[("CSEC", 3), ("foodnstuff", 1), ("home", 0), ("n00dles", 1)]
+Some((4, ["foodnstuff", "home", "CSEC"]))
+2 2
+[3] [1, 4]
+Ok([0.0, 0.5, 2.0, 1.0])
+[[4, 3, 2], [1]] [[2, 3, 4], [1]]
+Err(NegativeCycle(()))
+true
+7 5
+  home - n00dles 1
+  sigma-cosmetics - neo-net 1.5
+  foodnstuff - CSEC 2
+  home - foodnstuff 2.5
+  CSEC - neo-net 3
+[(0, 1, 1.0), (3, 5, 1.5), (2, 4, 2.0), (0, 2, 2.5), (4, 5, 3.0)]

@@ -19,6 +19,8 @@ mod arrays;
 #[path = "typeck_coll.rs"]
 mod coll;
 pub(crate) use coll::index_method as coll_index_method;
+#[path = "typeck_any.rs"]
+mod any;
 #[path = "typeck_conv.rs"]
 mod conv;
 #[path = "typeck_crates.rs"]
@@ -41,6 +43,8 @@ mod modules;
 mod ptr;
 #[path = "typeck_quote.rs"]
 mod quote;
+#[path = "typeck_react.rs"]
+mod react;
 #[path = "typeck_res.rs"]
 mod res;
 #[path = "typeck_slots.rs"]
@@ -52,7 +56,7 @@ mod traits;
 pub use arrays::array_try_from_len;
 pub use crates::CrateCall;
 pub use ext::{char_predicate, is_option_closure_method};
-pub use gaps::delegated_fmt_is_debug;
+pub use gaps::{delegated_fmt_is_debug, pin_identity};
 pub use jsval::swb_imports;
 pub use modules::{Imported, ModuleRef, Resolver, module_path, qualified_key, use_leaves};
 pub use ptr::{Ptrs, cellable as ptr_cellable, is_ptr_type, transmute_name};
@@ -92,6 +96,10 @@ pub struct Types {
     pub move_sites: std::collections::HashSet<(usize, usize)>,
     /// `write!` / `writeln!` destinations (by their start) that are `io::Write`rs.
     pub io_writes: std::collections::HashSet<usize>,
+    /// `TypeId::of::<T>()`, `type_name::<T>()` and `x.type_id()` calls: their string, by range.
+    pub any_strs: HashMap<(usize, usize), String>,
+    /// `x.is::<T>()` / `downcast_ref::<T>()` .. on a `dyn Any`: the `T` to test for, by range.
+    pub any_checks: HashMap<(usize, usize), Ty>,
     /// `write!` / `writeln!` destinations (by their start) that are `fmt::Write`rs of your own or
     /// a `W: fmt::Write` parameter.
     pub fmt_writes: std::collections::HashSet<usize>,
@@ -122,6 +130,11 @@ pub struct Types {
     pub index_places: std::collections::HashSet<(usize, usize)>,
     /// `&mut v[a..b]` of a Vec: a view whose writes reach `v` (`κσ.$sliceMut`), by the `&mut`.
     pub slice_views: std::collections::HashSet<(usize, usize)>,
+    /// `let r = &mut v[i];` / `&mut s.count` of a number, string, bool or `Option`: a slot over
+    /// that element or field (`κσ.$placeSlot`), by the `&mut`; `r` is a slot binding.
+    pub place_slots: std::collections::HashSet<(usize, usize)>,
+    /// Method calls that go to one of several impls of a generic trait: the method's key.
+    pub method_keys: HashMap<(usize, usize), String>,
     /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
     /// the `bool`), with the target type.
     pub derefs: HashMap<(usize, usize), (bool, Ty)>,
@@ -246,11 +259,14 @@ impl<'a> Checker<'a> {
             pending_parses: Vec::new(),
             pending_defaults: Vec::new(),
             missing_steps: std::cell::Cell::new(0),
+            crate_uses: Default::default(),
             consts: HashMap::new(),
             param_bounds: HashMap::new(),
             into_targets: HashMap::new(),
             nested_ok: Default::default(),
             slot_locals: HashMap::new(),
+            closure_slots: Vec::new(),
+            slot_options: HashMap::new(),
             pending_bounds: Vec::new(),
             loops: Vec::new(),
             boxed: Default::default(),
@@ -263,12 +279,18 @@ impl<'a> Checker<'a> {
             copy_arrays: Default::default(),
             move_sites: Default::default(),
             io_writes: Default::default(),
+            any_strs: Default::default(),
+            any_checks: Default::default(),
+            crate_name: String::new(),
             fmt_writes: Default::default(),
             array_fields: Default::default(),
+            shared_ref_fields: Default::default(),
             array_reads: Default::default(),
             cell_returns: Default::default(),
             index_places: Default::default(),
             slice_views: Default::default(),
+            place_slots: Default::default(),
+            method_keys: Default::default(),
             derefs: Default::default(),
             qualified_calls: Default::default(),
             pending_qualified: Vec::new(),
@@ -412,8 +434,15 @@ pub fn check(
     resolver: Resolver,
 ) -> (Types, Vec<RawDiag>) {
     let mut c = Checker::new(src);
+    c.crate_name = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim_end_matches(".rs")
+        .replace('-', "_");
     c.declare_items(file, filename, resolver, &mut vec![filename.to_string()]);
     c.scan_index_mut(file);
+    c.borrow_events.sigs = crate::borrows::ref_sigs(file);
     for item in crate::adt::all_items(file) {
         if let ast::Item::Fn(f) = &item {
             c.check_fn(f);
@@ -516,6 +545,8 @@ pub fn check(
     let cell_returns = std::mem::take(&mut c.cell_returns);
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
+    let place_slots = std::mem::take(&mut c.place_slots);
+    let method_keys = std::mem::take(&mut c.method_keys);
     let derefs = std::mem::take(&mut c.derefs);
     let qualified_calls = std::mem::take(&mut c.qualified_calls);
     let modules = std::mem::take(&mut c.modules);
@@ -538,6 +569,8 @@ pub fn check(
             mut_bindings,
             move_sites: std::mem::take(&mut c.move_sites),
             io_writes: std::mem::take(&mut c.io_writes),
+            any_strs: std::mem::take(&mut c.any_strs),
+            any_checks: std::mem::take(&mut c.any_checks),
             fmt_writes: std::mem::take(&mut c.fmt_writes),
             boxed,
             cell_args,
@@ -550,6 +583,8 @@ pub fn check(
             cell_returns,
             index_places,
             slice_views,
+            place_slots,
+            method_keys,
             derefs,
             qualified_calls,
             dict_params,
@@ -604,6 +639,8 @@ struct Checker<'a> {
     pending_defaults: Vec<(Ty, SyntaxNode)>,
     /// Work done by the current exhaustiveness check.
     missing_steps: std::cell::Cell<usize>,
+    /// `uses_crate`'s answers, by crate name (the source doesn't change during a check).
+    crate_uses: std::cell::RefCell<HashMap<String, bool>>,
     /// `const` and `static` items.
     consts: HashMap<String, Ty>,
     /// Bounds of the current function's type parameters.
@@ -615,6 +652,11 @@ struct Checker<'a> {
     /// Locals holding an iterator of slots (`false`) or a Vec of them (`true`), by name, with
     /// their items' shape (see `typeck_slots.rs`).
     slot_locals: HashMap<String, (bool, slots::SlotShape)>,
+    /// The parameters of the next closure checked that receive slot items (`it.filter(|x| ..)`
+    /// over a slot iterator): (parameter index, shape).
+    closure_slots: Vec<(usize, slots::SlotShape)>,
+    /// Locals holding an `Option` of slot items (`let big = v.iter_mut().find(..)`).
+    slot_options: HashMap<String, slots::SlotShape>,
     /// Bounds to check once a generic call's type arguments are known.
     pending_bounds: Vec<(Ty, String, SyntaxNode, usize)>,
     boxed: std::collections::HashSet<(usize, usize)>,
@@ -630,14 +672,24 @@ struct Checker<'a> {
     move_sites: std::collections::HashSet<(usize, usize)>,
     /// `write!` destinations that are `io::Write`rs (by their start).
     io_writes: std::collections::HashSet<usize>,
+    /// See `Types::any_strs` / `any_checks`.
+    any_strs: HashMap<(usize, usize), String>,
+    any_checks: HashMap<(usize, usize), Ty>,
+    /// The crate's name (the file's stem), which `type_name` puts before a struct's name.
+    crate_name: String,
     /// `write!` destinations that are `fmt::Write`rs (your own, or a type parameter's).
     fmt_writes: std::collections::HashSet<usize>,
     /// Struct fields declared as fixed-size arrays of `Copy` values: (struct, field).
     pub(super) array_fields: std::collections::HashSet<(String, String)>,
+    /// Fields declared as shared references (`&'a [u8]`, `Option<&T>`): `Copy` and `Clone`
+    /// whatever they point at. (struct or variant, field)
+    pub(super) shared_ref_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
+    place_slots: std::collections::HashSet<(usize, usize)>,
+    method_keys: HashMap<(usize, usize), String>,
     derefs: HashMap<(usize, usize), (bool, Ty)>,
     qualified_calls: HashMap<(usize, usize), QualifiedCall>,
     ptrs: Ptrs,
@@ -966,6 +1018,8 @@ impl<'a> Checker<'a> {
                 let (xs, ys) = (xs.clone(), ys.clone());
                 xs.iter().zip(ys.iter()).all(|(x, y)| self.unify(x, y))
             }
+            // Anything is a `dyn Any`.
+            (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr)) if tr == "Any" && !matches!(t, Ty::Dyn(_)) => true,
             // A struct or enum coerces to a `dyn Trait` it implements.
             (Ty::Dyn(tr), Ty::Adt(..)) | (Ty::Adt(..), Ty::Dyn(tr)) => {
                 let adt = if matches!(a, Ty::Adt(..)) {
@@ -975,6 +1029,27 @@ impl<'a> Checker<'a> {
                 };
                 let tr = tr.clone();
                 self.implements_user_trait(&adt, &tr)
+            }
+            // A built-in type with your impl of the trait (`Box<dyn io::Write>` holding a
+            // `Vec<u8>`, `Box<dyn Money>` an `f64`).
+            (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr))
+                if crate::adt::ext_key_of(t).is_some_and(|k| self.adts.ext_types.contains(k)) =>
+            {
+                let (tr, t) = (tr.clone(), t.clone());
+                if tr == "IoWrite"
+                    && let Ty::Vec(e) = &t
+                    && matches!(self.shallow(e), Ty::Var(_))
+                {
+                    self.unify(e, &Ty::Int(IntKind::U8));
+                }
+                self.implements_user_trait(&t, &tr)
+            }
+            // A hand-written future (`impl Future for X`) is a future of its `Output`.
+            (Ty::Future(x), t @ Ty::Adt(..)) | (t @ Ty::Adt(..), Ty::Future(x))
+                if self.adt_future_output(t).is_some() =>
+            {
+                let (x, out) = (x.clone(), self.adt_future_output(t).unwrap());
+                self.unify(&x, &out)
             }
             // A std error (`ParseIntError`) is a `dyn Error`.
             (Ty::Dyn(tr), Ty::Extern(n)) | (Ty::Extern(n), Ty::Dyn(tr))
@@ -1047,6 +1122,7 @@ impl<'a> Checker<'a> {
     /// Unify `found` with `expected`, reporting rustc's "mismatched types" on failure.
     fn expect(&mut self, n: &SyntaxNode, found: &Ty, expected: &Ty) {
         if let (Ty::Dyn(tr), Ty::Adt(adt, _)) = (self.shallow(expected), self.shallow(found))
+            && tr != "Any"
             && !self.unify(found, expected)
         {
             let msg = format!(
@@ -1188,6 +1264,18 @@ impl<'a> Checker<'a> {
             {
                 Ty::Dyn(self.user_trait_type(t).unwrap())
             }
+            // `dyn Any` (`&dyn Any`, `Box<dyn Any + Send>`): any value, tested by `is::<T>()`.
+            ast::Type::DynTraitType(d)
+                if d.type_bound_list().is_some_and(|l| {
+                    l.bounds().any(|b| {
+                        matches!(b.ty(), Some(ast::Type::PathType(p))
+                            if p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref())
+                                .is_some_and(|n| n.text() == "Any"))
+                    })
+                }) =>
+            {
+                Ty::Dyn("Any".into())
+            }
             // `Box<dyn Error>`: any error value (they all display themselves).
             ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_) if names_std_error(t) => {
                 Ty::Dyn("Error".into())
@@ -1206,12 +1294,18 @@ impl<'a> Checker<'a> {
                     .map(|n| n.text().to_string())
                     .unwrap_or_default();
                 if let Some(kind) = crate::ty::Coll::from_name(&name) {
+                    // (A trailing hasher or allocator argument, `IndexSet<K, S>`, is ignored.)
+                    let keep = match kind {
+                        crate::ty::Coll::BTreeMap | crate::ty::Coll::IndexMap => 2,
+                        _ => 1,
+                    };
                     let args: Vec<Ty> = seg
                         .clone()
                         .and_then(|s| s.generic_arg_list())
                         .map(|l| l.generic_args().collect::<Vec<_>>())
                         .unwrap_or_default()
                         .into_iter()
+                        .take(keep)
                         .map(|g| match g {
                             ast::GenericArg::TypeArg(ta) => {
                                 ta.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown)
@@ -1539,6 +1633,10 @@ impl<'a> Checker<'a> {
                 if name == "DefaultHasher" {
                     return Ty::Hasher;
                 }
+                // `std::any::TypeId`: the string naming the type.
+                if name == "TypeId" && !self.adts.defs.contains_key("TypeId") {
+                    return Ty::Str;
+                }
                 if crates::is_rng_type(&name) && self.uses_crate("rand") {
                     return Ty::Rng;
                 }
@@ -1620,6 +1718,7 @@ impl<'a> Checker<'a> {
         self.in_async = is_async;
         self.scopes = vec![HashMap::new()];
         self.slot_locals.clear();
+        self.slot_options.clear();
         // Const generic parameters: values in the body.
         for (n, ty) in self.const_tys.clone() {
             let local = Local {
@@ -1732,6 +1831,11 @@ impl<'a> Checker<'a> {
                 break;
             }
             let params = self.adts.defs[&adt].type_params.clone();
+            let kind = if self.adts.defs[&adt].is_enum {
+                "enum"
+            } else {
+                "struct"
+            };
             let cps = self.adts.const_params[&adt].clone();
             for (p, t) in params.iter().zip(&targs) {
                 // (Only a variable nothing settled: an unchecked type leaves it unknown.)
@@ -1742,7 +1846,7 @@ impl<'a> Checker<'a> {
                     self.diags.push(RawDiag {
                         start: r.0,
                         end: r.1,
-                        message: format!("type annotations needed: cannot infer the value of the const parameter `{p}` declared on the struct `{adt}`"),
+                        message: format!("type annotations needed: cannot infer the value of the const parameter `{p}` declared on the {kind} `{adt}`"),
                         severity: "error",
                     });
                 }
@@ -1960,6 +2064,18 @@ impl<'a> Checker<'a> {
             }
             // `let s = v.iter_mut().min_by(..)?;`: a `&mut` element.
             Some(e) if mut_element(&e) => Some(true),
+            // `let this = self.get_mut();` in a future's `poll` (`self: Pin<&mut Self>`).
+            Some(ast::Expr::MethodCallExpr(m))
+                if m.name_ref().is_some_and(|n| {
+                    matches!(
+                        n.text().to_string().as_str(),
+                        "get_mut" | "get_unchecked_mut"
+                    )
+                }) && m.arg_list().is_some_and(|a| a.args().next().is_none())
+                    && m.receiver().is_some_and(|r| r.syntax().text() == "self") =>
+            {
+                Some(true)
+            }
             _ => None,
         };
         let Some(pat) = l.pat() else { return };
@@ -1992,7 +2108,19 @@ impl<'a> Checker<'a> {
                 let r = self.range(name.syntax());
                 self.let_types.push((r, ty.clone()));
             }
+            // (What the initializer borrows, before `name` shadows a local it names.)
+            let borrowed = l
+                .initializer()
+                .map(|init| self.borrowed_local(&init))
+                .unwrap_or_default();
             self.declare(&name, local);
+            if declared_ref.is_none()
+                && l.initializer()
+                    .is_some_and(|i| crate::borrows::makes_owned(&i))
+            {
+                let r = self.range(name.syntax());
+                self.borrow_events.owned.insert(r);
+            }
             if self.copy_array(l.ty().as_ref(), l.initializer().as_ref(), &ty) {
                 let r = self.range(name.syntax());
                 self.copy_arrays.insert(r);
@@ -2001,13 +2129,12 @@ impl<'a> Checker<'a> {
             if self.ptr_let(l, &name, &ty) {
                 return;
             }
-            // `let r = &v;` / `let r = v.first();`: `r` borrows `v` while it's used.
-            if let Some(init) = l.initializer()
-                && let Some((of, mutable)) = self.borrowed_local(&init)
-            {
+            // `let r = &v;` / `let r = v.first();` / `let r = first(&v);`: `r` borrows `v`
+            // while it's used.
+            for place in borrowed {
                 let holder = self.range(name.syntax());
                 let from = self.range(l.syntax()).1;
-                self.borrow_events.borrows.push((holder, of, mutable, from));
+                self.borrow_events.borrows.push((holder, place, from));
             }
             return;
         }
@@ -2110,12 +2237,16 @@ impl<'a> Checker<'a> {
                     matches!(
                         n.text(),
                         "get_mut"
+                            | "get_index_mut"
+                            | "node_weight_mut"
+                            | "edge_weight_mut"
                             | "first_mut"
                             | "last_mut"
                             | "as_mut"
                             | "values_mut"
                             | "iter_mut"
                             | "split_at_mut"
+                            | "downcast_mut"
                     )
                 }),
                 _ => false,
@@ -2125,6 +2256,18 @@ impl<'a> Checker<'a> {
             && self.slot_calls.contains(&self.range(m.syntax()))
             && let ast::Pat::TupleStructPat(tp) = pat
             && let Some(ast::Pat::IdentPat(ip)) = tp.fields().next()
+            && let Some(n) = ip.name()
+        {
+            let r = self.range(n.syntax());
+            self.slot_bindings.insert(r);
+        }
+        // `Some((k, v))` against `index_map.get_index_mut(i)` of numbers: `v` is the slot.
+        if let Some(ast::Expr::MethodCallExpr(m)) = scrutinee.map(strip_parens)
+            && self.slot_calls.contains(&self.range(m.syntax()))
+            && m.name_ref().is_some_and(|n| n.text() == "get_index_mut")
+            && let ast::Pat::TupleStructPat(tp) = pat
+            && let Some(ast::Pat::TuplePat(t)) = tp.fields().next()
+            && let Some(ast::Pat::IdentPat(ip)) = t.fields().nth(1)
             && let Some(n) = ip.name()
         {
             let r = self.range(n.syntax());
@@ -2200,7 +2343,7 @@ impl<'a> Checker<'a> {
                 }
             }
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => self.expect_option(p, expected),
-            ast::Pat::PathPat(pp) if ordering_variant(pp.path()).is_some() => {
+            ast::Pat::PathPat(pp) if ordering_variant(pp.path(), &self.adts.defs).is_some() => {
                 if !self.unify(expected, &Ty::Ordering) {
                     let msg = format!(
                         "mismatched types: expected `{}`, found `Ordering`",
@@ -2534,8 +2677,10 @@ impl<'a> Checker<'a> {
                 .map(|sub| self.abstract_pat(&sub))
                 .unwrap_or_else(|| vec![Ap::Wild]),
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => vec![Ap::None],
-            ast::Pat::PathPat(pp) if ordering_variant(pp.path()).is_some() => {
-                vec![Ap::Ord(ordering_variant(pp.path()).unwrap())]
+            ast::Pat::PathPat(pp) if ordering_variant(pp.path(), &self.adts.defs).is_some() => {
+                vec![Ap::Ord(
+                    ordering_variant(pp.path(), &self.adts.defs).unwrap(),
+                )]
             }
             ast::Pat::TupleStructPat(tp) if result_variant(tp.path()).is_some() => {
                 let v = result_variant(tp.path()).unwrap();
@@ -2977,7 +3122,8 @@ impl<'a> Checker<'a> {
             // `Vec<u32>`.)
             Ty::Adt(n, targs) => self.adts.deref_targets.get(&n).map(|t| {
                 let map = self.adt_subst(&n, &targs);
-                (n.clone(), generic::subst(t, &map))
+                // (Resolved: `OrderedFloat(x).sqrt()` derefs to the `f64` its variable holds.)
+                (n.clone(), self.shallow(&generic::subst(t, &map)))
             }),
             _ => None,
         }
@@ -3033,7 +3179,25 @@ impl<'a> Checker<'a> {
                         }))
                 {
                     let z = self.zonk(&t);
-                    if z.is_js_primitive() || matches!(z, Ty::Option(_)) {
+                    // `let r = &mut v[i];`: `r` is a slot over the element (or field), made
+                    // once, so `*r = ..` writes it.
+                    let let_name = ast::LetStmt::cast(p.clone()).and_then(|l| match l.pat() {
+                        Some(ast::Pat::IdentPat(ip)) if ip.pat().is_none() => ip.name(),
+                        _ => None,
+                    });
+                    let range_index = matches!(
+                        strip_parens(&inner),
+                        ast::Expr::IndexExpr(ix) if matches!(ix.index(), Some(ast::Expr::RangeExpr(_)))
+                    );
+                    if (z.is_js_primitive() || matches!(z, Ty::Option(_)))
+                        && !range_index
+                        && let Some(n) = let_name
+                    {
+                        let rr = self.range(r.syntax());
+                        self.place_slots.insert(rr);
+                        let nr = self.range(n.syntax());
+                        self.slot_bindings.insert(nr);
+                    } else if z.is_js_primitive() || matches!(z, Ty::Option(_)) {
                         let msg = format!(
                             "keeping a `&mut` to a `{}` inside a struct, tuple or Vec in a variable isn't supported yet (JS can't reference that slot, so writes through it would be lost); assign through the place itself (`{} = ..`)",
                             self.describe(&t),
@@ -3114,7 +3278,11 @@ impl<'a> Checker<'a> {
                 };
                 Ty::RefCell(Box::new(inner))
             }
-            ast::Expr::CallExpr(c) if is_box_new(c) || is_rc_call(c) => {
+            ast::Expr::CallExpr(c)
+                if is_box_new(c)
+                    || is_rc_call(c)
+                    || is_pin_new(c, self.adts.defs.contains_key("Pin")) =>
+            {
                 // `Box::new(x)` is `x`.
                 let args: Vec<ast::Expr> =
                     c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
@@ -3231,6 +3399,9 @@ impl<'a> Checker<'a> {
                     return Ty::Unknown;
                 };
                 let t = self.infer(&inner, None);
+                if let Some(out) = self.adt_future_output(&t) {
+                    return out;
+                }
                 match self.shallow(&t) {
                     Ty::Future(t) => *t,
                     Ty::Unknown | Ty::Var(_) => Ty::Unknown,
@@ -3497,7 +3668,20 @@ impl<'a> Checker<'a> {
                 return t;
             }
             if name.text() == "None" {
-                return Ty::Option(Box::new(self.fresh(VarKind::General)));
+                // `None::<js::Element>`
+                let arg = path
+                    .segment()
+                    .and_then(|s| s.generic_arg_list())
+                    .and_then(|l| l.generic_args().next())
+                    .and_then(|a| match a {
+                        ast::GenericArg::TypeArg(t) => t.ty(),
+                        _ => None,
+                    });
+                let t = match arg {
+                    Some(t) => self.lower_type(&t),
+                    None => self.fresh(VarKind::General),
+                };
+                return Ty::Option(Box::new(t));
             }
             // `Some`, `Ok` and `Err` as functions: `.map(Some)`, `.map(Ok)`.
             if matches!(name.text(), "Some" | "Ok" | "Err") {
@@ -3936,6 +4120,27 @@ impl<'a> Checker<'a> {
             BinaryOp::CmpOp(cmp) => {
                 let lt = self.infer(&lhs, None);
                 let rt = self.infer(&rhs, Some(&lt));
+                // `"home" == host` / `id == 3` with `impl PartialEq<Host> for &str` /
+                // `impl PartialEq<u32> for Id`: that impl's `eq`.
+                if matches!(cmp, CmpOp::Eq { .. })
+                    && !self.could_be(&lt, &rt)
+                    && let Some(k) = match self.shallow(&lt) {
+                        Ty::Adt(n, _) => Some(n),
+                        t => crate::adt::ext_key_of(&t)
+                            .filter(|k| self.adts.ext_types.contains(*k))
+                            .map(str::to_string),
+                    }
+                    && let Some(sig) = self.adts.method(&k, "eq").cloned()
+                    && sig.params.first().is_some_and(|p| self.could_be(p, &rt))
+                {
+                    if let Some(p) = sig.params.first() {
+                        self.unify(p, &rt);
+                    }
+                    let r = self.range(b.syntax());
+                    self.conversions
+                        .insert(r, crate::adt::Conv::Method { key: "eq".into() });
+                    return Ty::Bool;
+                }
                 if !self.unify(&lt, &rt) {
                     let msg = format!(
                         "mismatched types: expected `{}`, found `{}`",
@@ -4016,13 +4221,18 @@ impl<'a> Checker<'a> {
     fn arith_operands(&mut self, b: &ast::BinExpr, op: ArithOp, lt: &Ty, rhs: &ast::Expr) -> Ty {
         if let Ty::Adt(n, _) = self.shallow(lt) {
             let assign = matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }));
-            return self.op_overload(b.syntax(), op, assign, &n, lt, rhs);
+            return self.op_overload(b.syntax(), op, assign, &n, lt, rhs, None);
         }
         if self.shallow(lt) == Ty::Str && op == ArithOp::Add {
             self.check(rhs, &Ty::Str);
             return Ty::Str;
         }
         let rt = self.infer(rhs, Some(lt));
+        // `2.0 * v` with your `impl Mul<V> for f64`.
+        let assign = matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }));
+        if let Some(k) = self.prim_op_key(op, assign, lt, &rt) {
+            return self.op_overload(b.syntax(), op, assign, &k, lt, rhs, Some(rt));
+        }
         if !self.unify(lt, &rt) {
             let (l, r) = (self.describe(lt), self.describe(&rt));
             let msg = match op {
@@ -4202,6 +4412,9 @@ impl<'a> Checker<'a> {
                 ["std" | "core", rest @ ..] => rest,
                 all => all,
             };
+            if let Some(t) = self.any_call(c, tail, &args) {
+                return t;
+            }
             if let Some(t) = self.ptr_call(c, tail, &args, expected) {
                 return t;
             }
@@ -4543,6 +4756,9 @@ impl<'a> Checker<'a> {
             };
             if ty == Ty::Unknown {
                 self.infer(a, None);
+            } else if matches!(&ty, Ty::Extern(n) if n == "ReactNode") {
+                // `ns.print_raw(x)`: a node, text, a number, ..
+                self.check_node_arg(a);
             } else if matches!(ty, Ty::Float { .. }) && is_int_literal(a) {
                 // Deliberate extension: every NS number is `f64`, and `ns.sleep(100)` is how every
                 // Bitburner script reads, so unsuffixed integer literals are accepted here.
@@ -5002,6 +5218,8 @@ impl<'a> Checker<'a> {
                     | "ge"
                     | "deref"
                     | "deref_mut"
+                    // (`Into` is every type's own: `host.into()` doesn't look through `Deref`.)
+                    | "into"
             )
             && !(method == "to_string" && self.adts.defs.get(&n).is_some_and(|d| d.display))
         {
@@ -5011,6 +5229,13 @@ impl<'a> Checker<'a> {
         }
         // A user trait method on a built-in type (`x.money()` with `impl Money for f64`); std's own
         // methods come first, as inherent methods do in Rust.
+        // (A generic trait implemented twice for the type: the impl whose signature fits.)
+        let method = match crate::adt::ext_key_of(&self.shallow(&rt)) {
+            Some(key) => self
+                .pick_method_alt(m, key, &method, &args, expected)
+                .unwrap_or(method),
+            None => method,
+        };
         if let Some(key) = crate::adt::ext_key_of(&self.shallow(&rt))
             && self.adts.ext_types.contains(key)
             && let Some(sig) = self.adts.method(key, &method).cloned()
@@ -5062,6 +5287,12 @@ impl<'a> Checker<'a> {
             } else {
                 sig.ret
             };
+        }
+        // `x.type_id()`, `any.is::<T>()` / `downcast_ref::<T>()`.
+        if !matches!(self.shallow(&rt), Ty::Adt(n, _) if self.adts.method(&n, &method).is_some())
+            && let Some(t) = self.any_method(m, &rt, &method, &args)
+        {
+            return t;
         }
         let resolved = match self.shallow(&rt) {
             // A custom iterator (`impl Iterator for Fib`): adapters and consumers work on it.
@@ -5270,7 +5501,28 @@ impl<'a> Checker<'a> {
             Ty::Unknown | Ty::Var(_) if is_float_method(&method) => Ty::Float { f32: false },
             Ty::Extern(name) => return self.extern_method(m, &name, &method, &args),
             Ty::Adt(name, targs) => {
+                let method = self
+                    .pick_method_alt(m, &name, &method, &args, expected)
+                    .unwrap_or(method);
                 return self.adt_method(m, &recv, &name, &targs, &method, &args);
+            }
+            // (A method that several impls of one generic trait give a type can't be told apart
+            // at run time.)
+            Ty::Param(_) | Ty::Dyn(_)
+                if self
+                    .adts
+                    .method_alts
+                    .keys()
+                    .any(|k| k.ends_with(&format!("::{method}"))) =>
+            {
+                let msg = format!(
+                    "`{method}` comes from a generic trait implemented more than once for one type; calling it through a type parameter or `dyn` isn't supported yet (call it on the concrete type)"
+                );
+                self.error(m.syntax(), msg);
+                for a in &args {
+                    self.infer(a, None);
+                }
+                return Ty::Unknown;
             }
             Ty::Param(name) => return self.param_method(m, &recv, &name, &method, &args),
             Ty::Dyn(tr) => return self.dyn_method(m, &recv, &tr, &method, &args),
@@ -5849,6 +6101,13 @@ impl<'a> Checker<'a> {
         if let Ty::Adt(n, _) = self.shallow(&bt) {
             return self.index_overload(ix, &n, &bt, &index);
         }
+        // `map[0]` / `set[1]` by position, `map[&k] = v` (indexmap's `Index` / `IndexMut`).
+        if let Ty::Coll(kind @ (crate::ty::Coll::IndexMap | crate::ty::Coll::IndexSet), view) =
+            self.shallow(&bt)
+            && let Some(t) = self.index_coll_index(ix, kind, &view, &index)
+        {
+            return t;
+        }
         // `deque[i]`, `btree_map[&k]`
         let bt = match self.shallow(&bt) {
             Ty::Coll(
@@ -5980,11 +6239,11 @@ impl<'a> Checker<'a> {
     fn for_expr(&mut self, f: &ast::ForExpr) {
         let Some(iterable) = f.iterable() else { return };
         // `for x in &v` / `v.iter()`: the loop borrows `v` for its whole body.
-        if let Some(body) = f.loop_body()
-            && let Some((of, mutable)) = self.borrowed_local(&iterable)
-        {
-            let r = self.range(body.syntax());
-            self.borrow_events.loops.push((of, mutable, r));
+        if let Some(body) = f.loop_body() {
+            for place in self.borrowed_local(&iterable) {
+                let r = self.range(body.syntax());
+                self.borrow_events.loops.push((place, r));
+            }
         }
         // (element type, reference kind of the loop variable)
         let (elem, reference) = match &iterable {
@@ -6517,11 +6776,19 @@ fn is_int_literal(e: &ast::Expr) -> bool {
     }
 }
 
-/// `Ordering::Less` → -1, `Equal` → 0, `Greater` → 1.
-pub fn ordering_variant(path: Option<ast::Path>) -> Option<i8> {
+/// `Ordering::Less` → -1, `Equal` → 0, `Greater` → 1. A user `enum Ordering` shadows std's
+/// unless the path says `cmp::Ordering`.
+pub fn ordering_variant(
+    path: Option<ast::Path>,
+    defs: &HashMap<String, crate::adt::AdtDef>,
+) -> Option<i8> {
     let text = path?.syntax().text().to_string();
-    let last2: Vec<&str> = text.rsplit("::").take(2).collect();
-    match last2.as_slice() {
+    let last3: Vec<&str> = text.rsplit("::").take(3).collect();
+    if defs.contains_key("Ordering") && last3.get(2).is_none_or(|s| s.trim() != "cmp") {
+        return None;
+    }
+    let last2 = &last3[..last3.len().min(2)];
+    match last2 {
         ["Less", "Ordering"] => Some(-1),
         ["Equal", "Ordering"] => Some(0),
         ["Greater", "Ordering"] => Some(1),
@@ -6737,6 +7004,32 @@ pub fn is_box_new(c: &ast::CallExpr) -> bool {
             .as_slice(),
         [.., "Box", "new" | "pin"]
     )
+}
+
+/// `Pin::new(&mut x)` / `Pin::new_unchecked(..)` / `Pin::into_inner(..)`: `x` (`Pin` is erased),
+/// unless the file has a `Pin` of its own (`has_own`).
+pub fn is_pin_new(c: &ast::CallExpr, has_own: bool) -> bool {
+    let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+        return false;
+    };
+    let names: Vec<String> = p
+        .path()
+        .map(|p| {
+            p.segments()
+                .filter_map(|s| s.name_ref())
+                .map(|n| n.text().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    !has_own
+        && matches!(
+            names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [.., "Pin", "new" | "new_unchecked" | "into_inner"]
+        )
 }
 
 /// An element taken out of a `&mut` iterator: `v.iter_mut().find(..)`, `.max_by_key(..)?`,
@@ -7025,6 +7318,20 @@ fn slot_let_binding(m: &ast::MethodCallExpr) -> Option<ast::Name> {
         ast::Pat::IdentPat(ip) => ip.name(),
         _ => None,
     }
+}
+
+/// Whether a call's result is matched (`if let` / `while let` / `match`).
+pub(super) fn matched_position(m: &ast::MethodCallExpr) -> bool {
+    let mut n = m.syntax().clone();
+    while let Some(p) = n
+        .parent()
+        .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+    {
+        n = p;
+    }
+    let Some(p) = n.parent() else { return false };
+    ast::LetExpr::can_cast(p.kind())
+        || ast::MatchExpr::cast(p).is_some_and(|me| me.expr().is_some_and(|e| e.syntax() == &n))
 }
 
 /// Whether a `get_mut`-style call's result is used where a slot can stand in for it: matched
@@ -7730,31 +8037,127 @@ impl Checker<'_> {
 }
 
 impl Checker<'_> {
-    /// The local `e` borrows (and whether mutably): `&v`, `&mut v.field`, `&v[i]`, and the
-    /// methods that hand out references into their receiver (`v.iter()`, `v.first()`,
-    /// `map.get(k)`, ..).
-    fn borrowed_local(&self, e: &ast::Expr) -> Option<(crate::borrows::Decl, bool)> {
-        let (place, mutable) = match strip_parens(e) {
-            ast::Expr::RefExpr(r) => (r.expr()?, r.mut_token().is_some()),
+    /// The locals `e` borrows (whether mutably, and which fields): `&v`, `&mut v.field`, `&v[i]`,
+    /// the methods that hand out references into their receiver (`v.iter()`, `v.first()`,
+    /// `map.get(k)`, ..), and calls of this file's functions that return a reference into an
+    /// argument (`first(&v)`, `s.name()`).
+    fn borrowed_local(&self, e: &ast::Expr) -> Vec<crate::borrows::Place> {
+        let mut out = Vec::new();
+        // `call`: the place is a call's argument or receiver (borrowed by the callee's signature,
+        // or auto-referenced); a reference local there is reborrowed, not borrowed.
+        let mut place = |place: Option<ast::Expr>, mutable: bool, call: bool| {
+            let Some(place) = place.map(|p| strip_parens(&p)) else {
+                return;
+            };
+            if crate::borrows::has_deref(&place) {
+                return;
+            }
+            let Some((name, through)) = Self::place_root(&place) else {
+                return;
+            };
+            let Some(local) = self.lookup(name.text()) else {
+                return;
+            };
+            // A reference held in a local (`r` in `&r[0]`) isn't the owner being borrowed.
+            if (through || call) && local.reference.is_some() {
+                return;
+            }
+            if let Some(of) = local.decl {
+                out.push(crate::borrows::Place {
+                    of,
+                    mutable,
+                    path: crate::borrows::field_path(&place),
+                    direct: !call && matches!(place, ast::Expr::PathExpr(_)),
+                });
+            }
+        };
+        match strip_parens(e) {
+            // (`&raw const v` makes a pointer.)
+            ast::Expr::RefExpr(r) if r.raw_token().is_none() => {
+                place(r.expr(), r.mut_token().is_some(), false)
+            }
+            ast::Expr::CallExpr(c) => {
+                let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+                    return out;
+                };
+                let segs: Vec<String> = p
+                    .path()
+                    .map(|p| {
+                        p.segments()
+                            .filter_map(|s| s.name_ref().map(|n| n.text().to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let key = match segs.as_slice() {
+                    [f] if self.lookup(f).is_none() => f.clone(),
+                    [t, f] if t != "Self" => format!("{t}::{f}"),
+                    _ => return out,
+                };
+                let Some(Some(sig)) = self.borrow_events.sigs.get(&key) else {
+                    return out;
+                };
+                let args: Vec<ast::Expr> =
+                    c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+                for &i in &sig.from_params {
+                    if let Some(ast::Expr::RefExpr(r)) = args.get(i).map(strip_parens) {
+                        place(r.expr(), r.mut_token().is_some(), true);
+                    }
+                }
+            }
             ast::Expr::MethodCallExpr(m) => {
-                let mutable = match m.name_ref()?.text() {
+                let (Some(method), Some(recv)) = (m.name_ref(), m.receiver()) else {
+                    return out;
+                };
+                // A method of your own type: what its signature borrows.
+                // (A `for` loop's iterable isn't checked yet: then its local's type.)
+                let recv_ty = self
+                    .raw
+                    .get(&self.range(recv.syntax()))
+                    .cloned()
+                    .or_else(|| match strip_parens(&recv) {
+                        ast::Expr::PathExpr(p) => {
+                            let n = p.path()?.as_single_name_ref()?;
+                            Some(self.lookup(n.text().to_string().as_str())?.ty.clone())
+                        }
+                        _ => None,
+                    })
+                    .map(|t| self.zonk(&t));
+                if let Some(Ty::Adt(n, _)) = &recv_ty
+                    && let Some(sig) = self.borrow_events.sigs.get(&format!("{n}::{method}"))
+                {
+                    let Some(sig) = sig else { return out };
+                    if let Some(mutable) = sig.from_self {
+                        place(Some(recv), mutable, true);
+                    }
+                    let args: Vec<ast::Expr> =
+                        m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+                    for &i in &sig.from_params {
+                        if let Some(ast::Expr::RefExpr(r)) = args.get(i).map(strip_parens) {
+                            place(r.expr(), r.mut_token().is_some(), true);
+                        }
+                    }
+                    return out;
+                }
+                // The std collections' methods that return a reference into them (on other
+                // types, `get` / `as_slice` may return a copy or a borrow of something else).
+                if !matches!(
+                    recv_ty,
+                    Some(Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..))
+                ) {
+                    return out;
+                }
+                let mutable = match method.text().to_string().as_str() {
                     "iter" | "first" | "last" | "get" | "keys" | "values" | "as_slice"
                     | "windows" | "chunks" => false,
                     "iter_mut" | "first_mut" | "last_mut" | "get_mut" | "values_mut"
                     | "as_mut_slice" => true,
-                    _ => return None,
+                    _ => return out,
                 };
-                (m.receiver()?, mutable)
+                place(Some(recv), mutable, true);
             }
-            _ => return None,
-        };
-        let (name, through) = Self::place_root(&strip_parens(&place))?;
-        let local = self.lookup(name.text())?;
-        // A reference held in a local (`r` in `&r[0]`) isn't the owner being borrowed.
-        if through && local.reference.is_some() {
-            return None;
+            _ => {}
         }
-        Some((local.decl?, mutable))
+        out
     }
 }
 
