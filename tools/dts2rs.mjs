@@ -8,6 +8,7 @@
 //
 // Mapping (TS → Rust):
 //   number → f64, string → String, boolean → bool, void → (), T[] / readonly T[] → Vec<T>
+//   (parameters borrow them: string → &str, T[] → &[T], [T, T] → &[T; 2])
 //   Promise<T> return → `async fn` returning T
 //   T | undefined, `x?:` → Option<T> for fields; `#[optional]` for parameters (may be omitted)
 //   ...rest: T[] → a trailing `#[variadic]` parameter of type T
@@ -335,6 +336,15 @@ export function dtsToRust(text) {
   }
 
   const rustType = (m, asField) => (m.optional && asField ? `Option<${m.ty}>` : m.ty);
+  /** A parameter's type: strings and arrays are borrowed (no NS function changes or keeps the
+   * ones it's given), so `&str` for `String` and `&[T]` for `Vec<T>`. */
+  const paramType = (ty) => {
+    if (ty === "String") return "&str";
+    const vec = ty.match(/^Vec<(.*)>$/);
+    if (vec) return `&[${vec[1]}]`;
+    if (/^\[.*; \d+\]$/.test(ty)) return `&${ty}`;
+    return ty;
+  };
   const docLines = (node, indent) => docOf(node).map((l) => `${indent}/// ${l}\n`).join("");
 
   function emitType(name) {
@@ -375,7 +385,7 @@ export function dtsToRust(text) {
       );
       const ps = params.map((p) => {
         const attr = p.variadic ? "#[variadic] " : p.optional ? "#[optional] " : "";
-        return `${attr}${p.name}: ${p.ty}`;
+        return `${attr}${p.name}: ${p.variadic ? p.ty : paramType(p.ty)}`;
       });
       const retTy = ret.ty === "()" ? "" : ` -> ${rustType(ret, true)}`;
       const asyncKw = ret.isAsync ? "async " : "";

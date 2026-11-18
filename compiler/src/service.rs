@@ -108,17 +108,26 @@ fn analyze_uncached(src: &str, filename: &str, resolver: Resolver) -> Analysis {
         // (`std::time`'s prelude after the program, as it compiles.)
         let text = crate::stdtime::with_prelude(&exp.text).unwrap_or(exp.text);
         let file = crate::macros::parse_tree(&text);
-        let (types, _) = typeck::check(&file, &text, filename, resolver);
+        let map = std::rc::Rc::new(exp.map);
+        let origin = typeck::Origin {
+            map: Some(map.clone()),
+            len: src.len(),
+        };
+        let (types, _) = typeck::check(&file, &text, filename, resolver, &origin);
         return Analysis {
             file,
             types,
-            map: Some(std::rc::Rc::new(exp.map)),
+            map: Some(map),
         };
     }
+    let origin = typeck::Origin {
+        map: None,
+        len: src.len(),
+    };
     let with_time = crate::stdtime::with_prelude(src);
     let src = with_time.as_deref().unwrap_or(src);
     let file = crate::macros::parse_tree(src);
-    let (types, _) = typeck::check(&file, src, filename, resolver);
+    let (types, _) = typeck::check(&file, src, filename, resolver, &origin);
     Analysis {
         file,
         types,
@@ -139,30 +148,34 @@ fn signature(name: &str, params: &[(String, Ty)], ret: &Ty, is_async: bool) -> S
         .iter()
         .map(|(n, t)| format!("{n}: {}", t.describe()))
         .collect();
+    signature_of(name, &ps, ret, is_async)
+}
+
+/// A signature from parameters already written out (`host?: &str`).
+fn signature_of(name: &str, params: &[String], ret: &Ty, is_async: bool) -> String {
     let ret = if *ret == Ty::Unit {
         String::new()
     } else {
         format!(" -> {}", ret.describe())
     };
     let a = if is_async { "async " } else { "" };
-    format!("{a}fn {name}({}){ret}", ps.join(", "))
+    format!("{a}fn {name}({}){ret}", params.join(", "))
 }
 
-/// An NS method's parameters; optional ones (which may be left out) are marked `?`.
-fn binding_params(m: &bindings::Method) -> Vec<(String, Ty)> {
+/// An NS method's parameters as declared (`connect_path: &[String]`); optional ones (which may be
+/// left out) are marked `?`.
+fn binding_params(m: &bindings::Method) -> Vec<String> {
     m.params
         .iter()
         .map(|p| {
-            (
-                if p.optional {
-                    format!("{}?", p.name)
-                } else {
-                    p.name.clone()
-                },
-                p.ty.clone(),
-            )
+            let q = if p.optional { "?" } else { "" };
+            format!("{}{q}: {}", p.name, p.shown)
         })
         .collect()
+}
+
+fn binding_signature(name: &str, m: &bindings::Method) -> String {
+    signature_of(name, &binding_params(m), &m.ret, m.is_async)
 }
 
 fn code(s: &str) -> String {
@@ -231,8 +244,7 @@ pub fn hover(
         match &rt {
             Some(Ty::Extern(t)) => {
                 if let Some(method) = b.types.get(t).and_then(|ty| ty.methods.get(&name)) {
-                    let sig =
-                        signature(&name, &binding_params(method), &method.ret, method.is_async);
+                    let sig = binding_signature(&name, method);
                     return Some(make(
                         format!("{}\n*{t}*\n\n{}", code(&sig), method.doc),
                         &node,
@@ -601,11 +613,8 @@ pub fn signature_help(
         if let Some(Ty::Extern(t)) = &rt {
             let b = bindings::current();
             let method = b.types.get(t)?.methods.get(&name)?;
-            let params: Vec<String> = binding_params(method)
-                .into_iter()
-                .map(|(n, t)| format!("{n}: {}", t.describe()))
-                .collect();
-            let label = signature(&name, &binding_params(method), &method.ret, method.is_async);
+            let params = binding_params(method);
+            let label = binding_signature(&name, method);
             return Some(help(label, params, method.doc.clone()));
         }
         let f = find_fn(&name)?;
@@ -637,11 +646,7 @@ fn members(t: &Ty, types: &Types) -> Vec<Completion> {
         Ty::Extern(name) => {
             if let Some(ty) = b.types.get(name) {
                 for (n, m) in &ty.methods {
-                    out.push(method(
-                        n,
-                        signature(n, &binding_params(m), &m.ret, m.is_async),
-                        &m.doc,
-                    ));
+                    out.push(method(n, binding_signature(n, m), &m.doc));
                 }
                 for (n, f) in &ty.fields {
                     out.push(Completion {

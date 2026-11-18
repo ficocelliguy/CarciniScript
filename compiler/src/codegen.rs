@@ -817,7 +817,11 @@ fn compile_text(
     }
     if cg.diags.is_empty() {
         let file = parse.tree();
-        let (types, type_diags) = typeck::check(&file, src, filename, resolver);
+        let origin = typeck::Origin {
+            map: map.clone(),
+            len: original.len(),
+        };
+        let (types, type_diags) = typeck::check(&file, src, filename, resolver, &origin);
         cg.types = types;
         cg.type_errors = type_diags.iter().any(|d| d.severity == "error");
         cg.emit_file(&file);

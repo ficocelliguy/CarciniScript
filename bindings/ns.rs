@@ -73,15 +73,15 @@ impl NS {
     /// Steal a server's money.
     /// RAM cost: 0.1 GB
     #[js = "hack"]
-    pub async fn hack(&self, #[optional] host: String, #[optional] opts: BasicHGWOptions) -> f64;
+    pub async fn hack(&self, #[optional] host: &str, #[optional] opts: BasicHGWOptions) -> f64;
     /// Spoof money in a server's bank account, increasing the amount available.
     /// RAM cost: 0.15 GB
     #[js = "grow"]
-    pub async fn grow(&self, #[optional] host: String, #[optional] opts: BasicHGWOptions) -> f64;
+    pub async fn grow(&self, #[optional] host: &str, #[optional] opts: BasicHGWOptions) -> f64;
     /// Reduce a server's security level.
     /// RAM cost: 0.15 GB
     #[js = "weaken"]
-    pub async fn weaken(&self, #[optional] host: String, #[optional] opts: BasicHGWOptions) -> f64;
+    pub async fn weaken(&self, #[optional] host: &str, #[optional] opts: BasicHGWOptions) -> f64;
     /// Predict the effect of weaken.
     /// RAM cost: 1 GB
     #[js = "weakenAnalyze"]
@@ -89,27 +89,27 @@ impl NS {
     /// Calculate the decimal number of threads needed to hack a specified amount of money from a target host.
     /// RAM cost: 1 GB
     #[js = "hackAnalyzeThreads"]
-    pub fn hack_analyze_threads(&self, host: String, hack_amount: f64) -> f64;
+    pub fn hack_analyze_threads(&self, host: &str, hack_amount: f64) -> f64;
     /// Get the fraction (between 0 and 1) of money stolen with a single thread.
     /// RAM cost: 1 GB
     #[js = "hackAnalyze"]
-    pub fn hack_analyze(&self, host: String) -> f64;
+    pub fn hack_analyze(&self, host: &str) -> f64;
     /// Get the security increase for a number of threads.
     /// RAM cost: 1 GB
     #[js = "hackAnalyzeSecurity"]
-    pub fn hack_analyze_security(&self, threads: f64, #[optional] host: String) -> f64;
+    pub fn hack_analyze_security(&self, threads: f64, #[optional] host: &str) -> f64;
     /// Get the chance of successfully hacking a server.
     /// RAM cost: 1 GB
     #[js = "hackAnalyzeChance"]
-    pub fn hack_analyze_chance(&self, #[optional] host: String) -> f64;
+    pub fn hack_analyze_chance(&self, #[optional] host: &str) -> f64;
     /// Calculate the number of grow threads needed for a given multiplicative growth factor.
     /// RAM cost: 1 GB
     #[js = "growthAnalyze"]
-    pub fn growth_analyze(&self, host: String, multiplier: f64, #[optional] cores: f64) -> f64;
+    pub fn growth_analyze(&self, host: &str, multiplier: f64, #[optional] cores: f64) -> f64;
     /// Calculate the security increase for a number of grow threads.
     /// RAM cost: 1 GB
     #[js = "growthAnalyzeSecurity"]
-    pub fn growth_analyze_security(&self, threads: f64, #[optional] host: String, #[optional] cores: f64) -> f64;
+    pub fn growth_analyze_security(&self, threads: f64, #[optional] host: &str, #[optional] cores: f64) -> f64;
     /// Suspends the script for n milliseconds.
     /// RAM cost: 0 GB
     #[js = "sleep"]
@@ -129,7 +129,7 @@ impl NS {
     /// Prints a formatted string to the script’s logs.
     /// RAM cost: 0 GB
     #[js = "printf"]
-    pub fn printf(&self, format: String, #[variadic] args: JsValue);
+    pub fn printf(&self, format: &str, #[variadic] args: JsValue);
     /// Prints one or more values or variables to the Terminal.
     /// RAM cost: 0 GB
     #[js = "tprint"]
@@ -141,7 +141,7 @@ impl NS {
     /// Prints a raw value or a variable to the Terminal.
     /// RAM cost: 0 GB
     #[js = "tprintf"]
-    pub fn tprintf(&self, format: String, #[variadic] values: JsValue);
+    pub fn tprintf(&self, format: &str, #[variadic] values: JsValue);
     /// Clears the script’s logs.
     /// RAM cost: 0 GB
     #[js = "clearLog"]
@@ -149,19 +149,19 @@ impl NS {
     /// Disables logging for the given NS function.
     /// RAM cost: 0 GB
     #[js = "disableLog"]
-    pub fn disable_log(&self, r#fn: String);
+    pub fn disable_log(&self, r#fn: &str);
     /// Enables logging for the given NS function.
     /// RAM cost: 0 GB
     #[js = "enableLog"]
-    pub fn enable_log(&self, r#fn: String);
+    pub fn enable_log(&self, r#fn: &str);
     /// Checks the status of the logging for the given NS function.
     /// RAM cost: 0 GB
     #[js = "isLogEnabled"]
-    pub fn is_log_enabled(&self, r#fn: String) -> bool;
+    pub fn is_log_enabled(&self, r#fn: &str) -> bool;
     /// Get all the logs of a script.
     /// RAM cost: 0 GB
     #[js = "getScriptLogs"]
-    pub fn get_script_logs(&self, #[optional] r#fn: JsValue, #[optional] host: String, #[variadic] args: JsValue) -> Vec<String>;
+    pub fn get_script_logs(&self, #[optional] r#fn: JsValue, #[optional] host: &str, #[variadic] args: JsValue) -> Vec<String>;
     /// Get an array of recently killed scripts across all servers.
     /// RAM cost: 0.2 GB
     #[js = "getRecentScripts"]
@@ -169,7 +169,7 @@ impl NS {
     /// Get the list of hostnames or IP addresses connected to a server. This function does not return darknet servers (e.g., "darkweb"). Use probe() if you want to list darknet ser...
     /// RAM cost: 0.2 GB
     #[js = "scan"]
-    pub fn scan(&self, #[optional] host: String, #[optional] return_opts: HostReturnOptions) -> Vec<String>;
+    pub fn scan(&self, #[optional] host: &str, #[optional] return_opts: HostReturnOptions) -> Vec<String>;
     /// Returns whether the player has access to the Dark Web via a TOR Router. Note that this is not the Darknet accessible via DarkscapeNavigator.exe.
     /// RAM cost: 0.05GB
     #[js = "hasTorRouter"]
@@ -177,39 +177,39 @@ impl NS {
     /// Runs NUKE.exe on a server.
     /// RAM cost: 0.05 GB
     #[js = "nuke"]
-    pub fn nuke(&self, #[optional] host: String) -> bool;
+    pub fn nuke(&self, #[optional] host: &str) -> bool;
     /// Runs BruteSSH.exe on a server.
     /// RAM cost: 0.05 GB
     #[js = "brutessh"]
-    pub fn brutessh(&self, #[optional] host: String) -> bool;
+    pub fn brutessh(&self, #[optional] host: &str) -> bool;
     /// Runs FTPCrack.exe on a server.
     /// RAM cost: 0.05 GB
     #[js = "ftpcrack"]
-    pub fn ftpcrack(&self, #[optional] host: String) -> bool;
+    pub fn ftpcrack(&self, #[optional] host: &str) -> bool;
     /// Runs relaySMTP.exe on a server.
     /// RAM cost: 0.05 GB
     #[js = "relaysmtp"]
-    pub fn relaysmtp(&self, #[optional] host: String) -> bool;
+    pub fn relaysmtp(&self, #[optional] host: &str) -> bool;
     /// Runs HTTPWorm.exe on a server.
     /// RAM cost: 0.05 GB
     #[js = "httpworm"]
-    pub fn httpworm(&self, #[optional] host: String) -> bool;
+    pub fn httpworm(&self, #[optional] host: &str) -> bool;
     /// Runs SQLInject.exe on a server.
     /// RAM cost: 0.05 GB
     #[js = "sqlinject"]
-    pub fn sqlinject(&self, #[optional] host: String) -> bool;
+    pub fn sqlinject(&self, #[optional] host: &str) -> bool;
     /// Start another script on the current server.
     /// RAM cost: 1 GB
     #[js = "run"]
-    pub fn run(&self, script: String, #[optional] thread_or_options: JsValue, #[variadic] args: JsValue) -> f64;
+    pub fn run(&self, script: &str, #[optional] thread_or_options: JsValue, #[variadic] args: JsValue) -> f64;
     /// Start another script on any server.
     /// RAM cost: 1.3 GB
     #[js = "exec"]
-    pub fn exec(&self, script: String, host: String, #[optional] thread_or_options: JsValue, #[variadic] args: JsValue) -> f64;
+    pub fn exec(&self, script: &str, host: &str, #[optional] thread_or_options: JsValue, #[variadic] args: JsValue) -> f64;
     /// Terminate current script and start another in a defined number of milliseconds.
     /// RAM cost: 2 GB
     #[js = "spawn"]
-    pub fn spawn(&self, script: String, #[optional] thread_or_options: JsValue, #[variadic] args: JsValue) -> JsValue;
+    pub fn spawn(&self, script: &str, #[optional] thread_or_options: JsValue, #[variadic] args: JsValue) -> JsValue;
     /// Returns the currently running script.
     /// RAM cost: 0 GB
     #[js = "self"]
@@ -217,11 +217,11 @@ impl NS {
     /// Terminate the script with the provided PID.
     /// RAM cost: 0.5 GB
     #[js = "kill"]
-    pub fn kill(&self, filename: JsValue, #[optional] host: String, #[variadic] args: JsValue) -> bool;
+    pub fn kill(&self, filename: JsValue, #[optional] host: &str, #[variadic] args: JsValue) -> bool;
     /// Terminate all scripts on a server.
     /// RAM cost: 0.5 GB
     #[js = "killall"]
-    pub fn killall(&self, #[optional] host: String, #[optional] safety_guard: bool) -> bool;
+    pub fn killall(&self, #[optional] host: &str, #[optional] safety_guard: bool) -> bool;
     /// Terminates the current script immediately.
     /// RAM cost: 0 GB
     #[js = "exit"]
@@ -229,19 +229,19 @@ impl NS {
     /// Copy file between servers.
     /// RAM cost: 0.6 GB
     #[js = "scp"]
-    pub fn scp(&self, files: JsValue, destination: String, #[optional] source: String) -> bool;
+    pub fn scp(&self, files: JsValue, destination: &str, #[optional] source: &str) -> bool;
     /// List files on a server.
     /// RAM cost: 0.2 GB
     #[js = "ls"]
-    pub fn ls(&self, #[optional] host: String, #[optional] substring: String) -> Vec<String>;
+    pub fn ls(&self, #[optional] host: &str, #[optional] substring: &str) -> Vec<String>;
     /// List running scripts on a server.
     /// RAM cost: 0.2 GB
     #[js = "ps"]
-    pub fn ps(&self, #[optional] host: String) -> Vec<ProcessInfo>;
+    pub fn ps(&self, #[optional] host: &str) -> Vec<ProcessInfo>;
     /// Check if you have root access on a server.
     /// RAM cost: 0.05 GB
     #[js = "hasRootAccess"]
-    pub fn has_root_access(&self, #[optional] host: String) -> bool;
+    pub fn has_root_access(&self, #[optional] host: &str) -> bool;
     /// Returns a string with the hostname of the server that the script is running on.
     /// RAM cost: 0.05 GB
     #[js = "getHostname"]
@@ -265,67 +265,67 @@ impl NS {
     /// Returns data of a server.
     /// RAM cost: 2 GB
     #[js = "getServer"]
-    pub fn get_server(&self, #[optional] host: String) -> ServerWithIsOnline;
+    pub fn get_server(&self, #[optional] host: &str) -> ServerWithIsOnline;
     /// Get money available on a server.
     /// RAM cost: 0.1 GB
     #[js = "getServerMoneyAvailable"]
-    pub fn get_server_money_available(&self, #[optional] host: String) -> f64;
+    pub fn get_server_money_available(&self, #[optional] host: &str) -> f64;
     /// Get the maximum money available on a server.
     /// RAM cost: 0.1 GB
     #[js = "getServerMaxMoney"]
-    pub fn get_server_max_money(&self, #[optional] host: String) -> f64;
+    pub fn get_server_max_money(&self, #[optional] host: &str) -> f64;
     /// Get a server growth parameter.
     /// RAM cost: 0.1 GB
     #[js = "getServerGrowth"]
-    pub fn get_server_growth(&self, #[optional] host: String) -> f64;
+    pub fn get_server_growth(&self, #[optional] host: &str) -> f64;
     /// Get server security level.
     /// RAM cost: 0.1 GB
     #[js = "getServerSecurityLevel"]
-    pub fn get_server_security_level(&self, #[optional] host: String) -> f64;
+    pub fn get_server_security_level(&self, #[optional] host: &str) -> f64;
     /// Returns the minimum security level of the target server.
     /// RAM cost: 0.1 GB
     #[js = "getServerMinSecurityLevel"]
-    pub fn get_server_min_security_level(&self, #[optional] host: String) -> f64;
+    pub fn get_server_min_security_level(&self, #[optional] host: &str) -> f64;
     /// Get the base security level of a server.
     /// RAM cost: 0.1 GB
     #[js = "getServerBaseSecurityLevel"]
-    pub fn get_server_base_security_level(&self, #[optional] host: String) -> f64;
+    pub fn get_server_base_security_level(&self, #[optional] host: &str) -> f64;
     /// Get the maximum amount of RAM on a server.
     /// RAM cost: 0.05 GB
     #[js = "getServerMaxRam"]
-    pub fn get_server_max_ram(&self, #[optional] host: String) -> f64;
+    pub fn get_server_max_ram(&self, #[optional] host: &str) -> f64;
     /// Get the used RAM on a server. This includes ram used by running scripts as well as blocked ram on darknet servers.
     /// RAM cost: 0.05 GB
     #[js = "getServerUsedRam"]
-    pub fn get_server_used_ram(&self, #[optional] host: String) -> f64;
+    pub fn get_server_used_ram(&self, #[optional] host: &str) -> f64;
     /// Returns the required hacking level of the target server.
     /// RAM cost: 0.1 GB
     #[js = "getServerRequiredHackingLevel"]
-    pub fn get_server_required_hacking_level(&self, #[optional] host: String) -> f64;
+    pub fn get_server_required_hacking_level(&self, #[optional] host: &str) -> f64;
     /// Returns the number of open ports required to successfully run NUKE.exe on the specified server.
     /// RAM cost: 0.1 GB
     #[js = "getServerNumPortsRequired"]
-    pub fn get_server_num_ports_required(&self, #[optional] host: String) -> f64;
+    pub fn get_server_num_ports_required(&self, #[optional] host: &str) -> f64;
     /// Given a hostname, returns its IP address; or given an IP address, returns its hostname.
     /// RAM cost: 0.05 GB
     #[js = "dnsLookup"]
-    pub fn dns_lookup(&self, #[optional] host: String) -> String;
+    pub fn dns_lookup(&self, #[optional] host: &str) -> String;
     /// Returns a boolean denoting whether or not the specified server exists.
     /// RAM cost: 0.1 GB
     #[js = "serverExists"]
-    pub fn server_exists(&self, #[optional] host: String) -> bool;
+    pub fn server_exists(&self, #[optional] host: &str) -> bool;
     /// Check if a file exists.
     /// RAM cost: 0.1 GB
     #[js = "fileExists"]
-    pub fn file_exists(&self, filename: String, #[optional] host: String) -> bool;
+    pub fn file_exists(&self, filename: &str, #[optional] host: &str) -> bool;
     /// Check if a script is running.
     /// RAM cost: 0.1 GB
     #[js = "isRunning"]
-    pub fn is_running(&self, #[optional] script: JsValue, #[optional] host: String, #[variadic] args: JsValue) -> bool;
+    pub fn is_running(&self, #[optional] script: JsValue, #[optional] host: &str, #[variadic] args: JsValue) -> bool;
     /// Get general info about a running script.
     /// RAM cost: 0.3 GB
     #[js = "getRunningScript"]
-    pub fn get_running_script(&self, #[optional] filename: JsValue, #[optional] host: String, #[variadic] args: JsValue) -> Option<RunningScript>;
+    pub fn get_running_script(&self, #[optional] filename: JsValue, #[optional] host: &str, #[variadic] args: JsValue) -> Option<RunningScript>;
     /// Change the current static RAM allocation of the script.
     /// RAM cost: 0 GB
     #[js = "ramOverride"]
@@ -333,7 +333,7 @@ impl NS {
     /// Write data to a file.
     /// RAM cost: 0 GB
     #[js = "write"]
-    pub fn write(&self, filename: String, #[optional] data: String, #[optional] mode: String);
+    pub fn write(&self, filename: &str, #[optional] data: &str, #[optional] mode: &str);
     /// Attempt to write to a port.
     /// RAM cost: 0 GB
     #[js = "tryWritePort"]
@@ -345,11 +345,11 @@ impl NS {
     /// Read content of a file.
     /// RAM cost: 0 GB
     #[js = "read"]
-    pub fn read(&self, filename: String) -> String;
+    pub fn read(&self, filename: &str) -> String;
     /// Get the metadata of a file.
     /// RAM cost: 0 GB
     #[js = "getFileMetadata"]
-    pub fn get_file_metadata(&self, filename: String, #[optional] host: String) -> Option<FileMetadata>;
+    pub fn get_file_metadata(&self, filename: &str, #[optional] host: &str) -> Option<FileMetadata>;
     /// Get a copy of the data from a port without popping it.
     /// RAM cost: 0 GB
     #[js = "peek"]
@@ -357,7 +357,7 @@ impl NS {
     /// Clear data from a file.
     /// RAM cost: 0 GB
     #[js = "clear"]
-    pub fn clear(&self, handle: String);
+    pub fn clear(&self, handle: &str);
     /// Clear data from a port.
     /// RAM cost: 0 GB
     #[js = "clearPort"]
@@ -385,15 +385,15 @@ impl NS {
     /// Delete a file.
     /// RAM cost: 0.6 GB
     #[js = "rm"]
-    pub fn rm(&self, name: String, #[optional] host: String) -> bool;
+    pub fn rm(&self, name: &str, #[optional] host: &str) -> bool;
     /// Check if any script with a filename is running.
     /// RAM cost: 1 GB
     #[js = "scriptRunning"]
-    pub fn script_running(&self, script: String, #[optional] host: String) -> bool;
+    pub fn script_running(&self, script: &str, #[optional] host: &str) -> bool;
     /// Kill all scripts with a filename.
     /// RAM cost: 1 GB
     #[js = "scriptKill"]
-    pub fn script_kill(&self, script: String, #[optional] host: String) -> bool;
+    pub fn script_kill(&self, script: &str, #[optional] host: &str) -> bool;
     /// Returns the current script name.
     /// RAM cost: 0 GB
     #[js = "getScriptName"]
@@ -401,19 +401,19 @@ impl NS {
     /// Get the ram cost of a script.
     /// RAM cost: 0.1 GB
     #[js = "getScriptRam"]
-    pub fn get_script_ram(&self, script: String, #[optional] host: String) -> f64;
+    pub fn get_script_ram(&self, script: &str, #[optional] host: &str) -> f64;
     /// Get the execution time of a hack() call.
     /// RAM cost: 0.05 GB
     #[js = "getHackTime"]
-    pub fn get_hack_time(&self, #[optional] host: String) -> f64;
+    pub fn get_hack_time(&self, #[optional] host: &str) -> f64;
     /// Get the execution time of a grow() call.
     /// RAM cost: 0.05 GB
     #[js = "getGrowTime"]
-    pub fn get_grow_time(&self, #[optional] host: String) -> f64;
+    pub fn get_grow_time(&self, #[optional] host: &str) -> f64;
     /// Get the execution time of a weaken() call.
     /// RAM cost: 0.05 GB
     #[js = "getWeakenTime"]
-    pub fn get_weaken_time(&self, #[optional] host: String) -> f64;
+    pub fn get_weaken_time(&self, #[optional] host: &str) -> f64;
     /// Get the income of all scripts.
     /// RAM cost: 0.1 GB
     #[js = "getTotalScriptIncome"]
@@ -421,7 +421,7 @@ impl NS {
     /// Get the income of a script.
     /// RAM cost: 0.1 GB
     #[js = "getScriptIncome"]
-    pub fn get_script_income(&self, script: String, #[optional] host: String, #[variadic] args: JsValue) -> f64;
+    pub fn get_script_income(&self, script: &str, #[optional] host: &str, #[variadic] args: JsValue) -> f64;
     /// Get the exp gain of all scripts.
     /// RAM cost: 0.1 GB
     #[js = "getTotalScriptExpGain"]
@@ -429,19 +429,19 @@ impl NS {
     /// Get the exp gain of a script.
     /// RAM cost: 0.1 GB
     #[js = "getScriptExpGain"]
-    pub fn get_script_exp_gain(&self, script: String, #[optional] host: String, #[variadic] args: JsValue) -> f64;
+    pub fn get_script_exp_gain(&self, script: &str, #[optional] host: &str, #[variadic] args: JsValue) -> f64;
     /// Format a string.
     /// RAM cost: 0 GB
     #[js = "sprintf"]
-    pub fn sprintf(&self, format: String, #[variadic] args: JsValue) -> String;
+    pub fn sprintf(&self, format: &str, #[variadic] args: JsValue) -> String;
     /// Format a string with an array of arguments.
     /// RAM cost: 0 GB
     #[js = "vsprintf"]
-    pub fn vsprintf(&self, format: String, args: Vec<JsValue>) -> String;
+    pub fn vsprintf(&self, format: &str, args: &[JsValue]) -> String;
     /// Prompt the player with an input modal.
     /// RAM cost: 0 GB
     #[js = "prompt"]
-    pub async fn prompt(&self, txt: String, #[optional] options: JsValue) -> JsValue;
+    pub async fn prompt(&self, txt: &str, #[optional] options: JsValue) -> JsValue;
     /// Open up a message box.
     /// RAM cost: 0 GB
     #[js = "alert"]
@@ -449,11 +449,11 @@ impl NS {
     /// Queue a toast (bottom-right notification).
     /// RAM cost: 0 GB
     #[js = "toast"]
-    pub fn toast(&self, msg: String, #[optional] variant: String, #[optional] duration: f64);
+    pub fn toast(&self, msg: &str, #[optional] variant: &str, #[optional] duration: f64);
     /// Download a file from the internet.
     /// RAM cost: 0 GB
     #[js = "wget"]
-    pub async fn wget(&self, url: String, target: String, #[optional] host: String) -> bool;
+    pub async fn wget(&self, url: &str, target: &str, #[optional] host: &str) -> bool;
     /// Returns the amount of Faction favor required to be able to donate to a faction.
     /// RAM cost: 0.1 GB
     #[js = "getFavorToDonate"]
@@ -473,11 +473,11 @@ impl NS {
     /// Add a callback to be executed when the script dies.
     /// RAM cost: 0 GB
     #[js = "atExit"]
-    pub fn at_exit(&self, f: JsValue, #[optional] id: String);
+    pub fn at_exit(&self, f: JsValue, #[optional] id: &str);
     /// Move a file on the target server.
     /// RAM cost: 0 GB
     #[js = "mv"]
-    pub fn mv(&self, host: String, source: String, destination: String);
+    pub fn mv(&self, host: &str, source: &str, destination: &str);
     /// Get information about resets.
     /// RAM cost: 1 GB
     #[js = "getResetInfo"]
@@ -485,11 +485,11 @@ impl NS {
     /// Get the RAM cost of a netscript function.
     /// RAM cost: 0 GB
     #[js = "getFunctionRamCost"]
-    pub fn get_function_ram_cost(&self, name: String) -> f64;
+    pub fn get_function_ram_cost(&self, name: &str) -> f64;
     /// Parse command line flags.
     /// RAM cost: 0 GB
     #[js = "flags"]
-    pub fn flags(&self, schema: Vec<JsValue>) -> JsValue;
+    pub fn flags(&self, schema: &[JsValue]) -> JsValue;
     /// Multiplies the reputation gain rate of faction work by sharing the server's RAM with the faction.
     /// RAM cost: 2.4 GB
     #[js = "share"]
@@ -501,7 +501,7 @@ impl NS {
     /// Dynamically import a script. Only scripts located on the same server can be imported. A dynamic import will not adjust RAM usage. This must be done manually with ramOverride.
     /// RAM cost: 0 GB
     #[js = "dynamicImport"]
-    pub async fn dynamic_import(&self, path: String) -> JsValue;
+    pub async fn dynamic_import(&self, path: &str) -> JsValue;
 }
 
 #[extends = "Fragment"]
@@ -584,7 +584,7 @@ pub struct AutocompleteData {
 impl AutocompleteData {
     /// Parses the flags schema on the already inputted flags
     #[js = "flags"]
-    pub fn flags(&self, schema: Vec<JsValue>) -> JsValue;
+    pub fn flags(&self, schema: &[JsValue]) -> JsValue;
 }
 
 /// Player must have installed a backdoor on this server.
@@ -855,7 +855,7 @@ impl Bladeburner {
     /// Start an action.
     /// RAM cost: 4 GB
     #[js = "startAction"]
-    pub fn start_action(&self, r#type: String, name: String) -> bool;
+    pub fn start_action(&self, r#type: &str, name: &str) -> bool;
     /// Stop current action.
     /// RAM cost: 2 GB
     #[js = "stopBladeburnerAction"]
@@ -867,7 +867,7 @@ impl Bladeburner {
     /// Get the time to complete an action.
     /// RAM cost: 4 GB
     #[js = "getActionTime"]
-    pub fn get_action_time(&self, r#type: String, name: String) -> f64;
+    pub fn get_action_time(&self, r#type: &str, name: &str) -> f64;
     /// Get the time elapsed on current action.
     /// RAM cost: 4 GB
     #[js = "getActionCurrentTime"]
@@ -875,47 +875,47 @@ impl Bladeburner {
     /// Get estimate success chance of an action.
     /// RAM cost: 4 GB
     #[js = "getActionEstimatedSuccessChance"]
-    pub fn get_action_estimated_success_chance(&self, r#type: String, name: String, #[optional] sleeve_number: f64) -> [f64; 2];
+    pub fn get_action_estimated_success_chance(&self, r#type: &str, name: &str, #[optional] sleeve_number: f64) -> [f64; 2];
     /// Get the reputation gain of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRepGain"]
-    pub fn get_action_rep_gain(&self, r#type: String, name: String, #[optional] level: f64) -> f64;
+    pub fn get_action_rep_gain(&self, r#type: &str, name: &str, #[optional] level: f64) -> f64;
     /// Get the rank gain of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRankGain"]
-    pub fn get_action_rank_gain(&self, r#type: String, name: String, #[optional] level: f64) -> f64;
+    pub fn get_action_rank_gain(&self, r#type: &str, name: &str, #[optional] level: f64) -> f64;
     /// Get the rank loss of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRankLoss"]
-    pub fn get_action_rank_loss(&self, r#type: String, name: String, #[optional] level: f64) -> f64;
+    pub fn get_action_rank_loss(&self, r#type: &str, name: &str, #[optional] level: f64) -> f64;
     /// Get action count remaining.
     /// RAM cost: 4 GB
     #[js = "getActionCountRemaining"]
-    pub fn get_action_count_remaining(&self, r#type: String, name: String) -> f64;
+    pub fn get_action_count_remaining(&self, r#type: &str, name: &str) -> f64;
     /// Get the maximum level of an action.
     /// RAM cost: 4 GB
     #[js = "getActionMaxLevel"]
-    pub fn get_action_max_level(&self, r#type: String, name: String) -> f64;
+    pub fn get_action_max_level(&self, r#type: &str, name: &str) -> f64;
     /// Get the current level of an action.
     /// RAM cost: 4 GB
     #[js = "getActionCurrentLevel"]
-    pub fn get_action_current_level(&self, r#type: String, name: String) -> f64;
+    pub fn get_action_current_level(&self, r#type: &str, name: &str) -> f64;
     /// Get whether an action is set to autolevel.
     /// RAM cost: 4 GB
     #[js = "getActionAutolevel"]
-    pub fn get_action_autolevel(&self, r#type: String, name: String) -> bool;
+    pub fn get_action_autolevel(&self, r#type: &str, name: &str) -> bool;
     /// Get action successes.
     /// RAM cost: 4 GB
     #[js = "getActionSuccesses"]
-    pub fn get_action_successes(&self, r#type: String, name: String) -> f64;
+    pub fn get_action_successes(&self, r#type: &str, name: &str) -> f64;
     /// Set an action autolevel.
     /// RAM cost: 4 GB
     #[js = "setActionAutolevel"]
-    pub fn set_action_autolevel(&self, r#type: String, name: String, auto_level: bool);
+    pub fn set_action_autolevel(&self, r#type: &str, name: &str, auto_level: bool);
     /// Set the level of an action.
     /// RAM cost: 4 GB
     #[js = "setActionLevel"]
-    pub fn set_action_level(&self, r#type: String, name: String, level: f64);
+    pub fn set_action_level(&self, r#type: &str, name: &str, level: f64);
     /// Get player bladeburner rank.
     /// RAM cost: 4 GB
     #[js = "getRank"]
@@ -923,7 +923,7 @@ impl Bladeburner {
     /// Get black op required rank.
     /// RAM cost: 2 GB
     #[js = "getBlackOpRank"]
-    pub fn get_black_op_rank(&self, name: String) -> f64;
+    pub fn get_black_op_rank(&self, name: &str) -> f64;
     /// Get bladeburner skill points.
     /// RAM cost: 4 GB
     #[js = "getSkillPoints"]
@@ -931,35 +931,35 @@ impl Bladeburner {
     /// Get skill level.
     /// RAM cost: 4 GB
     #[js = "getSkillLevel"]
-    pub fn get_skill_level(&self, skill_name: String) -> f64;
+    pub fn get_skill_level(&self, skill_name: &str) -> f64;
     /// Get cost to upgrade skill.
     /// RAM cost: 4 GB
     #[js = "getSkillUpgradeCost"]
-    pub fn get_skill_upgrade_cost(&self, skill_name: String, #[optional] count: f64) -> f64;
+    pub fn get_skill_upgrade_cost(&self, skill_name: &str, #[optional] count: f64) -> f64;
     /// Upgrade skill.
     /// RAM cost: 4 GB
     #[js = "upgradeSkill"]
-    pub fn upgrade_skill(&self, skill_name: String, #[optional] count: f64) -> bool;
+    pub fn upgrade_skill(&self, skill_name: &str, #[optional] count: f64) -> bool;
     /// Get team size.
     /// RAM cost: 4 GB
     #[js = "getTeamSize"]
-    pub fn get_team_size(&self, #[optional] r#type: String, #[optional] name: String) -> f64;
+    pub fn get_team_size(&self, #[optional] r#type: &str, #[optional] name: &str) -> f64;
     /// Set team size.
     /// RAM cost: 4 GB
     #[js = "setTeamSize"]
-    pub fn set_team_size(&self, r#type: String, name: String, size: f64) -> f64;
+    pub fn set_team_size(&self, r#type: &str, name: &str, size: f64) -> f64;
     /// Get estimated population in city.
     /// RAM cost: 4 GB
     #[js = "getCityEstimatedPopulation"]
-    pub fn get_city_estimated_population(&self, city: String) -> f64;
+    pub fn get_city_estimated_population(&self, city: &str) -> f64;
     /// Get number of communities in a city.
     /// RAM cost: 4 GB
     #[js = "getCityCommunities"]
-    pub fn get_city_communities(&self, city: String) -> f64;
+    pub fn get_city_communities(&self, city: &str) -> f64;
     /// Get chaos of a city.
     /// RAM cost: 4 GB
     #[js = "getCityChaos"]
-    pub fn get_city_chaos(&self, city: String) -> f64;
+    pub fn get_city_chaos(&self, city: &str) -> f64;
     /// Get current city.
     /// RAM cost: 4 GB
     #[js = "getCity"]
@@ -967,7 +967,7 @@ impl Bladeburner {
     /// Travel to another city in Bladeburner.
     /// RAM cost: 4 GB
     #[js = "switchCity"]
-    pub fn switch_city(&self, city: String) -> bool;
+    pub fn switch_city(&self, city: &str) -> bool;
     /// Get Bladeburner stamina.
     /// RAM cost: 4 GB
     #[js = "getStamina"]
@@ -1078,7 +1078,7 @@ pub struct BladeburnerFormulas {
 impl BladeburnerFormulas {
     /// Calculate the number of times that you can upgrade a skill.
     #[js = "skillMaxUpgradeCount"]
-    pub fn skill_max_upgrade_count(&self, name: String, level: f64, skill_points: f64) -> f64;
+    pub fn skill_max_upgrade_count(&self, name: &str, level: f64, skill_points: f64) -> f64;
 }
 
 /// General action names of Bladeburner
@@ -1239,23 +1239,23 @@ impl Cloud {
     /// Purchase a cloud server.
     /// RAM cost: 2.25 GB
     #[js = "purchaseServer"]
-    pub fn purchase_server(&self, hostname: String, ram: f64) -> String;
+    pub fn purchase_server(&self, hostname: &str, ram: f64) -> String;
     /// Get cost of upgrading a cloud server to the given RAM.
     /// RAM cost: 0.1 GB
     #[js = "getServerUpgradeCost"]
-    pub fn get_server_upgrade_cost(&self, host: String, ram: f64) -> f64;
+    pub fn get_server_upgrade_cost(&self, host: &str, ram: f64) -> f64;
     /// Upgrade a cloud server's RAM.
     /// RAM cost: 0.25 GB
     #[js = "upgradeServer"]
-    pub fn upgrade_server(&self, host: String, ram: f64) -> bool;
+    pub fn upgrade_server(&self, host: &str, ram: f64) -> bool;
     /// Rename a cloud server.
     /// RAM cost: 0 GB
     #[js = "renameServer"]
-    pub fn rename_server(&self, hostname: String, new_name: String) -> bool;
+    pub fn rename_server(&self, hostname: &str, new_name: &str) -> bool;
     /// Delete a cloud server.
     /// RAM cost: 2.25 GB
     #[js = "deleteServer"]
-    pub fn delete_server(&self, host: String) -> bool;
+    pub fn delete_server(&self, host: &str) -> bool;
     /// Returns an array with the hostnames or IP addresses of all of the cloud servers you have purchased. Returns hostnames by default.
     /// RAM cost: 1.05 GB
     #[js = "getServerNames"]
@@ -1277,31 +1277,31 @@ impl CodingContract {
     /// Attempts a coding contract, returning a reward string on success or empty string on failure.
     /// RAM cost: 10 GB
     #[js = "attempt"]
-    pub fn attempt(&self, answer: JsValue, filename: String, #[optional] host: String) -> String;
+    pub fn attempt(&self, answer: JsValue, filename: &str, #[optional] host: &str) -> String;
     /// Get the type of a coding contract.
     /// RAM cost: 5 GB
     #[js = "getContractType"]
-    pub fn get_contract_type(&self, filename: String, #[optional] host: String) -> String;
+    pub fn get_contract_type(&self, filename: &str, #[optional] host: &str) -> String;
     /// Get the description.
     /// RAM cost: 5 GB
     #[js = "getDescription"]
-    pub fn get_description(&self, filename: String, #[optional] host: String) -> String;
+    pub fn get_description(&self, filename: &str, #[optional] host: &str) -> String;
     /// Get the input data.
     /// RAM cost: 5 GB
     #[js = "getData"]
-    pub fn get_data(&self, filename: String, #[optional] host: String) -> JsValue;
+    pub fn get_data(&self, filename: &str, #[optional] host: &str) -> JsValue;
     /// Get various data about a specific contract.
     /// RAM cost: 15 GB
     #[js = "getContract"]
-    pub fn get_contract(&self, filename: String, #[optional] host: String) -> JsValue;
+    pub fn get_contract(&self, filename: &str, #[optional] host: &str) -> JsValue;
     /// Get the number of attempts remaining.
     /// RAM cost: 2 GB
     #[js = "getNumTriesRemaining"]
-    pub fn get_num_tries_remaining(&self, filename: String, #[optional] host: String) -> f64;
+    pub fn get_num_tries_remaining(&self, filename: &str, #[optional] host: &str) -> f64;
     /// Generate a dummy contract.
     /// RAM cost: 2 GB
     #[js = "createDummyContract"]
-    pub fn create_dummy_contract(&self, r#type: String, #[optional] host: String) -> Option<String>;
+    pub fn create_dummy_contract(&self, r#type: &str, #[optional] host: &str) -> Option<String>;
     /// List all contract types.
     /// RAM cost: 0 GB
     #[js = "getContractTypes"]
@@ -1715,147 +1715,147 @@ impl Corporation {
     /// Set material sell data.
     /// RAM cost: 20 GB
     #[js = "sellMaterial"]
-    pub fn sell_material(&self, division_name: String, city: String, material_name: String, amt: String, price: String);
+    pub fn sell_material(&self, division_name: &str, city: &str, material_name: &str, amt: &str, price: &str);
     /// Set product sell data.
     /// RAM cost: 20 GB
     #[js = "sellProduct"]
-    pub fn sell_product(&self, division_name: String, city: String, product_name: String, amt: String, price: String, all: bool);
+    pub fn sell_product(&self, division_name: &str, city: &str, product_name: &str, amt: &str, price: &str, all: bool);
     /// Discontinue a product.
     /// RAM cost: 20 GB
     #[js = "discontinueProduct"]
-    pub fn discontinue_product(&self, division_name: String, product_name: String);
+    pub fn discontinue_product(&self, division_name: &str, product_name: &str);
     /// Set smart supply.
     /// RAM cost: 20 GB
     #[js = "setSmartSupply"]
-    pub fn set_smart_supply(&self, division_name: String, city: String, enabled: bool);
+    pub fn set_smart_supply(&self, division_name: &str, city: &str, enabled: bool);
     /// Set whether smart supply uses leftovers before buying.
     /// RAM cost: 20 GB
     #[js = "setSmartSupplyOption"]
-    pub fn set_smart_supply_option(&self, division_name: String, city: String, material_name: String, option: String);
+    pub fn set_smart_supply_option(&self, division_name: &str, city: &str, material_name: &str, option: &str);
     /// Set material buy data.
     /// RAM cost: 20 GB
     #[js = "buyMaterial"]
-    pub fn buy_material(&self, division_name: String, city: String, material_name: String, amt: f64);
+    pub fn buy_material(&self, division_name: &str, city: &str, material_name: &str, amt: f64);
     /// Set material to bulk-buy.
     /// RAM cost: 20 GB
     #[js = "bulkPurchase"]
-    pub fn bulk_purchase(&self, division_name: String, city: String, material_name: String, amt: f64);
+    pub fn bulk_purchase(&self, division_name: &str, city: &str, material_name: &str, amt: f64);
     /// Get warehouse data.
     /// RAM cost: 10 GB
     #[js = "getWarehouse"]
-    pub fn get_warehouse(&self, division_name: String, city: String) -> Warehouse;
+    pub fn get_warehouse(&self, division_name: &str, city: &str) -> Warehouse;
     /// Get product data.
     /// RAM cost: 10 GB
     #[js = "getProduct"]
-    pub fn get_product(&self, division_name: String, city_name: String, product_name: String) -> Product;
+    pub fn get_product(&self, division_name: &str, city_name: &str, product_name: &str) -> Product;
     /// Get material data.
     /// RAM cost: 10 GB
     #[js = "getMaterial"]
-    pub fn get_material(&self, division_name: String, city: String, material_name: String) -> Material;
+    pub fn get_material(&self, division_name: &str, city: &str, material_name: &str) -> Material;
     /// Set Market-TA1 for a material.
     /// RAM cost: 20 GB
     #[js = "setMaterialMarketTA1"]
-    pub fn set_material_market_ta1(&self, division_name: String, city: String, material_name: String, on: bool);
+    pub fn set_material_market_ta1(&self, division_name: &str, city: &str, material_name: &str, on: bool);
     /// Set Market-TA2 for a material.
     /// RAM cost: 20 GB
     #[js = "setMaterialMarketTA2"]
-    pub fn set_material_market_ta2(&self, division_name: String, city: String, material_name: String, on: bool);
+    pub fn set_material_market_ta2(&self, division_name: &str, city: &str, material_name: &str, on: bool);
     /// Set Market-TA1 for a product.
     /// RAM cost: 20 GB
     #[js = "setProductMarketTA1"]
-    pub fn set_product_market_ta1(&self, division_name: String, product_name: String, on: bool);
+    pub fn set_product_market_ta1(&self, division_name: &str, product_name: &str, on: bool);
     /// Set Market-TA2 for a product.
     /// RAM cost: 20 GB
     #[js = "setProductMarketTA2"]
-    pub fn set_product_market_ta2(&self, division_name: String, product_name: String, on: bool);
+    pub fn set_product_market_ta2(&self, division_name: &str, product_name: &str, on: bool);
     /// Set material export data.
     /// RAM cost: 20 GB
     #[js = "exportMaterial"]
-    pub fn export_material(&self, source_division: String, source_city: String, target_division: String, target_city: String, material_name: String, amt: JsValue);
+    pub fn export_material(&self, source_division: &str, source_city: &str, target_division: &str, target_city: &str, material_name: &str, amt: JsValue);
     /// Cancel material export.
     /// RAM cost: 20 GB
     #[js = "cancelExportMaterial"]
-    pub fn cancel_export_material(&self, source_division: String, source_city: String, target_division: String, target_city: String, material_name: String);
+    pub fn cancel_export_material(&self, source_division: &str, source_city: &str, target_division: &str, target_city: &str, material_name: &str);
     /// Purchase warehouse for a new city.
     /// RAM cost: 20 GB
     #[js = "purchaseWarehouse"]
-    pub fn purchase_warehouse(&self, division_name: String, city: String);
+    pub fn purchase_warehouse(&self, division_name: &str, city: &str);
     /// Upgrade warehouse.
     /// RAM cost: 20 GB
     #[js = "upgradeWarehouse"]
-    pub fn upgrade_warehouse(&self, division_name: String, city: String, #[optional] amt: f64);
+    pub fn upgrade_warehouse(&self, division_name: &str, city: &str, #[optional] amt: f64);
     /// Create a new product.
     /// RAM cost: 20 GB
     #[js = "makeProduct"]
-    pub fn make_product(&self, division_name: String, city: String, product_name: String, design_invest: f64, marketing_invest: f64);
+    pub fn make_product(&self, division_name: &str, city: &str, product_name: &str, design_invest: f64, marketing_invest: f64);
     /// Limit material production.
     /// RAM cost: 20 GB
     #[js = "limitMaterialProduction"]
-    pub fn limit_material_production(&self, division_name: String, city: String, material_name: String, qty: f64);
+    pub fn limit_material_production(&self, division_name: &str, city: &str, material_name: &str, qty: f64);
     /// Limit product production.
     /// RAM cost: 20 GB
     #[js = "limitProductProduction"]
-    pub fn limit_product_production(&self, division_name: String, city: String, product_name: String, qty: f64);
+    pub fn limit_product_production(&self, division_name: &str, city: &str, product_name: &str, qty: f64);
     /// Get the cost to upgrade a warehouse to the next level.
     /// RAM cost: 10 GB
     #[js = "getUpgradeWarehouseCost"]
-    pub fn get_upgrade_warehouse_cost(&self, division_name: String, city: String, #[optional] amt: f64) -> f64;
+    pub fn get_upgrade_warehouse_cost(&self, division_name: &str, city: &str, #[optional] amt: f64) -> f64;
     /// Check if you have a warehouse in city.
     /// RAM cost: 10 GB
     #[js = "hasWarehouse"]
-    pub fn has_warehouse(&self, division_name: String, city: String) -> bool;
+    pub fn has_warehouse(&self, division_name: &str, city: &str) -> bool;
     /// Hire an employee.
     /// RAM cost: 20 GB
     #[js = "hireEmployee"]
-    pub fn hire_employee(&self, division_name: String, city: String, #[optional] employee_position: String) -> bool;
+    pub fn hire_employee(&self, division_name: &str, city: &str, #[optional] employee_position: &str) -> bool;
     /// Upgrade office size.
     /// RAM cost: 20 GB
     #[js = "upgradeOfficeSize"]
-    pub fn upgrade_office_size(&self, division_name: String, city: String, size: f64);
+    pub fn upgrade_office_size(&self, division_name: &str, city: &str, size: f64);
     /// Throw a party for your employees.
     /// RAM cost: 20 GB
     #[js = "throwParty"]
-    pub fn throw_party(&self, division_name: String, city: String, cost_per_employee: f64) -> f64;
+    pub fn throw_party(&self, division_name: &str, city: &str, cost_per_employee: f64) -> f64;
     /// Buy tea for your employees.
     /// RAM cost: 20 GB
     #[js = "buyTea"]
-    pub fn buy_tea(&self, division_name: String, city: String) -> bool;
+    pub fn buy_tea(&self, division_name: &str, city: &str) -> bool;
     /// Hire AdVert.
     /// RAM cost: 20 GB
     #[js = "hireAdVert"]
-    pub fn hire_ad_vert(&self, division_name: String);
+    pub fn hire_ad_vert(&self, division_name: &str);
     /// Purchase a research.
     /// RAM cost: 20 GB
     #[js = "research"]
-    pub fn research(&self, division_name: String, research_name: String);
+    pub fn research(&self, division_name: &str, research_name: &str);
     /// Get data about an office.
     /// RAM cost: 10 GB
     #[js = "getOffice"]
-    pub fn get_office(&self, division_name: String, city: String) -> Office;
+    pub fn get_office(&self, division_name: &str, city: &str) -> Office;
     /// Get the cost to hire AdVert.
     /// RAM cost: 10 GB
     #[js = "getHireAdVertCost"]
-    pub fn get_hire_ad_vert_cost(&self, division_name: String) -> f64;
+    pub fn get_hire_ad_vert_cost(&self, division_name: &str) -> f64;
     /// Get the number of times you have hired AdVert.
     /// RAM cost: 10 GB
     #[js = "getHireAdVertCount"]
-    pub fn get_hire_ad_vert_count(&self, division_name: String) -> f64;
+    pub fn get_hire_ad_vert_count(&self, division_name: &str) -> f64;
     /// Get the cost to unlock a research.
     /// RAM cost: 10 GB
     #[js = "getResearchCost"]
-    pub fn get_research_cost(&self, division_name: String, research_name: String) -> f64;
+    pub fn get_research_cost(&self, division_name: &str, research_name: &str) -> f64;
     /// Check if you unlocked a research.
     /// RAM cost: 10 GB
     #[js = "hasResearched"]
-    pub fn has_researched(&self, division_name: String, research_name: String) -> bool;
+    pub fn has_researched(&self, division_name: &str, research_name: &str) -> bool;
     /// Set the job assignment for a job.
     /// RAM cost: 20 GB
     #[js = "setJobAssignment"]
-    pub fn set_job_assignment(&self, division_name: String, city: String, job: JsValue, amount: f64) -> bool;
+    pub fn set_job_assignment(&self, division_name: &str, city: &str, job: JsValue, amount: f64) -> bool;
     /// Get the cost to upgrade an office.
     /// RAM cost: 10 GB
     #[js = "getOfficeSizeUpgradeCost"]
-    pub fn get_office_size_upgrade_cost(&self, division_name: String, city: String, size: f64) -> f64;
+    pub fn get_office_size_upgrade_cost(&self, division_name: &str, city: &str, size: f64) -> f64;
     /// Return whether the player has a corporation. Does not require API access.
     /// RAM cost: 0 GB
     #[js = "hasCorporation"]
@@ -1867,23 +1867,23 @@ impl Corporation {
     /// Create a Corporation. You should use canCreateCorporation to check if you are unsure you can do it, because it throws an error in these cases:
     /// RAM cost: 20 GB
     #[js = "createCorporation"]
-    pub fn create_corporation(&self, corporation_name: String, #[optional] self_fund: bool) -> bool;
+    pub fn create_corporation(&self, corporation_name: &str, #[optional] self_fund: bool) -> bool;
     /// Check if you have a one-time unlockable upgrade.
     /// RAM cost: 10 GB
     #[js = "hasUnlock"]
-    pub fn has_unlock(&self, upgrade_name: String) -> bool;
+    pub fn has_unlock(&self, upgrade_name: &str) -> bool;
     /// Get the cost to unlock a one-time unlockable upgrade.
     /// RAM cost: 10 GB
     #[js = "getUnlockCost"]
-    pub fn get_unlock_cost(&self, upgrade_name: String) -> f64;
+    pub fn get_unlock_cost(&self, upgrade_name: &str) -> f64;
     /// Get the level of a levelable upgrade.
     /// RAM cost: 10 GB
     #[js = "getUpgradeLevel"]
-    pub fn get_upgrade_level(&self, upgrade_name: String) -> f64;
+    pub fn get_upgrade_level(&self, upgrade_name: &str) -> f64;
     /// Get the cost to unlock the next level of a levelable upgrade.
     /// RAM cost: 10 GB
     #[js = "getUpgradeLevelCost"]
-    pub fn get_upgrade_level_cost(&self, upgrade_name: String) -> f64;
+    pub fn get_upgrade_level_cost(&self, upgrade_name: &str) -> f64;
     /// Get an offer for investment based on current corporation valuation.
     /// RAM cost: 10 GB
     #[js = "getInvestmentOffer"]
@@ -1895,11 +1895,11 @@ impl Corporation {
     /// Get constant data of an industry.
     /// RAM cost: 10 GB
     #[js = "getIndustryData"]
-    pub fn get_industry_data(&self, industry_name: String) -> CorpIndustryData;
+    pub fn get_industry_data(&self, industry_name: &str) -> CorpIndustryData;
     /// Get constant data of a material.
     /// RAM cost: 10 GB
     #[js = "getMaterialData"]
-    pub fn get_material_data(&self, material_name: String) -> CorpMaterialConstantData;
+    pub fn get_material_data(&self, material_name: &str) -> CorpMaterialConstantData;
     /// Accept the investment offer. The value of offer is based on current corporation valuation.
     /// RAM cost: 20 GB
     #[js = "acceptInvestmentOffer"]
@@ -1911,7 +1911,7 @@ impl Corporation {
     /// Bribe a faction. You must satisfy these conditions:
     /// RAM cost: 20 GB
     #[js = "bribe"]
-    pub fn bribe(&self, faction_name: String, amount_cash: f64) -> bool;
+    pub fn bribe(&self, faction_name: &str, amount_cash: f64) -> bool;
     /// Get corporation data.
     /// RAM cost: 10 GB
     #[js = "getCorporation"]
@@ -1919,23 +1919,23 @@ impl Corporation {
     /// Get division data.
     /// RAM cost: 10 GB
     #[js = "getDivision"]
-    pub fn get_division(&self, division_name: String) -> Division;
+    pub fn get_division(&self, division_name: &str) -> Division;
     /// Expand to a new industry.
     /// RAM cost: 20 GB
     #[js = "expandIndustry"]
-    pub fn expand_industry(&self, industry_type: String, division_name: String);
+    pub fn expand_industry(&self, industry_type: &str, division_name: &str);
     /// Expand to a new city.
     /// RAM cost: 20 GB
     #[js = "expandCity"]
-    pub fn expand_city(&self, division_name: String, city: String);
+    pub fn expand_city(&self, division_name: &str, city: &str);
     /// Unlock an upgrade.
     /// RAM cost: 20 GB
     #[js = "purchaseUnlock"]
-    pub fn purchase_unlock(&self, upgrade_name: String);
+    pub fn purchase_unlock(&self, upgrade_name: &str);
     /// Level up an upgrade.
     /// RAM cost: 20 GB
     #[js = "levelUpgrade"]
-    pub fn level_upgrade(&self, upgrade_name: String);
+    pub fn level_upgrade(&self, upgrade_name: &str);
     /// Issue dividends.
     /// RAM cost: 20 GB
     #[js = "issueDividends"]
@@ -1963,7 +1963,7 @@ impl Corporation {
     /// Sell a division.
     /// RAM cost: 20 GB
     #[js = "sellDivision"]
-    pub fn sell_division(&self, division_name: String);
+    pub fn sell_division(&self, division_name: &str);
 }
 
 /// General info about a corporation
@@ -2181,23 +2181,23 @@ impl Darknet {
     /// Sends a network request to try to authenticate on a darknet server. The target server must be directly connected to the server that the script is running on. The speed of authentication scales with...
     /// RAM cost: 0.4 GB
     #[js = "authenticate"]
-    pub async fn authenticate(&self, host: String, password: String, #[optional] additional_msec: f64) -> DarknetResultWithData;
+    pub async fn authenticate(&self, host: &str, password: &str, #[optional] additional_msec: f64) -> DarknetResultWithData;
     /// Attempts to connect to a target darknet server that you have previously authenticated on. Unlike authenticate(), connectToSession can be used to get a session on serv...
     /// RAM cost: 0.05 GB
     #[js = "connectToSession"]
-    pub fn connect_to_session(&self, host: String, password: String) -> DarknetResult;
+    pub fn connect_to_session(&self, host: &str, password: &str) -> DarknetResult;
     /// Overloads a darknet server with feedback to lock it down. Similar to status link, it will no longer move or go offline, although servers connected to it may still move. However, it also loses all o...
     /// RAM cost: 2 GB
     #[js = "freezeServer"]
-    pub fn freeze_server(&self, host: String) -> DarknetResult;
+    pub fn freeze_server(&self, host: &str) -> DarknetResult;
     /// Uses an exploit to extract log data from a server by sending a malformed heartbeat request. Retrieves the most recent logs on the server. This can be used to get more feedback on authentication att...
     /// RAM cost: 0.6 GB
     #[js = "heartbleed"]
-    pub async fn heartbleed(&self, host: String, #[optional] options: HeartbleedOptions) -> DarknetResultWithLogs;
+    pub async fn heartbleed(&self, host: &str, #[optional] options: HeartbleedOptions) -> DarknetResultWithLogs;
     /// Opens a .cache file on the current server to acquire its valuable contents.
     /// RAM cost: 2 GB
     #[js = "openCache"]
-    pub fn open_cache(&self, filename: String, #[optional] suppress_toast: bool) -> CacheResult;
+    pub fn open_cache(&self, filename: &str, #[optional] suppress_toast: bool) -> CacheResult;
     /// Returns a list of all darknet servers connected to the script's current server. For example, if called from a script running on `home`, it will return `["darkweb"]`. It will return an empty list if...
     /// RAM cost: 0.2 GB
     #[js = "probe"]
@@ -2217,11 +2217,11 @@ impl Darknet {
     /// Returns the darknet-specific details of the server.
     /// RAM cost: 0.1 GB
     #[js = "getServerDetails"]
-    pub fn get_server_details(&self, #[optional] host: String) -> DarknetServerDetailsWithIsOnline;
+    pub fn get_server_details(&self, #[optional] host: &str) -> DarknetServerDetailsWithIsOnline;
     /// Attempts to move a target server to other parts of the darknet, by overloading the connections between it and the current server. Continued attempts accrue charge on the target server, which causes...
     /// RAM cost: 4 GB
     #[js = "induceServerMigration"]
-    pub async fn induce_server_migration(&self, host: String) -> DarknetResultWithProgress;
+    pub async fn induce_server_migration(&self, host: &str) -> DarknetResultWithProgress;
     /// Executes STORM_SEED.exe, if it is present on the server the script is running on.
     /// RAM cost: 0.1 GB
     #[js = "unleashStormSeed"]
@@ -2229,23 +2229,23 @@ impl Darknet {
     /// Returns whether the server is a darknet server.
     /// RAM cost: 0.1 GB
     #[js = "isDarknetServer"]
-    pub fn is_darknet_server(&self, #[optional] host: String) -> bool;
+    pub fn is_darknet_server(&self, #[optional] host: &str) -> bool;
     /// Spends some time freeing some of the RAM currently blocked by the server owner. Must target an authenticated and directly connected server.
     /// RAM cost: 1 GB
     #[js = "memoryReallocation"]
-    pub async fn memory_reallocation(&self, #[optional] host: String) -> DarknetResult;
+    pub async fn memory_reallocation(&self, #[optional] host: &str) -> DarknetResult;
     /// Gets the amount of RAM blocked by the server owner's processes. This RAM can be freed for your own use using memoryReallocation().
     /// RAM cost: 0 GB
     #[js = "getBlockedRam"]
-    pub fn get_blocked_ram(&self, #[optional] host: String) -> f64;
+    pub fn get_blocked_ram(&self, #[optional] host: &str) -> f64;
     /// Gets the current depth of the specified server into the darknet. Servers immediately below the "darkweb" server are depth 0, and each visual row in the UI below that increases the depth of the server.
     /// RAM cost: 0.1 GB
     #[js = "getDepth"]
-    pub fn get_depth(&self, #[optional] host: String) -> f64;
+    pub fn get_depth(&self, #[optional] host: &str) -> f64;
     /// Spends some time spreading propaganda about a stock to increase its volatility. This does not actually change the stock's forecasts, but a savvy investor can take advantage of the chaos. The effect...
     /// RAM cost: 2 GB
     #[js = "promoteStock"]
-    pub async fn promote_stock(&self, sym: String) -> DarknetResult;
+    pub async fn promote_stock(&self, sym: &str) -> DarknetResult;
     /// Spends time sending out phishing emails, attempting to find some non-technical middle manager to fall for the scam. Builds charisma. Often the attempt will fail, but success can be increased with c...
     /// RAM cost: 2 GB
     #[js = "phishingAttack"]
@@ -2260,7 +2260,7 @@ impl Darknet {
     /// Gets the required charisma level to target the server with heartbleed().
     /// RAM cost: 0.1 GB
     #[js = "getServerRequiredCharismaLevel"]
-    pub fn get_server_required_charisma_level(&self, host: String) -> f64;
+    pub fn get_server_required_charisma_level(&self, host: &str) -> f64;
     /// Not all who wander are lost.
     /// RAM cost: 0 GB
     #[js = "labreport"]
@@ -2754,7 +2754,7 @@ impl Gang {
     /// Create a gang.
     /// RAM cost: 1GB
     #[js = "createGang"]
-    pub fn create_gang(&self, faction: String) -> bool;
+    pub fn create_gang(&self, faction: &str) -> bool;
     /// Check if you're in a gang. Does not require API access.
     /// RAM cost: 0GB
     #[js = "inGang"]
@@ -2766,7 +2766,7 @@ impl Gang {
     /// Rename a Gang member to a new unique name.
     /// RAM cost: 0 GB
     #[js = "renameMember"]
-    pub fn rename_member(&self, member_name: String, new_name: String) -> bool;
+    pub fn rename_member(&self, member_name: &str, new_name: &str) -> bool;
     /// Get information about your gang.
     /// RAM cost: 2 GB
     #[js = "getGangInformation"]
@@ -2778,7 +2778,7 @@ impl Gang {
     /// Get information about a specific gang member.
     /// RAM cost: 2 GB
     #[js = "getMemberInformation"]
-    pub fn get_member_information(&self, name: String) -> GangMemberInfo;
+    pub fn get_member_information(&self, name: &str) -> GangMemberInfo;
     /// Check if you can recruit a new gang member.
     /// RAM cost: 1 GB
     #[js = "canRecruitMember"]
@@ -2794,7 +2794,7 @@ impl Gang {
     /// Recruit a new gang member.
     /// RAM cost: 2 GB
     #[js = "recruitMember"]
-    pub fn recruit_member(&self, name: String) -> bool;
+    pub fn recruit_member(&self, name: &str) -> bool;
     /// List member task names.
     /// RAM cost: 0 GB
     #[js = "getTaskNames"]
@@ -2802,11 +2802,11 @@ impl Gang {
     /// Set gang member to task.
     /// RAM cost: 2 GB
     #[js = "setMemberTask"]
-    pub fn set_member_task(&self, member_name: String, task_name: String) -> bool;
+    pub fn set_member_task(&self, member_name: &str, task_name: &str) -> bool;
     /// Get stats of a task.
     /// RAM cost: 1 GB
     #[js = "getTaskStats"]
-    pub fn get_task_stats(&self, name: String) -> GangTaskStats;
+    pub fn get_task_stats(&self, name: &str) -> GangTaskStats;
     /// List equipment names.
     /// RAM cost: 0 GB
     #[js = "getEquipmentNames"]
@@ -2814,31 +2814,31 @@ impl Gang {
     /// Get cost of equipment.
     /// RAM cost: 2 GB
     #[js = "getEquipmentCost"]
-    pub fn get_equipment_cost(&self, equip_name: String) -> f64;
+    pub fn get_equipment_cost(&self, equip_name: &str) -> f64;
     /// Get type of an equipment.
     /// RAM cost: 2 GB
     #[js = "getEquipmentType"]
-    pub fn get_equipment_type(&self, equip_name: String) -> String;
+    pub fn get_equipment_type(&self, equip_name: &str) -> String;
     /// Get stats of an equipment.
     /// RAM cost: 2 GB
     #[js = "getEquipmentStats"]
-    pub fn get_equipment_stats(&self, equip_name: String) -> EquipmentStats;
+    pub fn get_equipment_stats(&self, equip_name: &str) -> EquipmentStats;
     /// Purchase an equipment for a gang member.
     /// RAM cost: 4 GB
     #[js = "purchaseEquipment"]
-    pub fn purchase_equipment(&self, member_name: String, equip_name: String) -> bool;
+    pub fn purchase_equipment(&self, member_name: &str, equip_name: &str) -> bool;
     /// Ascend a gang member.
     /// RAM cost: 4 GB
     #[js = "ascendMember"]
-    pub fn ascend_member(&self, member_name: String) -> Option<GangMemberAscension>;
+    pub fn ascend_member(&self, member_name: &str) -> Option<GangMemberAscension>;
     /// Get the result of an ascension without ascending.
     /// RAM cost: 2 GB
     #[js = "getAscensionResult"]
-    pub fn get_ascension_result(&self, member_name: String) -> Option<GangMemberAscension>;
+    pub fn get_ascension_result(&self, member_name: &str) -> Option<GangMemberAscension>;
     /// Get the effect of an install on ascension multipliers without installing.
     /// RAM cost: 2 GB
     #[js = "getInstallResult"]
-    pub fn get_install_result(&self, member_name: String) -> Option<GangMemberInstall>;
+    pub fn get_install_result(&self, member_name: &str) -> Option<GangMemberInstall>;
     /// Enable/Disable territory clashes.
     /// RAM cost: 2 GB
     #[js = "setTerritoryWarfare"]
@@ -2846,7 +2846,7 @@ impl Gang {
     /// Get chance to win clash with other gang.
     /// RAM cost: 4 GB
     #[js = "getChanceToWinClash"]
-    pub fn get_chance_to_win_clash(&self, gang_name: String) -> f64;
+    pub fn get_chance_to_win_clash(&self, gang_name: &str) -> f64;
     /// Get bonus time.
     /// RAM cost: 0 GB
     #[js = "getBonusTime"]
@@ -3349,7 +3349,7 @@ impl Go {
     /// Gets new IPvGO subnet with the specified size owned by the listed faction, ready for the player to make a move. This will reset your win streak if the current game is not complete and you have alre...
     /// RAM cost: 0 GB
     #[js = "resetBoardState"]
-    pub fn reset_board_state(&self, opponent: String, board_size: f64) -> Option<Vec<String>>;
+    pub fn reset_board_state(&self, opponent: &str, board_size: f64) -> Option<Vec<String>>;
 }
 
 /// Tools to analyze the IPvGO subnet.
@@ -3359,19 +3359,19 @@ impl GoAnalysis {
     /// Shows if each point on the board is a valid move for the player. By default, analyzes the current board state. Takes an optional boardState (and an optional prior-move boardState, if desired) to an...
     /// RAM cost: 8 GB
     #[js = "getValidMoves"]
-    pub fn get_valid_moves(&self, #[optional] board_state: JsValue, #[optional] prior_board_state: Vec<String>, #[optional] play_as_white: bool) -> Vec<Vec<bool>>;
+    pub fn get_valid_moves(&self, #[optional] board_state: JsValue, #[optional] prior_board_state: &[String], #[optional] play_as_white: bool) -> Vec<Vec<bool>>;
     /// Returns an ID for each point. All points that share an ID are part of the same network (or "chain"). Empty points are also given chain IDs to represent continuous empty space. Dead nodes are given ...
     /// RAM cost: 16 GB
     #[js = "getChains"]
-    pub fn get_chains(&self, #[optional] board_state: Vec<String>) -> Vec<Vec<f64>>;
+    pub fn get_chains(&self, #[optional] board_state: &[String]) -> Vec<Vec<f64>>;
     /// Returns a number for each point, representing how many open nodes its network/chain is connected to. Empty nodes and dead nodes are shown as -1 liberties.
     /// RAM cost: 16 GB
     #[js = "getLiberties"]
-    pub fn get_liberties(&self, #[optional] board_state: Vec<String>) -> Vec<Vec<f64>>;
+    pub fn get_liberties(&self, #[optional] board_state: &[String]) -> Vec<Vec<f64>>;
     /// Returns 'X' for black, 'O' for white, or '?' for each empty point to indicate which player controls that empty point. If no single player fully encircles the empty space, it is shown as contested w...
     /// RAM cost: 16 GB
     #[js = "getControlledEmptyNodes"]
-    pub fn get_controlled_empty_nodes(&self, #[optional] board_state: Vec<String>) -> Vec<String>;
+    pub fn get_controlled_empty_nodes(&self, #[optional] board_state: &[String]) -> Vec<String>;
     /// Displays the game history, captured nodes, and gained bonuses for each opponent you have played against.
     /// RAM cost: 0 GB
     #[js = "getStats"]
@@ -3383,11 +3383,11 @@ impl GoAnalysis {
     /// Starts a new game against the "No AI" opponent, and sets the initial board size, pieces, and offline nodes to the given board state. "X" represent black pieces, "O" white, and "." empty points. "#"...
     /// RAM cost: 4 GB
     #[js = "setTestingBoardState"]
-    pub fn set_testing_board_state(&self, board_state: Vec<String>, #[optional] komi: f64, #[optional] next_player_is_white: bool);
+    pub fn set_testing_board_state(&self, board_state: &[String], #[optional] komi: f64, #[optional] next_player_is_white: bool);
     /// Adds a colored circle indicator to the specified point. These indicators are removed once a move is played.
     /// RAM cost: 0 GB
     #[js = "highlightPoint"]
-    pub fn highlight_point(&self, x: f64, y: f64, #[optional] color: String, #[optional] text: String);
+    pub fn highlight_point(&self, x: f64, y: f64, #[optional] color: &str, #[optional] text: &str);
     /// Removes the highlight color and text from the specified node.
     /// RAM cost: 0 GB
     #[js = "clearPointHighlight"]
@@ -3435,11 +3435,11 @@ impl Grafting {
     /// Retrieve the grafting cost of an aug.
     /// RAM cost: 3.75 GB
     #[js = "getAugmentationGraftPrice"]
-    pub fn get_augmentation_graft_price(&self, aug_name: String) -> f64;
+    pub fn get_augmentation_graft_price(&self, aug_name: &str) -> f64;
     /// Retrieves the time required to graft an aug. Do not use this value to determine when the ongoing grafting finishes. The ongoing grafting is affected by current intelligence level and focus bonus. Y...
     /// RAM cost: 3.75 GB
     #[js = "getAugmentationGraftTime"]
-    pub fn get_augmentation_graft_time(&self, aug_name: String) -> f64;
+    pub fn get_augmentation_graft_time(&self, aug_name: &str) -> f64;
     /// Retrieves a list of augmentations that can be grafted.
     /// RAM cost: 5 GB
     #[js = "getGraftableAugmentations"]
@@ -3447,7 +3447,7 @@ impl Grafting {
     /// Begins grafting the named aug. You must be in New Tokyo to use this. When you call this API, the current work (grafting or other actions) will be canceled.
     /// RAM cost: 7.5 GB
     #[js = "graftAugmentation"]
-    pub fn graft_augmentation(&self, aug_name: String, #[optional] focus: bool) -> bool;
+    pub fn graft_augmentation(&self, aug_name: &str, #[optional] focus: bool) -> bool;
     /// Wait until the ongoing grafting finishes or is canceled.
     /// RAM cost: 0 GB
     #[js = "waitForOngoingGrafting"]
@@ -3613,11 +3613,11 @@ impl Hacknet {
     /// Get the cost of a hash upgrade.
     /// RAM cost: 0.5 GB
     #[js = "hashCost"]
-    pub fn hash_cost(&self, upg_name: String, #[optional] count: f64) -> f64;
+    pub fn hash_cost(&self, upg_name: &str, #[optional] count: f64) -> f64;
     /// Purchase a hash upgrade.
     /// RAM cost: 0.5 GB
     #[js = "spendHashes"]
-    pub fn spend_hashes(&self, upg_name: String, #[optional] upg_target: String, #[optional] count: f64) -> bool;
+    pub fn spend_hashes(&self, upg_name: &str, #[optional] upg_target: &str, #[optional] count: f64) -> bool;
     /// Get the list of hash upgrades
     /// RAM cost: 0 GB
     #[js = "getHashUpgrades"]
@@ -3625,7 +3625,7 @@ impl Hacknet {
     /// Get the level of a hash upgrade.
     /// RAM cost: 0.5 GB
     #[js = "getHashUpgradeLevel"]
-    pub fn get_hash_upgrade_level(&self, upg_name: String) -> f64;
+    pub fn get_hash_upgrade_level(&self, upg_name: &str) -> f64;
     /// Get the multiplier to study.
     /// RAM cost: 0.5 GB
     #[js = "getStudyMult"]
@@ -3838,7 +3838,7 @@ impl HacknetServersFormulas {
     pub fn cache_upgrade_cost(&self, starting_cache: f64, #[optional] extra_cache: f64) -> f64;
     /// Calculate hash cost of an upgrade.
     #[js = "hashUpgradeCost"]
-    pub fn hash_upgrade_cost(&self, upg_name: String, level: f64) -> f64;
+    pub fn hash_upgrade_cost(&self, upg_name: &str, level: f64) -> f64;
     /// Calculate the cost of a hacknet server.
     #[js = "hacknetServerCost"]
     pub fn hacknet_server_cost(&self, n: f64, #[optional] mult: f64) -> f64;
@@ -3917,7 +3917,7 @@ impl Infiltration {
     /// Get all infiltrations with difficulty, location and rewards.
     /// RAM cost: 15 GB
     #[js = "getInfiltration"]
-    pub fn get_infiltration(&self, location: String) -> InfiltrationLocation;
+    pub fn get_infiltration(&self, location: &str) -> InfiltrationLocation;
 }
 
 pub struct InfiltrationLocation {
@@ -4597,55 +4597,55 @@ impl OfficeAPI {
     /// Hire an employee.
     /// RAM cost: 20 GB
     #[js = "hireEmployee"]
-    pub fn hire_employee(&self, division_name: String, city: String, #[optional] employee_position: String) -> bool;
+    pub fn hire_employee(&self, division_name: &str, city: &str, #[optional] employee_position: &str) -> bool;
     /// Upgrade office size.
     /// RAM cost: 20 GB
     #[js = "upgradeOfficeSize"]
-    pub fn upgrade_office_size(&self, division_name: String, city: String, size: f64);
+    pub fn upgrade_office_size(&self, division_name: &str, city: &str, size: f64);
     /// Throw a party for your employees.
     /// RAM cost: 20 GB
     #[js = "throwParty"]
-    pub fn throw_party(&self, division_name: String, city: String, cost_per_employee: f64) -> f64;
+    pub fn throw_party(&self, division_name: &str, city: &str, cost_per_employee: f64) -> f64;
     /// Buy tea for your employees.
     /// RAM cost: 20 GB
     #[js = "buyTea"]
-    pub fn buy_tea(&self, division_name: String, city: String) -> bool;
+    pub fn buy_tea(&self, division_name: &str, city: &str) -> bool;
     /// Hire AdVert.
     /// RAM cost: 20 GB
     #[js = "hireAdVert"]
-    pub fn hire_ad_vert(&self, division_name: String);
+    pub fn hire_ad_vert(&self, division_name: &str);
     /// Purchase a research.
     /// RAM cost: 20 GB
     #[js = "research"]
-    pub fn research(&self, division_name: String, research_name: String);
+    pub fn research(&self, division_name: &str, research_name: &str);
     /// Get data about an office.
     /// RAM cost: 10 GB
     #[js = "getOffice"]
-    pub fn get_office(&self, division_name: String, city: String) -> Office;
+    pub fn get_office(&self, division_name: &str, city: &str) -> Office;
     /// Get the cost to hire AdVert.
     /// RAM cost: 10 GB
     #[js = "getHireAdVertCost"]
-    pub fn get_hire_ad_vert_cost(&self, division_name: String) -> f64;
+    pub fn get_hire_ad_vert_cost(&self, division_name: &str) -> f64;
     /// Get the number of times you have hired AdVert.
     /// RAM cost: 10 GB
     #[js = "getHireAdVertCount"]
-    pub fn get_hire_ad_vert_count(&self, division_name: String) -> f64;
+    pub fn get_hire_ad_vert_count(&self, division_name: &str) -> f64;
     /// Get the cost to unlock a research.
     /// RAM cost: 10 GB
     #[js = "getResearchCost"]
-    pub fn get_research_cost(&self, division_name: String, research_name: String) -> f64;
+    pub fn get_research_cost(&self, division_name: &str, research_name: &str) -> f64;
     /// Check if you unlocked a research.
     /// RAM cost: 10 GB
     #[js = "hasResearched"]
-    pub fn has_researched(&self, division_name: String, research_name: String) -> bool;
+    pub fn has_researched(&self, division_name: &str, research_name: &str) -> bool;
     /// Set the job assignment for a job.
     /// RAM cost: 20 GB
     #[js = "setJobAssignment"]
-    pub fn set_job_assignment(&self, division_name: String, city: String, job: JsValue, amount: f64) -> bool;
+    pub fn set_job_assignment(&self, division_name: &str, city: &str, job: JsValue, amount: f64) -> bool;
     /// Get the cost to upgrade an office.
     /// RAM cost: 10 GB
     #[js = "getOfficeSizeUpgradeCost"]
-    pub fn get_office_size_upgrade_cost(&self, division_name: String, city: String, size: f64) -> f64;
+    pub fn get_office_size_upgrade_cost(&self, division_name: &str, city: &str, size: f64) -> f64;
 }
 
 pub struct OrderEnumType {
@@ -5176,15 +5176,15 @@ impl Singularity {
     /// Take university class.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "universityCourse"]
-    pub fn university_course(&self, university_name: JsValue, course_name: String, #[optional] focus: bool) -> bool;
+    pub fn university_course(&self, university_name: JsValue, course_name: &str, #[optional] focus: bool) -> bool;
     /// Workout at the gym.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "gymWorkout"]
-    pub fn gym_workout(&self, gym_name: JsValue, stat: String, #[optional] focus: bool) -> bool;
+    pub fn gym_workout(&self, gym_name: JsValue, stat: &str, #[optional] focus: bool) -> bool;
     /// Travel to another city.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "travelToCity"]
-    pub fn travel_to_city(&self, city: String) -> bool;
+    pub fn travel_to_city(&self, city: &str) -> bool;
     /// Purchase the TOR router.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "purchaseTor"]
@@ -5192,7 +5192,7 @@ impl Singularity {
     /// Purchase a program from the Dark Web.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "purchaseProgram"]
-    pub fn purchase_program(&self, program_name: String) -> bool;
+    pub fn purchase_program(&self, program_name: &str) -> bool;
     /// Check if the player is busy.
     /// RAM cost: 0.5 GB * 16/4/1
     #[js = "isBusy"]
@@ -5220,43 +5220,43 @@ impl Singularity {
     /// Get Requirements for Company Position.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "getCompanyPositionInfo"]
-    pub fn get_company_position_info(&self, company_name: String, position_name: String) -> CompanyPositionInfo;
+    pub fn get_company_position_info(&self, company_name: &str, position_name: &str) -> CompanyPositionInfo;
     /// Get List of Company Positions.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "getCompanyPositions"]
-    pub fn get_company_positions(&self, company_name: String) -> Vec<String>;
+    pub fn get_company_positions(&self, company_name: &str) -> Vec<String>;
     /// Work for a company.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "workForCompany"]
-    pub fn work_for_company(&self, company_name: String, #[optional] focus: bool) -> bool;
+    pub fn work_for_company(&self, company_name: &str, #[optional] focus: bool) -> bool;
     /// Quit jobs by company.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "quitJob"]
-    pub fn quit_job(&self, company_name: String);
+    pub fn quit_job(&self, company_name: &str);
     /// Apply for a job at a company.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "applyToCompany"]
-    pub fn apply_to_company(&self, company_name: String, field: String) -> Option<String>;
+    pub fn apply_to_company(&self, company_name: &str, field: &str) -> Option<String>;
     /// Get company reputation.
     /// RAM cost: 1 GB * 16/4/1
     #[js = "getCompanyRep"]
-    pub fn get_company_rep(&self, company_name: String) -> f64;
+    pub fn get_company_rep(&self, company_name: &str) -> f64;
     /// Get company favor.
     /// RAM cost: 1 GB * 16/4/1
     #[js = "getCompanyFavor"]
-    pub fn get_company_favor(&self, company_name: String) -> f64;
+    pub fn get_company_favor(&self, company_name: &str) -> f64;
     /// Get company favor gain.
     /// RAM cost: 0.75 GB * 16/4/1
     #[js = "getCompanyFavorGain"]
-    pub fn get_company_favor_gain(&self, company_name: String) -> f64;
+    pub fn get_company_favor_gain(&self, company_name: &str) -> f64;
     /// List conditions for being invited to a faction.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "getFactionInviteRequirements"]
-    pub fn get_faction_invite_requirements(&self, faction: String) -> Vec<JsValue>;
+    pub fn get_faction_invite_requirements(&self, faction: &str) -> Vec<JsValue>;
     /// Get a list of enemies of a faction.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "getFactionEnemies"]
-    pub fn get_faction_enemies(&self, faction: String) -> Vec<String>;
+    pub fn get_faction_enemies(&self, faction: &str) -> Vec<String>;
     /// List all current faction invitations.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "checkFactionInvitations"]
@@ -5264,51 +5264,51 @@ impl Singularity {
     /// Join a faction.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "joinFaction"]
-    pub fn join_faction(&self, faction: String) -> bool;
+    pub fn join_faction(&self, faction: &str) -> bool;
     /// Work for a faction.
     /// RAM cost: 3 GB * 16/4/1
     #[js = "workForFaction"]
-    pub fn work_for_faction(&self, faction: String, work_type: String, #[optional] focus: bool) -> bool;
+    pub fn work_for_faction(&self, faction: &str, work_type: &str, #[optional] focus: bool) -> bool;
     /// Get the work types of a faction.
     /// RAM cost: 1 GB * 16/4/1
     #[js = "getFactionWorkTypes"]
-    pub fn get_faction_work_types(&self, faction: String) -> Vec<String>;
+    pub fn get_faction_work_types(&self, faction: &str) -> Vec<String>;
     /// Get faction reputation.
     /// RAM cost: 1 GB * 16/4/1
     #[js = "getFactionRep"]
-    pub fn get_faction_rep(&self, faction: String) -> f64;
+    pub fn get_faction_rep(&self, faction: &str) -> f64;
     /// Get faction favor.
     /// RAM cost: 1 GB * 16/4/1
     #[js = "getFactionFavor"]
-    pub fn get_faction_favor(&self, faction: String) -> f64;
+    pub fn get_faction_favor(&self, faction: &str) -> f64;
     /// Get faction favor gain.
     /// RAM cost: 0.75 GB * 16/4/1
     #[js = "getFactionFavorGain"]
-    pub fn get_faction_favor_gain(&self, faction: String) -> f64;
+    pub fn get_faction_favor_gain(&self, faction: &str) -> f64;
     /// Donate to a faction.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "donateToFaction"]
-    pub fn donate_to_faction(&self, faction: String, amount: f64) -> bool;
+    pub fn donate_to_faction(&self, faction: &str, amount: f64) -> bool;
     /// Create a program.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "createProgram"]
-    pub fn create_program(&self, program_name: String, #[optional] focus: bool) -> bool;
+    pub fn create_program(&self, program_name: &str, #[optional] focus: bool) -> bool;
     /// Get the hacking level requirement of a program.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getHackingLevelRequirementOfProgram"]
-    pub fn get_hacking_level_requirement_of_program(&self, program_name: String) -> f64;
+    pub fn get_hacking_level_requirement_of_program(&self, program_name: &str) -> f64;
     /// Commit a crime.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "commitCrime"]
-    pub fn commit_crime(&self, crime: String, #[optional] focus: bool) -> f64;
+    pub fn commit_crime(&self, crime: &str, #[optional] focus: bool) -> f64;
     /// Get chance to successfully commit a crime.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getCrimeChance"]
-    pub fn get_crime_chance(&self, crime: String) -> f64;
+    pub fn get_crime_chance(&self, crime: &str) -> f64;
     /// Get stats related to a crime.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getCrimeStats"]
-    pub fn get_crime_stats(&self, crime: String) -> CrimeStats;
+    pub fn get_crime_stats(&self, crime: &str) -> CrimeStats;
     /// Get a list of owned augmentation.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getOwnedAugmentations"]
@@ -5320,39 +5320,39 @@ impl Singularity {
     /// Get a list of faction(s) that have a specific Augmentation.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getAugmentationFactions"]
-    pub fn get_augmentation_factions(&self, aug_name: String) -> Vec<String>;
+    pub fn get_augmentation_factions(&self, aug_name: &str) -> Vec<String>;
     /// Get a list of augmentation available from a faction.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getAugmentationsFromFaction"]
-    pub fn get_augmentations_from_faction(&self, faction: String) -> Vec<String>;
+    pub fn get_augmentations_from_faction(&self, faction: &str) -> Vec<String>;
     /// Get the pre-requisite of an augmentation.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getAugmentationPrereq"]
-    pub fn get_augmentation_prereq(&self, aug_name: String) -> Vec<String>;
+    pub fn get_augmentation_prereq(&self, aug_name: &str) -> Vec<String>;
     /// Get price of an augmentation.
     /// RAM cost: 2.5 GB * 16/4/1
     #[js = "getAugmentationPrice"]
-    pub fn get_augmentation_price(&self, aug_name: String) -> f64;
+    pub fn get_augmentation_price(&self, aug_name: &str) -> f64;
     /// Get base price of an augmentation.
     /// RAM cost: 2.5 GB * 16/4/1
     #[js = "getAugmentationBasePrice"]
-    pub fn get_augmentation_base_price(&self, aug_name: String) -> f64;
+    pub fn get_augmentation_base_price(&self, aug_name: &str) -> f64;
     /// Get reputation requirement of an augmentation.
     /// RAM cost: 2.5 GB * 16/4/1
     #[js = "getAugmentationRepReq"]
-    pub fn get_augmentation_rep_req(&self, aug_name: String) -> f64;
+    pub fn get_augmentation_rep_req(&self, aug_name: &str) -> f64;
     /// Purchase an augmentation
     /// RAM cost: 5 GB * 16/4/1
     #[js = "purchaseAugmentation"]
-    pub fn purchase_augmentation(&self, faction: String, augmentation: String) -> bool;
+    pub fn purchase_augmentation(&self, faction: &str, augmentation: &str) -> bool;
     /// Get the stats of an augmentation.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getAugmentationStats"]
-    pub fn get_augmentation_stats(&self, name: String) -> Multipliers;
+    pub fn get_augmentation_stats(&self, name: &str) -> Multipliers;
     /// Install your purchased augmentations.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "installAugmentations"]
-    pub fn install_augmentations(&self, #[optional] cb_script: String);
+    pub fn install_augmentations(&self, #[optional] cb_script: &str);
     /// Hospitalize the player.
     /// RAM cost: 0.5 GB * 16/4/1
     #[js = "hospitalize"]
@@ -5360,11 +5360,11 @@ impl Singularity {
     /// Soft reset the game.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "softReset"]
-    pub fn soft_reset(&self, #[optional] cb_script: String);
+    pub fn soft_reset(&self, #[optional] cb_script: &str);
     /// Go to a location.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "goToLocation"]
-    pub fn go_to_location(&self, location_name: String) -> bool;
+    pub fn go_to_location(&self, location_name: &str) -> bool;
     /// Get the current server. Returns the hostname by default.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "getCurrentServer"]
@@ -5372,11 +5372,11 @@ impl Singularity {
     /// Displays the content of a file on the currently connected server.
     /// RAM cost: 0.5 * 16/4/1
     #[js = "cat"]
-    pub fn cat(&self, filename: String);
+    pub fn cat(&self, filename: &str);
     /// Connect to a server.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "connect"]
-    pub fn connect(&self, host: String) -> bool;
+    pub fn connect(&self, host: &str) -> bool;
     /// Run the hack command in the terminal.
     /// RAM cost: 2 GB * 16/4/1
     #[js = "manualHack"]
@@ -5400,15 +5400,15 @@ impl Singularity {
     /// Check the price of an exploit on the Dark Web.
     /// RAM cost: 0.5 GB * 16/4/1
     #[js = "getDarkwebProgramCost"]
-    pub fn get_darkweb_program_cost(&self, program_name: String) -> f64;
+    pub fn get_darkweb_program_cost(&self, program_name: &str) -> f64;
     /// b1t_flum3 into a different BN.
     /// RAM cost: 16 GB * 16/4/1
     #[js = "b1tflum3"]
-    pub fn b1tflum3(&self, next_bn: f64, #[optional] callback_script: String, #[optional] bit_node_options: BitNodeOptions);
+    pub fn b1tflum3(&self, next_bn: f64, #[optional] callback_script: &str, #[optional] bit_node_options: BitNodeOptions);
     /// Destroy the w0r1d_d43m0n and move on to the next BN.
     /// RAM cost: 32 GB * 16/4/1
     #[js = "destroyW0r1dD43m0n"]
-    pub fn destroy_w0r1d_d43m0n(&self, #[optional] next_bn: f64, #[optional] callback_script: String, #[optional] bit_node_options: BitNodeOptions);
+    pub fn destroy_w0r1d_d43m0n(&self, #[optional] next_bn: f64, #[optional] callback_script: &str, #[optional] bit_node_options: BitNodeOptions);
     /// Get the current work the player is doing.
     /// RAM cost: 0.5 GB * 16/4/1
     #[js = "getCurrentWork"]
@@ -5486,27 +5486,27 @@ impl Sleeve {
     /// Set a sleeve to commit crime.
     /// RAM cost: 4 GB
     #[js = "setToCommitCrime"]
-    pub fn set_to_commit_crime(&self, sleeve_number: f64, crime_type: String) -> bool;
+    pub fn set_to_commit_crime(&self, sleeve_number: f64, crime_type: &str) -> bool;
     /// Set a sleeve to work for a faction.
     /// RAM cost: 4 GB
     #[js = "setToFactionWork"]
-    pub fn set_to_faction_work(&self, sleeve_number: f64, faction_name: String, faction_work_type: String) -> Option<bool>;
+    pub fn set_to_faction_work(&self, sleeve_number: f64, faction_name: &str, faction_work_type: &str) -> Option<bool>;
     /// Set a sleeve to work for a company.
     /// RAM cost: 4 GB
     #[js = "setToCompanyWork"]
-    pub fn set_to_company_work(&self, sleeve_number: f64, company_name: String) -> bool;
+    pub fn set_to_company_work(&self, sleeve_number: f64, company_name: &str) -> bool;
     /// Set a sleeve to take a class at a university.
     /// RAM cost: 4 GB
     #[js = "setToUniversityCourse"]
-    pub fn set_to_university_course(&self, sleeve_number: f64, university_name: JsValue, course_name: String) -> bool;
+    pub fn set_to_university_course(&self, sleeve_number: f64, university_name: JsValue, course_name: &str) -> bool;
     /// Set a sleeve to workout at the gym.
     /// RAM cost: 4 GB
     #[js = "setToGymWorkout"]
-    pub fn set_to_gym_workout(&self, sleeve_number: f64, gym_name: JsValue, stat: String) -> bool;
+    pub fn set_to_gym_workout(&self, sleeve_number: f64, gym_name: JsValue, stat: &str) -> bool;
     /// Make a sleeve travel to another city. The cost for using this function is the same as for a player.
     /// RAM cost: 4 GB
     #[js = "travel"]
-    pub fn travel(&self, sleeve_number: f64, city: String) -> bool;
+    pub fn travel(&self, sleeve_number: f64, city: &str) -> bool;
     /// Get augmentations installed on a sleeve.
     /// RAM cost: 4 GB
     #[js = "getSleeveAugmentations"]
@@ -5514,11 +5514,11 @@ impl Sleeve {
     /// Get price of an augmentation.
     /// RAM cost: 4 GB
     #[js = "getSleeveAugmentationPrice"]
-    pub fn get_sleeve_augmentation_price(&self, aug_name: String) -> f64;
+    pub fn get_sleeve_augmentation_price(&self, aug_name: &str) -> f64;
     /// Get reputation requirement of an augmentation.
     /// RAM cost: 4 GB
     #[js = "getSleeveAugmentationRepReq"]
-    pub fn get_sleeve_augmentation_rep_req(&self, aug_name: String) -> f64;
+    pub fn get_sleeve_augmentation_rep_req(&self, aug_name: &str) -> f64;
     /// List purchasable augs for a sleeve.
     /// RAM cost: 4 GB
     #[js = "getSleevePurchasableAugs"]
@@ -5526,11 +5526,11 @@ impl Sleeve {
     /// Purchase an aug for a sleeve.
     /// RAM cost: 4 GB
     #[js = "purchaseSleeveAug"]
-    pub fn purchase_sleeve_aug(&self, sleeve_number: f64, aug_name: String) -> bool;
+    pub fn purchase_sleeve_aug(&self, sleeve_number: f64, aug_name: &str) -> bool;
     /// Set a sleeve to perform Bladeburner actions.
     /// RAM cost: 4 GB
     #[js = "setToBladeburnerAction"]
-    pub fn set_to_bladeburner_action(&self, sleeve_number: f64, action: JsValue, #[optional] contract: String) -> bool;
+    pub fn set_to_bladeburner_action(&self, sleeve_number: f64, action: JsValue, #[optional] contract: &str) -> bool;
     /// Purchase a sleeve. You must be in BitNode 10 to use this API.
     /// RAM cost: 4 GB
     #[js = "purchaseSleeve"]
@@ -5823,59 +5823,59 @@ impl Stock {
     /// Returns the price of a stock.
     /// RAM cost: 2 GB
     #[js = "getPrice"]
-    pub fn get_price(&self, sym: String) -> f64;
+    pub fn get_price(&self, sym: &str) -> f64;
     /// Returns the organization associated with a stock symbol.
     /// RAM cost: 2 GB
     #[js = "getOrganization"]
-    pub fn get_organization(&self, sym: String) -> String;
+    pub fn get_organization(&self, sym: &str) -> String;
     /// Returns the ask price of that stock.
     /// RAM cost: 2 GB
     #[js = "getAskPrice"]
-    pub fn get_ask_price(&self, sym: String) -> f64;
+    pub fn get_ask_price(&self, sym: &str) -> f64;
     /// Returns the bid price of that stock.
     /// RAM cost: 2 GB
     #[js = "getBidPrice"]
-    pub fn get_bid_price(&self, sym: String) -> f64;
+    pub fn get_bid_price(&self, sym: &str) -> f64;
     /// Returns the player’s position in a stock.
     /// RAM cost: 2 GB
     #[js = "getPosition"]
-    pub fn get_position(&self, sym: String) -> [f64; 4];
+    pub fn get_position(&self, sym: &str) -> [f64; 4];
     /// Returns the maximum number of shares of a stock.
     /// RAM cost: 2 GB
     #[js = "getMaxShares"]
-    pub fn get_max_shares(&self, sym: String) -> f64;
+    pub fn get_max_shares(&self, sym: &str) -> f64;
     /// Calculates cost of buying stocks.
     /// RAM cost: 2 GB
     #[js = "getPurchaseCost"]
-    pub fn get_purchase_cost(&self, sym: String, shares: f64, position_type: String) -> f64;
+    pub fn get_purchase_cost(&self, sym: &str, shares: f64, position_type: &str) -> f64;
     /// Calculate profit of selling stocks.
     /// RAM cost: 2 GB
     #[js = "getSaleGain"]
-    pub fn get_sale_gain(&self, sym: String, shares: f64, position_type: String) -> f64;
+    pub fn get_sale_gain(&self, sym: &str, shares: f64, position_type: &str) -> f64;
     /// Buy stocks.
     /// RAM cost: 2.5 GB
     #[js = "buyStock"]
-    pub fn buy_stock(&self, sym: String, shares: f64) -> f64;
+    pub fn buy_stock(&self, sym: &str, shares: f64) -> f64;
     /// Sell stocks.
     /// RAM cost: 2.5 GB
     #[js = "sellStock"]
-    pub fn sell_stock(&self, sym: String, shares: f64) -> f64;
+    pub fn sell_stock(&self, sym: &str, shares: f64) -> f64;
     /// Short stocks.
     /// RAM cost: 2.5 GB
     #[js = "buyShort"]
-    pub fn buy_short(&self, sym: String, shares: f64) -> f64;
+    pub fn buy_short(&self, sym: &str, shares: f64) -> f64;
     /// Sell short stock.
     /// RAM cost: 2.5 GB
     #[js = "sellShort"]
-    pub fn sell_short(&self, sym: String, shares: f64) -> f64;
+    pub fn sell_short(&self, sym: &str, shares: f64) -> f64;
     /// Place order for stocks.
     /// RAM cost: 2.5 GB
     #[js = "placeOrder"]
-    pub fn place_order(&self, sym: String, shares: f64, price: f64, order_type: String, position_type: String) -> bool;
+    pub fn place_order(&self, sym: &str, shares: f64, price: f64, order_type: &str, position_type: &str) -> bool;
     /// Cancel order for stocks.
     /// RAM cost: 2.5 GB
     #[js = "cancelOrder"]
-    pub fn cancel_order(&self, sym: String, shares: f64, price: f64, order_type: String, position_type: String);
+    pub fn cancel_order(&self, sym: &str, shares: f64, price: f64, order_type: &str, position_type: &str);
     /// Returns your order book for the stock market.
     /// RAM cost: 2.5 GB
     #[js = "getOrders"]
@@ -5883,11 +5883,11 @@ impl Stock {
     /// Returns the volatility of the specified stock.
     /// RAM cost: 2.5 GB
     #[js = "getVolatility"]
-    pub fn get_volatility(&self, sym: String) -> f64;
+    pub fn get_volatility(&self, sym: &str) -> f64;
     /// Returns the probability that the specified stock’s price will increase (as opposed to decrease) during the next tick.
     /// RAM cost: 2.5 GB
     #[js = "getForecast"]
-    pub fn get_forecast(&self, sym: String) -> f64;
+    pub fn get_forecast(&self, sym: &str) -> f64;
     /// Purchase 4S Market Data UI access (UI only).
     /// RAM cost: 2.5 GB
     #[js = "purchase4SMarketData"]
@@ -6038,7 +6038,7 @@ impl UserInterface {
     /// Open the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "openTail"]
-    pub fn open_tail(&self, #[optional] r#fn: JsValue, #[optional] host: String, #[variadic] args: JsValue);
+    pub fn open_tail(&self, #[optional] r#fn: JsValue, #[optional] host: &str, #[variadic] args: JsValue);
     /// Render a tail window.
     /// RAM cost: 0 GB
     #[js = "renderTail"]
@@ -6062,7 +6062,7 @@ impl UserInterface {
     /// Set the font size of the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailFontSize"]
-    pub fn set_tail_font_size(&self, #[optional] pixel: f64, #[optional] r#fn: JsValue, #[optional] host: String, #[variadic] args: JsValue);
+    pub fn set_tail_font_size(&self, #[optional] pixel: f64, #[optional] r#fn: JsValue, #[optional] host: &str, #[variadic] args: JsValue);
     /// Minimize or expand the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailMinimized"]
@@ -6110,11 +6110,11 @@ impl UserInterface {
     /// Programmatically sets an alias.
     /// RAM cost: 0 GB
     #[js = "alias"]
-    pub fn alias(&self, alias: String, substitution: String, #[optional] is_global: bool);
+    pub fn alias(&self, alias: &str, substitution: &str, #[optional] is_global: bool);
     /// Clears an existing alias.
     /// RAM cost: 0 GB
     #[js = "unalias"]
-    pub fn unalias(&self, alias: String) -> bool;
+    pub fn unalias(&self, alias: &str) -> bool;
     /// Returns a list of every alias that's been set.
     /// RAM cost: 0 GB
     #[js = "getAllAliases"]
@@ -6126,7 +6126,7 @@ impl UserInterface {
     /// Allows programmatic use of AutoLink.exe.
     /// RAM cost: 5 GB
     #[js = "createConnectLink"]
-    pub fn create_connect_link(&self, connect_path: Vec<String>, #[optional] link_text: String) -> ReactNode;
+    pub fn create_connect_link(&self, connect_path: &[String], #[optional] link_text: &str) -> ReactNode;
 }
 
 /// Interface Theme
@@ -6235,95 +6235,95 @@ impl WarehouseAPI {
     /// Set material sell data.
     /// RAM cost: 20 GB
     #[js = "sellMaterial"]
-    pub fn sell_material(&self, division_name: String, city: String, material_name: String, amt: String, price: String);
+    pub fn sell_material(&self, division_name: &str, city: &str, material_name: &str, amt: &str, price: &str);
     /// Set product sell data.
     /// RAM cost: 20 GB
     #[js = "sellProduct"]
-    pub fn sell_product(&self, division_name: String, city: String, product_name: String, amt: String, price: String, all: bool);
+    pub fn sell_product(&self, division_name: &str, city: &str, product_name: &str, amt: &str, price: &str, all: bool);
     /// Discontinue a product.
     /// RAM cost: 20 GB
     #[js = "discontinueProduct"]
-    pub fn discontinue_product(&self, division_name: String, product_name: String);
+    pub fn discontinue_product(&self, division_name: &str, product_name: &str);
     /// Set smart supply.
     /// RAM cost: 20 GB
     #[js = "setSmartSupply"]
-    pub fn set_smart_supply(&self, division_name: String, city: String, enabled: bool);
+    pub fn set_smart_supply(&self, division_name: &str, city: &str, enabled: bool);
     /// Set whether smart supply uses leftovers before buying.
     /// RAM cost: 20 GB
     #[js = "setSmartSupplyOption"]
-    pub fn set_smart_supply_option(&self, division_name: String, city: String, material_name: String, option: String);
+    pub fn set_smart_supply_option(&self, division_name: &str, city: &str, material_name: &str, option: &str);
     /// Set material buy data.
     /// RAM cost: 20 GB
     #[js = "buyMaterial"]
-    pub fn buy_material(&self, division_name: String, city: String, material_name: String, amt: f64);
+    pub fn buy_material(&self, division_name: &str, city: &str, material_name: &str, amt: f64);
     /// Set material to bulk-buy.
     /// RAM cost: 20 GB
     #[js = "bulkPurchase"]
-    pub fn bulk_purchase(&self, division_name: String, city: String, material_name: String, amt: f64);
+    pub fn bulk_purchase(&self, division_name: &str, city: &str, material_name: &str, amt: f64);
     /// Get warehouse data.
     /// RAM cost: 10 GB
     #[js = "getWarehouse"]
-    pub fn get_warehouse(&self, division_name: String, city: String) -> Warehouse;
+    pub fn get_warehouse(&self, division_name: &str, city: &str) -> Warehouse;
     /// Get product data.
     /// RAM cost: 10 GB
     #[js = "getProduct"]
-    pub fn get_product(&self, division_name: String, city_name: String, product_name: String) -> Product;
+    pub fn get_product(&self, division_name: &str, city_name: &str, product_name: &str) -> Product;
     /// Get material data.
     /// RAM cost: 10 GB
     #[js = "getMaterial"]
-    pub fn get_material(&self, division_name: String, city: String, material_name: String) -> Material;
+    pub fn get_material(&self, division_name: &str, city: &str, material_name: &str) -> Material;
     /// Set Market-TA1 for a material.
     /// RAM cost: 20 GB
     #[js = "setMaterialMarketTA1"]
-    pub fn set_material_market_ta1(&self, division_name: String, city: String, material_name: String, on: bool);
+    pub fn set_material_market_ta1(&self, division_name: &str, city: &str, material_name: &str, on: bool);
     /// Set Market-TA2 for a material.
     /// RAM cost: 20 GB
     #[js = "setMaterialMarketTA2"]
-    pub fn set_material_market_ta2(&self, division_name: String, city: String, material_name: String, on: bool);
+    pub fn set_material_market_ta2(&self, division_name: &str, city: &str, material_name: &str, on: bool);
     /// Set Market-TA1 for a product.
     /// RAM cost: 20 GB
     #[js = "setProductMarketTA1"]
-    pub fn set_product_market_ta1(&self, division_name: String, product_name: String, on: bool);
+    pub fn set_product_market_ta1(&self, division_name: &str, product_name: &str, on: bool);
     /// Set Market-TA2 for a product.
     /// RAM cost: 20 GB
     #[js = "setProductMarketTA2"]
-    pub fn set_product_market_ta2(&self, division_name: String, product_name: String, on: bool);
+    pub fn set_product_market_ta2(&self, division_name: &str, product_name: &str, on: bool);
     /// Set material export data.
     /// RAM cost: 20 GB
     #[js = "exportMaterial"]
-    pub fn export_material(&self, source_division: String, source_city: String, target_division: String, target_city: String, material_name: String, amt: JsValue);
+    pub fn export_material(&self, source_division: &str, source_city: &str, target_division: &str, target_city: &str, material_name: &str, amt: JsValue);
     /// Cancel material export.
     /// RAM cost: 20 GB
     #[js = "cancelExportMaterial"]
-    pub fn cancel_export_material(&self, source_division: String, source_city: String, target_division: String, target_city: String, material_name: String);
+    pub fn cancel_export_material(&self, source_division: &str, source_city: &str, target_division: &str, target_city: &str, material_name: &str);
     /// Purchase warehouse for a new city.
     /// RAM cost: 20 GB
     #[js = "purchaseWarehouse"]
-    pub fn purchase_warehouse(&self, division_name: String, city: String);
+    pub fn purchase_warehouse(&self, division_name: &str, city: &str);
     /// Upgrade warehouse.
     /// RAM cost: 20 GB
     #[js = "upgradeWarehouse"]
-    pub fn upgrade_warehouse(&self, division_name: String, city: String, #[optional] amt: f64);
+    pub fn upgrade_warehouse(&self, division_name: &str, city: &str, #[optional] amt: f64);
     /// Create a new product.
     /// RAM cost: 20 GB
     #[js = "makeProduct"]
-    pub fn make_product(&self, division_name: String, city: String, product_name: String, design_invest: f64, marketing_invest: f64);
+    pub fn make_product(&self, division_name: &str, city: &str, product_name: &str, design_invest: f64, marketing_invest: f64);
     /// Limit material production.
     /// RAM cost: 20 GB
     #[js = "limitMaterialProduction"]
-    pub fn limit_material_production(&self, division_name: String, city: String, material_name: String, qty: f64);
+    pub fn limit_material_production(&self, division_name: &str, city: &str, material_name: &str, qty: f64);
     /// Limit product production.
     /// RAM cost: 20 GB
     #[js = "limitProductProduction"]
-    pub fn limit_product_production(&self, division_name: String, city: String, product_name: String, qty: f64);
+    pub fn limit_product_production(&self, division_name: &str, city: &str, product_name: &str, qty: f64);
     /// Get the cost to upgrade a warehouse to the next level.
     /// RAM cost: 10 GB
     #[js = "getUpgradeWarehouseCost"]
-    pub fn get_upgrade_warehouse_cost(&self, division_name: String, city: String, #[optional] amt: f64) -> f64;
+    pub fn get_upgrade_warehouse_cost(&self, division_name: &str, city: &str, #[optional] amt: f64) -> f64;
     /// Check if you have a warehouse in city.
     /// RAM cost: 10 GB
     #[js = "hasWarehouse"]
-    pub fn has_warehouse(&self, division_name: String, city: String) -> bool;
+    pub fn has_warehouse(&self, division_name: &str, city: &str) -> bool;
 }
 
 /// Work formulas
@@ -6331,17 +6331,17 @@ pub struct WorkFormulas {
 }
 impl WorkFormulas {
     #[js = "crimeSuccessChance"]
-    pub fn crime_success_chance(&self, person: Person, crime_type: String) -> f64;
+    pub fn crime_success_chance(&self, person: Person, crime_type: &str) -> f64;
     #[js = "crimeGains"]
-    pub fn crime_gains(&self, person: Person, crime_type: String) -> WorkStats;
+    pub fn crime_gains(&self, person: Person, crime_type: &str) -> WorkStats;
     #[js = "gymGains"]
-    pub fn gym_gains(&self, person: Person, gym_type: String, location_name: String) -> WorkStats;
+    pub fn gym_gains(&self, person: Person, gym_type: &str, location_name: &str) -> WorkStats;
     #[js = "universityGains"]
-    pub fn university_gains(&self, person: Person, class_type: String, location_name: String) -> WorkStats;
+    pub fn university_gains(&self, person: Person, class_type: &str, location_name: &str) -> WorkStats;
     #[js = "factionGains"]
-    pub fn faction_gains(&self, person: Person, work_type: String, favor: f64) -> WorkStats;
+    pub fn faction_gains(&self, person: Person, work_type: &str, favor: f64) -> WorkStats;
     #[js = "companyGains"]
-    pub fn company_gains(&self, person: Person, company_name: String, work_type: String, favor: f64) -> WorkStats;
+    pub fn company_gains(&self, person: Person, company_name: &str, work_type: &str, favor: f64) -> WorkStats;
 }
 
 pub struct WorkStats {

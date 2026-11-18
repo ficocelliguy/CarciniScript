@@ -67,6 +67,19 @@ impl OffsetMap {
             .unwrap_or(off)
     }
 
+    /// Whether `off` is in text the compiler wrote: an expansion, or a prelude after the
+    /// program (`original_len` is the program's length).
+    pub fn generated(&self, off: usize, original_len: usize) -> bool {
+        if self
+            .segs
+            .iter()
+            .any(|s| s.synthetic && s.cur.0 <= off && off < s.cur.1)
+        {
+            return true;
+        }
+        self.orig(off, false) >= original_len
+    }
+
     /// The expanded offset of an original one, unless it's inside an invocation (or a removed
     /// definition).
     pub fn cur(&self, orig: usize) -> Option<usize> {

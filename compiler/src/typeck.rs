@@ -319,7 +319,6 @@ impl<'a> Checker<'a> {
             unbound_targs: Default::default(),
             generic_calls: Vec::new(),
             last_type_args: Vec::new(),
-            borrow_events: Default::default(),
             ptrs: Default::default(),
             quote_vars: Default::default(),
             quote_reps: Default::default(),
@@ -447,6 +446,24 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Where `src` came from: the preprocessor's map (if it was expanded) and the program's own
+/// length, which together tell generated code (expansions, bundled preludes) from the user's.
+#[derive(Clone, Default)]
+pub struct Origin {
+    pub map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
+    pub len: usize,
+}
+
+impl Origin {
+    /// Whether the offset is in code the compiler wrote.
+    pub fn generated(&self, off: usize) -> bool {
+        match &self.map {
+            Some(m) => m.generated(off, self.len),
+            None => off >= self.len,
+        }
+    }
+}
+
 /// Type-check `file`. `filename` is its path (for finding `mod` files) and `resolver` reads other
 /// files.
 pub fn check(
@@ -454,6 +471,7 @@ pub fn check(
     src: &str,
     filename: &str,
     resolver: Resolver,
+    origin: &Origin,
 ) -> (Types, Vec<RawDiag>) {
     let mut c = Checker::new(src);
     c.crate_name = filename
@@ -464,7 +482,6 @@ pub fn check(
         .replace('-', "_");
     c.declare_items(file, filename, resolver, &mut vec![filename.to_string()]);
     c.scan_index_mut(file);
-    c.borrow_events.sigs = crate::borrows::ref_sigs(file);
     for item in crate::adt::all_items(file) {
         if let ast::Item::Fn(f) = &item {
             c.check_fn(f);
@@ -523,7 +540,7 @@ pub fn check(
         let (moves, sites) = crate::moves::check(file, src, &map, &c.adts, &c.copy_arrays);
         c.diags.extend(moves);
         c.move_sites = sites;
-        let borrows = crate::borrows::check(file, src, 0, &c.borrow_events);
+        let borrows = crate::nll::check(file, src, &map, &c.adts, origin);
         c.diags.extend(borrows);
     }
     if let Some((&(start, end), ty)) = map
@@ -773,8 +790,6 @@ struct Checker<'a> {
     generic_calls: Vec<GenericCall>,
     /// The type variables the last `instantiate` made, in order.
     last_type_args: Vec<Ty>,
-    /// Borrows, uses and changes of locals, for the borrow-conflict warnings.
-    borrow_events: crate::borrows::Events,
     /// Types whose `index_mut` doesn't end in `&mut <place>`: assigning through them can't work.
     opaque_index_mut: std::collections::HashSet<String>,
     /// `static mut` items, by name: using one takes an `unsafe` block or function.
@@ -2228,19 +2243,7 @@ impl<'a> Checker<'a> {
                 let r = self.range(name.syntax());
                 self.let_types.push((r, ty.clone()));
             }
-            // (What the initializer borrows, before `name` shadows a local it names.)
-            let borrowed = l
-                .initializer()
-                .map(|init| self.borrowed_local(&init))
-                .unwrap_or_default();
             self.declare(&name, local);
-            if declared_ref.is_none()
-                && l.initializer()
-                    .is_some_and(|i| crate::borrows::makes_owned(&i))
-            {
-                let r = self.range(name.syntax());
-                self.borrow_events.owned.insert(r);
-            }
             if self.copy_array(l.ty().as_ref(), l.initializer().as_ref(), &ty) {
                 let r = self.range(name.syntax());
                 self.copy_arrays.insert(r);
@@ -2248,13 +2251,6 @@ impl<'a> Checker<'a> {
             // A raw pointer doesn't borrow.
             if self.ptr_let(l, &name, &ty) {
                 return;
-            }
-            // `let r = &v;` / `let r = v.first();` / `let r = first(&v);`: `r` borrows `v`
-            // while it's used.
-            for place in borrowed {
-                let holder = self.range(name.syntax());
-                let from = self.range(l.syntax()).1;
-                self.borrow_events.borrows.push((holder, place, from));
             }
             return;
         }
@@ -3871,9 +3867,8 @@ impl<'a> Checker<'a> {
         if let Some(name) = path.as_single_name_ref() {
             if let Some(local) = self.lookup(name.text()).cloned() {
                 if let Some(d) = local.decl {
-                    let r = self.range(p.syntax());
-                    self.borrow_events.uses.push((d, r));
                     if self.copy_arrays.contains(&d) {
+                        let r = self.range(p.syntax());
                         self.array_reads.insert(r);
                     }
                 }
@@ -4222,12 +4217,6 @@ impl<'a> Checker<'a> {
         let Some((name, through)) = Self::place_root(e) else {
             return;
         };
-        if let Some(d) = self.lookup(name.text()).and_then(|l| l.decl) {
-            let r = self.range(e.syntax());
-            self.borrow_events
-                .changes
-                .push((d, r, how == Mutation::Assign && !through));
-        }
         let Some(local) = self.lookup(name.text()).cloned() else {
             // A `static` or `const` item.
             let n = name.text().to_string();
@@ -6566,13 +6555,6 @@ impl<'a> Checker<'a> {
 
     fn for_expr(&mut self, f: &ast::ForExpr) {
         let Some(iterable) = f.iterable() else { return };
-        // `for x in &v` / `v.iter()`: the loop borrows `v` for its whole body.
-        if let Some(body) = f.loop_body() {
-            for place in self.borrowed_local(&iterable) {
-                let r = self.range(body.syntax());
-                self.borrow_events.loops.push((place, r));
-            }
-        }
         // (element type, reference kind of the loop variable)
         let (elem, reference) = match &iterable {
             ast::Expr::RangeExpr(r) => (self.range_elem(r), None),
@@ -8625,130 +8607,6 @@ impl Checker<'_> {
     }
 }
 
-impl Checker<'_> {
-    /// The locals `e` borrows (whether mutably, and which fields): `&v`, `&mut v.field`, `&v[i]`,
-    /// the methods that hand out references into their receiver (`v.iter()`, `v.first()`,
-    /// `map.get(k)`, ..), and calls of this file's functions that return a reference into an
-    /// argument (`first(&v)`, `s.name()`).
-    fn borrowed_local(&self, e: &ast::Expr) -> Vec<crate::borrows::Place> {
-        let mut out = Vec::new();
-        // `call`: the place is a call's argument or receiver (borrowed by the callee's signature,
-        // or auto-referenced); a reference local there is reborrowed, not borrowed.
-        let mut place = |place: Option<ast::Expr>, mutable: bool, call: bool| {
-            let Some(place) = place.map(|p| strip_parens(&p)) else {
-                return;
-            };
-            if crate::borrows::has_deref(&place) {
-                return;
-            }
-            let Some((name, through)) = Self::place_root(&place) else {
-                return;
-            };
-            let Some(local) = self.lookup(name.text()) else {
-                return;
-            };
-            // A reference held in a local (`r` in `&r[0]`) isn't the owner being borrowed.
-            if (through || call) && local.reference.is_some() {
-                return;
-            }
-            if let Some(of) = local.decl {
-                out.push(crate::borrows::Place {
-                    of,
-                    mutable,
-                    path: crate::borrows::field_path(&place),
-                    direct: !call && matches!(place, ast::Expr::PathExpr(_)),
-                });
-            }
-        };
-        match strip_parens(e) {
-            // (`&raw const v` makes a pointer.)
-            ast::Expr::RefExpr(r) if r.raw_token().is_none() => {
-                place(r.expr(), r.mut_token().is_some(), false)
-            }
-            ast::Expr::CallExpr(c) => {
-                let Some(ast::Expr::PathExpr(p)) = c.expr() else {
-                    return out;
-                };
-                let segs: Vec<String> = p
-                    .path()
-                    .map(|p| {
-                        p.segments()
-                            .filter_map(|s| s.name_ref().map(|n| n.text().to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let key = match segs.as_slice() {
-                    [f] if self.lookup(f).is_none() => f.clone(),
-                    [t, f] if t != "Self" => format!("{t}::{f}"),
-                    _ => return out,
-                };
-                let Some(Some(sig)) = self.borrow_events.sigs.get(&key) else {
-                    return out;
-                };
-                let args: Vec<ast::Expr> =
-                    c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
-                for &i in &sig.from_params {
-                    if let Some(ast::Expr::RefExpr(r)) = args.get(i).map(strip_parens) {
-                        place(r.expr(), r.mut_token().is_some(), true);
-                    }
-                }
-            }
-            ast::Expr::MethodCallExpr(m) => {
-                let (Some(method), Some(recv)) = (m.name_ref(), m.receiver()) else {
-                    return out;
-                };
-                // A method of your own type: what its signature borrows.
-                // (A `for` loop's iterable isn't checked yet: then its local's type.)
-                let recv_ty = self
-                    .raw
-                    .get(&self.range(recv.syntax()))
-                    .cloned()
-                    .or_else(|| match strip_parens(&recv) {
-                        ast::Expr::PathExpr(p) => {
-                            let n = p.path()?.as_single_name_ref()?;
-                            Some(self.lookup(n.text().to_string().as_str())?.ty.clone())
-                        }
-                        _ => None,
-                    })
-                    .map(|t| self.zonk(&t));
-                if let Some(Ty::Adt(n, _)) = &recv_ty
-                    && let Some(sig) = self.borrow_events.sigs.get(&format!("{n}::{method}"))
-                {
-                    let Some(sig) = sig else { return out };
-                    if let Some(mutable) = sig.from_self {
-                        place(Some(recv), mutable, true);
-                    }
-                    let args: Vec<ast::Expr> =
-                        m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
-                    for &i in &sig.from_params {
-                        if let Some(ast::Expr::RefExpr(r)) = args.get(i).map(strip_parens) {
-                            place(r.expr(), r.mut_token().is_some(), true);
-                        }
-                    }
-                    return out;
-                }
-                // The std collections' methods that return a reference into them (on other
-                // types, `get` / `as_slice` may return a copy or a borrow of something else).
-                if !matches!(
-                    recv_ty,
-                    Some(Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..))
-                ) {
-                    return out;
-                }
-                let mutable = match method.text().to_string().as_str() {
-                    "iter" | "first" | "last" | "get" | "keys" | "values" | "as_slice"
-                    | "windows" | "chunks" => false,
-                    "iter_mut" | "first_mut" | "last_mut" | "get_mut" | "values_mut"
-                    | "as_mut_slice" => true,
-                    _ => return out,
-                };
-                place(Some(recv), mutable, true);
-            }
-            _ => {}
-        }
-        out
-    }
-}
 
 /// Whether a const argument is a literal (not a `const` item's name).
 fn const_literal(v: &str) -> bool {

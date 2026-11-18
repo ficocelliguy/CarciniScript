@@ -86,15 +86,28 @@ Erasing them only means programs rustc would reject still run. Tiers:
 
 1. **Move checking** (phase 1, done): use-after-move via init/move dataflow. Needs only
    `Copy`-ness.
-2. **NLL-lite** (done, `borrows.rs`): borrows bound by `let` and borrowing `for` loops, live to
-   the holder's last use, conflicts reported with rustc's messages. Shown as warnings; strict
-   borrows make them errors. Also through calls of the file's own functions and methods (elided
-   and named lifetimes in their signatures), down to fields (disjoint fields don't conflict), and
-   ended by a `break` / `return` right after the change. Not yet: closures, struct literals,
-   references handed between locals, loop-carried borrows, `mod` files' functions.
-3. **NLL proper** (sketched 2026-11-17, below): rustc's shipping borrow checker is NLL, not
-   Polonius, and NLL is intra-procedural, so each function is checked and cached on its own.
-   That is what makes a full checker fit a browser compiler and a language service.
+2. **NLL-lite** (`borrows.rs`, retired 2026-11-18): borrows bound by `let` and borrowing
+   `for` loops, live to the holder's last use, conflicts reported with rustc's messages. Replaced
+   by tier 3, which keeps its messages, positions and the strict mode.
+3. **NLL proper** (done 2026-11-18, `nll.rs`, `nll_lower.rs`, `nll_rty.rs`, `nll_std.rs`,
+   `nll_bir.rs`): rustc's shipping borrow checker is NLL, not Polonius, and NLL is
+   intra-procedural, so each function is checked on its own. The sketch below is what was
+   built, as option A (an overlay): a per-function IR with places and a CFG, reference-aware
+   local types rebuilt from annotations, signatures, struct fields and a std borrow table,
+   liveness-based region inference with universal regions for the signature's lifetimes,
+   two-phase borrows, reborrows, closures as separate bodies over captured places (RFC 2229
+   field paths), temporaries with `let` lifetime extension and constant promotion, implied
+   bounds, deref coercion, and E0499 / E0502 / E0503 / E0505 / E0506 / E0597 / E0515 / E0716 /
+   "lifetime may not live long enough" with rustc's wording. Generated code (derive expansions,
+   bundled crate preludes) is skipped. Move checking stays in `moves.rs` (its diagnostics and
+   `move_sites` for `Drop` codegen are unchanged); the IR's moves feed only E0505.
+   Left out, as planned: Polonius, `for<'a>`, object lifetime defaults, drop-check subtleties,
+   `T: 'a` well-formedness on struct definitions; plus per-function result caching (the
+   file-level memo covers the editor's repeated analyses) and strict borrows as the default.
+   Unknown shapes (a generic `T` instantiated with a reference, methods of other modules and of
+   bundled crates, closures' return types outside std's closure-taking methods) default to
+   owned: silence, never a false positive. `NLL_DUMP=1` prints every body's IR and
+   `NLL_TIME=1` the checker's time (native builds).
 
 Optional debug mode: RefCell-style runtime guards on collections (e.g. mutate-while-iterating
 panics instead of silently misbehaving).
@@ -175,38 +188,189 @@ can't see) defaults to owned: silence, never a false positive, as the current ch
 - *No new crates.* The wasm is 5.9 MB; bitsets and index newtypes are a few hundred lines
   in-house. Expect roughly 300 to 500 KB more wasm.
 - Target against the performance scan's numbers: under 10 ms cold for `darknet.rs` (78 ms
-  compile today), near zero for an unchanged function in the service.
+  compile today), near zero for an unchanged function in the service. Measured 2026-11-18
+  (native release, `NLL_TIME=1`): `darknet.rs` 75 bodies, 3,254 points, 6.5 ms; `batcher.rs`
+  4.7 ms; `contracts.rs` 4.4 ms; over the 903 registry files the compiler accepts, 246 ms in
+  all, the largest (757 bodies, 9,507 points) 27 ms.
 
 **Staging**
 
-1. BIR lowering, CFG, liveness. Port move checking onto it and retire `moves.rs`; the existing
-   move fixtures validate the IR before any region work starts.
-2. RTy overlay, std borrow table, constraint generation, NLL inference, loans. Retire
-   `borrows.rs`. Closes every gap listed in RUST_GAPS "Checking": loop-carried borrows,
-   local-to-local handoff, struct literals, closures, other modules' functions.
-3. Dangling and escape errors (E0597, E0515, E0716), struct lifetime parameters, two-phase
+1. [x] BIR lowering, CFG, liveness. (Move checking stays in `moves.rs`: its conservative
+   "certainly owns a non-`Copy` value" rule and messages are tuned by fixtures; the IR's moves
+   feed E0505.)
+2. [x] RTy overlay, std borrow table, constraint generation, NLL inference, loans. `borrows.rs`
+   retired. Loop-carried borrows, local-to-local handoff, struct literals, closures are seen;
+   other modules' functions still return owned values as far as the checker knows (their
+   signatures are erased by the time they're imported).
+3. [x] Dangling and escape errors (E0597, E0515, E0716), struct lifetime parameters, two-phase
    borrows, reborrows, closure captures.
-4. Per-function caching, service wiring, and strict borrows as the default once the
-   false-positive rate is measured.
+4. [ ] Per-function caching and strict borrows as the default once the false-positive rate is
+   measured. The service is wired (diagnostics ride along with the analysis each edit already
+   runs); the checker is ~1 ms on the largest Bitburner script, so caching isn't needed yet.
 
 **Test oracle.** Every corpus file rustc accepts must produce zero borrow errors, so
 `npm run corpus` is a false-positive counter. For true positives, rustc's own
 `tests/ui/borrowck` suite with its `.stderr` files covers the subset well, and `record-native`
-can diff messages; keep rustc's exact wording, as `borrows.rs` does, since the editor shows it.
+can diff messages; keep rustc's exact wording, as `nll.rs` does, since the editor shows it.
+Done 2026-11-18: every fixture, module test, NS script and Bitburner corpus file (all accepted
+by rustc) compiles with zero borrow warnings, and so do the 903 cargo-registry files the
+compiler accepts (the sweep's `OK` list, compiled with the native `compile` example);
+`test/run.mjs` holds 30 programs rustc rejects (each confirmed against rustc) with the expected
+message and position, and 24 that rustc accepts which must stay quiet. The crash sweeps
+(registry 5,922 files, std 3,004) run with 0 panics.
 
-**Size.** 5 to 7k lines of Rust: BIR lowering 2 to 3k (every expression form in the subset),
-region typing and inference ~1.5k, std table and diagnostics under 1k each. About three times
-the current `moves.rs` + `borrows.rs`, under a tenth of the compiler.
+**Size.** Planned 5 to 7k lines; built in 6.8k: lowering 3.3k, region types and signatures
+1.3k, std table 0.8k, IR 0.7k, analysis and diagnostics 0.7k.
 
 ## NS bindings
 
 `tools/dts2rs.ts` uses the TypeScript compiler API on `NetscriptDefinitions.d.ts`:
-`number` → `f64`, `string` → `String`, `T[]` → `Vec<T>`, optional / `T | undefined` → `Option<T>`,
+`number` → `f64`, `string` → `String`, `T[]` → `Vec<T>` (parameters borrow: `&str`, `&[T]`, since
+no NS function changes or keeps a string or array it's given), optional / `T | undefined` → `Option<T>`,
 `Promise<T>` → `impl Future<Output = T>`, interfaces → extern structs (with `#[extends = ".."]`
 for `interface X extends Y`), tuples → `[T; N]` / `(A, B)`, `Map` / `Record` → `HashMap`, inline
 object results and `Named & { .. }` intersections → structs of their own, anything else →
 `JsValue` (wasm-bindgen's, with `as_string()` and friends; a `JsValue` parameter takes any value).
 Scripts can name the interfaces and build the option ones (`RunOptions { .., ..Default::default() }`).
+
+- [ ] **An owned value for a `&` parameter isn't rustc's E0308.** `ns.get_weaken_time(t)` with
+  `t: String` (or `ns.ui.create_connect_link(v)` with `v: Vec<String>`) compiles: references are
+  erased in typeck, so the argument unifies with the `&str` / `&[String]` parameter and
+  `moves.rs` counts it as a move, which shows up only at a later use as "use of moved value: `t`
+  ... `.clone()` it". rustc rejects the call itself: "mismatched types: expected `&str`, found
+  `String`", help "consider borrowing here: `&t`". The same holds for user functions
+  (`fn f(s: &str)` called as `f(t)`). The bindings keep the `&` (`bindings::Param::shown`, for
+  the language service) but `Param::ty` drops it. Fits the ref-or-not overlay (Option A under
+  "Borrow checking"): an owned argument where a parameter is declared `&` is the error, at the
+  argument, with the borrow suggestion; a move of it should then not be recorded.
+
+### Typed unions instead of `JsValue` (plan, 2026-11-18)
+
+**Goal.** Every NS value whose d.ts type is a union gets a Rust enum named after the TS type
+(`ScriptArg`, `FilenameOrPID`, `PlayerRequirement`, `Task`, `SleeveTask`), so hover says exactly
+what can be in it, `match` is checked for exhaustiveness, and the name is the one in Bitburner's
+NS docs (`markdown/bitburner.scriptarg.md`). `JsValue` stays only where the d.ts says `any`.
+
+**Survey.** `bindings/ns.rs` has 103 `JsValue` sites. By source:
+
+- *Primitive unions* (told apart by `typeof` / `Array.isArray`):
+  - `ScriptArg = string | number | boolean`: `ns.args`, `ProcessInfo` / `RunningScript` /
+    `RecentScript` `.args`, and the `...args` of `run`, `exec`, `spawn`, `kill`, `isRunning`,
+    `getRunningScript`, `getScriptIncome`, `getScriptExpGain`, `getScriptLogs`, `ui.openTail`,
+    `ui.setTailFontSize`.
+  - `FilenameOrPID = number | string`: `fn` / `filename` / `script` parameters of `kill`,
+    `isRunning`, `getRunningScript`, `getScriptLogs`, `ui.openTail`, `ui.setTailFontSize` (now
+    `JsValue` because the overloads disagree).
+  - `number | RunOptions`, `number | SpawnOptions`: `threadOrOptions` of `run` / `exec` / `spawn`.
+  - `string | number`: `Material` / `Product` `desiredSellPrice` / `desiredSellAmount`,
+    `exportMaterial`'s `amt`.
+  - `string | string[]`: `scp`'s `files`, `ui.openCodeEditor`'s `files`.
+  - `boolean | string`: `prompt`'s result.
+  - `string | ReactElement`: `RunningScript` / `RecentScript` `.title`.
+- *Tagged object unions* (told apart by a literal field):
+  - `PlayerRequirement` (`type: "money" | "skills" | ..`): `singularity.getFactionInviteRequirements`,
+    `NotRequirement.condition`, `SomeRequirement` / `EveryRequirement` `.conditions`.
+  - `Task` (`StudyTask | CompanyWorkTask | ..`): `singularity.getCurrentWork`.
+  - `SleeveTask`: `sleeve.getTask`.
+  - `Result<T> = SuccessResult<T> | FailureResult` (`success: true | false`): `sleeve.purchaseSleeve`,
+    `sleeve.upgradeMemory`, `dnet.labreport`, `dnet.labradar`.
+  - `CodingContractObject` (a mapped type: one variant per contract name, with that contract's
+    `data` and answer types from `CodingContractSignatures`): `codingcontract.getContract`.
+- *Not unions; generator gaps to fix alongside* (each its own small item):
+  - `Promise<void>` fields (`nextCompletion` on 17 task types): an awaitable `JsPromise<()>`.
+  - `() => void` (`atExit`'s `f`): emit `impl Fn()`, which the bindings parser already reads.
+  - `never` results (`exit`, `spawn`): `-> !`.
+  - `Date` (`timeOfDeath`): `js::Date`. `Uint8Array` (`getSaveData`): `Vec<u8>`.
+  - `LocationNameEnumType["X"]` indexed access (the `Gym` / `University` enum-type fields, and so
+    `gymWorkout` / `universityCourse` names) and `Exclude<Union, "Lit">` over string literals
+    (`setJobAssignment`'s `job`, sleeve Bladeburner actions): resolve to `String` like other
+    string-literal types.
+  - `Partial<Skills>` (`SkillRequirement.skills`): a struct with `Option` fields.
+  - `[bigint, bigint]` (`squareRoot` contract data): `(i128, i128)` or leave as `JsValue`.
+- *Stays `JsValue`* (`any` in the d.ts): port data (`readPort`, `peek`, `writePort`, `tryWrite`,
+  `NetscriptPort`), `codingcontract.getData`, `dynamicImport`, `flags`, `DarknetResult`'s
+  `data`, `print` / `tprint` / `alert` / `sprintf` / `vsprintf` arguments.
+
+**Representation: a view, not a wrapper.** The enum's value at run time is the JS value itself:
+`ScriptArg::Num(5.0)` is `5`, a `PlayerRequirement::Money(m)` is the game's `{ type: "money",
+.. }` object. Nothing is converted when a value crosses into or out of the game, `ns.args` stays
+the game's array, and ports and args keep identity. Rust code only sees it through the enum:
+- `match` lowers to `typeof v === "number"`, `Array.isArray(v)` and so on for primitive unions,
+  and to `v.type === "money"` (`v.success === true`) for tagged ones. Variant order doesn't
+  matter, since the tests are disjoint; the generator rejects a union whose members can't be
+  told apart (two object types with no shared literal field, `number | bigint` in one
+  `typeof` class), and those stay `JsValue`.
+- Constructing a variant emits its payload. A tagged variant's payload is the interface
+  struct, which already carries its `type` field.
+- This differs from user enums (tagged objects, see "Lowering decisions"), so it's a
+  representation flag on the ADT (`Repr::Js { tag: Option<String> }`), not a new type kind: the
+  exhaustiveness checker, `match` checking, hover and completions work on it unchanged, and only
+  codegen of construct, match and `{:?}` branches on the flag.
+
+**Bindings syntax** (what `dts2rs.mjs` emits; the compiler's `bindings.rs` parses it):
+
+```rust
+/// TypeScript: `string | number | boolean`
+#[untagged]
+pub enum ScriptArg { Str(String), Num(f64), Bool(bool) }
+
+/// TypeScript: `MoneyRequirement | SkillRequirement | ..`
+#[tag = "type"]
+pub enum PlayerRequirement {
+    #[js = "money"] Money(MoneyRequirement),
+    #[js = "skills"] Skills(SkillRequirement),
+    ..
+}
+```
+
+Naming: the TS alias name when the union has one, so it can be looked up in the NS docs, and
+`{Owner}{Member}` for an anonymous union (`MaterialDesiredSellPrice`, `RunThreadOrOptions`),
+the scheme inline object types already use. Variants: `Str` / `Num` / `Bool` / `BigInt` / `List`
+for primitives, the interface name minus the union's common suffix for tagged ones
+(`MoneyRequirement` → `Money`, `StudyTask` → `Study`). Every enum's doc comment quotes the TS
+type, so hover shows both. Bitburner's `Result<T>` would collide with Rust's `Result`, so it's
+`NsResult<T> { Success(T), Failure(FailureResult) }`, with `into_result()` returning a real
+`Result<T, String>` so `?` works.
+
+**Ergonomics, so typing doesn't cost anything at call sites:**
+- A parameter of a union type also takes any variant's payload type directly: `ns.run("x.rs",
+  4, "n00dles")` and `ns.kill(pid)` don't change. This is the same extension `JsValue`
+  parameters have today, and free here because the representation is the payload.
+- Primitive unions keep `JsValue`'s readers (`as_string()`, `as_f64()`, `as_bool()`, `is_*`)
+  as generated methods, so existing scripts (18 `ns.args` reads in the corpus) still compile,
+  and `{}` still prints JS's `String(v)`.
+- Primitive unions `impl Display` (JS's `String(v)`: `"n00dles"`, `"5"`, `"true"`), so
+  `ns.args[0].to_string()` works as in Rust and `{}` is ordinary formatting rather than an
+  extension. Unlike `JsValue` (no `Display` in wasm-bindgen, so `to_string()` stays an error
+  there), these enums are ours to give one. Tagged unions get `Debug` only.
+- `From<ScriptArg> for JsValue` and `JsValue::try_into::<ScriptArg>()` for the escape hatch;
+  both are the identity at run time (`try_into` checks the shape).
+
+**Staging.**
+1. Compiler: `pub enum` with `#[untagged]` / `#[tag = ".."]` / `#[js = ".."]` in bindings,
+   `Repr::Js` codegen (construct, `match`, `if let`, `matches!`, `{:?}`), payload-typed
+   arguments for union parameters, generated readers. `ScriptArg` and `FilenameOrPID` by hand
+   in a test bindings file first.
+2. `dts2rs.mjs`: name-preserving alias resolution for unions, primitive-union detection,
+   anonymous-union naming. Regenerate; every primitive union in the survey.
+3. Tagged unions: tag detection (a property every member declares with a distinct literal
+   type), variant naming, `PlayerRequirement` (recursive through `Not` / `Some` / `Every`),
+   `Task`, `SleeveTask`, `NsResult<T>`.
+4. `CodingContractObject`: one variant per contract, `data` typed from
+   `CodingContractSignatures`, and `submit` taking that contract's answer type. Biggest single
+   item; can slip.
+5. The non-union generator gaps above. Independent of 1 to 4 and cheap, so they can go first.
+
+**Later, needs a decision:** string-literal unions (`CityName`, `CorpEmployeePosition`,
+`GymType`, ..) are `String` today. A Rust enum per union (`CityName::Aevum`, its value the
+string) would show the valid values too, but would break `"Aevum"` literals unless those
+parameters also take a `&str`, and `ns.enums` already lists the values. Revisit after stage 3.
+
+**Tests.** A mock-NS fixture per stage (`test/` with `ns` stubbed as plain objects): matching each
+variant, constructing and passing each one back, the old `as_string()` calls, and that a value
+read from the game and written back is the same JS value. `npm run corpus` stays at zero new
+errors (it exercises the `ns.args` readers). Bitoxidizer's `RustScripts.test.ts` gets a hover
+check that `ns.args` shows `Vec<ScriptArg>`.
 
 ## Source maps
 
@@ -285,13 +449,24 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] Go to definition (also into `mod x;` files), find references and rename (`nav.rs`), in
      Bitburner's Monaco
    - [x] References and rename across files (Bitburner passes the server's `.rs` scripts)
+   - [ ] **Std methods have no docs on hover.** `v.first()` shows only `first(..) -> Option<i32>`:
+     no doc text, no parameters (`..`), no receiver (`[T]`) and no `&` in the return (rustc's is
+     `Option<&i32>`). `unwrap_or`, `to_uppercase` and the rest are the same, and hovering
+     `String::from` shows nothing. User functions and NS methods do have docs. Wants a table of
+     std signatures and summaries (the first paragraph of each std doc comment, which is enough
+     for a hover) keyed like the typeck's std method table, used by hover, signature help and
+     completions. Bundled crates have the same gap and show their internals: itertools'
+     `sorted()` is `sorted(..) -> std::slice::Iter<'_, i32>`, petgraph's `g.add_node(1)` is
+     `fn add_node(_0: N) -> PgNodeIndex` on `*PgGraph*` (the prelude's names, not `NodeIndex` /
+     `Graph`, and no parameter name)
 4. **Later:** wider std, more JS globals (see FEATURES).
    (`macro_rules!` is done.)
    - [x] Optional overflow checks (debug-build semantics), with `test/debug/` against `rustc` without `-O`
    - [x] `T::assoc()` / `T::CONST` / `T::default()` on generic `T` in free functions and on a
      method's own type parameters (hidden class
      arguments); default trait functions without `self`
-   - [x] NLL-lite borrow warnings (and a strict mode)
+   - [x] NLL-lite borrow warnings (and a strict mode); replaced by the NLL borrow checker
+     (`nll*.rs`, see "Borrow checking")
    - [x] Raw pointers as nullable references (cells for numbers), `ptr::null`/`eq`,
      `Box::into_raw`/`from_raw`, same-size `transmute`; `unsafe { }` bodies are type-checked
    - [x] Wider std: float bits and math, `div_euclid`/`ilog`/`isqrt`, `scan`/`unzip`/`map_while`,
@@ -984,6 +1159,19 @@ operators on type parameters (41 + 28), a tuple-struct pattern of another crate'
 (`Bound::Included(&i)`, 39). Worth sorting next: several are probably std types the checker
 doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
 
+- [ ] **An unknown type is "not supported yet (planned for phase 1)".** `let x: Foo = 1;` with no
+  `Foo` anywhere says "type `Foo` is not supported yet (planned for phase 1)" (`typeck.rs`, the
+  two errors at the end of the path-type lowering). Phase 1 is done, and a typo or a missing
+  `use` isn't a missing feature: rustc's E0412 is "cannot find type `Foo` in this scope", with a
+  close name suggested ("help: a struct with a similar name exists: `Foo2`", `bindings::suggest`
+  already does this for NS names). Keep "not supported" only for real std / crate types the
+  checker doesn't model (`std::cell::UnsafeCell<i32>` gets the same message today), naming the
+  type rather than a phase. The other phase messages are stale the same way; sweep them all:
+  `codegen.rs` `unsupported(..)`, typeck's `<T as Tr>::f(..)` and iterator-adapter ones, and
+  "cannot find function `std::cell::UnsafeCell::new` (paths are resolved in phase 2)". (The
+  opposite leniency: `HashMap::new()` with no `use std::collections::HashMap;` compiles, where
+  rustc's E0433 asks for the import.)
+
 ### Std-library gaps
 
 Files hitting each, among files that compile apart from external names. In all, 888 files miss a std
@@ -1247,7 +1435,7 @@ re-run all of it (`service.rs` `analyze`).
 - [x] Smaller ones: `OffsetMap::orig` / `replace` are linear in segments (`mbe.rs:51, 94`; called
   per source-map mapping): binary search, one rebuild per pass. `used_names` is cloned per
   top-level item and per method (`codegen.rs:1194`, `codegen_adt.rs:338`): an undo log.
-  `borrows::check` is uses × changes per borrow (`borrows.rs:136-185`): index by declaration.
+  `borrows::check` was uses × changes per borrow (since replaced by `nll.rs`): index by declaration.
   Macro arguments are parsed separately by typeck, moves and codegen, and `rules_of` re-tokenizes
   a definition per invocation. Done: `orig` is a binary search (`replace` stays: its text
   splice is the linear part anyway); `used_names` has an undo log (`name_log`, `undo_names`;
@@ -1432,5 +1620,7 @@ map/filter/sum chains are about 1.3x a hand loop.
   signatures. Keep the std surface small and grow on demand.
 - **Silent divergence:** `Copy` structs, `&mut` primitives, UTF-8 vs UTF-16, `i64` precision.
   Every one goes in `RUST_GAPS.md`.
-- **No full borrow checker:** programs rustc rejects can still run. Documented.
+- **The borrow checker sees through erased types only as far as its overlay reaches:** what it
+  can't follow is silent, so some programs rustc rejects still run (and what it reports is a
+  warning unless strict borrows are on). Documented in RUST_GAPS "Checking".
 - **ra_ap_syntax churn:** pinned version; upgrades are deliberate.

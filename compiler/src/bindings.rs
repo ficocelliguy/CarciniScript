@@ -28,6 +28,9 @@ use crate::ty::Ty;
 pub struct Param {
     pub name: String,
     pub ty: Ty,
+    /// The type as the language service shows it: as declared for a reference (`&str`, `&[String]`;
+    /// `ty` erases the `&`), else `ty`'s.
+    pub shown: String,
     /// May be omitted (a trailing optional TS parameter).
     pub optional: bool,
 }
@@ -424,9 +427,14 @@ fn method_of(f: &ast::Fn, structs: &HashSet<String>) -> Method {
             .pat()
             .map(|x| x.syntax().text().to_string())
             .unwrap_or_default();
+        let shown = match p.ty() {
+            Some(t @ ast::Type::RefType(_)) => t.syntax().text().to_string(),
+            _ => pty.describe(),
+        };
         params.push(Param {
             name,
             ty: pty,
+            shown,
             optional: attr_value(&p, "optional").is_some(),
         });
     }

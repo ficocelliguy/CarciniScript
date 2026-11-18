@@ -545,13 +545,17 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Checking
 
-- **A partial borrow checker.** Lifetimes are erased. The common conflicts (changing a Vec while a
-  reference into it is used later, or inside a `for` over it, also when the reference came from
-  a call of the file's own function or method, or borrows one field of a struct) are reported,
-  as warnings unless strict borrows are on. It errs toward silence: borrows through closures,
-  struct literals, other modules' functions, trait default methods, or a reference handed on from
-  local to local aren't tracked, and a borrow taken in one loop iteration and used in the next
-  isn't seen, so other programs rustc rejects still run.
+- **The borrow checker is rustc's NLL over an overlay.** Lifetimes are erased in the emitted JS,
+  so conflicts are warnings unless strict borrows are on (then errors, as in rustc). The
+  checker (`nll.rs`) rebuilds references from annotations, signatures, struct fields and a table
+  of std's borrowing methods, and reports E0499, E0502, E0503, E0505, E0506, E0597, E0515, E0716
+  and "lifetime may not live long enough" with rustc's wording: through `let`s, struct
+  literals, this file's functions and methods, `?`, `match` and `if let`, loops, closures and
+  std's iterators and adapters. It errs toward silence where it can't see: functions of other
+  modules and of bundled crates return owned values as far as it knows; a generic `T` holding
+  a reference is owned; a closure's return type is inferred only when std hands it an item
+  (`iter().map(..)`, `opt.map(..)`); `RefCell` borrows aren't checked at run time; use after
+  move is `moves.rs`'s (see below). Such programs rustc rejects still run.
 - **Use after move is checked only where the checker is sure a local owns its value** (see
   FEATURES). It misses moves out of fields by expression (`let v = s.items;` then `s.items`),
   `match` / `if let` bindings that move, a `String` field bound by a `let` pattern (`let S {

@@ -22,7 +22,7 @@ fn settings() -> Settings {
     Settings {
         bindings: crate::bindings::generation(),
         overflow: crate::codegen::overflow_checks(),
-        strict: crate::borrows::strict(),
+        strict: crate::nll::strict(),
     }
 }
 

@@ -7,7 +7,11 @@ mod adt;
 mod alias;
 mod assocbounds;
 mod bindings;
-mod borrows;
+mod nll;
+mod nll_bir;
+mod nll_lower;
+mod nll_rty;
+mod nll_std;
 mod bundled;
 mod clap_derive;
 mod codegen;
@@ -73,7 +77,7 @@ pub fn set_overflow_checks(on: bool) {
 /// errors for the compiles that follow; they're warnings by default.
 #[wasm_bindgen(js_name = setStrictBorrows)]
 pub fn set_strict_borrows(on: bool) {
-    borrows::set_strict(on);
+    nll::set_strict(on);
 }
 
 /// Native counterpart of `setNsBindings`.
