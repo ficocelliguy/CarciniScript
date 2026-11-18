@@ -635,7 +635,9 @@ const rejected = [
   ["a required trait const next to a default one", "}\ntrait T { const N: usize = 1; const M: usize; }\nstruct S;\nimpl T for S {}\nfn g() {", "5:12 not all trait items implemented, missing: `M`"],
   ["a trait const default of the wrong type", "}\ntrait T { const N: usize = \"x\"; }\nfn g() {", "3:28 mismatched types: expected `usize`, found `String`"],
   ["get_or_insert on an immutable binding", "let o: Option<i32> = None;\n    *o.get_or_insert(1) += 1;", "3:6 cannot borrow `o` as mutable, as it is not declared as mutable"],
-  ["TryFrom implemented twice", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<u8> for E {\n    type Error = ();\n    fn try_from(v: u8) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {", "12:8 implementing `TryFrom` more than once for `E` isn't supported yet"],
+  ["str and String impls that disagree", "}\ntrait S {\n    fn s(&self) -> String;\n}\nimpl S for str {\n    fn s(&self) -> String {\n        self.to_uppercase()\n    }\n}\nimpl S for String {\n    fn s(&self) -> String {\n        format!(\"{}!\", self)\n    }\n}\nfn g() {", "11:6 `S` is implemented for both `str` and `String`, which are one type in JS"],
+  ["slice and Vec impls that disagree", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for [u8] {\n    fn s(&self) -> usize {\n        self.len()\n    }\n}\nimpl S for Vec<u8> {\n    fn s(&self) -> usize {\n        self.len() + 1\n    }\n}\nfn g() {", "11:6 `S` is implemented for both `[T]` and `Vec<T>`, which are one type in JS"],
+  ["TryFrom twice, neither taking the argument", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<bool> for E {\n    type Error = ();\n    fn try_from(v: bool) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {\n    let _ = E::try_from(\"x\");", "17:25 mismatched types"],
   ["try_into without a target", "let x = 5i64.try_into();", "2:13 type annotations needed: say what `.try_into()` converts to"],
   ["hash of a float", "}\nuse std::hash::{Hash, Hasher};\nstruct P(f64);\nimpl Hash for P {\n    fn hash<H: Hasher>(&self, state: &mut H) {\n        self.0.hash(state);\n    }\n}\nfn g() {", "7:9 the trait bound `f64: Hash` is not satisfied"],
   ["`<` on a type parameter without PartialOrd", "}\nfn big<T>(a: T, b: T) -> bool {\n    a > b", "4:5 comparing with `<` on type parameter `T` needs a bound: add `T: PartialOrd`"],
@@ -676,6 +678,9 @@ const rejected = [
   ["parse into a type parameter without FromStr", "}\nfn p<T: Copy>(s: &str) -> T {\n    s.parse::<T>().unwrap()", "4:5 the trait bound `T: FromStr` is not satisfied"],
   ["a user type without the operator a bound needs","}\n#[derive(Clone, Copy)]\nstruct M(i32);\nfn dbl<T: std::ops::Add<Output = T> + Copy>(x: T) -> T {\n    x + x\n}\nfn g() {\n    let m = dbl(M(1));", "9:13 the trait bound `M: Add` is not satisfied"],
   ["unsupported trait bound", "}\nfn f<T: Read>(x: T) {", "3:9 the trait bound `Read` is not supported yet on type parameters"],
+  ["T::try_from without a TryFrom bound", "}\nfn p<T: From<u8>>(x: u8) -> T {\n    T::try_from(x).ok().unwrap()", "4:5 no function or associated item named `try_from` found for type parameter `T`"],
+  ["{:x?} on a struct", "}\n#[derive(Debug)]\nstruct S { a: u8 }\nfn g() {\n    println!(\"{:x?}\", S { a: 1 });", "6:14 `{:x?}` is supported on numbers, strings and collections"],
+  ["{:x?} with a width argument", "let w = 4;\n    println!(\"{:w$x?}\", vec![1u8]);", "3:14 `{:x?}` is supported on numbers"],
   ["method outside a type parameter's bounds", "}\nfn f<T>(x: T) -> usize {\n    x.len()", "4:5 no method named `len` found for type parameter `T`"],
   ["mutable string slice", "let mut s = String::from(\"abc\");\n    let t = &mut s[1..];", "3:13 mutable string slices (`&mut s[a..b]`) are not supported"],
   ["trait impl missing a method", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nimpl T for S {}\nfn f() {", "5:12 not all trait items implemented, missing: `a`"],
@@ -830,6 +835,21 @@ const rejected = [
   ],
   ["`resize` with the wrong fill value", 'let mut v = vec![1u8];\n    v.resize(3, "x");', "3:17 mismatched types: expected `u8`, found `String`"],
   ["`next_power_of_two` on a signed integer", "let x = 5i32.next_power_of_two();", "2:13 no method named `next_power_of_two`"],
+  [
+    "`iter_mut()` over numbers into `partition`",
+    "let mut v = vec![1, 2, 3];\n    let (a, b): (Vec<&mut i32>, Vec<&mut i32>) = v.iter_mut().partition(|x| **x > 1);",
+    "3:50 `iter_mut()` followed by `.partition()` isn't supported yet over numbers",
+  ],
+  [
+    "indexing a `Vec<&mut i32>` collected from `iter_mut()`",
+    "let mut w = vec![1, 2];\n    let mut rs: Vec<&mut i32> = w.iter_mut().collect();\n    *rs[1] = 9;",
+    "4:6 indexing a `Vec<&mut T>` collected from `iter_mut()` over numbers, strings or bools isn't supported yet",
+  ],
+  [
+    "returning a `&mut` iterator with `&mut` inside tuple items",
+    "}\nfn f(v: &mut Vec<u8>) -> impl Iterator<Item = (usize, &mut u8)> {\n    v.iter_mut().enumerate()\n}\nfn g() {",
+    "4:5 mismatched types",
+  ],
   ["`get_index_mut` on an `IndexMap` of numbers, not matched", "let mut m: indexmap::IndexMap<&str, i32> = indexmap::IndexMap::new();\n    m.insert(\"a\", 1);\n    *m.get_index_mut(0).unwrap().1 += 1;", "4:6 `IndexMap::get_index_mut` on a map of `i32` isn't supported here"],
 ];
 for (const [label, body, want] of rejected) {
@@ -957,6 +977,25 @@ const rejectedFiles = [
     "1:1 circular modules",
   ],
   ["crates other than std", { "main.rs": "use reqwest::blocking;\nfn main() {}" }, "1:5 unresolved import `reqwest`"],
+  [
+    "renaming a crate other than std",
+    { "main.rs": "extern crate reqwest as http;\nfn main() {}" },
+    "1:1 unresolved import `reqwest`",
+  ],
+  [
+    "two imported types of one name, renamed",
+    {
+      "main.rs": "mod a;\nmod b;\nuse a::Error as AError;\nuse b::Error as BError;\nfn main() {}",
+      "a.rs": "pub struct Error;",
+      "b.rs": "pub struct Error(pub i32);",
+    },
+    "3:5 renaming the imported type `Error` isn't supported when another `Error` is in scope",
+  ],
+  [
+    "a renamed imported type next to the file's own of that name",
+    { "main.rs": "mod a;\nuse a::Error as AError;\nstruct Error;\nfn main() {}", "a.rs": "pub struct Error;" },
+    "2:5 renaming the imported type `Error` isn't supported when another `Error` is in scope",
+  ],
   [
     "`TypeId::of` a type parameter (erased at run time)",
     { "main.rs": "use std::any::{Any, TypeId};\nfn id<T: 'static>() -> TypeId {\n    TypeId::of::<T>()\n}\nfn main() {}\n" },

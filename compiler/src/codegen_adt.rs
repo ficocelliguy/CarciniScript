@@ -79,6 +79,12 @@ pub(super) fn ext_self_ty(key: &str) -> Ty {
     match key {
         "String" => Ty::Str,
         "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+        "VecDeque" => Ty::Coll(
+            crate::ty::Coll::VecDeque,
+            Box::new(Ty::Vec(Box::new(Ty::Unknown))),
+        ),
+        "Range" => Ty::Range(Box::new(Ty::Unknown), false),
+        "RangeInclusive" => Ty::Range(Box::new(Ty::Unknown), true),
         "Option" => Ty::Option(Box::new(Ty::Unknown)),
         "bool" => Ty::Bool,
         "char" => Ty::Char,
@@ -666,6 +672,7 @@ impl Codegen<'_> {
                 crate::ty::Coll::BTreeSet,
                 Box::new(Ty::Set(Box::new(Ty::Unknown))),
             ),
+            "VecDeque" | "Range" | "RangeInclusive" => ext_self_ty(key),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             k => Ty::from_name(k),
@@ -783,6 +790,11 @@ impl Codegen<'_> {
                 muts.join(", ")
             )));
         }
+        // `Box<dyn Shape>`'s `from`s: called by name only.
+        if key.starts_with("dyn$") {
+            self.line(Frag::default());
+            return;
+        }
         // A blanket impl's class: `κσ.$dcall` tries it for any value.
         if key.ends_with("$all") {
             self.line(Frag::text(format!("κσ.$blanketReg($extRegs, $ext${key});")));
@@ -801,6 +813,10 @@ impl Codegen<'_> {
             "HashSet" => ("set", false),
             "BTreeMap" => ("btreemap", false),
             "BTreeSet" => ("btreeset", false),
+            "VecDeque" => ("deque", false),
+            // (A range value is an `Iter` over a `RangeIt`.)
+            "Range" => ("range", false),
+            "RangeInclusive" => ("rangeincl", false),
             "f32" | "f64" => ("number", false),
             // (The 64- and 128-bit kinds are BigInts.)
             "i64" | "u64" | "i128" | "u128" => ("bigint", true),
@@ -1052,6 +1068,31 @@ impl Codegen<'_> {
                 vec![format!(
                     "static [{}](x) {{ return {js}(x); }}",
                     super::js_string(&format!("$from${src}"))
+                )],
+            );
+        }
+        // ... and each `TryFrom<X>` impl's `try_from` as `$tryfrom$X` (for `T: TryFrom<X>`).
+        let adts = &self.types.adts;
+        let try_keys = adts
+            .method_alts
+            .get(&format!("{}::try_from", def.name))
+            .cloned()
+            .unwrap_or_else(|| vec!["try_from".to_string()]);
+        let tries: Vec<(String, String)> = try_keys
+            .into_iter()
+            .filter_map(|k| {
+                let sig = adts.method(&def.name, &k)?;
+                (sig.receiver.is_none() && sig.params.len() == 1)
+                    .then(|| (sig.params[0].describe(), k))
+            })
+            .collect();
+        for (src, key) in tries {
+            let js = format!("this{}", super::member(&prop(&key)));
+            lines(
+                self,
+                vec![format!(
+                    "static [{}](x) {{ return {js}(x); }}",
+                    super::js_string(&format!("$tryfrom${src}"))
                 )],
             );
         }
@@ -1491,6 +1532,13 @@ impl Codegen<'_> {
                 (self.convert(conv, f).at(start), Ty::Adt(adt, vec![]))
             }
             Resolved::Assoc(adt, m) => {
+                // (One of several impls of a generic trait: `Name::try_from(bytes)`.)
+                let m = self
+                    .types
+                    .method_keys
+                    .get(&self.range_of(c.syntax()))
+                    .cloned()
+                    .unwrap_or(m);
                 let sig = self.types.adts.method(&adt, &m)?.clone();
                 let cls = self.class(&adt);
                 let js = prop(&m);

@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxToken,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, HasModuleItem, HasName, HasVisibility},
 };
 
@@ -526,6 +526,26 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
             let (ma, mb) = range(m.syntax());
             edits.push((ma, l.text_range().end().into(), String::new()));
             edits.push((r.text_range().start().into(), mb, String::new()));
+            // (And its `//!` docs and `#![..]` attributes, which can't follow other items.)
+            // (The parser hangs comments on the item after them.)
+            let ours = |t: &SyntaxToken| {
+                t.parent_ancestors()
+                    .find(|a| a.kind() == SyntaxKind::ITEM_LIST)
+                    .is_some_and(|l| &l == list.syntax())
+            };
+            for e in list.syntax().descendants_with_tokens() {
+                let inner = match &e {
+                    NodeOrToken::Token(t) => t.kind() == SyntaxKind::INNER_DOC_COMMENT && ours(t),
+                    NodeOrToken::Node(n) if n.parent().as_ref() != Some(list.syntax()) => false,
+                    NodeOrToken::Node(n) => {
+                        ast::Attr::cast(n.clone()).is_some_and(|a| a.excl_token().is_some())
+                    }
+                };
+                if inner {
+                    let r = e.text_range();
+                    edits.push((r.start().into(), r.end().into(), String::new()));
+                }
+            }
         }
     }
     for (u, new) in &removed {

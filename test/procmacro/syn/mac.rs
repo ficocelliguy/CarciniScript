@@ -104,7 +104,8 @@ pub fn variant_names(input: TokenStream) -> TokenStream {
 /// `#[derive(Describe)]`: `T::describe()`, for generic types too.
 #[proc_macro_derive(Describe)]
 pub fn describe(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+    // (Typed by the `let`.)
+    let input: DeriveInput = parse_macro_input!(input);
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let fields: Vec<String> = match &input.data {

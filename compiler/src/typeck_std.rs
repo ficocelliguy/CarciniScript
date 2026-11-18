@@ -215,6 +215,11 @@ impl Checker<'_> {
                 count(self, 0);
                 rt.clone()
             }
+            // `b.as_mut()` / `b.borrow_mut()` for `B: AsMut<[u8]>`: the same `Vec`.
+            (Ty::Vec(_), "as_mut" | "borrow_mut") => {
+                count(self, 0);
+                rt.clone()
+            }
             // ---- integers
             (Ty::Int(k), m2)
                 if m2.starts_with("checked_")

@@ -300,12 +300,29 @@ pub fn expand_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
     if renames.is_empty() {
         return false;
     }
-    let toks: Vec<ra_ap_syntax::SyntaxToken> = file
-        .syntax()
+    let mut edits = rename_uses_of(&file, &renames, &uses);
+    let changed = !edits.is_empty();
+    apply(text, map, &mut edits);
+    changed
+}
+
+/// Non-trivia tokens of `file`.
+fn tokens(file: &SourceFile) -> Vec<ra_ap_syntax::SyntaxToken> {
+    file.syntax()
         .descendants_with_tokens()
         .filter_map(|e| e.into_token())
         .filter(|t| !t.kind().is_trivia())
-        .collect();
+        .collect()
+}
+
+/// Edits writing each use of a renamed name (a path's first segment, not a field, method, macro
+/// or the name of something declared) as what it stands for. Not inside `uses`.
+fn rename_uses_of(
+    file: &SourceFile,
+    renames: &std::collections::HashMap<String, String>,
+    uses: &[TextRange],
+) -> Vec<(usize, usize, String)> {
+    let toks = tokens(file);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (i, t) in toks.iter().enumerate() {
         if t.kind() != SyntaxKind::IDENT {
@@ -337,11 +354,267 @@ pub fn expand_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
         }
         edits.push((usize::from(r.start()), usize::from(r.end()), full.clone()));
     }
-    let changed = !edits.is_empty();
-    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-    for (a, b, new) in edits {
-        text.replace_range(a..b, &new);
-        map.replace(a, b, new.len());
+    edits
+}
+
+fn apply(text: &mut String, map: &mut OffsetMap, edits: &mut [(usize, usize, String)]) {
+    edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
+    let mut last_start = usize::MAX;
+    for (a, b, new) in edits.iter() {
+        if *b > last_start {
+            continue;
+        }
+        text.replace_range(*a..*b, new);
+        map.replace(*a, *b, new.len());
+        last_start = *a;
     }
-    changed
+}
+
+/// An edit removing `rename` (` as Name`) with the whitespace before it.
+fn drop_rename(text: &str, rename: &ast::Rename) -> (usize, usize, String) {
+    let r = rename.syntax().text_range();
+    let end = usize::from(r.end());
+    let start = usize::from(r.start());
+    let start = start - (text[..start].len() - text[..start].trim_end().len());
+    (start, end, String::new())
+}
+
+fn is_std_crate(name: &str) -> bool {
+    matches!(name, "std" | "core" | "alloc")
+}
+
+/// Whether `text` may rename a crate (`extern crate itertools as it;`).
+pub fn has_crate_renames(text: &str) -> bool {
+    text.contains("extern crate") && text.contains(" as ")
+}
+
+/// `extern crate itertools as it;` (std or a bundled crate): the rename goes, and each path
+/// starting with `it::` (also `crate::it::`, and in a `use`) starts with `itertools::` instead
+/// (`std::` for `extern crate alloc as core_alloc;`). Between std's crates (`extern crate core as
+/// std;`, `extern crate std as alloc;`) only the rename goes: they're one crate here. Other
+/// crates are left for the "unresolved" error.
+pub fn expand_crate_renames(text: &mut String, map: &mut OffsetMap) -> bool {
+    let file = crate::macros::parse_tree(text);
+    let mut renames: std::collections::HashMap<String, String> = Default::default();
+    let mut edits = Vec::new();
+    for e in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::ExternCrate::cast)
+    {
+        let (Some(n), Some(rename)) = (e.name_ref(), e.rename()) else {
+            continue;
+        };
+        let Some(alias) = rename.name() else { continue };
+        let (name, alias) = (n.text().to_string(), alias.text().to_string());
+        let known = is_std_crate(&name) || crate::typeck::crates::BUNDLED.contains(&name.as_str());
+        if !known || name == alias {
+            continue;
+        }
+        edits.push(drop_rename(text, &rename));
+        if is_std_crate(&name) && !is_std_crate(&alias) {
+            // (std's paths are the best known.)
+            renames.insert(alias, "std".to_string());
+        } else if !is_std_crate(&name) {
+            renames.insert(alias, name);
+        }
+    }
+    if edits.is_empty() {
+        return false;
+    }
+    let toks = tokens(&file);
+    for (i, t) in toks.iter().enumerate() {
+        if t.kind() != SyntaxKind::IDENT
+            || toks.get(i + 1).is_none_or(|n| n.text() != "::")
+            || t.parent_ancestors()
+                .any(|a| a.kind() == SyntaxKind::MACRO_RULES)
+        {
+            continue;
+        }
+        let Some(name) = renames.get(t.text()) else {
+            continue;
+        };
+        let r = t.text_range();
+        let prev = if i > 0 { toks[i - 1].text() } else { "" };
+        let before = if i > 1 { toks[i - 2].text() } else { "" };
+        let start = match prev {
+            "." | "$" | "'" => continue,
+            // `crate::it::join` → `itertools::join`
+            "::" if before == "crate" && (i < 3 || toks[i - 3].text() != "::") => {
+                toks[i - 2].text_range().start()
+            }
+            "::" if (i > 1 && toks[i - 2].kind() == SyntaxKind::IDENT)
+                || matches!(before, ">" | "self" | "super" | "Self" | "crate") =>
+            {
+                continue;
+            }
+            _ => r.start(),
+        };
+        edits.push((start.into(), r.end().into(), name.clone()));
+    }
+    apply(text, map, &mut edits);
+    true
+}
+
+/// Whether `text` may rename an imported item (`use geo::Point as P;`), or import one that a
+/// `mod` file renamed.
+pub fn has_import_renames(text: &str) -> bool {
+    text.contains("use ") && (text.contains(" as ") || text.contains("mod "))
+}
+
+/// `use geo::Point as P;` / `use serde_json::Value as Json;` at the top of the file, for a type,
+/// trait or constant (both names capitalized) of a `mod` file or a crate: the rename goes and
+/// each use of `P` is written `Point`. Not when that would be ambiguous: the file declares or
+/// imports another `Point`, or renames two different `Point`s (types share one namespace here, so
+/// those stay an error). Std's are `expand_use_renames`'s, inline modules' `modflat`'s.
+///
+/// With the file's name and a resolver, a `use geo::AreaError;` whose `mod` file renames it
+/// (`pub use area::Error as AreaError;`) is `use geo::Error;` the same way: the module exports
+/// the type by its own name.
+pub fn expand_import_renames(
+    text: &mut String,
+    map: &mut OffsetMap,
+    files: Option<(&str, crate::typeck::Resolver)>,
+) -> bool {
+    let file = crate::macros::parse_tree(text);
+    // `geo::AreaError` → `Error`, from `mod` files' `pub use`s.
+    let reexported = |path: &[String]| -> Option<String> {
+        let (filename, resolver) = files?;
+        let rel: Vec<&String> = path
+            .iter()
+            .skip_while(|s| matches!(s.as_str(), "crate" | "self"))
+            .collect();
+        let (name, mods) = rel.split_last()?;
+        if mods.is_empty() {
+            return None;
+        }
+        let mut cur = filename.to_string();
+        let mut src = String::new();
+        for m in mods {
+            let (p, t, _) = crate::typeck::find_module(&cur, m, resolver)?;
+            cur = p;
+            src = t;
+        }
+        crate::typeck::pub_use_renames(&src).remove(name.as_str())
+    };
+    let capital = crate::typeck::capitalized;
+    // alias → (original name, its path); the original name → its paths.
+    let mut renames: std::collections::HashMap<String, (String, String)> = Default::default();
+    let mut paths: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        Default::default();
+    let mut drops: Vec<(ast::Rename, String)> = Vec::new();
+    // `use geo::AreaError;` leaves whose last segment is written `Error`.
+    let mut renamed_leaves: Vec<(ast::NameRef, String)> = Vec::new();
+    let mut uses = Vec::new();
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        uses.push(u.syntax().text_range());
+        let top = u
+            .syntax()
+            .parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::SOURCE_FILE);
+        let mut trees: Vec<ast::UseTree> = u
+            .syntax()
+            .descendants()
+            .filter_map(ast::UseTree::cast)
+            .filter(|t| t.use_tree_list().is_none())
+            .collect();
+        for (path, rename, star) in crate::typeck::use_leaves(&u) {
+            let tree = (!trees.is_empty()).then(|| trees.remove(0));
+            if star || path.is_empty() {
+                continue;
+            }
+            let orig = path.last().cloned().unwrap_or_default();
+            let full = path
+                .iter()
+                .map(String::as_str)
+                .skip_while(|s| matches!(*s, "crate" | "self"))
+                .collect::<Vec<_>>()
+                .join("::");
+            // (A renamed import doesn't bring in its original name, but one that this pass
+            // writes back does.)
+            let Some(alias) = rename else {
+                if top
+                    && capital(&orig)
+                    && let Some(real) = reexported(&path)
+                    && let Some(seg) = tree
+                        .as_ref()
+                        .and_then(|t| t.path())
+                        .and_then(|p| p.segment())
+                        .and_then(|s| s.name_ref())
+                {
+                    let mut real_path = full
+                        .rsplit_once("::")
+                        .map_or(String::new(), |p| p.0.to_string());
+                    real_path.push_str("::");
+                    real_path.push_str(&real);
+                    paths
+                        .entry(real.clone())
+                        .or_default()
+                        .insert(real_path.clone());
+                    renamed_leaves.push((seg, orig.clone()));
+                    renames.insert(orig, (real, real_path));
+                    continue;
+                }
+                paths.entry(orig).or_default().insert(full);
+                continue;
+            };
+            if !top
+                || alias == orig
+                || path.len() < 2
+                || is_std_crate(&path[0])
+                || !capital(&alias)
+                || !capital(&orig)
+            {
+                continue;
+            }
+            paths.entry(orig.clone()).or_default().insert(full.clone());
+            if let Some(prev) = renames.get(&alias)
+                && prev.1 != full
+            {
+                renames.insert(alias.clone(), (String::new(), String::new()));
+                continue;
+            }
+            renames.insert(alias.clone(), (orig, full.clone()));
+            if let Some(r) = tree.and_then(|t| t.rename()) {
+                drops.push((r, alias));
+            }
+        }
+    }
+    // Names the file declares (not the `as` names).
+    let mut declared = std::collections::HashSet::new();
+    for n in file.syntax().descendants().filter_map(ast::Name::cast) {
+        if n.syntax()
+            .parent()
+            .is_none_or(|p| p.kind() != SyntaxKind::RENAME)
+        {
+            declared.insert(n.text().to_string());
+        }
+    }
+    renames.retain(|alias, (orig, _)| {
+        !orig.is_empty()
+            && !declared.contains(alias.as_str())
+            && !declared.contains(orig.as_str())
+            && paths.get(orig.as_str()).is_none_or(|p| p.len() == 1)
+    });
+    if renames.is_empty() {
+        return false;
+    }
+    let names: std::collections::HashMap<String, String> = renames
+        .iter()
+        .map(|(a, (o, _))| (a.clone(), o.clone()))
+        .collect();
+    let mut edits = rename_uses_of(&file, &names, &uses);
+    for (r, alias) in drops {
+        if names.contains_key(&alias) {
+            edits.push(drop_rename(text, &r));
+        }
+    }
+    for (seg, alias) in renamed_leaves {
+        if let Some(real) = names.get(&alias) {
+            let r = seg.syntax().text_range();
+            edits.push((r.start().into(), r.end().into(), real.clone()));
+        }
+    }
+    apply(text, map, &mut edits);
+    true
 }

@@ -1529,6 +1529,9 @@
 
   const NUM_TYPES = {};
   const NUM_EXT = new WeakMap();
+  // `{:p}`'s made-up addresses: one per object, a new one per formatting of anything else.
+  const PTRS = new WeakMap();
+  let nextPtr = 0;
   const OP_METHODS = {
     "+": "add",
     "-": "sub",
@@ -2806,7 +2809,7 @@
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
-      const kind = Array.isArray(x) || x instanceof Deque ? "array" : typeof x;
+      const kind = x instanceof Deque && regs.kinds.deque ? "deque" : Array.isArray(x) || x instanceof Deque ? "array" : typeof x;
       for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
         if (kind === "number" && r.integral !== Number.isInteger(x) && (regs.kinds[kind] ?? []).some((o) => o !== r && o.integral === Number.isInteger(x) && typeof o.cls.prototype[name] === "function")) continue;
@@ -2820,10 +2823,19 @@
       return rt.$dcall(regs, x, name, ...args);
     },
     $dcall(regs, x, name, ...args) {
+      // (A range value is an `Iter` over a `RangeIt`: your `Range` impls before its own methods.)
+      if (x instanceof Iter && x.it instanceof RangeIt) {
+        for (const r of regs.kinds[x.it.incl ? "rangeincl" : "range"] ?? []) {
+          if (typeof r.cls.prototype[name] === "function") return r.cls.prototype[name].call(x, ...args);
+        }
+      }
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
-      const kind = Array.isArray(x) || x instanceof Deque
+      // (A `VecDeque` is a `Deque`: its own impls', else a `Vec`'s.)
+      const kind = x instanceof Deque && regs.kinds.deque
+        ? "deque"
+        : Array.isArray(x) || x instanceof Deque
         ? "array"
         : x instanceof BTreeMap
           ? "btreemap"
@@ -3193,6 +3205,30 @@
         for (let i = 0; i < a.length; i++) yield rt.$vecSlot(a, i);
       });
     },
+    // `map.values_mut()` / `map.iter_mut()` of numbers, strings or bools outside a `for` loop: an
+    // iterator of slots over the values (`pairs`: `[k, slot]` items).
+    $mapMutSlots(map, pairs) {
+      const slots = map.$slots();
+      return Iter.of(function* () {
+        for (const s of slots) {
+          const slot = {
+            get 1() {
+              return s[1];
+            },
+            set 1(v) {
+              s[1] = v;
+            },
+            $cmp(o) {
+              return cmp(s[1], o[1]);
+            },
+            $eq(o) {
+              return eq(s[1], o[1]);
+            },
+          };
+          yield pairs ? [s[0], slot] : slot;
+        }
+      });
+    },
     $andModify(map, k, modify) {
       const slot = map.m.get(key(k));
       if (slot) modify(slot);
@@ -3330,6 +3366,15 @@
     // A provided `Hasher::write_u32(x)` of your own hasher.
     $hasherWrite(h, x, bits) {
       return ownMethod(h, "write")(rt.$toBytes(x, bits, true));
+    },
+    // `x.into()` with `x: T` where `T: Into<i64>` (or `u64`, `i128`, `u128`): any narrower
+    // integer (a number) or a `bool` becomes a BigInt.
+    $intoBig(x) {
+      return typeof x === "bigint" ? x : BigInt(x);
+    },
+    // ... and into a number kind (`T: Into<f64>`, `T: Into<i32>`): a `bool` becomes 0 or 1.
+    $intoNum(x) {
+      return typeof x === "boolean" ? Number(x) : x;
     },
     // `u8::try_from(x)` / `x.try_into()` between integer types: `Err` when out of range.
     $tryInt(x, bits, signed, big) {
@@ -3554,6 +3599,17 @@
       }
       return expandExponent(up);
     },
+    // `{:p}`: JS has no addresses, so a made-up one (`0x10000` up, 16 apart), the same each time
+    // for one object.
+    $fmtPtr(x) {
+      const obj = (x !== null && typeof x === "object") || typeof x === "function";
+      let n = obj ? PTRS.get(x) : undefined;
+      if (n === undefined) {
+        n = nextPtr++;
+        if (obj) PTRS.set(x, n);
+      }
+      return "0x" + (0x10000 + n * 16).toString(16);
+    },
     // `{:x}` / `{:o}` / `{:b}` (`#` adds the prefix): negative values print the two's
     // complement of their `bits`-wide type, as Rust does.
     $radix(x, radix, upper, alt, bits) {
@@ -3669,9 +3725,21 @@
       if (vals.length === 0) return name;
       return `${name} { ${vals.map((v, i) => `${names[i]}: ${v}`).join(", ")} }`;
     },
-    // `*r = v` for a `&mut` struct or enum: the object keeps its identity, its contents change.
+    // `*r = v` for a `&mut` struct or enum (or a `Vec` or other collection): the object keeps
+    // its identity, its contents change.
     $replace(target, value) {
       if (target === value) return;
+      if (Array.isArray(target)) {
+        // (A view of part of a `Vec`, `*arr = [..]` through a `&mut [T; N]`: same length.)
+        if (target[VIEW]) {
+          for (let i = 0; i < target.length; i++) target[i] = value[i];
+          return;
+        }
+        const items = Array.from(value);
+        target.length = 0;
+        for (const x of items) target.push(x);
+        return;
+      }
       for (const k of Object.keys(target)) delete target[k];
       Object.assign(target, value);
     },
@@ -3987,6 +4055,14 @@
       const base = v[VIEW];
       if (base !== undefined) return sliceView(base.v, base.lo + lo, end - lo);
       return sliceView(arr(v), lo, end - lo);
+    },
+    // `v.get(lo..hi)` / `v.get_mut(lo..hi)` (hi null for `lo..`): the slice (a view for
+    // `get_mut`), or `None` (null) when the range doesn't fit.
+    $getRange(v, lo, hi, inclusive, mutable) {
+      const n = v.length;
+      const end = hi === null ? n : inclusive ? hi + 1 : hi;
+      if (lo > end || end > n) return null;
+      return mutable ? this.$sliceMut(v, lo, hi, inclusive, "<std>") : v.slice(lo, end);
     },
     // `v.split_at_mut(mid)`: views of both halves.
     $splitAtMut(v, mid, location) {
@@ -4590,6 +4666,20 @@
       if (T === rt.$prims.char) return String.fromCodePoint(Number(x));
       const f = T["$from$" + src];
       return f ? f.call(T, x) : T.from(x);
+    },
+    // `T::try_from(x)` with `T: TryFrom<X>`: an integer kind checks the range; a type's own
+    // `TryFrom<X>` impl, else its `From<X>` (std's blanket impl) as `Ok`.
+    $ttryfrom(T, src, x) {
+      if (T.kind !== undefined) {
+        const v = typeof x === "string" ? x.codePointAt(0) : typeof x === "boolean" ? Number(x) : x;
+        return T.float ? new Res(0, Number(v)) : rt.$tryInt(v, T.bits, T.signed, T.big);
+      }
+      if (T === rt.$prims.char) return rt.$tryChar(x);
+      if (T === rt.$prims.str) return new Res(0, String(x));
+      const f = T["$tryfrom$" + src];
+      if (f) return f.call(T, x);
+      const g = T["$from$" + src];
+      return g ? new Res(0, g.call(T, x)) : T.try_from(x);
     },
     // `iter.sum::<T>()` / `product` with `T: Sum`: the type's own `sum`, else by its kind.
     $gsum(it, T, product) {

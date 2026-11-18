@@ -776,6 +776,7 @@ fn compile_text(
             marks: Vec::new(),
         },
         diags: Vec::new(),
+        type_errors: false,
         fns: HashMap::new(),
         scopes: Vec::new(),
         used_names: HashMap::new(),
@@ -815,6 +816,7 @@ fn compile_text(
         let file = parse.tree();
         let (types, type_diags) = typeck::check(&file, src, filename, resolver);
         cg.types = types;
+        cg.type_errors = type_diags.iter().any(|d| d.severity == "error");
         cg.emit_file(&file);
         // The type checker owns name and type errors. Codegen may report the same problem at the
         // same node (it re-checks some things while lowering); the checker's report wins.
@@ -885,6 +887,9 @@ struct Codegen<'a> {
     idx: LineIndex<'a>,
     out: Out,
     diags: Vec<Diagnostic>,
+    /// The type checker reported errors: types it couldn't work out (`Ty::Unknown`) follow from
+    /// one of them, so codegen needn't report what it can't do with them.
+    type_errors: bool,
     fns: HashMap<String, FnSig>,
     scopes: Vec<HashMap<String, Local>>,
     used_names: HashMap<String, u32>,
@@ -1175,8 +1180,8 @@ impl<'a> Codegen<'a> {
             crate::adt::Conv::TryInt { bits, signed, big } => {
                 value.wrap("κσ.$tryInt(", &format!(", {bits}, {signed}, {big})"))
             }
-            crate::adt::Conv::TryFrom { adt } => {
-                value.wrap(&format!("{}.try_from(", self.class(&adt)), ")")
+            crate::adt::Conv::TryFrom { adt, key } => {
+                value.wrap(&format!("{}.{key}(", self.class(&adt)), ")")
             }
             crate::adt::Conv::TryVec => value.wrap("κσ.Ok(κσ.$clone(", "))"),
             crate::adt::Conv::TryChar => value.wrap("κσ.$tryChar(", ")"),
@@ -1397,12 +1402,12 @@ impl<'a> Codegen<'a> {
                     _ => t,
                 };
                 // `impl Money for f64` goes into the `$ext$f64` class.
-                let t = match crate::adt::ext_key(&t) {
+                let t = match crate::adt::ext_key_any(&t) {
                     Some(k)
-                        if self.types.adts.ext_types.contains(k)
+                        if self.types.adts.ext_types.contains(&k)
                             && !self.local_adts.contains(&t) =>
                     {
-                        k.to_string()
+                        k
                     }
                     _ => t,
                 };
@@ -1452,9 +1457,8 @@ impl<'a> Codegen<'a> {
                         crate::adt::impl_parts(imp)
                             .1
                             .or_else(|| crate::adt::impl_self_name(imp))
-                            .and_then(|t| crate::adt::ext_key(&t))
-                            .filter(|k| self.types.adts.ext_types.contains(*k))
-                            .map(str::to_string)
+                            .and_then(|t| crate::adt::ext_key_any(&t))
+                            .filter(|k| self.types.adts.ext_types.contains(k))
                     });
                     if let Some(k) = key
                         && ext_done.insert(k.clone())
@@ -2929,7 +2933,7 @@ impl<'a> Codegen<'a> {
 
     /// Element `i` of `source` (emitted as `place`) in a loop by index: `v[i]`, or a deque's
     /// `q.b[q.$p(i)]` (its backing array at the ring index).
-    fn index_place(&self, source: &ast::Expr, place: &str, i: &str) -> String {
+    pub(super) fn index_place(&self, source: &ast::Expr, place: &str, i: &str) -> String {
         if matches!(
             self.raw_ty_of(strip_refs(source).syntax()),
             Some(Ty::Coll(crate::ty::Coll::VecDeque, _))
@@ -3370,9 +3374,19 @@ impl<'a> Codegen<'a> {
             }
             ast::Expr::CallExpr(c)
                 if crate::typeck::is_box_new(c)
+                    || crate::typeck::box_from_call(c).is_some()
                     || crate::typeck::is_rc_call(c)
                     || crate::typeck::is_pin_new(c, self.types.adts.defs.contains_key("Pin")) =>
             {
+                // `Box::from(sq)` through your `impl From<Sq> for Box<dyn Shape>`.
+                if let Some(conv) = self.conv_of(c.syntax())
+                    && let Some(a) = c.arg_list().and_then(|a| a.args().next())
+                {
+                    let (f, t) = self.emit_expr(&a, None);
+                    let f = self.by_value(&a, f, &t);
+                    let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
+                    return (self.convert(conv, f).at(self.off(c.syntax())), ty);
+                }
                 // `Box::new(x)` is `x`.
                 match c.arg_list().and_then(|a| a.args().next()) {
                     Some(a) => {
@@ -3670,9 +3684,9 @@ impl<'a> Codegen<'a> {
                     return (Frag::text(cell.to_string()), local.ty.clone());
                 }
                 // (A loop's `x` over `a.iter_mut()` that is the element itself, `a[$t1]`: a
-                // cell over that place.)
+                // cell over that place. Also for a `T` or struct element handed to a closure's
+                // `&mut T` parameter, which takes a cell whatever `T` is.)
                 if self.types.cell_args.contains(&self.range_of(p.syntax()))
-                    && crate::typeck::ptr_cellable(&local.ty)
                     && (local.js.ends_with(']') || local.js.contains('.'))
                 {
                     let js = local.js.clone();
@@ -3930,7 +3944,9 @@ impl<'a> Codegen<'a> {
             } else {
                 self.ty_of(b.syntax()).unwrap_or(Ty::Unknown)
             };
-            // (On a number: `$ext$f64.prototype.mul$0.call(2, v)`.)
+            // (On a number: `$ext$f64.prototype.mul$0.call(2, v)`. The checker's type first: a
+            // range value is a `Range` there, `r == span`.)
+            let lt = self.raw_ty_of(lhs.syntax()).unwrap_or(lt);
             let mut f = if let Some(k) =
                 crate::adt::ext_key_of(&lt).filter(|k| self.types.adts.ext_types.contains(*k))
                 && self.types.adts.method(k, &key).is_some()
@@ -3980,6 +3996,7 @@ impl<'a> Codegen<'a> {
                     // (A view `v[a..b]` may be evaluated twice too: both write to `v`.)
                     ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| {
                         is_pure(&b)
+                            || self.same_vec_call(&b).is_some()
                             || self
                                 .types
                                 .slice_views
@@ -4050,8 +4067,9 @@ impl<'a> Codegen<'a> {
                         }
                     },
                 };
-                // `*r = v` / `*self = v` with `r` a `&mut` to a struct or enum: the JS variable
-                // holds the object itself, so replace its contents in place.
+                // `*r = v` / `*self = v` with `r` a `&mut` to a struct or enum (or a `Vec`, map,
+                // set or other collection): the JS variable holds the object itself, so replace
+                // its contents in place.
                 let through_ref = match strip_refs(&lhs) {
                     ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => {
                         matches!(
@@ -4062,7 +4080,13 @@ impl<'a> Codegen<'a> {
                     ast::Expr::PathExpr(_) => lf.plain() == "this",
                     _ => false,
                 };
-                if op.is_none() && through_ref && matches!(lt, Ty::Adt(..)) {
+                if op.is_none()
+                    && through_ref
+                    && matches!(
+                        lt,
+                        Ty::Adt(..) | Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..)
+                    )
+                {
                     let mut f = Frag::text("κσ.$replace(");
                     f.append(lf).push(", ").append(value).push(")");
                     return (f, Ty::Unit);
@@ -5131,7 +5155,12 @@ impl<'a> Codegen<'a> {
         }
         // `T::make(..)` with `T`'s class at hand (`$T.make(..)`), `Self::make(..)` in a trait's
         // default method.
+        // (`T::len(x)` with a `self` method: a method call on `x`, below.)
         if let Some(ast::Expr::PathExpr(p)) = c.expr()
+            && !self
+                .types
+                .qualified_calls
+                .contains_key(&self.range_of(c.syntax()))
             && let Some(class) = self.param_class(&p)
             && let Some(f) = p
                 .path()
@@ -5141,8 +5170,14 @@ impl<'a> Codegen<'a> {
             let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
             let args = self.emit_args(c.arg_list(), &[]);
             // `T::from(x)` with `T: From<X>`: the class's conversion from `X`.
+            // (`T::try_from(x)` with `T: TryFrom<X>`: its `try_from`, or `from` as `Ok`.)
             if let Some(src) = self.types.param_froms.get(&self.range_of(c.syntax())) {
-                let mut out = Frag::text(format!("κσ.$tfrom({class}, {}, ", js_string(src)));
+                let helper = if f.text() == "try_from" {
+                    "ttryfrom"
+                } else {
+                    "tfrom"
+                };
+                let mut out = Frag::text(format!("κσ.${helper}({class}, {}, ", js_string(src)));
                 out.append(Frag::join(args, ", ")).push(")");
                 return (out.at(self.off(c.syntax())), ty);
             }
@@ -7280,7 +7315,10 @@ impl<'a> Codegen<'a> {
                 } else {
                     format!("`.{method}()` outside a `for` loop")
                 };
-                self.unsupported(m.syntax(), &what, 1);
+                // (Values of a type defined elsewhere: the checker said so already.)
+                if !(*v == Ty::Unknown && self.type_errors && method != "entry") {
+                    self.unsupported(m.syntax(), &what, 1);
+                }
                 (Frag::text("undefined"), Ty::Unknown)
             }
             _ => self.no_method(m.syntax(), method, &map_ty),
@@ -7455,12 +7493,28 @@ impl<'a> Codegen<'a> {
         (f, Ty::Vec(Box::new(elem)))
     }
 
+    /// `x.as_mut()` / `x.as_mut_slice()` of a `Vec` `x` that's safe to evaluate twice: `x`, the
+    /// same array (so `b.as_mut()[0] = 7` for `B: AsMut<[u8]>` stays assignable).
+    fn same_vec_call(&self, e: &ast::Expr) -> Option<ast::Expr> {
+        let ast::Expr::MethodCallExpr(m) = strip_parens_expr(e) else {
+            return None;
+        };
+        let name = m.name_ref()?.text().to_string();
+        let r = m.receiver()?;
+        (matches!(name.as_str(), "as_mut" | "as_mut_slice")
+            && m.arg_list().is_some_and(|l| l.args().next().is_none())
+            && is_pure(&r)
+            && matches!(self.ty_of(r.syntax()), Some(Ty::Vec(_))))
+        .then_some(r)
+    }
+
     /// `v[i]` with Rust's bounds check: `v[κσ.$ix(v, i, loc)]`, which stays assignable. When `v`
     /// isn't safe to evaluate twice, reads go through `κσ.$get` instead.
     fn emit_index(&mut self, ix: &ast::IndexExpr) -> (Frag, Ty) {
         let (Some(base), Some(index)) = (ix.base(), ix.index()) else {
             return (Frag::text("undefined"), Ty::Unknown);
         };
+        let base = self.same_vec_call(&base).unwrap_or(base);
         // `grid[i]` with an `impl Index`: `grid.index$0(i)`.
         if let Some(crate::adt::Conv::Method { key }) = self.conv_of(ix.syntax()) {
             let (bf, _) = self.receiver(&base);
@@ -7699,6 +7753,31 @@ impl<'a> Codegen<'a> {
             };
             return (f, Ty::Option(Box::new(elem.clone())));
         }
+        // `v.get(1..3)` / `dest.get_mut(n..)`: `Some` of the slice (a view for `get_mut`, which
+        // writes reach), `None` past the end.
+        if matches!(method, "get" | "get_mut")
+            && let Some(ast::Expr::RangeExpr(r)) = m
+                .arg_list()
+                .and_then(|l| l.args().next())
+                .map(|e| crate::typeck::strip_parens(&e).clone())
+        {
+            use ra_ap_syntax::ast::RangeItem;
+            let mut bound = |e: Option<ast::Expr>, none: &str| match e {
+                Some(e) => self.emit_expr(&e, Some(&usize)).0,
+                None => Frag::text(none),
+            };
+            let lo = bound(r.start(), "0");
+            let hi = bound(r.end(), "null");
+            let incl = r.op_kind() == Some(ast::RangeOp::Inclusive);
+            let mut f = Frag::mapped(name_off, "κσ.$getRange(");
+            f.append(rf.clone())
+                .push(", ")
+                .append(lo)
+                .push(", ")
+                .append(hi)
+                .push(format!(", {incl}, {})", method == "get_mut"));
+            return (f, Ty::Option(Box::new(vec_ty)));
+        }
         match method {
             "len" => (rf.clone().push(".length").clone(), usize),
             "pop" => (helper("pop", vec![]), Ty::Option(Box::new(elem.clone()))),
@@ -7755,11 +7834,14 @@ impl<'a> Codegen<'a> {
                 (f, vec_ty)
             }
             "iter" | "iter_mut" | "into_iter" => {
-                self.unsupported(
-                    m.syntax(),
-                    &format!("`.{method}()` outside a `for` loop"),
-                    1,
-                );
+                // (Elements of a type defined elsewhere: the checker said so already.)
+                if !(*elem == Ty::Unknown && self.type_errors) {
+                    self.unsupported(
+                        m.syntax(),
+                        &format!("`.{method}()` outside a `for` loop"),
+                        1,
+                    );
+                }
                 (Frag::text("undefined"), Ty::Unknown)
             }
             _ => self.no_method(m.syntax(), method, &vec_ty),
@@ -8382,10 +8464,36 @@ fn debug_fn(ty: &Ty) -> Option<String> {
     debug_fn_in(ty, &HashMap::new())
 }
 
+thread_local! {
+    /// Inside a `{:x?}` / `{:X?}`: the spec each integer is printed with (`{:x}` / `{:X}`, with
+    /// the `#`, `0` and width given).
+    static HEX_DBG: std::cell::RefCell<Option<Spec>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The bits `{:x}` / `{:b}` show for an integer type (its two's complement).
+fn radix_bits(ty: &Ty) -> u32 {
+    match ty {
+        Ty::Int(k) => match k {
+            IntKind::I8 | IntKind::U8 => 8,
+            IntKind::I16 | IntKind::U16 => 16,
+            IntKind::I32 | IntKind::U32 => 32,
+            IntKind::I128 | IntKind::U128 => 128,
+            _ => 64,
+        },
+        _ => 32,
+    }
+}
+
 /// `debug_fn` inside a generic type's `$dbg`, where `params` names the formatter for each type
 /// parameter.
 fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
     let debug_fn = |t: &Ty| debug_fn_in(t, params);
+    if matches!(ty, Ty::Int(_) | Ty::IntLit)
+        && let Some(spec) = HEX_DBG.with(|h| h.borrow().clone())
+    {
+        let f = format_value(Frag::text("x"), ty, &spec, None, None);
+        return Some(format!("((x) => {})", f.plain()));
+    }
     match ty {
         Ty::Str => Some("κσ.$dbgStr".into()),
         Ty::Char => Some("κσ.$dbgChar".into()),
@@ -8482,6 +8590,39 @@ fn format_value(
     prec_arg: Option<Frag>,
 ) -> Frag {
     let ty = &ty.view();
+    // `{:x?}` / `{:#X?}`: an integer as `{:x}` / `{:#X}`; elsewhere each integer inside the
+    // `Debug` text that way (`[0a, ff]`), with the width per integer.
+    if spec.debug && matches!(spec.kind, Some('x' | 'X')) {
+        let hex = Spec {
+            debug: false,
+            ..spec.clone()
+        };
+        if matches!(ty, Ty::Int(_) | Ty::IntLit) {
+            return format_value(f, ty, &hex, width_arg, None);
+        }
+        let outer = Spec {
+            kind: None,
+            width: None,
+            zero: false,
+            fill: None,
+            align: None,
+            ..spec.clone()
+        };
+        let prev = HEX_DBG.with(|h| h.replace(Some(hex)));
+        let s = format_value(f, ty, &outer, None, None);
+        HEX_DBG.with(|h| *h.borrow_mut() = prev);
+        return s;
+    }
+    // `{:p}`: a made-up address, the same for the same object; padded like a string.
+    if spec.kind == Some('p') {
+        let mut g = Frag::text("κσ.$fmtPtr(");
+        g.append(f).push(")");
+        let plain = Spec {
+            kind: None,
+            ..spec.clone()
+        };
+        return format_value(g, &Ty::Str, &plain, width_arg, None);
+    }
     let width = width_arg.or_else(|| spec.width.map(|w| Frag::text(w.to_string())));
     let precision = prec_arg.or_else(|| spec.precision.map(|p| Frag::text(p.to_string())));
     let call = |name: &str, f: Frag, extra: &str| {
@@ -8550,16 +8691,7 @@ fn format_value(
                     'o' => 8,
                     _ => 2,
                 };
-                let bits = match ty {
-                    Ty::Int(k) => match k {
-                        IntKind::I8 | IntKind::U8 => 8,
-                        IntKind::I16 | IntKind::U16 => 16,
-                        IntKind::I32 | IntKind::U32 => 32,
-                        IntKind::I128 | IntKind::U128 => 128,
-                        _ => 64,
-                    },
-                    _ => 32,
-                };
+                let bits = radix_bits(ty);
                 call_with(
                     "κσ.$radix",
                     f,

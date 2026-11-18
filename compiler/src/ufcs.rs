@@ -426,7 +426,9 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
             i = c + 1;
             continue;
         }
+        // (Not a macro's type: `<Token![,]>::default()` stays as it is.)
         let path_like = c > i + 1
+            && !(i + 1..c).any(|k| at(k) == "!")
             && (toks[i + 1].kind() == SyntaxKind::IDENT
                 || matches!(first.as_str(), "Self" | "crate" | "self" | "super" | "$")
                 || first == "::");

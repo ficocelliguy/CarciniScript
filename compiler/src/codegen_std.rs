@@ -178,7 +178,8 @@ impl Codegen<'_> {
                 f
             }
 
-            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow") => rf.clone(),
+            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow")
+            | (Ty::Vec(_), "as_mut" | "borrow_mut") => rf.clone(),
             (Ty::Int(_), "is_multiple_of") => helper("isMultipleOf", self.arg_frags(m)),
             // ---- integers
             // `h.wrapping_mul(k)` on a BigInt kind with a BigInt argument: inline, wrapped to

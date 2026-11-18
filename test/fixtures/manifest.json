@@ -84,6 +84,12 @@
     "panic": null
   },
   {
+    "file": "box_dyn_from_range_impls.rs",
+    "stdout": "boxing a square\n9\n12\nboxing a square\n1\nboxing a square\n4\ntrue false\n3 false true\n6 1\n7..9 2\n2 3 4 \n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "btree_ordered.rs",
     "stdout": "{1: \"a\", 3: \"c\", 5: \"e\", 7: \"g\", 9: \"i\"}\nSome((1, \"a\")) Some((9, \"i\"))\nSome((1, \"a\")) Some((9, \"i\"))\n{0: \"zero\", 3: \"C\", 4: \"d\", 5: \"e\", 7: \"g\"} 5\n[(3, \"C\"), (4, \"d\")]\n[3, 4, 5, 7]\n3\n[\"zero\", \"C\"]\n0\n[0, 2, 3, 4, 5, 7, 8]\n[\"zero\", \"b\", \"C\", \"D\", \"e\", \"g\", \"h\"]\nSome(\"C\") None Some(\"D\")\n{0: \"zero\", 2: \"b\", 4: \"D\", 8: \"h\"}\n{0: \"zero\", 1: \"one\", 2: \"b\", 4: \"D\", 6: \"six\", 8: \"eight\"} {}\n{0: \"zero\", 1: \"one\", 2: \"b\", 4: \"D\", 6: \"six\", 8: \"eight\"} false 6\n0=zero 1=one 2=b 4=D 6=six 8=eight 100=big \nSome((0, \"w\"))\nSome((1, \"w\"))\n0w 1w 2w 4w 6w 8w 100w 0 None\nNone\nSome((0, 0)) Some((5997, 1999)) 2000\n[(-1, -1), (0, 0), (3, 1), (6, 2), (9, 3), (10, 10)]\n3358152836 Some((4494, 1498)) 503\n[(1, 1), (4494, 1498), (4497, 1499)]\n505 true 5998\n{\"apple\": 5, \"fig\": 3, \"pear\": 4}\n{' ': 1, 'd': 1, 'e': 1, 'h': 1, 'l': 3, 'o': 2, 'r': 1, 'w': 1}\n[('e', 1), ('h', 1), ('l', 3)]\ntrue true true true false true {-2, 0, 3, 5, 9} 5\nSome(-2) Some(9)\nSome(-2) Some(9) {0, 3, 5}\ntrue false {3, 5}\n[0, 3]\n[5, 3, 0, -5]\n[-5, 0, 3, 4, 5, 100]\n[3]\n[-5, 0, 5]\nfalse true\n{0, 3, 5} true false\n{\"alpha\", \"bravo\", \"charlie\", \"delta\"} Some(\"alpha\")\n{(1, 2), (1, 9), (2, 0), (2, 1)} [(1, 9), (2, 0)]\n5997000 3000 Some((5000, 0)) Some((5999, 2631))\nNone\nNone None\nfalse\n{1, 2}\n",
     "exitCode": 0,
@@ -348,6 +354,12 @@
     "panic": null
   },
   {
+    "file": "crate_renames.rs",
+    "stdout": "1-2-3\n[6, 2, 4]\n{1: \"one\", 2: \"two\"}\n[1, 2] 9\nnum 1\nstr x\nother\nfalse true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "crate_rustc_hash.rs",
     "stdout": "20365011074 49\nSome(6)\n[(\"a\", 3), (\"b\", 2), (\"c\", 1)]\n[1, 2, 3] true\n",
     "exitCode": 0,
@@ -582,6 +594,12 @@
     "panic": null
   },
   {
+    "file": "generic_param_calls.rs",
+    "stdout": "6\n6\nlen 5 / 5\n6\nen-7 x3\nStore { state: [], n: 1 }\nStore { state: \"\", n: 1 }\n7\n8\n15\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "generic_statics.rs",
     "stdout": "[Square(1.0), Square(1.0), Square(1.0)]\n3-gon with 3 sides, unit area 0.433\nSquare(0.0) 0 \"\"\n(\"4-gon with 4 sides, unit area 1.000\", 2)\n",
     "exitCode": 0,
@@ -632,6 +650,12 @@
   {
     "file": "hashset.rs",
     "stdout": "true true false\n2 true false\ntrue false\n{\"apple\"} false\nflood from (0,0): 13\nflood from (3,4): 13\ntrue true true false\n4 4 false\ntrue\nsum 20, sorted [4, 6, 8, 10]\n4 distinct letters\n0 {(1, \"one\")}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "hex_debug_ptr_format.rs",
+    "stdout": "[a, ff, 3]\n[A, FF, 3]\n[0a, ff, 03]\n0xff\n[\n    0xa,\n    0xff,\n    0x3,\n]\nSome(FF)\n(1, \"s\", 'c', 2.5, fffffffffffffffe)\n[dead, 7]\nbad [01, 02, ab] after\nbb8|    ff|ff    |0000FF\n{10: [11]}\nErr(fffffff0) Ok(ffffffffffffffffffffffffffffffff)\na\nId(0xff)\nP { a: 1 }\ntrue true true\n[                true]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -732,6 +756,12 @@
     "panic": null
   },
   {
+    "file": "iter_mut_more_adapters.rs",
+    "stdout": "[Group { id: 1, args: [] }, Group { id: 2, args: [20] }, Group { id: 3, args: [3] }] [(\"a\", []), (\"b\", [7])]\n[H { name: 1 }, H { name: 2 }, H { name: 0 }] [10, 102, 103]\nOk(()) [2, 3, 4]\nErr(\"too big: 500\") [3, 4, 5, 500]\nErr(3) Some(41) Some(-1) [11, -1, 4, 5]\n[\"a!\", \"b!\"] [1, 11, 21, 3, 4]\n[100, 6, 8] [\"a?\", \"\", \"c?\"] [Group { id: 10, args: [] }, Group { id: 20, args: [42] }] 2\n[101, 108, 0] [4, 5, 6]\n{\"x\": \"one!.\", \"y\": \"2y.\"}\n{1: 1009, 2: 1101, 3: 1059} 3169 [1, 2, 3]\nGroup { id: 14, args: [1, 2] }\n[-1, 3, 6, 9]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "iter_mut_outside_for.rs",
     "stdout": "[9, 20, 3, 4, 5]\n[9, 21, 5, 7, 9]\n[-1, 1, -25, 7, 9]\n[19, 41, 35, 7, 9]\n[38, 82, 70, 14, 18]\n5 [39, 83, 71, 15, 19]\n[-1, 83, 71, 15, 0]\n[-1, 83, 333, 15, 0] 5\n[-1, 183, 333, 115, 0]\n[\"A!\", \"B!\"]\n[true, false, true]\n",
     "exitCode": 0,
@@ -782,6 +812,12 @@
   {
     "file": "macro_closure_args.rs",
     "stdout": "[7, 12, 4]\n2 5\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "macro_fragments.rs",
+    "stdout": "[0, 1, 2, 5, 7, 3, 2]\n[true, false]\n48 true false\n3 46\nOk(4) Err(\"no even number: 2\")\n7 0 SafeU8 { inner: 7 }\na => 1\nb == 2\nc <= 3\ndollar pound\n(42, \"answer\")\n(2.5, \"half of \\\"5\\\"\")\n50\ntrue false\n6 -1\n25 3\n1\n",
     "exitCode": 0,
     "panic": null
   },
@@ -848,6 +884,12 @@
   {
     "file": "matching.rs",
     "stdout": "negative zero small digit big even big odd \nABCF\nvowel consonant digit smiley other \nSome(4) None None\non\ngreen\ntotal 206 after 7\nsum 1023\nnot found\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "more_std_type_impls.rs",
+    "stdout": "6 900\ntotal=6 total=900\n[\"b\", \"c\", \"a\"]\n[\"a\", \"b\", \"c\"]\n42\n42\nABC HEY\nABC ABC X X\n1 3\n4.25\n9\n",
     "exitCode": 0,
     "panic": null
   },
@@ -968,6 +1010,12 @@
   {
     "file": "or_pattern_bindings.rs",
     "stdout": "Circle(1.5) -> 1.5\nSquare(2.0) -> 2\nRect(3.0, 4.0) -> 12\nRect(2.0, 150.0) -> 150\nDot -> 0\nSome(1) Some(5) None\nsmall, picked 7\nsmall, picked 1\nsmall, picked 3\n1..4\nempty\n(1, 2) (4, 3) (0, 0)\n1\nb\n3\n42\n6 []\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "own_try_macro_2015.rs",
+    "stdout": "Ok(42) Err(\"own: invalid digit found in string\")\nOk(2.5) Err(\"own: invalid float literal\")\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1242,6 +1290,12 @@
     "panic": null
   },
   {
+    "file": "std_trait_bounds.rs",
+    "stdout": "Ok(Even(4)) Err(\"5 is odd\")\ntrue Ok(30)\nErr(TryFromIntError(PosOverflow))\nOk(200)\nErr(\"7 is odd\")\nOk('A')\n(Some(7), None)\n(None, Some(-100))\nSome(Even(6))\ntrue\nok 10\n[7, 3] [1, 5]\n[1, 9]\n3\n[1, 2]\n[1, 2]\n5 [104, 101, 108, 108, 111]\n\"abcdefghij\"\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "std_trait_builtins.rs",
     "stdout": "HI 3 bytes\nV2(2.0, 4.0) V2(3.0, 6.0) V2(4.0, 8.0)\nMoney(15)\ntrue false true\ntrue false true\n",
     "exitCode": 0,
@@ -1250,6 +1304,12 @@
   {
     "file": "std_trait_impls.rs",
     "stdout": "2 false\n[2]\n2\nBob\nPoint { x: 1, y: 2 } Point { x: 10, y: 2 }\nOk(Even(8)) Err(\"7 is not a non-negative even number\")\nOk(Even(12))\nOk(255) Err(TryFromIntError(PosOverflow))\nErr(TryFromIntError(NegOverflow)) Err(TryFromIntError(NegOverflow))\n300 5\nerror: number too large to fit in target type\nErr(TryFromIntError(PosOverflow))\nOk('A') Ok('😀') Err(CharTryFromError(()))\nconverted integer out of range for `char`\nBag { items: [1, 2, 3, 4], total: 10 }\n[50, 60, 1, 2, 100, 101, 102] 416\n6 30\n4\n2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_traits_twice.rs",
+    "stdout": "Bag { items: [1, 2, 30, 40, 50] }\nOk(Name(\"s:abc\"))\nErr(\"empty\")\nOk(Name(\"S:own\"))\nOk(Name(\"&S:ref\"))\nOk(Name(\"v:hi\"))\nErr(\"utf8\")\nOk(Name(\"s:conv\"))\nOk(Name(\"S:conv2\"))\nOk(Ident(\"abc_1\"))\nOk(Ident(\"abc_1\"))\nErr(\"bad ident \\\"x y\\\"\")\nOk(Ident(\"q\"))\nErr(\"bad ident \\\"-\\\"\")\nOk(Ident(\"zz\"))\nOk(Ident(\"abc_1\"))\nOk(Ident(\"a\"))\nErr(\"bad ident \\\"b c\\\"\")\nTotals { sum: 22, n: 7 }\nTotals { sum: 6, n: 3 } Totals { sum: 6, n: 3 }\nStream { toks: [\"a\", \"b\"] }\nStream { toks: [\"a\", \"b\", \"c\", \"|\"] }\nStream { toks: [\"x\", \"[y,z]\"] }\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1320,6 +1380,12 @@
     "panic": null
   },
   {
+    "file": "try_macro_2015.rs",
+    "stdout": "Ok(42) true\nOk(4)\nparse error: invalid digit found in string\n3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "try_option.rs",
     "stdout": "Some(427)\nNone\nNone\nSome(4) None\nSome(4)\nSome(12)\nNone\nNone\n",
     "exitCode": 0,
@@ -1334,6 +1400,12 @@
   {
     "file": "type_aliases.rs",
     "stdout": ".../..#\n[(\"a\", 3), (\"b\", 1), (\"c\", 1)]\nRobot { at: (0, 1), facing: East, score: 2 }\n5 20\n0 true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "type_param_positions.rs",
+    "stdout": "oops at /tmp/x\n<hi> Some(3)\n3 [\"x\", \"x\", \"x\"]\nSome(3)\nNone\nSome(\"x\")\nalloc in \"main\"\nalloc in \"main\"\n(0, 1)\n[1.5, 2.5]\n[2, 4, 6]\n[(9, 1), (9, 2)]\n(\"a\", \"b\")\nstart job\nend job\n42\nstart job\nend job\nhi\n42\n6 400 8 2199023255552\n2\n1.5 1.25 3.5\n2 -3\n3541774862152233910272 5902958103587056517120\n6 9\n7 2\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1400,6 +1472,12 @@
   {
     "file": "where_fn_bounds.rs",
     "stdout": "3 s\n[10, 20, 30]\n[1, 2]\nOk(200) Err(\"fail 2\")\n[(0, [3, 6]), (1, [1, 4]), (2, [2, 5])]\n9 16 2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "writes_through_refs.rs",
+    "stdout": "[170, 187, 120, 121, 122, 0, 0, 0]\n[1, 4, 3, 2, 5, 6]\n[0, 9, 7, 0, 2, 0]\n[\"d\", \"a\", \"b\", \"c\"] [false, true, true, false, false]\nSome([2, 3]) Some([1, 2]) None\n[1, 3, 20, 0, 0] true\nOk(5) [97, 98, 99, 100, 101, 0, 0, 0]\ntrue\n3 [120, 121, 122, 0, 0, 0]\n[1, 2, 9, 9, 9]\n[7, 7]\n[101, 102, -1]\n1-2-3\n4, 5\n69\n[ab] [42]\ntext <eol> 13\n[Acc { n: 10 }, Acc { n: 14 }] [7, 14, 21]\nababy 3\n",
     "exitCode": 0,
     "panic": null
   }

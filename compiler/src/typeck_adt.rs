@@ -22,6 +22,13 @@ impl Checker<'_> {
     /// Declare every struct and enum, lower their fields, then read `impl` signatures. Runs
     /// before function signatures so they can name these types.
     pub(super) fn collect_adts(&mut self, file: &ast::SourceFile) {
+        for item in crate::adt::all_items(file) {
+            if let ast::Item::Trait(t) = &item
+                && let Some(n) = t.name()
+            {
+                self.file_trait_names.insert(n.text().to_string());
+            }
+        }
         // `use std::cmp::Reverse;`: a generic tuple struct whose class is the runtime's, with the
         // order reversed there.
         let uses_reverse = file
@@ -466,7 +473,37 @@ impl Checker<'_> {
         // `where A::Item: PartialEq` on the method.
         self.note_where_projections(f.where_clause());
         if let Some(gp) = f.generic_param_list() {
-            for p in gp.generic_params() {
+            // Parameters whose bounds name other parameters (`OP: FnOnce() -> R`, `S: Into<T>`,
+            // `I: IntoIterator<Item = P>`) come after those, whatever the order written; then
+            // those with trait arguments after the plain ones.
+            let mut gps: Vec<ast::GenericParam> = gp.generic_params().collect();
+            let lists_of = |tp: &ast::TypeParam| -> Option<(String, Vec<ast::TypeBoundList>)> {
+                let n = tp.name()?.text().to_string();
+                let lists = tp
+                    .type_bound_list()
+                    .into_iter()
+                    .chain(where_bounds(f, &n))
+                    .collect();
+                Some((n, lists))
+            };
+            let all: Vec<(String, Vec<ast::TypeBoundList>)> = gps
+                .iter()
+                .filter_map(|p| match p {
+                    ast::GenericParam::TypeParam(tp) => lists_of(tp),
+                    _ => None,
+                })
+                .collect();
+            let depths = super::generic::mention_depths(&all);
+            gps.sort_by_key(|p| match p {
+                ast::GenericParam::TypeParam(tp) => lists_of(tp).map_or((0, false), |(n, l)| {
+                    (
+                        depths.get(&n).copied().unwrap_or(0),
+                        l.iter().any(bounds_name_params),
+                    )
+                }),
+                _ => (0, false),
+            });
+            for p in gps {
                 match p {
                     ast::GenericParam::TypeParam(tp) => {
                         let Some(n) = tp.name() else { continue };
@@ -547,6 +584,16 @@ impl Checker<'_> {
                     ast::GenericParam::LifetimeParam(_) => {}
                 }
             }
+            // (Back in the written order: turbofish arguments follow it.)
+            let order: Vec<String> = gp
+                .generic_params()
+                .filter_map(|p| match p {
+                    ast::GenericParam::TypeParam(tp) => Some(tp.name()?.text().to_string()),
+                    ast::GenericParam::ConstParam(cp) => Some(cp.name()?.text().to_string()),
+                    ast::GenericParam::LifetimeParam(_) => None,
+                })
+                .collect();
+            own.sort_by_key(|n| order.iter().position(|x| x == n));
         }
         own
     }
@@ -560,6 +607,7 @@ impl Checker<'_> {
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
+        self.try_from_args.clear();
         let mut impl_params: Vec<(String, Option<ast::TypeBoundList>)> = Vec::new();
         if let Some(gp) = imp.generic_param_list() {
             for p in gp.generic_params() {
@@ -866,16 +914,17 @@ impl Checker<'_> {
             self.adts.ext_types.insert(type_name.clone());
             self.adts.blankets.insert(tr, bounds);
         }
-        // `impl Money for f64`: a user trait for a built-in type (and `impl From<Id> for String`).
+        // `impl Money for f64`: a user trait for a built-in type (and `impl From<Id> for String`,
+        // `impl From<Sq> for Box<dyn Shape>`).
         if !self.adts.defs.contains_key(&type_name)
-            && let Some(key) = crate::adt::ext_key(&type_name)
+            && let Some(key) = crate::adt::ext_key_any(&type_name)
             && trait_name.as_deref().is_some_and(|t| {
                 self.adts.traits.contains_key(t)
                     || matches!(t, "From" | "PartialEq")
                     || crate::adt::op_method(t).is_some()
             })
         {
-            type_name = key.to_string();
+            type_name = key;
             self.adts.ext_types.insert(type_name.clone());
         }
         if !self.adts.defs.contains_key(&type_name) && !self.adts.ext_types.contains(&type_name) {
@@ -1171,14 +1220,33 @@ impl Checker<'_> {
                     .insert(key, method);
                 continue;
             }
+            // (`TryFrom<&str>` / `Extend<&'a T>`: how the argument is written, to tell it from a
+            // `TryFrom<String>` / `Extend<T>` impl at a call.)
+            let written = match trait_name.as_deref() {
+                Some("TryFrom" | "FromIterator" | "Extend") => imp
+                    .trait_()
+                    .and_then(|t| match t {
+                        ast::Type::PathType(p) => p.path()?.segment()?.generic_arg_list(),
+                        _ => None,
+                    })
+                    .and_then(|l| l.generic_args().next())
+                    .and_then(|g| match g {
+                        ast::GenericArg::TypeArg(ta) => ta.ty(),
+                        _ => None,
+                    })
+                    .map(|t| crate::adt::written_arg_ref(&t)),
+                _ => None,
+            };
             // A generic trait's second impl for this type (`impl IntoS<u16> for Vec<u8>` after
-            // `impl IntoS<u8> for Vec<u8>`): its methods under keys of their own.
+            // `impl IntoS<u8> for Vec<u8>`, `impl TryFrom<Vec<u8>>` after `impl TryFrom<&str>`):
+            // its methods under keys of their own.
             if let Some(tr) = trait_name.as_deref()
-                && self
-                    .adts
-                    .traits
-                    .get(tr)
-                    .is_some_and(|d| !d.type_params.is_empty())
+                && (matches!(tr, "TryFrom" | "FromIterator" | "Extend")
+                    || self
+                        .adts
+                        .traits
+                        .get(tr)
+                        .is_some_and(|d| !d.type_params.is_empty()))
                 && self
                     .adts
                     .methods
@@ -1195,6 +1263,11 @@ impl Checker<'_> {
                 alts.push(key.clone());
                 let at = self.range(name.syntax()).0;
                 self.adts.alt_keys_at.insert(at, key.clone());
+                if let Some(w) = written {
+                    self.adts
+                        .alt_arg_refs
+                        .insert(format!("{type_name}::{key}"), w);
+                }
                 self.adts
                     .methods
                     .entry(type_name.clone())
@@ -1202,23 +1275,16 @@ impl Checker<'_> {
                     .insert(key, method);
                 continue;
             }
+            if let Some(w) = written {
+                self.adts
+                    .alt_arg_refs
+                    .insert(format!("{type_name}::{}", name.text()), w);
+            }
             let methods = self.adts.methods.entry(type_name.clone()).or_default();
             if trait_name.is_none() && methods.contains_key(name.text().to_string().as_str()) {
                 self.error(
                     name.syntax(),
                     format!("duplicate definitions with name `{}`", name.text()),
-                );
-                continue;
-            }
-            // (Their methods share a name per type: one impl of each.)
-            if let Some(t @ ("TryFrom" | "FromIterator" | "Extend")) = trait_name.as_deref()
-                && methods.contains_key(name.text().to_string().as_str())
-            {
-                self.error(
-                    name.syntax(),
-                    format!(
-                        "implementing `{t}` more than once for `{type_name}` isn't supported yet"
-                    ),
                 );
                 continue;
             }
@@ -1234,6 +1300,7 @@ impl Checker<'_> {
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
+        self.try_from_args.clear();
     }
 
     /// A method's signature (without `self`), with `Self` lowered per `self.self_ty`.
@@ -1313,11 +1380,11 @@ impl Checker<'_> {
             let Some(mut type_name) = type_name.or_else(|| crate::adt::impl_self_name(imp)) else {
                 continue;
             };
-            if let Some(key) = crate::adt::ext_key(&type_name)
+            if let Some(key) = crate::adt::ext_key_any(&type_name)
                 && !self.adts.defs.contains_key(&type_name)
-                && self.adts.ext_types.contains(key)
+                && self.adts.ext_types.contains(&key)
             {
-                type_name = key.to_string();
+                type_name = key;
             }
             if let Some((tr, _, _)) = crate::adt::blanket_impl(imp)
                 && self.adts.blankets.contains_key(&tr)
@@ -1438,6 +1505,7 @@ impl Checker<'_> {
             self.lenient_projs.clear();
             self.const_tys.clear();
             self.from_args.clear();
+            self.try_from_args.clear();
         }
     }
 
@@ -1673,6 +1741,16 @@ impl Checker<'_> {
                 {
                     return Some(self.conv_from_call(c, &adt, args));
                 }
+                // `Name::try_from(bytes)` with several `impl TryFrom<X> for Name`: the one for
+                // the argument.
+                let m = if let [a] = args
+                    && self.adts.method_alts.contains_key(&format!("{adt}::{m}"))
+                {
+                    let at = self.infer(a, None);
+                    self.pick_alt_by_item(&adt, &m, 0, &at, c.syntax())
+                } else {
+                    m
+                };
                 let Some(method) = self.adts.method(&adt, &m).cloned() else {
                     self.no_assoc(c.syntax(), &adt, &m);
                     for a in args {
@@ -2436,6 +2514,19 @@ fn where_bounds(f: &ast::Fn, name: &str) -> Vec<ast::TypeBoundList> {
         })
         .filter_map(|p| p.type_bound_list())
         .collect()
+}
+
+/// Whether a bound list's traits take arguments (`FnOnce() -> R`, `Into<T>`,
+/// `IntoIterator<Item = P>`), which may name the function's other type parameters.
+fn bounds_name_params(l: &ast::TypeBoundList) -> bool {
+    l.bounds().any(|b| match b.ty() {
+        Some(ast::Type::PathType(p)) => p.path().and_then(|p| p.segment()).is_some_and(|s| {
+            ast::HasGenericArgs::generic_arg_list(&s).is_some()
+                || s.parenthesized_arg_list().is_some()
+                || s.ret_type().is_some()
+        }),
+        _ => false,
+    })
 }
 
 /// The value of a constant integer expression, for enum discriminants: literals, `const` items,

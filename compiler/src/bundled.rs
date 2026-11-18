@@ -1460,10 +1460,27 @@ fn tt_open(tt: &ast::TokenTree) -> Option<ra_ap_syntax::SyntaxKind> {
 }
 
 /// `items` split at their top-level commas (a trailing one ends the list).
+/// A comma between the `<` and `>` of a qualified path (`<R<(), ()> as Clone>::clone(&x)`, at
+/// the start of a value or after `::`) is the value's own, as `json!`'s `$value:expr` takes it.
 fn split_commas(items: &[ra_ap_syntax::SyntaxElement]) -> Vec<Vec<ra_ap_syntax::SyntaxElement>> {
+    use ra_ap_syntax::SyntaxKind::{COLON, COLON2, COMMA, EQ, L_ANGLE, MINUS, R_ANGLE};
     let mut out = vec![Vec::new()];
+    let mut angle = 0usize;
+    let mut prev: Option<ra_ap_syntax::SyntaxKind> = None;
     for e in items {
-        if e.kind() == ra_ap_syntax::SyntaxKind::COMMA {
+        let k = e.kind();
+        if k.is_trivia() {
+            continue;
+        }
+        match k {
+            L_ANGLE if angle > 0 || matches!(prev, None | Some(COMMA | COLON | COLON2)) => {
+                angle += 1
+            }
+            R_ANGLE if angle > 0 && !matches!(prev, Some(MINUS | EQ)) => angle -= 1,
+            _ => {}
+        }
+        prev = Some(k);
+        if k == COMMA && angle == 0 {
             out.push(Vec::new());
         } else if let Some(last) = out.last_mut() {
             last.push(e.clone());

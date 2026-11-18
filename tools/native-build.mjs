@@ -33,8 +33,8 @@ const VERSIONS = {
   indexmap: "2",
 };
 const CRATES = Object.keys(VERSIONS).concat(["lazy_static", "hashbrown"]).join("|");
-const uses = (src, c) => new RegExp(`\\b${c}(::|!)|\\buse ${c}\\b`).test(src);
-export const usesCrates = (src) => new RegExp(`\\b(${CRATES})(::|!)|\\buse (${CRATES})\\b`).test(src);
+const uses = (src, c) => new RegExp(`\\b${c}(::|!)|\\b(use|extern crate) ${c}\\b`).test(src);
+export const usesCrates = (src) => new RegExp(`\\b(${CRATES})(::|!)|\\b(use|extern crate) (${CRATES})\\b`).test(src);
 
 /** Compile `file` to the executable `exe` (`debug`: without optimizations). Throws on errors. */
 export function buildNative(file, exe, { debug = false } = {}) {

@@ -121,6 +121,13 @@ macro_rules! parse_macro_input {
             Err(err) => return err.to_compile_error(),
         }
     };
+    // (`let input: DeriveInput = parse_macro_input!(input);`: the type is the `let`'s.)
+    ($tokens:ident) => {
+        match __parse_all($tokens) {
+            Ok(data) => data,
+            Err(err) => return err.to_compile_error(),
+        }
+    };
 }
 
 /// `parse_quote!(Vec<#inner>)`: a syntax tree from quoted tokens.

@@ -3,14 +3,123 @@
 //! own static method (`from$0`, `from$1`, ..); the checker picks one per call by the argument's
 //! type and records it in `Types::conversions` for codegen. A child module of `typeck`.
 
-use ra_ap_syntax::{AstNode, SyntaxNode, ast, ast::ArithOp};
+use ra_ap_syntax::{AstNode, SyntaxNode, ast, ast::ArithOp, ast::HasArgList};
 
 use super::{Checker, VarKind};
-use crate::adt::{Conv, FromImpl};
+use crate::adt::{ArgRef, Conv, FromImpl};
 use crate::ty::{IntKind, Ty};
 
 /// The `X` of `.into()`'s receiver when it's a parameter of the enclosing function declared
 /// `impl Into<X>`, or `T` with a `T: Into<X>` bound (inline or in `where`).
+/// `x.into()` with `x: T` where `T: Into<X>` for a number type `X`: narrower integers are JS
+/// numbers, so into an `i64` they become BigInts (and a `bool` 0 or 1).
+fn into_number_conv(target: &Ty) -> Conv {
+    match target {
+        Ty::Int(k) if k.is_big() => Conv::Wrap {
+            js: "κσ.$intoBig".into(),
+        },
+        Ty::Float { .. } | Ty::Int(_) => Conv::Wrap {
+            js: "κσ.$intoNum".into(),
+        },
+        _ => Conv::Identity,
+    }
+}
+
+/// How the argument of a conversion call at `node` is written, for `narrow_alts`: the receiver
+/// of `x.try_into()`, the argument of `T::try_from(x)`, the items of `it.collect()` and of
+/// `t.extend(it)`.
+fn arg_ref_hint(node: &SyntaxNode) -> Option<ArgRef> {
+    if let Some(mc) = ast::MethodCallExpr::cast(node.clone()) {
+        return match mc.name_ref()?.text().to_string().as_str() {
+            "try_into" => expr_ref_hint(&mc.receiver()?),
+            "collect" => items_ref_hint(&mc.receiver()?),
+            "extend" => items_ref_hint(&mc.arg_list()?.args().next()?),
+            _ => None,
+        };
+    }
+    let c = ast::CallExpr::cast(node.clone())?;
+    let ast::Expr::PathExpr(p) = c.expr()? else {
+        return None;
+    };
+    let f = p.path()?.segment()?.name_ref()?;
+    let a = c.arg_list()?.args().next()?;
+    match f.text().to_string().as_str() {
+        "try_from" => expr_ref_hint(&a),
+        "from_iter" => items_ref_hint(&a),
+        _ => None,
+    }
+}
+
+/// `ArgRef` of a value by how it's written: `"x"` / `s.as_str()` / `&v[..]` are slices, `&x` a
+/// reference, `s.to_string()` / `format!(..)` / `vec![..]` values. `None` when it doesn't say
+/// (a variable).
+fn expr_ref_hint(e: &ast::Expr) -> Option<ArgRef> {
+    match crate::typeck::strip_parens(e) {
+        ast::Expr::Literal(l) => match l.kind() {
+            ast::LiteralKind::String(_) | ast::LiteralKind::ByteString(_) => Some(ArgRef::Slice),
+            _ => Some(ArgRef::Owned),
+        },
+        ast::Expr::RefExpr(r) => match r.expr().map(|x| crate::typeck::strip_parens(&x)) {
+            Some(ast::Expr::IndexExpr(_)) => Some(ArgRef::Slice),
+            _ => Some(ArgRef::Ref),
+        },
+        ast::Expr::MethodCallExpr(m) => match m.name_ref()?.text().to_string().as_str() {
+            "as_str" | "as_slice" | "as_bytes" | "as_ref" | "trim" | "trim_start" | "trim_end"
+            | "as_path" => Some(ArgRef::Slice),
+            "to_string" | "to_owned" | "clone" | "to_vec" | "into" | "collect" | "into_bytes"
+            | "into_owned" | "into_string" | "join" | "concat" | "repeat" | "to_uppercase"
+            | "to_lowercase" | "replace" | "into_boxed_str" | "into_boxed_slice" => {
+                Some(ArgRef::Owned)
+            }
+            _ => None,
+        },
+        ast::Expr::MacroExpr(m) => {
+            let name = m.macro_call()?.path()?.segment()?.name_ref()?;
+            matches!(name.text().to_string().as_str(), "format" | "vec").then_some(ArgRef::Owned)
+        }
+        ast::Expr::CallExpr(c) => {
+            let ast::Expr::PathExpr(p) = c.expr()? else {
+                return None;
+            };
+            let f = p.path()?.segment()?.name_ref()?;
+            matches!(
+                f.text().to_string().as_str(),
+                "from" | "new" | "with_capacity" | "from_utf8" | "from_utf8_lossy"
+            )
+            .then_some(ArgRef::Owned)
+        }
+        ast::Expr::ArrayExpr(_) | ast::Expr::TupleExpr(_) => Some(ArgRef::Owned),
+        _ => None,
+    }
+}
+
+/// `ArgRef` of the items of an iterable by how it's written: `&v` / `v.iter()` / `m.keys()`
+/// give references, `vec![..]` / `[..]` / `.cloned()` / `.drain(..)` values.
+fn items_ref_hint(e: &ast::Expr) -> Option<ArgRef> {
+    match crate::typeck::strip_parens(e) {
+        ast::Expr::RefExpr(_) => Some(ArgRef::Ref),
+        ast::Expr::ArrayExpr(_) => Some(ArgRef::Owned),
+        ast::Expr::MacroExpr(m) => {
+            let name = m.macro_call()?.path()?.segment()?.name_ref()?;
+            (name.text() == "vec").then_some(ArgRef::Owned)
+        }
+        ast::Expr::MethodCallExpr(m) => match m.name_ref()?.text().to_string().as_str() {
+            "iter" | "keys" | "values" => Some(ArgRef::Ref),
+            "into_iter" => match crate::typeck::strip_parens(&m.receiver()?) {
+                ast::Expr::RefExpr(_) => Some(ArgRef::Ref),
+                _ => Some(ArgRef::Owned),
+            },
+            "cloned" | "copied" | "drain" | "into_values" | "into_keys" | "chars" | "bytes"
+            | "lines" | "split_whitespace" => Some(ArgRef::Owned),
+            // (Adapters that pass the items on as they are.)
+            "filter" | "skip" | "take" | "rev" | "chain" | "peekable" | "skip_while"
+            | "take_while" | "step_by" | "fuse" | "inspect" => items_ref_hint(&m.receiver()?),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn into_bound_target(m: &ast::MethodCallExpr) -> Option<ast::Type> {
     use ra_ap_syntax::ast::{HasGenericArgs, HasGenericParams, HasName, HasTypeBounds};
     let ast::Expr::PathExpr(p) = crate::typeck::strip_parens(&m.receiver()?) else {
@@ -85,6 +194,12 @@ impl Checker<'_> {
     /// Whether `a` and `b` could be the same type once inference finishes (no side effects).
     pub(super) fn could_be(&self, a: &Ty, b: &Ty) -> bool {
         let (a, b) = (self.shallow(a), self.shallow(b));
+        if let Ty::MutRef(x) = &a {
+            return self.could_be(x, &b);
+        }
+        if let Ty::MutRef(y) = &b {
+            return self.could_be(&a, y);
+        }
         match (&a, &b) {
             (Ty::Unknown, _) | (_, Ty::Unknown) | (Ty::Never, _) | (_, Ty::Never) => true,
             (Ty::Var(_), Ty::Var(_)) => true,
@@ -111,6 +226,13 @@ impl Checker<'_> {
                         ia.len() == ib.len() && ia.iter().zip(&ib).all(|(p, q)| self.could_be(p, q))
                     }
                 }
+            }
+            // (As `unify` takes it: any iterable of `T` but an `Option`.)
+            (Ty::IntoIter(e), other) | (other, Ty::IntoIter(e))
+                if !matches!(other, Ty::Option(_) | Ty::Param(_)) =>
+            {
+                self.iter_elem(other)
+                    .is_some_and(|item| self.could_be(e, &item))
             }
             _ => false,
         }
@@ -207,14 +329,106 @@ impl Checker<'_> {
                     && expected.is_none_or(|e| c.could_be(&sig.ret, e))
             })
         };
-        let key = keys
-            .iter()
-            .find(|k| fits(self, k))
-            .cloned()
+        let fitting: Vec<String> = keys.iter().filter(|k| fits(self, k)).cloned().collect();
+        let key = self
+            .narrow_alts(ty, method, fitting, m.syntax())
             .unwrap_or_else(|| keys[0].clone());
         let r = self.range(m.syntax());
         self.method_keys.insert(r, key.clone());
         Some(key)
+    }
+
+    /// `method` of `ty` among several impls of one generic trait, by its argument `idx`
+    /// (`impl TryFrom<&str>` and `impl TryFrom<Vec<u8>>`) or, for an `IntoIterator<Item = X>`
+    /// parameter, by the items (`impl FromIterator<Tok>`, `impl Extend<Stream>`): the first
+    /// impl that takes `arg` (see `narrow_alts`), recorded for codegen at `node`. The method's
+    /// own name when the type has one impl.
+    pub(super) fn pick_alt_by_item(
+        &mut self,
+        ty: &str,
+        method: &str,
+        idx: usize,
+        arg: &Ty,
+        node: &SyntaxNode,
+    ) -> String {
+        let Some(keys) = self
+            .adts
+            .method_alts
+            .get(&format!("{ty}::{method}"))
+            .cloned()
+        else {
+            return method.to_string();
+        };
+        let fits = |c: &Self, k: &String| {
+            c.adts
+                .method(ty, k)
+                .and_then(|sig| sig.params.get(idx))
+                .is_some_and(|p| match c.shallow(p) {
+                    Ty::IntoIter(x) if !matches!(c.shallow(arg), Ty::IntoIter(_)) => {
+                        c.could_be(&x, arg)
+                    }
+                    p => c.could_be(&p, arg),
+                })
+        };
+        let fitting: Vec<String> = keys.iter().filter(|k| fits(self, k)).cloned().collect();
+        let key = self
+            .narrow_alts(ty, method, fitting, node)
+            .unwrap_or_else(|| keys[0].clone());
+        let r = self.range(node);
+        self.method_keys.insert(r, key.clone());
+        key
+    }
+
+    /// The impl to call among those whose argument types fit (`fitting`, in order). Impls whose
+    /// argument types differ only by references (`TryFrom<&str>` and `TryFrom<String>`,
+    /// `Extend<&T>` and `Extend<T>`) take the same JS value, so how the call's argument is
+    /// written decides (`s.as_str()`, `s.to_string()`, `&s`, `v.iter()`; see `arg_ref_hint`).
+    /// Failing that, never the impl the call is in (`Self::try_from(s.as_str())` in the
+    /// `String` impl hands on to another), then the first.
+    fn narrow_alts(
+        &self,
+        ty: &str,
+        method: &str,
+        fitting: Vec<String>,
+        node: &SyntaxNode,
+    ) -> Option<String> {
+        let mut fitting = fitting;
+        let written = |k: &String| self.adts.alt_arg_refs.get(&format!("{ty}::{k}")).copied();
+        if fitting.len() > 1
+            && let Some(h) = arg_ref_hint(node)
+        {
+            let mut same: Vec<String> = fitting
+                .iter()
+                .filter(|k| written(k) == Some(h))
+                .cloned()
+                .collect();
+            // (`&s` of a `String` into `TryFrom<&str>` when there's no `TryFrom<&String>`.)
+            if same.is_empty() && h == ArgRef::Ref {
+                same = fitting
+                    .iter()
+                    .filter(|k| written(k) == Some(ArgRef::Slice))
+                    .cloned()
+                    .collect();
+            }
+            if !same.is_empty() {
+                fitting = same;
+            }
+        }
+        if fitting.len() > 1
+            && let Some(f) = node.ancestors().find_map(ast::Fn::cast)
+            && let Some(n) = ast::HasName::name(&f)
+            && n.text() == method
+        {
+            let at = self.range(n.syntax()).0;
+            let own = self
+                .adts
+                .alt_keys_at
+                .get(&at)
+                .cloned()
+                .unwrap_or_else(|| method.to_string());
+            fitting.retain(|k| *k != own);
+        }
+        fitting.into_iter().next()
     }
 
     /// A call of a user trait method on a built-in type, for codegen.
@@ -285,8 +499,10 @@ impl Checker<'_> {
         // `h.into()` with `h: impl Into<Host>` / `h: H` where `H: Into<Host>`: the parameter is a
         // `Host` here already, and the bound says that's what it converts to.
         if let Some(x) = into_bound_target(m) {
-            self.record_conv(m.syntax(), Conv::Identity);
-            return self.lower_type(&x);
+            let t = self.lower_type(&x);
+            // (`P: Into<i64>` stays a parameter, so it may be any narrower number or a `bool`.)
+            self.record_conv(m.syntax(), into_number_conv(&t));
+            return t;
         }
         let target = self.fresh(VarKind::General);
         self.pending_intos
@@ -355,14 +571,16 @@ impl Checker<'_> {
                 }
                 (_, Ty::Adt(adt, args)) if self.adts.method(adt, "try_from").is_some() => {
                     let (adt, args) = (adt.clone(), args.clone());
-                    let m = self.adts.method(&adt, "try_from").cloned().unwrap();
+                    // (Several `impl TryFrom<X>`: the one for this source.)
+                    let key = self.pick_alt_by_item(&adt, "try_from", 0, &src, &node);
+                    let m = self.adts.method(&adt, &key).cloned().unwrap();
                     let m = self.method_inst(&m, Some(&args));
                     let ok = m.params.first().is_some_and(|p| self.unify(p, &src))
                         && self.unify(
                             &m.ret,
                             &Ty::Result(Box::new(target.clone()), Box::new(err.clone())),
                         );
-                    ok.then_some(Conv::TryFrom { adt })
+                    ok.then_some(Conv::TryFrom { adt, key })
                 }
                 (Ty::Vec(x), Ty::Vec(y)) => {
                     let (x, y) = (x.clone(), y.clone());
@@ -392,8 +610,14 @@ impl Checker<'_> {
         let target = self.shallow(p);
         let from_target =
             matches!(&target, Ty::Adt(tn, _) if self.adts.from_impls.contains_key(tn));
+        // (A suffixed number literal has a type of its own: `4u8` into an `impl Into<i64>`.)
+        let suffixed = matches!(target, Ty::Int(_) | Ty::Float { .. })
+            && matches!(crate::typeck::strip_parens(a), ast::Expr::Literal(l)
+                if matches!(l.kind(), ast::LiteralKind::IntNumber(n) if n.suffix().is_some())
+                    || matches!(l.kind(), ast::LiteralKind::FloatNumber(n) if n.suffix().is_some()));
         // (Literals, closures and the like take the parameter's type as written.)
         if !from_target
+            && !suffixed
             && !matches!(
                 crate::typeck::strip_parens(a),
                 ast::Expr::PathExpr(_)
@@ -444,13 +668,18 @@ impl Checker<'_> {
                 && let Some(into) = self.into_targets.get(p).cloned()
             {
                 self.unify(&t, &into);
-                self.record_conv(&node, Conv::Identity);
+                self.record_conv(&node, into_number_conv(&into));
                 continue;
             }
             let conv = match (&s, &t) {
                 (_, Ty::Var(_)) if self.var_kind(&t) == Some(VarKind::General) => {
                     self.error(&node, "type annotations needed: say what `.into()` converts to (e.g. `let y: Y = x.into();`)");
                     continue;
+                }
+                // `sq.into()` as a `Box<dyn Shape>` through your `impl From<Sq> for Box<dyn Shape>`.
+                (_, Ty::Dyn(tr)) if self.adts.from_impls.contains_key(&format!("dyn${tr}")) => {
+                    let adt = format!("dyn${tr}");
+                    self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
                 }
                 (_, Ty::Adt(adt, _))
                     if self.adts.from_impls.contains_key(adt) && !self.could_be(&s, &t) =>

@@ -35,6 +35,7 @@ name = "carciniscript"
 version = "0.1.0"
 dependencies = [
  "js-sys",
+ "ra_ap_parser",
  "ra_ap_syntax",
  "serde",
  "serde_json",

@@ -304,7 +304,9 @@ Every `.rs` file in the local cargo registry (226 crates, 5,197 files after drop
 compile-fail fixtures) was compiled file by file, and each error was sorted into "missing crate or
 module", "thread", "std library", or "language". Errors from names in other crates or other files of
 the same crate, and from threads, `Arc`, `Mutex` and atomics, don't count. Unresolved names don't
-hide later errors, so this is a fair per-file check.
+hide later errors, so this is a fair per-file check. To re-run it:
+`node --stack-size=8000 tools/corpus-classify.mjs <registry src dir> out.jsonl`, then
+`node tools/corpus-report.mjs out.jsonl` (verdicts, gap table, crates, and a per-file CSV).
 
 - **Language features all supported:** 67% of files (61% of `src/`, 85% of `examples/`, 86% of
   `tests/`, 93% of `benches/`). Counting std-library gaps as failures, 50.5%. By lines, 39%.
@@ -327,6 +329,21 @@ hide later errors, so this is a fair per-file check.
   The leading "impl on a std type" rows (273 files) are now mostly std traits on std types
   (`impl<T> Index<Id> for Vec<T>`, `impl PartialEq<N> for str`, `impl Default for Box<..>`), a
   trait on `Box<str>`, or the crate's own types named like std ones (anyhow's `Chain`).
+- **Re-run after `1c180cd`, on the uncommitted tree** (2026-11-17): language features all
+  supported in **79.0%** (4,126 of 5,220); counting std gaps, 69.7%; by lines, 61.6%. 1,009 files
+  have a language gap (631 of them unsafe/memory, not planned), 488 are std-only, and 64 have other
+  errors with nothing unresolved (15 methods on unknown types, 11 type mismatches, 10 `env!`).
+  49 crates pass in every file (from 35); 132 pass in 80% or more. Two causes:
+  - The classifier (now `tools/corpus-classify.mjs`) no longer counts a crate's own types and
+    traits with std names as std ones: a name from a `crate::` / `self::` / `super::` path, from
+    another crate's `use`, or that a `struct`, `enum`, `union` or `trait` in the crate defines
+    (aliases don't count: `type Result<T> = std::result::Result<..>` is still std's). That moved
+    about 85 files out of "language gap" and 223 out of "std-only" (anyhow's `Chain` / `Ref` /
+    `Backtrace`, `crate::File`, `crate::Path`, `syn::Path`). Earlier runs' "impl on a std type"
+    and std-type counts include these.
+  - Compiler changes since `db63e10`: "type parameter in this position" fell 211 → 24 files and
+    "generic trait implemented more than once" 49 → 0.
+  The open items are under "Open from the 2026-11-17 re-run" in Language gaps, below.
 - [x] **Regressions in `3c15b78`**, both in files that compiled before:
   - a user `enum Ordering` in a pattern is taken as `std::cmp::Ordering`: "expected `Ordering`,
     found `Ordering`" (`ra_ap_syntax` `ast/operators.rs`); a file's own `Ordering` now shadows
@@ -407,7 +424,8 @@ done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
     `mod` line in the file that declares it (and that file's `#[macro_use] mod`s), up to the
     crate root, and every `#[macro_export]` one (`crate::m!`, `use crate::m;`); a crate's own
     `info!` then beats the bundled `log`'s (`modules/macro_scope`).
-  - Left: rules relying on finer fragment parsing.
+  - Left: rules relying on finer fragment parsing (since done: fragments are parsed by
+    rust-analyzer's parser, see "`macro_rules!` expansions that don't parse" below).
 - [x] **Generic bounds on std traits** (49, down from 82): `A: Allocator` (ignored, with
   `Vec<T, A>`, `Global`, `Vec::new_in`; `fixtures/allocator_params.rs`, built natively with
   `RUSTC_BOOTSTRAP` for its `#![feature(allocator_api)]`) and `impl Future for ..` (hand-written
@@ -455,6 +473,201 @@ done · 🚧 in progress · `[ ]` open (the same 🚧 as FEATURES.md's legend).
   (`fixtures/logic_block_operands.rs`); const generics on traits (`trait Buf<const N: usize>`,
   `impl Buf<4> for X`, `impl<const N: usize> Tr for [u8; N]`; the trait's own default methods
   can't read `N` yet; `fixtures/const_generic_traits.rs`).
+
+#### Open from the 2026-11-17 re-run
+
+Files hitting each, then files where it's the only language gap, then crates. Each item gives the
+first run's counts; "now" is the second run (fixed classifier, compiler as of `1c180cd` plus
+uncommitted work). Unsafe/memory (now 631 / 412 / 112), `union` (126 / 3 / 8), `extern` blocks
+and their items (66 / 28 / 16) and the proc-macro API outside a proc-macro crate (55 / 51 / 12)
+aren't listed (not planned).
+
+- 🚧 **Your trait on a std/built-in type, what's left** (228 / 153 / 79):
+  - [x] impls on `VecDeque` (their own `$ext$VecDeque` class and run-time kind, apart from a
+    `Vec` impl, also through a generic `T: Tr`), on `Box<Node>` / `Rc<Node>` / `Pin<Box<Fut>>`
+    (the contents' impl), and a `Box<dyn Tr>` struct field declared before the trait
+    (`fixtures/more_std_type_impls.rs`). `Option`, `HashMap` / `HashSet`, `Vec`, `str` / `&str`
+    and forwarding `impl<'a, T: Tr> Tr for &'a T` already worked (probed against rustc).
+  - [x] A silent miscompile: `impl Tr for String` next to `impl Tr for str` (or `Vec<T>` next to
+    `[T]`) was always dropped for the borrowed impl, even when its body did something else. Now
+    it's dropped only when each method hands on to the borrowed one (`self.as_str().f()`,
+    `Tr::f(&self.as_str())`, `self[..].f()`), and is an error otherwise (zeroize's `Vec` impls,
+    which also truncate, now say so).
+  - [x] `impl From<X> for Box<dyn Tr>`: its `from`s go on a `$ext$dyn$Tr` class, picked by the
+    source type at `x.into()`, `Box::from(x)` and `<Box<dyn Tr>>::from(x)`. Your traits on
+    `Range<T>` / `RangeInclusive<T>` (`$ext$Range`, a `range` run-time kind for generic calls),
+    with `impl PartialEq<Span> for Range<usize>` (`r == span`) and `impl From<Span> for
+    Range<usize>`; a literal range is a `Range` value when it calls one of those methods, is
+    borrowed (`&(1..2)`) or is an array element (`fixtures/box_dyn_from_range_impls.rs`).
+  - [x] Many of the counted hits were the crate's own types named like std ones (anyhow's
+    `Chain`, `crate::File`, `crate::Path`). The classifier is in the repo now
+    (`tools/corpus-classify.mjs`, `tools/corpus-report.mjs`) and drops them (see the re-run
+    bullet above): **now 113 / 75 / 52**. Most remaining hits are impls a `macro_rules!` body
+    writes for numbers, arrays and `Vec` (`vectors! {..}` 240 hits, `array_impl!(..)` 106,
+    wasm-bindgen's `type_wasm_native!` / `type_abi_as_u32!` 130, `impl_values!` 39,
+    `ref_by_copy!` 18), so the error points at the macro call. Written out: `Option` (26),
+    `Vec` (25), `String` (18), `Box` (17), `str` (14).
+- [x] **A type parameter in an unsupported position** (211 / 113 / 83), "type `T` is not supported
+  yet" (`fixtures/type_param_positions.rs`). Registry files whose first error was a one-letter
+  "type `T` is not supported yet" fell from 22 to 1, and 8 more files compile, with no file that
+  compiled before failing:
+  - a type parameter as a trait's type argument (`impl<T> Store<T> for Bag<T>`,
+    `impl<'a, T, U> Alloc<T> for Arena<'a, T, U>`): the impl's parameters are in scope for its
+    trait arguments and associated types; a generic call's `S: Store<T>` settles `T` from `S`'s
+    impl (when there's one), as rustc infers it
+  - an associated type set to a parameter (`type Item = T;`): `C::Item` of a `Stack<i32>` is `i32`
+  - `Item = P` in a bound with `P: Into<i64>`: it compiled, but `p.into()` stayed a JS number
+    and failed mixing with BigInts (`T: Into<i64>` too, and `impl Into<u128>` given `3u8`). Now
+    `.into()` to a 64/128-bit kind makes a BigInt, and a `bool` into a number is 0 or 1
+  - `F: FnOnce() -> T` in a trait or impl method's `where` clause, and any bound naming a
+    parameter declared after it (`F: FnOnce() -> P, P: Into<PathBuf>`, `T: Fn(i32) -> A, A:
+    Iterator`): parameters are lowered in the order their bounds need, on fns and methods
+  - left: `I: IntoParallelIterator<Iter: IndexedParallelIterator, ..>` (associated type bounds),
+    generic associated types (`type List<'a, T: 'a> = &'a [T];`)
+  - now 24 / 13 / 13, most of them inside macro expansions: rayon's `impl_unzip_iter!(A =>
+    FromA, ..)` (63 hits) and rand's `uniform_int_impl! { i8, u8, u32 }` (8 per invocation)
+- [x] **One generic trait implemented more than once, remaining shapes** (49 / 18 / 28):
+  several `TryFrom`, `FromIterator` and `Extend` impls on one type, picked by the argument's (or
+  items') type at `T::try_from(x)`, `x.try_into()`, `.collect()` and `t.extend(..)`
+  (`fixtures/std_traits_twice.rs`). Impls whose types differ only by references (`TryFrom<&str>` /
+  `TryFrom<String>` / `TryFrom<&String>`, `Extend<&'a T>` / `Extend<T>`) are told apart by how the
+  argument is written (`s.as_str()`, `s.to_string()`, `&s`, `v.iter()`, `vec![..]`), and a call
+  never picks the impl it's in, so `Self::try_from(s.as_str())` in the `String` impl hands on.
+  Not looked at: `extend_one` / `extend_reserve` (nightly), `TokenStream` impls in proc-macro
+  crates.
+- [x] **Writes through references into containers** (34 / 21 / 21)
+  (`fixtures/writes_through_refs.rs`). `buf[a..b].copy_from_slice(..)`, in-place methods on a
+  range of a `Vec` and `dest = &mut dest[n..]` already worked (probed against rustc). New:
+  - `v.get(a..b)` / `dest.get_mut(n..)`: `Some` of the slice (a view for `get_mut`), `None` past
+    the end, so `dest = dest.get_mut(n..).ok_or(..)?` re-slices
+  - silent miscompile: `*output = vec![..]` through a `&mut Vec` parameter left the caller's
+    `Vec` alone (only structs were replaced in place); now `Vec`s, maps, sets and the other
+    collections are too
+  - silent miscompile: a closure taking `&mut` to a number or string (`F: FnMut(&mut String)`
+    with `|f| write!(f, "-")`, `|v: &mut i32| *v += 1`, `Box<dyn Fn(&mut i64)>`, a function item
+    called through a variable) wrote to a copy. Such a parameter is now a `Ty::MutRef` in the
+    closure's type: the closure takes a cell and a call passes one, also for `F: FnMut(&mut T)`
+    over structs or numbers
+  - now 28 / 19 / 17: a range of a range (`buf[current..][..length].fill(x)`), `let Some(r) =
+    &mut self.0 else { .. }`, slices of a method's result (`self.buf.write_buf()[..n]
+    .copy_from_slice(..)`), and `write!` into a closure's writer (which may predate the fix in
+    the wasm the re-run used)
+- [x] **Generic calls on type parameters** (29 / 5 / 25) (`fixtures/generic_param_calls.rs`):
+  `T::len(x)` / `T::drive(t, v)` (a bound's method with `self`, by path) is a method call on its
+  first argument, as `Trait::len(x)` is; a `&mut` cell argument of a path call
+  (`Trait::add_to(&x, &mut n)`) now passes its cell. `A::size()`, `S::default()` passed to a
+  constructor and `M::INFO.label(..)` already worked. `P::value_parser()` is clap's, not looked
+  at. Now 29 / 14 / 25: mostly rayon's `impl_unzip_iter!` expansions, then hashbrown's
+  `Self::with_capacity_and_hasher_in(.., S::default(), A::default())` and rayon's
+  `T::drive_unindexed(self, consumer)` / `T::opt_len(self)` (which may predate the fix in the
+  wasm the re-run used).
+- [x] **`macro_rules!` expansions that don't parse** (first run: not counted, a bug in the tally;
+  now 77 / 77 / 16, every one the file's only language gap): thin-vec's `array_impls!` (128
+  hits), serde_json's `number_partialeq_ok!` (72) and `json!` (24), time's `assert_errs!` (60),
+  bitvec's `safe!` (27), autocfg's `try!` (23), serde_derive's `quote_block!` (22), syn's
+  `snapshot!` (18 per version) and `Token!` (13). (`fixtures/macro_fragments.rs`,
+  `fixtures/try_macro_2015.rs`, `fixtures/own_try_macro_2015.rs`.) Registry re-run with this
+  classifier: 87 / 87 / 17 → **10 / 10 / 3**, and the 10 are files rustc rejects too
+  (ra_ap_parser's `test_data/**/err` (5), serde_json's `tests/ui` (4)) and anyhow's
+  `ensure!(&0 as &dyn EqDebug<i32, Assoc = bool> != &0)`, which rust-analyzer's parser doesn't
+  take. No file that compiled before fails (one more compiles).
+  - `expr`, `ty`, `pat`, `pat_param`, `path`, `stmt`, `item`, `meta` captures go through
+    rust-analyzer's prefix parser (`ra_ap_parser`, the parse rustc's matcher does), falling
+    back to the token scan when it reports an error: `$($N:expr)*` of `0 1 2 ..`, a qualified
+    path's commas (`<R<(), ()> as Clone>::clone(..)`); a `pat` the rule follows with `|` is a
+    `pat_param` (itertools' `|$it:pat|`, 2018 code)
+  - written-out captures stay one piece of syntax: no parentheses around a block `expr` (`$body
+    $i += 1;`), parentheses around a `ty` before `<` (`as $t << 4`); repetitions don't glue into
+    `"x"as` (a suffixed literal) or `ident#` (a reserved prefix)
+  - an expression-position expansion's trailing `;` is dropped (multipart's `return Err(..);`)
+  - a matcher or transcriber `$` with nothing after it is the token `$` (syn's `[$] => ..`)
+  - `<Token![,]>::default()` is left as it is by the `<T>::f` rewrite
+  - a macro named `safe` (`Safe` before parsing) and 2015-edition `try!` (`r#try!`; std's is
+    `$e?`, a file's own `macro_rules! try` wins)
+  - `json!`'s values keep a qualified path's commas
+  - `//!` docs and `#![..]` of an inline module are dropped when it's flattened (they ended up
+    after other items: simd-adler32)
+- [x] **`macro_rules!` with no rule matching** (likewise not counted the first time; now 12 / 12 /
+  9): "rules relying on finer fragment parsing", left from the macro work above. Registry re-run:
+  13 / 13 / 10 → **4 / 4 / 3**. Fixed: a `tt` takes joined punctuation as one token (`$delim:tt`
+  of `=>`); hygiene doesn't rename a rule marker (`@closure` next to `let closure`:
+  wasm-bindgen's `closures!`); calls inside `quote!` / `parse_quote!` aren't expanded (icu's
+  `langid!(#repr)`, tinystr); a bundled crate's macro gives way to the crate's own (also
+  `macro_rules! log_enabled` no longer hides the bundled `log!`); the bundled `log` takes
+  `logger: ..`; `parse_macro_input!(input)` typed by its `let` (clap_derive). Left: anyhow's
+  `ensure!()` UI test (rustc rejects it), and regex-automata's `log! { .. }` (2) and wasmparser's
+  `bail!(offset, ..)` (1), which are the crate root's macros: the survey's resolver only reads
+  files next to the one compiled, so they get the bundled `log` / `anyhow` ones.
+- [x] **Bounds on std traits not yet accepted** (27 / 19 / 13; now 14 / 10 / 8)
+  (`fixtures/std_trait_bounds.rs`):
+  - `UnwindSafe` / `RefUnwindSafe` bounds are markers (all 140 hits are time's `meta.rs`)
+  - `T: TryFrom<X>`: `T::try_from(x)` is `Result<T, T::Error>` (`T::Error` unchecked, also in
+    a signature). The caller's class decides at run time (`κσ.$ttryfrom`): an integer kind is
+    range-checked, `char` too, your type's `TryFrom<X>` impl (`$tryfrom$X`) or else its
+    `From<X>` as `Ok`. With several bounds (`TryFrom<u64> + TryFrom<i64>`) the argument picks
+  - `B: AsMut<[u8]>` / `S: AsMut<Vec<i32>>` / `BorrowMut<X>`: the target, like `AsRef`;
+    `b.as_mut()[0] = 7` and `v.as_mut_slice()[i] = x` assign into the same `Vec`
+  - `Read` / `Write`: std's were already accepted (the io prelude's `IoRead` / `IoWrite`), also
+    in `where` with `Send + 'static`. The hits left are `crate::io::{Read, Write}` re-exports
+    (flate2, borsh), serde_json's own `Read<'de>` trait and `dyn Read + Send` fields (tiny_http):
+    not resolvable from one file
+- [x] **Format strings** (24 / 15 / 20; now 21 / 13 / 18) (`fixtures/hex_debug_ptr_format.rs`):
+  - `{:x?}` / `{:X?}` (28 hits): `Debug` with each integer in hex, `#` / `0` / the width
+    applying per integer (`{:02x?}` of bytes, `{:#x?}` pretty with `0x`), on numbers, strings
+    and collections, options, results and tuples of them; an error on structs, enums and
+    generic values, whose `Debug` is compiled without it (rustls's `{:x?}` is on integers)
+  - `{:p}` (8): a made-up address (`κσ.$fmtPtr`), the same for one object
+  - `info!(logger: l, ..)` now expands (to the global logger); log's own tests still need its `Log` /
+    `Record` API, not bundled) and defmt's `{=str}` (defmt isn't bundled: its `write!` is its
+    own macro)
+- [x] **Renaming imported types or crates** (19 / 13 / 19; now 19 / 14 / 19)
+  (`fixtures/crate_renames.rs`, `modules/renames`). Pre-passes in `alias.rs`:
+  - `extern crate itertools as it;` (std or a bundled crate): the rename goes and `it::` /
+    `crate::it::` paths (also in `use`) are written `itertools::`; `extern crate alloc as
+    core_alloc;` is `std::`; between std's crates (`extern crate core as std;`, `std as alloc`)
+    only the rename goes
+  - `use geo::Point as P;` / `use serde_json::Value as Json;` (a capitalized type, trait or
+    constant of a `mod` file or crate, at the top of the file): the rename goes and `P` is written
+    `Point`, also in the `mod` file's exports (`pub fn f() -> M`). A renamed re-export (`pub use
+    area::Error as AreaError;`) exports the type by its own name, and a file that imports
+    `geo::AreaError` by name writes it `Error`
+  - still errors (types share one namespace): two different `Error`s renamed apart in one file
+    (rand_distr's `Error as BinomialError`, `Error as CauchyError`, .., borsh's), a renamed `Error`
+    next to the file's own, a rename inside a block, one new name for `#[cfg]` alternatives
+    (tiny_http's `SslContextImpl`). `use super::X as Y` at the top of a module file is the
+    general `super::` gap.
+  - re-measured on the 19 affected crates' files: files with the gap 19 → 4 (borsh, jiff,
+    rand_distr, tiny_http; all for the reasons above), 3 more files compile (base64, bitflags,
+    icu_collections' `codepointtrie`); the others now stop at later gaps (bumpalo at its raw
+    `alloc` / `dealloc`)
+- [x] **`iter_mut()` outside `for`, remaining adapters** (15 / 1 / 15; now 14 / 1 / 14)
+  (`fixtures/iter_mut_more_adapters.rs`). Every hit was a type from another file of the crate
+  (`ArgGroup`, `Header`, `Limb`), whose `Ty::Unknown` elements codegen reported again; it no
+  longer does when the checker has already reported an error (0 hits; in those 14 crates, 9
+  "cannot borrow `x` as mutable" errors went too). The shapes behind them, probed against rustc:
+  - `if let Some(g) = v.iter_mut().find(..)` / `.rev().find(..)` of structs or tuples, and
+    `let mut it = v.iter_mut(); while let Some(h) = it.next()` (bindings weren't `&mut`)
+  - `try_for_each`, `try_fold` and `find_map` over numbers, strings and bools (slots)
+  - `&mut` iterators returned (`-> impl Iterator<Item = &mut T>`, `Box<dyn ..>`,
+    `slice::IterMut<'_, T>`), passed as parameters and kept in fields; over numbers they're slot
+    iterators (`self.it.next()` writes through)
+  - a map's `values_mut()` / `iter_mut()` outside a `for` (`κσ.$mapMutSlots`, or the values
+    themselves when they're objects)
+  - `let (src, dst) = (a, &mut *b);`: `dst` is a `&mut`
+  - silent miscompile: `VecDeque::iter_mut().for_each(..)` wrote to the deque object's
+    properties, not its elements
+  - silent miscompile, now an error: indexing a `Vec<&mut i32>` collected from `iter_mut()`
+    (`*rs[1] = 9`) wrote to a copy
+  - left: items that are tuples holding a `&mut` in a returned iterator (`Item = (usize, &mut
+    u8)`), `partition`, iterators over generic elements (smallvec's `A::Item`), rayon's
+    `mem::replace(&mut self.iter, [].iter_mut())`, and `MaybeUninit` (anstyle-parse, http)
+- [ ] **Const generics, remaining** (15 / 3 / 11; unchanged): const parameters wider than 32 bits
+  or not integers, and const arguments that aren't a literal or integer arithmetic.
+- [ ] **Blanket `impl<T> Tr for T`** (12 / 3 / 9; now 12 / 6 / 9).
+- [ ] **Macro recursion limit** (9 / 9 / 6; unchanged): expansions deeper than 128 levels.
+- [ ] Smaller: iterator chain shapes over numbers, strings or bools (6 / 1; now 5 / 1),
+  `macro_rules!` in an unsupported position (5 / 5), nested `use` paths (4 / 2), byte / C string
+  literals in one position (1 / 0).
 
 ### Std-library gaps
 

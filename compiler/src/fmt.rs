@@ -19,7 +19,7 @@ pub struct Spec {
     pub debug: bool,
     /// `#`: pretty `{:#?}`, or a `0x`/`0o`/`0b` prefix.
     pub alt: bool,
-    /// `x`, `X`, `o`, `b`, `e` or `E`.
+    /// `x`, `X`, `o`, `b`, `e`, `E` or `p` (with `debug`: `x` or `X`, from `{:x?}`).
     pub kind: Option<char>,
     /// `{:width$}` / `{:1$}`: the width comes from an argument.
     pub width_arg: Option<ArgRef>,
@@ -175,7 +175,12 @@ fn parse_spec(s: &str) -> Result<Spec, String> {
     match &chars[i..] {
         [] => {}
         ['?'] => spec.debug = true,
-        [k @ ('x' | 'X' | 'o' | 'b' | 'e' | 'E')] => spec.kind = Some(*k),
+        // `{:x?}`: `Debug` with its integers in hex.
+        [k @ ('x' | 'X'), '?'] => {
+            spec.debug = true;
+            spec.kind = Some(*k);
+        }
+        [k @ ('x' | 'X' | 'o' | 'b' | 'e' | 'E' | 'p')] => spec.kind = Some(*k),
         rest => {
             let rest: String = rest.iter().collect();
             return Err(format!("unsupported format spec `{rest}`"));

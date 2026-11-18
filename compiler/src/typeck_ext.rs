@@ -29,15 +29,38 @@ impl Checker<'_> {
         let slot_params = std::mem::take(&mut self.closure_slots);
         let mut ptys = Vec::new();
         for (i, p) in params.iter().enumerate() {
-            let annotated = p.ty().map(|t| self.lower_type(&t));
+            let annotated = p.ty().map(|t| self.closure_param_ty(&t));
             let t = match (annotated, &hint) {
                 (Some(t), Some((ps, _))) => {
                     self.unify(&t, &ps[i]);
-                    t
+                    // (`|s: &String|` given to a `FnMut(&mut String)`: still a cell.)
+                    match (&t, self.shallow(&ps[i])) {
+                        (Ty::MutRef(_), _) => t,
+                        (_, m @ Ty::MutRef(_)) => m,
+                        _ => t,
+                    }
                 }
                 (Some(t), None) => t,
-                (None, Some((ps, _))) => ps[i].clone(),
+                (None, Some((ps, _))) => self.shallow(&ps[i]),
                 (None, None) => self.fresh(VarKind::General),
+            };
+            // `|s| write!(s, "-")` for a `FnMut(&mut String)`: `s` is a cell, which the caller
+            // passes (`f(&mut out)`), so the writes reach the caller's string.
+            let t = match t {
+                Ty::MutRef(inner) => {
+                    if let Some(ast::Pat::IdentPat(ip)) = p.pat()
+                        && let Some(n) = ip.name()
+                    {
+                        let r = self.range(n.syntax());
+                        self.boxed.insert(r);
+                    }
+                    ptys.push(Ty::MutRef(inner.clone()));
+                    *inner
+                }
+                t => {
+                    ptys.push(t.clone());
+                    t
+                }
             };
             if let Some(pat) = p.pat() {
                 self.pat(&pat, &t);
@@ -45,7 +68,6 @@ impl Checker<'_> {
                     self.bind_slot_shape(&pat, shape);
                 }
             }
-            ptys.push(t);
         }
         // Closure parameters are usually references (`&T`, `&mut T` from iter_mut/retain/
         // and_modify); writing through them with `*x = ..` is allowed.
@@ -115,6 +137,23 @@ impl Checker<'_> {
         ret
     }
 
+    /// A closure type's parameter: `&mut i32` / `&mut String` (or `&mut T`) is a `MutRef`, which
+    /// the closure takes as a cell.
+    pub(super) fn closure_param_ty(&mut self, p: &ast::Type) -> Ty {
+        if let ast::Type::RefType(r) = p
+            && r.mut_token().is_some()
+            && let Some(inner) = r.ty()
+        {
+            let t = self.lower_type(&inner);
+            return if self.cell_param(&t) {
+                Ty::MutRef(Box::new(t))
+            } else {
+                t
+            };
+        }
+        self.lower_type(p)
+    }
+
     /// `impl Fn(A) -> R`, `&dyn FnMut(A)`, `fn(A) -> R`.
     pub(super) fn lower_fn_type(&mut self, t: &ast::Type) -> Option<Ty> {
         let (params, ret): (Vec<ast::Type>, Option<ast::Type>) = match t {
@@ -126,7 +165,7 @@ impl Checker<'_> {
             ast::Type::DynTraitType(d) => return self.lower_fn_bounds(&d.type_bound_list()?),
             _ => return None,
         };
-        let params = params.iter().map(|p| self.lower_type(p)).collect();
+        let params = params.iter().map(|p| self.closure_param_ty(p)).collect();
         let ret = ret.map(|r| self.lower_type(&r)).unwrap_or(Ty::Unit);
         Some(Ty::Closure {
             params,
@@ -158,7 +197,7 @@ impl Checker<'_> {
             .filter_map(|a| a.ty())
             .collect();
         let ret = seg.ret_type().and_then(|r| r.ty());
-        let params = params.iter().map(|p| self.lower_type(p)).collect();
+        let params = params.iter().map(|p| self.closure_param_ty(p)).collect();
         let ret = ret.map(|r| self.lower_type(&r)).unwrap_or(Ty::Unit);
         let ret = if is_async {
             Ty::Future(Box::new(ret))
@@ -306,25 +345,25 @@ impl Checker<'_> {
 
     /// Whether `collect` can build `target` from elements of `elem`. `None` means the target isn't
     /// known yet.
-    fn collect_into(&mut self, target: &Ty, elem: &Ty) -> Option<bool> {
+    fn collect_into(&mut self, target: &Ty, elem: &Ty, node: &SyntaxNode) -> Option<bool> {
         Some(match self.shallow(target) {
             Ty::Vec(x) | Ty::Set(x) => self.unify(&x, elem),
             Ty::Map(k, v) => self.unify(&Ty::Tuple(vec![*k, *v]), elem),
-            Ty::Coll(_, view) => return self.collect_into(&view, elem),
+            Ty::Coll(_, view) => return self.collect_into(&view, elem, node),
             // `Result<C, E>` from `Result<T, E>` items, collecting the `T`s into `C`.
             Ty::Result(inner, err) => {
                 let item = self.fresh(VarKind::General);
                 if !self.unify(elem, &Ty::Result(Box::new(item.clone()), err)) {
                     return Some(false);
                 }
-                return self.collect_into(&inner, &item);
+                return self.collect_into(&inner, &item, node);
             }
             Ty::Option(inner) => {
                 let item = self.fresh(VarKind::General);
                 if !self.unify(elem, &Ty::Option(Box::new(item.clone()))) {
                     return Some(false);
                 }
-                return self.collect_into(&inner, &item);
+                return self.collect_into(&inner, &item, node);
             }
             Ty::Str => matches!(
                 self.shallow(elem),
@@ -336,7 +375,9 @@ impl Checker<'_> {
             }
             // `impl FromIterator<T> for Bag`
             Ty::Adt(n, args) if self.adts.method(&n, "from_iter").is_some() => {
-                let m = self.adts.method(&n, "from_iter").cloned().unwrap();
+                // (Several `impl FromIterator<X>`: the one for these elements.)
+                let key = self.pick_alt_by_item(&n, "from_iter", 0, elem, node);
+                let m = self.adts.method(&n, &key).cloned().unwrap();
                 let m = self.method_inst(&m, Some(&args));
                 match m.params.first().map(|p| self.shallow(p)) {
                     Some(Ty::IntoIter(item)) => self.unify(&item, elem),
@@ -354,7 +395,7 @@ impl Checker<'_> {
         let saved = self.base;
         for (target, elem, node, base) in std::mem::take(&mut self.pending_collects) {
             self.base = base;
-            match self.collect_into(&target, &elem) {
+            match self.collect_into(&target, &elem, &node) {
                 Some(true) => {}
                 Some(false) => {
                     let msg = format!(
@@ -847,8 +888,9 @@ impl Checker<'_> {
         // Adapters with closures: the parameter that gets an item binds a slot.
         let closure_params: &[usize] = match method {
             "filter" | "find" | "position" | "any" | "all" | "map" | "filter_map" | "inspect"
-            | "skip_while" | "take_while" | "max_by_key" | "min_by_key" | "for_each" => &[0],
-            "fold" => &[1],
+            | "skip_while" | "take_while" | "max_by_key" | "min_by_key" | "for_each"
+            | "try_for_each" | "find_map" => &[0],
+            "fold" | "try_fold" => &[1],
             "max_by" | "min_by" => &[0, 1],
             _ => &[],
         };
@@ -1254,7 +1296,7 @@ impl Checker<'_> {
                         _ => fresh(self),
                     },
                 };
-                match self.collect_into(&target, &e) {
+                match self.collect_into(&target, &e, m.syntax()) {
                     Some(true) => {}
                     Some(false) => {
                         let msg = format!(

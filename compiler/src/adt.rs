@@ -184,6 +184,9 @@ pub struct ConstParam {
     pub derive: Option<(usize, String)>,
 }
 
+/// A user-trait impl's self type arguments and trait arguments (see `Adts::impl_heads`).
+pub type ImplHead = (Vec<Ty>, Vec<Ty>);
+
 #[derive(Default, Clone, Debug)]
 pub struct Adts {
     pub defs: HashMap<String, AdtDef>,
@@ -206,6 +209,10 @@ pub struct Adts {
     pub blankets: HashMap<String, Vec<String>>,
     /// Each impl's associated types (`type Unit = f64;`), by (type, trait).
     pub impl_assoc: HashMap<(String, String), HashMap<String, Ty>>,
+    /// Each user-trait impl's self type arguments and trait arguments (`impl<T> Store<T> for
+    /// Bag<T>` → `([T], [T])`), by (type, trait): what a generic call's `S: Store<X>` makes `X`
+    /// once `S` is known, and what the impl's parameters in `impl_assoc` stand for.
+    pub impl_heads: HashMap<(String, String), Vec<ImplHead>>,
     /// The user traits each type implements.
     pub trait_impls: HashMap<String, Vec<String>>,
     /// Names of loaded modules (`mod name;`), which paths may start with.
@@ -218,6 +225,11 @@ pub struct Adts {
     pub method_alts: HashMap<String, Vec<String>>,
     /// Those keys by the absolute offset of the method's name.
     pub alt_keys_at: HashMap<usize, String>,
+    /// For `TryFrom` / `Extend` / `FromIterator` impls, what their argument (or item) type is
+    /// as written, by `"Type::key"`: `TryFrom<&str>` and `TryFrom<String>` take the same JS
+    /// value, so a call picks between them by how its argument is written (`.as_str()`,
+    /// `.to_string()`, `&x`).
+    pub alt_arg_refs: HashMap<String, ArgRef>,
     /// `impl Add<R> for T` and the other `std::ops` traits, by `T`.
     pub op_impls: HashMap<String, Vec<OpImpl>>,
     /// Associated constants (`impl Grid { const W: usize = 3; }`), by type then name.
@@ -259,7 +271,7 @@ pub fn own_method(m: &str) -> bool {
 
 /// The key a built-in type's extension-trait methods are stored under: `i32`, `f64`, `bool`,
 /// `char`, `String` (also for `str`), `Vec`, `Option`, `Result`, `HashMap`, `HashSet`,
-/// `BTreeMap`, `BTreeSet`.
+/// `BTreeMap`, `BTreeSet`, `VecDeque`, `Range`, `RangeInclusive`.
 pub fn ext_key(name: &str) -> Option<&'static str> {
     Some(match name {
         "i8" => "i8",
@@ -286,6 +298,9 @@ pub fn ext_key(name: &str) -> Option<&'static str> {
         "HashSet" => "HashSet",
         "BTreeMap" => "BTreeMap",
         "BTreeSet" => "BTreeSet",
+        "VecDeque" => "VecDeque",
+        "Range" => "Range",
+        "RangeInclusive" => "RangeInclusive",
         _ => return None,
     })
 }
@@ -307,6 +322,9 @@ pub fn ext_key_of(t: &Ty) -> Option<&'static str> {
         Ty::Set(_) => Some("HashSet"),
         Ty::Coll(crate::ty::Coll::BTreeMap, _) => Some("BTreeMap"),
         Ty::Coll(crate::ty::Coll::BTreeSet, _) => Some("BTreeSet"),
+        Ty::Coll(crate::ty::Coll::VecDeque, _) => Some("VecDeque"),
+        Ty::Range(_, false) => Some("Range"),
+        Ty::Range(_, true) => Some("RangeInclusive"),
         _ => None,
     }
 }
@@ -315,7 +333,7 @@ pub fn ext_key_of(t: &Ty) -> Option<&'static str> {
 /// `[String, i64]`), matched against a receiver's.
 pub fn ext_args(t: &Ty) -> Vec<Ty> {
     match t {
-        Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) => vec![(**e).clone()],
+        Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Range(e, _) => vec![(**e).clone()],
         Ty::Map(k, v) | Ty::Result(k, v) => vec![(**k).clone(), (**v).clone()],
         Ty::Coll(_, view) => ext_args(view),
         _ => vec![],
@@ -362,6 +380,33 @@ fn boxed_builtin(p: &ast::PathType) -> Option<String> {
         _ => return None,
     };
     ext_key(&name).map(|_| name)
+}
+
+/// What a conversion's argument is, by how it's written (references are erased in JS).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArgRef {
+    /// `&str` / `&[T]`: a string literal, `s.as_str()`, `&v[..]`.
+    Slice,
+    /// Another reference: `&String`, `&'a T`, `&x`, the items of `v.iter()`.
+    Ref,
+    /// A value: `String`, `T`, `s.to_string()`, `format!(..)`, the items of `vec![..]`.
+    Owned,
+}
+
+/// `ArgRef` of a type as written in an impl's trait arguments (`TryFrom<&str>`).
+pub fn written_arg_ref(t: &ast::Type) -> ArgRef {
+    match t {
+        ast::Type::RefType(r) => match r.ty() {
+            Some(ast::Type::SliceType(_)) => ArgRef::Slice,
+            Some(ast::Type::PathType(p))
+                if p.path().is_some_and(|p| p.syntax().text() == "str") =>
+            {
+                ArgRef::Slice
+            }
+            _ => ArgRef::Ref,
+        },
+        _ => ArgRef::Owned,
+    }
 }
 
 /// One `impl Add<R> for T` (or `Sub`, `Neg`, `AddAssign`, ..): its method is `key` (`add$0`).
@@ -425,8 +470,9 @@ pub enum Conv {
     Ext { key: String },
     /// `x.try_into()` to an integer type: `κσ.$tryInt(x, bits, signed, big)`.
     TryInt { bits: u32, signed: bool, big: bool },
-    /// `x.try_into()` through an `impl TryFrom<X> for Y`: `Y.try_from(x)`.
-    TryFrom { adt: String },
+    /// `x.try_into()` through an `impl TryFrom<X> for Y`: `Y.key(x)` (`try_from`, or
+    /// `try_from$1`, .. when `Y` has several).
+    TryFrom { adt: String, key: String },
     /// `v.try_into()` from a slice to an array: `Ok` of a copy (lengths aren't in the types).
     TryVec,
     /// `n.try_into()` to a `char`: `κσ.$tryChar(n)`.
@@ -588,11 +634,72 @@ pub fn impl_parts(imp: &ast::Impl) -> (Option<String>, Option<String>) {
                 .and_then(|s| s.name_ref())
                 .is_some_and(|n| matches!(n.text().to_string().as_str(), "Box" | "Rc" | "Arc")) =>
         {
-            boxed_builtin(&p).or_else(|| name_of(Some(ast::Type::PathType(p))))
+            boxed_builtin(&p)
+                .or_else(|| boxed_named(&p, imp))
+                .or_else(|| name_of(Some(ast::Type::PathType(p))))
+        }
+        // (`Pin<Box<Fut>>`: as `Box<Fut>`.)
+        Some(ast::Type::PathType(p))
+            if p.path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| n.text() == "Pin") =>
+        {
+            boxed_named(&p, imp).or_else(|| name_of(Some(ast::Type::PathType(p))))
         }
         t => name_of(t),
     };
     (name_of(imp.trait_()), self_name)
+}
+
+/// The named type in `Box<Shape>` / `Rc<Node>` / `Pin<Box<Fut>>` (a box is its contents in JS,
+/// so the impl is the type's), unless it's one of the impl's type parameters (`impl<T> Tr for
+/// Box<T>`, see `wrapped_param`).
+fn boxed_named(p: &ast::PathType, imp: &ast::Impl) -> Option<String> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let seg = p.path()?.segment()?;
+    let ast::GenericArg::TypeArg(a) = seg.generic_arg_list()?.generic_args().next()? else {
+        return None;
+    };
+    // `impl From<Sq> for Box<dyn Shape>`: `dyn$Shape`, a class of its own for the `from`s.
+    if let Some(ast::Type::DynTraitType(d)) = a.ty()
+        && impl_parts_trait(imp).as_deref() == Some("From")
+    {
+        let b = d.type_bound_list()?.bounds().next()?;
+        let ast::Type::PathType(p) = b.ty()? else {
+            return None;
+        };
+        return Some(format!("dyn${}", p.path()?.segment()?.name_ref()?.text()));
+    }
+    let ast::Type::PathType(inner) = a.ty()? else {
+        return None;
+    };
+    let n = inner.path()?.segment()?.name_ref()?.text().to_string();
+    if matches!(n.as_str(), "Box" | "Rc" | "Arc" | "Pin") {
+        return boxed_builtin(&inner).or_else(|| boxed_named(&inner, imp));
+    }
+    let is_param = imp.generic_param_list().is_some_and(|l| {
+        l.generic_params().any(|g| {
+            matches!(g, ast::GenericParam::TypeParam(tp) if tp.name().is_some_and(|x| x.text() == n.as_str()))
+        })
+    });
+    (!is_param).then_some(n)
+}
+
+/// The trait's name of `impl Trait for ..`.
+fn impl_parts_trait(imp: &ast::Impl) -> Option<String> {
+    match imp.trait_()? {
+        ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+        _ => None,
+    }
+}
+
+/// The extension key of a built-in type's impls (`ext_key`), or `dyn$Shape` for the `From`
+/// impls of `Box<dyn Shape>`.
+pub fn ext_key_any(name: &str) -> Option<String> {
+    ext_key(name)
+        .map(str::to_string)
+        .or_else(|| name.starts_with("dyn$").then(|| name.to_string()))
 }
 
 /// `impl<T: Bound> Trait for T`: (the trait, `T`, `T`'s bounds from the parameter list and the
@@ -747,10 +854,21 @@ fn forwards(f: &ast::Fn) -> bool {
                                     | "deref_mut"
                                     | "borrow"
                                     | "borrow_mut"
+                                    | "as_str"
+                                    | "as_mut_str"
+                                    | "as_slice"
+                                    | "as_mut_slice"
                             )
                         }) =>
                 {
                     m.receiver()?
+                }
+                // (`self[..]`: a `String`'s or `Vec`'s whole slice.)
+                ast::Expr::IndexExpr(i)
+                    if matches!(i.index(), Some(ast::Expr::RangeExpr(r))
+                        if ast::RangeItem::start(&r).is_none() && ast::RangeItem::end(&r).is_none()) =>
+                {
+                    i.base()?
                 }
                 other => return Some(other),
             };
@@ -953,8 +1071,9 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
             .cloned()
             .collect();
         // `impl Tr for String` next to `impl Tr for str` (or `Vec<T>` next to `[T]`): one type in
-        // JS, so the borrowed type's impl serves and the owned one (which usually hands on to it,
-        // `self.as_str().f()`) goes.
+        // JS, so the borrowed type's impl serves and the owned one goes when it hands each call
+        // on to it (`self.as_str().f()`). (One that doesn't stays, and the checker reports the
+        // two impls.)
         let twin = |imp: &ast::Impl| -> Option<(String, bool)> {
             let tr = imp.trait_()?.syntax().text().to_string();
             let mut t = imp.self_ty()?;
@@ -991,7 +1110,16 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
             .into_iter()
             .filter(|i| match i {
                 ast::Item::Impl(imp) => {
-                    !twin(imp).is_some_and(|(k, owned)| owned && borrowed.contains(&k))
+                    !(twin(imp).is_some_and(|(k, owned)| owned && borrowed.contains(&k))
+                        && imp
+                            .assoc_item_list()
+                            .into_iter()
+                            .flat_map(|l| l.assoc_items())
+                            .all(|item| match item {
+                                ast::AssocItem::Fn(f) => forwards(&f),
+                                ast::AssocItem::TypeAlias(_) | ast::AssocItem::Const(_) => true,
+                                ast::AssocItem::MacroCall(_) => false,
+                            }))
                 }
                 _ => true,
             })

@@ -359,6 +359,10 @@ impl Codegen<'_> {
             return None;
         }
         let vec = im.receiver()?;
+        // (A map's `iter_mut()` is its own iterator.)
+        if matches!(self.ty_of(strip_refs(&vec).syntax()), Some(Ty::Map(..))) {
+            return None;
+        }
         let (vf, _) = self.emit_expr(&vec, None);
         let place = if is_pure(&strip_refs(&vec)) {
             vf.plain()
@@ -373,11 +377,12 @@ impl Codegen<'_> {
             t
         };
         let i = self.temp();
-        let element = format!("{place}[{i}]");
+        // (A `VecDeque`'s element `i` is at `d.b[d.$p(i)]`.)
+        let element = self.index_place(&vec, &place, &i);
         let subjects = if enumerate {
-            vec![vec![i.clone(), element]]
+            vec![vec![i.clone(), element.clone()]]
         } else {
-            vec![vec![element]]
+            vec![vec![element.clone()]]
         };
         let closure = match m.arg_list()?.args().next()? {
             ast::Expr::ClosureExpr(c) => self.emit_closure_aliased(&c, vec![i], subjects),
@@ -385,9 +390,9 @@ impl Codegen<'_> {
                 // A function value gets a copy of the element; it can't write back.
                 let (f, _) = self.emit_expr(&other, None);
                 let call = if enumerate {
-                    format!("[{i}, {place}[{i}]]")
+                    format!("[{i}, {element}]")
                 } else {
-                    format!("{place}[{i}]")
+                    element
                 };
                 Frag::text(format!("({i}) => "))
                     .append(f)
@@ -538,6 +543,23 @@ impl Codegen<'_> {
             (Ty::Map(..), "iter" | "into_iter") => out(call("entries", vec![])),
             (Ty::Map(..), "keys" | "into_keys") => out(call("keys", vec![])),
             (Ty::Map(..), "values" | "into_values") => out(call("values", vec![])),
+            // Slots over numbers, strings and bools; over JS objects, the values themselves.
+            (Ty::Map(..), "values_mut" | "iter_mut")
+                if self.types.slot_calls.contains(&self.range_of(m.syntax())) =>
+            {
+                let pairs = Frag::text(if method == "iter_mut" {
+                    "true"
+                } else {
+                    "false"
+                });
+                out(helper("mapMutSlots", vec![pairs]))
+            }
+            (Ty::Map(_, v), "values_mut") if !v.is_js_primitive() && **v != Ty::Unknown => {
+                out(call("values", vec![]))
+            }
+            (Ty::Map(_, v), "iter_mut") if !v.is_js_primitive() && **v != Ty::Unknown => {
+                out(call("entries", vec![]))
+            }
 
             // ---- Vec
             (Ty::Vec(_), "sort_by" | "sort_unstable_by") => {
@@ -733,7 +755,7 @@ impl Codegen<'_> {
             // ---- iterators
             (Ty::Iter { elem, .. }, m2) => {
                 let elem = (**elem).clone();
-                self.emit_iter_method(m2, rf, &elem, a0, a1, &result_ty, &call)
+                self.emit_iter_method(m, m2, rf, &elem, a0, a1, &result_ty, &call)
             }
             _ => None,
         }
@@ -742,6 +764,7 @@ impl Codegen<'_> {
     #[allow(clippy::too_many_arguments)]
     fn emit_iter_method(
         &mut self,
+        m: &ast::MethodCallExpr,
         method: &str,
         rf: &Frag,
         elem: &Ty,
@@ -962,7 +985,14 @@ impl Codegen<'_> {
                     ),
                     // `impl FromIterator<T> for Bag`: `Bag.from_iter(it)`.
                     Ty::Adt(n, _) if self.types.adts.method(n, "from_iter").is_some() => {
-                        let mut f = Frag::text(format!("{}.from_iter(", self.class(n)));
+                        // (One of several `impl FromIterator<X>`: its key.)
+                        let key = self
+                            .types
+                            .method_keys
+                            .get(&self.range_of(m.syntax()))
+                            .cloned()
+                            .unwrap_or_else(|| "from_iter".into());
+                        let mut f = Frag::text(format!("{}.{key}(", self.class(n)));
                         f.append(rf.clone()).push(")");
                         f
                     }

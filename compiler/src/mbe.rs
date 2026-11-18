@@ -457,6 +457,11 @@ fn parse_matcher(toks: &[Tok]) -> Result<Vec<Pat>, String> {
                         }
                     }
                 }
+                // A `$` with nothing after it is itself (syn's `[$] => { .. }`).
+                None => {
+                    out.push(Pat::Tok("$".into()));
+                    i += 1;
+                }
                 _ => return Err("expected a name or `(` after `$`".into()),
             },
             Tok::Leaf { text, .. } => {
@@ -507,6 +512,10 @@ fn parse_transcriber(toks: &[Tok]) -> Result<Vec<Tpl>, String> {
                     out.push(Tpl::Var(name.clone(), *spaced));
                     i += 2;
                 }
+                None => {
+                    out.push(Tpl::Tok("$".into(), false));
+                    i += 1;
+                }
                 _ => return Err("expected a name or `(` after `$`".into()),
             },
             Tok::Leaf { text, spaced, .. } => {
@@ -538,11 +547,21 @@ struct Rule {
     transcriber: Vec<Tpl>,
 }
 
-/// A captured fragment: its text (and whether it's an `expr`), or one per repetition.
+/// A captured fragment: its text and kind, or one per repetition.
 #[derive(Clone, Debug)]
 enum Bound {
-    One(String, bool),
+    One(String, Frag),
     Seq(Vec<Bound>),
+}
+
+/// What a capture needs around it to stay one piece of syntax once it's text again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Frag {
+    /// Parenthesized, as Rust treats it as one expression.
+    Expr,
+    /// Parenthesized before a `<` (`as $t << 3` isn't `$t<..>`).
+    Ty,
+    Other,
 }
 
 type Bindings = HashMap<String, Bound>;
@@ -606,7 +625,16 @@ impl Matcher<'_> {
                     let end = self.fragment(kind, toks, pos, &stop)?;
                     // (An empty `vis` binds nothing.)
                     let text = capture(&toks[pos..end], self.src);
-                    b.insert(name.clone(), Bound::One(text, kind == "expr"));
+                    // (A block needs no parentheses, and in statement position mustn't have
+                    // them: `$body $i += 1;` with a `{ .. }` body.)
+                    let block = end == pos + 1
+                        && matches!(&toks[pos], Tok::Group { open, .. } if open == "{");
+                    let frag = match kind.as_str() {
+                        "expr" | "expr_2021" if !block => Frag::Expr,
+                        "ty" => Frag::Ty,
+                        _ => Frag::Other,
+                    };
+                    b.insert(name.clone(), Bound::One(text, frag));
                     pos = end;
                 }
                 Pat::Rep(inner, sep, op) => {
@@ -674,6 +702,19 @@ impl Matcher<'_> {
             return Some(pos);
         }
         let t = toks.get(pos)?;
+        // One fragment as rustc parses it (`$($n:expr)*` takes `0 1 2` as three, and
+        // `<R<(), ()> as Clone>::clone(&x)` is one `expr`). Falls back to the scan below when the
+        // parser doesn't take the tokens.
+        // A `pat` the rule follows with `|` (`|$it:pat| ..`, 2018-edition code) has no top-level
+        // alternatives, as `pat_param` doesn't.
+        let parsed_kind = if kind == "pat" && stop.first().is_some_and(|s| s == "|") {
+            "pat_param"
+        } else {
+            kind
+        };
+        if let Some(end) = parsed_end(parsed_kind, toks, pos) {
+            return Some(end);
+        }
         match kind {
             "ident" => match t {
                 Tok::Leaf { text, .. }
@@ -702,7 +743,8 @@ impl Matcher<'_> {
                 }
                 _ => None,
             },
-            "tt" => Some(pos + 1),
+            // One token tree, where joined punctuation is one token (`=>`, `::`, `..=`).
+            "tt" => Some(pos + joint_punct_len(toks, pos)),
             // `pub`, `pub(crate)`, .., or nothing at all.
             "vis" => match t {
                 Tok::Leaf { text, .. } if text == "pub" => match toks.get(pos + 1) {
@@ -767,6 +809,144 @@ impl Matcher<'_> {
             }
         }
     }
+}
+
+/// How many tokens at `toks[pos..]` make one of Rust's multi-character operators, written
+/// together (`=>` is one `tt` to rustc; `= >` is two); 1 for anything else.
+fn joint_punct_len(toks: &[Tok], pos: usize) -> usize {
+    const OPS: [&str; 24] = [
+        "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=",
+        "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..",
+    ];
+    let mut s = String::new();
+    let mut k = pos;
+    let mut lens = Vec::new();
+    while let Some(Tok::Leaf {
+        text, kind, spaced, ..
+    }) = toks.get(k)
+    {
+        if !kind.is_punct() || s.len() >= 3 {
+            break;
+        }
+        s.push_str(text);
+        k += 1;
+        lens.push((s.clone(), k - pos));
+        if *spaced {
+            break;
+        }
+    }
+    lens.iter()
+        .rev()
+        .find(|(op, _)| OPS.contains(&op.as_str()))
+        .map_or(1, |&(_, n)| n)
+}
+
+/// The end of the `kind` fragment at `toks[pos..]` by rust-analyzer's parser (the same prefix
+/// parse rustc's macro matcher does), or `None` when it isn't a parsed kind, the parser reports
+/// an error, or it stops inside a group.
+fn parsed_end(kind: &str, toks: &[Tok], pos: usize) -> Option<usize> {
+    use ra_ap_parser::{Input, PrefixEntryPoint, Step};
+    let entry = match kind {
+        "expr" | "expr_2021" => PrefixEntryPoint::Expr,
+        "ty" => PrefixEntryPoint::Ty,
+        "pat" => PrefixEntryPoint::PatTop,
+        "pat_param" => PrefixEntryPoint::Pat,
+        "path" => PrefixEntryPoint::Path,
+        "stmt" => PrefixEntryPoint::Stmt,
+        "item" => PrefixEntryPoint::Item,
+        "meta" => PrefixEntryPoint::MetaItem,
+        _ => return None,
+    };
+    fn delim(s: &str) -> Option<SyntaxKind> {
+        Some(match s {
+            "(" => SyntaxKind::L_PAREN,
+            ")" => SyntaxKind::R_PAREN,
+            "[" => SyntaxKind::L_BRACK,
+            "]" => SyntaxKind::R_BRACK,
+            "{" => SyntaxKind::L_CURLY,
+            "}" => SyntaxKind::R_CURLY,
+            _ => return None,
+        })
+    }
+    // Pushes `toks`, flattened; `false` for a token the parser can't be given.
+    fn push(input: &mut Input, toks: &[Tok]) -> bool {
+        let ed = crate::macros::EDITION;
+        for (i, t) in toks.iter().enumerate() {
+            match t {
+                Tok::Leaf {
+                    text, kind, spaced, ..
+                } => {
+                    if *kind == SyntaxKind::IDENT {
+                        let ctx = SyntaxKind::from_contextual_keyword(text, ed)
+                            .unwrap_or(SyntaxKind::IDENT);
+                        input.push_ident(ctx, ed);
+                    } else {
+                        input.push(*kind, ed);
+                    }
+                    // `:` `:` is `::` only when written together.
+                    let next_punct = matches!(
+                        toks.get(i + 1),
+                        Some(Tok::Leaf { kind: k, .. }) if k.is_punct()
+                    );
+                    if kind.is_punct() && !spaced && next_punct {
+                        input.was_joint();
+                    }
+                }
+                Tok::Group {
+                    open, close, toks, ..
+                } => {
+                    let (Some(o), Some(c)) = (delim(open), delim(close)) else {
+                        return false;
+                    };
+                    input.push(o, ed);
+                    if !push(input, toks) {
+                        return false;
+                    }
+                    input.push(c, ed);
+                }
+            }
+        }
+        true
+    }
+    // The flattened length at the end of each token from `pos`.
+    fn flat_len(t: &Tok) -> usize {
+        match t {
+            Tok::Leaf { .. } => 1,
+            Tok::Group { toks, .. } => 2 + toks.iter().map(flat_len).sum::<usize>(),
+        }
+    }
+    // No fragment runs past a top-level `;` (an item may end with one), so the parser isn't
+    // handed the rest of a long invocation each time.
+    let to = toks[pos..]
+        .iter()
+        .position(|t| t.text() == Some(";"))
+        .map_or(toks.len(), |k| pos + k + 1);
+    let toks = &toks[..to];
+    let mut input = Input::with_capacity(toks.len() - pos);
+    if !push(&mut input, &toks[pos..]) {
+        return None;
+    }
+    let ends: Vec<usize> = toks[pos..]
+        .iter()
+        .scan(0, |n, t| {
+            *n += flat_len(t);
+            Some(*n)
+        })
+        .collect();
+    let out = entry.parse(&input);
+    let mut n = 0usize;
+    for step in out.iter() {
+        match step {
+            Step::Token { n_input_tokens, .. } => n += n_input_tokens as usize,
+            Step::FloatSplit { .. } => n += 1,
+            Step::Error { .. } => return None,
+            Step::Enter { .. } | Step::Exit => {}
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    ends.iter().position(|&e| e == n).map(|k| pos + k + 1)
 }
 
 fn starts_with(toks: &[Tok], at: usize, seq: &[String]) -> bool {
@@ -1059,10 +1239,11 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
             let prev = i.checked_sub(1).and_then(|j| text(&t[j]));
             let next = t.get(i + 1).and_then(text);
             out.push(match x {
-                // (Not a field: `.x`, `Point { x: 1 }`, `a::x`.)
+                // (Not a field: `.x`, `Point { x: 1 }`, `a::x`; nor a rule's marker:
+                // `closures!(@closure ..)`.)
                 Tpl::Tok(s, sp)
                     if names.contains(s)
-                        && !matches!(prev, Some("." | "::"))
+                        && !matches!(prev, Some("." | "::" | "@"))
                         && !(braces && next == Some(":") && matches!(prev, None | Some(",")))
                         && !(prev == Some(":") && i >= 2 && text(&t[i - 2]) == Some(":")) =>
                 {
@@ -1088,7 +1269,7 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
 }
 
 fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
-    for x in t {
+    for (i, x) in t.iter().enumerate() {
         match x {
             Tpl::Tok(s, spaced) => {
                 out.push_str(s);
@@ -1101,7 +1282,7 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
             Tpl::Group(o, c, inner, spaced)
                 if out.trim_end().ends_with("stringify!")
                     && matches!(inner.as_slice(), [Tpl::Var(n, _)]
-                        if matches!(b.get(n), Some(Bound::One(_, true)))) =>
+                        if matches!(b.get(n), Some(Bound::One(_, Frag::Expr)))) =>
             {
                 let [Tpl::Var(n, _)] = inner.as_slice() else {
                     unreachable!()
@@ -1125,8 +1306,9 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
             }
             Tpl::Var(n, spaced) => {
                 match b.get(n) {
-                    Some(Bound::One(text, expr)) => {
-                        if *expr {
+                    Some(Bound::One(text, frag)) => {
+                        let angle = matches!(t.get(i + 1), Some(Tpl::Tok(s, _)) if s == "<");
+                        if *frag == Frag::Expr || (*frag == Frag::Ty && angle) {
                             out.push('(');
                             out.push_str(text);
                             out.push(')');
@@ -1180,13 +1362,17 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
                     }
                     let at = out.len();
                     transcribe(inner, &ib, out)?;
-                    // Repetitions are separate tokens: `$($a : $b)*` → `a : b c : d`, not `bc`.
+                    // Repetitions are separate tokens: `$($a : $b)*` → `a : b c : d`, not `bc`,
+                    // and `"x" as` isn't the literal `"x"as` with a suffix.
                     // (Punctuation stays joined: `$($t)*` of `::` is `::`.)
                     let word = |c: char| c.is_alphanumeric() || c == '_';
+                    // Nor is `x #y` the reserved prefix `x#`, or `r "s"` the raw string `r"s"`.
+                    let lit_end = |c: char| word(c) || matches!(c, '"' | '\'');
+                    let lit_start = |c: char| word(c) || matches!(c, '"' | '\'' | '#');
                     if k > 0
                         && sep.is_none()
-                        && out[..at].ends_with(word)
-                        && out[at..].starts_with(word)
+                        && ((out[..at].ends_with(lit_end) && out[at..].starts_with(word))
+                            || (out[..at].ends_with(word) && out[at..].starts_with(lit_start)))
                     {
                         out.insert(at, ' ');
                     }
@@ -1268,7 +1454,12 @@ fn own_macros_left_out(macros: &str, src: &str) -> String {
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        if !src.contains(&format!("macro_rules! {name}")) {
+        // (`macro_rules! log_enabled` doesn't define `log`.)
+        let pat = format!("macro_rules! {name}");
+        let defined = src.match_indices(&pat).any(|(k, _)| {
+            !src[k + pat.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        });
+        if !defined {
             out.push_str("macro_rules! ");
             out.push_str(block);
         }
@@ -1284,34 +1475,41 @@ pub(crate) fn uses_log(src: &str) -> bool {
         || src.contains("simple_logger")
 }
 
-/// The bundled `log`'s macros: `info!(..)` and the other levels (also with `target: ..`),
-/// `log!(level, ..)` and `log_enabled!(level)`.
+/// The bundled `log`'s macros: `info!(..)` and the other levels (also with `target: ..` and
+/// `logger: ..`, which is the global logger here), `log!(level, ..)` and `log_enabled!(level)`.
 const LOG_MACROS: &str = r#"
 macro_rules! log {
+    (logger: $l:expr, $($rest:tt)+) => { log!($($rest)+) };
     (target: $t:expr, $lvl:expr, $($arg:tt)+) => { __log_emit($lvl, &format!($($arg)+)) };
     ($lvl:expr, $($arg:tt)+) => { __log_emit($lvl, &format!($($arg)+)) };
 }
 macro_rules! log_enabled {
+    (logger: $l:expr, $($rest:tt)+) => { log_enabled!($($rest)+) };
     (target: $t:expr, $lvl:expr) => { __log_enabled($lvl) };
     ($lvl:expr) => { __log_enabled($lvl) };
 }
 macro_rules! error {
+    (logger: $l:expr, $($rest:tt)+) => { error!($($rest)+) };
     (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Error, &format!($($arg)+)) };
     ($($arg:tt)+) => { __log_emit(LogLevel::Error, &format!($($arg)+)) };
 }
 macro_rules! warn {
+    (logger: $l:expr, $($rest:tt)+) => { warn!($($rest)+) };
     (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Warn, &format!($($arg)+)) };
     ($($arg:tt)+) => { __log_emit(LogLevel::Warn, &format!($($arg)+)) };
 }
 macro_rules! info {
+    (logger: $l:expr, $($rest:tt)+) => { info!($($rest)+) };
     (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Info, &format!($($arg)+)) };
     ($($arg:tt)+) => { __log_emit(LogLevel::Info, &format!($($arg)+)) };
 }
 macro_rules! debug {
+    (logger: $l:expr, $($rest:tt)+) => { debug!($($rest)+) };
     (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Debug, &format!($($arg)+)) };
     ($($arg:tt)+) => { __log_emit(LogLevel::Debug, &format!($($arg)+)) };
 }
 macro_rules! trace {
+    (logger: $l:expr, $($rest:tt)+) => { trace!($($rest)+) };
     (target: $t:expr, $($arg:tt)+) => { __log_emit(LogLevel::Trace, &format!($($arg)+)) };
     ($($arg:tt)+) => { __log_emit(LogLevel::Trace, &format!($($arg)+)) };
 }
@@ -1368,6 +1566,20 @@ fn foreign_path(segs: &[String]) -> bool {
 
 fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Vec<Site> {
     let in_def = |n: &SyntaxNode| n.ancestors().any(|a| ast::MacroRules::can_cast(a.kind()));
+    // Tokens a proc macro emits (`quote! { icu::langid!(#repr) }`) aren't expanded here.
+    let in_quote = |n: &SyntaxNode| {
+        n.ancestors().filter_map(ast::MacroCall::cast).any(|c| {
+            c.path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| {
+                    matches!(
+                        n.text(),
+                        "quote" | "quote_spanned" | "parse_quote" | "parse_quote_spanned"
+                    )
+                })
+        })
+    };
     let mut sites: Vec<Site> = Vec::new();
     for c in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
         let Some(name) = c
@@ -1417,7 +1629,7 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::TOKEN_TREE)
     {
-        if in_def(&tt) {
+        if in_def(&tt) || in_quote(&tt) {
             continue;
         }
         let items: Vec<NodeOrToken<SyntaxNode, ra_ap_syntax::SyntaxToken>> = tt
@@ -1694,6 +1906,10 @@ fn expand_with(
             edits.push((
                 (a, b),
                 if site.in_expr {
+                    // An expression's trailing `;` is dropped, as rustc does (`None =>
+                    // bail!(..)` of `return Err(..);`).
+                    let body = body.trim_end();
+                    let body = body.strip_suffix(';').unwrap_or(body);
                     format!("({body})")
                 } else {
                     body
@@ -1798,11 +2014,90 @@ fn include_strs(
     Ok(changed)
 }
 
+/// Macros named like keywords of the 2021 edition the file is parsed as. `safe` (bitvec's
+/// `safe! { .. }`): the parser takes `safe` before an item as the `safe fn` qualifier and fails
+/// on `safe!`, so its definition and calls are spelled `Safe` (macros have their own namespace,
+/// so a type `Safe` is fine). `try` (2015-edition code's `try!(x)`, std's or the file's own
+/// `macro_rules! try`) is a keyword since 2018, spelled `r#try` as rustc does.
+fn rename_keyword_macros(text: &mut String, map: &mut OffsetMap) -> bool {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let named = |name: &str| {
+        text.match_indices("macro_rules!").any(|(k, m)| {
+            let rest = text[k + m.len()..].trim_start();
+            rest.starts_with(name) && !rest.as_bytes().get(name.len()).is_some_and(|&c| word(c))
+        })
+    };
+    let safe = named("safe");
+    let try_ = text.contains("try!");
+    if !safe && !try_ {
+        return false;
+    }
+    // The `safe` / `try` tokens before a `!` (not `!=`) or after `macro_rules!`.
+    let file = crate::macros::parse_tree(text);
+    let toks: Vec<ra_ap_syntax::SyntaxToken> = file
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    let mut edits: Vec<(usize, usize, &str)> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        // (`safe` is lexed as an identifier, but the parser may have made it the keyword.)
+        let to = match (t.kind(), t.text()) {
+            (SyntaxKind::IDENT | SyntaxKind::SAFE_KW, "safe") if safe => "Safe",
+            (SyntaxKind::TRY_KW, "try") => "r#try",
+            _ => continue,
+        };
+        let next = |k: usize| toks.get(i + k).map(|t| t.text().to_string());
+        let call = next(1).as_deref() == Some("!")
+            && !(next(2).as_deref() == Some("=")
+                && toks[i + 1].text_range().end() == toks[i + 2].text_range().start());
+        let def = i >= 2 && toks[i - 1].text() == "!" && toks[i - 2].text() == "macro_rules";
+        if call || def {
+            let r = t.text_range();
+            edits.push((r.start().into(), r.end().into(), to));
+        }
+    }
+    for &(a, b, to) in edits.iter().rev() {
+        text.replace_range(a..b, to);
+        map.replace(a, b, to.len());
+    }
+    !edits.is_empty()
+}
+
+/// std's `try!` (2015 edition), for files that don't define their own: `?`.
+const TRY_MACRO: &str = r#"
+macro_rules! r#try {
+    ($e:expr $(,)?) => { $e? };
+}
+"#;
+
 pub fn preprocess_with(
     src: &str,
     macros: &str,
     procs: Option<(&str, crate::typeck::Resolver)>,
 ) -> Result<Option<Preprocessed>, Vec<(usize, usize, String)>> {
+    // (std's `try!`, unless the file or its macros define one.)
+    let with_try;
+    let try_call = src.match_indices("try!").any(|(k, _)| {
+        !src[..k].ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '#')
+            && !src[k + 4..].starts_with('=')
+    });
+    let defines_try = |s: &str| {
+        s.lines().any(|l| {
+            l.trim_start()
+                .strip_prefix("macro_rules!")
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix("try"))
+                .is_some_and(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        })
+    };
+    let macros = if try_call && !defines_try(src) && !defines_try(macros) {
+        with_try = format!("{macros}{TRY_MACRO}");
+        with_try.as_str()
+    } else {
+        macros
+    };
     let full = if macros.is_empty() {
         src.to_string()
     } else {
@@ -1828,6 +2123,9 @@ pub fn preprocess_with(
     if crate::bundled::uses_bundled(&text) {
         changed |= crate::bundled::expand(&mut text, &mut map)?;
     }
+    if text.contains("macro_rules!") {
+        changed |= rename_keyword_macros(&mut text, &mut map);
+    }
     if text.contains("macro_rules!")
         && let Some(e) = expand_with(&text, map.clone())?
     {
@@ -1836,6 +2134,10 @@ pub fn preprocess_with(
         changed = true;
         // (Expansions can have `#[cfg]`s too.)
         crate::macros::strip_cfg(&mut text);
+    }
+    // `extern crate itertools as it;`
+    if crate::alias::has_crate_renames(&text) {
+        changed |= crate::alias::expand_crate_renames(&mut text, &mut map);
     }
     let mut names = HashMap::new();
     if crate::modflat::has_inline_modules(&text) {
@@ -1854,6 +2156,9 @@ pub fn preprocess_with(
     if crate::variants::has_variant_imports(&text) {
         crate::variants::expand(&mut text, &mut map);
         changed = true;
+    }
+    if crate::alias::has_import_renames(&text) {
+        changed |= crate::alias::expand_import_renames(&mut text, &mut map, procs);
     }
     if crate::alias::has_use_renames(&text) {
         changed |= crate::alias::expand_use_renames(&mut text, &mut map);
@@ -1883,8 +2188,18 @@ pub fn preprocess_with(
 /// The `macro_rules!` definitions this file can use from its `mod x;` files: those marked
 /// `#[macro_export]`, and all of a module's when its `mod` has `#[macro_use]`.
 pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resolver) -> String {
+    let theirs = crate_macros(src, filename, resolver);
+    // A bundled crate's macro that the crate defines itself (regex-automata's `log!`,
+    // wasmparser's `bail!`) is the crate's.
+    let mut out = own_macros_left_out(&bundled_macros(src), &theirs);
+    out.push_str(&theirs);
+    out
+}
+
+/// The macros of the crate's other files that `src` sees.
+fn crate_macros(src: &str, filename: &str, resolver: crate::typeck::Resolver) -> String {
     use ra_ap_syntax::ast::{HasAttrs, HasModuleItem};
-    let mut out = bundled_macros(src);
+    let mut out = String::new();
     // The macros in scope where the file's `mod` item is (Rust's textual scoping), and the
     // crate's `#[macro_export]` ones.
     out.push_str(&inherited_macros(filename, resolver, 0));

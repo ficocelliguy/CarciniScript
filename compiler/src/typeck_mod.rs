@@ -91,6 +91,68 @@ pub fn module_path(current: &str, name: &str) -> String {
     }
 }
 
+/// The file of `mod n;` in `filename`: its path, text and import specifier. `n.rs` next to the
+/// file, else `n/mod.rs`, else (a module file's children live in a folder named after it)
+/// `geo/n.rs` next to `geo.rs`.
+pub fn find_module(
+    filename: &str,
+    n: &str,
+    resolver: Resolver,
+) -> Option<(String, String, String)> {
+    let flat = module_path(filename, n);
+    if let Some(t) = resolver(&flat) {
+        return Some((flat, t, format!("./{n}.rs")));
+    }
+    let nested = module_path(filename, &format!("{n}/mod"));
+    if let Some(t) = resolver(&nested) {
+        return Some((nested, t, format!("./{n}/mod.rs")));
+    }
+    let stem = filename
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.strip_suffix(".rs"))
+        .filter(|s| !matches!(*s, "mod" | "main" | "lib"))?;
+    let under = module_path(filename, &format!("{stem}/{n}"));
+    let t = resolver(&under)?;
+    Some((under, t, format!("./{stem}/{n}.rs")))
+}
+
+/// A type's, trait's or constant's name (`Point`, `MAX`, `__BenchFlags`), not a function's or
+/// module's.
+pub fn capitalized(s: &str) -> bool {
+    s.trim_start_matches('_')
+        .starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// What `pub use x::Error as AreaError;` items in `text` rename: `AreaError` → `Error`, for
+/// capitalized names of the file's own modules (not std's or crates').
+pub fn pub_use_renames(text: &str) -> HashMap<String, String> {
+    let file = crate::macros::parse_tree(text);
+    let mut out = HashMap::new();
+    for item in file.items() {
+        let ast::Item::Use(u) = item else { continue };
+        if u.visibility().is_none() {
+            continue;
+        }
+        for (path, rename, star) in use_leaves(&u) {
+            let (Some(alias), Some(orig)) = (rename, path.last()) else {
+                continue;
+            };
+            let capital = capitalized;
+            if !star
+                && path.len() >= 2
+                && !matches!(path[0].as_str(), "std" | "core" | "alloc")
+                && !crate::typeck::crates::BUNDLED.contains(&path[0].as_str())
+                && capital(&alias)
+                && capital(orig)
+            {
+                out.insert(alias, orig.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The leaves of a `use` tree: (path, `as` name, whether it's `path::*`).
 pub fn use_leaves(u: &ast::Use) -> Vec<(Vec<String>, Option<String>, bool)> {
     fn walk(
@@ -133,8 +195,9 @@ fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
     if let Some(t) = c.consts.get(name) {
         out.consts.insert(as_name.to_string(), t.clone());
     }
-    // Types and traits keep their names (renaming them isn't supported).
-    if name == as_name {
+    // Types and traits keep their names: types share one namespace here, so an importing file
+    // writes `pub use area::Error as AreaError`'s `AreaError` as `Error` (`pub_use_renames`).
+    {
         if let Some(def) = c.adts.defs.get(name) {
             let mut def = def.clone();
             def.module = None;
@@ -169,6 +232,20 @@ fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
 
 /// The public signatures of the module in `text`.
 fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String>) -> Exports {
+    // Renamed imports and crates, as the file itself compiles them (`pub fn f() -> M` with `use
+    // units::Meters as M;`).
+    let mut renamed = text.to_string();
+    let mut map = crate::mbe::OffsetMap::identity(text.len());
+    if crate::alias::has_crate_renames(&renamed) {
+        crate::alias::expand_crate_renames(&mut renamed, &mut map);
+    }
+    if crate::alias::has_import_renames(&renamed) {
+        crate::alias::expand_import_renames(&mut renamed, &mut map, Some((path, resolver)));
+    }
+    if crate::alias::has_use_renames(&renamed) {
+        crate::alias::expand_use_renames(&mut renamed, &mut map);
+    }
+    let text = renamed.as_str();
     let parse = crate::macros::parse_file(text);
     let file = parse.tree();
     let mut c = Checker::new(text);
@@ -412,35 +489,10 @@ impl Checker<'_> {
                 );
                 continue;
             }
-            // `name.rs` next to this file, else `name/mod.rs`.
-            let flat = module_path(filename, &n);
             let nested = module_path(filename, &format!("{n}/mod"));
-            // (A module file's children live in a folder named after it, `geo/shapes.rs`.)
-            let stem = filename
-                .rsplit('/')
-                .next()
-                .and_then(|f| f.strip_suffix(".rs"))
-                .filter(|s| !matches!(*s, "mod" | "main" | "lib"))
-                .map(|s| s.to_string());
-            let under = stem
-                .as_ref()
-                .map(|st| module_path(filename, &format!("{st}/{n}")));
-            let (path, text, specifier) = match resolver(&flat) {
-                Some(t) => (flat, Some(t), format!("./{n}.rs")),
-                None => match resolver(&nested) {
-                    Some(t) => (nested.clone(), Some(t), format!("./{n}/mod.rs")),
-                    None => match under
-                        .as_ref()
-                        .and_then(|u| resolver(u).map(|t| (u.clone(), t)))
-                    {
-                        Some((u, t)) => (
-                            u,
-                            Some(t),
-                            format!("./{}/{n}.rs", stem.clone().unwrap_or_default()),
-                        ),
-                        None => (flat, None, String::new()),
-                    },
-                },
+            let (path, text, specifier) = match find_module(filename, &n, resolver) {
+                Some((path, text, specifier)) => (path, Some(text), specifier),
+                None => (module_path(filename, &n), None, String::new()),
             };
             if stack.contains(&path) {
                 self.error(
@@ -676,10 +728,11 @@ impl Checker<'_> {
                                     sig: None,
                                 });
                             } else {
-                                self.error(
-                                    tree.syntax(),
-                                    "renaming imported types isn't supported yet",
+                                // (`alias::expand_import_renames` writes the others back.)
+                                let msg = format!(
+                                    "renaming the imported type `{item}` isn't supported when another `{item}` is in scope (types share one namespace here), when `{alias}` names two items (`#[cfg]` alternatives), or inside a block"
                                 );
+                                self.error(tree.syntax(), msg);
                             }
                         }
                     }

@@ -218,6 +218,12 @@ impl Checker<'_> {
         match type_name {
             "String" => Ty::Str,
             "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
+            "VecDeque" => Ty::Coll(
+                crate::ty::Coll::VecDeque,
+                Box::new(Ty::Vec(Box::new(Ty::Unknown))),
+            ),
+            "Range" => Ty::Range(Box::new(Ty::Unknown), false),
+            "RangeInclusive" => Ty::Range(Box::new(Ty::Unknown), true),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             "f64" => Ty::Float { f32: false },
@@ -341,6 +347,25 @@ impl Checker<'_> {
         }
         let mut m: HashMap<String, Ty> =
             [("Self".to_string(), self.self_ty_named(type_name))].into();
+        // The impl's type parameters, which its trait arguments and associated types may name
+        // (`impl<T> Store<T> for Bag<T> { type Item = T; }`). (`enter_impl` sets them up again,
+        // with their bounds, for the methods.)
+        self.generics.clear();
+        for p in imp
+            .generic_param_list()
+            .into_iter()
+            .flat_map(|l| l.generic_params())
+        {
+            let n = match p {
+                ast::GenericParam::TypeParam(tp) => tp.name(),
+                ast::GenericParam::ConstParam(cp) => cp.name(),
+                ast::GenericParam::LifetimeParam(_) => None,
+            };
+            if let Some(n) = n {
+                let n = n.text().to_string();
+                self.generics.insert(n.clone(), Ty::Param(n));
+            }
+        }
         // The impl's associated types (`type Unit = f64;`) and trait arguments
         // (`impl Convert<String>`) for the defaults it inherits.
         for i in imp
@@ -360,6 +385,7 @@ impl Checker<'_> {
                     .insert(name.text().to_string(), t);
             }
         }
+        let mut head_args = Vec::new();
         if let Some(ast::Type::PathType(pt)) = imp.trait_()
             && let Some(args) = pt
                 .path()
@@ -373,11 +399,27 @@ impl Checker<'_> {
                     _ => None,
                 })
                 .collect();
+            let mut trait_args = Vec::new();
             for (p, t) in def.type_params.iter().zip(given) {
                 let t = self.lower_type(&t);
-                m.insert(format!("{tr}::{p}"), t);
+                m.insert(format!("{tr}::{p}"), t.clone());
+                trait_args.push(t);
             }
+            head_args = trait_args;
         }
+        // (`enter_impl` lowers the self type again, and reports what's wrong with it.)
+        let n_diags = self.diags.len();
+        let self_args = match imp.self_ty().map(|t| self.lower_type(&t)) {
+            Some(Ty::Adt(_, args)) => args,
+            Some(t) => crate::adt::ext_args(&t),
+            None => Vec::new(),
+        };
+        self.diags.truncate(n_diags);
+        self.adts
+            .impl_heads
+            .entry((type_name.to_string(), tr.to_string()))
+            .or_default()
+            .push((self_args, head_args));
         for tm in def
             .methods
             .iter()
@@ -400,7 +442,35 @@ impl Checker<'_> {
                 .trait_()
                 .map(|t| t.syntax().clone())
                 .unwrap_or_else(|| imp.syntax().clone());
-            let msg = if def.type_params.is_empty() {
+            // (`impl Tr for String` next to `impl Tr for str` whose methods don't hand on to it:
+            // see `adt::all_items`.)
+            let owned = match imp.self_ty() {
+                Some(ast::Type::PathType(p)) => p
+                    .path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.name_ref())
+                    .is_some_and(|n| n.text() == type_name),
+                _ => false,
+            };
+            let msg = if owned && matches!(type_name, "String" | "Vec") {
+                let (owned, borrowed, call) = if type_name == "String" {
+                    ("String", "str", "self.as_str()")
+                } else {
+                    ("Vec<T>", "[T]", "self.as_slice()")
+                };
+                format!(
+                    "`{tr}` is implemented for both `{borrowed}` and `{owned}`, which are one type in JS: the `{owned}` impl's methods must hand each call on to the `{borrowed}` impl's (`{call}.method(args)`)"
+                )
+            } else if matches!(type_name, "String" | "Vec") {
+                let same = if type_name == "String" {
+                    "`str`, `&str`, `String` and `Box<str>`"
+                } else {
+                    "`[T]`, `&[T]`, `[T; N]`, `Vec<T>` and `Box<[T]>`"
+                };
+                format!(
+                    "conflicting implementations of trait `{tr}` for type `{type_name}` ({same} are one type in JS)"
+                )
+            } else if def.type_params.is_empty() {
                 format!("conflicting implementations of trait `{tr}` for type `{type_name}`")
             } else {
                 format!(
@@ -753,9 +823,67 @@ impl Checker<'_> {
         }
     }
 
+    /// `t`, written in the impl of `tr` for `key`, with the impl's type parameters replaced by
+    /// what the value of type `z` has for them (`T` of `impl<T> Tr for Stack<T>`, for a
+    /// `Stack<i32>`). Parameters it can't place stay as they are.
+    fn through_impl_head(&mut self, z: &Ty, key: &str, tr: &str, t: &Ty) -> Ty {
+        let Some(heads) = self.adts.impl_heads.get(&(key.to_string(), tr.to_string())) else {
+            return t.clone();
+        };
+        let Some((pattern, _)) = heads.first() else {
+            return t.clone();
+        };
+        let actual = match z {
+            Ty::Adt(_, args) => args.clone(),
+            other => crate::adt::ext_args(other),
+        };
+        let mut m = HashMap::new();
+        for (p, a) in pattern.iter().zip(&actual) {
+            if let Ty::Param(n) = p {
+                m.insert(n.clone(), a.clone());
+            }
+        }
+        super::generic::subst(t, &m)
+    }
+
     /// Settle generic calls' projections (`S::Unit` of a call with `S = Square` is `Square`'s
     /// `type Unit`) whose `S` is known. `last` gives up on the rest.
     pub(super) fn resolve_projections(&mut self, last: bool) {
+        // `S: Store<T>` with `S = Bag<String>` and `impl<T> Store<T> for Bag<T>`: `T` is
+        // `String`. (Only when one impl of the trait is there to pick.)
+        for (s, tr, args) in std::mem::take(&mut self.pending_trait_args) {
+            let key = match &self.shallow(&s) {
+                Ty::Adt(n, _) => Some(n.clone()),
+                Ty::Var(_) => {
+                    if !last {
+                        self.pending_trait_args.push((s, tr, args));
+                    }
+                    continue;
+                }
+                Ty::Param(_) | Ty::Unknown => None,
+                other => crate::adt::ext_key_of(other).map(str::to_string),
+            };
+            let Some(key) = key else { continue };
+            let heads = self
+                .adts
+                .impl_heads
+                .get(&(key.clone(), tr.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let [(_, want)] = heads.as_slice() else {
+                continue;
+            };
+            // (`shallow`: the value's own unsettled arguments stay variables, to settle here.)
+            let sh = self.shallow(&s);
+            for (a, w) in args.iter().zip(want) {
+                let w = self.through_impl_head(&sh, &key, &tr, w);
+                let mut placed = true;
+                w.walk(&mut |x| placed &= !matches!(x, Ty::Param(_)));
+                if placed {
+                    self.unify(a, &w);
+                }
+            }
+        }
         let pending = std::mem::take(&mut self.pending_projections);
         for (s, tr, assoc, x) in pending {
             let z = self.zonk(&s);
@@ -770,11 +898,15 @@ impl Checker<'_> {
                 Ty::Var(_) | Ty::Unknown => None,
                 other => crate::adt::ext_key_of(other).map(str::to_string),
             };
+            // (`impl<T> Container for Stack<T> { type Item = T; }`: `T` is the value's argument.)
             let found = key.and_then(|k| {
-                self.adts
+                let t = self
+                    .adts
                     .impl_assoc
-                    .get(&(k, tr.clone()))
-                    .and_then(|m| m.get(&assoc).cloned())
+                    .get(&(k.clone(), tr.clone()))
+                    .and_then(|m| m.get(&assoc).cloned())?;
+                let sh = self.shallow(&s);
+                Some(self.through_impl_head(&sh, &k, &tr, &t))
             });
             match found {
                 Some(t) => {
@@ -798,7 +930,8 @@ impl Checker<'_> {
         list.bounds().find_map(|b| match b.ty()? {
             ast::Type::PathType(p) => {
                 let n = p.path()?.segment()?.name_ref()?.text().to_string();
-                self.adts.traits.contains_key(&n).then_some(n)
+                (self.adts.traits.contains_key(&n) || self.file_trait_names.contains(&n))
+                    .then_some(n)
             }
             _ => None,
         })

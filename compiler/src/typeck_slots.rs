@@ -75,6 +75,27 @@ impl Checker<'_> {
         }
     }
 
+    /// `map.values_mut()` / `map.iter_mut()` of numbers, strings or bools (value type `v`): a slot
+    /// iterator (`κσ.$mapMutSlots`) unless a `for` loop iterates it directly.
+    pub(super) fn note_map_iter_mut(&mut self, m: &ast::MethodCallExpr, v: &Ty) {
+        let mut n = m.syntax().clone();
+        while let Some(p) = n
+            .parent()
+            .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+        {
+            n = p;
+        }
+        let for_iterable = n
+            .parent()
+            .and_then(ast::ForExpr::cast)
+            .and_then(|f| f.iterable())
+            .is_some_and(|it| it.syntax() == &n);
+        if self.zonk(v).is_js_primitive() && !for_iterable {
+            let r = self.range(m.syntax());
+            self.slot_calls.insert(r);
+        }
+    }
+
     /// The slot shape of the items of iterator expression `e`, if any hold slots.
     pub(super) fn iter_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
         match strip_parens(e) {
@@ -82,9 +103,27 @@ impl Checker<'_> {
                 let name = m.name_ref()?.text().to_string();
                 let recv = m.receiver()?;
                 match name.as_str() {
+                    // A map's `iter_mut()` yields `(k, slot)`.
                     "iter_mut" if self.slot_calls.contains(&self.range(m.syntax())) => {
+                        let map = self.raw.get(&self.range(recv.syntax())).is_some_and(|t| {
+                            match self.zonk(t) {
+                                Ty::Map(..) => true,
+                                // (`BTreeMap`, `IndexMap`: a map underneath.)
+                                Ty::Coll(_, view) => matches!(*view, Ty::Map(..)),
+                                _ => false,
+                            }
+                        });
+                        Some(if map {
+                            SlotShape::Tuple(vec![None, Some(SlotShape::Slot)])
+                        } else {
+                            SlotShape::Slot
+                        })
+                    }
+                    "values_mut" if self.slot_calls.contains(&self.range(m.syntax())) => {
                         Some(SlotShape::Slot)
                     }
+                    // (`for v in map.values_mut()` writes through the map's own slots.)
+                    "values_mut" => None,
                     // A collected `Vec<&mut T>`.
                     "iter" | "iter_mut" | "into_iter" => self.vec_slot_shape(&recv),
                     "skip" | "take" | "rev" | "step_by" | "peekable" | "by_ref" | "fuse"
@@ -114,17 +153,35 @@ impl Checker<'_> {
                         });
                         (a.is_some() || b.is_some()).then(|| SlotShape::Tuple(vec![a, b]))
                     }
-                    _ => None,
+                    _ => self.returned_slots(e),
                 }
             }
             ast::Expr::PathExpr(p) => {
                 let n = p.path()?.as_single_name_ref()?.text().to_string();
-                match self.slot_locals.get(&n)? {
-                    (false, s) => Some(s.clone()),
-                    _ => None,
+                match self.slot_locals.get(&n) {
+                    Some((false, s)) => Some(s.clone()),
+                    Some(_) => None,
+                    // A parameter: `it: impl Iterator<Item = &mut i32>`.
+                    None => self.returned_slots(e),
                 }
             }
             ast::Expr::RefExpr(r) => self.vec_slot_shape(&r.expr()?),
+            // A call, or a field holding one (`self.it.next()`).
+            _ => self.returned_slots(e),
+        }
+    }
+
+    /// A `&mut` iterator over numbers, strings or bools that comes from elsewhere: a call
+    /// returning one (`-> impl Iterator<Item = &mut i32>`, `-> slice::IterMut<'_, String>`), a
+    /// parameter or a field. It was made as a slot iterator (`v.iter_mut()` that isn't looped over
+    /// by index), so the items are slots.
+    fn returned_slots(&self, e: &ast::Expr) -> Option<SlotShape> {
+        let t = self.raw.get(&self.range(e.syntax()))?;
+        match self.zonk(t) {
+            Ty::Iter {
+                elem,
+                mutable: true,
+            } if elem.is_js_primitive() => Some(SlotShape::Slot),
             _ => None,
         }
     }
@@ -135,7 +192,7 @@ impl Checker<'_> {
     }
 
     /// The item shape of a local Vec collected from a slot iterator (`refs`, `&mut refs`).
-    fn vec_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
+    pub(super) fn vec_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
         match strip_parens(e) {
             ast::Expr::PathExpr(p) => {
                 let n = p.path()?.as_single_name_ref()?.text().to_string();

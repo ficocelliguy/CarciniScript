@@ -187,6 +187,10 @@ pub enum Ty {
     Map(Box<Ty>, Box<Ty>),
     /// What `map.entry(k)` returns; only usable with `.or_insert(..)` and friends.
     Entry(Box<Ty>, Box<Ty>),
+    /// `&mut T` for a number, string, bool or `Option` `T`, as a closure's parameter only
+    /// (`F: FnMut(&mut String)`, `|n: &mut i32|`): the closure takes a cell, and a call passes
+    /// one (`f(&mut n)`). Anywhere else it's `T`.
+    MutRef(Box<Ty>),
     /// A closure or function value: `impl Fn(A, B) -> R`. A JS function.
     Closure {
         params: Vec<Ty>,
@@ -375,6 +379,7 @@ impl Ty {
             | Ty::Set(e)
             | Ty::Future(e)
             | Ty::RefCell(e)
+            | Ty::MutRef(e)
             | Ty::IntoIter(e) => {
                 vec![(**e).clone()]
             }
@@ -502,6 +507,7 @@ impl Ty {
             Ty::IntoIter(e) => format!("impl IntoIterator<Item = {}>", e.describe()),
             Ty::Range(e, false) => format!("Range<{}>", e.describe()),
             Ty::Range(e, true) => format!("RangeInclusive<{}>", e.describe()),
+            Ty::MutRef(t) => format!("&mut {}", t.describe()),
             Ty::Var(_) => "_".into(),
             Ty::Unknown => "{unknown}".into(),
         }

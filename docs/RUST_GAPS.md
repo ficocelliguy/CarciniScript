@@ -71,12 +71,17 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   still applies to what you write, but CarciniScript accepts some forms rustc would reject.
 - **A closure passed where `&mut T` is expected can only write back through collections.** Map
   slots (`retain`, `and_modify`) and `iter_mut().for_each` alias the real element; a named
-  function passed in their place gets a copy.
+  function passed in their place gets a copy. (Your own `F: FnMut(&mut String)` /
+  `Fn(&mut i32)` closures, a `|v: &mut i32|` closure and a function item called through a
+  variable take a cell, so their writes reach the caller's value.)
 - **`iter_mut()` over numbers, strings or bools outside a loop yields slots** (objects whose
-  `[1]` is the element), followed through `next()`, non-closure adapters and `collect()` into a
-  `Vec<&mut T>`. A slot passed on to a function that takes `&mut i32`, or printed with `{:?}`,
-  is a copy of the element or the slot object; adapters with closures (`filter`, `map`) on such
-  an iterator are rejected.
+  `[1]` is the element), followed through `next()`, adapters (with closures too: `filter`, `map`,
+  `find`, `try_for_each`, `try_fold`, `find_map`, ..), `collect()` into a `Vec<&mut T>`, and
+  functions, parameters and fields that hand on a `&mut` iterator; so is a map's `values_mut()` /
+  `iter_mut()`. A slot passed on to a function that takes `&mut i32`, or printed with `{:?}`, is a
+  copy of the element or the slot object. Not yet: indexing a collected `Vec<&mut T>` (`*rs[1] =
+  9`; loop over it instead), `partition`, and a returned iterator whose items are tuples holding a
+  `&mut` (`impl Iterator<Item = (usize, &mut u8)>`, rejected as mismatched types).
 - **`sum()` / `product()` without a type use the element type** where rustc asks for an
   annotation.
 - **Generic functions take only `Fn`-bounded type parameters**, and each one is a single concrete
@@ -100,8 +105,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   in a local (`let cur = &mut self.root;` walking a tree, `let n = &mut self.count;`): that's a
   compile error, since writes through it would be lost. Recursion, or assigning through the place
   itself, does the same job.
-- **`*r = value` for a `&mut` struct replaces the object's contents in place** (`κσ.$replace`),
-  since JS can't rebind the caller's variable. The result is the same as Rust's.
+- **`*r = value` for a `&mut` struct (or `Vec`, map, set or other collection) replaces the
+  object's contents in place** (`κσ.$replace`), since JS can't rebind the caller's variable. The
+  result is the same as Rust's.
 - **`From` impls must be for a struct or enum declared in your code.** `impl From<MyErr> for
   String` (a std target) isn't supported; `?` converts error types only into your own types.
 - **`Into<X>` / `AsRef<X>` parameters and bounds take `X` itself.** `impl Into<String>` accepts
@@ -124,7 +130,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `>>`, `!` and `parse::<T>()` are errors, and `+`, `-`, `*` are JS arithmetic (no wrapping).
   A struct built where its `T` isn't known (an unannotated empty `Vec` field nothing settles)
   carries no class, and its `/` divides like a float. Overflow on a `T` wraps even in a debug
-  build (`--debug` comparisons), where Rust panics. `T::Err` of a `T: FromStr` is unchecked.
+  build (`--debug` comparisons), where Rust panics. `T::Err` of a `T: FromStr` and `T::Error`
+  of a `T: TryFrom<X>` are unchecked, and a `T: TryFrom<X>` given a type without that impl fails
+  when the call runs, not at compile time.
   `impl Shl` / `impl Shr` for your own types isn't supported.
 - **`{:?}` of a generic value is guessed from the run-time value where no caller says its type.**
   A generic function or method that prints a `T` with `{:?}` takes a formatter for `T` from each
@@ -141,6 +149,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   directly); otherwise `x/mod.rs`, then `util/x.rs` like rustc. For the same reason `super::` works only inside inline `mod x { .. }` blocks, not at the top of a
   module file, and `crate::` names this file. A module file's generic `pub type` aliases
   (`pub type Grid<T> = ..`) aren't usable from the file that loads it (plain ones are).
+- **Types share one namespace across files.** A renamed import of another file's or a crate's
+  type, trait or constant (`use geo::Point as P;`, `pub use area::Error as AreaError;`) is
+  written back under its own name, so two different `Error`s renamed apart in one file (`use
+  a::Error as AError; use b::Error as BError;`), or a renamed `Error` next to the file's own
+  `Error`, is an error. So is such a rename inside a block. A renamed re-export reaches other
+  files through a named `use` (`use geo::AreaError;`), not through `use geo::*`.
 - **Generics are erased, so a few things need help at run time.** `T::new()`, `T::CONST` and
   `T::default()` work in free functions, on a method's own type parameters and on an `impl<T>`'s
   in its associated functions, which get `T`'s class as a hidden argument, but not on an
@@ -156,7 +170,14 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `arr`'s length shows in the `let` (an annotation, an array literal, `<[T; N]>::try_from(..)`);
   an array from a function call needs the annotation (`let [a, b]: [f64; 2] = f();`). The same
   goes for `Default` of `[T; N]` (a `#[derive(Default)]` field or a `let` annotation).
-- **One `TryFrom`, `FromIterator` and `Extend` impl per type.** A second one is an error.
+- **Several `TryFrom`, `FromIterator` or `Extend` impls on one type whose argument types differ
+  only by references** (`TryFrom<&str>` / `TryFrom<String>` / `TryFrom<&String>`, `Extend<&'a T>` /
+  `Extend<T>`) take the same JS value, so a call picks by how its argument is written: a string
+  literal, `s.as_str()` or `&v[..]` for `&str` / `&[T]`, `&s` for another reference,
+  `s.to_string()` / `format!(..)` / `vec![..]` for a value; for items, `v.iter()` / `&v` for
+  references and `vec![..]` / `.into_iter()` / `.copied()` for values. A plain variable says
+  nothing: the first impl serves (never the one the call is in), which is right whenever the
+  impls agree, as std's and most crates' do.
 - **Array lengths aren't part of types, so const generics lean on arguments.** A const parameter
   is inferred from a written argument or a struct's type (`Matrix<2, 3>`), or read at run time off
   an argument (`[T; N]`'s length), but not from an array type alone: `let z: [f64; 4] = zeros();`
@@ -168,7 +189,7 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Associated types are checked through function type parameters, not `impl<T>`'s or `dyn`.**
   In `fn f<S: Shape>`, `S::Unit` is its own type with the bounds the trait declares, as in
   rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
-  type. A generic trait can be implemented once per type. An associated type a `where` clause
+  type. An associated type a `where` clause
   constrains (`where S::Unit: PartialEq<T>`), or one of a trait with a blanket impl, is unchecked
   rather than given those bounds.
 - **`&mut` to a number, string or bool inside a struct, tuple or Vec can't be passed to a
@@ -343,7 +364,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   elements. On a panic the values in scope are dropped before the panic message is printed
   (Rust prints it first).
 - **A range made by `a..b` is an iterator until something asks for a `Range`** (a `let r =
-  a..b`, a `Range<T>` field, parameter or return type), so `(0..5).start` isn't there.
+  a..b`, a `Range<T>` field, parameter or return type, or with your `impl Tr for Range<T>`, a
+  call of its method, `&(a..b)` or an array element), so `(0..5).start` isn't there.
 - **`Cow::to_mut()` can't change a string in place** (strings are immutable in JS): use it on
   slices, or `into_owned()` and change the `String`. `Cow::from(String)` is borrowed (a `String`
   and a `&str` are one type here), and `is_borrowed` / `is_owned` (unstable in Rust) aren't
@@ -415,6 +437,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Formatting
 
+- **`{:p}` prints a made-up address** (`0x10000` and up): the same for one object each time,
+  but a number or string gets a new one each time it's formatted, and two references to one
+  number variable don't print the same address.
+- **`{:x?}` doesn't reach into structs, enums or generic values**: their `Debug` is compiled
+  without it, so it's an error there (Rust prints their integer fields in hex).
 - **`{:#?}` of a value holding a hand-written `Debug`** spreads that impl's own parentheses and
   braces over lines too (the pretty form is made from the compact one), where Rust prints what
   the impl wrote: a serde_json `Value` in `{:#?}` shows `Bool(` / `true,` / `)` for
@@ -538,8 +565,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   method; when both `Option<u8>` and `u8` implement it, `Some(3u8)` reaches `u8`'s. A nested
   `Option<Option<T>>` there doesn't print its inner value with `{:?}`.
 - **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`, `Path` and `PathBuf`): one
-  type in JS, so the borrowed type's impl serves both and the owned one's body isn't used (it
-  usually hands on to the borrowed one anyway).
+  type in JS, so the borrowed type's impl serves both. The owned one must hand each call on to it
+  (`self.as_str().f(a)`, `Tr::f(&self.as_str())`, `self[..].f()`); one that does something else
+  (zeroize's `Vec` impl also truncates) is an error.
+- **`T: Into<PathBuf>` (and other non-number targets) is the target type itself**, so a closure
+  for `F: FnOnce() -> P, P: Into<PathBuf>` must return a `PathBuf`, not a `&str`.
 - **`Box<dyn Error>` from a string** (`"x".into()`, `format!(..).into()`) is the string itself:
   `{}`, `{:?}` and `to_string()` match std, but `downcast_ref::<String>()` style checks see a
   plain string.
@@ -556,7 +586,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **Files are parsed as the 2021 edition.** `gen` is a name (`rng.gen()`, `let gen = ..`), as in
   rand 0.8 code; 2024-only syntax that depends on the edition (`gen` blocks, which are unstable)
-  doesn't parse.
+  doesn't parse. 2015-edition `try!(x)` works (written `r#try!`; std's is `x?`, and a file's own
+  `macro_rules! try` is used when it has one); other 2015-only syntax (`dyn` as a name, `async`
+  as a name, anonymous trait method parameters) doesn't parse.
 
 ## Macros
 
@@ -564,11 +596,24 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   closure parameters) are renamed per expansion, so they don't clash with the caller's; other
   names (functions, types, a `static` the body names) resolve at the call site, as in a textual
   expansion.
-- **Fragments are matched by their tokens**, the way rustc's fragment parsers would split them:
-  an `expr` ends at a top-level `,`, `;` or `=>` (a leading closure's `|a, b|` and a turbofish's
-  `<A, B>` keep theirs), a `path` keeps commas inside `<..>`, a `ty` ends at a token that can't
-  continue a type, an `item` after its `;` or `{ .. }` body. Rules that rely on finer parsing (an
-  `expr` followed by an operator token) can match differently.
+- **Fragments are parsed like rustc's**: `expr`, `ty`, `pat`, `pat_param`, `path`, `stmt`,
+  `item` and `meta` captures go through rust-analyzer's parser (the prefix parse rustc's matcher
+  does), so `$($n:expr)*` takes `0 1 2` as three and `2 * 4 -1` as one, and a qualified path's
+  commas (`<R<(), ()> as Clone>::clone(&x)`) are the expression's. Where that parser rejects the
+  tokens (it doesn't take `&0 as &dyn Tr<A = B> != &0`, which rustc does), the capture falls back
+  to a token scan (an `expr` ends at a top-level `,`, `;` or `=>`). A `tt` takes joined
+  punctuation as one token (`=>`, `::`, `..=`), as rustc's lexer does.
+- **Captures stay one piece of syntax when written out**: an `expr` is parenthesized (a block
+  isn't, so `$body $i += 1;` works), a `ty` before `<` is too (`x as $t << 4`), and tokens of
+  separate repetitions are kept apart (`"x" as`, not the suffixed literal `"x"as`; `ident #y`,
+  not the reserved prefix `ident#`). In expression position an expansion's trailing `;` is
+  dropped, as rustc does under `#[allow(semicolon_in_expressions_from_macros)]` (a hard
+  `deny` by default there).
+- **Rule markers aren't renamed by hygiene**: `@closure` in `m!(@closure ..)` stays put even when
+  the expansion also binds `let closure`.
+- **A macro named `safe`** (bitvec's `safe! { .. }`) is spelled `Safe` before parsing, as
+  rust-analyzer's parser takes `safe` before an item as the `safe fn` qualifier.
+- **Calls inside `quote!` / `parse_quote!` aren't expanded**: they're tokens a proc macro emits.
 - **`#[cfg]`-gated alternative macros**: of several `macro_rules!` definitions of one name, an
   invocation uses the last one before it whose `#[cfg]` holds (features off, `test` off). A `cfg`
   the compiler can't evaluate (a custom `--cfg` name, a platform predicate) counts as off; when

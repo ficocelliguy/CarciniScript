@@ -48,6 +48,7 @@ const KNOWN_BOUNDS: &[&str] = &[
     "ShrAssign",
     "FromStr",
     "From",
+    "TryFrom",
     "Sum",
     "Product",
     // (Marker traits: nothing to check in JS.)
@@ -55,6 +56,8 @@ const KNOWN_BOUNDS: &[&str] = &[
     "Sync",
     "Unpin",
     "Sized",
+    "UnwindSafe",
+    "RefUnwindSafe",
     "BuildHasher",
     "Allocator",
     "ToString",
@@ -103,6 +106,51 @@ fn type_params(f: &ast::Fn) -> Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)
     out
 }
 
+/// For each type parameter, how many others its bounds wait on: 0 when they name no other
+/// parameter, else one more than the deepest one they name (`F: FnOnce() -> P` waits on `P`,
+/// whatever `P`'s own bounds are). Lowering in this order sees each named parameter first.
+pub(super) fn mention_depths(
+    params: &[(String, Vec<ast::TypeBoundList>)],
+) -> HashMap<String, usize> {
+    let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+    let mentions: Vec<Vec<usize>> = params
+        .iter()
+        .map(|(n, lists)| {
+            let mut out = Vec::new();
+            for l in lists {
+                for t in l
+                    .syntax()
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                {
+                    if t.kind() == ra_ap_syntax::SyntaxKind::IDENT
+                        && t.text() != n.as_str()
+                        && let Some(i) = names.iter().position(|x| *x == t.text())
+                        && !out.contains(&i)
+                    {
+                        out.push(i);
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+    let mut depth = vec![0usize; params.len()];
+    // (A cycle can't be ordered: it stops growing after a pass per parameter.)
+    for _ in 0..params.len() {
+        for i in 0..params.len() {
+            let d = mentions[i]
+                .iter()
+                .map(|&j| depth[j] + 1)
+                .max()
+                .unwrap_or(0)
+                .min(params.len());
+            depth[i] = d;
+        }
+    }
+    params.iter().map(|(n, _)| n.clone()).zip(depth).collect()
+}
+
 /// The last path segment of each trait bound (`std::fmt::Display` → `Display`); `?Sized` and
 /// lifetimes are skipped.
 fn bound_names(lists: &[ast::TypeBoundList]) -> Vec<(String, SyntaxNode)> {
@@ -149,6 +197,7 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
         Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst(e, m)).collect()),
         Ty::Adt(n, args) => Ty::Adt(n.clone(), args.iter().map(|a| subst(a, m)).collect()),
         Ty::RefCell(x) => Ty::RefCell(s(x)),
+        Ty::MutRef(x) => Ty::MutRef(s(x)),
         Ty::Iter { elem, mutable } => Ty::Iter {
             elem: s(elem),
             mutable: *mutable,
@@ -174,13 +223,21 @@ impl Checker<'_> {
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
+        self.try_from_args.clear();
         let mut params = Vec::new();
         // Bounds that name other parameters come after the plain ones: `Fut: Future<Output = T>`,
         // then `F: Fn() -> Fut` / `S: Into<T>`, then `I: IntoIterator<Item = P>`. (Rust takes
         // `<F: FnOnce() -> T, T>` and `where F: FnOnce() -> T` in any order.)
         let mut tps = type_params(f);
-        tps.sort_by_key(|(_, lists, _)| {
-            if lists.iter().any(|l| {
+        // (First by what the bounds name: `F: FnOnce() -> P` after `P: Into<PathBuf>`.)
+        let depths = mention_depths(
+            &tps.iter()
+                .map(|(n, l, _)| (n.clone(), l.clone()))
+                .collect::<Vec<_>>(),
+        );
+        tps.sort_by_key(|(name, lists, _)| {
+            let depth = depths.get(name).copied().unwrap_or(0);
+            let kind = if lists.iter().any(|l| {
                 super::bounds_into_iter_item(l).is_some()
                     || super::bounds_iterator_item(l).is_some()
             }) {
@@ -198,7 +255,8 @@ impl Checker<'_> {
                 2
             } else {
                 0
-            }
+            };
+            (depth, kind)
         });
         for (name, lists, node) in tps {
             // `Fut: Future<Output = T>`: a future of `T`, like `impl Future<Output = T>`.
@@ -272,7 +330,7 @@ impl Checker<'_> {
                 } else if report {
                     self.error(
                         &bnode,
-                        format!("the trait bound `{b}` is not supported yet on type parameters (supported: the comparison, formatting, `Clone`/`Copy`/`Default`/`Hash`, arithmetic and bitwise operator, `From`/`FromStr`, `Sum`/`Product`, iterator and closure traits, `Send`/`Sync`, and traits declared in the file)"),
+                        format!("the trait bound `{b}` is not supported yet on type parameters (supported: the comparison, formatting, `Clone`/`Copy`/`Default`/`Hash`, arithmetic and bitwise operator, `From`/`TryFrom`/`FromStr`, `AsRef`/`AsMut`, `Sum`/`Product`, iterator and closure traits, `Send`/`Sync`/`UnwindSafe`, and traits declared in the file)"),
                     );
                 }
             }
@@ -385,13 +443,24 @@ impl Checker<'_> {
             for b in l.bounds() {
                 if let Some(ast::Type::PathType(pt)) = b.ty()
                     && let Some(seg) = pt.path().and_then(|p| p.segment())
-                    && seg.name_ref().is_some_and(|n| n.text() == "From")
+                    && let Some(tr) = seg.name_ref().map(|n| n.text().to_string())
+                    && matches!(tr.as_str(), "From" | "TryFrom")
                     && let Some(ast::GenericArg::TypeArg(ta)) =
                         seg.generic_arg_list().and_then(|l| l.generic_args().next())
                     && let Some(t) = ta.ty()
                 {
                     let x = self.lower_type(&t);
-                    self.from_args.insert(name.to_string(), x);
+                    if tr == "From" {
+                        self.from_args.insert(name.to_string(), x);
+                    } else {
+                        // (`T: TryFrom<u64> + TryFrom<i64>`: a call picks by its argument;
+                        // `T::Error` is left unchecked.)
+                        self.try_from_args
+                            .entry(name.to_string())
+                            .or_default()
+                            .push(x);
+                        self.lenient_projs.insert(format!("{name}::Error"));
+                    }
                 }
             }
         }
@@ -451,6 +520,7 @@ impl Checker<'_> {
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
+        self.try_from_args.clear();
     }
 
     /// Fresh type variables for a generic function's parameters, with the bounds to check once
@@ -670,7 +740,8 @@ impl Checker<'_> {
             return ok;
         }
         match b {
-            "Sized" | "Send" | "Sync" | "Unpin" | "BuildHasher" | "Allocator" => true,
+            "Sized" | "Send" | "Sync" | "Unpin" | "UnwindSafe" | "RefUnwindSafe"
+            | "BuildHasher" | "Allocator" => true,
             "FromStr" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.method(n, "from_str").is_some(),
@@ -684,8 +755,9 @@ impl Checker<'_> {
                 _ => false,
             },
             // (`From<X>`'s `X` is checked at `T::from(x)`, `Into<Y>`'s at `.into()`; JSON's
-            // traits where it's read or written.)
-            "From" | "Into" | "Serialize" | "Deserialize" | "DeserializeOwned" => true,
+            // traits where it's read or written. A `TryFrom<X>` without a fitting impl fails
+            // at run time.)
+            "From" | "TryFrom" | "Into" | "Serialize" | "Deserialize" | "DeserializeOwned" => true,
             "Display" | "ToString" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| d.display),
