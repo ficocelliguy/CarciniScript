@@ -300,15 +300,35 @@ impl Checker<'_> {
         &mut self,
         m: &ast::MethodCallExpr,
         ty: &str,
+        targs: &[Ty],
         method: &str,
         args: &[ast::Expr],
         expected: Option<&Ty>,
     ) -> Option<String> {
-        let keys = self
+        let mut keys = self
             .adts
             .method_alts
             .get(&format!("{ty}::{method}"))?
             .clone();
+        // Inherent impls for other instantiations: the one for the receiver's type arguments.
+        if self.adts.inherent_alts.contains(&format!("{ty}::{method}")) {
+            keys = self.alts_for_args(ty, keys, targs);
+            // (`W(2).get()` with `impl W<i32>` and `impl W<u8>`: the literal's type isn't
+            // settled yet, so rustc can't choose.)
+            let mut open_lit = false;
+            for t in targs {
+                self.resolve_vars(t)
+                    .walk(&mut |x| open_lit |= *x == Ty::IntLit);
+            }
+            if keys.len() > 1 && open_lit {
+                self.error(
+                    m.syntax(),
+                    format!(
+                        "multiple applicable items in scope: `{method}` is defined in `impl`s for several instantiations of `{ty}`, and the receiver's type isn't settled yet (give the number a suffix or a type)"
+                    ),
+                );
+            }
+        }
         // (The arguments' types decide between `Scale<u32>` and `Scale<&str>`; a closure is left
         // to the impl's own check.)
         let arg_tys: Vec<Ty> = args
@@ -336,6 +356,47 @@ impl Checker<'_> {
         let r = self.range(m.syntax());
         self.method_keys.insert(r, key.clone());
         Some(key)
+    }
+
+    /// Of `keys` (one method's keys in inherent impls for several instantiations of `ty`), those
+    /// whose impl could be for type arguments `targs` (all of them when none could).
+    pub(super) fn alts_for_args(&self, ty: &str, keys: Vec<String>, targs: &[Ty]) -> Vec<String> {
+        let targs: Vec<Ty> = targs.iter().map(|t| self.resolve_vars(t)).collect();
+        let fits: Vec<String> = keys
+            .iter()
+            .filter(|k| {
+                self.adts.method(ty, k).is_some_and(|sig| {
+                    sig.impl_args.len() != targs.len()
+                        || !sig
+                            .impl_args
+                            .iter()
+                            .zip(&targs)
+                            .any(|(i, t)| crate::adt::disjoint_args(i, t))
+                })
+            })
+            .cloned()
+            .collect();
+        if fits.is_empty() { keys } else { fits }
+    }
+
+    /// `t` with its settled variables filled in; an integer literal's still open variable is
+    /// `IntLit`, any other open one stays.
+    fn resolve_vars(&self, t: &Ty) -> Ty {
+        let r = |x: &Ty| Box::new(self.resolve_vars(x));
+        match self.shallow(t) {
+            v @ Ty::Var(_) => match self.var_kind(&v) {
+                Some(VarKind::Int) => Ty::IntLit,
+                _ => v,
+            },
+            Ty::Adt(n, args) => Ty::Adt(n, args.iter().map(|a| self.resolve_vars(a)).collect()),
+            Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| self.resolve_vars(e)).collect()),
+            Ty::Vec(e) => Ty::Vec(r(&e)),
+            Ty::Option(e) => Ty::Option(r(&e)),
+            Ty::Set(e) => Ty::Set(r(&e)),
+            Ty::Map(k, v) => Ty::Map(r(&k), r(&v)),
+            Ty::Result(k, v) => Ty::Result(r(&k), r(&v)),
+            other => other,
+        }
     }
 
     /// `method` of `ty` among several impls of one generic trait, by its argument `idx`
@@ -742,6 +803,7 @@ impl Checker<'_> {
                         Coll::BTreeMap => "κσ.BTreeMap.from",
                         Coll::IndexSet => "κσ.IndexSet.from",
                         Coll::IndexMap => "κσ.IndexMap.from",
+                        Coll::FixedArray(_) => "Array.from",
                     };
                     Some(Conv::Wrap { js: js.into() })
                 }

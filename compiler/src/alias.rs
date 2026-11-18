@@ -5,8 +5,8 @@
 //! `Vec::<i32>::new()`). An `OffsetMap` keeps positions pointing at the original text.
 
 use ra_ap_syntax::{
-    AstNode, SourceFile, SyntaxKind, SyntaxNode, TextRange,
-    ast::{self, HasGenericArgs, HasGenericParams, HasModuleItem, HasName},
+    AstNode, SourceFile, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    ast::{self, HasGenericArgs, HasGenericParams, HasModuleItem, HasName, HasVisibility},
 };
 
 use crate::macros::EDITION;
@@ -357,7 +357,7 @@ fn rename_uses_of(
     edits
 }
 
-fn apply(text: &mut String, map: &mut OffsetMap, edits: &mut [(usize, usize, String)]) {
+pub(crate) fn apply(text: &mut String, map: &mut OffsetMap, edits: &mut [(usize, usize, String)]) {
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
     let mut last_start = usize::MAX;
     for (a, b, new) in edits.iter() {
@@ -423,9 +423,17 @@ pub fn expand_crate_renames(text: &mut String, map: &mut OffsetMap) -> bool {
         return false;
     }
     let toks = tokens(&file);
+    // (In a macro call's tokens, `::` is two `:`s: `println!("{}", it::join(..))`.)
+    let colon2_at = |j: usize| {
+        toks.get(j).is_some_and(|t| t.text() == "::")
+            || (toks.get(j).is_some_and(|t| t.text() == ":")
+                && toks.get(j + 1).is_some_and(|n| {
+                    n.text() == ":" && n.text_range().start() == toks[j].text_range().end()
+                }))
+    };
     for (i, t) in toks.iter().enumerate() {
         if t.kind() != SyntaxKind::IDENT
-            || toks.get(i + 1).is_none_or(|n| n.text() != "::")
+            || !colon2_at(i + 1)
             || t.parent_ancestors()
                 .any(|a| a.kind() == SyntaxKind::MACRO_RULES)
         {
@@ -435,15 +443,26 @@ pub fn expand_crate_renames(text: &mut String, map: &mut OffsetMap) -> bool {
             continue;
         };
         let r = t.text_range();
-        let prev = if i > 0 { toks[i - 1].text() } else { "" };
-        let before = if i > 1 { toks[i - 2].text() } else { "" };
+        let mut prev = if i > 0 { toks[i - 1].text() } else { "" };
+        // The token before `prev`.
+        let mut b = i.checked_sub(2);
+        // (`x::it::` in a macro call: the `::` before is two `:`s too.)
+        if prev == ":" && i > 1 && colon2_at(i - 2) {
+            prev = "::";
+            b = i.checked_sub(3);
+        }
+        let before = b.map(|j| toks[j].text()).unwrap_or("");
         let start = match prev {
             "." | "$" | "'" => continue,
             // `crate::it::join` → `itertools::join`
-            "::" if before == "crate" && (i < 3 || toks[i - 3].text() != "::") => {
-                toks[i - 2].text_range().start()
+            "::" if before == "crate"
+                && b.is_none_or(|j| {
+                    j == 0 || (toks[j - 1].text() != "::" && toks[j - 1].text() != ":")
+                }) =>
+            {
+                toks[b.unwrap_or(i)].text_range().start()
             }
-            "::" if (i > 1 && toks[i - 2].kind() == SyntaxKind::IDENT)
+            "::" if b.is_some_and(|j| toks[j].kind() == SyntaxKind::IDENT)
                 || matches!(before, ">" | "self" | "super" | "Self" | "crate") =>
             {
                 continue;
@@ -451,6 +470,269 @@ pub fn expand_crate_renames(text: &mut String, map: &mut OffsetMap) -> bool {
             _ => r.start(),
         };
         edits.push((start.into(), r.end().into(), name.clone()));
+    }
+    apply(text, map, &mut edits);
+    true
+}
+
+/// Whether `text` may name an inline module of a `mod` file (`geo::shapes::Circle`).
+pub fn has_inline_module_imports(text: &str) -> bool {
+    text.contains("mod ") && text.matches("::").count() >= 2
+}
+
+/// The inline modules of `src` that `segs` goes down through (`shapes`, `a::b`), if it names an
+/// item inside one: how many segments are modules.
+fn inline_module_depth(src: &str, segs: &[String]) -> usize {
+    let file = crate::macros::parse_tree(src);
+    let mut items: Vec<ast::Item> = file.items().collect();
+    let mut depth = 0;
+    while depth + 1 < segs.len() {
+        let Some(list) = items.iter().find_map(|i| match i {
+            ast::Item::Module(m)
+                if m.name().is_some_and(|n| n.text() == segs[depth].as_str())
+                    && m.visibility().is_some()
+                    && !crate::adt::test_only(m.syntax()) =>
+            {
+                m.item_list()
+            }
+            _ => None,
+        }) else {
+            break;
+        };
+        items = list.items().collect();
+        depth += 1;
+    }
+    depth
+}
+
+/// Paths into a `mod` file's inline modules (`use geo::shapes::Circle;`, `geo::shapes::area(..)`,
+/// `use stamp::{context::NoContext, ..}`): `modflat` moves those items to the module file's top
+/// level as `shapes__Circle`, so the paths are written that way, and a name a `use` brings in is
+/// written so where it's used (`Circle` → `shapes__Circle`; an `as` name too). Folder modules
+/// (`pointer/invariant.rs`) are real `mod` files and need nothing.
+pub fn expand_inline_module_imports(
+    text: &mut String,
+    map: &mut OffsetMap,
+    files: Option<(&str, crate::typeck::Resolver)>,
+) -> bool {
+    let Some((filename, resolver)) = files else {
+        return false;
+    };
+    let file = crate::macros::parse_tree(text);
+    // How many of this file's inline modules are around `n`.
+    let inline_levels = |n: &SyntaxNode| {
+        n.ancestors()
+            .filter_map(ast::Module::cast)
+            .filter(|m| m.item_list().is_some())
+            .count()
+    };
+    // Module files' sources, by the path from this file (`geo`, `geo::shapes`).
+    let mut srcs: std::collections::HashMap<String, Option<(String, String)>> = Default::default();
+    // For `segs` (a path as written, inside `levels` of this file's inline modules): the
+    // segments that are inline modules of a `mod` file, as (first index, count), and the mangled
+    // name of the item they lead to. Only paths from the crate root: `crate::`, as many `super::`
+    // as there are inline modules around, or none at the top (`self::` there too).
+    let mut resolve = |segs: &[String], levels: usize| -> Option<(usize, usize, String)> {
+        let supers = segs.iter().take_while(|s| *s == "super").count();
+        let start = match segs.first().map(String::as_str) {
+            Some("crate") => 1,
+            Some("super") if supers == levels => supers,
+            Some("self") if levels == 0 => 1,
+            _ if levels == 0 && supers == 0 => 0,
+            _ => return None,
+        };
+        let mut cur = filename.to_string();
+        let mut src = None;
+        let mut i = start;
+        while i + 1 < segs.len() {
+            let key = segs[start..=i].join("::");
+            let found = srcs
+                .entry(key)
+                .or_insert_with(|| {
+                    crate::typeck::find_module(&cur, &segs[i], resolver).map(|(p, t, _)| (p, t))
+                })
+                .clone();
+            let Some((p, t)) = found else { break };
+            cur = p;
+            src = Some(t);
+            i += 1;
+        }
+        let src = src?;
+        let depth = inline_module_depth(&src, &segs[i..]);
+        (depth > 0).then(|| (i, depth, segs[i..=i + depth].join("__")))
+    };
+    // (The name only: a segment's generic arguments stay.)
+    let seg_end = |s: &ast::PathSegment| {
+        s.name_ref()
+            .map_or(s.syntax().text_range(), |n| n.syntax().text_range())
+            .end()
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    // (Where the name is known (None: the whole file), the name, what it's written.)
+    let mut renames: Vec<(Option<TextRange>, String, String)> = Vec::new();
+    let mut uses = Vec::new();
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        uses.push(u.syntax().text_range());
+        let top = u
+            .syntax()
+            .parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::SOURCE_FILE);
+        let levels = inline_levels(u.syntax());
+        // The `use` is written again, one per leaf (`use geo::shapes::{area, Circle};` is `use
+        // geo::shapes__area; use geo::shapes__Circle;`), when a leaf names such an item.
+        let leaves = crate::typeck::use_leaves(&u);
+        let mut out = Vec::new();
+        let mut any = false;
+        for (path, rename, star) in &leaves {
+            let target = (!star && path.last().is_some_and(|l| l != "self"))
+                .then(|| resolve(path, levels))
+                .flatten();
+            let Some((i, depth, mangled)) = target else {
+                let mut p = path.join("::");
+                if *star {
+                    p.push_str("::*");
+                } else if let Some(stem) = p.strip_suffix("::self") {
+                    p = stem.to_string();
+                }
+                if let Some(r) = rename {
+                    p = format!("{p} as {r}");
+                }
+                out.push(p);
+                continue;
+            };
+            any = true;
+            let mut written: Vec<String> = path[..i].to_vec();
+            written.push(mangled.clone());
+            written.extend(path[i + depth + 1..].iter().cloned());
+            let name = rename
+                .clone()
+                .unwrap_or_else(|| path.last().cloned().unwrap_or_default());
+            if name == "_" {
+                out.push(format!("{} as _", written.join("::")));
+                continue;
+            }
+            out.push(written.join("::"));
+            // (The name is the item's where the `use` reaches: the file, or the block or inline
+            // module the `use` is in.)
+            let scope = u.syntax().parent().filter(|_| !top).map(|p| p.text_range());
+            renames.push((scope, name, mangled));
+        }
+        if !any {
+            continue;
+        }
+        let vis = u
+            .visibility()
+            .map(|v| format!("{} ", v.syntax().text()))
+            .unwrap_or_default();
+        let start = u
+            .visibility()
+            .map(|v| v.syntax().text_range().start())
+            .or_else(|| u.use_token().map(|t| t.text_range().start()));
+        let Some(start) = start else { continue };
+        let all: Vec<String> = out.iter().map(|p| format!("{vis}use {p};")).collect();
+        edits.push((
+            start.into(),
+            u.syntax().text_range().end().into(),
+            all.join(" "),
+        ));
+    }
+    // Paths elsewhere: `geo::shapes::area(..)`, `stamp::context::NoContext`.
+    for p in file.syntax().descendants().filter_map(ast::Path::cast) {
+        if p.syntax()
+            .parent()
+            .is_some_and(|q| q.kind() == SyntaxKind::PATH)
+            || p.syntax().ancestors().any(|a| a.kind() == SyntaxKind::USE)
+        {
+            continue;
+        }
+        let segs: Vec<ast::PathSegment> = p.segments().collect();
+        let names: Vec<String> = segs
+            .iter()
+            .map(|s| s.name_ref().map_or(String::new(), |n| n.text().to_string()))
+            .collect();
+        if names.len() < 3 || names.iter().any(String::is_empty) {
+            continue;
+        }
+        let Some((i, depth, mangled)) = resolve(&names, inline_levels(p.syntax())) else {
+            continue;
+        };
+        let (a, b) = (
+            segs[i].syntax().text_range().start(),
+            seg_end(&segs[i + depth]),
+        );
+        edits.push((a.into(), b.into(), mangled));
+    }
+    // And inside macro arguments (`println!("{}", geo::shapes::area(&c))`), which are tokens.
+    for tt in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::MacroCall::cast)
+        .filter_map(|m| m.token_tree())
+    {
+        // (Nested macro calls' trees are inside this one's; their tokens are seen once.)
+        if tt
+            .syntax()
+            .ancestors()
+            .skip(1)
+            .any(|a| a.kind() == SyntaxKind::TOKEN_TREE)
+        {
+            continue;
+        }
+        let toks: Vec<ra_ap_syntax::SyntaxToken> = tt
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia())
+            .collect();
+        let mut k = 0;
+        while k < toks.len() {
+            let starts = toks[k].kind() == SyntaxKind::IDENT
+                && (k == 0 || !matches!(toks[k - 1].text(), ":" | "::" | "." | "$"));
+            if !starts {
+                k += 1;
+                continue;
+            }
+            // `a::b::c` as tokens: ident (`::` ident)*, the `::` one token or two.
+            let sep = |j: usize| -> Option<usize> {
+                match toks.get(j).map(|t| t.text()) {
+                    Some("::") => Some(j + 1),
+                    Some(":") if toks.get(j + 1).is_some_and(|t| t.text() == ":") => Some(j + 2),
+                    _ => None,
+                }
+            };
+            let mut run = vec![k];
+            while let Some(&last) = run.last()
+                && let Some(next) = sep(last + 1)
+                && toks
+                    .get(next)
+                    .is_some_and(|t| t.kind() == SyntaxKind::IDENT)
+            {
+                run.push(next);
+            }
+            let names: Vec<String> = run.iter().map(|&j| toks[j].text().to_string()).collect();
+            if names.len() >= 3
+                && let Some((i, depth, mangled)) = resolve(&names, inline_levels(tt.syntax()))
+            {
+                let (a, b) = (
+                    toks[run[i]].text_range().start(),
+                    toks[run[i + depth]].text_range().end(),
+                );
+                edits.push((a.into(), b.into(), mangled));
+            }
+            k = run.last().map_or(k, |&j| j) + 1;
+        }
+    }
+    if edits.is_empty() {
+        return false;
+    }
+    // (A name that's also declared here would be a conflict rustc reports.)
+    for (scope, name, mangled) in renames {
+        let one = std::collections::HashMap::from([(name, mangled)]);
+        edits.extend(
+            rename_uses_of(&file, &one, &uses)
+                .into_iter()
+                .filter(|e| scope.is_none_or(|s| s.contains(TextSize::from(e.0 as u32)))),
+        );
     }
     apply(text, map, &mut edits);
     true

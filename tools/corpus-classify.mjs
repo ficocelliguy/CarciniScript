@@ -154,9 +154,16 @@ function classify(m, lineText, file) {
     const t = (m.match(/found for (?:struct |enum |type parameter |type )?`([^`]*)`/) || [])[1] || "";
     const tb = base(t);
     if (thr(tb)) return ["THREAD", tb];
-    if (STD.has(tb) && /^[A-Z]/.test(tb) && ownType(tb, tb, file)) return ["GENERIC", "method on unknown/external type"];
-    if (STD.has(tb) || /^\[|^&?\[|^\(|^&?str$/.test(t)) return ["STD", "method " + tb + "::" + n];
+    const own = STD.has(tb) && /^[A-Z]/.test(tb) && ownType(tb, tb, file);
+    if (STD.has(tb) && !own || /^\[|^&?\[|^\(|^&?str$/.test(t)) return ["STD", "method " + tb + "::" + n];
+    // A method on the crate's own type (or a type parameter) that this file doesn't define is in
+    // another file's impl, or another crate's trait.
+    if (!file.fns.has(n)) return ["EXT", "method defined elsewhere"];
     return ["GENERIC", "method on unknown/external type"];
+  }
+  if (/^no field `[^`]*` on type `/.test(m)) {
+    const t = base((m.match(/on type `([^`]*)`/) || [])[1] || "");
+    if (!file.types.has(t)) return ["EXT", "field of a type defined elsewhere"];
   }
   if (/^`cfg!\(/.test(m) || /scripts run in JS, not on rustc's target/.test(m)) return ["LANG", "cfg on target"];
   // Language features.
@@ -198,14 +205,19 @@ for (const f of files.sort()) {
   let src; try { src = fs.readFileSync(f, "utf8"); } catch { continue; }
   const L = src.split("\n"); const dir = path.dirname(f);
   const r = compile(src, path.basename(f), p => { try { return fs.readFileSync(path.join(dir, p), "utf8"); } catch {} });
-  const file = { crate: path.relative(root, f).split(path.sep)[0], uses: [...src.matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/gm)].map(m => m[1].replace(/\s+/g, " ")) };
+  const file = {
+    crate: path.relative(root, f).split(path.sep)[0],
+    uses: [...src.matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/gm)].map(m => m[1].replace(/\s+/g, " ")),
+    fns: new Set([...src.matchAll(/\bfn\s+(\w+)/g)].map(m => m[1])),
+    types: new Set([...src.matchAll(/\b(?:struct|enum|union)\s+(\w+)/g)].map(m => m[1])),
+  };
   const errs = (r.diagnostics||[]).filter(d=>d.severity==="error").map(d => {
     let i = d.line-1, depth = 0;
     while (i < L.length) { const t = L[i].trim(); if (depth > 0 || t.startsWith("#") || t.startsWith("//") || t === "") { depth = Math.max(0, depth + (t.match(/\[/g)||[]).length - (t.match(/\]/g)||[]).length); i++; continue; } break; }
     let [cat, why] = classify(d.message, (L[i]||"").trim(), file);
     // A parse error on a line with a macro call is in that macro's expansion.
     if (cat === "PARSE" && /[\w:]+!\s*[\(\[\{]/.test(L[d.line-1] || "")) [cat, why] = ["LANG", "macro_rules expansion"];
-    return { cat, why, line: d.line, m: d.message.slice(0, 160) };
+    return { cat, why, line: d.line, start: d.start, end: d.end, m: d.message.slice(0, 160) };
   });
   const thread = /\bstd::(thread|sync::(mpsc|atomic|Arc|Mutex|RwLock|Condvar|Barrier))|\bthread::spawn|\brayon\b|\bcrossbeam\b/.test(src);
   fs.writeSync(out, JSON.stringify({ f: path.relative(root, f), lines: L.length, ok: !!r.code, thread, errs }) + "\n");

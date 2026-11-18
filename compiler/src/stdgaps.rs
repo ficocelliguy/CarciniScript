@@ -15,6 +15,7 @@ use crate::mbe::OffsetMap;
 const MARKER: &str = include_str!("marker_prelude.rs");
 const PATH: &str = include_str!("path_prelude.rs");
 const WRAPPING: &str = include_str!("wrapping_prelude.rs");
+const CSTR: &str = include_str!("cstr_prelude.rs");
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
 fn declares(text: &str, name: &str) -> bool {
@@ -52,7 +53,39 @@ pub(crate) fn preludes(text: &str) -> String {
         out.push('\n');
         out.push_str(WRAPPING);
     }
+    if crate::stdtime::has_word(text, "CStr")
+        && !text.contains("// (cstr prelude)")
+        && !declares(text, "CStr")
+    {
+        out.push('\n');
+        out.push_str(CSTR);
+    }
     out
+}
+
+/// Whether `text` may have a C string literal (`c"text"`, `cr"text"`, `cr#"text"#`).
+fn has_c_strings(text: &str) -> bool {
+    text.contains("c\"") || text.contains("cr#")
+}
+
+/// `c"text"` as `CStr::__lit(&[116, 101, 120, 116])` (the cstr prelude's), everywhere: in macro
+/// arguments too.
+fn c_string_literals(file: &SourceFile) -> Vec<(usize, usize, String)> {
+    file.syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter_map(ast::CString::cast)
+        .map(|s| {
+            let bytes = s.value().map(|v| v.into_owned()).unwrap_or_default();
+            let items: Vec<String> = bytes.iter().map(|b| format!("{b}u8")).collect();
+            let r = s.syntax().text_range();
+            (
+                usize::from(r.start()),
+                usize::from(r.end()),
+                format!("CStr::__lit(&[{}])", items.join(", ")),
+            )
+        })
+        .collect()
 }
 
 /// Whether the pre-pass has anything to do in `text`.
@@ -73,6 +106,7 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
     ]
     .iter()
     .any(|n| crate::stdtime::has_word(text, n))
+        || has_c_strings(text)
         || [
             "format_args",
             "env!",
@@ -198,6 +232,7 @@ pub(crate) fn expand(
     let toks = tokens(&file, &uses);
     let mut edits: Vec<(usize, usize, String)> = write_fmt_calls(&file);
     edits.extend(writer_params(&file));
+    edits.extend(c_string_literals(&file));
     let txt = |i: usize| toks.get(i).map(|t| t.text.clone()).unwrap_or_default();
     let mut errors = Vec::new();
     let mut i = 0;

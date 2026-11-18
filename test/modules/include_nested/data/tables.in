@@ -1,0 +1,15 @@
+macro_rules! table {
+    ($name:ident = $($v:expr),*) => {
+        const $name: &[u32] = &[$($v),*];
+    };
+}
+
+#[macro_export]
+macro_rules! tag {
+    () => {
+        "49.0.0"
+    };
+}
+
+table!(SQUARES = 1, 4, 9);
+include!("more.in");

@@ -5,11 +5,13 @@
 
 mod adt;
 mod alias;
+mod assocbounds;
 mod bindings;
 mod borrows;
 mod bundled;
 mod clap_derive;
 mod codegen;
+mod consteval;
 mod fmt;
 mod json;
 mod jsx;

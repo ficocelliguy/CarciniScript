@@ -44,6 +44,11 @@ struct Exports {
     fns: HashMap<String, FnSig>,
     adts: Adts,
     consts: HashMap<String, Ty>,
+    /// Its functions' and associated functions' const parameters passed as values
+    /// (function or `Type::name`, parameter, whether an argument holds it).
+    const_needs: Vec<(String, String, bool)>,
+    /// The values of its `const`s that are constant integers or `bool`s.
+    const_vals: HashMap<String, crate::consteval::CVal>,
     /// A module this one loads (directly or not) loads it back.
     circular: Option<String>,
     /// Its `pub mod`s, by name.
@@ -57,6 +62,22 @@ struct Exports {
 fn export_type_extras(c: &Checker, out: &mut Exports, name: &str) {
     // (Types leave this checker without its inference variables: `zonk` makes them `Unknown`.)
     let a = &c.adts;
+    if let (Some(ks), Some(file)) = (a.assoc_consts.get(name), &c.root_file) {
+        let known = crate::consteval::Known {
+            consts: Some(&c.const_vals),
+            assoc: Some(&a.assoc_const_vals),
+        };
+        for k in ks.keys() {
+            if let Some(v) = crate::consteval::eval_assoc(file, &known, name, k) {
+                let vals = out
+                    .adts
+                    .assoc_const_vals
+                    .entry(name.to_string())
+                    .or_default();
+                vals.insert(k.clone(), v);
+            }
+        }
+    }
     if let Some(t) = a.deref_targets.get(name) {
         out.adts.deref_targets.insert(name.to_string(), c.zonk(t));
     }
@@ -195,6 +216,9 @@ fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
     if let Some(t) = c.consts.get(name) {
         out.consts.insert(as_name.to_string(), t.clone());
     }
+    if let Some(v) = c.const_vals.get(name) {
+        out.const_vals.insert(as_name.to_string(), *v);
+    }
     // Types and traits keep their names: types share one namespace here, so an importing file
     // writes `pub use area::Error as AreaError`'s `AreaError` as `Error` (`pub_use_renames`).
     {
@@ -238,6 +262,14 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
     let mut map = crate::mbe::OffsetMap::identity(text.len());
     if crate::alias::has_crate_renames(&renamed) {
         crate::alias::expand_crate_renames(&mut renamed, &mut map);
+    }
+    // Inline modules' items, as the file's own compile flattens them (`pub mod context { pub
+    // struct NoContext; }` exports `context__NoContext`), and paths into other files' ones.
+    if crate::alias::has_inline_module_imports(&renamed) {
+        crate::alias::expand_inline_module_imports(&mut renamed, &mut map, Some((path, resolver)));
+    }
+    if crate::modflat::has_inline_modules(&renamed) {
+        crate::modflat::flatten(&mut renamed, &mut map);
     }
     if crate::alias::has_import_renames(&renamed) {
         crate::alias::expand_import_renames(&mut renamed, &mut map, Some((path, resolver)));
@@ -320,6 +352,9 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
                     && let Some(t) = c.consts.get(n.text().to_string().as_str())
                 {
                     out.consts.insert(n.text().to_string(), t.clone());
+                    if let Some(v) = k.body().and_then(|b| c.eval_const(&b)) {
+                        out.const_vals.insert(n.text().to_string(), v);
+                    }
                 }
             }
             ast::Item::Static(s) if public(s.visibility()) => {
@@ -384,6 +419,71 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
             sub.nested.push((k[prefix.len()..].to_string(), inner));
         }
         out.nested.push((m.name.clone(), sub));
+    }
+    // Const parameters its functions and associated functions take as values
+    // (`Buf::<4>::new()` passes `4`): another file's calls pass them too.
+    for item in file.items().filter(|i| !crate::adt::test_only(i.syntax())) {
+        match &item {
+            ast::Item::Fn(f) => {
+                if let Some(n) = f.name()
+                    && out.fns.contains_key(n.text().to_string().as_str())
+                {
+                    for (p, d) in c.const_param_needs(f, Vec::new()) {
+                        out.const_needs.push((n.text().to_string(), p, d));
+                    }
+                }
+            }
+            ast::Item::Impl(imp) if imp.trait_().is_none() => {
+                let Some(ast::Type::PathType(pt)) = imp.self_ty() else {
+                    continue;
+                };
+                let Some(ty) = pt
+                    .path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.name_ref())
+                    .map(|n| n.text().to_string())
+                else {
+                    continue;
+                };
+                if !out.adts.defs.contains_key(&ty) {
+                    continue;
+                }
+                let impl_consts: Vec<String> = imp
+                    .generic_param_list()
+                    .into_iter()
+                    .flat_map(|l| l.generic_params())
+                    .filter_map(|p| match p {
+                        ast::GenericParam::ConstParam(cp) => Some(cp.name()?.text().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                for a in imp
+                    .assoc_item_list()
+                    .into_iter()
+                    .flat_map(|l| l.assoc_items())
+                {
+                    let ast::AssocItem::Fn(f) = a else { continue };
+                    let Some(name) = f.name() else { continue };
+                    let Some(m) = c.adts.method(&ty, name.text().to_string().as_str()) else {
+                        continue;
+                    };
+                    let extra: Vec<String> = if m.receiver.is_none() {
+                        impl_consts
+                            .iter()
+                            .filter(|n| m.impl_args.contains(&Ty::Param((*n).clone())))
+                            .cloned()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    for (p, d) in c.const_param_needs(&f, extra) {
+                        out.const_needs
+                            .push((format!("{ty}::{}", name.text()), p, d));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     // Types leave this module's checker: resolve its variables, and forget any still open.
     let freeze = |t: &Ty| -> Ty { erase_vars(&c.zonk(t)) };
@@ -579,6 +679,17 @@ impl Checker<'_> {
         self.adts.from_impls.extend(ex.adts.from_impls);
         self.adts.op_impls.extend(ex.adts.op_impls);
         self.adts.assoc_consts.extend(ex.adts.assoc_consts);
+        self.adts.assoc_const_vals.extend(ex.adts.assoc_const_vals);
+        for (k, n, d) in ex.const_needs {
+            if !k.contains("::") {
+                self.note_const_need(&format!("{module}.{k}"), &n, d);
+            }
+            self.note_const_need(&k, &n, d);
+        }
+        for (n, v) in ex.const_vals {
+            self.const_vals.insert(format!("{module}.{n}"), v);
+            self.const_vals.insert(n, v);
+        }
         self.adts.deref_targets.extend(ex.adts.deref_targets);
         self.adts.deref_mut.extend(ex.adts.deref_mut);
         self.adts.iter_items.extend(ex.adts.iter_items);

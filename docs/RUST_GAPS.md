@@ -134,6 +134,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   of a `T: TryFrom<X>` are unchecked, and a `T: TryFrom<X>` given a type without that impl fails
   when the call runs, not at compile time.
   `impl Shl` / `impl Shr` for your own types isn't supported.
+- **A blanket impl's `&mut self` method can't assign to `*self`.** In `impl<T: AddAssign> Bump
+  for T`, `self` may be a number or a string, which would need a cell per call; `*self += by`
+  there is an error. Methods that read `self`, or call its `&mut self` methods, work.
+- **A derived `Default` of a generic struct leaves a bare `T` field `undefined`.**
+  `#[derive(Default)] struct W<T> { n: T }` then `W::<u8>::default()` (or `T::default()` with
+  `T = W<u8>`) has `n` undefined, not `0`: the derived function doesn't take `T`'s class.
 - **`{:?}` of a generic value is guessed from the run-time value where no caller says its type.**
   A generic function or method that prints a `T` with `{:?}` takes a formatter for `T` from each
   call (so `Some(..)`, `1.0` and `'c'` print as in Rust), and so does a blanket impl's method
@@ -182,10 +188,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   is inferred from a written argument or a struct's type (`Matrix<2, 3>`), or read at run time off
   an argument (`[T; N]`'s length), but not from an array type alone: `let z: [f64; 4] = zeros();`
   needs `zeros::<4>()` (it's a "type annotations needed" error, not a wrong value). For the same
-  reason a mismatched length (`sum::<2>([1, 2, 3])`) isn't an error. A const argument can be a
-  literal, integer arithmetic on literals (`{ 128 / 8 }`), a const parameter or a `const` item,
-  not a `const fn` call. A trait's const parameter read in the trait's default methods, and
-  64/128-bit ones, aren't supported.
+  reason a mismatched length (`sum::<2>([1, 2, 3])`) isn't an error. A const argument is a
+  const parameter or a constant integer or `bool` expression the compiler works out: literals,
+  `const` items, associated consts, arithmetic, `as` casts, `size_of::<u32>()` and calls of the
+  file's `const fn`s; not a `const` struct's method (`{ CONFIG.encode() }`) or another crate's
+  `const fn`. A trait's const parameter read in the trait's default methods, and an associated
+  const reading its `impl`'s const parameter, aren't supported.
 - **Associated types are checked through function type parameters, not `impl<T>`'s or `dyn`.**
   In `fn f<S: Shape>`, `S::Unit` is its own type with the bounds the trait declares, as in
   rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
@@ -545,8 +553,10 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   local to local aren't tracked, and a borrow taken in one loop iteration and used in the next
   isn't seen, so other programs rustc rejects still run.
 - **Use after move is checked only where the checker is sure a local owns its value** (see
-  FEATURES). It misses moves out of fields (`let v = s.items;` then `s.items`), out of pattern
-  bindings, and into closures without `move`; those run with the JS value still shared.
+  FEATURES). It misses moves out of fields by expression (`let v = s.items;` then `s.items`),
+  `match` / `if let` bindings that move, a `String` field bound by a `let` pattern (`let S {
+  name, .. } = s;` leaves `s` usable: a `String` field looks like a `&str` one here), and moves
+  into closures without `move`; those run with the JS value still shared.
   Definite initialization is checked for `let x;` (use before assignment, assigning an immutable
   one twice); names declared by a `let (a, b);` pattern aren't checked yet.
 - **Type checking covers the supported subset only.** Within it, mismatches and mutability
@@ -560,6 +570,13 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   to the integer impl (`i64` / `u64` / `i128` / `u128` values are BigInts and always reach their
   own impl). Called on a value of known type (`x.money()` with `x: f64`), the right impl is
   chosen at compile time.
+- **A tuple is a JS array**, so through a generic `T: Trait` its impl is picked by length:
+  one trait implemented for both a tuple and a slice, array or `Vec` is an error, and two
+  impls for tuples of one length (`(u8, u8)` and `(String, String)`) conflict.
+- **A `mod` file's traits implemented for built-in types in the file that loads it** join the
+  module's registry, which is shared by every script that loads that module: when two
+  scripts implement one of its traits for the same type, the module's generic functions use
+  the last script's impl (a re-exported trait's module isn't reached).
 - **An `Option` through a generic `T: Trait`** is `null` or its value at run time, so the
   `Option` impl serves `None` and any `Some(x)` whose value's own type has no impl of that
   method; when both `Option<u8>` and `u8` implement it, `Some(3u8)` reaches `u8`'s. A nested
@@ -592,6 +609,12 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Macros
 
+- **Inline modules of `mod` files are reached by their items' flattened names.** `use
+  geo::shapes::Circle;` (with `pub mod shapes { .. }` in `geo.rs`) works, but an error about
+  the type may name it `shapes__Circle`. Re-exporting a `mod` file's item from one of this
+  file's inline modules (`mod prelude { pub use crate::geo::Point; }`) isn't supported.
+- **`c"..."` is a `CStr` value only.** There's no C to pass it to: `as_ptr()` and `CString`
+  aren't there.
 - **`macro_rules!` hygiene covers local bindings.** Names a macro's body binds (`let`, `for`,
   closure parameters) are renamed per expansion, so they don't clash with the caller's; other
   names (functions, types, a `static` the body names) resolve at the call site, as in a textual
@@ -611,6 +634,18 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `deny` by default there).
 - **Rule markers aren't renamed by hygiene**: `@closure` in `m!(@closure ..)` stays put even when
   the expansion also binds `let closure`.
+- **Recursion limit**: expansions go 128 levels deep, as rustc's do, or as deep as a
+  `#![recursion_limit = "N"]` in the file or its crate root says (the root is found through the
+  `mod` items that declare the file, so a test file's `mod common;` sibling roots in `tests/`,
+  which no `mod` path leads to, aren't seen). Past 1024 levels it's an error either way: each
+  level re-reads the file. Deep expansions make deeply nested expressions; the compiler's wasm
+  stack is 8 MB, which takes an accumulator like `(($acc) * 2 % 9 + 1)` some 600 levels deep
+  before the JS engine's own stack runs out (a `RangeError`).
+- **`log::debug!` is the `log` crate's**, also when the crate has its own `macro_rules! debug`
+  (aho-corasick's `debug!` is `log!(log::debug!(..))` under `#[cfg(feature = "logging")]`, which
+  used to expand itself until the limit). The bundled `log`'s macros are left out when the crate
+  defines its own of that name, so such a call is reported as an unsupported macro. Features count
+  as undecided (see `cfg`), so the `#[cfg(feature = ..)]` block isn't dropped.
 - **A macro named `safe`** (bitvec's `safe! { .. }`) is spelled `Safe` before parsing, as
   rust-analyzer's parser takes `safe` before an item as the `safe fn` qualifier.
 - **Calls inside `quote!` / `parse_quote!` aren't expanded**: they're tokens a proc macro emits.

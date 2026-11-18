@@ -138,16 +138,26 @@ impl Checker<'_> {
             // signatures are what calls on a concrete type use) and is replaced in the default
             // methods an impl inherits.
             let def = self.adts.traits.get(&n).cloned();
+            // (`trait IterExt: Iterator`: `Self::Item` is the iterator's, unchecked here.)
+            let iter_ext = def.as_ref().is_some_and(|d| {
+                d.supers.iter().any(|s| {
+                    matches!(
+                        s.as_str(),
+                        "Iterator" | "DoubleEndedIterator" | "ExactSizeIterator"
+                    )
+                })
+            });
             let (params, assoc) = def
                 .map(|d| (d.type_params, d.assoc_types))
                 .unwrap_or_default();
-            let saved_assoc = std::mem::replace(
-                &mut self.impl_assoc,
-                assoc
-                    .iter()
-                    .map(|a| (a.clone(), Ty::Param(format!("{n}::{a}"))))
-                    .collect(),
-            );
+            let mut assoc_tys: HashMap<String, Ty> = assoc
+                .iter()
+                .map(|a| (a.clone(), Ty::Param(format!("{n}::{a}"))))
+                .collect();
+            if iter_ext {
+                assoc_tys.entry("Item".into()).or_insert(Ty::Unknown);
+            }
+            let saved_assoc = std::mem::replace(&mut self.impl_assoc, assoc_tys);
             self.generics.clear();
             for p in &params {
                 self.generics
@@ -215,6 +225,13 @@ impl Checker<'_> {
 
     /// The type an impl's `Self` names: a struct or enum, or a built-in type's `ext_key`.
     pub(super) fn self_ty_named(&self, type_name: &str) -> Ty {
+        // (A blanket impl's `Self` is its `T`, which each call replaces.)
+        if let Some(p) = type_name
+            .strip_suffix("$all")
+            .and_then(|tr| self.adts.blanket_params.get(tr))
+        {
+            return Ty::Param(p.clone());
+        }
         match type_name {
             "String" => Ty::Str,
             "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
@@ -432,6 +449,29 @@ impl Checker<'_> {
                 .or_default()
                 .insert(tm.name.clone(), sig);
         }
+        // Tuples and `Vec`s (slices, arrays) are all JS arrays: a call through a type parameter
+        // tells tuples apart by length, but not a tuple from a `Vec`.
+        let has = |k: &str| {
+            self.adts
+                .trait_impls
+                .get(k)
+                .is_some_and(|ts| ts.iter().any(|t| t == tr))
+        };
+        let clash = if crate::adt::tuple_arity(type_name).is_some() {
+            has("Vec")
+        } else {
+            type_name == "Vec" && (1..=12).filter_map(crate::adt::tuple_key).any(has)
+        };
+        if clash {
+            let node = imp
+                .self_ty()
+                .map(|t| t.syntax().clone())
+                .unwrap_or_else(|| imp.syntax().clone());
+            self.error(
+                &node,
+                format!("`{tr}` for both a tuple and a slice, array or `Vec` isn't supported yet (all of them are JS arrays, which a call through a type parameter can't tell apart)"),
+            );
+        }
         let impls = self
             .adts
             .trait_impls
@@ -469,6 +509,10 @@ impl Checker<'_> {
                 };
                 format!(
                     "conflicting implementations of trait `{tr}` for type `{type_name}` ({same} are one type in JS)"
+                )
+            } else if let Some(n) = crate::adt::tuple_arity(type_name) {
+                format!(
+                    "`{tr}` for two tuples of {n} isn't supported yet (tuples are JS arrays, which a call through a type parameter tells apart by length only)"
                 )
             } else if def.type_params.is_empty() {
                 format!("conflicting implementations of trait `{tr}` for type `{type_name}`")
@@ -522,6 +566,20 @@ impl Checker<'_> {
                 };
                 let saved = self.self_ty.replace(Ty::Param("Self".into()));
                 self.param_bounds.insert("Self".into(), vec![tr.clone()]);
+                // (`trait Stats: Iterator`: `self` is an iterator, of items unchecked here.)
+                let self_ty = if def.supers.iter().any(|s| {
+                    matches!(
+                        s.as_str(),
+                        "Iterator" | "DoubleEndedIterator" | "ExactSizeIterator"
+                    )
+                }) {
+                    Ty::Iter {
+                        elem: Box::new(Ty::Unknown),
+                        mutable: false,
+                    }
+                } else {
+                    Ty::Param("Self".into())
+                };
                 let self_local = f
                     .param_list()
                     .and_then(|pl| pl.self_param())
@@ -529,7 +587,7 @@ impl Checker<'_> {
                         Some((
                             sp.name()?,
                             Local {
-                                ty: Ty::Param("Self".into()),
+                                ty: self_ty.clone(),
                                 mutable: sp.amp_token().is_none() && sp.mut_token().is_some(),
                                 deferred: false,
                                 reference: sp.amp_token().map(|_| sp.mut_token().is_some()),
@@ -616,8 +674,180 @@ impl Checker<'_> {
         })
     }
 
+    /// A blanket impl's method or associated function for `ty`: the impl's `T` (and `Self`) is
+    /// `ty`.
+    pub(super) fn blanket_inst(&mut self, key: &str, sig: &Method, ty: &Ty) -> Method {
+        let mut sig = self.method_inst(sig, Some(std::slice::from_ref(ty)));
+        let mut map: HashMap<String, Ty> = [("Self".to_string(), ty.clone())].into();
+        // (`impl<I: Iterator> Stats for I`: `I::Item` is the receiver's item.)
+        if let Some(p) = key
+            .strip_suffix("$all")
+            .and_then(|tr| self.adts.blanket_params.get(tr))
+        {
+            map.insert(p.clone(), ty.clone());
+            let item = match self.zonk(ty) {
+                Ty::Iter { elem, .. } | Ty::Range(elem, _) => Some(*elem),
+                Ty::Adt(n, _) => self.adts.iter_items.get(&n).cloned(),
+                _ => None,
+            };
+            if let Some(item) = item {
+                map.insert(format!("{p}::Item"), item);
+            }
+        }
+        sig.params = sig
+            .params
+            .iter()
+            .map(|t| super::generic::subst(t, &map))
+            .collect();
+        sig.ret = super::generic::subst(&sig.ret, &map);
+        sig
+    }
+
+    /// The blanket impl (key, function) whose associated function `ty::f()` reaches
+    /// (`i32::make()` with `impl<T: Default> Make for T`): `ty` has no function of that name and
+    /// meets the impl's bounds.
+    pub(super) fn blanket_static(&self, ty: &Ty, f: &str) -> Option<(String, Method)> {
+        let ty = self.zonk(ty);
+        if matches!(ty, Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_)) {
+            return None;
+        }
+        let own = match &ty {
+            Ty::Adt(n, _) => self.adts.method(n, f).is_some(),
+            t => crate::adt::ext_key_of(t).is_some_and(|k| self.adts.method(k, f).is_some()),
+        };
+        if own {
+            return None;
+        }
+        // (A built-in type's own associated functions come first: `String::new()`.)
+        if !matches!(ty, Ty::Adt(..))
+            && matches!(
+                f,
+                "new"
+                    | "from"
+                    | "default"
+                    | "with_capacity"
+                    | "from_iter"
+                    | "from_str"
+                    | "try_from"
+                    | "from_utf8"
+                    | "from_str_radix"
+                    | "from_le_bytes"
+                    | "from_be_bytes"
+                    | "from_ne_bytes"
+                    | "from_u32"
+                    | "from_digit"
+                    | "with_hasher"
+                    | "with_capacity_and_hasher"
+                    | "new_in"
+            )
+        {
+            return None;
+        }
+        let mut found: Vec<(&String, &Vec<String>)> = self.adts.blankets.iter().collect();
+        found.sort();
+        found.into_iter().find_map(|(tr, bounds)| {
+            let key = format!("{tr}$all");
+            let sig = self.adts.method(&key, f)?.clone();
+            if sig.receiver.is_some() {
+                return None;
+            }
+            bounds
+                .iter()
+                .all(|b| self.meets_bound(&ty, b))
+                .then_some((key, sig))
+        })
+    }
+
+    /// The type `T` names in a `T::f()` call that may reach a blanket impl's associated function:
+    /// a built-in type or one of the file's structs and enums (with `Vec::<u8>`'s arguments).
+    pub(super) fn blanket_qualifier(&mut self, path: &ast::Path, t: &str) -> Option<Ty> {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        if self.adts.blankets.is_empty() || self.param_bounds.contains_key(t) {
+            return None;
+        }
+        let args: Vec<Ty> = path
+            .qualifier()
+            .and_then(|q| q.segment())
+            .and_then(|s| s.generic_arg_list())
+            .map(|l| {
+                l.generic_args()
+                    .filter_map(|g| match g {
+                        ast::GenericArg::TypeArg(ta) => ta.ty(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .iter()
+            .map(|a| self.lower_type(a))
+            .collect();
+        let arg = |i: usize| Box::new(args.get(i).cloned().unwrap_or(Ty::Unknown));
+        Some(match t {
+            "String" | "str" => Ty::Str,
+            "Vec" => Ty::Vec(arg(0)),
+            "Option" => Ty::Option(arg(0)),
+            "HashMap" => Ty::Map(arg(0), arg(1)),
+            "HashSet" => Ty::Set(arg(0)),
+            "bool" => Ty::Bool,
+            "char" => Ty::Char,
+            n if crate::adt::ext_key(n).is_some() && Ty::from_name(n).is_numeric() => {
+                Ty::from_name(n)
+            }
+            n if self.adts.defs.get(n).is_some_and(|d| d.module.is_none()) => {
+                let n_params = self.adts.defs[n].type_params.len();
+                let mut targs = args.clone();
+                while targs.len() < n_params {
+                    targs.push(self.fresh(super::VarKind::General));
+                }
+                Ty::Adt(n.to_string(), targs)
+            }
+            _ => return None,
+        })
+    }
+
+    /// `ty::f(..)` through a blanket impl's associated function (`i32::make()`).
+    pub(super) fn blanket_static_call(
+        &mut self,
+        c: &ast::CallExpr,
+        ty: &Ty,
+        f: &str,
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        let (key, sig) = self.blanket_static(ty, f)?;
+        let sig = self.blanket_inst(&key, &sig, ty);
+        self.arg_count(c.syntax(), "function", sig.params.len(), args.len());
+        for (a, p) in args.iter().zip(&sig.params) {
+            self.check(a, p);
+        }
+        self.record_conv(
+            c.syntax(),
+            crate::adt::Conv::ExtDict {
+                key,
+                dict: ty.clone(),
+            },
+        );
+        Some(sig.ret)
+    }
+
+    /// The blanket impl whose associated function is being checked, when `param` is its `T`
+    /// (`Self::make()` / `T::make()` in `impl<T: Default> Make for T`): the trait.
+    pub(super) fn cur_blanket_trait(&self, param: &str) -> Option<String> {
+        let cur = self.cur_fn.as_deref()?;
+        let (ty, _) = cur.split_once("::")?;
+        let tr = ty.strip_suffix("$all")?;
+        (self.adts.blanket_params.get(tr).map(String::as_str) == Some(param))
+            .then(|| tr.to_string())
+    }
+
     /// Whether `ty` meets the bound `b`: a std trait, or a user trait it implements.
     fn meets_bound(&self, ty: &Ty, b: &str) -> bool {
+        // (Marker traits every value here has: one thread, no unsized values.)
+        if matches!(
+            b,
+            "Sized" | "Send" | "Sync" | "Unpin" | "UnwindSafe" | "RefUnwindSafe"
+        ) {
+            return true;
+        }
         if self.adts.traits.contains_key(b) {
             self.implements_user_trait(ty, b)
         } else if b == "Iterator" {
@@ -748,6 +978,24 @@ impl Checker<'_> {
     /// `p::Unit` for a type parameter `p` whose bounds declare `type Unit`: the bound's `Unit =
     /// X`, or the projection itself.
     pub(super) fn projection(&self, p: &str, assoc: &str) -> Option<Ty> {
+        // `Self::Item` in `trait IterExt: Iterator { fn f(self) -> Vec<Self::Item> { .. } }`: the
+        // implementing iterator's item (unchecked; each impl's own signatures name it).
+        if assoc == "Item"
+            && self.bound_traits(p).iter().any(|t| {
+                matches!(
+                    t.as_str(),
+                    "Iterator" | "DoubleEndedIterator" | "ExactSizeIterator"
+                )
+            })
+            && !self.bound_traits(p).iter().any(|t| {
+                self.adts
+                    .traits
+                    .get(t)
+                    .is_some_and(|d| d.assoc_types.iter().any(|a| a == assoc))
+            })
+        {
+            return Some(Ty::Unknown);
+        }
         let tr = self.bound_traits(p).into_iter().find(|t| {
             self.adts
                 .traits

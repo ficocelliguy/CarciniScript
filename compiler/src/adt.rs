@@ -207,6 +207,8 @@ pub struct Adts {
     /// Blanket impls (`impl<T: Display> Shout for T`): the trait's bounds on `T`, by trait. Their
     /// methods are under the key `Shout$all`.
     pub blankets: HashMap<String, Vec<String>>,
+    /// The type parameter each blanket impl is for (`T`), by trait.
+    pub blanket_params: HashMap<String, String>,
     /// Each impl's associated types (`type Unit = f64;`), by (type, trait).
     pub impl_assoc: HashMap<(String, String), HashMap<String, Ty>>,
     /// Each user-trait impl's self type arguments and trait arguments (`impl<T> Store<T> for
@@ -225,6 +227,10 @@ pub struct Adts {
     pub method_alts: HashMap<String, Vec<String>>,
     /// Those keys by the absolute offset of the method's name.
     pub alt_keys_at: HashMap<usize, String>,
+    /// The `"Type::method"`s of `method_alts` from inherent impls for different instantiations
+    /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
+    /// arguments, not by a trait.
+    pub inherent_alts: std::collections::HashSet<String>,
     /// For `TryFrom` / `Extend` / `FromIterator` impls, what their argument (or item) type is
     /// as written, by `"Type::key"`: `TryFrom<&str>` and `TryFrom<String>` take the same JS
     /// value, so a call picks between them by how its argument is written (`.as_str()`,
@@ -234,6 +240,9 @@ pub struct Adts {
     pub op_impls: HashMap<String, Vec<OpImpl>>,
     /// Associated constants (`impl Grid { const W: usize = 3; }`), by type then name.
     pub assoc_consts: HashMap<String, HashMap<String, Ty>>,
+    /// Their values, when they're constant integers or `bool`s (for const arguments in other
+    /// files: `Buf<{ Grid::W }>`).
+    pub assoc_const_vals: HashMap<String, HashMap<String, crate::consteval::CVal>>,
     /// Built-in types with user trait impls (`impl Money for f64`), by `ext_key`. Their methods
     /// are in `methods` under that key.
     pub ext_types: std::collections::HashSet<String>,
@@ -301,7 +310,7 @@ pub fn ext_key(name: &str) -> Option<&'static str> {
         "VecDeque" => "VecDeque",
         "Range" => "Range",
         "RangeInclusive" => "RangeInclusive",
-        _ => return None,
+        k => return tuple_arity(k).and_then(tuple_key),
     })
 }
 
@@ -325,7 +334,84 @@ pub fn ext_key_of(t: &Ty) -> Option<&'static str> {
         Ty::Coll(crate::ty::Coll::VecDeque, _) => Some("VecDeque"),
         Ty::Range(_, false) => Some("Range"),
         Ty::Range(_, true) => Some("RangeInclusive"),
+        Ty::Tuple(es) => tuple_key(es.len()),
         _ => None,
+    }
+}
+
+/// A constant pattern's path as segment names, with a type anchor read as its type
+/// (`<S as Tr>::TOP` → `["S", "TOP"]`). Empty when some segment is neither.
+pub fn const_pat_segs(path: ast::Path) -> Vec<String> {
+    let names = |p: ast::Path| -> Option<Vec<String>> {
+        p.segments()
+            .map(|s| s.name_ref().map(|n| n.text().to_string()))
+            .collect()
+    };
+    let mut segs = Vec::new();
+    for s in path.segments() {
+        match (s.name_ref(), s.type_anchor().and_then(|a| a.ty())) {
+            (Some(n), _) => segs.push(n.text().to_string()),
+            (None, Some(ast::Type::PathType(t))) => match t.path().and_then(names) {
+                Some(n) => segs.extend(n),
+                None => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        }
+    }
+    segs
+}
+
+/// Whether two impls' type arguments can never be the same type (`i32` and `String`, `1` and
+/// `2`, `Vec<u8>` and `Vec<u16>`); a type parameter could be anything.
+pub fn disjoint_args(a: &Ty, b: &Ty) -> bool {
+    let both = |x: &[&Ty], y: &[&Ty]| {
+        x.len() != y.len() || x.iter().zip(y).any(|(p, q)| disjoint_args(p, q))
+    };
+    match (a, b) {
+        (Ty::Param(_) | Ty::Unknown | Ty::Var(_), _)
+        | (_, Ty::Param(_) | Ty::Unknown | Ty::Var(_)) => false,
+        (Ty::Adt(n, xs), Ty::Adt(m, ys)) => {
+            n != m
+                || both(
+                    &xs.iter().collect::<Vec<_>>(),
+                    &ys.iter().collect::<Vec<_>>(),
+                )
+        }
+        (Ty::Tuple(xs), Ty::Tuple(ys)) => both(
+            &xs.iter().collect::<Vec<_>>(),
+            &ys.iter().collect::<Vec<_>>(),
+        ),
+        (Ty::Vec(x), Ty::Vec(y))
+        | (Ty::Option(x), Ty::Option(y))
+        | (Ty::Set(x), Ty::Set(y))
+        | (Ty::RefCell(x), Ty::RefCell(y)) => disjoint_args(x, y),
+        (Ty::Map(k, v), Ty::Map(k2, v2)) | (Ty::Result(k, v), Ty::Result(k2, v2)) => {
+            disjoint_args(k, k2) || disjoint_args(v, v2)
+        }
+        (Ty::Coll(c, x), Ty::Coll(d, y)) => c != d || disjoint_args(x, y),
+        // (An integer literal not yet given a kind.)
+        (Ty::IntLit, Ty::Int(_) | Ty::IntLit) | (Ty::Int(_), Ty::IntLit) => false,
+        (
+            Ty::Int(_)
+            | Ty::Float { .. }
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Str
+            | Ty::Unit
+            | Ty::ConstVal(_),
+            _,
+        )
+        | (
+            _,
+            Ty::Int(_)
+            | Ty::Float { .. }
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Str
+            | Ty::Unit
+            | Ty::ConstVal(_),
+        ) => a != b,
+        _ => std::mem::discriminant(a) != std::mem::discriminant(b),
     }
 }
 
@@ -336,6 +422,7 @@ pub fn ext_args(t: &Ty) -> Vec<Ty> {
         Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Range(e, _) => vec![(**e).clone()],
         Ty::Map(k, v) | Ty::Result(k, v) => vec![(**k).clone(), (**v).clone()],
         Ty::Coll(_, view) => ext_args(view),
+        Ty::Tuple(es) => es.clone(),
         _ => vec![],
     }
 }
@@ -361,8 +448,26 @@ pub fn impl_self_name(imp: &ast::Impl) -> Option<String> {
         ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
         // `impl<const N: usize> Tr for [u8; N]`: arrays and slices are `Vec`s in JS.
         ast::Type::ArrayType(_) | ast::Type::SliceType(_) => Some("Vec".into()),
+        // `impl Tr for (A, B)`: a tuple's impls are by its length (`Tuple2`).
+        ast::Type::TupleType(t) => tuple_key(t.fields().count()).map(str::to_string),
         _ => None,
     }
+}
+
+/// The extension key of a tuple's impls, by its length (`Tuple2`): tuples are JS arrays, told
+/// apart from each other by length (and from `Vec`s by not sharing a trait with them).
+pub fn tuple_key(n: usize) -> Option<&'static str> {
+    const KEYS: [&str; 12] = [
+        "Tuple1", "Tuple2", "Tuple3", "Tuple4", "Tuple5", "Tuple6", "Tuple7", "Tuple8", "Tuple9",
+        "Tuple10", "Tuple11", "Tuple12",
+    ];
+    KEYS.get(n.checked_sub(1)?).copied()
+}
+
+/// `Tuple2` → 2.
+pub fn tuple_arity(key: &str) -> Option<usize> {
+    let n: usize = key.strip_prefix("Tuple")?.parse().ok()?;
+    (tuple_key(n) == Some(key)).then_some(n)
 }
 
 /// The built-in type in `Box<str>` / `Rc<[T]>` / `Arc<String>`: its extension key's name.
@@ -468,6 +573,9 @@ pub enum Conv {
     Method { key: String },
     /// A user trait method on a built-in type: `$ext$key.prototype.method.call(recv, ..)`.
     Ext { key: String },
+    /// A blanket impl's associated function on a type (`i32::make()`):
+    /// `$ext$key.f.call(<the type's class>, ..)`.
+    ExtDict { key: String, dict: crate::ty::Ty },
     /// `x.try_into()` to an integer type: `κσ.$tryInt(x, bits, signed, big)`.
     TryInt { bits: u32, signed: bool, big: bool },
     /// `x.try_into()` through an `impl TryFrom<X> for Y`: `Y.key(x)` (`try_from`, or
@@ -733,9 +841,10 @@ fn blanket_parts(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
             }
             _ => None,
         })?;
-    // (`impl<T> Trait for T` through a reference too, `for &T`.)
+    // (`impl<T> Trait for T` through a reference too, `for &T`. `?Sized` asks for nothing.)
     let names = |l: ast::TypeBoundList| -> Vec<String> {
         l.bounds()
+            .filter(|b| b.question_mark_token().is_none())
             .filter_map(|b| match b.ty()? {
                 ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
                 _ => None,

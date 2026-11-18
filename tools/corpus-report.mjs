@@ -1,10 +1,18 @@
-// The real-world corpus survey, step 2: summarize `corpus-classify.mjs` output. Prints each file's
-// verdict by kind (src / tests / benches / examples), the language gaps (files, files where it's the
-// only one, crates), the crates that pass in every file, and writes a CSV next to the input.
-//   node tools/corpus-report.mjs [out.jsonl]   (defaults to the classifier's default output)
+// The real-world corpus survey, step 3: summarize `corpus-classify.mjs` output, with the syntax
+// `compiler/examples/corpus_ast.rs` adds when it's there. Prints each file's verdict by kind
+// (src / tests / benches / examples), the language gaps (files, files where it's the only one,
+// crates), every syntactic feature with its use and whether its probe compiles, what's left
+// uncategorized, and the crates that pass in every file; writes a CSV next to the input.
+//   node tools/corpus-report.mjs [in.jsonl]   (defaults to the AST step's output, else the
+//   classifier's, in the OS temp dir)
 import fs from "node:fs"; import os from "node:os"; import path from "node:path";
 
-const input = process.argv[2] || path.join(os.tmpdir(), "carciniscript-corpus.jsonl");
+const astOut = path.join(os.tmpdir(), "carciniscript-corpus.ast.jsonl");
+const input = process.argv[2] || (fs.existsSync(astOut) ? astOut : path.join(os.tmpdir(), "carciniscript-corpus.jsonl"));
+const probeFile = input + ".probes.json";
+const probes = new Map(fs.existsSync(probeFile) ? JSON.parse(fs.readFileSync(probeFile, "utf8")).map(p => [p.id, p]) : []);
+const missing = id => probes.get(id) && !probes.get(id).ok;
+console.log(`reading ${input}${probes.size ? ` (${probes.size} feature probes)` : " (no syntax: run the corpus_ast step for features)"}`);
 // Parser and compile-fail fixtures aren't meant to compile.
 const FIXTURE = /test_data|[\\/]ui[\\/]|compile[-_]fail|[\\/]trybuild|[\\/]tests[\\/]ui/;
 const KR = /[\/\\](tests?|benches|examples)[\/\\]/;
@@ -19,7 +27,16 @@ let fixtures = 0;
 for (const line of fs.readFileSync(input, "utf8").split("\n").filter(Boolean)) {
   const r = JSON.parse(line);
   if (FIXTURE.test(r.f)) { fixtures++; continue; }
-  for (const e of r.errs) if (e.cat === "GENERIC" && /^no rules of/.test(e.m)) { e.cat = "LANG"; e.why = "macro_rules matching"; }
+  for (const e of r.errs) {
+    if (e.cat === "GENERIC" && /^no rules of/.test(e.m)) { e.cat = "LANG"; e.why = "macro_rules matching"; }
+    if (e.cat !== "GENERIC") continue;
+    // With the syntax: an error in a construct naming something from another crate or file (or
+    // a type the compiler couldn't resolve) is downstream of that name; one in a feature whose
+    // probe fails is that feature's gap.
+    if (/defined multiple times|^duplicate definitions/.test(e.m) && e.node?.cfg) { e.cat = "LANG"; e.why = "same item under alternative #[cfg]s"; }
+    else if (e.node?.feat && missing(e.node.feat)) { e.cat = "LANG"; e.why = "feature: " + probes.get(e.node.feat).label; }
+    else if (e.ext?.length || e.ctx_ext?.length || /\{unknown\}/.test(e.m)) { e.cat = "EXT"; e.why = "downstream of an external name"; }
+  }
   const cats = new Set(r.errs.map(e => e.cat));
   const ext = cats.has("EXT") || cats.has("THREAD");
   r.v = r.errs.length === 0 ? "A compiles as-is"
@@ -53,10 +70,41 @@ console.log("\nlanguage gaps: files, files where it's the only one, crates");
 for (const [w, g] of [...gaps].sort((a, b) => b[1].files - a[1].files))
   console.log(`${String(g.files).padStart(6)}${String(g.solo).padStart(6)}${String(g.crates.size).padStart(6)}  ${w}${NOT_PLANNED.has(w) ? " (not planned)" : ""}`);
 
-const generic = new Map();
-for (const r of rows.filter(r => r.v[0] === "D")) for (const w of new Set(r.errs.filter(e => e.cat === "GENERIC").map(e => e.why))) generic.set(w, (generic.get(w) || 0) + 1);
-console.log("\nother errors, nothing unresolved:");
-for (const [w, c] of [...generic].sort((a, b) => b[1] - a[1]).slice(0, 8)) console.log(String(c).padStart(6), w);
+// Every syntactic feature: files and crates using it, files where an uncategorized error lands in
+// it, and whether its probe compiles.
+if (probes.size) {
+  const use = new Map(), landed = new Map();
+  for (const r of rows) {
+    for (const id of Object.keys(r.feats || {})) {
+      const u = use.get(id) || { files: 0, crates: new Set() };
+      u.files++; u.crates.add(crateOf(r.f)); use.set(id, u);
+    }
+    for (const id of new Set(r.errs.filter(e => e.node?.feat && (e.cat === "GENERIC" || e.why.startsWith("feature:"))).map(e => e.node.feat)))
+      landed.set(id, (landed.get(id) || 0) + 1);
+  }
+  const row = id => { const p = probes.get(id), u = use.get(id) || { files: 0, crates: new Set() };
+    return `${String(u.files).padStart(6)}${String(u.crates.size).padStart(6)}${String(landed.get(id) || 0).padStart(7)}  ${p.label}`; };
+  const order = [...probes.keys()].sort((a, b) => (use.get(b)?.files || 0) - (use.get(a)?.files || 0));
+  console.log("\nmissing features (probe fails): files using it, crates, files with errors in it");
+  for (const id of order.filter(id => missing(id) && !probes.get(id).not_planned)) console.log(`${row(id)}\n${"".padEnd(21)}probe: ${probes.get(id).error}`);
+  console.log("\nnot planned:");
+  for (const id of order.filter(id => probes.get(id).not_planned)) console.log(row(id));
+  console.log("\nsupported features (probe compiles) where errors still land: files using it, crates, files with errors in it");
+  for (const id of order.filter(id => !missing(id) && !probes.get(id).not_planned && landed.get(id))) console.log(row(id));
+  console.log("\nsupported features, no errors landing in them:");
+  console.log(order.filter(id => !missing(id) && !probes.get(id).not_planned && !landed.get(id)).map(id => `${id} (${use.get(id)?.files || 0})`).join(", "));
+}
+
+// What's still uncategorized (no unresolved names involved), by message and the construct it's in.
+const left = new Map();
+for (const r of rows) for (const e of r.errs.filter(e => e.cat === "GENERIC")) {
+  const k = `${e.why}  @ ${e.node ? e.node.feat || e.node.kinds[0] : "?"}`;
+  const g = left.get(k) || { files: new Set(), ex: `${r.f}:${e.line} ${e.node?.text || ""}` };
+  g.files.add(r.f); left.set(k, g);
+}
+console.log(`\nuncategorized errors with nothing unresolved, by message @ construct (${[...left.values()].reduce((s, g) => s + g.files.size, 0)} file hits):`);
+for (const [k, g] of [...left].sort((a, b) => b[1].files.size - a[1].files.size).slice(0, 30))
+  console.log(`${String(g.files.size).padStart(6)}  ${k}\n${"".padEnd(10)}e.g. ${g.ex.slice(0, 140)}`);
 
 const by = new Map();
 for (const r of rows) { const c = crateOf(r.f), e = by.get(c) || { n: 0, ok: 0 }; e.n++; if (ok(r)) e.ok++; by.set(c, e); }

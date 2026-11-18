@@ -121,6 +121,9 @@ pub enum Coll {
     IndexMap,
     /// `κσ.IndexSet`; the view is `HashSet<T>`.
     IndexSet,
+    /// `[T; N]` with its length known, as the exhaustiveness check sees it (only there: arrays
+    /// are `Vec<T>` everywhere else); the view is `Vec<T>`.
+    FixedArray(usize),
 }
 
 impl Coll {
@@ -144,6 +147,7 @@ impl Coll {
             Coll::BTreeSet => "BTreeSet",
             Coll::IndexMap => "IndexMap",
             Coll::IndexSet => "IndexSet",
+            Coll::FixedArray(_) => "array",
         }
     }
 
@@ -291,7 +295,11 @@ impl Ty {
             "char" => Ty::Char,
             "String" | "str" => Ty::Str,
             "NS" => Ty::Extern("NS".into()),
-            _ => Ty::Unknown,
+            // (A tuple's extension key, `Tuple2`.)
+            k => match crate::adt::tuple_arity(k) {
+                Some(n) => Ty::Tuple(vec![Ty::Unknown; n]),
+                None => Ty::Unknown,
+            },
         }
     }
 

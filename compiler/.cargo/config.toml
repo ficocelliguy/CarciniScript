@@ -1,4 +1,7 @@
 # ra_ap_syntax drops parse trees on a background thread unless this cfg is set. wasm32 has no
 # threads, so the first dropped tree panics.
+# The stack is 8 MB, not wasm's 1 MB: the checker and codegen recurse over the syntax tree, and an
+# expression nested ~125 levels deep (`((x) * 2 % 9 + 1)` repeated, as a macro's accumulator
+# writes it) overflowed 1 MB, which traps the whole module.
 [target.wasm32-unknown-unknown]
-rustflags = ["--cfg", "no_salsa_async_drops"]
+rustflags = ["--cfg", "no_salsa_async_drops", "-C", "link-arg=-zstack-size=8388608"]

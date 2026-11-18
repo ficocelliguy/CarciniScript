@@ -2751,7 +2751,9 @@
       }
       if (how === "default") return cp >= 0x20 && cp <= 0x7e ? c : uni;
       if (c === "\0") return "\\0";
-      return cp < 0x20 || cp === 0x7f || (cp >= 0x80 && cp < 0xa0) ? uni : c;
+      // (Rust's: grapheme extenders (combining marks), and what isn't printable: control,
+      // format, private-use, unassigned and separator characters but the space.)
+      return /^(?:\p{Grapheme_Extend}|[\p{C}\p{Z}])$/u.test(c) && c !== " " ? uni : c;
     },
     // `x.to_le_bytes()` / `to_be_bytes()`: the two's complement bytes of a `bits`-wide integer.
     $toBytes(x, bits, little) {
@@ -2795,12 +2797,48 @@
     $newRegs() {
       return { kinds: {}, blankets: [] };
     },
-    $extReg(regs, kind, cls, integral) {
-      (regs.kinds[kind] ??= []).push({ cls, integral });
+    // (`arity`: a tuple's impl, for arrays of that length only.)
+    $extReg(regs, kind, cls, integral, arity) {
+      (regs.kinds[kind] ??= []).push({ cls, integral, arity });
     },
     // Blanket impls (`impl<T: Display> Shout for T`): tried for any value, last.
     $blanketReg(regs, cls) {
       regs.blankets.push(cls);
+    },
+    // A type's class `d` passed for a type parameter (`T::make()`), with the associated
+    // functions of the blanket impls it lacks (`impl<T: Default> Make for T`), each called with
+    // the class as `this`.
+    $bdict(regs, d) {
+      let w = null;
+      for (const cls of regs.blankets) {
+        for (const k of Object.getOwnPropertyNames(cls)) {
+          if (k === "length" || k === "name" || k === "prototype" || typeof cls[k] !== "function" || k in d) continue;
+          w ??= Object.create(d);
+          w[k] = (...a) => cls[k].call(w, ...a);
+        }
+      }
+      return w ?? d;
+    },
+    // A file's impls of a `mod` file's traits also join that module's registry (`m.$extRegs`),
+    // so the module's generic functions find them. Modules are shared between scripts: the
+    // newest script's class goes first, and replaces an older run's class of the same name and
+    // methods.
+    $extRegIn(m, kind, cls, integral, arity) {
+      const regs = m?.$extRegs;
+      if (!regs) return;
+      const list = (regs.kinds[kind] ??= []);
+      const sig = (c) => `${c.name}:${Object.getOwnPropertyNames(c.prototype).sort().join(",")}`;
+      const i = list.findIndex((r) => r.cls !== cls && sig(r.cls) === sig(cls) && r.from === "mod");
+      if (i >= 0) list.splice(i, 1);
+      if (!list.some((r) => r.cls === cls)) list.unshift({ cls, integral, arity, from: "mod" });
+    },
+    $blanketRegIn(m, cls) {
+      const regs = m?.$extRegs;
+      if (!regs) return;
+      const sig = (c) => `${c.name}:${Object.getOwnPropertyNames(c.prototype).sort().join(",")}`;
+      regs.blankets = regs.blankets.filter((c) => c === cls || sig(c) !== sig(cls) || !c.$fromMod);
+      cls.$fromMod = true;
+      if (!regs.blankets.includes(cls)) regs.blankets.unshift(cls);
     },
     // `w.put(..)` for a `w: &mut W` (its cell `c`): an impl's `&mut self` method on a string or
     // number (listed in its class's `$mut`) gets the cell as `this`, others the value.
@@ -2812,6 +2850,7 @@
       const kind = x instanceof Deque && regs.kinds.deque ? "deque" : Array.isArray(x) || x instanceof Deque ? "array" : typeof x;
       for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
+        if (r.arity !== undefined && !(Array.isArray(x) && x.length === r.arity)) continue;
         if (kind === "number" && r.integral !== Number.isInteger(x) && (regs.kinds[kind] ?? []).some((o) => o !== r && o.integral === Number.isInteger(x) && typeof o.cls.prototype[name] === "function")) continue;
         return r.cls.prototype[name].call(r.cls.$mut?.has(name) ? c : x, ...args);
       }
@@ -2851,6 +2890,8 @@
       let pick = null;
       for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
+        // (A tuple's impl: arrays of its length only.)
+        if (r.arity !== undefined && !(Array.isArray(x) && x.length === r.arity)) continue;
         pick ??= r;
         // A number goes to an integer type's impl when it's whole, else to a float type's.
         if (kind === "number" && r.integral === Number.isInteger(x)) {
@@ -5421,6 +5462,30 @@
           first = false;
         }
       });
+    },
+    // `it.set_from(src)` over `iter_mut()`: slots (numbers, strings, bools) are set, objects
+    // replaced in place; the number assigned.
+    setFromSlots(it, src) {
+      const s = items(src)[Symbol.iterator]();
+      let n = 0;
+      for (const slot of it) {
+        const r = s.next();
+        if (r.done) break;
+        slot[1] = r.value;
+        n++;
+      }
+      return n;
+    },
+    setFrom(it, src) {
+      const s = items(src)[Symbol.iterator]();
+      let n = 0;
+      for (const x of it) {
+        const r = s.next();
+        if (r.done) break;
+        rt.$replace(x, r.value);
+        n++;
+      }
+      return n;
     },
     merge(it, other) {
       const xs = Array.from(it);

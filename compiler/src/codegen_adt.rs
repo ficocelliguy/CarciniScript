@@ -312,11 +312,35 @@ impl Codegen<'_> {
                         };
                         let ty = k.ty().map(|t| self.lower_type(&t));
                         let (f, _) = self.emit_expr(&body, ty.as_ref());
+                        // A value naming other items (`W * 2` with `const W` below the class,
+                        // another class's const) is computed on first read: they may not be
+                        // initialized yet when the class is.
+                        let lazy = body
+                            .syntax()
+                            .descendants()
+                            .filter_map(ast::PathExpr::cast)
+                            .any(|p| {
+                                p.path()
+                                    .and_then(|p| p.first_segment())
+                                    .is_none_or(|s| s.syntax().text() != "Self")
+                            });
+                        let name = escape_ident(n.text());
                         let mut line = Frag::mapped(
                             self.off(k.syntax()),
-                            format!("static {} = ", escape_ident(n.text())),
+                            if lazy {
+                                format!("static get {name}() {{ const v = ")
+                            } else {
+                                format!("static {name} = ")
+                            },
                         );
-                        line.append(f).push(";");
+                        line.append(f);
+                        if lazy {
+                            line.push(format!(
+                                "; Object.defineProperty(this, \"{name}\", {{ value: v }}); return v; }}"
+                            ));
+                        } else {
+                            line.push(";");
+                        }
                         self.line(line);
                     }
                     _ => {}
@@ -446,6 +470,12 @@ impl Codegen<'_> {
         }
         let saved_dbgs = super::set_dbg_scope(dbgs.clone());
         let saved_dicts = std::mem::replace(&mut self.dict_scope, dicts);
+        // A blanket impl's associated function: its `T`'s class is `this`.
+        let blanket_this = match &self_ty {
+            Ty::Param(p) if p != "Self" && sig.receiver.is_none() => Some(p.clone()),
+            _ => None,
+        };
+        let saved_blanket = std::mem::replace(&mut self.blanket_this, blanket_this);
         // The `impl`'s const parameters: `this.$N` in a method, passed (`$N`) to an
         // associated function.
         let mut outer = Vec::new();
@@ -617,6 +647,7 @@ impl Codegen<'_> {
         self.drop_flags.remove("this");
         self.scopes.pop();
         self.dict_scope = saved_dicts;
+        self.blanket_this = saved_blanket;
         super::set_const_scope(Some(saved_consts));
         super::set_dbg_scope(saved_dbgs);
         self.tmp = saved_tmp;
@@ -677,6 +708,11 @@ impl Codegen<'_> {
             "char" => Ty::Char,
             k => Ty::from_name(k),
         };
+        // (`Self::make()` in its methods is the class's own function.)
+        let saved_ext = std::mem::replace(
+            &mut self.ext_class,
+            (!key.ends_with("$all")).then(|| key.to_string()),
+        );
         self.line(Frag::text(format!("class $ext${key} {{")));
         self.out.indent += 1;
         let mut given: Vec<String> = Vec::new();
@@ -766,6 +802,7 @@ impl Codegen<'_> {
                 self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
             }
         }
+        self.ext_class = saved_ext;
         self.out.indent -= 1;
         self.line(Frag::text("}"));
         // The `&mut self` methods, which `κσ.$dcallMut` calls with the receiver's cell.
@@ -795,13 +832,60 @@ impl Codegen<'_> {
             self.line(Frag::default());
             return;
         }
+        // Traits from `mod` files: their default methods (which this file doesn't compile again)
+        // are mixed in, and the class joins the module's registry as well as this file's, so the
+        // module's generic functions find it (`κσ.$extRegIn`).
+        let mut modules: Vec<String> = Vec::new();
+        for tr in &traits {
+            let Some(m) = self
+                .types
+                .adts
+                .traits
+                .get(tr)
+                .and_then(|d| d.module.clone())
+            else {
+                continue;
+            };
+            if m == "κσ"
+                || self
+                    .file_traits
+                    .iter()
+                    .any(|t| t.name().is_some_and(|n| n.text() == tr.as_str()))
+            {
+                continue;
+            }
+            let prefix = format!("{m}.{}", escape_ident(tr));
+            self.line(Frag::text(format!(
+                "κσ.$mixin($ext${key}, {prefix}$defaults ?? {{}}, {}, {prefix}$statics);",
+                super::js_string(tr)
+            )));
+            if !modules.contains(&m) {
+                modules.push(m);
+            }
+        }
         // A blanket impl's class: `κσ.$dcall` tries it for any value.
         if key.ends_with("$all") {
             self.line(Frag::text(format!("κσ.$blanketReg($extRegs, $ext${key});")));
+            for m in &modules {
+                self.line(Frag::text(format!("κσ.$blanketRegIn({m}, $ext${key});")));
+            }
             self.line(Frag::default());
             return;
         }
-        // Found by `κσ.$dcall` when a generic function calls the method on a built-in value.
+        // Found by `κσ.$dcall` when a generic function calls the method on a built-in value. (A
+        // tuple is an array of its length.)
+        if let Some(n) = crate::adt::tuple_arity(key) {
+            self.line(Frag::text(format!(
+                "κσ.$extReg($extRegs, \"array\", $ext${key}, false, {n});"
+            )));
+            for m in &modules {
+                self.line(Frag::text(format!(
+                    "κσ.$extRegIn({m}, \"array\", $ext${key}, false, {n});"
+                )));
+            }
+            self.line(Frag::default());
+            return;
+        }
         let (kind, integral) = match key {
             "String" | "char" => ("string", false),
             "bool" => ("boolean", false),
@@ -825,6 +909,11 @@ impl Codegen<'_> {
         self.line(Frag::text(format!(
             "κσ.$extReg($extRegs, \"{kind}\", $ext${key}, {integral});"
         )));
+        for m in &modules {
+            self.line(Frag::text(format!(
+                "κσ.$extRegIn({m}, \"{kind}\", $ext${key}, {integral});"
+            )));
+        }
         self.line(Frag::default());
     }
 

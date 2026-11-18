@@ -919,8 +919,17 @@ impl Checker<'_> {
                         | "next_back"
                         | "max"
                         | "min"
+                        | "set_from"
                 ));
-        if mutable && !objects && !matches!(method, "for_each" | "enumerate") && !for_zip && !slots
+        // (Items of a type defined elsewhere, or whose type failed: an error says so already.)
+        let unknown_after_errors =
+            self.zonk(&e) == Ty::Unknown && self.diags.iter().any(|d| d.severity == "error");
+        if mutable
+            && !objects
+            && !matches!(method, "for_each" | "enumerate")
+            && !for_zip
+            && !slots
+            && !unknown_after_errors
         {
             self.error(
                 m.syntax(),

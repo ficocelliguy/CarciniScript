@@ -29,6 +29,8 @@ fn shared(kind: Coll, method: &str) -> bool {
                 | "drain"
         ),
         Coll::BinaryHeap => matches!(method, "len" | "is_empty" | "iter" | "clear"),
+        // (Never a value's type: see `Coll::FixedArray`.)
+        Coll::FixedArray(_) => false,
         Coll::BTreeMap | Coll::IndexMap => matches!(
             method,
             "insert"
@@ -133,7 +135,7 @@ impl Checker<'_> {
         }
         let b = |t: &Ty| Box::new(t.clone());
         let view = match kind {
-            Coll::VecDeque | Coll::BinaryHeap => Ty::Vec(b(&args[0])),
+            Coll::VecDeque | Coll::BinaryHeap | Coll::FixedArray(_) => Ty::Vec(b(&args[0])),
             Coll::BTreeSet | Coll::IndexSet => Ty::Set(b(&args[0])),
             Coll::BTreeMap | Coll::IndexMap => Ty::Map(b(&args[0]), b(&args[1])),
         };

@@ -92,10 +92,111 @@ Erasing them only means programs rustc would reject still run. Tiers:
    and named lifetimes in their signatures), down to fields (disjoint fields don't conflict), and
    ended by a `break` / `return` right after the change. Not yet: closures, struct literals,
    references handed between locals, loop-carried borrows, `mod` files' functions.
-3. **Polonius** (not planned): would need MIR-like lowering and region inference.
+3. **NLL proper** (sketched 2026-11-17, below): rustc's shipping borrow checker is NLL, not
+   Polonius, and NLL is intra-procedural, so each function is checked and cached on its own.
+   That is what makes a full checker fit a browser compiler and a language service.
 
 Optional debug mode: RefCell-style runtime guards on collections (e.g. mutate-while-iterating
 panics instead of silently misbehaving).
+
+### NLL sketch
+
+The algorithm is not the hard part. The hard part is that the compiler erases `&T` to `T` before
+anything downstream sees it (`typeck.rs` `lower_type`; `Ty` has no `Ref` variant, `MutRef` only
+for closure parameters and cells), and a borrow checker needs reference structure for every local.
+
+**What has to exist that doesn't today**
+
+- *A per-function IR with explicit places and a CFG* ("BIR"). Everything today walks the
+  ra_ap_syntax CST keyed by byte ranges. Borrow checking needs basic blocks, temporaries for
+  subexpressions, places as a local plus projections (field, deref, index, enum downcast), and
+  `StorageDead` at scope ends. Patterns lower to switches plus downcast projections, `?` to a
+  branch and return, loops to back edges, closures to separate bodies with upvar places.
+- *Reference-aware types for BIR locals* ("RTy"): the typeck `Ty` shape with
+  `Ref(region, mut, inner)` nodes reinstated and region inference variables attached. ADTs with
+  lifetime parameters (`Parser<'a>`) carry regions as generic arguments.
+- *A borrow table for the std surface*: which input a result borrows from (`iter`, `get`,
+  `first`, `as_str`, `chars`, `split_whitespace`, `entry`, `iter_mut`, `windows`,
+  `HashMap::get`, the std iterators' `Item` types, ..). `borrows::ref_sig` already does this for
+  the file's own functions by rustc's elision rules; it generalizes to a table of signature text.
+- *Liveness and region inference.* Backward liveness per local over the CFG; drop-liveness only
+  for ADTs with an `impl Drop`. Each region is a set of CFG points. Constraints `'a: 'b` from
+  assignment, call instantiation (fresh regions per call), return, and reborrow propagate point
+  sets to a fixed point. The signature's named and elided lifetimes are universal (free) regions.
+- *Loans and conflict detection.* Each `&p` / `&mut p` is a loan live over its region's points,
+  killed by an assignment to a prefix of `p`. Every access is checked against the active loans:
+  E0499, E0502, E0505, E0506 within the function; E0597, E0515, E0716 when a loan's region
+  reaches the place's `StorageDead` or a free region.
+- *Move dataflow on the same IR*, replacing `moves.rs`: maybe-uninitialized places over BIR
+  gives use after move, partial moves and definite initialization with less special casing than
+  the CST walker, and supplies `move_sites` for `Drop` codegen as today.
+- *Two-phase borrows and implicit reborrows.* `v.push(v.len())` and handing a `&mut` local on
+  to a `&mut` parameter are everywhere in the corpus; without these the checker false-positives
+  constantly.
+- *Closure capture analysis.* Rust 2018 whole-variable captures first; RFC 2229 precise path
+  captures later.
+- *Variance* computed from field types by a fixpoint over ADTs (`&mut T` and interior
+  mutability make `T` invariant); cheap, and needed to avoid both false positives and holes.
+
+Deliberately left out of "most of one": Polonius location sensitivity, higher-ranked bounds
+(`for<'a>`), `dyn Trait + 'a` object lifetime defaults, drop-check subtleties (`#[may_dangle]`),
+`T: 'a` well-formedness on struct definitions, `impl Trait` capture rules (treat as capturing
+everything). `async` bodies are checked as if synchronous (`.await` is a call), which matches
+rustc for non-`Send` futures. Unknown shape (a `T` instantiated with a reference the overlay
+can't see) defaults to owned: silence, never a false positive, as the current checks do.
+
+**The one real design decision: where reference-ness lives**
+
+- *Option A, an overlay.* BIR lowering rebuilds `Ref` nodes from syntax (`&e`, `*e`),
+  annotations, user signatures, the std table, autoref/autoderef at method calls and match
+  ergonomics (default binding modes: `for (k, v) in &map`, `if let Some(x) = opt.as_ref()`),
+  and runs a small unification restricted to ref-or-not shape. Keeps the erasure behaviors the
+  rest of the compiler depends on (one impl serving `T` and `&T`; `String` and `&str` one JS
+  type; the `&mut` cell and write-back machinery). Deletable if it fails.
+- *Option B, `Ty::Ref` in the type checker*, erased at codegen. One inference instead of two,
+  and it would close some gaps that come from erasure. Touches the 9k-line typeck and every
+  `Ty` match across ~30 files.
+- Recommendation: A first. Promote to B only if the overlay's duplicated method resolution
+  becomes the dominant maintenance cost.
+
+**Performance (browser compile and language service)**
+
+- *Function-granularity caching.* A function's result depends only on its expanded text, the
+  signatures of the callees it names and the ADT definitions it touches. Hash those and keep
+  results across edits: `memo.rs` one level down, so a keystroke re-checks one function.
+- *Dense indices, no hashing per point.* Lower once to arrays indexed by `LocalId`, `PointId`,
+  `RegionId`, `LoanId` (u32); regions as word-packed bitsets over points. Functions here are
+  typically under a few hundred points, so the fixpoint is microseconds to low milliseconds.
+- *Run after typeck, only on functions with no type errors* (incomplete types make garbage
+  loans). The service already runs one analysis per edit for hover, completions and signature
+  help, so borrow diagnostics ride along at no extra parse cost.
+- *A budget escape hatch.* Functions above a point threshold fall back to NLL-lite or skip with
+  a note, so a pathological file can never make the editor stutter.
+- *No new crates.* The wasm is 5.9 MB; bitsets and index newtypes are a few hundred lines
+  in-house. Expect roughly 300 to 500 KB more wasm.
+- Target against the performance scan's numbers: under 10 ms cold for `darknet.rs` (78 ms
+  compile today), near zero for an unchanged function in the service.
+
+**Staging**
+
+1. BIR lowering, CFG, liveness. Port move checking onto it and retire `moves.rs`; the existing
+   move fixtures validate the IR before any region work starts.
+2. RTy overlay, std borrow table, constraint generation, NLL inference, loans. Retire
+   `borrows.rs`. Closes every gap listed in RUST_GAPS "Checking": loop-carried borrows,
+   local-to-local handoff, struct literals, closures, other modules' functions.
+3. Dangling and escape errors (E0597, E0515, E0716), struct lifetime parameters, two-phase
+   borrows, reborrows, closure captures.
+4. Per-function caching, service wiring, and strict borrows as the default once the
+   false-positive rate is measured.
+
+**Test oracle.** Every corpus file rustc accepts must produce zero borrow errors, so
+`npm run corpus` is a false-positive counter. For true positives, rustc's own
+`tests/ui/borrowck` suite with its `.stderr` files covers the subset well, and `record-native`
+can diff messages; keep rustc's exact wording, as `borrows.rs` does, since the editor shows it.
+
+**Size.** 5 to 7k lines of Rust: BIR lowering 2 to 3k (every expression form in the subset),
+region typing and inference ~1.5k, std table and diagnostics under 1k each. About three times
+the current `moves.rs` + `borrows.rs`, under a tenth of the compiler.
 
 ## NS bindings
 
@@ -304,9 +405,21 @@ Every `.rs` file in the local cargo registry (226 crates, 5,197 files after drop
 compile-fail fixtures) was compiled file by file, and each error was sorted into "missing crate or
 module", "thread", "std library", or "language". Errors from names in other crates or other files of
 the same crate, and from threads, `Arc`, `Mutex` and atomics, don't count. Unresolved names don't
-hide later errors, so this is a fair per-file check. To re-run it:
-`node --stack-size=8000 tools/corpus-classify.mjs <registry src dir> out.jsonl`, then
-`node tools/corpus-report.mjs out.jsonl` (verdicts, gap table, crates, and a per-file CSV).
+hide later errors, so this is a fair per-file check. To re-run it: `npm run corpus` (about 5
+minutes; results in the OS temp dir). Its three steps:
+- `tools/corpus-classify.mjs [root] [out.jsonl]` compiles each file and sorts each error (another
+  crate or file, thread, std, language, parse, or uncategorized), with its byte range
+- `compiler/examples/corpus_ast.rs` parses each file with rust-analyzer's parser and adds the
+  Rust features it uses (about 90 syntactic detectors, so a feature counts even where an
+  unresolved name stops the compiler first), the construct each error is on, and the names
+  from other crates or files in that construct, its statement, its function's signature and its
+  `impl`'s header. Each feature has a probe program (all accepted by rustc, 2021 edition); a
+  feature whose probe doesn't compile is missing. `--probes` prints just those results
+- `tools/corpus-report.mjs` reclassifies an uncategorized error as downstream of another crate
+  or file when such names are involved, or as a language gap when it's on a missing feature
+  or is a `#[cfg]`'d item defined twice, then prints the verdicts, language gaps, every feature
+  with its use and probe result, what's still uncategorized by message and construct, and the
+  crates that pass in every file, and writes a per-file CSV
 
 - **Language features all supported:** 67% of files (61% of `src/`, 85% of `examples/`, 86% of
   `tests/`, 93% of `benches/`). Counting std-library gaps as failures, 50.5%. By lines, 39%.
@@ -344,6 +457,17 @@ hide later errors, so this is a fair per-file check. To re-run it:
   - Compiler changes since `db63e10`: "type parameter in this position" fell 211 → 24 files and
     "generic trait implemented more than once" 49 → 0.
   The open items are under "Open from the 2026-11-17 re-run" in Language gaps, below.
+- **Re-run after `049fcee`, on the uncommitted tree, with the syntax step** (2026-11-17): language
+  features all supported in **81.8%** (4,272 of 5,220); counting std gaps, 72.2%; by lines,
+  64.9%. 896 files have a language gap (631 unsafe/memory, not planned), 505 are std-only, 44
+  have only uncategorized errors (from 64). 70 crates pass in every file (from 49); 153 in 80%
+  or more. Uncategorized errors fell from 3,987 file hits to 1,814: most were downstream of a
+  type, method or trait in another file of the crate (a method that file's impl defines, a field
+  of its struct, `self` in an `impl` of its type). New items are under "Open from the syntax
+  re-run", below. Counts left in the gaps above: a trait on a std type 63 / 32 / 38, generics in
+  this position 29 / 12 / 24, writes through references 28 / 18 / 17, a type parameter in this
+  position 26 / 16 / 13, std-trait bounds 14 / 9 / 8, format strings 8 / 4 / 8, const generics
+  6 / 1 / 5, renames 4 / 3 / 4, macros 7 files.
 - [x] **Regressions in `3c15b78`**, both in files that compiled before:
   - a user `enum Ordering` in a pattern is taken as `std::cmp::Ordering`: "expected `Ordering`,
     found `Ordering`" (`ra_ap_syntax` `ast/operators.rs`); a file's own `Ordering` now shadows
@@ -482,7 +606,7 @@ uncommitted work). Unsafe/memory (now 631 / 412 / 112), `union` (126 / 3 / 8), `
 and their items (66 / 28 / 16) and the proc-macro API outside a proc-macro crate (55 / 51 / 12)
 aren't listed (not planned).
 
-- 🚧 **Your trait on a std/built-in type, what's left** (228 / 153 / 79):
+- [x] **Your trait on a std/built-in type, what's left** (228 / 153 / 79):
   - [x] impls on `VecDeque` (their own `$ext$VecDeque` class and run-time kind, apart from a
     `Vec` impl, also through a generic `T: Tr`), on `Box<Node>` / `Rc<Node>` / `Pin<Box<Fut>>`
     (the contents' impl), and a `Box<dyn Tr>` struct field declared before the trait
@@ -507,6 +631,31 @@ aren't listed (not planned).
     wasm-bindgen's `type_wasm_native!` / `type_abi_as_u32!` 130, `impl_values!` 39,
     `ref_by_copy!` 18), so the error points at the macro call. Written out: `Option` (26),
     `Vec` (25), `String` (18), `Box` (17), `str` (14).
+  - [x] Re-run (2026-11-17, 116 files): 1,050 of the 1,200 hits were impls of a trait the file
+    can't see (declared in another file of the crate, like defmt's `Format` in `impls/*.rs` or
+    wasm-bindgen's `IntoWasmAbi` in its `vectors!` / `type_wasm_native!` expansions). The error
+    named the built-in type ("cannot find type `u8`"); it now names the trait ("`impl Format
+    for ..` is not supported yet"), as for a struct, which the classifier counts as another
+    file's name. The same shape loaded with `mod` (trait in `fmt.rs`, `impl fmt::Format for u8`
+    in the script) already compiled, but was a silent miscompile: the module's own generic
+    functions (`pub fn describe<T: Format>(x: &T)`) and the trait's default methods called
+    through them didn't find the script's impls (`x.twice is not a function`). A file with
+    `pub` traits now exports its registry (`$extRegs`), calls their methods through it, and a
+    file loading it registers its impls there too (`κσ.$extRegIn`); the trait's default
+    methods are mixed into the built-in type's class (`modules/ext_impls`).
+  - [x] Tuples: `impl Area for (f64, f64)`, `impl<A: Encode, B: Encode> Encode for (A, B)`,
+    nested, with default methods and through a generic `T: Tr` (a `$ext$Tuple2` class, picked
+    by the array's length; `fixtures/tuple_trait_impls.rs`). Their impls used to be dropped
+    without a word. One trait for both a tuple and a slice / array / `Vec` is an error: a
+    call through a type parameter can't tell them apart.
+  - Measured on the 53 affected crates (1,762 files): files with the gap 116 → 66, only gap
+    75 → 32; no file that compiled stopped compiling. Left: std types with no value here
+    (`RangeFrom` / `RangeTo` / `RangeFull` / `RangeToInclusive` 7 files each, `CStr` /
+    `CString`, `Cell`, `LinkedList`, iterator adapters like `Peekable` / `Chars` / `Keys`,
+    `TcpStream`, `Instant`, `Wrapping`, `ControlFlow`), the unsafe ones (`MaybeUninit`,
+    `NonNull`, `ManuallyDrop`, `Layout`), `impl PartialOrd<Bytes> for str` (only `PartialEq`
+    takes your type as the argument), tuple and `Vec` impls of one trait (borsh), and rayon's
+    `impl IntoParallelIterator for &[T; N]` / `&Vec<T>` inside rayon itself.
 - [x] **A type parameter in an unsupported position** (211 / 113 / 83), "type `T` is not supported
   yet" (`fixtures/type_param_positions.rs`). Registry files whose first error was a one-letter
   "type `T` is not supported yet" fell from 22 to 1, and 8 more files compile, with no file that
@@ -661,13 +810,179 @@ aren't listed (not planned).
   - left: items that are tuples holding a `&mut` in a returned iterator (`Item = (usize, &mut
     u8)`), `partition`, iterators over generic elements (smallvec's `A::Item`), rayon's
     `mem::replace(&mut self.iter, [].iter_mut())`, and `MaybeUninit` (anstyle-parse, http)
-- [ ] **Const generics, remaining** (15 / 3 / 11; unchanged): const parameters wider than 32 bits
-  or not integers, and const arguments that aren't a literal or integer arithmetic.
-- [ ] **Blanket `impl<T> Tr for T`** (12 / 3 / 9; now 12 / 6 / 9).
-- [ ] **Macro recursion limit** (9 / 9 / 6; unchanged): expansions deeper than 128 levels.
-- [ ] Smaller: iterator chain shapes over numbers, strings or bools (6 / 1; now 5 / 1),
+- [x] **Const generics, remaining** (15 / 3 / 11; unchanged) (`fixtures/const_arg_exprs.rs`,
+  `modules/const_args`):
+  - const arguments are constant expressions, worked out at compile time (`consteval.rs`, which
+    enum discriminants use too): arithmetic, comparisons and `as` casts over `const` items
+    (`{ 2 * D_CODES + 1 }`), associated consts of the file's impls, also on numbers
+    (`{ CpuFeatures::NONE }`, `{ u128::MAX_STR_LEN - 16 }`), `u8::MAX` / `usize::BITS`,
+    `size_of::<u32>()`, `crate::m::ID`, and calls of the file's `const fn`s (`let`, `if`,
+    early `return`, turbofish types for `size_of::<T>()`), also inside macro arguments
+  - another file's `pub const` / associated consts count (`Buf<{ sizes::WORDS * 3 }>`)
+  - `u64` / `i64` / `u128` / `i128` const parameters: a BigInt in the body, whatever number
+    the caller passes (`u128::MAX` too)
+  - silent miscompile: a `mod` file's function or associated function with a const parameter
+    (`sizes::Buf::<4>::new()`, `let b: Buf<4> = Buf::new()`) wasn't passed it from another
+    file (`[1; N]` made one element). Modules now export which const parameters they take
+  - silent miscompile: an associated const naming a `const` declared below its type
+    (`const ALL: usize = Self::AVX | LATE;`) threw "Cannot access before initialization" when
+    the module loaded. Such consts are computed on first read now
+  - re-measured on the 12 affected crates (1,220 files): files with the gap 16 → 6 (deranged's
+    `{ u128::MAX }` and itoa's `{ u128::MAX_STR_LEN - 16 }` went), one more compiles. Left:
+    constants of other crates or other files the survey doesn't load (bitvec's `elts`, zlib-rs'
+    `CpuFeatures`, ring, zerocopy's `crate::REPR_C_..`) and a `const` struct's method
+    (`{ Config::DEFAULT.encode() }`); also an associated const reading its `impl`'s const
+    parameter (`impl<const P: u128> U<P> { const PER: u128 = P * 1000; }`)
+- [x] **Blanket `impl<T> Tr for T`** (12 / 3 / 9; now 12 / 6 / 9)
+  (`fixtures/blanket_impls_more.rs`). Methods of a blanket impl on any type meeting its bounds
+  already worked; probed against rustc, what failed:
+  - `?Sized` (and `Send` / `Sync` / `Unpin` ..) among the bounds made every struct fail them
+  - a method returning the impl's `T` (`fn into_source(self) -> T`) lost the receiver's type
+  - extension traits on iterators: `impl<I: Iterator> Stats for I` with `I::Item` in its
+    signatures (the receiver's item), and `trait Stats: Iterator` with `Self::Item` and default
+    methods over `self` (`for x in self`, `self.count()`)
+  - associated functions: `i32::zeroed()`, `Vec::<u8>::zeroed()`, `Cfg::zeroed()`,
+    `<Cfg as Zeroed>::pair()`, `let v: Vec<f64> = Zeroed::zeroed_n(3)` and `T::zeroed()` in a
+    generic function, with `T::default()` / `Self::zeroed()` in their bodies: they run with the
+    type's class as `this` (`$ext$Zeroed$all.zeroed.call(κσ.$bdict(..))`, which adds the blanket
+    functions a class lacks)
+  - silent miscompiles, also without blanket impls: `let x: i32 = Make::make();` (your impl for a
+    built-in type, by the expected type) emitted `undefined.make()`; `Inc::inc(&mut n)` /
+    `<f64 as Money>::money(&x)` on a built-in type called a method the number doesn't have; a
+    trait's default associated function calling `Self::make()` failed for built-in types
+  - a blanket impl of another file's trait (gimli's `impl<T: RelocateWriter> Writer for T`) now
+    says what any impl of such a trait says, so the survey counts it as another crate
+  - an error now: `*self = ..` / `*self += ..` in a blanket impl's `&mut self` method (it used to
+    be rejected by accident; with the rest supported it compiled to invalid JS)
+  - re-measured on the affected crates (638 files): files with the gap 12 → 0, one more compiles
+    (num-traits' `tests/cast.rs`). The registry's other hits are the classifier's: parser test
+    data with an undeclared `S`, and windows-sys' `CY`, which aren't type parameters
+  - found on the way, not fixed: a derived `Default` of a generic struct with a bare `T` field
+    (`struct W<T> { n: T }`) leaves it `undefined` (`W::<u8>::default()`, also through
+    `T::default()`), in the baseline too
+- [x] **Macro recursion limit** (9 / 9 / 6; unchanged; 8 / 8 / 5 after the macro work above)
+  (`fixtures/macro_recursion_limit.rs`, `modules/recursion_limit`). Only syn's were really deep;
+  the rest recursed by mistake:
+  - writeable's `assert_writeable_eq!` hands on to `$crate::assert_writeable_eq!(@internal, ..)`,
+    and its second rule's `$actual:expr` took `@internal`: where the fragment parser rejects the
+    tokens, the fallback scan took anything. A fragment no longer starts with a token rustc's
+    can't (`@`, `,`, `=>`, `+`, ..; `::`, `..`, `&&` can, and `?` starts a `ty`)
+  - aho-corasick's `debug!` is `log!(log::debug!(..))`: `log::debug!` was the crate's own `debug!`
+    again. A `log::` / `anyhow::` / `tokio::` / `futures::` path is that crate's macro (the
+    bundled one, left out when the crate defines its own of that name)
+  - `#![recursion_limit = "N"]` is honored (up to 1024), in the file or its crate root, found
+    through the `mod` items that declare it (`imported_macros` passes it on)
+  - the wasm stack is 8 MB (`compiler/.cargo/config.toml`): an expression ~125 levels deep (a
+    macro accumulator's `(($acc) * 2 % 1000 + 1)`, or written out) overflowed 1 MB and trapped
+    the module, also before this change; now ~600 levels, then the JS engine's `RangeError`
+  - now 3 / 3 / 3, all syn's `tests/common/eq.rs` (`spanless_eq_enum!`, ~170 levels): its
+    `#![recursion_limit = "1024"]` is in each `tests/test_*.rs` root, which no `mod` path from
+    `common/` reaches. writeable's `impls.rs` now stops at `impl Writeable for u8` (a trait on a
+    std type, above); aho-corasick's files at external names. No other file's errors changed
+- [x] Smaller: iterator chain shapes over numbers, strings or bools (6 / 1; now 5 / 1),
   `macro_rules!` in an unsupported position (5 / 5), nested `use` paths (4 / 2), byte / C string
-  literals in one position (1 / 0).
+  literals in one position (1 / 0). (`fixtures/c_strings_set_from.rs`, `modules/nested_use`,
+  `modules/include_nested`.) Re-measured on the hit files: all four gaps 0 but jiff's one (below);
+  `unicode-properties`' `lib.rs` and the two icu data crates' files compile.
+  - iterator chains: the hits were items of a type from another file (clap's `ArgGroup`,
+    tiny_http's `Header`, ring's `Limb`, zerovec's `T::ULE`); the checker no longer reports the
+    chain again after an error, as codegen already didn't. The shapes behind them (`zip` +
+    `for_each`, `find`, `try_for_each` over numbers) already matched rustc. New: itertools'
+    `set_from` over `iter_mut()` (slots over numbers, strings and bools, else replaced in place)
+  - `macro_rules!` positions: `include!` of files that define and call macros (icu's generated
+    data) is pasted in before macro expansion, its own `include!`s read next to it; `macro_rules
+    ! name` with a space (ra_ap_parser's generated code); `pub use __make_provider as
+    make_provider;` renaming a macro of the file
+  - nested `use` paths into a `mod` file's inline modules (`use geo::shapes::Circle;`, `use
+    stamp::{context::NoContext, ..}`, `geo::shapes::area(..)`, also in macro arguments, `super::`
+    / `crate::` from this file's inline modules, a `use` in a block): `alias.rs` writes them as
+    `modflat`'s flattened names (`shapes__Circle`), and a module's exports include its inline
+    modules' items. Left: re-exporting a `mod` file's item through an inline module (`mod
+    prelude { pub use crate::geo::Point; }`, also without nesting); jiff's hit is the survey
+    compiling `error/mod.rs` alone, where `crate::util` finds the sibling `util.rs`
+  - C strings: `c"..."` / `cr"..."` are the cstr prelude's `CStr` (`to_bytes`,
+    `to_bytes_with_nul`, `to_str`, `to_string_lossy`, `count_bytes`, `from_bytes_with_nul` /
+    `until_nul` with std's errors, comparisons, std's `{:?}`). No `CString`. On the way:
+    `char::escape_debug` escapes combining marks and non-printable separators / format
+    characters as Rust does (`\u{301}`, `\u{a0}`, `\u{200d}`)
+
+#### Open from the syntax re-run (2026-11-17)
+
+Features whose probe doesn't compile (`cargo run --release --example corpus_ast -- --probes`),
+by files using them / crates / files where an error lands on them. "Using" counts every use of
+the syntax, many of which work (the moved-value one needs the value used again), so the last
+number is the measured harm; the first is what a fix could touch.
+
+- [x] **`let S { x, .. } = p` then using `p`** (215 / 65 / 0): binding a `Copy` field by value
+  moves `p` here ("use of moved value: `p`"); rustc only moves the bound fields. The error lands
+  on the later use of `p`, so the survey can't count the files it breaks.
+  - a `let` pattern now moves only what it binds by value and whose type moves (`ref` bindings
+    and bindings under a `&` pattern move nothing); a partial move records the moved top-level
+    fields, so `p.x` stays readable and using `p` whole is "use of partially moved value", as
+    in rustc (`moves.rs`, `fixtures/let_partial_moves.rs`). A `String` field bound this way
+    isn't counted as a move (strings aren't tracked unless certainly owned)
+- [x] **Inherent impls per instantiation with the same method name** (151 / 55; errors are
+  "duplicate definitions with name `find`"): `impl W<i32> { fn get(..) }` next to `impl
+  W<String> { fn get(..) }`, aho-corasick's `impl<V: Vector> Slim<V, 1>` / `Slim<V, 2>`. Probe:
+  "duplicate definitions with name `get`".
+  - a later impl whose type arguments are disjoint from every earlier one's
+    (`adt::disjoint_args`: a type parameter overlaps anything) keeps its methods under keys of
+    their own (`get$1`, the `method_alts` of generic traits; `Adts::inherent_alts` marks them).
+    A method call picks by the receiver's type arguments, a path call by the path's
+    (`W::<i32>::kind()`) or the impl's (`Self::kind()`); `W::kind()`, and a receiver whose
+    integer literal isn't settled (`W(2).get()` with `W<i32>` and `W<u8>` impls), are rustc's
+    E0034 (`fixtures/inherent_per_instantiation.rs`)
+- [x] **Associated const as a pattern** (99 / 38 / 39; 27 files where it's the only gap):
+  `match x { Self::MAX => .., S::Z => .. }`. Probe: "cannot find tuple struct, struct or
+  variant `S::Z`".
+  - path patterns naming an associated const (`Self::MAX`, `S::Z`, `<S as Tr>::TOP`) or a std
+    one (`u8::MAX`) compare with the value (`===`, or `κσ.$eq` for structs and enums); they
+    and plain `const`s are range bounds too (`0..=S::LIMIT`, `B::LO..=B::MID`). Integer values
+    (`consteval::eval_segs`) count for exhaustiveness (`fixtures/assoc_const_patterns.rs`)
+  - on the way, a silent miscompile: a range bound that wasn't a literal (`0..=LIMIT` with a
+    plain `const`) was dropped from the test, so `0..=LIMIT` matched everything above 0. A bound
+    codegen can't read is now an error
+- [x] **Slice patterns on arrays** (89 / 39 / 17; 12 only gap): `match [1, 2, 3] { [first, ..,
+  last] => .. }` is "non-exhaustive patterns: `[]` not covered"; an array's length is known, so
+  rustc accepts it.
+  - the scrutinee's dimensions come from the source (`typeck_arrays::array_dims_in_file`: an
+    array literal, a `let`'s type or initializer, a parameter's, field's or function's return
+    type, `[T; N]` with a `const N`), nested ones too (`[[u8; 2]; 3]`), and the exhaustiveness
+    check sees that column as `Coll::FixedArray(n)`: only length `n` is a value to cover. Also
+    for `let` (`let [[p, _], [_, q]] = grid;`) and `for` items (`for [k, v] in pairs`,
+    `pairs.iter()`) (`fixtures/array_slice_patterns.rs`). A pattern of the wrong length is
+    "non-exhaustive", not rustc's E0527 "pattern requires 2 elements but array has 3"
+- [x] **`extern crate x as y` of `core`** (30 / 28 / 0): `extern crate core as c;
+  c::cmp::max(1, 2)` is "cannot find function `c::cmp::max`" (the rename pass handles
+  `itertools as it` and `alloc as ..`).
+  - the rename pass already handled `core as c`, but not inside a macro call's arguments
+    (`println!("{}", c::cmp::max(1, 2))`), where `::` is two `:` tokens; the same fix reaches
+    `it::join(..)` in `format!` for every renamed crate (`fixtures/extern_crate_core_alias.rs`)
+  - found on the way, not fixed: a full std path to an enum variant or a generic std function
+    (`std::option::Option::Some(3)`, `core::result::Result::Ok(1)`, `std::mem::size_of::<u32>()`)
+    is "cannot find function"
+- [x] **Associated type bounds** (17 / 3 / 0): `I: IntoIterator<Item: Display>` loses the bound
+  ("`I::Item` doesn't implement `std::fmt::Display`").
+  - a pre-pass (`assocbounds.rs`) writes them as `where I::Item: Display` (on a type parameter
+    or a `where` predicate of a plain name, in a `fn`, `impl` or `trait`), and in argument
+    position (`it: impl Iterator<Item: Into<i64>>`) as a type parameter of the function
+    (`Item = __Item0`, `__Item0: Into<i64>`) (`fixtures/assoc_type_bounds.rs`). Left alone:
+    return position, `dyn`, nested bounds, and a subject that isn't a plain name
+- [ ] **Inline `const { .. }` blocks** (13 / 8 / 9): "this block kind is not supported yet".
+- [ ] **The same item under alternative `#[cfg]`s** (20 / 11 / 16, from "defined multiple
+  times" / "duplicate definitions" on an item with a `#[cfg]`): combinations beyond `x` /
+  `not(x)`, such as brotli's `#[cfg(any(not(feature = "std"), feature = "pass-through-ffi-panics"))]`
+  next to its opposite, or anyhow's `#[cfg(any(feature = "std", not(anyhow_no_core_error)))]`.
+- [ ] Smaller: your trait on a function pointer type (`impl Tr for fn() -> i32`, 1 file).
+
+Still uncategorized (1,814 file hits, none involving another file's names that the syntax step
+can see), by message and construct: "no method named" on a method call (166 files), mismatched
+types (85 on a name, 37 on a method call, 34 on a `&`), a `#[derive]` whose field type lacks the
+trait (81, e.g. `Clone` for `Arc<dyn PrefilterI>`), a tuple field of a method's result
+(`self.0.get_ref().0`, 81), `.into()` needing a target (67), "needs a bound" comparisons and
+operators on type parameters (41 + 28), a tuple-struct pattern of another crate's enum
+(`Bound::Included(&i)`, 39). Worth sorting next: several are probably std types the checker
+doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
 
 ### Std-library gaps
 

@@ -137,23 +137,151 @@ impl Checker<'_> {
         };
         count_ok && fixed.iter().all(|p| self.irrefutable_pat(p))
     }
+
+    /// The dimensions of the array a `let` binds (`[[u8; 2]; 3]` → `[3, 2]`): from its type,
+    /// else its initializer.
+    pub(super) fn let_dims(&self, l: &ast::LetStmt) -> Vec<usize> {
+        let dims = l.ty().map(|t| array_type_dims(&t)).unwrap_or_default();
+        if !dims.is_empty() {
+            return dims;
+        }
+        l.initializer()
+            .map(|e| array_dims_in_file(&e, 0))
+            .unwrap_or_default()
+    }
+
+    /// The dimensions of the items a `for` loop takes from `iterable` (`for [k, v] in pairs`,
+    /// `pairs.iter()`, `&pairs`): the array's, less the outermost.
+    pub(super) fn item_dims(&self, iterable: &ast::Expr) -> Vec<usize> {
+        let inner = match super::strip_parens(iterable) {
+            ast::Expr::MethodCallExpr(m)
+                if m.name_ref().is_some_and(|n| {
+                    matches!(
+                        n.text().to_string().as_str(),
+                        "iter" | "iter_mut" | "into_iter"
+                    )
+                }) =>
+            {
+                m.receiver()
+            }
+            other => Some(other),
+        };
+        let dims = inner.map(|e| array_dims_in_file(&e, 0)).unwrap_or_default();
+        dims.get(1..).map(<[usize]>::to_vec).unwrap_or_default()
+    }
+
+    /// `ty` as the exhaustiveness check sees an array of dimensions `dims`: its length known at
+    /// each level (see `Coll::FixedArray`).
+    pub(super) fn with_dims(&self, ty: &Ty, dims: &[usize]) -> Ty {
+        let Some((&n, inner)) = dims.split_first() else {
+            return self.zonk(ty);
+        };
+        match self.zonk(ty) {
+            Ty::Vec(e) => Ty::Coll(
+                crate::ty::Coll::FixedArray(n),
+                Box::new(Ty::Vec(Box::new(self.with_dims(&e, inner)))),
+            ),
+            other => other,
+        }
+    }
+
+    /// Whether `pat` matches every value of `ty`, an array of dimensions `dims`
+    /// (`let [a, [b, _]] = grid;`, `for [k, v] in pairs`).
+    pub(super) fn array_pat_covers(&self, pat: &ast::Pat, ty: &Ty, dims: &[usize]) -> bool {
+        let has_slice = pat
+            .syntax()
+            .descendants()
+            .any(|n| ast::SlicePat::can_cast(n.kind()));
+        if dims.is_empty() || !has_slice {
+            return false;
+        }
+        let rows: Vec<Vec<super::Ap>> = self
+            .abstract_pat(pat)
+            .into_iter()
+            .map(|ap| vec![ap])
+            .collect();
+        self.missing_steps.set(0);
+        self.missing(&rows, &[self.with_dims(ty, dims)]).is_none()
+    }
 }
 
 /// `array_expr_len`, also through what the file declares: a local's `let`, a parameter's type,
 /// a function's or method's return type, a field's type, a `const`.
 pub fn array_len_in_file(e: &ast::Expr, depth: usize) -> Option<usize> {
+    array_dims_in_file(e, depth).first().copied()
+}
+
+/// The nested lengths of an array type (`[[u8; 2]; 3]` → `[3, 2]`), as far as they're written
+/// with literals or a `const` of the file set to one.
+pub fn array_type_dims(t: &ast::Type) -> Vec<usize> {
+    match t {
+        ast::Type::ArrayType(a) => {
+            let Some(n) = array_type_len(t).or_else(|| const_len(a)) else {
+                return Vec::new();
+            };
+            let mut dims = vec![n];
+            if let Some(inner) = a.ty() {
+                dims.extend(array_type_dims(&inner));
+            }
+            dims
+        }
+        ast::Type::RefType(r) => r.ty().map(|t| array_type_dims(&t)).unwrap_or_default(),
+        ast::Type::ParenType(p) => p.ty().map(|t| array_type_dims(&t)).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// `[T; N]` with `const N: usize = 4;` in the file: 4.
+fn const_len(a: &ast::ArrayType) -> Option<usize> {
     use ast::HasName;
-    if let Some(n) = array_expr_len(e) {
-        return Some(n);
-    }
+    let name = a.const_arg()?.syntax().text().to_string();
+    let name = name.trim();
+    let root = a.syntax().ancestors().last()?;
+    let body = root
+        .descendants()
+        .filter_map(ast::Const::cast)
+        .find(|c| c.name().is_some_and(|n| n.text() == name))?
+        .body()?;
+    body.syntax()
+        .text()
+        .to_string()
+        .trim()
+        .trim_end_matches("usize")
+        .replace('_', "")
+        .parse()
+        .ok()
+}
+
+/// `array_len_in_file` with the lengths of nested arrays too (`[[1, 2], [3, 4]]` → `[2, 2]`).
+pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
+    use ast::HasName;
     if depth > 4 {
-        return None;
+        return array_expr_len(e).into_iter().collect();
     }
-    let root = e.syntax().ancestors().last()?;
+    if let Some(n) = array_expr_len(e) {
+        let mut dims = vec![n];
+        // (The elements' own lengths: the first element's, or the repeated one's.)
+        if let ast::Expr::ArrayExpr(a) = strip_wrappers(e)
+            && let Some(first) = a.exprs().next()
+        {
+            dims.extend(array_dims_in_file(&first, depth + 1));
+        }
+        return dims;
+    }
+    let Some(root) = e.syntax().ancestors().last() else {
+        return Vec::new();
+    };
     let name_of = |n: Option<ast::Name>| n.map(|n| n.text().to_string());
+    let type_dims = |t: Option<ast::Type>| t.map(|t| array_type_dims(&t)).unwrap_or_default();
     match super::strip_parens(e) {
         ast::Expr::PathExpr(p) => {
-            let name = p.path()?.as_single_name_ref()?.text().to_string();
+            let Some(name) = p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .map(|n| n.text().to_string())
+            else {
+                return Vec::new();
+            };
             // The nearest `let name ..` before it, else a parameter `name: [T; N]`.
             let at = e.syntax().text_range().start();
             let mut best: Option<ast::LetStmt> = None;
@@ -172,66 +300,102 @@ pub fn array_len_in_file(e: &ast::Expr, depth: usize) -> Option<usize> {
                 }
             }
             if let Some(l) = best {
-                return l.ty().and_then(|t| array_type_len(&t)).or_else(|| {
-                    l.initializer()
-                        .and_then(|i| array_len_in_file(&i, depth + 1))
-                });
+                let dims = type_dims(l.ty());
+                if !dims.is_empty() {
+                    return dims;
+                }
+                return l
+                    .initializer()
+                    .map(|i| array_dims_in_file(&i, depth + 1))
+                    .unwrap_or_default();
             }
             for f in e.syntax().ancestors().filter_map(ast::Fn::cast) {
                 for prm in f.param_list().into_iter().flat_map(|pl| pl.params()) {
                     if let Some(ast::Pat::IdentPat(ip)) = prm.pat()
                         && name_of(ip.name()).as_deref() == Some(name.as_str())
                     {
-                        return prm.ty().and_then(|t| array_type_len(&t));
+                        return type_dims(prm.ty());
                     }
                 }
             }
             // `const ARR: [T; N] = ..`
-            root.descendants()
-                .filter_map(ast::Const::cast)
-                .find(|c| name_of(c.name()).as_deref() == Some(name.as_str()))
-                .and_then(|c| c.ty())
-                .and_then(|t| array_type_len(&t))
+            type_dims(
+                root.descendants()
+                    .filter_map(ast::Const::cast)
+                    .find(|c| name_of(c.name()).as_deref() == Some(name.as_str()))
+                    .and_then(|c| c.ty()),
+            )
         }
-        ast::Expr::CallExpr(c) => {
-            let ast::Expr::PathExpr(p) = c.expr()? else {
-                return None;
-            };
-            let f = p.path()?.segment()?.name_ref()?.text().to_string();
-            fn_ret_len(&root, &f)
-        }
-        ast::Expr::MethodCallExpr(m) => fn_ret_len(&root, m.name_ref()?.text()),
+        ast::Expr::CallExpr(c) => match c.expr() {
+            Some(ast::Expr::PathExpr(p)) => p
+                .path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+                .map(|f| fn_ret_dims(&root, f.text()))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+        ast::Expr::MethodCallExpr(m) => m
+            .name_ref()
+            .map(|n| fn_ret_dims(&root, n.text()))
+            .unwrap_or_default(),
         ast::Expr::FieldExpr(fe) => {
-            let field = fe.name_ref()?.text().to_string();
-            let lens: Vec<Option<usize>> = root
+            let Some(field) = fe.name_ref().map(|n| n.text().to_string()) else {
+                return Vec::new();
+            };
+            let all: Vec<Vec<usize>> = root
                 .descendants()
                 .filter_map(ast::RecordField::cast)
                 .filter(|rf| name_of(rf.name()).as_deref() == Some(field.as_str()))
-                .map(|rf| rf.ty().and_then(|t| array_type_len(&t)))
+                .map(|rf| type_dims(rf.ty()))
                 .collect();
-            match lens.as_slice() {
-                [Some(n)] => Some(*n),
-                [Some(n), rest @ ..] if rest.iter().all(|x| *x == Some(*n)) => Some(*n),
-                _ => None,
-            }
+            agreed(all)
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
-/// The array length every function named `name` in the file returns, if they agree.
-fn fn_ret_len(root: &ra_ap_syntax::SyntaxNode, name: &str) -> Option<usize> {
+/// `e` without the wrappers `array_expr_len` looks through.
+fn strip_wrappers(e: &ast::Expr) -> ast::Expr {
+    match e {
+        ast::Expr::ParenExpr(p) => p.expr().map(|i| strip_wrappers(&i)),
+        ast::Expr::RefExpr(r) => r.expr().map(|i| strip_wrappers(&i)),
+        ast::Expr::TryExpr(t) => t.expr().map(|i| strip_wrappers(&i)),
+        ast::Expr::MethodCallExpr(m)
+            if m.name_ref().is_some_and(|n| {
+                matches!(n.text().to_string().as_str(), "unwrap" | "expect" | "ok")
+            }) =>
+        {
+            m.receiver().map(|i| strip_wrappers(&i))
+        }
+        _ => None,
+    }
+    .unwrap_or_else(|| e.clone())
+}
+
+/// The dimensions all of `all` share, or none when they differ (or one is unknown).
+fn agreed(all: Vec<Vec<usize>>) -> Vec<usize> {
+    match all.split_first() {
+        Some((first, rest)) if !first.is_empty() && rest.iter().all(|d| d == first) => {
+            first.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The array dimensions every function named `name` in the file returns, if they agree.
+fn fn_ret_dims(root: &ra_ap_syntax::SyntaxNode, name: &str) -> Vec<usize> {
     use ast::HasName;
-    let lens: Vec<Option<usize>> = root
+    let all: Vec<Vec<usize>> = root
         .descendants()
         .filter_map(ast::Fn::cast)
         .filter(|f| f.name().is_some_and(|n| n.text() == name))
         .map(|f| {
             f.ret_type()
                 .and_then(|r| r.ty())
-                .and_then(|t| array_type_len(&t))
+                .map(|t| array_type_dims(&t))
+                .unwrap_or_default()
         })
         .collect();
-    let first = (*lens.first()?)?;
-    lens.iter().all(|x| *x == Some(first)).then_some(first)
+    agreed(all)
 }

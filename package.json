@@ -34,7 +34,7 @@
     "test:react": "node test/react/run.mjs",
     "record-native": "node tools/record-native.mjs",
     "sweep": "cd compiler && cargo run --release --example sweep --",
-    "corpus": "node --stack-size=8000 tools/corpus-classify.mjs && node tools/corpus-report.mjs",
+    "corpus": "node --stack-size=8000 tools/corpus-classify.mjs && cd compiler && cargo run --release --example corpus_ast && cd .. && node tools/corpus-report.mjs",
     "bindings": "node tools/dts2rs.mjs ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts bindings/ns.rs"
   },
   "license": "MIT",

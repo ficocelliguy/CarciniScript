@@ -762,6 +762,9 @@ impl Matcher<'_> {
             // One type, as rustc parses it: `$($t:ty)*` takes `u8 Vec<u8> &str` as three.
             "ty" if let Some(end) = ty_end(toks, pos, stop) => Some(end),
             "item" if let Some(end) = item_end(toks, pos) => Some(end),
+            // A token none of them can start with (`@internal`, `=>`, `,`): no match, as with
+            // rustc, so a tt-muncher's `(@internal, ..)` rule isn't taken by an `$e:expr` one.
+            _ if !can_begin_fragment(kind, toks, pos) => None,
             _ => {
                 // Like rustc's fragment parsers: an `expr` never holds a top-level `,`, `;` or
                 // `=>`; a type or path holds commas only between `<` and `>`.
@@ -808,6 +811,32 @@ impl Matcher<'_> {
                 (end > pos).then_some(end)
             }
         }
+    }
+}
+
+/// Whether `toks[pos]` can start an `expr`, `ty`, `pat`, `path`, `stmt`, `item` or `meta`
+/// fragment: a punctuation token like `@`, `,`, `=>` or `+` can't (`::`, `..`, `&&`, `||` and
+/// `<<` can, and `?` starts a type: `?Sized`). (A lone `$` is let through: macros that write
+/// macros pass theirs along.)
+fn can_begin_fragment(kind: &str, toks: &[Tok], pos: usize) -> bool {
+    let Some(Tok::Leaf { text, kind: tk, .. }) = toks.get(pos) else {
+        return true;
+    };
+    if !tk.is_punct() {
+        return true;
+    }
+    let n = joint_punct_len(toks, pos);
+    let op: String = toks[pos..pos + n].iter().filter_map(Tok::text).collect();
+    if matches!(
+        op.as_str(),
+        "::" | ".." | "..=" | "..." | "&&" | "||" | "<<"
+    ) {
+        return true;
+    }
+    match text.as_str() {
+        "@" | "," | ";" | "=" | ">" | "+" | "/" | "%" | "^" | "~" | ":" | "." => false,
+        "?" => kind == "ty",
+        _ => true,
     }
 }
 
@@ -1564,6 +1593,20 @@ fn foreign_path(segs: &[String]) -> bool {
     })
 }
 
+/// Whether `log::debug!` (a bundled crate's path) names that crate's macro while the file's
+/// `debug` is its own `macro_rules!` (aho-corasick's `debug!` is `log!(log::debug!(..))`, which
+/// would otherwise expand itself forever). The bundled definitions are left out then.
+fn bundled_crate_path(segs: &[String], def: &ast::MacroRules) -> bool {
+    let [first, _, ..] = segs else { return false };
+    if !matches!(first.as_str(), "log" | "anyhow" | "tokio" | "futures") {
+        return false;
+    }
+    let d = def.syntax().text().to_string();
+    ![PIN_MACROS, LOG_MACROS, ANYHOW_MACROS, TOKIO_MACROS]
+        .iter()
+        .any(|m| m.contains(d.as_str()))
+}
+
 fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Vec<Site> {
     let in_def = |n: &SyntaxNode| n.ancestors().any(|a| ast::MacroRules::can_cast(a.kind()));
     // Tokens a proc macro emits (`quote! { icu::langid!(#repr) }`) aren't expanded here.
@@ -1603,7 +1646,7 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
                     .collect()
             })
             .unwrap_or_default();
-        if foreign_path(&segs) {
+        if foreign_path(&segs) || bundled_crate_path(&segs, &defs[name.text()]) {
             continue;
         }
         let Some(tt) = c.token_tree() else { continue };
@@ -1658,7 +1701,8 @@ fn outer_sites(file: &SourceFile, defs: &HashMap<String, ast::MacroRules>) -> Ve
                 && id.kind() == SyntaxKind::IDENT
                 && bang.text() == "!"
                 && args.kind() == SyntaxKind::TOKEN_TREE
-                && defs.contains_key(id.text())
+                && let Some(def) = defs.get(id.text())
+                && !bundled_crate_path(&segs, def)
             {
                 let start = items[first].text_range().start();
                 sites.push(Site {
@@ -1778,6 +1822,51 @@ fn macro_uses(
     out
 }
 
+/// The marker `imported_macros` writes for the crate root's `#![recursion_limit = "N"]` when the
+/// file is a module of it.
+const ROOT_LIMIT: &str = "// crate root: recursion_limit = ";
+
+/// The deepest a `#![recursion_limit]` takes expansions here (each level re-reads the file).
+const MAX_RECURSION_LIMIT: usize = 1024;
+
+/// How deep macro expansions may go: rustc's 128, or the crate's `#![recursion_limit = "N"]` (in
+/// the file, or its crate root's, which `imported_macros` passes along), up to
+/// `MAX_RECURSION_LIMIT`.
+fn recursion_limit(text: &str) -> usize {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let rest = l
+                .strip_prefix(ROOT_LIMIT)
+                .or_else(|| l.strip_prefix("#![recursion_limit").map(|r| r.trim_start()))?;
+            let digits: String = rest
+                .trim_start_matches(['=', ' ', '"'])
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<usize>().ok()
+        })
+        .max()
+        .map_or(128, |n| n.min(MAX_RECURSION_LIMIT))
+}
+
+/// The `#![recursion_limit = "N"]` of the crate root `filename` is a module of (through the
+/// `mod` items that declare it), as `ROOT_LIMIT`'s line.
+fn root_recursion_limit(filename: &str, resolver: crate::typeck::Resolver) -> String {
+    let mut file = filename.to_string();
+    for _ in 0..16 {
+        let Some((parent, text, _)) = declaring_file(&file, resolver) else {
+            break;
+        };
+        if text.contains("#![recursion_limit") {
+            let n = recursion_limit(&text);
+            return format!("\n{ROOT_LIMIT}{n}\n");
+        }
+        file = parent;
+    }
+    String::new()
+}
+
 /// The definition an invocation at `at` uses, of those of its name: one whose `#[cfg]` holds
 /// (`#[cfg(feature = "std")]` / `#[cfg(not(feature = "std"))]` alternatives), the last one
 /// before the invocation (a macro defined again replaces the first from there on).
@@ -1812,6 +1901,7 @@ fn expand_with(
     let mut text = src.to_string();
     let mut rounds = 0;
     let mut changed = false;
+    let limit = recursion_limit(src);
     loop {
         let file = crate::macros::parse_tree(&text);
         // Every definition of each name, in source order (`#[cfg]`-gated alternatives, or a
@@ -1865,10 +1955,18 @@ fn expand_with(
         for site in &sites {
             let (a, b) = site.range;
             let err = |msg: String| vec![(map.orig(a, false), map.orig(b, true), msg)];
-            if rounds > 128 {
-                return Err(err(
-                    "recursion limit reached while expanding macros (128 levels)".into(),
-                ));
+            if rounds > limit {
+                let hint = if limit < MAX_RECURSION_LIMIT {
+                    format!(
+                        "; a `#![recursion_limit = \"{}\"]` attribute on the crate raises it",
+                        limit * 2
+                    )
+                } else {
+                    ", the most CarciniScript expands".to_string()
+                };
+                return Err(err(format!(
+                    "recursion limit reached while expanding macros ({limit} levels{hint})"
+                )));
             }
             let name = site.name.clone();
             let def = pick_def(&all[&name], a);
@@ -2065,6 +2163,186 @@ fn rename_keyword_macros(text: &mut String, map: &mut OffsetMap) -> bool {
     !edits.is_empty()
 }
 
+/// `macro_rules ! name { .. }` (generated code spaces it out) as `macro_rules! name`, which the
+/// passes below look for.
+fn join_macro_rules_bang(text: &mut String, map: &mut OffsetMap) -> bool {
+    let file = crate::macros::parse_tree(text);
+    let toks: Vec<ra_ap_syntax::SyntaxToken> = file
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    for w in toks.windows(2) {
+        if w[0].text() == "macro_rules"
+            && w[1].text() == "!"
+            && w[0].text_range().end() < w[1].text_range().start()
+        {
+            edits.push((
+                w[0].text_range().end().into(),
+                w[1].text_range().start().into(),
+            ));
+        }
+    }
+    for &(a, b) in edits.iter().rev() {
+        text.replace_range(a..b, "");
+        map.replace(a, b, 0);
+    }
+    !edits.is_empty()
+}
+
+/// `pub use __make_provider as make_provider;` (also `use crate::m as n;`) for a macro of the
+/// file: the `use` becomes a copy of the definition under the new name, so `make_provider!(..)`
+/// expands as `__make_provider!(..)` does. Not when an item of the file has the old name too (the
+/// `use` would import that as well).
+fn macro_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
+    let file = crate::macros::parse_tree(text);
+    let mut defs: HashMap<String, ast::MacroRules> = HashMap::new();
+    for d in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::MacroRules::cast)
+    {
+        if let Some(n) = d.name() {
+            defs.insert(n.text().to_string(), d);
+        }
+    }
+    if defs.is_empty() {
+        return false;
+    }
+    let taken: Vec<String> = file
+        .syntax()
+        .descendants()
+        .filter(|n| !ast::MacroRules::can_cast(n.kind()))
+        .filter_map(|n| ast::Item::cast(n).and_then(|i| ast::AnyHasName::cast(i.syntax().clone())))
+        .filter_map(|i| i.name())
+        .map(|n| n.text().to_string())
+        .collect();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for u in file.syntax().children().filter_map(ast::Use::cast) {
+        let Some(tree) = u.use_tree() else { continue };
+        let (Some(p), Some(alias)) = (tree.path(), tree.rename().and_then(|r| r.name())) else {
+            continue;
+        };
+        let segs: Vec<String> = p
+            .segments()
+            .filter_map(|s| s.name_ref())
+            .map(|n| n.text().to_string())
+            .collect();
+        let (Some(name), rest) = (segs.last(), &segs[..segs.len().saturating_sub(1)]) else {
+            continue;
+        };
+        if !rest.iter().all(|s| matches!(s.as_str(), "crate" | "self"))
+            || taken.iter().any(|t| t == name)
+        {
+            continue;
+        }
+        let Some(tt) = defs.get(name).and_then(|d| d.token_tree()) else {
+            continue;
+        };
+        let body = tt.syntax().text().to_string();
+        let semi = if body.starts_with('{') { "" } else { ";" };
+        let r = u.syntax().text_range();
+        edits.push((
+            r.start().into(),
+            r.end().into(),
+            format!("macro_rules! {} {body}{semi}", alias.text()),
+        ));
+    }
+    for (a, b, new) in edits.iter().rev() {
+        text.replace_range(*a..*b, new);
+        map.replace(*a, *b, new.len());
+    }
+    !edits.is_empty()
+}
+
+/// `include!("tables.rs")`: the file's text in place of the call (an item's `;` too), before
+/// `macro_rules!` expansion, so the macros it defines and calls are expanded with the file's.
+/// Its own `include!`s are read next to it (`include!("../data/mod.rs")` including
+/// `"tables.rs"` reads `../data/tables.rs`). A file that can't be read is left for `stdgaps`,
+/// which reports it.
+fn include_items(
+    text: &mut String,
+    map: &mut OffsetMap,
+    resolver: crate::typeck::Resolver,
+) -> bool {
+    fn inlined(src: &str, base: &str, resolver: crate::typeck::Resolver, depth: usize) -> String {
+        let mut out = src.to_string();
+        let mut edits = Vec::new();
+        for (a, b, path) in include_calls(src) {
+            let full = format!("{base}{path}");
+            if depth < 8
+                && let Some(content) = resolver(&full)
+            {
+                let dir = full
+                    .rfind('/')
+                    .map_or(String::new(), |k| full[..=k].to_string());
+                edits.push((a, b, inlined(&content, &dir, resolver, depth + 1)));
+            }
+        }
+        for (a, b, new) in edits.into_iter().rev() {
+            out.replace_range(a..b, &new);
+        }
+        out
+    }
+    let mut edits = Vec::new();
+    for (a, b, path) in include_calls(text) {
+        let Some(content) = resolver(&path) else {
+            continue;
+        };
+        let dir = path
+            .rfind('/')
+            .map_or(String::new(), |k| path[..=k].to_string());
+        edits.push((a, b, inlined(&content, &dir, resolver, 1)));
+    }
+    for (a, b, new) in edits.iter().rev() {
+        text.replace_range(*a..*b, new);
+        map.replace(*a, *b, new.len());
+    }
+    !edits.is_empty()
+}
+
+/// The `include!("path")` calls of `text` with a string literal: (start, end, path), an item's
+/// `;` included. Not `x::include!`, nor inside a `macro_rules!` definition.
+fn include_calls(text: &str) -> Vec<(usize, usize, String)> {
+    if !text.contains("include!") {
+        return Vec::new();
+    }
+    let file = crate::macros::parse_tree(text);
+    file.syntax()
+        .descendants()
+        .filter_map(ast::MacroCall::cast)
+        .filter(|m| {
+            m.path()
+                .is_some_and(|p| p.qualifier().is_none() && p.to_string() == "include")
+                && !m
+                    .syntax()
+                    .ancestors()
+                    .any(|a| a.kind() == SyntaxKind::MACRO_RULES)
+        })
+        .filter_map(|m| {
+            let tt = m.token_tree()?;
+            let toks: Vec<ra_ap_syntax::SyntaxToken> = tt
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| !t.kind().is_trivia())
+                .collect();
+            // `(` "path" `)`
+            let [_, lit, _] = toks.as_slice() else {
+                return None;
+            };
+            let path = <ast::String as ra_ap_syntax::AstToken>::cast(lit.clone())?
+                .value()
+                .ok()?
+                .replace('\\', "/");
+            let r = m.syntax().text_range();
+            Some((r.start().into(), r.end().into(), path))
+        })
+        .collect()
+}
+
 /// std's `try!` (2015 edition), for files that don't define their own: `?`.
 const TRY_MACRO: &str = r#"
 macro_rules! r#try {
@@ -2105,8 +2383,12 @@ pub fn preprocess_with(
     };
     let mut text = full.clone();
     let mut map = OffsetMap::identity(full.len());
+    let mut changed = false;
+    if text.contains("macro_rules ") {
+        changed |= join_macro_rules_bang(&mut text, &mut map);
+    }
     // Items under a `#[cfg(..)]` that's off go first (alternative definitions of one name).
-    let mut changed = crate::macros::strip_cfg(&mut text);
+    changed |= crate::macros::strip_cfg(&mut text);
     // Proc macros first: their output may define or use `macro_rules!` macros.
     if let Some((filename, resolver)) = procs {
         // (`jsx!` components can be `pub fn`s of the `mod` files.)
@@ -2117,6 +2399,11 @@ pub fn preprocess_with(
         if text.contains("include_str!") {
             changed |= include_strs(&mut text, &mut map, resolver)?;
         }
+        // (`include!("tables.rs")` among the items may define and call macros.)
+        if text.contains("include!") && include_items(&mut text, &mut map, resolver) {
+            changed = true;
+            crate::macros::strip_cfg(&mut text);
+        }
         changed |= crate::procmacro::expand(&mut text, &mut map, filename, resolver)?;
     }
     // The bundled crates written as rewrites (`#[derive(thiserror::Error)]`, `bitflags!`, ..).
@@ -2125,6 +2412,9 @@ pub fn preprocess_with(
     }
     if text.contains("macro_rules!") {
         changed |= rename_keyword_macros(&mut text, &mut map);
+    }
+    if text.contains("macro_rules!") && text.contains(" as ") {
+        changed |= macro_use_renames(&mut text, &mut map);
     }
     if text.contains("macro_rules!")
         && let Some(e) = expand_with(&text, map.clone())?
@@ -2138,6 +2428,14 @@ pub fn preprocess_with(
     // `extern crate itertools as it;`
     if crate::alias::has_crate_renames(&text) {
         changed |= crate::alias::expand_crate_renames(&mut text, &mut map);
+    }
+    // `I: IntoIterator<Item: Display>`
+    if crate::assocbounds::has_assoc_bounds(&text) {
+        changed |= crate::assocbounds::expand_assoc_bounds(&mut text, &mut map);
+    }
+    // `use geo::shapes::Circle;` with `pub mod shapes { .. }` inside `geo.rs`.
+    if crate::alias::has_inline_module_imports(&text) {
+        changed |= crate::alias::expand_inline_module_imports(&mut text, &mut map, procs);
     }
     let mut names = HashMap::new();
     if crate::modflat::has_inline_modules(&text) {
@@ -2193,6 +2491,9 @@ pub fn imported_macros(src: &str, filename: &str, resolver: crate::typeck::Resol
     // wasmparser's `bail!`) is the crate's.
     let mut out = own_macros_left_out(&bundled_macros(src), &theirs);
     out.push_str(&theirs);
+    if !out.is_empty() || src.contains("macro_rules!") {
+        out.push_str(&root_recursion_limit(filename, resolver));
+    }
     out
 }
 

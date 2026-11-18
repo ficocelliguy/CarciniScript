@@ -266,6 +266,8 @@ impl<'a> Checker<'a> {
             missing_steps: std::cell::Cell::new(0),
             crate_uses: Default::default(),
             consts: HashMap::new(),
+            const_vals: HashMap::new(),
+            root_file: None,
             param_bounds: HashMap::new(),
             into_targets: HashMap::new(),
             nested_ok: Default::default(),
@@ -354,6 +356,7 @@ impl<'a> Checker<'a> {
         resolver: Resolver,
         stack: &mut Vec<String>,
     ) {
+        self.root_file = Some(file.clone());
         self.load_modules(file, filename, resolver, stack);
         // (A struct's field may name a `const` as a const argument, `History<WINDOW>`, before
         // the consts are checked.)
@@ -662,6 +665,12 @@ struct Checker<'a> {
     crate_uses: std::cell::RefCell<HashMap<String, bool>>,
     /// `const` and `static` items.
     consts: HashMap<String, Ty>,
+    /// Other files' `const` items' values (also as `module.NAME`), when they're constant
+    /// integers or `bool`s: for const arguments (`Buf<{ util::SIZE * 2 }>`).
+    pub(super) const_vals: HashMap<String, crate::consteval::CVal>,
+    /// The file being checked: the items a const argument re-parsed out of a macro call
+    /// (`println!("{}", f::<{ N * 2 }>())`) refers to.
+    root_file: Option<ast::SourceFile>,
     /// Bounds of the current function's type parameters.
     param_bounds: HashMap<String, Vec<String>>,
     /// `T: Into<f64>`: what `.into()` on a `T` makes (a number type; `T` stays generic).
@@ -1917,6 +1926,69 @@ impl<'a> Checker<'a> {
             };
             let alias = adt.is_some() || (local_trait && matches!(t, Ty::Param(_) | Ty::Dyn(_)));
             let on_self = !q.receiver && t == Ty::Param("Self".into());
+            // `Shout::shout(&5)` / `<f64 as Money>::money(&x)`: your impl's method on a
+            // built-in type, or a blanket impl's (on any type without its own).
+            if q.receiver && !matches!(t, Ty::Param(_) | Ty::Dyn(_) | Ty::Var(_) | Ty::Unknown) {
+                let own = adt
+                    .as_ref()
+                    .is_some_and(|n| self.adts.method(n, &q.method).is_some());
+                let ext = crate::adt::ext_key_of(&t)
+                    .filter(|k| {
+                        adt.is_none()
+                            && self.adts.ext_types.contains(*k)
+                            && self.adts.method(k, &q.method).is_some()
+                    })
+                    .map(str::to_string);
+                let key = match ext {
+                    Some(k) => Some(k),
+                    None if !own => self.blanket_method(&t, &q.method).map(|(k, _)| k),
+                    None => None,
+                };
+                if let Some(key) = key {
+                    self.conversions.insert(r, crate::adt::Conv::Ext { key });
+                    continue;
+                }
+            }
+            // `<W as Make>::make()` for a struct only a blanket impl gives `make`.
+            if !q.receiver
+                && let Some(n) = &adt
+                && self.adts.method(n, &q.method).is_none()
+                && let Some((key, _)) = self.blanket_static(&t, &q.method)
+            {
+                self.conversions.insert(
+                    r,
+                    crate::adt::Conv::ExtDict {
+                        key,
+                        dict: t.clone(),
+                    },
+                );
+                continue;
+            }
+            // `<i32 as Make>::make()` / `let x: String = Make::make();`: your impl for the
+            // built-in type, or a blanket impl's.
+            if adt.is_none() && !q.receiver && !matches!(t, Ty::Param(_) | Ty::Dyn(_) | Ty::Var(_))
+            {
+                let ext = crate::adt::ext_key_of(&t).filter(|k| {
+                    self.adts.ext_types.contains(*k)
+                        && self
+                            .adts
+                            .method(k, &q.method)
+                            .is_some_and(|m| m.receiver.is_none())
+                });
+                let conv = match ext {
+                    Some(k) => Some(crate::adt::Conv::Ext { key: k.to_string() }),
+                    None => self.blanket_static(&t, &q.method).map(|(key, _)| {
+                        crate::adt::Conv::ExtDict {
+                            key,
+                            dict: t.clone(),
+                        }
+                    }),
+                };
+                if let Some(conv) = conv {
+                    self.conversions.insert(r, conv);
+                    continue;
+                }
+            }
             let unconstrained = matches!(self.shallow(&self_ty), Ty::Var(_));
             if adt.is_none()
                 && !q.receiver
@@ -2207,6 +2279,7 @@ impl<'a> Checker<'a> {
         } else if !self.irrefutable_pat(&pat)
             && !self.or_pat_covers(&pat, &ty)
             && !self.array_pat_fits(l, &pat)
+            && !self.array_pat_covers(&pat, &ty, &self.let_dims(l))
         {
             self.error(
                 pat.syntax(),
@@ -2417,6 +2490,18 @@ impl<'a> Checker<'a> {
                 }
             }
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => self.expect_option(p, expected),
+            ast::Pat::PathPat(pp) if self.const_path_pat(pp).is_some() => {
+                // An associated (or std) constant compares against its value.
+                let (t, _) = self.const_path_pat(pp).unwrap();
+                if !self.unify(expected, &t) {
+                    let msg = format!(
+                        "mismatched types: expected `{}`, found `{}`",
+                        self.describe(expected),
+                        self.describe(&t)
+                    );
+                    self.error(p.syntax(), msg);
+                }
+            }
             ast::Pat::PathPat(pp) if ordering_variant(pp.path(), &self.adts.defs).is_some() => {
                 if !self.unify(expected, &Ty::Ordering) {
                     let msg = format!(
@@ -2706,8 +2791,14 @@ impl<'a> Checker<'a> {
                 rows.extend(self.abstract_pat(&p).into_iter().map(|ap| vec![ap]));
             }
         }
+        // (An array of known length: `[]` or longer arrays aren't values to cover.)
+        let dims = m
+            .expr()
+            .map(|e| arrays::array_dims_in_file(&e, 0))
+            .unwrap_or_default();
+        let st = self.with_dims(st, &dims);
         self.missing_steps.set(0);
-        if let Some(witness) = self.missing(&rows, std::slice::from_ref(st)) {
+        if let Some(witness) = self.missing(&rows, std::slice::from_ref(&st)) {
             let node = m
                 .expr()
                 .map(|e| e.syntax().clone())
@@ -2745,12 +2836,27 @@ impl<'a> Checker<'a> {
             ast::Pat::IdentPat(ip) if self.unit_struct_pat(&ip).is_some() => self
                 .adt_abstract(&ast::Pat::IdentPat(ip))
                 .unwrap_or(vec![Ap::Opaque]),
-            ast::Pat::IdentPat(ip) if self.const_pat(&ip).is_some() => vec![Ap::Other],
+            ast::Pat::IdentPat(ip) if self.const_pat(&ip).is_some() => {
+                let value = || {
+                    let n = ip.name()?.text().to_string();
+                    self.eval_const_segs(ip.syntax(), &[n])?.int()
+                };
+                match (self.const_pat(&ip), value()) {
+                    (Some(Ty::Int(_)), Some(v)) => vec![Ap::Int(v, v)],
+                    _ => vec![Ap::Other],
+                }
+            }
             ast::Pat::IdentPat(ip) => ip
                 .pat()
                 .map(|sub| self.abstract_pat(&sub))
                 .unwrap_or_else(|| vec![Ap::Wild]),
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => vec![Ap::None],
+            ast::Pat::PathPat(pp) if self.const_path_pat(&pp).is_some() => {
+                match self.const_path_pat(&pp) {
+                    Some((Ty::Int(_), Some(v))) => vec![Ap::Int(v, v)],
+                    _ => vec![Ap::Other],
+                }
+            }
             ast::Pat::PathPat(pp) if ordering_variant(pp.path(), &self.adts.defs).is_some() => {
                 vec![Ap::Ord(
                     ordering_variant(pp.path(), &self.adts.defs).unwrap(),
@@ -2794,6 +2900,19 @@ impl<'a> Checker<'a> {
                 let bound = |p: Option<ast::Pat>| match p {
                     Some(ast::Pat::LiteralPat(lp)) => {
                         int_lit_value(&lp).or_else(|| char_lit_value(&lp)).map(Some)
+                    }
+                    // `LIMIT`
+                    Some(ast::Pat::IdentPat(ip)) if self.const_pat(&ip).is_some() => {
+                        let n = ip.name()?.text().to_string();
+                        self.eval_const_segs(ip.syntax(), &[n])
+                            .and_then(|v| v.int())
+                            .map(Some)
+                    }
+                    // `S::LIMIT`
+                    Some(ast::Pat::PathPat(pp))
+                        if matches!(self.const_path_pat(&pp), Some((Ty::Int(_), Some(_)))) =>
+                    {
+                        Some(self.const_path_pat(&pp).and_then(|(_, v)| v))
                     }
                     // `u8::MAX`, `i32::MIN`
                     Some(ast::Pat::PathPat(pp)) => {
@@ -2942,6 +3061,10 @@ impl<'a> Checker<'a> {
             (Ty::Adt(n, targs), _) if self.adts.defs.contains_key(&n) => Family::Adt(n, targs),
             (Ty::Result(t, e), _) => Family::Result(*t, *e),
             (Ty::Vec(e), Some(Ap::Slice(..))) => Family::Slice(*e),
+            (Ty::Coll(crate::ty::Coll::FixedArray(n), v), _) => match *v {
+                Ty::Vec(e) => Family::Array(*e, n),
+                _ => return None,
+            },
             // Values without end: a catch-all must cover what the patterns leave.
             (Ty::Int(_) | Ty::Float { .. } | Ty::Char | Ty::Str, _) => Family::Infinite,
             (Ty::Unknown, Some(Ap::Int(..))) => Family::Infinite,
@@ -2956,7 +3079,8 @@ impl<'a> Checker<'a> {
             (_, Ap::Opaque) => false,
             (Family::Bool, Ap::Bool(_)) | (Family::Ordering, Ap::Ord(_)) => true,
             (Family::Option(_), Ap::None | Ap::Some(_)) => true,
-            (Family::Tuple(_), Ap::Tuple(_)) | (Family::Slice(_), Ap::Slice(..)) => true,
+            (Family::Tuple(_), Ap::Tuple(_))
+            | (Family::Slice(_) | Family::Array(..), Ap::Slice(..)) => true,
             (Family::Adt(..) | Family::Result(..), Ap::Ctor(..)) => true,
             (Family::Int(_) | Family::Char | Family::Infinite, Ap::Int(..) | Ap::Other) => true,
             _ => false,
@@ -3033,6 +3157,15 @@ impl<'a> Checker<'a> {
                     let head = self.render_ctor(&n, v, &w[..k]);
                     Some([vec![head], w[k..].to_vec()].concat())
                 })
+            }
+            // An array: only its own length.
+            Family::Array(elem, n) => {
+                let w = self.missing(
+                    &specialize(&Ap::Slice(vec![], vec![], false), n),
+                    &[vec![elem; n], rest.to_vec()].concat(),
+                )?;
+                let head = format!("[{}]", w[..n].join(", "));
+                Some([vec![head], w[n..].to_vec()].concat())
             }
             Family::Slice(elem) => {
                 // Lengths up to the longest fixed part decide everything; longer behave alike.
@@ -4466,6 +4599,25 @@ impl<'a> Checker<'a> {
                 .map(|n| n.text().to_string())
                 .collect()
         });
+        // `Self::make()` in a blanket impl (`T::make()`), or in an impl for a built-in type,
+        // also in a default copied there (`i32::make()`).
+        let names: Vec<String> = match (names.as_slice(), self.self_ty.clone()) {
+            ([s, f], Some(Ty::Param(p))) if s == "Self" && p != "Self" => vec![p, f.clone()],
+            ([s, f], Some(t)) if s == "Self" && !matches!(t, Ty::Param(_) | Ty::Adt(..)) => {
+                match crate::adt::ext_key_of(&t) {
+                    Some(k) if self.adts.ext_types.contains(k) => vec![k.to_string(), f.clone()],
+                    _ => names,
+                }
+            }
+            _ => names,
+        };
+        // `i32::make()` / `Vec::<u8>::make()` / `Q::make()`: a blanket impl's associated function.
+        if let [t, f] = names.as_slice()
+            && let Some(qt) = self.blanket_qualifier(&path, t)
+            && let Some(ty) = self.blanket_static_call(c, &qt, f, &args)
+        {
+            return ty;
+        }
         let stripped = self.strip_modules(&names);
         if let [single] = stripped.as_slice()
             && self.fns.contains_key(single)
@@ -5377,7 +5529,7 @@ impl<'a> Checker<'a> {
         // (A generic trait implemented twice for the type: the impl whose signature fits.)
         let method = match crate::adt::ext_key_of(&self.shallow(&rt)) {
             Some(key) => self
-                .pick_method_alt(m, key, &method, &args, expected)
+                .pick_method_alt(m, key, &[], &method, &args, expected)
                 .unwrap_or(method),
             None => method,
         };
@@ -5423,7 +5575,9 @@ impl<'a> Checker<'a> {
             if sig.receiver == Some(crate::adt::Receiver::MutRef) {
                 self.check_mutable(&recv, Mutation::Borrow);
             }
-            let sig = self.method_inst(&sig, None);
+            // The impl's `T` (and `Self`) is the receiver's type: `fn into_source(self) -> T`.
+            let recv_ty = self.zonk(&rt);
+            let sig = self.blanket_inst(&key, &sig, &recv_ty);
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
             for (a, p) in args.iter().zip(&sig.params) {
                 self.check(a, p);
@@ -5649,18 +5803,16 @@ impl<'a> Checker<'a> {
             Ty::Extern(name) => return self.extern_method(m, &name, &method, &args),
             Ty::Adt(name, targs) => {
                 let method = self
-                    .pick_method_alt(m, &name, &method, &args, expected)
+                    .pick_method_alt(m, &name, &targs, &method, &args, expected)
                     .unwrap_or(method);
                 return self.adt_method(m, &recv, &name, &targs, &method, &args);
             }
             // (A method that several impls of one generic trait give a type can't be told apart
             // at run time.)
             Ty::Param(_) | Ty::Dyn(_)
-                if self
-                    .adts
-                    .method_alts
-                    .keys()
-                    .any(|k| k.ends_with(&format!("::{method}"))) =>
+                if self.adts.method_alts.keys().any(|k| {
+                    k.ends_with(&format!("::{method}")) && !self.adts.inherent_alts.contains(k)
+                }) =>
             {
                 let msg = format!(
                     "`{method}` comes from a generic trait implemented more than once for one type; calling it through a type parameter or `dyn` isn't supported yet (call it on the concrete type)"
@@ -6476,7 +6628,8 @@ impl<'a> Checker<'a> {
         };
         self.scopes.push(HashMap::new());
         if let Some(pat) = f.pat() {
-            if !self.irrefutable_pat(&pat) {
+            let dims = f.iterable().map(|i| self.item_dims(&i)).unwrap_or_default();
+            if !self.irrefutable_pat(&pat) && !self.array_pat_covers(&pat, &elem, &dims) {
                 self.error(pat.syntax(), "refutable pattern in `for` loop binding");
             }
             self.pat(&pat, &elem);
@@ -7021,6 +7174,8 @@ enum Ap {
 enum Family {
     Adt(String, Vec<Ty>),
     Slice(Ty),
+    /// `[T; N]` with `N` known.
+    Array(Ty, usize),
     Result(Ty, Ty),
     Bool,
     Ordering,
@@ -7998,7 +8153,9 @@ impl Checker<'_> {
         args: &[ast::Expr],
     ) -> Option<Ty> {
         let pty = Ty::Param(param.to_string());
-        let bounds = self.bound_traits(param);
+        let mut bounds = self.bound_traits(param);
+        // (In a blanket impl's associated function, `T` implements its trait too.)
+        bounds.extend(self.cur_blanket_trait(param));
         // `T::from(x)` with `T: From<X>`.
         if f == "from" && self.param_has(param, "From") {
             self.arg_count(c.syntax(), "function", 1, args.len());
@@ -8144,6 +8301,25 @@ impl Checker<'_> {
     /// A function's const parameters (and an associated function's `impl`'s, `extra`): passed
     /// as `$N` unless an argument holds them.
     fn note_const_params(&mut self, key: &str, f: &ast::Fn, extra: Vec<String>) {
+        for (n, derivable) in self.const_param_needs(f, extra) {
+            self.note_const_need(key, &n, derivable);
+        }
+    }
+
+    /// `key` (a function, or `Type::name`) takes the const value `n` (also for another file's,
+    /// which that file's checker found); `derivable` when an argument holds it.
+    pub(super) fn note_const_need(&mut self, key: &str, n: &str, derivable: bool) {
+        let k = (key.to_string(), n.to_string());
+        self.dict_uses.insert(k.clone());
+        self.const_needs.insert(k.clone());
+        if derivable {
+            self.const_derivable.insert(k);
+        }
+    }
+
+    /// A function's const parameters, with `extra` (its `impl`'s), and whether an argument
+    /// holds each (`a: [u8; N]`).
+    pub(super) fn const_param_needs(&self, f: &ast::Fn, extra: Vec<String>) -> Vec<(String, bool)> {
         let mut names: Vec<String> = f
             .generic_param_list()
             .into_iter()
@@ -8154,21 +8330,20 @@ impl Checker<'_> {
             })
             .collect();
         names.extend(extra);
-        for n in names {
-            let k = (key.to_string(), n.clone());
-            self.dict_uses.insert(k.clone());
-            self.const_needs.insert(k.clone());
-            if f.param_list()
-                .into_iter()
-                .flat_map(|pl| pl.params())
-                .any(|p| {
-                    p.ty()
-                        .is_some_and(|t| crate::adt::const_path(&t, &n, &self.adts).is_some())
-                })
-            {
-                self.const_derivable.insert(k);
-            }
-        }
+        names
+            .into_iter()
+            .map(|n| {
+                let derivable = f
+                    .param_list()
+                    .into_iter()
+                    .flat_map(|pl| pl.params())
+                    .any(|p| {
+                        p.ty()
+                            .is_some_and(|t| crate::adt::const_path(&t, &n, &self.adts).is_some())
+                    });
+                (n, derivable)
+            })
+            .collect()
     }
 
     /// Each generic call's const arguments must be known, or readable off an argument.
@@ -8228,7 +8403,7 @@ impl Checker<'_> {
     }
 
     /// A const argument: a literal (`3`, `true`, `'a'`, `-1`), a const parameter or a `const`
-    /// item (`N`, `{ N }`).
+    /// item (`N`, `{ N }`), or a constant expression `consteval` works out (`{ 2 * W + 1 }`).
     pub(super) fn lower_const_arg(&mut self, e: &ast::Expr) -> Ty {
         match e {
             ast::Expr::Literal(l) => match l.kind() {
@@ -8290,27 +8465,76 @@ impl Checker<'_> {
             }
             // `{ 128 / 8 }`
             _ if const_int(e).is_some() => Ty::ConstVal(const_int(e).unwrap().to_string()),
+            // `{ 2 * D_CODES + 1 }`, `{ CpuFeatures::NONE }`, `{ size_of::<u32>() }`, `{ elts(BITS) }`
+            _ if self.eval_const(e).is_some() => Ty::ConstVal(self.eval_const(e).unwrap().text()),
             _ => {
                 self.error(
                     e.syntax(),
-                    "this const argument isn't supported yet (a literal, integer arithmetic on literals, a const parameter or a `const` item is)",
+                    "this const argument isn't supported yet (constant integer and `bool` expressions are: literals, `const` items, associated consts, arithmetic, `as` casts and calls of this file's `const fn`s)",
                 );
                 Ty::Unknown
             }
         }
     }
 
-    /// A const parameter's type: an integer (up to 32 bits, or `usize`/`isize`), `bool` or
-    /// `char`.
+    /// The value of the constant the path `segs` names (at `node`, for its file and `Self`).
+    pub(super) fn eval_const_segs(
+        &self,
+        node: &SyntaxNode,
+        segs: &[String],
+    ) -> Option<crate::consteval::CVal> {
+        let known = crate::consteval::Known {
+            consts: Some(&self.const_vals),
+            assoc: Some(&self.adts.assoc_const_vals),
+        };
+        let self_ty = match &self.self_ty {
+            Some(Ty::Adt(n, _)) => Some(n.as_str()),
+            _ => None,
+        };
+        let own = node.ancestors().last().and_then(ast::SourceFile::cast);
+        own.as_ref()
+            .and_then(|f| crate::consteval::eval_segs(f, &known, segs, self_ty))
+            .or_else(|| {
+                let root = self.root_file.as_ref()?;
+                if own.is_some_and(|f| f.syntax() == root.syntax()) {
+                    return None;
+                }
+                crate::consteval::eval_segs(root, &known, segs, self_ty)
+            })
+    }
+
+    /// The value of a constant expression, with what other files' consts are known to be.
+    pub(super) fn eval_const(&self, e: &ast::Expr) -> Option<crate::consteval::CVal> {
+        let known = crate::consteval::Known {
+            consts: Some(&self.const_vals),
+            assoc: Some(&self.adts.assoc_const_vals),
+        };
+        let own = e
+            .syntax()
+            .ancestors()
+            .last()
+            .and_then(ast::SourceFile::cast);
+        own.as_ref()
+            .and_then(|f| crate::consteval::eval(f, &known, e))
+            .or_else(|| {
+                let root = self.root_file.as_ref()?;
+                if own.is_some_and(|f| f.syntax() == root.syntax()) {
+                    return None;
+                }
+                crate::consteval::eval(root, &known, e)
+            })
+    }
+
+    /// A const parameter's type: an integer (a 64- or 128-bit one is a BigInt in the body),
+    /// `bool` or `char`.
     pub(super) fn const_param_ty(&mut self, cp: &ast::ConstParam, report: bool) -> Ty {
         let ty = cp.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
-        let ok = matches!(ty, Ty::Bool | Ty::Char | Ty::Unknown)
-            || matches!(&ty, Ty::Int(k) if !k.is_big());
+        let ok = matches!(ty, Ty::Bool | Ty::Char | Ty::Unknown | Ty::Int(_));
         if !ok && report {
             self.error(
                 cp.syntax(),
                 format!(
-                    "const parameters of type `{}` aren't supported (integers up to 32 bits, `usize`, `isize`, `bool` and `char` are)",
+                    "const parameters of type `{}` aren't supported (integers, `bool` and `char` are)",
                     ty.describe()
                 ),
             );

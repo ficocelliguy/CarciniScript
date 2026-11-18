@@ -55,6 +55,7 @@ pub fn is_std_error(name: &str) -> bool {
             | "TryFromIntError"
             | "CharTryFromError"
             | "TryFromSliceError"
+            | "Utf8Error"
             | "serde_json::Error"
     )
 }

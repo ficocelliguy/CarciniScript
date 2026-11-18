@@ -681,7 +681,8 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
     }
     // `macro_rules!` macros are expanded and inline modules flattened first; positions are
     // reported in `src`.
-    if src.contains("macro_rules!")
+    if src.contains("macro_rules")
+        || src.contains("include!")
         || src.contains("mod ")
         || src.contains("self::")
         || src.contains("super::")
@@ -797,6 +798,8 @@ fn compile_text(
         view_params: HashMap::new(),
         view_args: Vec::new(),
         dict_scope: Vec::new(),
+        blanket_this: None,
+        ext_class: None,
         in_trait_default: false,
         loop_dests: Vec::new(),
         prelude_at,
@@ -928,6 +931,11 @@ struct Codegen<'a> {
     view_args: Vec<bool>,
     /// The type parameters the function being emitted takes a class for (`$T`).
     dict_scope: Vec<String>,
+    /// Emitting a blanket impl's associated function (`impl<T: Default> Make for T`): its `T`,
+    /// whose class is `this`.
+    pub(super) blanket_this: Option<String>,
+    /// Emitting the class of your trait impls for a built-in type (`$ext$i32`): its key.
+    pub(super) ext_class: Option<String>,
     /// Emitting a trait's default methods: `Self::f()` is `this` (static) or `this.constructor`.
     in_trait_default: bool,
     /// Enclosing loops, innermost last: (label, where a `loop`'s `break value` goes; None for
@@ -1170,7 +1178,7 @@ impl<'a> Codegen<'a> {
         match conv {
             crate::adt::Conv::Identity => value,
             crate::adt::Conv::Method { key } => value.wrap("(", &format!(").{key}()")),
-            crate::adt::Conv::Ext { .. } => value,
+            crate::adt::Conv::Ext { .. } | crate::adt::Conv::ExtDict { .. } => value,
             crate::adt::Conv::From { adt, key } if self.types.adts.ext_types.contains(&adt) => {
                 value.wrap(&format!("$ext${adt}.{key}("), ")")
             }
@@ -1415,8 +1423,12 @@ impl<'a> Codegen<'a> {
             }
         }
         let mut ext_done: std::collections::HashSet<String> = Default::default();
-        // Pass 2: code. Impls for built-in types register in this script's own registry.
-        if !self.types.adts.ext_types.is_empty() {
+        // Pass 2: code. Impls for built-in types register in this script's own registry. A file
+        // with `pub` traits exports it: a file that loads this one with `mod` registers its
+        // impls of them there too, so this file's generic functions find them.
+        if self.has_pub_traits() {
+            self.line(Frag::text("export const $extRegs = κσ.$newRegs();"));
+        } else if !self.types.adts.ext_types.is_empty() {
             self.line(Frag::text("const $extRegs = κσ.$newRegs();"));
         }
         // (Each item starts from the globals: its names are undone after it.)
@@ -4896,6 +4908,22 @@ impl<'a> Codegen<'a> {
         if self.dict_scope.contains(&first) {
             return Some(format!("${first}"));
         }
+        // (A blanket impl's associated function: `T::make()` / `Self::make()` on `this`.)
+        if let Some(t) = &self.blanket_this
+            && (first == *t || first == "Self")
+        {
+            return Some("this".into());
+        }
+        // (`Self::make()` in a method of `$ext$i32`: its class, `this` in a static one.)
+        if first == "Self"
+            && let Some(k) = &self.ext_class
+        {
+            return Some(if self.lookup("self").is_some() {
+                format!("$ext${k}")
+            } else {
+                "this".into()
+            });
+        }
         // (An `impl<T>`'s `T` in a method with `self`: `this.$T`.)
         if let Some(js) = const_js_of(&first) {
             return Some(js);
@@ -4926,9 +4954,77 @@ impl<'a> Codegen<'a> {
             .unwrap_or_default()
     }
 
-    /// The class (or built-in stand-in) passed for a type parameter's `T::make()` calls.
+    /// `$ext$Make$all.make.call(<ty's class>, ..)`: a blanket impl's associated function, with
+    /// the type's class as `this` (its `T` and `Self`).
+    fn emit_ext_dict_call(
+        &mut self,
+        c: &ast::CallExpr,
+        key: &str,
+        dict: &Ty,
+        f: &str,
+    ) -> (Frag, Ty) {
+        let sig = self.types.adts.method(key, f).cloned();
+        let params = sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
+        let ty = self
+            .ty_of(c.syntax())
+            .unwrap_or_else(|| sig.map(|s| s.ret).unwrap_or(Ty::Unknown));
+        let args = self.emit_args(c.arg_list(), &params);
+        let mut out = Frag::mapped(
+            self.off(c.syntax()),
+            format!(
+                "$ext${key}.{}.call({}",
+                adt_gen::prop(f),
+                self.dict_of(dict)
+            ),
+        );
+        for a in args {
+            out.push(", ").append(a);
+        }
+        out.push(")");
+        (out, ty)
+    }
+
+    /// Whether some blanket impl has associated functions, which a type's class then needs
+    /// (`T::make()` for a `T` only the blanket impl gives `make`).
+    fn blanket_statics(&self) -> bool {
+        self.types.adts.blankets.keys().any(|tr| {
+            self.types
+                .adts
+                .methods
+                .get(&format!("{tr}$all"))
+                .is_some_and(|ms| ms.values().any(|m| m.receiver.is_none()))
+        })
+    }
+
+    /// The class (or built-in stand-in) passed for a type parameter's `T::make()` calls, with
+    /// the blanket impls' associated functions it lacks (`κσ.$bdict`).
     fn dict_of(&self, t: &Ty) -> String {
+        let d = self.dict_of_own(t);
+        let wrap = match t {
+            Ty::ConstVal(_) => false,
+            Ty::Param(_) => false,
+            Ty::Adt(n, _) => self.types.adts.blankets.keys().any(|tr| {
+                self.types
+                    .adts
+                    .methods
+                    .get(&format!("{tr}$all"))
+                    .into_iter()
+                    .flat_map(|ms| ms.iter())
+                    .any(|(f, m)| m.receiver.is_none() && self.types.adts.method(n, f).is_none())
+            }),
+            _ => true,
+        };
+        if wrap && d != "undefined" && self.blanket_statics() {
+            format!("κσ.$bdict($extRegs, {d})")
+        } else {
+            d
+        }
+    }
+
+    fn dict_of_own(&self, t: &Ty) -> String {
         match t {
+            // (A blanket impl's `T` in its associated functions: their `this`.)
+            Ty::Param(p) if self.blanket_this.as_deref() == Some(p.as_str()) => "this".into(),
             // A const argument: its value.
             Ty::ConstVal(v) => self.const_js(v),
             Ty::Param(p) if const_js_of(p).is_some() => const_js_of(p).unwrap(),
@@ -5042,6 +5138,11 @@ impl<'a> Codegen<'a> {
                 }
             }
             CONST_SCOPE.with(|s| s.borrow_mut().insert(n.clone(), js.clone()));
+            // A `u64` / `i128` .. parameter is a BigInt in the body, whichever number came in.
+            let js = match ty {
+                Ty::Int(k) if k.is_big() => format!("BigInt({js})"),
+                _ => js,
+            };
             self.declare(&n, None, Local { js, ty });
         }
         lines
@@ -5196,6 +5297,66 @@ impl<'a> Codegen<'a> {
             .cloned()
         {
             let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
+            // `<i32 as Make>::make()`: your impl for the built-in type, or a blanket impl's.
+            match self.conv_of(c.syntax()) {
+                Some(crate::adt::Conv::ExtDict { key, dict }) => {
+                    let (f, _) = self.emit_ext_dict_call(c, &key, &dict, &q.method);
+                    return (f, ty);
+                }
+                Some(crate::adt::Conv::Ext { key }) if !q.receiver => {
+                    let args = self.emit_args(c.arg_list(), &[]);
+                    let mut out = Frag::mapped(
+                        self.off(c.syntax()),
+                        format!("$ext${key}.{}(", adt_gen::prop(&q.method)),
+                    );
+                    out.append(Frag::join(args, ", ")).push(")");
+                    return (out, ty);
+                }
+                // `Shout::shout(&5)`: `$ext$Shout$all.prototype.shout.call(5, ..)`.
+                Some(crate::adt::Conv::Ext { key }) => {
+                    let all: Vec<ast::Expr> =
+                        c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+                    let Some(recv) = all.first() else {
+                        return (Frag::text("undefined"), ty);
+                    };
+                    let sig = self.types.adts.method(&key, &q.method).cloned();
+                    let recv = strip_refs(recv);
+                    let (rf, rt) = self.emit_expr(&recv, None);
+                    let rf = if sig
+                        .as_ref()
+                        .is_some_and(|s| adt_gen::cell_self(s, &adt_gen::ext_self_ty(&key)))
+                    {
+                        self.recv_cell(&recv, rf)
+                    } else if sig
+                        .as_ref()
+                        .is_some_and(|s| s.receiver == Some(crate::adt::Receiver::Value))
+                    {
+                        self.by_value(&recv, rf, &rt)
+                    } else {
+                        rf
+                    };
+                    let params = sig.map(|s| s.params).unwrap_or_default();
+                    let mut parts = vec![rf];
+                    for (a, p) in all
+                        .iter()
+                        .skip(1)
+                        .zip(params.iter().chain(std::iter::repeat(&Ty::Unknown)))
+                    {
+                        let (f, t) = self.emit_expr(a, Some(p));
+                        parts.push(self.by_value(a, f, &t));
+                    }
+                    if key.ends_with("$all") {
+                        parts.push(Frag::text(debug_fn(&rt).unwrap_or_else(|| "String".into())));
+                    }
+                    let mut out = Frag::mapped(
+                        self.off(c.syntax()),
+                        format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&q.method)),
+                    );
+                    out.append(Frag::join(parts, ", ")).push(")");
+                    return (out, ty);
+                }
+                _ => {}
+            }
             let key = if q.alias {
                 format!("{}${}", q.trait_name, q.method)
             } else {
@@ -5310,6 +5471,12 @@ impl<'a> Codegen<'a> {
                 .map(|n| n.text().to_string())
                 .collect()
         });
+        // `i32::make()` through a blanket impl.
+        if let Some(crate::adt::Conv::ExtDict { key, dict }) = self.conv_of(c.syntax())
+            && let Some(f) = segs.last()
+        {
+            return self.emit_ext_dict_call(c, &key, &dict, f);
+        }
         if let [single] = self.strip_modules(&segs).as_slice()
             && self.fns.contains_key(single)
         {
@@ -5539,6 +5706,23 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// The file declares a `pub` trait, which a file loading it may implement for built-in types.
+    fn has_pub_traits(&self) -> bool {
+        self.file_traits
+            .iter()
+            .any(|t| ast::HasVisibility::visibility(t).is_some())
+    }
+
+    /// `method` is a method of one of the file's `pub` traits: a call through a type parameter
+    /// goes through the registry, which a loading file's impls for built-in types join.
+    fn pub_trait_method(&self, method: &str) -> bool {
+        self.file_traits
+            .iter()
+            .filter(|t| ast::HasVisibility::visibility(*t).is_some())
+            .flat_map(|t| t.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()))
+            .any(|i| matches!(i, ast::AssocItem::Fn(f) if f.name().is_some_and(|n| n.text() == method)))
+    }
+
     /// A trait method called on a value whose type is erased (a type parameter or `dyn Trait`):
     /// `x.method(..)`, or, when the file implements the method for a built-in type (`impl Money
     /// for f64`), `κσ.$dcall(x, "method", ..)`, which also finds those.
@@ -5570,7 +5754,8 @@ impl<'a> Codegen<'a> {
             .adts
             .ext_types
             .iter()
-            .any(|k| self.types.adts.method(k, method).is_some());
+            .any(|k| self.types.adts.method(k, method).is_some())
+            || self.pub_trait_method(method);
         // A `&mut self` method of a string or number impl: hand over the receiver's cell.
         let mut_ext = self.types.adts.ext_types.iter().any(|k| {
             self.types
@@ -6528,6 +6713,16 @@ impl<'a> Codegen<'a> {
             ast::Pat::PathPat(pp) if path_is(pp.path(), "None") => {
                 out.conds.push(Frag::text(format!("{subject} == null")))
             }
+            // `S::ZERO`, `<S as Tr>::TOP`, `u8::MAX`: compared with the constant's value.
+            ast::Pat::PathPat(pp) if self.const_pat_js(pp).is_some() => {
+                let js = self.const_pat_js(pp).unwrap();
+                let primitive = self.ty_of(p.syntax()).is_some_and(|t| t.is_js_primitive());
+                out.conds.push(Frag::text(if primitive {
+                    format!("{subject} === {js}")
+                } else {
+                    format!("κσ.$eq({subject}, {js})")
+                }));
+            }
             ast::Pat::TupleStructPat(tp) if crate::typeck::result_variant(tp.path()).is_some() => {
                 let v = crate::typeck::result_variant(tp.path()).unwrap();
                 self.lower_result_pat(tp, v, subject, out);
@@ -6558,8 +6753,41 @@ impl<'a> Codegen<'a> {
                     subject.to_string()
                 };
                 let bound = |cg: &mut Self, b: Option<ast::Pat>| -> Option<Frag> {
-                    let ast::Pat::LiteralPat(lp) = b? else {
-                        return None;
+                    let lp = match b? {
+                        ast::Pat::LiteralPat(lp) => lp,
+                        // `0..=LIMIT`
+                        ast::Pat::IdentPat(ip) => {
+                            let js = ip.name().and_then(|n| {
+                                cg.consts.get(n.text().to_string().as_str()).cloned()
+                            });
+                            let Some(js) = js else {
+                                cg.unsupported(ip.syntax(), "this range pattern bound", 1);
+                                return None;
+                            };
+                            return Some(Frag::text(if is_char {
+                                format!("{js}.codePointAt(0)")
+                            } else {
+                                js
+                            }));
+                        }
+                        // `S::LO..S::HI`, `..=u8::MAX`
+                        ast::Pat::PathPat(pp) => {
+                            let js = cg.const_pat_js(&pp).or_else(|| {
+                                // (`char::MAX`.)
+                                let segs = crate::adt::const_pat_segs(pp.path()?);
+                                (segs == ["char", "MAX"]).then(|| "\"\\u{10ffff}\"".to_string())
+                            });
+                            let Some(js) = js else {
+                                cg.unsupported(pp.syntax(), "this range pattern bound", 1);
+                                return None;
+                            };
+                            return Some(Frag::text(if is_char {
+                                format!("{js}.codePointAt(0)")
+                            } else {
+                                js
+                            }));
+                        }
+                        _ => return None,
                     };
                     if is_char && let Some(LiteralKind::Char(c)) = lp.literal().map(|l| l.kind()) {
                         return Some(Frag::text((c.value().unwrap_or('\0') as u32).to_string()));
@@ -6694,6 +6922,32 @@ impl<'a> Codegen<'a> {
                 };
                 self.unsupported(other.syntax(), what, 1);
             }
+        }
+    }
+
+    /// A path pattern naming a constant (see `Checker::const_path_pat`): its value as JS.
+    fn const_pat_js(&self, pp: &ast::PathPat) -> Option<String> {
+        let segs = crate::adt::const_pat_segs(pp.path()?);
+        if let [name] = segs.as_slice() {
+            return self.consts.get(name).cloned();
+        }
+        let tail: Vec<&str> = segs.iter().map(String::as_str).collect();
+        if let Some((js, _)) = crate::ty::std_const(crate::ty::std_tail(&tail)) {
+            return Some(js.to_string());
+        }
+        match self.resolve(&segs)? {
+            crate::adt::Resolved::Assoc(adt, m)
+                if self.types.adts.method(&adt, &m).is_none()
+                    && self
+                        .types
+                        .adts
+                        .assoc_consts
+                        .get(&adt)
+                        .is_some_and(|c| c.contains_key(&m)) =>
+            {
+                Some(format!("{}.{}", self.class(&adt), escape_ident(&m)))
+            }
+            _ => None,
         }
     }
 
@@ -8425,7 +8679,12 @@ fn const_value_js(v: &str) -> String {
         };
         return js_string(&c.to_string());
     }
-    v.to_string()
+    // (Past 2^53 only a 64/128-bit parameter's value, exact as a BigInt.)
+    match v.parse::<i128>() {
+        Ok(n) if n.unsigned_abs() > 1 << 53 => format!("{n}n"),
+        Err(_) if v.parse::<u128>().is_ok() => format!("{v}n"),
+        _ => v.to_string(),
+    }
 }
 
 /// A struct's class with its const arguments (`Buf<4>` → `κσ.$cv(Buf, [4])`), for calling its

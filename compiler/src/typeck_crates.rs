@@ -61,6 +61,7 @@ pub(super) const ITERTOOLS_METHODS: &[&str] = &[
     "interleave",
     "merge",
     "intersperse",
+    "set_from",
     "take_while_inclusive",
     "positions",
     "dropping",
@@ -288,9 +289,9 @@ impl Checker<'_> {
             self.note_crate(m.syntax(), js, vec![]);
             return Some(ret);
         }
-        if let Ty::Iter { elem, .. } = resolved
+        if let Ty::Iter { elem, mutable } = resolved
             && self.uses_crate("itertools")
-            && let Some(t) = self.itertools_method(m, elem, method, args)
+            && let Some(t) = self.itertools_method(m, elem, *mutable, method, args)
         {
             return Some(t);
         }
@@ -585,6 +586,7 @@ impl Checker<'_> {
         &mut self,
         m: &ast::MethodCallExpr,
         elem: &Ty,
+        mutable: bool,
         method: &str,
         args: &[ast::Expr],
     ) -> Option<Ty> {
@@ -721,6 +723,28 @@ impl Checker<'_> {
             "intersperse" => {
                 self.crate_args(m, args, std::slice::from_ref(&e));
                 ("intersperse", iter(e))
+            }
+            // `v.iter_mut().set_from(src)`: each item is assigned the next of `src`; the count.
+            // Over numbers, strings and bools the items are slots, else the objects themselves
+            // (replaced in place).
+            "set_from" => {
+                if !mutable {
+                    self.error(
+                        m.syntax(),
+                        "`set_from` assigns through the items: call it on `iter_mut()`",
+                    );
+                }
+                let u = self.iterable_arg(m, args);
+                if !self.unify(&e, &u) {
+                    let msg = format!(
+                        "mismatched types: expected items of type `{}`, found `{}`",
+                        self.describe(&e),
+                        self.describe(&u)
+                    );
+                    self.error(m.syntax(), msg);
+                }
+                let slots = self.zonk(&e).is_js_primitive();
+                (if slots { "setFromSlots" } else { "setFrom" }, usize_ty)
             }
             "take_while_inclusive" | "positions" => {
                 let f = Ty::Closure {

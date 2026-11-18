@@ -35,6 +35,8 @@ impl Codegen<'_> {
                     Coll::BTreeSet => arg.wrap("κσ.BTreeSet.from(", ")"),
                     Coll::IndexMap => arg.wrap("κσ.IndexMap.from(", ")"),
                     Coll::IndexSet => arg.wrap("κσ.IndexSet.from(", ")"),
+                    // (Never named: see `Coll::FixedArray`.)
+                    Coll::FixedArray(_) => arg.wrap("[...", "]"),
                 }
             }
             _ => Frag::text(new_coll(kind)),
@@ -222,7 +224,7 @@ impl Codegen<'_> {
 pub(super) fn new_coll(kind: Coll) -> &'static str {
     match kind {
         Coll::VecDeque => "new κσ.Deque()",
-        Coll::BinaryHeap => "[]",
+        Coll::BinaryHeap | Coll::FixedArray(_) => "[]",
         Coll::BTreeMap => "new κσ.BTreeMap()",
         Coll::BTreeSet => "new κσ.BTreeSet()",
         Coll::IndexMap => "new κσ.IndexMap()",

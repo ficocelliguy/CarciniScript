@@ -30,6 +30,9 @@ type Decl = (usize, usize);
 struct State {
     /// Moved bindings: where, and how (`UNINIT` for a `let x;` not yet assigned).
     moved: HashMap<Decl, (usize, &'static str)>,
+    /// Moved bindings that are only partly moved (`let S { name, .. } = s;`): the fields that
+    /// moved. Reading another field (`s.x`) is still fine.
+    partial: HashMap<Decl, HashSet<String>>,
     /// `let x;` bindings that may have been assigned already.
     assigned: HashSet<Decl>,
     /// `let x;` bindings assigned on no path yet.
@@ -49,6 +52,18 @@ impl State {
         if b.unreachable {
             return a;
         }
+        // A binding partly moved on both paths (or partly on one, not at all on the other) is
+        // partly moved; fully moved on either path, fully.
+        let mut partial = HashMap::new();
+        for (k, _) in a.moved.iter().chain(&b.moved) {
+            let (pa, pb) = (a.partial.get(k), b.partial.get(k));
+            let full = (a.moved.contains_key(k) && pa.is_none())
+                || (b.moved.contains_key(k) && pb.is_none());
+            if !full {
+                let fields: HashSet<String> = pa.into_iter().chain(pb).flatten().cloned().collect();
+                partial.insert(*k, fields);
+            }
+        }
         let mut moved = a.moved;
         for (k, v) in b.moved {
             moved.entry(k).or_insert(v);
@@ -58,6 +73,7 @@ impl State {
         let unassigned = a.unassigned.intersection(&b.unassigned).copied().collect();
         State {
             moved,
+            partial,
             assigned,
             unassigned,
             unreachable: false,
@@ -260,6 +276,71 @@ impl Walker<'_> {
         }
     }
 
+    /// What destructuring with `p` moves out of the value: `Some(fields)` names the top-level
+    /// fields (empty when nothing moves), `None` is the whole value (or fields we can't name).
+    fn moved_fields(&self, p: &ast::Pat) -> Option<HashSet<String>> {
+        let elems = |fields: Vec<ast::Pat>| {
+            let rest = fields
+                .iter()
+                .position(|f| matches!(f, ast::Pat::RestPat(_)));
+            let mut out = HashSet::new();
+            for (i, f) in fields.iter().enumerate() {
+                if self.binds_move(f) {
+                    // (After a `..` the index depends on the arity.)
+                    if rest.is_some_and(|r| i > r) {
+                        return None;
+                    }
+                    out.insert(i.to_string());
+                }
+            }
+            Some(out)
+        };
+        match p {
+            ast::Pat::ParenPat(pp) => pp.pat().and_then(|i| self.moved_fields(&i)),
+            ast::Pat::RecordPat(rp) => {
+                let mut out = HashSet::new();
+                for f in rp
+                    .record_pat_field_list()
+                    .into_iter()
+                    .flat_map(|l| l.fields())
+                {
+                    let (Some(name), Some(sub)) = (f.field_name(), f.pat()) else {
+                        continue;
+                    };
+                    if self.binds_move(&sub) {
+                        out.insert(name.text().to_string());
+                    }
+                }
+                Some(out)
+            }
+            ast::Pat::TupleStructPat(tp) => elems(tp.fields().collect()),
+            ast::Pat::TuplePat(tp) => elems(tp.fields().collect()),
+            other if self.binds_move(other) => None,
+            _ => Some(HashSet::new()),
+        }
+    }
+
+    /// Whether `p` binds a value that moves by value (not by `ref`, nor through a `&` pattern).
+    fn binds_move(&self, p: &ast::Pat) -> bool {
+        p.syntax()
+            .descendants()
+            .filter_map(ast::IdentPat::cast)
+            .any(|ip| {
+                ip.ref_token().is_none()
+                    && !ip
+                        .syntax()
+                        .ancestors()
+                        .take_while(|a| a != p.syntax())
+                        .any(|a| ast::RefPat::can_cast(a.kind()))
+                    && !ast::RefPat::can_cast(p.syntax().kind())
+                    && ip.name().is_some_and(|n| match self.ty(n.syntax()) {
+                        Some(t) => self.moves(t),
+                        // (Unknown: as before, assume it moves.)
+                        None => true,
+                    })
+            })
+    }
+
     /// Whether `init` certainly produces an owned value (so the binding owns it).
     fn owned_init(&self, init: &ast::Expr) -> bool {
         match strip(init) {
@@ -388,6 +469,12 @@ impl Walker<'_> {
                     )
                 } else if moved_at == at.0 {
                     format!("use of moved value: `{n}` (moved here {how} in the loop's previous iteration; `.clone()` it to keep a copy)")
+                } else if st.partial.contains_key(&decl) {
+                    format!(
+                        "use of partially moved value: `{n}` (a field moved on line {}:{} {how}; bind it with `ref` or `.clone()` it there to keep it)",
+                        l + 1,
+                        c + 1
+                    )
                 } else {
                     format!(
                         "use of moved value: `{n}` (moved on line {}:{} {how}; `.clone()` it there to keep a copy)",
@@ -403,6 +490,7 @@ impl Walker<'_> {
             && self.tracked.contains(&decl)
         {
             st.moved.insert(decl, (at.0, how));
+            st.partial.remove(&decl);
             self.move_sites.insert(at);
         }
     }
@@ -429,8 +517,32 @@ impl Walker<'_> {
 
     fn let_stmt(&mut self, l: &ast::LetStmt, st: &mut State) {
         let init = l.initializer();
+        let pat = l.pat();
+        // A destructuring pattern moves only the fields it binds by value, and only when their
+        // values move (`let S { x, .. } = s;` with a `Copy` `x` leaves `s` whole).
+        let moved_fields = match &pat {
+            Some(ast::Pat::IdentPat(ip)) if ip.pat().is_none() => None,
+            Some(p) => Some(self.moved_fields(p)),
+            None => None,
+        };
         if let Some(e) = &init {
-            self.expr(e, st, Mode::Move("by `let`"));
+            match &moved_fields {
+                Some(Some(f)) if f.is_empty() => self.expr(e, st, Mode::Use),
+                _ => self.expr(e, st, Mode::Move("by `let`")),
+            }
+            // Partly moved: the other fields can still be read.
+            if let Some(Some(f)) = &moved_fields
+                && !f.is_empty()
+                && let ast::Expr::PathExpr(p) = strip(e)
+                && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+                && let Some(d) = self.lookup(n.text().to_string().as_str())
+                && st
+                    .moved
+                    .get(&d)
+                    .is_some_and(|m| m.0 == self.range(p.syntax()).0)
+            {
+                st.partial.insert(d, f.clone());
+            }
         }
         if let Some(le) = l.let_else()
             && let Some(b) = le.block_expr()
@@ -438,7 +550,7 @@ impl Walker<'_> {
             let mut s2 = st.clone();
             self.block(&b, &mut s2, Mode::Use);
         }
-        let Some(pat) = l.pat() else { return };
+        let Some(pat) = pat else { return };
         match &pat {
             ast::Pat::IdentPat(ip) if ip.pat().is_none() && ip.ref_token().is_none() => {
                 let Some(n) = ip.name() else { return };
@@ -654,7 +766,26 @@ impl Walker<'_> {
                 }
             }
             ast::Expr::FieldExpr(f) => {
-                if let Some(x) = f.expr() {
+                // A field that stayed behind in a partly moved struct can still be read.
+                let kept = |me: &Self, x: &ast::Expr| {
+                    let ast::Expr::PathExpr(p) = strip(x) else {
+                        return false;
+                    };
+                    let Some(d) = p
+                        .path()
+                        .and_then(|p| p.as_single_name_ref())
+                        .and_then(|n| me.lookup(n.text().to_string().as_str()))
+                    else {
+                        return false;
+                    };
+                    let field = f.name_ref().map(|n| n.text().to_string());
+                    st.partial
+                        .get(&d)
+                        .is_some_and(|moved| field.is_some_and(|n| !moved.contains(&n)))
+                };
+                if let Some(x) = f.expr()
+                    && !kept(self, &x)
+                {
                     self.expr(&x, st, Mode::Use);
                 }
                 // A field moved out of its struct (`let x = s.inner;`): the struct no longer

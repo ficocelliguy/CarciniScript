@@ -659,6 +659,25 @@ impl Checker<'_> {
                             }
                         }
                     }
+                    // `impl<I: Iterator> Stats for I` without `Item = ..`: an iterator of
+                    // `I::Item`, which each call takes from its receiver (`blanket_inst`).
+                    if crate::adt::blanket_impl(imp).is_some_and(|(_, t, _)| t == n)
+                        && tp
+                            .type_bound_list()
+                            .and_then(|l| super::bounds_iterator_item(&l))
+                            .is_some_and(|item| item.is_none())
+                    {
+                        let item = Ty::Param(format!("{n}::Item"));
+                        self.generics.insert(format!("{n}::Item"), item.clone());
+                        self.generics.insert(
+                            n,
+                            Ty::Iter {
+                                elem: Box::new(item),
+                                mutable: false,
+                            },
+                        );
+                        continue;
+                    }
                     // `impl<I: Iterator<Item = T>> .. for Pairs<I>`: the runtime's iterator.
                     if let Some(it) = self.iter_param(&tp) {
                         self.generics.insert(n, it);
@@ -902,16 +921,21 @@ impl Checker<'_> {
         let Some(mut type_name) = type_name.or_else(|| crate::adt::impl_self_name(imp)) else {
             return;
         };
+        // (`impl<T> (T,) {}`: only core's docs write inherent impls on tuples.)
+        if trait_name.is_none() && crate::adt::tuple_arity(&type_name).is_some() {
+            return;
+        }
         let node = imp
             .self_ty()
             .map(|t| t.syntax().clone())
             .unwrap_or_else(|| imp.syntax().clone());
         // `impl<T: Display> Shout for T`: for every type meeting the bounds.
-        if let Some((tr, _, bounds)) = crate::adt::blanket_impl(imp)
+        if let Some((tr, param, bounds)) = crate::adt::blanket_impl(imp)
             && self.adts.traits.contains_key(&tr)
         {
             type_name = format!("{tr}$all");
             self.adts.ext_types.insert(type_name.clone());
+            self.adts.blanket_params.insert(tr.clone(), param);
             self.adts.blankets.insert(tr, bounds);
         }
         // `impl Money for f64`: a user trait for a built-in type (and `impl From<Id> for String`,
@@ -932,6 +956,25 @@ impl Checker<'_> {
             // the same value in JS, so they can't have different impls.
             if crate::adt::wrapping_impl(imp) {
                 self.error(&node, "an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl (`(**self).method(args)`, overriding the default methods `T`'s impls override): references and boxes are erased in JS, so `&T` can't behave differently from `T`");
+                return;
+            }
+            // `impl<T: Bound> Other for T` with `Other` from another file or crate: what any impl
+            // of a trait not declared here gets.
+            if let Some((tr, _, _)) = crate::adt::blanket_impl(imp)
+                && !self.adts.traits.contains_key(&tr)
+            {
+                let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
+                self.error(&node, format!("`impl {tr} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"));
+                return;
+            }
+            // `impl Format for u8` with `Format` neither declared here, imported from a `mod`
+            // file nor one of std's: the trait is what's missing, not the type.
+            if let Some(t) = trait_name.as_deref()
+                && !self.adts.traits.contains_key(t)
+                && !impl_std_trait(t)
+            {
+                let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
+                self.error(&node, unknown_impl_trait(t));
                 return;
             }
             self.error(&node, format!("cannot find type `{type_name}` in this scope (impls are for structs and enums in this file)"));
@@ -1012,16 +1055,15 @@ impl Checker<'_> {
             }
             Some(t) => {
                 let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
-                self.error(
-                    &node,
-                    format!("`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"),
-                );
+                self.error(&node, unknown_impl_trait(t));
                 return;
             }
         }
         let self_ty = self.enter_impl(imp, &type_name);
         let impl_args = match &self_ty {
             Ty::Adt(_, args) => args.clone(),
+            // A blanket impl's `T`: its associated functions take `T`'s class (as `this`).
+            Ty::Param(p) if type_name.ends_with("$all") => vec![Ty::Param(p.clone())],
             // `impl Total for HashMap<String, i64>` / `impl<T> Tr for Option<T>`.
             t => crate::adt::ext_args(t),
         };
@@ -1280,6 +1322,49 @@ impl Checker<'_> {
                     .alt_arg_refs
                     .insert(format!("{type_name}::{}", name.text()), w);
             }
+            // An inherent impl for another instantiation (`impl W<String> { fn get }` next to
+            // `impl W<i32> { fn get }`): its methods under keys of their own, picked by the
+            // receiver's type arguments.
+            if trait_name.is_none()
+                && !impl_args.is_empty()
+                && let Some(existing) = self.adts.methods.get(&type_name)
+                && existing.contains_key(name.text().to_string().as_str())
+            {
+                let n = name.text().to_string();
+                let keys = self
+                    .adts
+                    .method_alts
+                    .get(&format!("{type_name}::{n}"))
+                    .cloned()
+                    .unwrap_or_else(|| vec![n.clone()]);
+                let disjoint = keys.iter().all(|k| {
+                    existing.get(k).is_some_and(|m| {
+                        m.impl_args.len() == impl_args.len()
+                            && m.impl_args
+                                .iter()
+                                .zip(&impl_args)
+                                .any(|(a, b)| crate::adt::disjoint_args(a, b))
+                    })
+                });
+                if disjoint {
+                    let alts = self
+                        .adts
+                        .method_alts
+                        .entry(format!("{type_name}::{n}"))
+                        .or_insert_with(|| vec![n.clone()]);
+                    let key = format!("{n}${}", alts.len());
+                    alts.push(key.clone());
+                    let at = self.range(name.syntax()).0;
+                    self.adts.alt_keys_at.insert(at, key.clone());
+                    self.adts.inherent_alts.insert(format!("{type_name}::{n}"));
+                    self.adts
+                        .methods
+                        .entry(type_name.clone())
+                        .or_default()
+                        .insert(key, method);
+                    continue;
+                }
+            }
             let methods = self.adts.methods.entry(type_name.clone()).or_default();
             if trait_name.is_none() && methods.contains_key(name.text().to_string().as_str()) {
                 self.error(
@@ -1492,6 +1577,22 @@ impl Checker<'_> {
                 let saved_fn = self.cur_fn.replace(format!("{type_name}::{key}"));
                 self.check_body(&f, m.params.clone(), m.ret.clone(), m.is_async, self_local);
                 self.cur_fn = saved_fn;
+                // A blanket impl's `*self = ..` / `*self += ..`: `self` may be a number or a
+                // string, which would need a cell per call.
+                if type_name.ends_with("$all")
+                    && m.receiver == Some(crate::adt::Receiver::MutRef)
+                    && let Some(body) = f.body()
+                {
+                    for e in body.syntax().descendants().filter_map(ast::BinExpr::cast) {
+                        let assigns = matches!(e.op_kind(), Some(ast::BinaryOp::Assignment { .. }));
+                        let to_self = matches!(e.lhs(), Some(ast::Expr::PrefixExpr(p))
+                            if p.op_kind() == Some(ast::UnaryOp::Deref)
+                                && matches!(p.expr(), Some(ast::Expr::PathExpr(s)) if s.syntax().text() == "self"));
+                        if assigns && to_self {
+                            self.error(e.syntax(), "assigning to `*self` in a blanket impl's method (`impl<T> Tr for T`) isn't supported yet: `self` may be a number or string there, which can't be changed in place");
+                        }
+                    }
+                }
                 for p in own {
                     self.generics.remove(&p);
                     self.param_bounds.remove(&p);
@@ -1688,6 +1789,46 @@ impl Checker<'_> {
         );
     }
 
+    /// The key of `adt::m` among inherent impls for several instantiations, by the path's type
+    /// arguments (`W::<i32>::kind()`) or the impl's own (`Self::kind()`); recorded for codegen.
+    fn pick_inherent_assoc(&mut self, c: &ast::CallExpr, adt: &str, m: &str) -> String {
+        let Some(keys) = self.adts.method_alts.get(&format!("{adt}::{m}")).cloned() else {
+            return m.to_string();
+        };
+        let qual = match c.expr() {
+            Some(ast::Expr::PathExpr(p)) => p.path().and_then(|p| p.qualifier()),
+            _ => None,
+        };
+        let written: Vec<ast::GenericArg> = qual
+            .as_ref()
+            .and_then(|q| q.segment()?.generic_arg_list())
+            .map(|l| l.generic_args().collect())
+            .unwrap_or_default();
+        let targs: Vec<Ty> = if !written.is_empty() {
+            written
+                .iter()
+                .map(|g| self.generic_arg_ty(g).unwrap_or(Ty::Unknown))
+                .collect()
+        } else if qual.as_ref().is_some_and(|q| q.syntax().text() == "Self")
+            && let Some(Ty::Adt(_, a)) = self.self_ty.clone()
+        {
+            a
+        } else {
+            // (rustc resolves `W::get` before looking at the arguments: every impl applies.)
+            self.error(
+                c.syntax(),
+                format!(
+                    "multiple applicable items in scope: `{m}` is defined in `impl`s for several instantiations of `{adt}`; name the type arguments (`{adt}::<..>::{m}`)"
+                ),
+            );
+            Vec::new()
+        };
+        let key = self.alts_for_args(adt, keys, &targs).swap_remove(0);
+        let r = self.range(c.syntax());
+        self.method_keys.insert(r, key.clone());
+        key
+    }
+
     /// `Point(1, 2)`, `Shape::Circle(r)`, `Point::new(..)`, `Point::len(&p)`.
     pub(super) fn adt_call(
         &mut self,
@@ -1741,6 +1882,13 @@ impl Checker<'_> {
                 {
                     return Some(self.conv_from_call(c, &adt, args));
                 }
+                // `W::<i32>::kind()` / `Self::kind()` with inherent impls for several
+                // instantiations: the one for those type arguments.
+                let m = if self.adts.inherent_alts.contains(&format!("{adt}::{m}")) {
+                    self.pick_inherent_assoc(c, &adt, &m)
+                } else {
+                    m
+                };
                 // `Name::try_from(bytes)` with several `impl TryFrom<X> for Name`: the one for
                 // the argument.
                 let m = if let [a] = args
@@ -2260,6 +2408,32 @@ impl Checker<'_> {
             .cloned()
     }
 
+    /// A path pattern naming a constant (`S::ZERO`, `Self::MAX`, `<S as Tr>::TOP`, `u8::MAX`,
+    /// a `const` as a range bound): compared against, not bound. Its type, and its integer
+    /// value when known (for exhaustiveness).
+    pub(super) fn const_path_pat(&self, pp: &ast::PathPat) -> Option<(Ty, Option<i128>)> {
+        let segs = crate::adt::const_pat_segs(pp.path()?);
+        let value = || {
+            self.eval_const_segs(pp.syntax(), &segs)
+                .and_then(|v| v.int())
+        };
+        if let [name] = segs.as_slice() {
+            let ty = self.consts.get(name)?.clone();
+            return Some((ty, value()));
+        }
+        let tail: Vec<&str> = segs.iter().map(String::as_str).collect();
+        if let Some((_, ty)) = crate::ty::std_const(crate::ty::std_tail(&tail)) {
+            return Some((ty, value()));
+        }
+        match self.resolve(&segs)? {
+            Resolved::Assoc(adt, m) if self.adts.method(&adt, &m).is_none() => {
+                let ty = self.adts.assoc_consts.get(&adt)?.get(&m)?.clone();
+                Some((ty, value()))
+            }
+            _ => None,
+        }
+    }
+
     /// Patterns that match every value: also struct patterns (but not enum variants) whose
     /// fields are irrefutable, and unit structs.
     pub(super) fn irrefutable_pat(&self, p: &ast::Pat) -> bool {
@@ -2529,139 +2703,65 @@ fn bounds_name_params(l: &ast::TypeBoundList) -> bool {
     })
 }
 
-/// The value of a constant integer expression, for enum discriminants: literals, `const` items,
-/// another enum's variants (`Other::X as isize`), `u8::MAX`-style bounds, arithmetic, bit
-/// operations and `as` casts between integer types. `None` for anything else.
-fn const_eval(file: &ast::SourceFile, e: &ast::Expr, depth: u32) -> Option<i128> {
-    use ast::{ArithOp, BinaryOp, UnaryOp};
-    if depth > 32 {
-        return None;
-    }
-    let ev = |e: &ast::Expr| const_eval(file, e, depth + 1);
-    match e {
-        ast::Expr::Literal(l) => match l.kind() {
-            ast::LiteralKind::IntNumber(n) => i128::try_from(n.value().ok()?).ok(),
-            ast::LiteralKind::Byte(b) => Some(i128::from(b.value().ok()?)),
-            ast::LiteralKind::Char(c) => Some(i128::from(u32::from(c.value().ok()?))),
-            ast::LiteralKind::Bool(b) => Some(i128::from(b)),
-            _ => None,
-        },
-        ast::Expr::ParenExpr(p) => ev(&p.expr()?),
-        ast::Expr::BlockExpr(b) if b.statements().next().is_none() => ev(&b.tail_expr()?),
-        ast::Expr::PrefixExpr(p) => {
-            let v = ev(&p.expr()?)?;
-            match p.op_kind()? {
-                UnaryOp::Neg => v.checked_neg(),
-                UnaryOp::Not => Some(!v),
-                _ => None,
-            }
-        }
-        ast::Expr::BinExpr(b) => {
-            let (l, r) = (ev(&b.lhs()?)?, ev(&b.rhs()?)?);
-            match b.op_kind()? {
-                BinaryOp::ArithOp(ArithOp::Add) => l.checked_add(r),
-                BinaryOp::ArithOp(ArithOp::Sub) => l.checked_sub(r),
-                BinaryOp::ArithOp(ArithOp::Mul) => l.checked_mul(r),
-                BinaryOp::ArithOp(ArithOp::Div) => l.checked_div(r),
-                BinaryOp::ArithOp(ArithOp::Rem) => l.checked_rem(r),
-                BinaryOp::ArithOp(ArithOp::Shl) => l.checked_shl(u32::try_from(r).ok()?),
-                BinaryOp::ArithOp(ArithOp::Shr) => l.checked_shr(u32::try_from(r).ok()?),
-                BinaryOp::ArithOp(ArithOp::BitAnd) => Some(l & r),
-                BinaryOp::ArithOp(ArithOp::BitOr) => Some(l | r),
-                BinaryOp::ArithOp(ArithOp::BitXor) => Some(l ^ r),
-                _ => None,
-            }
-        }
-        ast::Expr::CastExpr(c) => {
-            let v = ev(&c.expr()?)?;
-            let ast::Type::PathType(t) = c.ty()? else {
-                return None;
-            };
-            let name = t.path()?.as_single_name_ref()?.text().to_string();
-            let (bits, signed) = int_kind(&name)?;
-            if bits == 128 {
-                return Some(v);
-            }
-            let m = v.rem_euclid(1i128 << bits);
-            Some(if signed && m >= 1i128 << (bits - 1) {
-                m - (1i128 << bits)
-            } else {
-                m
-            })
-        }
-        ast::Expr::PathExpr(p) => {
-            let path = p.path()?;
-            let segs: Vec<String> = path
-                .segments()
-                .map(|s| s.name_ref().map(|n| n.text().to_string()))
-                .collect::<Option<_>>()?;
-            match segs.as_slice() {
-                [name] => {
-                    let body = crate::adt::all_items(file)
-                        .into_iter()
-                        .find_map(|i| match i {
-                            ast::Item::Const(k)
-                                if k.name().is_some_and(|n| n.text() == name.as_str()) =>
-                            {
-                                k.body()
-                            }
-                            _ => None,
-                        })?;
-                    ev(&body)
-                }
-                [ty, bound] if matches!(bound.as_str(), "MAX" | "MIN") => {
-                    let (bits, signed) = int_kind(ty)?;
-                    Some(match (bound.as_str(), signed) {
-                        ("MAX", true) => (1i128 << (bits - 1)) - 1,
-                        ("MIN", true) => -(1i128 << (bits - 1)),
-                        ("MAX", false) if bits == 128 => i128::MAX,
-                        ("MAX", false) => (1i128 << bits) - 1,
-                        _ => 0,
-                    })
-                }
-                [en, variant] => {
-                    let e = crate::adt::all_items(file)
-                        .into_iter()
-                        .find_map(|i| match i {
-                            ast::Item::Enum(e)
-                                if e.name().is_some_and(|n| n.text() == en.as_str()) =>
-                            {
-                                Some(e)
-                            }
-                            _ => None,
-                        })?;
-                    let mut next = 0i128;
-                    for v in e.variant_list()?.variants() {
-                        if let Some(d) = v.const_arg().and_then(|c| c.expr()) {
-                            next = ev(&d)?;
-                        }
-                        if v.name().is_some_and(|n| n.text() == variant.as_str()) {
-                            return Some(next);
-                        }
-                        next = next.checked_add(1)?;
-                    }
-                    None
-                }
-                _ => None,
-            }
-        }
-        _ => None,
+/// The value of a constant integer expression, for enum discriminants (see `consteval`).
+fn const_eval(file: &ast::SourceFile, e: &ast::Expr, _depth: u32) -> Option<i128> {
+    match crate::consteval::eval(file, &crate::consteval::Known::default(), e)? {
+        crate::consteval::CVal::Int(n) => Some(n),
+        crate::consteval::CVal::Bool(_) | crate::consteval::CVal::U128(_) => None,
     }
 }
 
-/// An integer type's width and signedness (`isize` / `usize` are 64 bits here).
-fn int_kind(name: &str) -> Option<(u32, bool)> {
-    Some(match name {
-        "i8" => (8, true),
-        "i16" => (16, true),
-        "i32" => (32, true),
-        "i64" | "isize" => (64, true),
-        "i128" => (128, true),
-        "u8" => (8, false),
-        "u16" => (16, false),
-        "u32" => (32, false),
-        "u64" | "usize" => (64, false),
-        "u128" => (128, false),
-        _ => return None,
-    })
+/// The std traits `collect_impl` knows, by name (the `std::ops` operators too).
+fn impl_std_trait(t: &str) -> bool {
+    crate::adt::op_method(t).is_some()
+        || matches!(
+            t,
+            "Default"
+                | "Display"
+                | "From"
+                | "Ord"
+                | "PartialOrd"
+                | "PartialEq"
+                | "Eq"
+                | "Clone"
+                | "Debug"
+                | "Error"
+                | "Sum"
+                | "Product"
+                | "Iterator"
+                | "IntoIterator"
+                | "Send"
+                | "Sync"
+                | "Unpin"
+                | "Future"
+                | "ExactSizeIterator"
+                | "FusedIterator"
+                | "DoubleEndedIterator"
+                | "TrustedLen"
+                | "UnwindSafe"
+                | "RefUnwindSafe"
+                | "Hasher"
+                | "BuildHasher"
+                | "Deref"
+                | "DerefMut"
+                | "AsRef"
+                | "AsMut"
+                | "Borrow"
+                | "BorrowMut"
+                | "FromStr"
+                | "TryFrom"
+                | "FromIterator"
+                | "Extend"
+                | "Drop"
+                | "Copy"
+                | "Hash"
+        )
+}
+
+/// `impl Tr for ..` of a trait that's neither the file's, a loaded module's, nor one of std's
+/// that can be implemented.
+fn unknown_impl_trait(t: &str) -> String {
+    format!(
+        "`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file or a loaded `mod` file work)"
+    )
 }
