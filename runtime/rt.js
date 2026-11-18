@@ -5758,9 +5758,35 @@
     if (x == null || x instanceof HashMap) return x;
     return HashMap.from(x instanceof Map ? x : Object.entries(x));
   };
+  // A bindings enum (a TS union, `ScriptArg`, `PlayerRequirement`): the value is the JS value
+  // itself. `variants` is `[[test, name, fmt], ..]`: `test` is the value's JS kind for an
+  // untagged enum (`"string"`, `"number"`, `"array"`, `"object"`, ..), or the tag field's value
+  // when `tag` names that field.
+  const jsKind = (v) => (Array.isArray(v) ? "array" : v === null ? "null" : typeof v);
+  const jsEnumVariant = (v, variants, tag) =>
+    variants.find(([test]) => (tag === undefined ? jsKind(v) === test : v != null && v[tag] === test));
+  // `{:?}` of one: `Str("n00dles")`, `Money(MoneyRequirement { .. })`.
+  rt.$dbgJsEnum = (v, variants, tag) => {
+    const hit = jsEnumVariant(v, variants, tag);
+    return hit ? `${hit[1]}(${(hit[2] ?? rt.$dbg)(v)})` : rt.$dbg(v);
+  };
+  // `{:?}` of an NS interface value: `Server { hostname: "home", max_ram: 8.0 }` over its
+  // declared fields (`[[jsName, rustName, fmt], ..]`); a field the object lacks is left out
+  // (an `Option` one prints `None`).
+  rt.$dbgIface = (name, o, fields) => {
+    if (o === null || typeof o !== "object") return rt.$dbg(o);
+    const shown = fields.filter(([js, , fmt]) => js in o || /\$dbgOpt/.test(String(fmt)));
+    return rt.$dbgStruct(name, shown.map(([, rust]) => rust), shown.map(([js, , fmt]) => fmt(o[js] ?? null)));
+  };
+  // `ScriptArg::try_from(v)`: `Ok(v)` when the value fits a variant, else `Err(v)`.
+  rt.$jsEnumTry = (v, variants, tag) => (jsEnumVariant(v, variants, tag) ? rt.Ok(v) : rt.Err(v));
   // `JsValue`'s methods (wasm-bindgen's): `v.as_string()` is `κσ.$jsv.$asString(v)`. `None` is
   // `null`.
   rt.$jsv = {
+    // (A primitive union's `to_string()`: JS's text for it.)
+    $asText: (v) => String(v),
+    // (`NsResult::into_result()`: the game's `{ success, message }` as a `Result`.)
+    $nsResult: (v) => (v != null && v.success ? rt.Ok(v) : rt.Err(v == null ? "" : String(v.message ?? ""))),
     $asString: (v) => (typeof v === "string" ? v : null),
     $asF64: (v) => (typeof v === "number" ? v : null),
     $asBool: (v) => (typeof v === "boolean" ? v : null),

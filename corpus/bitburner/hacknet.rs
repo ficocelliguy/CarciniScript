@@ -124,7 +124,7 @@ pub async fn main(ns: NS) {
         .and_then(|a| a.as_f64())
         .unwrap_or(0.25)
         .clamp(0.0, 1.0);
-    let hash_target = ns.args.get(1).and_then(JsValue::as_string);
+    let hash_target = ns.args.get(1).and_then(ScriptArg::as_string);
     let mult = ns.get_player().mults.hacknet_node_money;
 
     let mut spent_total = 0.0;

@@ -1,6 +1,11 @@
 export interface Diagnostic {
   message: string;
   severity: "error" | "warning";
+  /**
+   * The rule behind the message in JavaScript or Python terms, and what to try, for a player who
+   * doesn't know Rust. One or two sentences; not every message has one. Show it under `message`.
+   */
+  help?: string;
   /** Byte offsets into the source. */
   start: number;
   end: number;
@@ -143,6 +148,7 @@ export function rename(
 export function setOverflowChecks(on: boolean): void;
 
 /**
- * Borrow conflicts rustc rejects as errors for the compiles that follow, instead of warnings.
+ * Borrow conflicts rustc rejects are errors by default, as in rustc; `false` makes them warnings
+ * for the compiles that follow (the program still runs).
  */
 export function setStrictBorrows(on: boolean): void;

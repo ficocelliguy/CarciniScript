@@ -161,8 +161,8 @@ In Bitburner, `js::document()` and `js::window()` cost 25 GB like their JS names
 (types, function signatures, NS docs with RAM costs), and `completions(...)` lists the members of
 the value before a `.` (or the names in scope for a plain identifier), and `signatureHelp(...)`
 gives parameter hints inside a call. `setOverflowChecks(true)` makes the compiles that follow panic on integer overflow, like a Rust debug
-build (the default wraps, like a release build). Borrow conflicts rustc rejects are warnings;
-`setStrictBorrows(true)` makes them errors.
+build (the default wraps, like a release build). Borrow conflicts rustc rejects are errors, as in rustc;
+`setStrictBorrows(false)` makes them warnings (the program still runs).
 
 `definition(...)` finds where the name under the cursor is
 defined (locals by scope; functions, types, methods, fields, variants and aliases; items of
@@ -178,8 +178,10 @@ rename providers for `.rs` files; a definition in another script opens it in a t
 call, field and namespace is type-checked: wrong argument types, misspelled methods ("did you
 mean"), and a forgotten `.await` are compile errors. The interfaces are Rust structs a script can
 name and build (`RunOptions { threads: Some(4.0), ..Default::default() }`), a `Player` is accepted
-where a `Person` is, and untyped values are wasm-bindgen's `JsValue`
-(`ns.args.first().and_then(|a| a.as_string())`, `serde_wasm_bindgen::from_value(data)`).
+where a `Person` is, the d.ts's unions are enums over the JS value itself (`ns.args` is a
+`Vec<ScriptArg>`: `match a { ScriptArg::Str(s) => .., ScriptArg::Num(n) => .., ScriptArg::Bool(b) => .. }`,
+or `a.as_string()` as before; `PlayerRequirement::Money(m)`, `NsResult::Success(..)`), and only
+`any` is wasm-bindgen's `JsValue` (`serde_wasm_bindgen::from_value(data)`).
 Regenerate after NS API changes:
 
 ```sh
@@ -187,4 +189,6 @@ npm run bindings   # reads ../bitoxidizer-src/src/ScriptEditor/NetscriptDefiniti
 ```
 
 `code` and `sourceMap` are `null` when there are errors. Diagnostics carry byte offsets plus
-1-based line and UTF-16 column, ready for Monaco markers.
+1-based line and UTF-16 column, ready for Monaco markers. Some carry a `help` line: the
+rule behind the message in JavaScript terms and what to try, for players who don't know Rust;
+show it under the message.

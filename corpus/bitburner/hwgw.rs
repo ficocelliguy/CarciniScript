@@ -39,7 +39,7 @@ pub struct Report {
     pub finished_at: f64,
 }
 
-fn arg_string(v: &JsValue) -> String {
+fn arg_string(v: &ScriptArg) -> String {
     v.as_string()
         .or_else(|| v.as_f64().map(|n| n.to_string()))
         .unwrap_or_default()

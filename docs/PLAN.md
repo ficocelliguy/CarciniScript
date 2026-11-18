@@ -103,7 +103,8 @@ Erasing them only means programs rustc would reject still run. Tiers:
    `move_sites` for `Drop` codegen are unchanged); the IR's moves feed only E0505.
    Left out, as planned: Polonius, `for<'a>`, object lifetime defaults, drop-check subtleties,
    `T: 'a` well-formedness on struct definitions; plus per-function result caching (the
-   file-level memo covers the editor's repeated analyses) and strict borrows as the default.
+   file-level memo covers the editor's repeated analyses). Strict borrows became the default
+   on 2026-11-18, once the corpus and the registry sweep showed no false positives.
    Unknown shapes (a generic `T` instantiated with a reference, methods of other modules and of
    bundled crates, closures' return types outside std's closure-taking methods) default to
    owned: silence, never a false positive. `NLL_DUMP=1` prints every body's IR and
@@ -204,9 +205,11 @@ can't see) defaults to owned: silence, never a false positive, as the current ch
    signatures are erased by the time they're imported).
 3. [x] Dangling and escape errors (E0597, E0515, E0716), struct lifetime parameters, two-phase
    borrows, reborrows, closure captures.
-4. [ ] Per-function caching and strict borrows as the default once the false-positive rate is
-   measured. The service is wired (diagnostics ride along with the analysis each edit already
-   runs); the checker is ~1 ms on the largest Bitburner script, so caching isn't needed yet.
+4. [x] Strict borrows as the default (2026-11-18): conflicts are errors, as in rustc;
+   `setStrictBorrows(false)` keeps the old warnings. The false-positive rate was measured first
+   (zero over the fixtures, corpus and the registry sweep's OK list). Per-function caching is
+   left out: the service is wired (diagnostics ride along with the analysis each edit already
+   runs) and the checker is ~1 ms on the largest Bitburner script.
 
 **Test oracle.** Every corpus file rustc accepts must produce zero borrow errors, so
 `npm run corpus` is a false-positive counter. For true positives, rustc's own
@@ -229,20 +232,25 @@ message and position, and 24 that rustc accepts which must stay quiet. The crash
 no NS function changes or keeps a string or array it's given), optional / `T | undefined` → `Option<T>`,
 `Promise<T>` → `impl Future<Output = T>`, interfaces → extern structs (with `#[extends = ".."]`
 for `interface X extends Y`), tuples → `[T; N]` / `(A, B)`, `Map` / `Record` → `HashMap`, inline
-object results and `Named & { .. }` intersections → structs of their own, anything else →
-`JsValue` (wasm-bindgen's, with `as_string()` and friends; a `JsValue` parameter takes any value).
+object results and `Named & { .. }` intersections → structs of their own, unions → enums whose
+value is the JS value itself (see "Typed unions", below), `any` → `JsValue` (wasm-bindgen's,
+with `as_string()` and friends; a `JsValue` parameter takes any value).
 Scripts can name the interfaces and build the option ones (`RunOptions { .., ..Default::default() }`).
 
-- [ ] **An owned value for a `&` parameter isn't rustc's E0308.** `ns.get_weaken_time(t)` with
-  `t: String` (or `ns.ui.create_connect_link(v)` with `v: Vec<String>`) compiles: references are
-  erased in typeck, so the argument unifies with the `&str` / `&[String]` parameter and
-  `moves.rs` counts it as a move, which shows up only at a later use as "use of moved value: `t`
-  ... `.clone()` it". rustc rejects the call itself: "mismatched types: expected `&str`, found
-  `String`", help "consider borrowing here: `&t`". The same holds for user functions
-  (`fn f(s: &str)` called as `f(t)`). The bindings keep the `&` (`bindings::Param::shown`, for
-  the language service) but `Param::ty` drops it. Fits the ref-or-not overlay (Option A under
-  "Borrow checking"): an owned argument where a parameter is declared `&` is the error, at the
-  argument, with the borrow suggestion; a move of it should then not be recorded.
+- [x] **An owned value for a `&` parameter is rustc's E0308** (2026-11-18). `ns.get_weaken_time(t)`
+  with `t: String`, `f(v)` with `fn f(v: &[i32])` and `v: Vec<i32>`, `p.far(q)` with a `&Point`
+  parameter: "mismatched types: expected `&str`, found `String` (consider borrowing here:
+  `&t`)", at the argument. Typeck keeps each parameter's written `&T` (`FnSig::ref_params`,
+  `adt::Method::ref_params`, `bindings::Param::shown`) and reports it where the argument
+  certainly owns its value (`Checker::certainly_owned`): a local declared with an owned type or
+  initialized by a made value (`String::from`, `clone`, `format!`, `vec!`, a literal, a struct
+  literal, a function or method declared to return an owned type), a by-value parameter, or
+  anything from the NS bindings (`ns.get_hostname()`, `ns.args[0].as_string().unwrap()`,
+  `ns.scan(..)[0]`: JS values hold no references). Anything else (`v[i]`, a field, a pattern
+  binding, a `match` result) stays silent, since erasure can't tell `Vec<&str>` from
+  `Vec<String>`. `moves.rs` no longer records an argument to a `&` parameter as a move (your
+  functions' by their declarations, NS methods' by the bindings), so the stale "use of moved
+  value ... `.clone()` it" is gone.
 
 ### Typed unions instead of `JsValue` (plan, 2026-11-18)
 
@@ -346,20 +354,42 @@ type, so hover shows both. Bitburner's `Result<T>` would collide with Rust's `Re
 - `From<ScriptArg> for JsValue` and `JsValue::try_into::<ScriptArg>()` for the escape hatch;
   both are the identity at run time (`try_into` checks the shape).
 
-**Staging.**
-1. Compiler: `pub enum` with `#[untagged]` / `#[tag = ".."]` / `#[js = ".."]` in bindings,
-   `Repr::Js` codegen (construct, `match`, `if let`, `matches!`, `{:?}`), payload-typed
-   arguments for union parameters, generated readers. `ScriptArg` and `FilenameOrPID` by hand
-   in a test bindings file first.
-2. `dts2rs.mjs`: name-preserving alias resolution for unions, primitive-union detection,
-   anonymous-union naming. Regenerate; every primitive union in the survey.
-3. Tagged unions: tag detection (a property every member declares with a distinct literal
-   type), variant naming, `PlayerRequirement` (recursive through `Not` / `Some` / `Every`),
-   `Task`, `SleeveTask`, `NsResult<T>`.
-4. `CodingContractObject`: one variant per contract, `data` typed from
-   `CodingContractSignatures`, and `submit` taking that contract's answer type. Biggest single
-   item; can slip.
-5. The non-union generator gaps above. Independent of 1 to 4 and cheap, so they can go first.
+**Staging** (all done 2026-11-18; `bindings/ns.rs` has 28 `JsValue` sites left, every one an
+`any` in the d.ts).
+1. [x] Compiler: `pub enum` with `#[untagged]` / `#[tag = ".."]` / `#[js = ".."]` in bindings
+   (`bindings.rs`: `ExternType::variants`, `Repr`), the enum as a `Ty::Extern` with variants
+   rather than a new ADT kind: patterns (`extern_enum_pat`), exhaustiveness
+   (`Family::Extern`, "`ScriptArg::Bool(_)` not covered"), constructors and `try_from`
+   (`extern_enum_call`), payload-typed arguments and fields (`check_enum_arg`: the enum, any
+   payload, an integer literal or non-BigInt integer for an `f64` payload, as for NS numbers),
+   `{}` and `to_string()` for untagged enums, `{:?}` for all (`κσ.$dbgJsEnum`; NS structs now
+   print their fields, `κσ.$dbgIface`, instead of `[object Object]`), `.into()` as a `JsValue`,
+   readers as function values (`ScriptArg::as_f64`), hover on the enum and its variants. Codegen
+   emits the payload for a constructor and `typeof v === "string"` / `v?.type === "money"` for a
+   pattern (`lower_adt_pat`). Tested by hand-written bindings first, then the generated ones.
+2. [x] `dts2rs.mjs`: a union alias is an enum under its name (`ScriptArg`, `FilenameOrPID`,
+   `PromptResult`); an anonymous one is `{Owner}{Member}` (`RunThreadOrOptions`,
+   `MaterialDesiredSellPrice`, `ScpFiles`), a type of its own per owner; overloads that
+   disagree on a parameter make one too (`KillFilename`). Members are told apart by JS kind
+   (`Str` / `Num` / `Bool` / `BigInt` / `List`, a struct by its name); a clash stays `JsValue`.
+3. [x] Tagged unions: the field every member declares with a distinct literal (`type`, or
+   `success: true | false`), variants named by the member minus the union's common prefix and
+   suffix (`Money`, `Study`, `Bladeburner`; a prelude name like `Some` keeps the full name),
+   `PlayerRequirement` (recursive), `Task`, `SleeveTask`, and `NsResult { Success(SuccessResult),
+   Failure(FailureResult) }` with `into_result() -> Result<SuccessResult, String>` (not
+   generic: `Result<any>`'s payload is untyped anyway).
+4. [x] `CodingContractObject`: the mapped type expanded per key of `CodingContractSignatures`
+   (`resolveTypeNode` follows `Sig[T][0]`), one struct per contract
+   (`FindLargestPrimeFactorContract { data: f64, .. }` with `submit(answer: f64)` and
+   `num_tries_remaining()`; `SquareRootContract.data: i128`) and the enum by `type`.
+5. [x] The non-union gaps: `Promise<void>` fields are `impl Future<Output = ()>` (awaitable),
+   `() => void` parameters `impl Fn()`, `never` results `!`, `Date` the `js` crate's,
+   `Uint8Array` `Vec<u8>` (`#[array]`), `X["Key"]` and `Exclude<..>` over literals `String`,
+   `Partial<Skills>` a `PartialSkills` with `Option` fields, `bigint` `i128`.
+Corpus: `ns.args` helpers typed `&[JsValue]` / `JsValue::as_string` became `&[ScriptArg]` /
+`ScriptArg::as_string` (4 files), as rustc would require; the 18 reader calls were untouched.
+Test: `test/ns/unions.rs` against the mock (matching, constructing, passing payloads,
+`try_from`, the tagged unions, `NsResult`, two contracts, a prompt).
 
 **Later, needs a decision:** string-literal unions (`CityName`, `CorpEmployeePosition`,
 `GymType`, ..) are `String` today. A Rust enum per union (`CityName::Aevum`, its value the
@@ -449,16 +479,19 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
    - [x] Go to definition (also into `mod x;` files), find references and rename (`nav.rs`), in
      Bitburner's Monaco
    - [x] References and rename across files (Bitburner passes the server's `.rs` scripts)
-   - [ ] **Std methods have no docs on hover.** `v.first()` shows only `first(..) -> Option<i32>`:
-     no doc text, no parameters (`..`), no receiver (`[T]`) and no `&` in the return (rustc's is
-     `Option<&i32>`). `unwrap_or`, `to_uppercase` and the rest are the same, and hovering
-     `String::from` shows nothing. User functions and NS methods do have docs. Wants a table of
-     std signatures and summaries (the first paragraph of each std doc comment, which is enough
-     for a hover) keyed like the typeck's std method table, used by hover, signature help and
-     completions. Bundled crates have the same gap and show their internals: itertools'
-     `sorted()` is `sorted(..) -> std::slice::Iter<'_, i32>`, petgraph's `g.add_node(1)` is
-     `fn add_node(_0: N) -> PgNodeIndex` on `*PgGraph*` (the prelude's names, not `NodeIndex` /
-     `Graph`, and no parameter name)
+   - [x] **Std methods have docs on hover** (2026-11-18). `std_docs.rs` is a table of the
+     supported std methods (by owner: `Vec`, `slice`, `String`, `str`, `Option`, `Result`,
+     `Iterator`, the maps and sets, `VecDeque`, `BinaryHeap`, `Range`, the number kinds,
+     `char`, `bool`, and itertools) with each method's signature over the owner's type
+     parameters and the first sentence of its std doc. Hover fills the receiver's arguments in:
+     `v.first()` on a `Vec<i32>` shows `fn first(&self) -> Option<&i32>` on `[i32]` with the
+     summary; `String::from` / `Vec::with_capacity` / `i32::MAX` path hovers too. Completions
+     carry the signature and summary, and signature help works for std methods (parameters from
+     the signature) and for path calls. A user or prelude method shows its declaration as
+     written (`fn_label`, now with `&self`), with a bundled crate's prelude names mapped back to
+     the crate's (`bundled::user_name`: `PgGraph` → `Graph`, `PgNodeIndex` → `NodeIndex`), and
+     signature help for a method finds it on the receiver's type rather than any `fn` of that
+     name. A unit test checks every name in `service::std_methods` has an entry.
 4. **Later:** wider std, more JS globals (see FEATURES).
    (`macro_rules!` is done.)
    - [x] Optional overflow checks (debug-build semantics), with `test/debug/` against `rustc` without `-O`
@@ -1267,6 +1300,233 @@ Marginal: `static_assertions`, `tap`, `strsim`, a `base64` alias over `js::btoa`
 (criterion, quickcheck, proptest, insta), system and FFI crates, zero-copy and binary serialization,
 thread crates, and networking.
 
+## Bitburner player gaps (2026-11-18)
+
+What a Bitburner player still misses, now that every item in `corpus/bitburner/GAPS.md` is
+fixed. Ranked by how often real scripts hit it times how badly: a silent wrong result or a false
+compile error on an everyday pattern outranks a missing feature with a workaround. Each entry was
+checked against the working tree with a probe program (50 probes over `RUST_GAPS.md`'s open
+items and the idioms of the corpus scripts); the three marked **undocumented** are in neither
+gaps document.
+
+- [x] **1. False "cannot borrow `s` as mutable" on a `&mut T` or `Option<&mut T>` that one of the
+  file's own functions returns** (undocumented). `if let Some(s) = net.find_mut("a") { s.ram -= 4.0 }`,
+  `let g = net.get_mut(0); g.ram -= 1.0;`, the `match` and `let .. else` forms, and a free
+  `fn find<'a>(v: &'a mut Vec<Srv>, ..) -> Option<&'a mut Srv>` all fail; the same through std
+  (`v.get_mut(0)`, `iter_mut().find(..)`, `last_mut()`, `HashMap::get_mut`) passes (C14 covered
+  std only). Every per-server bookkeeping struct has such a helper, and rustc warns on the
+  `mut` the message asks for. Fix: a binding of a call whose declared return type is `&mut T`
+  / `Option<&mut T>` is mutable, as `iter_mut()`'s items are.
+  **Done (2026-11-18):** `FnSig` / `Method` carry `ret_mut_ref` (a return type written `&mut T` /
+  `Option<&mut T>` with `T` not a number, string, bool or `Option`, which stay the slot gap); a
+  `let` of such a call (also through `?`, `.unwrap()`, `.expect()`), and an `if let` / `match` /
+  `let .. else` on one, bind a `&mut` (`fixtures/user_mut_ref_returns.rs`).
+- [ ] **2. Mutating an `Option<number>` field in place is silently a no-op or a crash**
+  (crash undocumented). `if let Some(ref mut n) = self.timer { *n -= 1 }` and
+  `match self.timer { Some(ref mut n) => .. }` change a copy (`RUST_GAPS.md`, "ref mut");
+  `self.timer.as_mut()` (also in `for j in jobs.iter_mut() { if let Some(p) = j.pid.as_mut() .. }`)
+  compiles and throws "Assignment to constant variable". Only `if let Some(n) = &mut self.timer`
+  writes through. Compiles-but-wrong, the class `GAPS.md` ranks first. Fix: lower `ref mut` /
+  `as_mut()` on a field's `Option` to the slot form `&mut self.timer` already uses.
+- [ ] **3. Cross-folder modules.** `mod x;` finds only a sibling `x.rs` or `x/mod.rs`
+  (`typeck_mod.rs` `load_modules`); `#[path = "/lib/util.rs"]` is ignored, and `super::` doesn't
+  work from a module file. A `/lib/` shared by scripts in `/hack/` and `/corp/`, the usual
+  Bitburner layout (`import .. from "/lib/util.js"`), can't be expressed. Fix: honor `#[path]`
+  and absolute `/dir/file.rs` paths through the resolver the host already provides.
+- [ ] **4. `#[serde(tag = "..")]`, `#[serde(content = "..")]` and `#[serde(flatten)]` are silently
+  ignored.** An internally tagged enum is written externally tagged, then fails to read its own
+  output (`unknown variant `type``). Tagged enums are the natural port-message protocol between
+  scripts. `serialize_with` already errors; these should work or error the same way.
+- [ ] **5. Integer-valued NS results are all `f64`**: ports required, pids, thread counts,
+  `hacknet.numNodes()`, levels. So `n == 3`, `pid == 0`, `for i in 0..ns.hacknet.num_nodes()`
+  and `v[n as usize]` each need a cast. rustc-consistent given the bindings, so the fix is in
+  `tools/dts2rs.mjs`: a curated list of names (`num*`, `*Count`, `pid`, `threads`, `port`,
+  `*Level`) typed as integers (same JS number; `|0` wrapping is harmless there).
+- [ ] **6. `std::sync` and tokio's sync primitives as single-threaded shims.** `Mutex`, `RwLock`,
+  the atomics, `thread_local!`, `std::sync::mpsc`, `tokio::sync::mpsc`, `tokio::select!` and
+  `tokio::time::timeout` all error, though `Arc` is already erased. The only way to hold
+  mutable module-level state in valid Rust today is `static mut` plus `unsafe`, and reading a
+  `static mut` inside a macro inside an `unsafe` block is rejected ("requires unsafe block",
+  undocumented). `select!` / `timeout` are how a Rust author writes "wait for a port write or a
+  deadline" (`Promise::race` exists, but isn't what they reach for). `Mutex` = `RefCell` with
+  `lock()` as `Ok(borrow_mut())`; a channel = a `VecDeque` with an awaitable `recv`.
+- [ ] **7. `ns.flags` ergonomics.** The schema needs `JsValue::from(("target", "home"))` per
+  entry and the result is a `JsValue`; `serde_wasm_bindgen::from_value::<Flags>(..)` reads it
+  into a struct fine. clap's `Args::parse()` already reads `ns.args` and matches
+  `run x.rs --target n00dles`, so this is a docs item (point players to clap) plus a
+  `&[(&str, ScriptArg)]`-style schema once typed unions land (see "Typed unions").
+- [ ] **8. A derived `Default` on a generic struct leaves `T` fields `undefined`**
+  (`RUST_GAPS.md`), so a `History<f64, N>` ring buffer computes `NaN`. Rare, silent. Fix: the
+  derived function takes `T`'s class like `T::default()` in associated functions does.
+- [ ] **9. An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
+  are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
+  Compile the tests to a `main` that runs each and prints libtest's summary.
+- [ ] **10. `u64` is BigInt**, documented, but players reach for `u64` for money and thread
+  math: a 2M-iteration loop is 37 ms as `u64`, 3 ms as `usize`, 2 ms as `f64`. A hint on `u64`
+  / `i64` locals that only hold NS numbers would do.
+
+Stale in `RUST_GAPS.md` (works now, each confirmed by a probe): `HashMap::get_mut` on number
+values writes through (`if let Some(v) = m.get_mut("a") { *v += 2.0 }`, `*m.get_mut("a").unwrap() += 1.0`);
+string byte-range slicing (`&s[0..5]`, `&s[6..]`); `BTreeMap::range`; and two renamed `Error`
+types from inline modules (`use a::Error as AError; use b::Error as BError;`).
+
+## Diagnostics for non-Rust players (plan, 2026-11-18)
+
+**Goal.** Every error a Bitburner player is likely to hit carries a short second line that says,
+in JavaScript or Python terms, what the rule is and what to try. The first line stays the
+rustc-style one-liner so a player can paste it into a search engine and find the same answer a
+Rust developer would. The help line is one or two sentences, never a paragraph.
+
+**What exists.** A `Diagnostic` (`codegen.rs`) is `message`, `severity` and positions; there is no
+help or note field. Messages are built at ~314 call sites (`self.error(node, msg)`), 125 of them in
+`typeck.rs` and 41 in `typeck_adt.rs`; borrow errors come from `nll.rs`, move errors from
+`moves.rs`. Hints already ride inside the message in parentheses, chosen per case in
+`typeck.rs` `expect()` (`(write `1.0`, or convert with `as f64`)`, `(NS numbers are `f64`;
+convert with `as`)`, `(did you forget `.await`?)`), in the argument check
+(`(consider borrowing here: `&s`)`), in `moves.rs` (`(moved on line 1:48 by `let`; `.clone()` it
+there to keep a copy)`), and for immutability (`(declare it with `let mut`)`). The host shows a
+diagnostic in three places (`bitoxidizer-src`): Monaco markers in the editor
+(`ScriptEditorRoot.tsx` `updateRustMarkers`), the first error when a script is run
+(`compileRust.ts` `formatRustDiagnostic`, `file:line:col: message (and N more errors)`), and the
+"Compile error in `x.rs`, server: home. ..." thrown from `ScriptTransformer.ts`. The web REPL
+lists them as `line:col severity: message`. The language service (`service.rs`) has hover,
+completions, signature help, definition, references and rename; nothing diagnostic-related
+beyond `compile`. `test/run.mjs`'s `rejected` table matches wanted messages by prefix
+(`m.startsWith(want)`), so appended text never breaks a test, but a separate field does not
+change `message` at all.
+
+**Probe (working tree, `node.cjs`).** Common beginner mistakes and what they get today:
+
+| Mistake | Message today | Verdict |
+|---|---|---|
+| `fn name() { String::from("x") }` (no `-> String`) | `mismatched types: expected `()`, found `String`` on the tail expression | **Misleading.** Nothing says the `()` comes from the missing return type. See item 1. |
+| `fn name() { return String::from("x"); }` | same, on the `return` value | same |
+| `fn name() -> String { String::from("x"); }` (stray `;`) | `mismatched types: expected `String`, found `()`` on the whole body | Needs "remove the `;`" |
+| `let t = s; let u = s;` | `use of moved value: `s` (moved on line 1:48 by `let`; `.clone()` it there to keep a copy)` | Good fix, no rule |
+| `let a = &mut v; let b = &mut v;` | `cannot borrow `v` as mutable more than once at a time` (+ ` (rustc rejects this borrow; here the program still runs)` as a warning when strict borrows is off) | Rule unexplained |
+| `let r = &v[0]; v.push(..); r.len()` | `cannot borrow `v` as mutable because it is also borrowed as immutable` | Rule unexplained |
+| `fn f() -> &String { let s = ..; &s }` | `cannot return reference to local variable `s`` | Rule unexplained |
+| `let v = vec![1]; v.push(2)` | `cannot borrow `v` as mutable, as it is not declared as mutable` | No fix (the `let x = 1; x = 2` case has one) |
+| `let x: f64 = 1` | `.. found `{integer}` (write `1.0`, or convert with `as f64`)` | Good |
+| `x * y` with `f64` and `i32` | `cannot multiply `f64` by `i32`` | Needs "Rust never converts numbers; cast with `as f64`" |
+| `let x: i32 = v.first()` | `mismatched types: expected `i32`, found `Option<{integer}>`` | Needs what `Option` is and `.unwrap()` / `if let` |
+| `v.length()` | `no method named `length` found for `Vec<..>` (the std surface is still small; see docs/FEATURES.md)` | Should name `.len()` for the JS names (`length`, `push_back`, `size`, `indexOf`, ..) |
+| `s.length` | `no field `length` on type `String`` | same |
+| `f(1, 2)` for `fn f(a: i32)` | `this function takes 1 argument but 2 were supplied` | Fine |
+| `if .. { 1 } else { 2 } let y` | `expected SEMICOLON` | Parser's token name; needs "missing `;`" wording |
+
+Not caught at all, so no message to improve (gaps, not this plan): `let r = &v[0]` over a
+`Vec<i32>` then `v.push` (the index copies), `"a" + "b"`, an un-awaited `ns.hack(..)`, and a
+partial move out of a struct (`let a = p.a; let q = p;`).
+
+**Plan.**
+
+1. **The missing return type.** `check_body` (`typeck.rs`) compares the body's type with `ret`,
+   which `unwrap_or(Ty::Unit)` made `()` when `f.ret_type()` is `None`. Keep rustc's primary
+   wording (rustc says exactly `expected `()`, found `String`` here, so a search still works)
+   but when the declared return type is absent and `found` is not `()`, replace the message with
+   `mismatched types: expected `()`, found `String`: `name` has no return type, so it must
+   return nothing (add `-> String` after the parameters, or end the line with `;`)`. The
+   `return e;` form reaches the same `ret_ty` through `Expr::ReturnExpr` and gets the same
+   hint. The stray-`;` form (`-> String` declared, body ends in `;`) is the mirror: when `ret`
+   is not `()` and `found` is `()` and the block has no tail expression, say `the last line
+   ends with `;`, so the function returns nothing; remove the `;` to return its value`. Track
+   "declared return type absent" as a `bool` on the checker next to `ret_ty` so `return`
+   expressions can see it. Both are the first thing to do: they are the most common mistakes
+   a JavaScript author makes (functions return by `return` there, and every statement ends in
+   `;`) and the current message points the wrong way.
+
+2. **A `help` field.** Add `pub help: Option<String>` to `Diagnostic`, `#[serde(skip_serializing_if
+   = "Option::is_none")]`, `help?: string` in `index.d.ts` and the host's `Diagnostic` type.
+   `message` keeps the one-liner (with its existing parenthetical fix, which is a *fix* not an
+   *explanation*); `help` carries the rule. Add `error_help(node, msg, help)` beside `error` in
+   `Codegen`, `Typeck`, `nll.rs` and `moves.rs`; the plain `error` stays, so this is
+   incremental. Hosts that ignore the field lose nothing.
+
+3. **A help catalog, not ad-hoc strings.** `compiler/src/diag_help.rs`: `pub const` strings, one
+   per concept a JavaScript or Python author is missing, each "the rule" + "what to try", two
+   sentences at most. Grouped:
+   - *Moves* (`use of moved value`, `use of partially moved value`): "Passing or assigning a
+     `String`, `Vec` or struct hands it over; the old name can't be used again. Pass `&s` to
+     lend it, or `s.clone()` to copy it."
+   - *Borrows* (the five `cannot borrow ..`, `cannot assign .. because it is borrowed`,
+     `cannot move out of .. because it is borrowed`, `cannot use .. because it was mutably
+     borrowed`, `does not live long enough`): "`&v` lends read access and `&mut v` write
+     access; while a `&mut` is alive nothing else may touch `v`, and while any `&` is alive
+     nothing may change it. Finish using the reference before the next change, or copy the
+     value out first." With strict borrows off, append "This runs anyway here (rustc would
+     refuse); turn on 'Rust: borrow conflicts are errors' to match rustc." instead of the
+     current parenthetical.
+   - *Returned references* (`cannot return reference to local variable`, `cannot return value
+     referencing local variable`): "A reference points at a variable that is deleted when the
+     function ends. Return the value itself (`String`, not `&String`), or `.clone()` it."
+   - *Mutability* (`cannot assign twice`, `cannot borrow .. as mutable, as it is not declared
+     as mutable`): "Variables are read-only unless declared `let mut`." Add the `(declare it
+     with `let mut v`)` fix to the borrow form, which lacks it.
+   - *References vs values* (`expected `&str`, found `String``, `expected `&P`, found `P`):
+     "`&` in a parameter type means the function borrows the value instead of taking it; add
+     `&` in front of the argument."
+   - *Numbers* (`expected `f64`, found `{integer}``, `cannot multiply `f64` by `i32``,
+     `cannot add ..` across kinds): "Rust never converts between number types for you; all NS
+     numbers are `f64`. Write `1.0`, or cast with `as f64` / `as usize`."
+   - *`Option` / `Result`* (`expected `i32`, found `Option<..>``, `.. found `Result<..>``):
+     "`Option<T>` is a value that may be missing (`null` in JavaScript); `Result<T, E>` is a
+     value or an error. Get the inside with `.unwrap()` (panics if missing), `if let Some(x) =
+     ..`, or `?` inside a function returning the same wrapper."
+   - *Futures* (`did you forget `.await`?`): already adequate; move the text into the catalog.
+   - *JS names on std types* (`no method named .. found for ..`, `no field ..`): a small table
+     of JavaScript / Python names to the Rust name (`length` → `.len()`, `push_back`/`append`
+     → `.push()`, `indexOf` → `.iter().position(..)`, `includes`/`contains` on `Vec` →
+     `.contains(&x)`, `substring`/`slice` → `&s[a..b]`, `toUpperCase` → `.to_uppercase()`,
+     `trim`, `split`, `join` as `.join(..)` on a `Vec<String>`, `Math.floor` → `.floor()`,
+     `parseInt` → `.parse::<i32>()`, `keys`/`values`/`entries` on a `HashMap`). The message
+     names the Rust method when the table hits; the FEATURES pointer stays for the rest.
+   - *Parser* (`expected SEMICOLON` and the other token names ra_ap_syntax produces): map the
+     common tokens to words: `expected `;``, `expected `}``, `expected an expression`.
+   - *Unsupported* (`is not supported yet`, `isn't supported here`): "CarciniScript compiles a
+     subset of Rust; see docs/FEATURES.md for what's in." Already partly there.
+
+4. **Wire the catalog in priority order.** (a) Item 1 and the stray-`;` mirror. (b) Borrow and
+   move errors (`nll.rs`, `moves.rs`): they have no JavaScript analogue, so they are the
+   messages a non-Rust player can't guess at. (c) The `mismatched types` family: `expect()` in
+   `typeck.rs` already picks a parenthetical by `(expected, found)` shape and is the one place
+   to also pick the help entry; the argument check with `consider borrowing` is the other.
+   (d) Mutability, numbers, `Option`. (e) `no method` / `no field` with the JS-name table.
+   (f) Parser token names. The long tail of resolution and trait errors stays without help.
+
+5. **Show it in the host.** `updateRustMarkers`: `message: d.help ? `${d.message}\n\n${d.help}` :
+   d.message` so the hover shows the rule under the error. `formatRustDiagnostic`: the help on a
+   second indented line, so the run-failure popup and the terminal carry it. The REPL's
+   `#diagnostics` list: same. The `(and N more errors)` summary is unchanged.
+
+6. **Tests.** `test/run.mjs`: the `rejected` table gets an optional fourth column, the expected
+   help prefix, checked with `startsWith` against `d.help` on the entries whose help is wired
+   (and `d.help === undefined` on a few that must stay bare). One `ns/` fixture per concept group
+   checks the full player-facing string end to end. Item 1 gets three entries: no return type
+   with a tail, no return type with `return e;`, and the stray `;`. The 876-file corpus sweep
+   (`Performance scan`) already prints every file's first diagnostic; re-run it after step 4 to
+   catch a help line attached to the wrong shape.
+
+7. **Keep the rustc contract.** `message` must still start with rustc's words for the same
+   program (the differential tests and a player's web search depend on it). Help text never
+   goes into `message`; the parentheticals already there are fixes, kept short, and the new
+   ones (item 1, `let mut v`) follow that rule. No message longer than one line.
+
+**Status (2026-11-18): done.** Steps 1 to 7 as planned, with one change: the help lines are
+chosen in two ways. The sites whose shape matters pick them (`error_help` in `typeck.rs`: the
+missing return type and the stray `;` in `check_body` and `return e;`, `expect()` by (expected,
+found) kind for numbers, `Option` / `Result` and futures, `check_ref_arg`, `arith_operands`, the
+`no method` / `no field` sites with the JavaScript-name table), and `diag_help::for_message`
+attaches the fixed-rule groups (moves, borrows, returned references, mutability, unsupported,
+parser tokens) by message prefix where every diagnostic is built (`codegen.rs` `diag_range_help`),
+so `moves.rs` and `nll.rs` are untouched. The lax-borrow parenthetical moved out of the message
+into the help (the message is rustc's; the severity says it's a warning). Parser messages write
+ra_ap_syntax's token names as tokens (`expected `;``). The host's `(and N more errors)` summary is
+unchanged, as planned; the "ns/ fixture per group" became
+entries in `test/run.mjs`'s `rejected` / `rejectedNs` tables (a fourth column is the help prefix, or
+`null` for a message that must stay bare). The host (`bitoxidizer-src`) shows the help under the
+marker, in the run-failure popup and in the terminal.
+
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 
 Bitburner scripts draw tail windows and terminal widgets with React: `ns.printRaw(<Dash />)` from a
@@ -1621,6 +1881,6 @@ map/filter/sum chains are about 1.3x a hand loop.
 - **Silent divergence:** `Copy` structs, `&mut` primitives, UTF-8 vs UTF-16, `i64` precision.
   Every one goes in `RUST_GAPS.md`.
 - **The borrow checker sees through erased types only as far as its overlay reaches:** what it
-  can't follow is silent, so some programs rustc rejects still run (and what it reports is a
-  warning unless strict borrows are on). Documented in RUST_GAPS "Checking".
+  can't follow is silent, so some programs rustc rejects still run (what it does see is an
+  error, as in rustc). Documented in RUST_GAPS "Checking".
 - **ra_ap_syntax churn:** pinned version; upgrades are deliberate.

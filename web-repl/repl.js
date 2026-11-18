@@ -273,7 +273,7 @@ function recompile() {
       startColumn: d.column,
       endLineNumber: d.endLine,
       endColumn: Math.max(d.endColumn, d.column + 1),
-      message: d.message,
+      message: d.help ? `${d.message}\n\n${d.help}` : d.message,
       severity: d.severity === "error" ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
     })),
   );
@@ -283,6 +283,12 @@ function recompile() {
       const li = document.createElement("li");
       li.className = d.severity;
       li.textContent = `${d.line}:${d.column} ${d.severity}: ${d.message}`;
+      if (d.help) {
+        const help = document.createElement("div");
+        help.className = "help";
+        help.textContent = d.help;
+        li.append(help);
+      }
       li.onclick = () => {
         rustEditor.setPosition({ lineNumber: d.line, column: d.column });
         rustEditor.revealLineInCenter(d.line);

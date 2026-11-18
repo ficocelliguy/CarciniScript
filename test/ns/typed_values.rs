@@ -12,7 +12,7 @@ enum Answer {
     Pairs(Vec<[i64; 2]>),
 }
 
-fn arg_text(v: &JsValue) -> String {
+fn arg_text(v: &ScriptArg) -> String {
     v.as_string()
         .or_else(|| v.as_f64().map(|n| n.to_string()))
         .or_else(|| v.as_bool().map(|b| b.to_string()))
@@ -28,7 +28,7 @@ struct Plan {
 pub async fn main(ns: NS) {
     // A2: arguments.
     let target = ns.args.first().and_then(|a| a.as_string()).unwrap_or_default();
-    let threads = ns.args.get(1).and_then(JsValue::as_f64).unwrap_or(1.0);
+    let threads = ns.args.get(1).and_then(ScriptArg::as_f64).unwrap_or(1.0);
     let words: Vec<String> = ns.args.iter().map(arg_text).collect();
     ns.tprint(&format!("{target} {threads} {words:?} {}", ns.args[2].is_string()));
 

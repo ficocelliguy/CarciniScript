@@ -173,10 +173,10 @@ impl Default for Options {
     }
 }
 
-impl TryFrom<&[JsValue]> for Options {
+impl TryFrom<&[ScriptArg]> for Options {
     type Error = BatchError;
 
-    fn try_from(raw: &[JsValue]) -> Result<Self> {
+    fn try_from(raw: &[ScriptArg]) -> Result<Self> {
         let mut opts = Options::default();
         let mut args = raw
             .iter()

@@ -1588,6 +1588,48 @@ impl Codegen<'_> {
     }
 
     /// `Point(1, 2)`, `Shape::Circle(r)`, `Point::new(..)`, `Point::norm(&p)`.
+    /// `ScriptArg::Str("x")`: the payload itself (the enum's value is the JS value).
+    /// `ScriptArg::try_from(v)`: `Ok(v)` when the value fits a variant, else `Err(v)`.
+    pub(super) fn emit_extern_enum_call(
+        &mut self,
+        c: &ast::CallExpr,
+        segs: &[String],
+    ) -> Option<(Frag, Ty)> {
+        let [e, v] = segs else { return None };
+        if self.types.adts.defs.contains_key(e) {
+            return None;
+        }
+        let b = bindings::current();
+        let et = b.enum_of(e)?;
+        let start = self.off(c.syntax());
+        if v == "try_from" {
+            let a = c.arg_list()?.args().next()?;
+            let (f, _) = self.emit_expr(&a, None);
+            let variants = et.variants_js(|_| "null".to_string());
+            let out = f.wrap(
+                "κσ.$jsEnumTry(",
+                &format!(", {variants}, {})", et.tag_js()),
+            );
+            return Some((
+                out.at(start),
+                Ty::Result(
+                    Box::new(Ty::Extern(e.clone())),
+                    Box::new(Ty::Extern("JsValue".into())),
+                ),
+            ));
+        }
+        // (An unknown variant: the type checker has reported it.)
+        let Some((_, variant)) = et.variant(v) else {
+            return Some((Frag::text("undefined"), Ty::Unknown));
+        };
+        let tys = vec![variant.payload.clone()];
+        let mut args = self.emit_args(c.arg_list(), &tys);
+        if args.is_empty() {
+            return Some((Frag::text("undefined"), Ty::Unknown));
+        }
+        Some((args.remove(0).at(start), Ty::Extern(e.clone())))
+    }
+
     pub(super) fn emit_adt_call(
         &mut self,
         c: &ast::CallExpr,
@@ -1860,6 +1902,23 @@ impl Codegen<'_> {
             },
             _ => return false,
         };
+        // A bindings enum's variant (`ScriptArg::Str(s)`): the value is the payload itself, told
+        // apart by its JS type or its tag field.
+        if let [e, v] = segs.as_slice()
+            && !self.types.adts.defs.contains_key(e)
+            && let Some(et) = bindings::current().enum_of(e)
+            && let Some((_, variant)) = et.variant(v)
+            && let Some(repr) = &et.repr
+        {
+            out.conds.push(Frag::text(variant.js_test(repr, subject)));
+            if let ast::Pat::TupleStructPat(tp) = p
+                && let Some(f) = tp.fields().next()
+                && !matches!(f, ast::Pat::RestPat(_))
+            {
+                self.lower_pat(&f, subject, out);
+            }
+            return true;
+        }
         let Some(Resolved::Ctor(adt, v)) = self.resolve(&segs) else {
             return false;
         };

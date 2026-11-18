@@ -53,7 +53,7 @@ fn arg_ref_hint(node: &SyntaxNode) -> Option<ArgRef> {
 /// `ArgRef` of a value by how it's written: `"x"` / `s.as_str()` / `&v[..]` are slices, `&x` a
 /// reference, `s.to_string()` / `format!(..)` / `vec![..]` values. `None` when it doesn't say
 /// (a variable).
-fn expr_ref_hint(e: &ast::Expr) -> Option<ArgRef> {
+pub(super) fn expr_ref_hint(e: &ast::Expr) -> Option<ArgRef> {
     match crate::typeck::strip_parens(e) {
         ast::Expr::Literal(l) => match l.kind() {
             ast::LiteralKind::String(_) | ast::LiteralKind::ByteString(_) => Some(ArgRef::Slice),
@@ -765,6 +765,12 @@ impl Checker<'_> {
                 // `{}` is the text and its `{:?}` the quoted text, like std's string error's).
                 (Ty::Str, Ty::Dyn(tr))
                     if tr == "Error" && !self.adts.traits.contains_key("Error") =>
+                {
+                    Some(Conv::Identity)
+                }
+                // `arg.into()` of a bindings enum (`ScriptArg`) as a `JsValue`: the value itself.
+                (Ty::Extern(src), Ty::Extern(n))
+                    if n == "JsValue" && self.bindings.is_enum(src) =>
                 {
                     Some(Conv::Identity)
                 }

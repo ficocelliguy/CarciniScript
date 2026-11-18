@@ -4,6 +4,7 @@
 #![allow(clippy::cloned_ref_to_slice_refs)]
 
 mod adt;
+mod diag_help;
 mod alias;
 mod assocbounds;
 mod bindings;
@@ -32,6 +33,7 @@ mod nested;
 mod procmacro;
 pub mod service;
 mod sourcemap;
+mod std_docs;
 mod stdgaps;
 mod stdtime;
 mod ty;
@@ -73,8 +75,9 @@ pub fn set_overflow_checks(on: bool) {
     codegen::set_overflow_checks(on);
 }
 
-/// Borrow conflicts rustc rejects (a `push` while a reference into the Vec is still used, ..) as
-/// errors for the compiles that follow; they're warnings by default.
+/// Borrow conflicts rustc rejects (a `push` while a reference into the Vec is still used, ..) are
+/// errors by default, as in rustc; `false` makes them warnings for the compiles that follow (the
+/// program still runs).
 #[wasm_bindgen(js_name = setStrictBorrows)]
 pub fn set_strict_borrows(on: bool) {
     nll::set_strict(on);

@@ -124,6 +124,13 @@ pub struct Method {
     pub type_params: Vec<String>,
     /// None for associated functions (`Point::new`).
     pub receiver: Option<Receiver>,
+    /// For each parameter declared as a reference (`&str`, `&[T]`), the type as written
+    /// (`params` erases the `&`): an owned argument there is rustc's E0308.
+    pub ref_params: Vec<Option<String>>,
+    /// Whether the return type is written as an owned value (see `FnSig::ret_owned`).
+    pub ret_owned: bool,
+    /// Whether it is written `&mut T` / `Option<&mut T>` (see `FnSig::ret_mut_ref`).
+    pub ret_mut_ref: bool,
 }
 
 impl Method {

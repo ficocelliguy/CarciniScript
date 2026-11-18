@@ -24,17 +24,21 @@ pub fn swb_error() -> Ty {
 impl Checker<'_> {
     /// `JsValue::as_string` as a value, `JsValue::NULL`; None for other paths.
     pub(super) fn jsvalue_path(&mut self, segs: &[&str]) -> Option<Ty> {
-        let [.., "JsValue", item] = segs else {
+        // (Also a bindings enum's readers, `ScriptArg::as_string`, which are `JsValue`'s.)
+        let [.., owner, item] = segs else {
             return None;
         };
-        if matches!(*item, "NULL" | "UNDEFINED") {
+        if *owner != "JsValue" && !self.bindings.is_enum(owner) {
+            return None;
+        }
+        if *owner == "JsValue" && matches!(*item, "NULL" | "UNDEFINED") {
             return Some(js_value());
         }
         let b = self.bindings.clone();
-        let sig = b.types.get("JsValue")?.methods.get(*item)?;
+        let sig = b.types.get(*owner)?.methods.get(*item)?;
         let mut params: Vec<Ty> = Vec::new();
         if !sig.is_static {
-            params.push(js_value());
+            params.push(Ty::Extern(owner.to_string()));
         }
         params.extend(sig.params.iter().map(|p| p.ty.clone()));
         Some(Ty::Closure {

@@ -52,6 +52,10 @@ use crate::typeck::{self, Types, is_none_binding, path_is};
 pub struct Diagnostic {
     pub message: String,
     pub severity: &'static str,
+    /// The rule behind the message in JavaScript or Python terms, and what to try, for a player
+    /// who doesn't know Rust (`diag_help.rs`). Not every message has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
     /// Byte offsets into the source.
     pub start: usize,
     pub end: usize,
@@ -717,6 +721,7 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
                         Diagnostic {
                             message,
                             severity: "error",
+                            help: None,
                             start,
                             end,
                             line: l0 + 1,
@@ -811,7 +816,7 @@ fn compile_text(
         cg.diag_range(
             usize::from(r.start()),
             usize::from(r.end()),
-            e.to_string(),
+            crate::diag_help::parser_message(&e.to_string()),
             "error",
         );
     }
@@ -839,7 +844,7 @@ fn compile_text(
                 .iter()
                 .any(|e| e.start == d.start && e.end == d.end && e.message == d.message)
             {
-                cg.diag_range(d.start, d.end, d.message, d.severity);
+                cg.diag_range_help(d.start, d.end, d.message, d.severity, d.help);
             }
         }
         cg.diags.sort_by_key(|d| (d.start, d.end));
@@ -959,11 +964,25 @@ impl<'a> Codegen<'a> {
     }
 
     fn diag_range(&mut self, start: usize, end: usize, message: String, severity: &'static str) {
+        self.diag_range_help(start, end, message, severity, None);
+    }
+
+    /// A diagnostic with its help line; without one, the message's shape picks it (`diag_help`).
+    fn diag_range_help(
+        &mut self,
+        start: usize,
+        end: usize,
+        message: String,
+        severity: &'static str,
+        help: Option<String>,
+    ) {
         let (l0, c0) = self.idx.line_col(start);
         let (l1, c1) = self.idx.line_col(end);
+        let help = help.or_else(|| crate::diag_help::for_message(&message, severity));
         self.diags.push(Diagnostic {
             message,
             severity,
+            help,
             start,
             end,
             line: l0 + 1,
@@ -5502,6 +5521,9 @@ impl<'a> Codegen<'a> {
                 Ty::Adt("TokenStream".into(), vec![]),
             );
         }
+        if let Some(r) = self.emit_extern_enum_call(c, &segs) {
+            return r;
+        }
         if let Some(r) = self.emit_adt_call(c, &segs) {
             return r;
         }
@@ -6246,8 +6268,9 @@ impl<'a> Codegen<'a> {
             if sig.is_none() && matches!(method.as_str(), "clone" | "to_owned") {
                 return (rf.wrap("κσ.$clone(", ")"), rt.clone());
             }
-            // `v.as_string()`: the runtime's `κσ.$jsv.asString(v)` (any JS value has them).
-            if type_name == "JsValue"
+            // `v.as_string()`: the runtime's `κσ.$jsv.asString(v)` (any JS value has them). A
+            // bindings enum's readers (`arg.as_f64()`, `res.into_result()`) are the same helpers.
+            if (type_name == "JsValue" || b.is_enum(type_name))
                 && let Some(s) = sig
             {
                 let args = self.emit_args(m.arg_list(), &[]);
@@ -8644,6 +8667,8 @@ fn tuple_formatters_in(es: &[Ty], params: &HashMap<String, String>) -> String {
 thread_local! {
     /// The type parameters whose `{:?}` formatter the function being emitted takes (`$dbg$T`).
     static DBG_SCOPE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The NS types whose `{:?}` formatter is being written (a recursive one names itself).
+    static DBG_EXTERN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -8766,6 +8791,61 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
         // (`()` is `undefined`, which `$dbg` prints as `()`: `Ok(())`.)
         // (`()` prints as such whatever stands for it: `Some(())` is a marker.)
         Ty::Unit => Some("(() => \"()\")".into()),
+        // A bindings enum: `Str("n00dles")` / `Money(MoneyRequirement { .. })` by the variant the
+        // value fits, its payload printed by the payload's own formatter. A named function, so
+        // a recursive type (`NotRequirement.condition: PlayerRequirement`) refers back to it.
+        Ty::Extern(n) if bindings::current().is_enum(n) => {
+            let fn_name = format!("$dbg${}", n.replace("::", "$"));
+            if DBG_EXTERN.with(|s| s.borrow().contains(n)) {
+                return Some(fn_name);
+            }
+            DBG_EXTERN.with(|s| s.borrow_mut().push(n.clone()));
+            let b = bindings::current();
+            let et = b.enum_of(n)?;
+            let variants =
+                et.variants_js(|t| debug_fn(t).unwrap_or_else(|| "κσ.$dbg".into()));
+            DBG_EXTERN.with(|s| s.borrow_mut().pop());
+            Some(format!(
+                "(function {fn_name}(v) {{ return κσ.$dbgJsEnum(v, {variants}, {}); }})",
+                et.tag_js()
+            ))
+        }
+        // An NS interface (`Server`, `MoneyRequirement`): its declared fields, as a derived
+        // `Debug` would print a struct (`Server { hostname: "home", .. }`), the JS value's own
+        // text otherwise.
+        Ty::Extern(n)
+            if bindings::current()
+                .types
+                .get(n)
+                .is_some_and(|t| t.is_struct && !t.fields.is_empty()) =>
+        {
+            let fn_name = format!("$dbg${}", n.replace("::", "$"));
+            if DBG_EXTERN.with(|s| s.borrow().contains(n)) {
+                return Some(fn_name);
+            }
+            DBG_EXTERN.with(|s| s.borrow_mut().push(n.clone()));
+            let b = bindings::current();
+            let et = b.types.get(n)?;
+            let mut fields: Vec<(&String, &bindings::Field)> = et.fields.iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(b.0));
+            let items: Vec<String> = fields
+                .iter()
+                .map(|(name, f)| {
+                    format!(
+                        "[{}, {}, {}]",
+                        js_string(&f.js),
+                        js_string(name),
+                        debug_fn(&f.ty).unwrap_or_else(|| "κσ.$dbg".into())
+                    )
+                })
+                .collect();
+            DBG_EXTERN.with(|s| s.borrow_mut().pop());
+            Some(format!(
+                "(function {fn_name}(o) {{ return κσ.$dbgIface({}, o, [{}]); }})",
+                js_string(n),
+                items.join(", ")
+            ))
+        }
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),
         // (A `Box<dyn Error>` may hold a string, whose `{:?}` is quoted.)
         Ty::Dyn(_) => Some("κσ.$dbgAny".into()),

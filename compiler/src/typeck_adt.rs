@@ -369,6 +369,9 @@ impl Checker<'_> {
                     into_params: vec![],
                     impl_args: args,
                     type_params: vec![],
+                    ref_params: vec![],
+                    ret_owned: true,
+                    ret_mut_ref: false,
                 });
         }
     }
@@ -463,6 +466,9 @@ impl Checker<'_> {
             into_params: m.into_params.clone(),
             impl_args: m.impl_args.iter().map(|t| subst(t, &map)).collect(),
             type_params: m.type_params.clone(),
+            ref_params: m.ref_params.clone(),
+            ret_owned: m.ret_owned,
+            ret_mut_ref: m.ret_mut_ref,
         }
     }
 
@@ -1437,6 +1443,19 @@ impl Checker<'_> {
             .and_then(|r| r.ty())
             .map(|t| self.lower_type(&t))
             .unwrap_or(Ty::Unit);
+        let ref_params = f
+            .param_list()
+            .map(|pl| pl.params().map(|p| p.ty().as_ref().and_then(super::written_ref)).collect())
+            .unwrap_or_default();
+        let ret_owned = f
+            .ret_type()
+            .and_then(|r| r.ty())
+            .is_some_and(|t| super::written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown));
+        let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::written_mut_ref(&t))
+            && !self.cellable(match &ret {
+                Ty::Option(t) => t,
+                t => t,
+            });
         let method = Method {
             params,
             ret,
@@ -1446,6 +1465,9 @@ impl Checker<'_> {
             into_params: super::into_param_flags(f),
             impl_args: vec![],
             type_params: own.clone(),
+            ref_params,
+            ret_owned,
+            ret_mut_ref,
         };
         for p in &own {
             self.generics.remove(p);
@@ -1551,6 +1573,8 @@ impl Checker<'_> {
                             mutable: sp.amp_token().is_none() && sp.mut_token().is_some(),
                             deferred: false,
                             reference: sp.amp_token().map(|_| sp.mut_token().is_some()),
+                            owned: false,
+                            js: false,
                             decl: None,
                         };
                         Some((n, local))
@@ -1930,9 +1954,20 @@ impl Checker<'_> {
                 }
                 let mut params = method.params.clone();
                 let mut into_params = method.into_params.clone();
+                let mut ref_params = method.ref_params.clone();
+                let mut cell_params = method.cell_params.clone();
                 if method.receiver.is_some() {
                     params.insert(0, Ty::Adt(adt.clone(), method.impl_args.clone()));
                     into_params.insert(0, false);
+                    ref_params.insert(
+                        0,
+                        match method.receiver {
+                            Some(Receiver::Ref) => Some(format!("&{adt}")),
+                            Some(Receiver::MutRef) => Some(format!("&mut {adt}")),
+                            _ => None,
+                        },
+                    );
+                    cell_params.insert(0, false);
                     if method.receiver == Some(Receiver::MutRef)
                         && let Some(first) = args.first()
                     {
@@ -1944,7 +1979,14 @@ impl Checker<'_> {
                     if into_params.get(i) == Some(&true) {
                         self.check_into_arg(a, p);
                     } else {
+                        let before = self.diags.len();
                         self.check(a, p);
+                        if self.diags.len() == before
+                            && cell_params.get(i) != Some(&true)
+                            && let Some(Some(shown)) = ref_params.get(i)
+                        {
+                            self.check_ref_arg(a, shown);
+                        }
                     }
                 }
                 Some(if method.is_async {
@@ -2141,7 +2183,15 @@ impl Checker<'_> {
                 if sig.into_params.get(i) == Some(&true) {
                     self.check_into_arg(a, p);
                 } else {
+                    let before = self.diags.len();
                     self.check(a, p);
+                    // `p.dist(q)` with `q: Point` where the parameter is `&Point`: E0308.
+                    if self.diags.len() == before
+                        && sig.cell_params.get(i) != Some(&true)
+                        && let Some(Some(shown)) = sig.ref_params.get(i)
+                    {
+                        self.check_ref_arg(a, shown);
+                    }
                 }
             }
             for a in args.iter().skip(sig.params.len()) {
@@ -2764,4 +2814,13 @@ fn unknown_impl_trait(t: &str) -> String {
     format!(
         "`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file or a loaded `mod` file work)"
     )
+}
+
+/// `a`, `a or b`, `a, b or c`.
+pub(super) fn join_or(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} or {last}", init.join(", ")),
+    }
 }

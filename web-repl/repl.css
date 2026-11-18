@@ -233,3 +233,10 @@ main {
     border-bottom: 1px solid var(--border);
   }
 }
+
+#diagnostics .help {
+  color: #8a8f98;
+  font-size: 0.9em;
+  margin: 2px 0 4px 1.5em;
+  white-space: normal;
+}

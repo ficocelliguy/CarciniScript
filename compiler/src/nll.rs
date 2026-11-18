@@ -13,7 +13,8 @@
 //!    argument); a universal region made to outlive one it isn't declared to is "lifetime may
 //!    not live long enough".
 //!
-//! Lifetimes are erased in the emitted JS, so these are warnings unless strict borrows are on.
+//! These are errors, as in rustc. Lifetimes are erased in the emitted JS, so with strict borrows
+//! off (`set_strict(false)`) they're warnings and the program still runs.
 
 use std::collections::HashMap;
 
@@ -26,10 +27,10 @@ use crate::nll_rty::Env;
 use crate::ty::Ty;
 use crate::typeck::RawDiag;
 
-static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Report borrow conflicts as errors (the program doesn't compile, as with rustc) instead of
-/// warnings.
+/// Report borrow conflicts as errors (the program doesn't compile, as with rustc; the default)
+/// or, with `false`, as warnings.
 pub fn set_strict(on: bool) {
     STRICT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -76,12 +77,10 @@ pub fn check(
             out.push(RawDiag {
                 start: span.0,
                 end: span.1,
-                message: if strict {
-                    msg
-                } else {
-                    format!("{msg} (rustc rejects this borrow; here the program still runs)")
-                },
+                message: msg,
                 severity: if strict { "error" } else { "warning" },
+                // (The help says it runs anyway when borrow conflicts are warnings.)
+                help: None,
             });
         }
     }

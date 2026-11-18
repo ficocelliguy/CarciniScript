@@ -1,0 +1,20 @@
+n00dles 4 ["text n00dles", "number 4", "text --fast"]
+[Str("n00dles"), Num(4.0), Str("--fast")] n00dles 4
+1 flag(s)
+run hack.rs 4
+run hack.rs {"threads":2}
+exec hack.rs home 1 ["a",1]
+kill 7 home []
+kill "hack.rs" home ["n00dles"]
+Ok(Bool(false)) true
+$1000000
+hacking Some(50.0)
+not (employed by FulcrumTech)
+studying Computer Science at Rothman University
+sleeve 0 commits Shoplift (1/5)
+None
+not bought: You cannot afford a sleeve
+Ok(true)
+Find Largest Prime Factor: 91 -> $1000
+4 tries left; got [[1,3],[2,6]]
+typed typed

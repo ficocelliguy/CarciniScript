@@ -64,6 +64,70 @@ pub struct Field {
     pub array: bool,
 }
 
+/// How a bindings enum's variants are told apart at run time. The value is the JS value itself
+/// (a `ScriptArg::Num(5.0)` is `5`, a `PlayerRequirement::Money(m)` is the game's object), so
+/// nothing is converted when it crosses into or out of the game.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Repr {
+    /// `#[untagged]`: a primitive union (`string | number | boolean`), by the value's JS type.
+    Untagged,
+    /// `#[tag = "type"]`: an object union, by a field's literal value (`v.type === "money"`).
+    Tagged(String),
+}
+
+/// The tag value a tagged enum's variant carries (`#[js = "money"]`, `#[js = true]`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum JsTag {
+    Str(String),
+    Bool(bool),
+}
+
+/// A variant of a bindings enum: `Str(String)`, `#[js = "money"] Money(MoneyRequirement)`.
+#[derive(Clone, Debug)]
+pub struct ExternVariant {
+    pub name: String,
+    /// Every variant has one payload: the value itself, seen as this type.
+    pub payload: Ty,
+    /// The payload as declared, for messages (`String`, `RunOptions`).
+    pub shown: String,
+    pub tag: Option<JsTag>,
+    pub doc: String,
+}
+
+impl ExternVariant {
+    /// What JS calls values of an untagged variant's payload: the `typeof` result, or `array`
+    /// for an array.
+    pub fn js_kind(&self) -> &'static str {
+        match &self.payload {
+            Ty::Str | Ty::Char => "string",
+            Ty::Int(k) if k.is_big() => "bigint",
+            Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => "number",
+            Ty::Bool => "boolean",
+            Ty::Vec(_) | Ty::Tuple(_) | Ty::Coll(..) => "array",
+            Ty::Closure { .. } | Ty::Fn => "function",
+            _ => "object",
+        }
+    }
+
+    /// The JS test that `subject` is this variant, given the enum's representation.
+    pub fn js_test(&self, repr: &Repr, subject: &str) -> String {
+        match (repr, &self.tag) {
+            (Repr::Tagged(key), Some(JsTag::Str(v))) => {
+                format!("{subject}?.{key} === {}", serde_json::to_string(v).unwrap_or_default())
+            }
+            (Repr::Tagged(key), Some(JsTag::Bool(v))) => format!("{subject}?.{key} === {v}"),
+            (Repr::Tagged(key), None) => format!("{subject}?.{key} === undefined"),
+            (Repr::Untagged, _) => match self.js_kind() {
+                "array" => format!("Array.isArray({subject})"),
+                "object" => format!(
+                    "(typeof {subject} === \"object\" && {subject} !== null && !Array.isArray({subject}))"
+                ),
+                kind => format!("typeof {subject} === \"{kind}\""),
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ExternType {
     pub fields: HashMap<String, Field>,
@@ -74,6 +138,47 @@ pub struct ExternType {
     /// Whether it's declared as a struct (an interface a script can name and build), not only
     /// through an `impl`.
     pub is_struct: bool,
+    /// Whether it's declared as an enum (a TS union), with `repr` and `variants`.
+    pub is_enum: bool,
+    pub repr: Option<Repr>,
+    pub variants: Vec<ExternVariant>,
+    pub doc: String,
+}
+
+impl ExternType {
+    pub fn variant(&self, name: &str) -> Option<(usize, &ExternVariant)> {
+        self.variants.iter().enumerate().find(|(_, v)| v.name == name)
+    }
+
+    /// The variants' tests and names as a JS array literal, for the runtime's
+    /// `$dbgJsEnum` / `$jsEnumTry`: `[["string", "Str"], ..]` for an untagged enum,
+    /// `[["money", "Money"], ..]` for a tagged one (whose tag key is passed separately).
+    pub fn variants_js(&self, with_fmt: impl Fn(&Ty) -> String) -> String {
+        let items: Vec<String> = self
+            .variants
+            .iter()
+            .map(|v| {
+                let test = match (&self.repr, &v.tag) {
+                    (Some(Repr::Tagged(_)), Some(JsTag::Str(s))) => {
+                        serde_json::to_string(s).unwrap_or_default()
+                    }
+                    (Some(Repr::Tagged(_)), Some(JsTag::Bool(b))) => b.to_string(),
+                    (Some(Repr::Tagged(_)), None) => "undefined".to_string(),
+                    _ => format!("\"{}\"", v.js_kind()),
+                };
+                format!("[{test}, \"{}\", {}]", v.name, with_fmt(&v.payload))
+            })
+            .collect();
+        format!("[{}]", items.join(", "))
+    }
+
+    /// The tag key as a JS argument (`"type"`), or `undefined` for an untagged enum.
+    pub fn tag_js(&self) -> String {
+        match &self.repr {
+            Some(Repr::Tagged(k)) => serde_json::to_string(k).unwrap_or_default(),
+            _ => "undefined".to_string(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -108,6 +213,16 @@ impl Bindings {
     /// (`RunOptions`, `Server`): a struct the bindings declare.
     pub fn is_interface(&self, name: &str) -> bool {
         self.types.get(name).is_some_and(|t| t.is_struct)
+    }
+
+    /// Whether `name` is an enum of the bindings (a TS union: `ScriptArg`, `PlayerRequirement`).
+    pub fn is_enum(&self, name: &str) -> bool {
+        self.types.get(name).is_some_and(|t| t.is_enum)
+    }
+
+    /// The bindings enum `name`.
+    pub fn enum_of(&self, name: &str) -> Option<&ExternType> {
+        self.types.get(name).filter(|t| t.is_enum)
     }
 }
 
@@ -194,6 +309,16 @@ fn attr_value(item: &impl HasAttrs, name: &str) -> Option<String> {
     })
 }
 
+/// The value of a `#[name = value]` attribute as written (quotes kept): `"money"` or `true`.
+fn attr_raw(item: &impl HasAttrs, name: &str) -> Option<String> {
+    item.attrs().find_map(|a| {
+        let text = a.syntax().text().to_string();
+        let inner = text.trim().strip_prefix("#[")?.strip_suffix(']')?.trim().to_string();
+        let (key, value) = inner.split_once('=')?;
+        (key.trim() == name).then(|| value.trim().to_string())
+    })
+}
+
 fn doc(item: &impl HasAttrs) -> String {
     item.doc_comments()
         .map(|c| {
@@ -222,7 +347,8 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
         ast::Type::ArrayType(a) => Ty::Vec(Box::new(
             a.ty().map(|t| lower(&t, structs)).unwrap_or(Ty::Unknown),
         )),
-        // `impl Fn(f64) -> bool`: a callback.
+        // `impl Fn(f64) -> bool`: a callback. `impl Future<Output = T>`: a JS promise (a
+        // task's `next_completion`), `.await`ed like an `async fn`'s result.
         ast::Type::ImplTraitType(i) => {
             let Some(seg) = i
                 .type_bound_list()
@@ -234,6 +360,19 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
             else {
                 return Ty::Unknown;
             };
+            if seg.name_ref().is_some_and(|n| n.text() == "Future") {
+                let output = seg
+                    .generic_arg_list()
+                    .and_then(|l| {
+                        l.generic_args().find_map(|a| match a {
+                            ast::GenericArg::AssocTypeArg(at) => at.ty(),
+                            _ => None,
+                        })
+                    })
+                    .map(|t| lower(&t, structs))
+                    .unwrap_or(Ty::Unit);
+                return Ty::Future(Box::new(output));
+            }
             let params = seg
                 .parenthesized_arg_list()
                 .map(|l| {
@@ -291,6 +430,26 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
                     }
                 }
                 "Option" => Ty::Option(Box::new(arg().unwrap_or(Ty::Unknown))),
+                // `Result<SuccessResult, String>` (what `NsResult::into_result` gives).
+                "Result" => {
+                    let args: Vec<Ty> = seg
+                        .generic_arg_list()
+                        .map(|l| {
+                            l.generic_args()
+                                .filter_map(|a| match a {
+                                    ast::GenericArg::TypeArg(ta) => {
+                                        ta.ty().map(|t| lower(&t, structs))
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match args.as_slice() {
+                        [t, e] => Ty::Result(Box::new(t.clone()), Box::new(e.clone())),
+                        _ => Ty::Unknown,
+                    }
+                }
                 // (A parameter of this type takes any value: see `loosen`.)
                 "JsValue" => Ty::Extern("JsValue".into()),
                 "JsAny" => Ty::Unknown,
@@ -298,9 +457,13 @@ fn lower(t: &ast::Type, structs: &HashSet<String>) -> Ty {
                 // a `jsx!` child may be.)
                 "ReactNode" => Ty::Extern("ReactNode".into()),
                 n if structs.contains(n) => Ty::Extern(n.to_string()),
+                // (`Date`: the `js` crate's, declared in `js.rs`.)
+                n if is_js_type(n) => Ty::Extern(n.to_string()),
                 n => Ty::from_name(n),
             }
         }
+        // `-> !` (`ns.exit()`).
+        ast::Type::NeverType(_) => Ty::Never,
         _ => Ty::Unknown,
     }
 }
@@ -314,16 +477,87 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
         .map(|e| e.to_string())
         .collect();
     let file = parse.tree();
+    // (The declared type names, structs and enums: `lower` makes them `Ty::Extern`.)
     let structs: HashSet<String> = file
         .items()
         .filter_map(|i| match i {
             ast::Item::Struct(s) => s.name().map(|n| n.text().to_string()),
+            ast::Item::Enum(e) => e.name().map(|n| n.text().to_string()),
             _ => None,
         })
         .collect();
     let mut bindings = Bindings::default();
     for item in file.items() {
         match item {
+            // `#[untagged] pub enum ScriptArg { Str(String), Num(f64), Bool(bool) }`,
+            // `#[tag = "type"] pub enum PlayerRequirement { #[js = "money"] Money(MoneyRequirement), .. }`
+            ast::Item::Enum(e) => {
+                let Some(name) = e.name() else { continue };
+                let repr = match attr_value(&e, "tag") {
+                    Some(key) => Repr::Tagged(key),
+                    None if attr_value(&e, "untagged").is_some() => Repr::Untagged,
+                    None => {
+                        errors.push(format!(
+                            "enum `{}` needs `#[untagged]` or `#[tag = \"..\"]`",
+                            name.text()
+                        ));
+                        continue;
+                    }
+                };
+                let mut variants = Vec::new();
+                for v in e.variant_list().into_iter().flat_map(|l| l.variants()) {
+                    let Some(vname) = v.name() else { continue };
+                    let payload = match v.field_list() {
+                        Some(ast::FieldList::TupleFieldList(l)) if l.fields().count() == 1 => {
+                            l.fields().next().and_then(|f| f.ty())
+                        }
+                        _ => None,
+                    };
+                    let Some(payload) = payload else {
+                        errors.push(format!(
+                            "variant `{}::{}` must have exactly one tuple field",
+                            name.text(),
+                            vname.text()
+                        ));
+                        continue;
+                    };
+                    let tag = attr_raw(&v, "js").map(|raw| match raw.as_str() {
+                        "true" => JsTag::Bool(true),
+                        "false" => JsTag::Bool(false),
+                        s => JsTag::Str(s.trim_matches('"').to_string()),
+                    });
+                    if matches!(repr, Repr::Tagged(_)) && tag.is_none() {
+                        errors.push(format!(
+                            "variant `{}::{}` of a tagged enum needs `#[js = \"..\"]`",
+                            name.text(),
+                            vname.text()
+                        ));
+                    }
+                    variants.push(ExternVariant {
+                        name: vname.text().to_string(),
+                        payload: lower(&payload, &structs),
+                        shown: payload.syntax().text().to_string(),
+                        tag,
+                        doc: doc(&v),
+                    });
+                }
+                if repr == Repr::Untagged {
+                    let mut kinds: Vec<&str> = variants.iter().map(|v| v.js_kind()).collect();
+                    kinds.sort_unstable();
+                    kinds.dedup();
+                    if kinds.len() != variants.len() {
+                        errors.push(format!(
+                            "untagged enum `{}`: two variants have the same JS type",
+                            name.text()
+                        ));
+                    }
+                }
+                let ty = bindings.types.entry(name.text().to_string()).or_default();
+                ty.is_enum = true;
+                ty.repr = Some(repr);
+                ty.variants = variants;
+                ty.doc = doc(&e);
+            }
             ast::Item::Struct(s) => {
                 let Some(name) = s.name() else { continue };
                 let ty = bindings.types.entry(name.text().to_string()).or_default();

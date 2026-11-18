@@ -3,27 +3,42 @@
 //   node tools/dts2rs.mjs path/to/NetscriptDefinitions.d.ts [out.rs]
 //
 // The output is Rust declaration syntax that the compiler parses at init (`setNsBindings`):
-// TS interfaces become `pub struct`s (fields) plus `impl` blocks (methods without bodies), and
-// every member records its JS name in `#[js = "..."]`.
+// TS interfaces become `pub struct`s (fields) plus `impl` blocks (methods without bodies), TS
+// unions become `pub enum`s, and every member records its JS name in `#[js = "..."]`.
 //
 // Mapping (TS → Rust):
-//   number → f64, string → String, boolean → bool, void → (), T[] / readonly T[] → Vec<T>
-//   (parameters borrow them: string → &str, T[] → &[T], [T, T] → &[T; 2])
-//   Promise<T> return → `async fn` returning T
+//   number → f64, string → String, boolean → bool, bigint → i128, void → (), never → !
+//   T[] / readonly T[] → Vec<T> (parameters borrow them: string → &str, T[] → &[T], [T, T] → &[T; 2])
+//   Promise<T> return → `async fn` returning T; a `Promise<T>` property → `impl Future<Output = T>`
 //   T | undefined, `x?:` → Option<T> for fields; `#[optional]` for parameters (may be omitted)
 //   ...rest: T[] → a trailing `#[variadic]` parameter of type T
 //   string-literal unions and Bitburner's `_ValueOf<...EnumType>` enums → String
+//   other unions → an enum named after the TS alias (`ScriptArg`) or after where it appears
+//   (`RunThreadOrOptions`, `MaterialDesiredSellPrice`): `#[untagged]` when the members are told
+//   apart by their JS type (`Str(String)`, `Num(f64)`, `Bool(bool)`, `List(Vec<T>)`, a struct by its
+//   name), `#[tag = "type"]` when every member is an interface with a distinct literal in one
+//   field (`#[js = "money"] Money(MoneyRequirement)`). The value is the JS value itself; a
+//   parameter of an enum type also takes any variant's payload directly.
+//   Bitburner's `Result<T>` → `NsResult { Success(SuccessResult), Failure(FailureResult) }` by
+//   `success`, with `into_result()`.
+//   `CodingContractObject` (a mapped type over the contract names) → one struct per contract
+//   (`FindLargestPrimeFactorContract`, with `data` and `submit(answer)` typed for it) and the
+//   enum over them by `type`
 //   interfaces → their name, with `#[extends = "Base"]` for `interface X extends Base` (a value
 //   of `X` is accepted where a `Base` is expected)
 //   tuples → `[T; N]` when every element has the same type, else `(A, B, ..)`
 //   Map<K, V>, Record<K, V> (also Partial) → HashMap<K, V>; number keys are i32, others String
+//   Partial<Interface> → a struct with every field optional (`PartialSkills`)
+//   X["Key"] indexed access and `Exclude<Union, ..>` over string literals → String
 //   inline object types in results and fields → a struct named after where they appear
 //   (`GoMakeMoveResult`); `Named & { extra }` → `NamedWithExtra`, extending `Named`; a
 //   `type X = A & { .. }` alias → struct `X`
+//   `() => void` parameters → `impl Fn()`; `Date` → the `js` crate's `Date`;
+//   `Uint8Array` → `Vec<u8>` (`#[array]`)
 //   ReactNode / ReactElement (Bitburner's stand-ins for React's) → `ReactNode` (`react::Node`, from
 //   the `js` crate); a parameter of it takes what a `jsx!` child may be (text, numbers, ..)
-//   anything else (other unions, generics, callbacks, inline types in parameters) → JsValue
-//   (untyped; a `JsValue` parameter takes any value)
+//   anything else (`any`, generics, inline types in parameters) → JsValue (untyped; a `JsValue`
+//   parameter takes any value)
 import fs from "node:fs";
 import ts from "typescript";
 
@@ -49,7 +64,12 @@ export function snakeCase(name) {
 }
 
 function docOf(node) {
-  const docs = ts.getJSDocCommentsAndTags(node).filter(ts.isJSDoc);
+  let docs;
+  try {
+    docs = ts.getJSDocCommentsAndTags(node).filter(ts.isJSDoc);
+  } catch {
+    return [];
+  }
   const doc = docs[docs.length - 1];
   if (!doc) return [];
   const summary = (ts.getTextOfJSDocComment(doc.comment) ?? "").split(/\n\s*\n/)[0].replace(/\s+/g, " ").trim();
@@ -61,6 +81,17 @@ function docOf(node) {
   }
   // `{@link Foo | bar}` → bar
   return lines.map((l) => l.replace(/\{@link\s+[^}|]*\|\s*([^}]*)\}/g, "$1").replace(/\{@link\s+([^}]*)\}/g, "$1"));
+}
+
+/** The source text of a type node (one line), or a rendering for a node made here. */
+function textOf(node) {
+  try {
+    if (node.pos >= 0) return node.getText().replace(/\s+/g, " ");
+  } catch {
+    // (a synthesized node)
+  }
+  if (ts.isLiteralTypeNode(node) && ts.isStringLiteral(node.literal)) return JSON.stringify(node.literal.text);
+  return "?";
 }
 
 export function dtsToRust(text) {
@@ -105,9 +136,12 @@ export function dtsToRust(text) {
       )
       .map(([n, a]) => [n, a]),
   );
-  // Structs made for inline object types and intersections: name -> { members, extends, doc }.
+  // Structs made for inline object types and intersections: name -> { members, extends, env }.
   const synthesized = new Map();
   const synthByText = new Map();
+  // Enums made for unions: name -> { repr: "untagged" | { tag }, variants, doc, methods }.
+  const enums = new Map();
+  const enumByText = new Map();
   const pascal = (s) =>
     snakeCase(s)
       .replace(/^r#/, "")
@@ -115,24 +149,237 @@ export function dtsToRust(text) {
       .filter(Boolean)
       .map((w) => w[0].toUpperCase() + w.slice(1))
       .join("");
+  // (A generic alias never becomes a type here, so its name is free: `SuccessResult`.)
+  const taken = (name) =>
+    interfaces.has(name) ||
+    (aliases.has(name) && !aliases.get(name).typeParameters) ||
+    synthesized.has(name) ||
+    enums.has(name) ||
+    RESERVED_TYPE_NAMES.has(name);
+  /** A Rust name from a TS key (`"Total Ways to Sum II"` → `TotalWaysToSumII`): words
+   * capitalized, short all-caps words (roman numerals, `RLE`) kept, accents dropped. */
+  const titleCase = (s) =>
+    s
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .split(/[^A-Za-z0-9]+/)
+      .filter(Boolean)
+      .map((w) => (/^[A-Z0-9]{1,3}$/.test(w) ? w : w[0].toUpperCase() + w.slice(1)))
+      .join("");
+  // (Names a bare pattern would take for the prelude's.)
+  const PRELUDE_NAMES = new Set(["Some", "None", "Ok", "Err", "Self", "Option", "Result", "Vec", "String", "Box"]);
+  const envKey = (env) => (env ? JSON.stringify(Object.fromEntries(Object.entries(env).map(([k, v]) => [k, textOf(v)]))) : "");
   /** A struct for an inline object type (or an intersection), named `hint` unless the same type
-   * was already given a name. */
-  function synthesize(node, members, bases, hint) {
-    const key = node.getText().replace(/\s+/g, " ");
+   * was already given a name. `env` resolves a mapped type's parameter in its members. */
+  function synthesize(node, members, bases, hint, env) {
+    const key = textOf(node) + envKey(env);
     if (synthByText.has(key)) return synthByText.get(key);
     let name = hint;
-    for (let i = 2; interfaces.has(name) || aliases.has(name) || synthesized.has(name); i++) name = `${hint}${i}`;
+    for (let i = 2; taken(name); i++) name = `${hint}${i}`;
     synthByText.set(key, name);
-    synthesized.set(name, { members, bases });
+    synthesized.set(name, { members, bases, env });
     return name;
   }
+  const isStructName = (ty) => isStruct(ty) || synthesized.has(ty);
+  const envOf = (name) => synthesized.get(name)?.env;
   /** `[A, B]` element types. */
   const tupleElems = (node) => node.elements.map((e) => (ts.isNamedTupleMember(e) ? e.type : e));
+  const isNullish = (t) =>
+    t.kind === ts.SyntaxKind.UndefinedKeyword ||
+    t.kind === ts.SyntaxKind.NullKeyword ||
+    (ts.isLiteralTypeNode(t) && t.literal.kind === ts.SyntaxKind.NullKeyword);
+
+  /** A type node with a mapped type's parameter, an alias and an indexed access (`X["k"]`,
+   * `[A, B][0]`) resolved, one level. Null when the access names nothing. */
+  function resolveTypeNode(node, env) {
+    if (ts.isParenthesizedTypeNode(node)) return resolveTypeNode(node.type, env);
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName) && !node.typeArguments) {
+      const n = node.typeName.text;
+      if (env && env[n]) return env[n];
+      const a = aliases.get(n);
+      if (a && !a.typeParameters) return a.type;
+      return node;
+    }
+    if (ts.isIndexedAccessTypeNode(node)) {
+      const obj = resolveTypeNode(node.objectType, env);
+      const idx = resolveTypeNode(node.indexType, env);
+      if (!obj || !idx || !ts.isLiteralTypeNode(idx)) return null;
+      if (ts.isStringLiteral(idx.literal)) {
+        const key = idx.literal.text;
+        const members = ts.isTypeLiteralNode(obj)
+          ? obj.members
+          : ts.isTypeReferenceNode(obj) && ts.isIdentifier(obj.typeName)
+            ? membersOf(obj.typeName.text)
+            : [];
+        const m = members.find((m) => ts.isPropertySignature(m) && memberName(m) === key);
+        return m?.type ?? null;
+      }
+      if (ts.isNumericLiteral(idx.literal) && ts.isTupleTypeNode(obj)) {
+        return tupleElems(obj)[Number(idx.literal.text)] ?? null;
+      }
+      return null;
+    }
+    return node;
+  }
+
+  /** The literal a member's type is (`"money"`, `true`), resolving a mapped type's parameter. */
+  function literalOf(typeNode, env) {
+    const t = typeNode && resolveTypeNode(typeNode, env);
+    if (!t || !ts.isLiteralTypeNode(t)) return undefined;
+    if (ts.isStringLiteral(t.literal)) return t.literal.text;
+    if (t.literal.kind === ts.SyntaxKind.TrueKeyword) return true;
+    if (t.literal.kind === ts.SyntaxKind.FalseKeyword) return false;
+    return undefined;
+  }
+
+  /** What JS calls values of a Rust type from `map`: the `typeof`, or `array`; null when it
+   * can't be told apart (`JsValue`). */
+  function jsKind(ty) {
+    if (ty === "String") return "string";
+    if (ty === "f64") return "number";
+    if (ty === "bool") return "boolean";
+    if (ty === "i128") return "bigint";
+    if (/^Vec<|^\[.*; \d+\]$|^\(.*\)$/.test(ty)) return "array";
+    if (/^impl Fn/.test(ty)) return "function";
+    if (ty === "JsValue" || ty === "()") return null;
+    return "object";
+  }
+  const VARIANT_BY_KIND = { string: "Str", number: "Num", boolean: "Bool", bigint: "BigInt", array: "List", function: "Fn" };
+  function variantName(ty, kind) {
+    if (kind !== "object") return VARIANT_BY_KIND[kind];
+    if (ty === "ReactNode") return "Node";
+    if (/^HashMap</.test(ty)) return "Map";
+    return ty;
+  }
+
+  /** The field every struct in `names` declares with a distinct literal type: `{ key, values }`. */
+  function commonTag(names) {
+    const first = membersOf(names[0]).filter(ts.isPropertySignature);
+    for (const m of first) {
+      const key = memberName(m);
+      if (!key) continue;
+      const values = new Map();
+      let ok = true;
+      for (const n of names) {
+        const member = membersOf(n).find((x) => ts.isPropertySignature(x) && memberName(x) === key);
+        const lit = member && literalOf(member.type, envOf(n));
+        if (lit === undefined || [...values.values()].includes(lit)) {
+          ok = false;
+          break;
+        }
+        values.set(n, lit);
+      }
+      if (ok) return { key, values };
+    }
+    return null;
+  }
+
+  const commonPrefix = (names) => {
+    let p = names[0];
+    for (const n of names) while (!n.startsWith(p)) p = p.slice(0, -1);
+    return p;
+  };
+  const commonSuffix = (names) => {
+    let s = names[0];
+    for (const n of names) while (!n.endsWith(s)) s = s.slice(1);
+    return s;
+  };
+
+  /** Registers an enum for a union whose members map to the Rust types `tys` (text: the TS
+   * union, for its doc). Returns its name, or null when the members can't be told apart. */
+  function enumFor(tys, hint, key, tsText) {
+    if (enumByText.has(key)) return enumByText.get(key);
+    let def = null;
+    if (tys.length > 1 && tys.every(isStructName)) {
+      const tag = commonTag(tys);
+      if (tag) {
+        const prefix = commonPrefix(tys);
+        const suffix = commonSuffix(tys);
+        const variants = tys.map((n) => {
+          let v = n.slice(prefix.length, n.length - suffix.length);
+          if (!v || tys.filter((o) => o.slice(prefix.length, o.length - suffix.length) === v).length > 1) v = n;
+          if (PRELUDE_NAMES.has(v)) v = n;
+          return { name: pascal(v), ty: n, js: tag.values.get(n) };
+        });
+        def = { repr: { tag: tag.key }, variants };
+      }
+    }
+    if (!def) {
+      const kinds = tys.map(jsKind);
+      if (kinds.includes(null) || new Set(kinds).size !== kinds.length) return null;
+      def = { repr: "untagged", variants: tys.map((t, i) => ({ name: variantName(t, kinds[i]), ty: t })) };
+    }
+    let name = hint;
+    if (!name) return null;
+    for (let i = 2; taken(name) && !(aliases.has(name) && name === hint && !enums.has(name)); i++) name = `${hint}${i}`;
+    enumByText.set(key, name);
+    def.doc = [`TypeScript: \`${tsText}\``];
+    enums.set(name, def);
+    return name;
+  }
+
+  /** Bitburner's `Result<T>` (`SuccessResult<T> | FailureResult` by `success`). */
+  function nsResult() {
+    if (enums.has("NsResult")) return "NsResult";
+    const success = aliases.get("SuccessResult");
+    const lit = success && ts.isIntersectionTypeNode(success.type) ? success.type.types.find(ts.isTypeLiteralNode) : null;
+    if (!lit || !isStruct("FailureResult")) return "JsValue";
+    const ok = synthesize(lit, [...lit.members], [], "SuccessResult");
+    enums.set("NsResult", {
+      repr: { tag: "success" },
+      variants: [
+        { name: "Success", ty: ok, js: true },
+        { name: "Failure", ty: "FailureResult", js: false },
+      ],
+      doc: ["TypeScript: `SuccessResult<T> | FailureResult` (Bitburner's `Result`)"],
+      methods: [
+        {
+          rust: "into_result",
+          js: "nsResult",
+          sig: `(self) -> Result<${ok}, String>`,
+          doc: "The result as a Rust `Result`: `Ok(success)` or `Err(message)`, so `?` works.",
+        },
+      ],
+    });
+    return "NsResult";
+  }
+
+  /** `{ [T in keyof Sig]: {..} }[keyof Sig]` (`CodingContractObject`): one struct per key, with
+   * the key for `T`, and the enum over them by the field that names the key. */
+  function expandMapped(alias, name) {
+    if (enums.has(name)) return name;
+    const access = alias.type;
+    if (!ts.isIndexedAccessTypeNode(access) || !ts.isMappedTypeNode(access.objectType)) return null;
+    const mapped = access.objectType;
+    const constraint = mapped.typeParameter.constraint;
+    if (!constraint || !ts.isTypeOperatorNode(constraint) || !ts.isTypeReferenceNode(constraint.type)) return null;
+    const sig = resolveTypeNode(constraint.type, undefined);
+    if (!sig || !ts.isTypeLiteralNode(sig) || !mapped.type || !ts.isTypeLiteralNode(mapped.type)) return null;
+    const param = mapped.typeParameter.name.text;
+    const tys = [];
+    const keys = [];
+    for (const m of sig.members) {
+      const key = memberName(m);
+      if (!key) continue;
+      const env = { [param]: ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(key)) };
+      tys.push(synthesize(mapped.type, [...mapped.type.members], [], `${titleCase(key)}Contract`, env));
+      keys.push(key);
+    }
+    const tag = commonTag(tys);
+    if (!tag) return null;
+    enums.set(name, {
+      repr: { tag: tag.key },
+      variants: tys.map((t, i) => ({ name: titleCase(keys[i]), ty: t, js: tag.values.get(t) })),
+      doc: [`TypeScript: \`${textOf(alias.type).slice(0, 120)}..\` (one variant per contract)`],
+    });
+    return name;
+  }
 
   const resolving = new Set();
-  /** Map a TS type to `{ ty, optional }` (`optional`: the type admits undefined/null). `hint`
-   * names a struct made for an inline object type (none: such types are `JsValue`). */
-  function map(node, hint) {
+  /** Map a TS type to `{ ty, optional, array? }` (`optional`: the type admits undefined/null).
+   * `hint` names a struct or enum made for an inline type (none: such types are `JsValue`);
+   * `env` resolves a mapped type's parameter. */
+  function map(node, hint, env) {
     if (!node) return { ty: "JsValue", optional: false };
     switch (node.kind) {
       case ts.SyntaxKind.NumberKeyword:
@@ -141,22 +388,26 @@ export function dtsToRust(text) {
         return { ty: "String", optional: false };
       case ts.SyntaxKind.BooleanKeyword:
         return { ty: "bool", optional: false };
+      case ts.SyntaxKind.BigIntKeyword:
+        return { ty: "i128", optional: false };
       case ts.SyntaxKind.VoidKeyword:
         return { ty: "()", optional: false };
+      case ts.SyntaxKind.NeverKeyword:
+        return { ty: "!", optional: false };
       case ts.SyntaxKind.UndefinedKeyword:
       case ts.SyntaxKind.NullKeyword:
         return { ty: "()", optional: true };
     }
-    if (ts.isParenthesizedTypeNode(node)) return map(node.type, hint);
-    if (ts.isTypeOperatorNode(node) && node.operator === ts.SyntaxKind.ReadonlyKeyword) return map(node.type, hint);
-    if (ts.isArrayTypeNode(node)) return { ty: `Vec<${map(node.elementType, hint).ty}>`, optional: false };
+    if (ts.isParenthesizedTypeNode(node)) return map(node.type, hint, env);
+    if (ts.isTypeOperatorNode(node) && node.operator === ts.SyntaxKind.ReadonlyKeyword) return map(node.type, hint, env);
+    if (ts.isArrayTypeNode(node)) return { ty: `Vec<${map(node.elementType, hint, env).ty}>`, optional: false };
     // `[number, number]` → `[f64; 2]`; `[number, string]` → `(f64, String)`.
     if (ts.isTupleTypeNode(node)) {
       const elems = tupleElems(node);
       if (elems.length === 0 || elems.some((e) => ts.isRestTypeNode(e) || ts.isOptionalTypeNode(e))) {
         return { ty: "JsValue", optional: false };
       }
-      const tys = elems.map((e) => map(e, hint)).map((m) => (m.optional ? `Option<${m.ty}>` : m.ty));
+      const tys = elems.map((e) => map(e, hint, env)).map((m) => (m.optional ? `Option<${m.ty}>` : m.ty));
       if (tys.includes("JsValue") || tys.includes("()")) return { ty: "JsValue", optional: false };
       const same = tys.every((t) => t === tys[0]);
       return { ty: same ? `[${tys[0]}; ${tys.length}]` : `(${tys.join(", ")})`, optional: false };
@@ -166,7 +417,7 @@ export function dtsToRust(text) {
       if (!node.members.every((m) => ts.isPropertySignature(m) || ts.isMethodSignature(m))) {
         return { ty: "JsValue", optional: false };
       }
-      return { ty: synthesize(node, [...node.members], [], hint), optional: false };
+      return { ty: synthesize(node, [...node.members], [], hint, env), optional: false };
     }
     if (ts.isLiteralTypeNode(node)) {
       const l = node.literal;
@@ -176,9 +427,28 @@ export function dtsToRust(text) {
       if (l.kind === ts.SyntaxKind.NullKeyword) return { ty: "()", optional: true };
       return { ty: "JsValue", optional: false };
     }
+    // `(x: number) => void`: a callback parameter.
+    if (ts.isFunctionTypeNode(node)) {
+      const params = node.parameters.map((p) => map(p.type, undefined, env).ty);
+      const ret = map(node.type, undefined, env).ty;
+      return { ty: `impl Fn(${params.join(", ")})${ret === "()" ? "" : ` -> ${ret}`}`, optional: false };
+    }
+    if (ts.isIndexedAccessTypeNode(node)) {
+      const r = resolveTypeNode(node, env);
+      return r ? map(r, hint, env) : { ty: "JsValue", optional: false };
+    }
     if (ts.isUnionTypeNode(node)) {
-      const parts = node.types.map((t) => map(t, hint));
-      const optional = parts.some((p) => p.optional);
+      const members = node.types.filter((t) => !isNullish(t));
+      const optional = members.length !== node.types.length;
+      // `Sig[T][1] | string` (a contract's `submit(answer)`): the answer type itself; its text
+      // form is a convenience the typed binding doesn't need.
+      if (env && members.length === 2) {
+        const indexed = members.find(ts.isIndexedAccessTypeNode);
+        if (indexed && members.some((t) => t.kind === ts.SyntaxKind.StringKeyword)) {
+          return { ...map(indexed, hint, env), optional };
+        }
+      }
+      const parts = members.map((t) => map(t, hint, env));
       const tys = [...new Set(parts.filter((p) => !(p.optional && p.ty === "()")).map((p) => p.ty))];
       if (tys.length === 0) return { ty: "()", optional };
       if (tys.length === 1) return { ty: tys[0], optional };
@@ -186,12 +456,14 @@ export function dtsToRust(text) {
       if (tys.includes("ReactNode") && tys.every((t) => ["ReactNode", "String", "f64", "bool", "Vec<ReactNode>"].includes(t))) {
         return { ty: "ReactNode", optional };
       }
-      return { ty: "JsValue", optional };
+      // (Keyed by where it appears too: an anonymous union is a type of its own per owner.)
+      const name = enumFor(tys, hint, `${hint}:${textOf(node)}${envKey(env)}`, textOf(node));
+      return { ty: name ?? "JsValue", optional };
     }
     // `Server & { isOnline?: boolean }`: `ServerWithIsOnline`, extending `Server` (without a
     // name for it, the named interface).
     if (ts.isIntersectionTypeNode(node)) {
-      const named = node.types.map((t) => map(t)).find((m) => isStruct(m.ty));
+      const named = node.types.map((t) => map(t, undefined, env)).find((m) => isStruct(m.ty));
       const literals = node.types.filter(ts.isTypeLiteralNode);
       const refs = node.types.filter((t) => ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName));
       if (named && hint && literals.length && refs.length + literals.length === node.types.length) {
@@ -200,7 +472,7 @@ export function dtsToRust(text) {
           const extra = literals.flatMap((l) => l.members);
           const members = [...bases.flatMap((b) => membersOf(b)), ...extra];
           const extraNames = extra.map(memberName).filter(Boolean).map(pascal).join("");
-          const name = synthesize(node, members, bases, `${bases[0]}With${extraNames || "Extra"}`);
+          const name = synthesize(node, members, bases, `${bases[0]}With${extraNames || "Extra"}`, env);
           return { ty: name, optional: false };
         }
       }
@@ -210,28 +482,63 @@ export function dtsToRust(text) {
       if (!ts.isIdentifier(node.typeName)) return { ty: "JsValue", optional: false };
       const name = node.typeName.text;
       const args = node.typeArguments ?? [];
+      if (env && args.length === 0 && env[name]) return map(env[name], hint, env);
       if (name === "ReactNode" || name === "ReactElement") return { ty: "ReactNode", optional: name === "ReactNode" };
       if ((name === "Array" || name === "ReadonlyArray") && args.length === 1) {
-        return { ty: `Vec<${map(args[0], hint).ty}>`, optional: false };
+        return { ty: `Vec<${map(args[0], hint, env).ty}>`, optional: false };
       }
       // `Map<number, number>`, `Record<string, T>`, `Partial<Record<K, T>>`: a `HashMap` (string
       // keys for every key type but `number`, whose keys are `i32`).
       if ((name === "Map" || name === "Record") && args.length === 2) {
-        const k = map(args[0]);
-        const v = map(args[1], hint);
+        const k = map(args[0], undefined, env);
+        const v = map(args[1], hint, env);
         const key = k.ty === "f64" ? "i32" : k.ty === "String" ? "String" : null;
         if (!key || v.ty === "JsValue" || v.ty === "()") return { ty: "JsValue", optional: false };
         return { ty: `HashMap<${key}, ${v.optional ? `Option<${v.ty}>` : v.ty}>`, optional: false };
       }
-      if (name === "Partial" && args.length === 1 && ts.isTypeReferenceNode(args[0]) && ts.isIdentifier(args[0].typeName) && args[0].typeName.text === "Record") {
-        return map(args[0], hint);
+      if (name === "Partial" && args.length === 1 && ts.isTypeReferenceNode(args[0]) && ts.isIdentifier(args[0].typeName)) {
+        const inner = args[0].typeName.text;
+        if (inner === "Record") return map(args[0], hint, env);
+        // `Partial<Skills>`: the struct with every field optional.
+        if (isStruct(inner)) {
+          const members = membersOf(inner).map((m) => {
+            if (!ts.isPropertySignature(m) || m.questionToken) return m;
+            const o = Object.create(m);
+            o.questionToken = ts.factory.createToken(ts.SyntaxKind.QuestionToken);
+            return o;
+          });
+          return { ty: synthesize(node, members, [], `Partial${inner}`), optional: false };
+        }
       }
+      // `Exclude<Union, "Lit">` over string literals: the strings.
+      if (name === "Exclude" && args.length >= 1) return map(args[0], hint, env);
+      // A `Promise<void>` property (a task's `nextCompletion`): awaitable.
+      if (name === "Promise") {
+        const inner = args[0] ? map(args[0], hint, env) : { ty: "()" };
+        return { ty: `impl Future<Output = ${inner.optional ? `Option<${inner.ty}>` : inner.ty}>`, optional: false };
+      }
+      if (name === "Date") return { ty: "Date", optional: false };
+      if (name === "Uint8Array") return { ty: "Vec<u8>", optional: false, array: true };
+      if (name === "Result") return { ty: nsResult(), optional: false };
       if (name === "_ValueOf" && args.length === 1) return enumValue(args[0]);
       if (args.length === 0 && isStruct(name)) return { ty: name, optional: false };
+      if (args.length === 0 && enums.has(name)) return { ty: name, optional: false };
       const alias = aliases.get(name);
       if (alias && !alias.typeParameters && args.length === 0 && !resolving.has(name)) {
         resolving.add(name);
-        const r = map(alias.type, hint);
+        let r;
+        if (ts.isUnionTypeNode(alias.type)) {
+          // A union alias: an enum named after it (`ScriptArg`), or `String` for literals.
+          const parts = alias.type.types.filter((t) => !isNullish(t)).map((t) => map(t, name, env));
+          const tys = [...new Set(parts.map((p) => p.ty))];
+          const optional = parts.length !== alias.type.types.length;
+          if (tys.length === 1) r = { ty: tys[0], optional };
+          else r = { ty: enumFor(tys, name, `alias:${name}`, textOf(alias.type)) ?? "JsValue", optional };
+        } else if (ts.isIndexedAccessTypeNode(alias.type) && ts.isMappedTypeNode(alias.type.objectType)) {
+          r = { ty: expandMapped(alias, name) ?? "JsValue", optional: false };
+        } else {
+          r = map(alias.type, hint, env);
+        }
         resolving.delete(name);
         return r;
       }
@@ -299,38 +606,43 @@ export function dtsToRust(text) {
   const memberName = (m) =>
     m.name && (ts.isIdentifier(m.name) || ts.isStringLiteral(m.name)) ? m.name.text : undefined;
 
-  function paramList(sig) {
+  /** `hint`: names an enum or struct made for a parameter's inline type (`RunThreadOrOptions`). */
+  function paramList(sig, hint, env) {
     return sig.parameters.map((p, i) => {
       const name = ts.isIdentifier(p.name) ? snakeCase(p.name.text) : `arg${i}`;
+      const ph = hint ? `${hint}${pascal(name)}` : undefined;
       if (p.dotDotDotToken) {
-        const t = p.type && ts.isArrayTypeNode(p.type) ? map(p.type.elementType).ty : "JsValue";
+        const t = p.type && ts.isArrayTypeNode(p.type) ? map(p.type.elementType, ph, env).ty : "JsValue";
         return { name, ty: t, optional: true, variadic: true };
       }
-      const m = map(p.type);
+      const m = map(p.type, ph, env);
       return { name, ty: m.ty === "()" ? "JsValue" : m.ty, optional: !!p.questionToken || !!p.initializer || m.optional };
     });
   }
 
-  function returnOf(sig, hint) {
+  function returnOf(sig, hint, env) {
     const t = sig.type;
     if (t && ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) && t.typeName.text === "Promise") {
-      const inner = t.typeArguments?.[0] ? map(t.typeArguments[0], hint) : { ty: "()", optional: false };
+      const inner = t.typeArguments?.[0] ? map(t.typeArguments[0], hint, env) : { ty: "()", optional: false };
       return { ...inner, isAsync: true };
     }
-    return { ...map(t, hint), isAsync: false };
+    return { ...map(t, hint, env), isAsync: false };
   }
 
   /** One Rust signature for a set of TS overloads. */
-  function mergeOverloads(sigs, hint) {
-    if (sigs.length === 1) return { params: paramList(sigs[0]), ret: returnOf(sigs[0], hint) };
-    const lists = sigs.map(paramList);
+  function mergeOverloads(sigs, hint, env) {
+    if (sigs.length === 1) return { params: paramList(sigs[0], hint, env), ret: returnOf(sigs[0], `${hint}Result`, env) };
+    const lists = sigs.map((s) => paramList(s, hint, env));
     const longest = lists.reduce((a, b) => (b.length > a.length ? b : a));
     const minLen = Math.min(...lists.map((l) => l.filter((p) => !p.optional).length));
     const params = longest.map((p, i) => {
-      const sameType = lists.every((l) => !l[i] || l[i].ty === p.ty);
-      return { ...p, ty: sameType ? p.ty : "JsValue", optional: p.optional || i >= minLen };
+      const tys = [...new Set(lists.filter((l) => l[i]).map((l) => l[i].ty))];
+      // (Overloads that disagree on a parameter's type: an enum of them, `KillFilename`.)
+      const ty =
+        tys.length === 1 ? p.ty : (enumFor(tys, `${hint}${pascal(p.name)}`, `overloads:${hint}:${p.name}:${tys.join("|")}`, tys.join(" | ")) ?? "JsValue");
+      return { ...p, ty, optional: p.optional || i >= minLen };
     });
-    const rets = sigs.map((sg) => returnOf(sg, hint));
+    const rets = sigs.map((sg) => returnOf(sg, `${hint}Result`, env));
     const sameRet = rets.every((r) => r.ty === rets[0].ty && r.isAsync === rets[0].isAsync);
     return { params, ret: sameRet ? rets[0] : { ty: "JsValue", optional: false, isAsync: rets.every((r) => r.isAsync) } };
   }
@@ -348,6 +660,7 @@ export function dtsToRust(text) {
   const docLines = (node, indent) => docOf(node).map((l) => `${indent}/// ${l}\n`).join("");
 
   function emitType(name) {
+    const env = envOf(name);
     const members = membersOf(name);
     const fields = [];
     const methods = new Map();
@@ -363,11 +676,12 @@ export function dtsToRust(text) {
         const rust = snakeCase(js);
         if (used.has(rust)) continue;
         used.add(rust);
-        const t = map(m.type, `${name}${pascal(js)}`);
+        const t = map(m.type, `${name}${pascal(js)}`, env);
         // (A field that may hold a node, like a script's `title`, is read as any JS value.)
         if (t.ty === "ReactNode") t.ty = "JsValue";
         const ty = rustType({ ...t, optional: t.optional || !!m.questionToken }, true);
-        fields.push(`${docLines(m, "    ")}    #[js = ${JSON.stringify(js)}]\n    pub ${rust}: ${ty},\n`);
+        const array = t.array ? "    #[array]\n" : "";
+        fields.push(`${docLines(m, "    ")}    #[js = ${JSON.stringify(js)}]\n${array}    pub ${rust}: ${ty},\n`);
       }
     }
     const declared = (interfaces.get(name) ?? [objectAliases.get(name) ?? intersectionAliases.get(name)])[0];
@@ -381,7 +695,8 @@ export function dtsToRust(text) {
       used.add(rust);
       const { params, ret } = mergeOverloads(
         overloads.map((o) => o.sig),
-        `${name === "NS" ? "" : name}${pascal(js)}Result`,
+        `${name === "NS" ? "" : name}${pascal(js)}`,
+        env,
       );
       const ps = params.map((p) => {
         const attr = p.variadic ? "#[variadic] " : p.optional ? "#[optional] " : "";
@@ -389,9 +704,49 @@ export function dtsToRust(text) {
       });
       const retTy = ret.ty === "()" ? "" : ` -> ${rustType(ret, true)}`;
       const asyncKw = ret.isAsync ? "async " : "";
+      const array = ret.array ? "    #[array]\n" : "";
       fns.push(
-        `${docLines(overloads[0].node, "    ")}    #[js = ${JSON.stringify(js)}]\n    pub ${asyncKw}fn ${rust}(&self${ps.map((p) => `, ${p}`).join("")})${retTy};\n`,
+        `${docLines(overloads[0].node, "    ")}    #[js = ${JSON.stringify(js)}]\n${array}    pub ${asyncKw}fn ${rust}(&self${ps.map((p) => `, ${p}`).join("")})${retTy};\n`,
       );
+    }
+    if (fns.length) out += `impl ${name} {\n${fns.join("")}}\n`;
+    return out;
+  }
+
+  /** The readers an untagged enum gets, by the JS kinds of its payloads (what `JsValue` has). */
+  const READERS = {
+    string: [
+      ["as_string", "asString", "Option<String>", "The string, if the value is one."],
+      ["is_string", "isString", "bool", "Whether the value is a string."],
+    ],
+    number: [["as_f64", "asF64", "Option<f64>", "The number, if the value is one."]],
+    boolean: [["as_bool", "asBool", "Option<bool>", "The boolean, if the value is one."]],
+    array: [["is_array", "isArray", "bool", "Whether the value is an array."]],
+    object: [["is_object", "isObject", "bool", "Whether the value is an object (not `null`)."]],
+  };
+
+  function emitEnum(name) {
+    const def = enums.get(name);
+    const attr = def.repr === "untagged" ? "#[untagged]" : `#[tag = ${JSON.stringify(def.repr.tag)}]`;
+    const variants = def.variants.map((v) => {
+      const js = v.js === undefined ? "" : `    #[js = ${typeof v.js === "string" ? JSON.stringify(v.js) : v.js}]\n`;
+      return `${js}    ${v.name}(${v.ty}),\n`;
+    });
+    let out = `${def.doc.map((l) => `/// ${l}\n`).join("")}${attr}\npub enum ${name} {\n${variants.join("")}}\n`;
+    const fns = [];
+    if (def.repr === "untagged") {
+      const seen = new Set();
+      for (const v of def.variants) {
+        for (const [rust, js, ret, doc] of READERS[jsKind(v.ty)] ?? []) {
+          if (seen.has(rust)) continue;
+          seen.add(rust);
+          fns.push(`    /// ${doc}\n    #[js = ${JSON.stringify(js)}]\n    pub fn ${rust}(&self) -> ${ret};\n`);
+        }
+      }
+      fns.push(`    /// The value as JS text (\`"n00dles"\`, \`"5"\`, \`"true"\`), as \`{}\` prints it.\n    #[js = "asText"]\n    pub fn to_string(&self) -> String;\n`);
+    }
+    for (const m of def.methods ?? []) {
+      fns.push(`    /// ${m.doc}\n    #[js = ${JSON.stringify(m.js)}]\n    pub fn ${m.rust}${m.sig};\n`);
     }
     if (fns.length) out += `impl ${name} {\n${fns.join("")}}\n`;
     return out;
@@ -407,7 +762,9 @@ export function dtsToRust(text) {
   const header =
     "// Generated by carciniscript/tools/dts2rs.mjs from Bitburner's NetscriptDefinitions.d.ts. Do not edit.\n" +
     "// `JsValue` is an untyped JS value. `#[optional]` parameters may be omitted; a `#[variadic]` last\n" +
-    "// parameter takes any number of arguments.\n\n";
+    "// parameter takes any number of arguments. An `enum` is a TS union: its value is the JS value\n" +
+    "// itself (`#[untagged]`: by its JS type; `#[tag = \"f\"]`: by the field `f`), and a parameter of it\n" +
+    "// also takes any variant's payload directly.\n\n";
   const emitted = names.map(emitType);
   // The structs made along the way (their own inline types may add more).
   const done = new Set();
@@ -420,6 +777,7 @@ export function dtsToRust(text) {
       emitted.push(emitType(n));
     }
   }
+  for (const n of [...enums.keys()].sort()) emitted.push(emitEnum(n));
   return header + emitted.join("\n");
 }
 

@@ -101,8 +101,9 @@ export function setOverflowChecks(on) {
 }
 
 /**
- * Borrow conflicts rustc rejects (a `push` while a reference into the Vec is still used, ..) as
- * errors for the compiles that follow, instead of warnings.
+ * Borrow conflicts rustc rejects (a `push` while a reference into the Vec is still used, ..) are
+ * errors by default, as in rustc; `false` makes them warnings for the compiles that follow (the
+ * program still runs).
  */
 export function setStrictBorrows(on) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");

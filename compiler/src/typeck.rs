@@ -74,6 +74,7 @@ use ra_ap_syntax::{
     },
 };
 
+use crate::diag_help;
 use crate::bindings::{self, Bindings, bare};
 use crate::fmt::{self, ArgRef, Piece};
 use crate::macros::{self, MacroArg};
@@ -84,6 +85,9 @@ pub struct RawDiag {
     pub end: usize,
     pub message: String,
     pub severity: &'static str,
+    /// The rule behind the message for a player who doesn't know Rust (`diag_help.rs`);
+    /// `None` leaves it to the message's shape.
+    pub help: Option<String>,
 }
 
 /// Resolved types keyed by absolute `(start, end)` byte range: every expression, and the name of
@@ -203,6 +207,15 @@ pub struct FnSig {
     pub type_params: Vec<generic::TypeParam>,
     /// User-trait bounds' type arguments (`S: Store<T>` → `("S", "Store", [T])`).
     pub bound_args: Vec<(String, String, Vec<Ty>)>,
+    /// For each parameter declared as a reference (`&str`, `&[T]`, `&Point`), the type as
+    /// written; `params` erases the `&`. An owned argument there is rustc's E0308.
+    pub ref_params: Vec<Option<String>>,
+    /// Whether the return type is written as an owned value (no `&`, `impl`, `dyn` or type
+    /// parameter): a call's result then certainly owns its value.
+    pub ret_owned: bool,
+    /// Whether the return type is written `&mut T` or `Option<&mut T>` with `T` a struct, enum
+    /// or collection: a binding of the call's result can be written through without `mut`.
+    pub ret_mut_ref: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -229,6 +242,14 @@ struct Local {
     deferred: bool,
     /// `Some(true)` if the binding holds a `&mut` reference, `Some(false)` for `&`.
     reference: Option<bool>,
+    /// Whether the binding certainly owns its value, as rustc sees it: a parameter declared
+    /// without `&`, or a `let` with an owned type or an initializer that makes a value
+    /// (`String::from(..)`, `x.clone()`, an NS result). Passing it where a parameter is `&T`
+    /// is rustc's E0308. False when unknown (a pattern binding, `v[i]`, a field).
+    owned: bool,
+    /// Whether the value came from the JS bindings (an NS result, `ns.args`), so nothing in it
+    /// is a reference: its elements and fields are owned values too.
+    js: bool,
     /// The binding's name range (set by `declare`).
     decl: Option<(usize, usize)>,
 }
@@ -253,6 +274,8 @@ impl<'a> Checker<'a> {
             fns: HashMap::new(),
             scopes: Vec::new(),
             ret_ty: Ty::Unit,
+            ret_declared: true,
+            fn_name: String::new(),
             in_async: false,
             bindings: bindings::current(),
             pending_collects: Vec::new(),
@@ -419,6 +442,18 @@ impl<'a> Checker<'a> {
                     .collect();
                 bound_args.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
                 self.leave_generics();
+                let ref_params = f
+                    .param_list()
+                    .map(|pl| pl.params().map(|p| p.ty().as_ref().and_then(written_ref)).collect())
+                    .unwrap_or_default();
+                let ret_owned = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| {
+                    written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown)
+                });
+                let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t))
+                    && !self.cellable(match &ret {
+                        Ty::Option(t) => t,
+                        t => t,
+                    });
                 let sig = FnSig {
                     params,
                     ret,
@@ -428,6 +463,9 @@ impl<'a> Checker<'a> {
                     module: None,
                     cell_params,
                     into_params: into_param_flags(f),
+                    ref_params,
+                    ret_owned,
+                    ret_mut_ref,
                 };
                 if self
                     .fns
@@ -516,6 +554,7 @@ pub fn check(
             end,
             message,
             severity: "error",
+            help: None,
         });
     }
     // (`Option<Option<T>>` and `Option<()>` are representable: `Some(None)` and `Some(())` are
@@ -533,6 +572,7 @@ pub fn check(
             end,
             message,
             severity: "error",
+            help: None,
         });
     }
     // Moves are only checked in programs that type-check: they rely on the types.
@@ -556,6 +596,7 @@ pub fn check(
             end,
             message,
             severity: "error",
+            help: None,
         });
     }
     // (Before the definitions move out: methods' type parameters are looked up there.)
@@ -657,6 +698,11 @@ struct Checker<'a> {
     fns: HashMap<String, FnSig>,
     scopes: Vec<HashMap<String, Local>>,
     ret_ty: Ty,
+    /// Whether the function being checked writes a return type (`-> T`); a `return e;` or a
+    /// tail value in one that doesn't gets the "no return type" message.
+    ret_declared: bool,
+    /// The name of the function being checked, for that message.
+    fn_name: String,
     in_async: bool,
     bindings: Rc<Bindings>,
     /// `collect()` calls whose target type wasn't known yet: (target, item type, call node).
@@ -852,6 +898,7 @@ impl<'a> Checker<'a> {
             end,
             message: "this loop never ends and never awaits, so it would freeze Bitburner: add `ns.sleep(..).await` (or another awaited NS call) inside it".into(),
             severity: "warning",
+            help: None,
         });
     }
 
@@ -862,6 +909,29 @@ impl<'a> Checker<'a> {
             end,
             message: message.into(),
             severity: "error",
+            help: None,
+        });
+    }
+
+    /// rustc's "expected `()`, found `T`" for a value in a function with no `-> T`, saying where
+    /// the `()` comes from.
+    fn missing_ret_msg(&self, found: &str) -> String {
+        let suggest = found.replace("{integer}", "i32").replace("{float}", "f64");
+        format!(
+            "mismatched types: expected `()`, found `{found}` (`{}` has no return type: add `-> {suggest}` after the parameters, or end the line with `;`)",
+            self.fn_name
+        )
+    }
+
+    /// An error with its rule spelled out for a player who doesn't know Rust (`diag_help.rs`).
+    fn error_help(&mut self, n: &SyntaxNode, message: impl Into<String>, help: &str) {
+        let (start, end) = self.range(n);
+        self.diags.push(RawDiag {
+            start,
+            end,
+            message: message.into(),
+            severity: "error",
+            help: Some(help.to_string()),
         });
     }
 
@@ -1206,13 +1276,32 @@ impl<'a> Checker<'a> {
                 }
                 _ => "",
             };
+            let help = match (self.shallow(expected), self.shallow(found)) {
+                (e, f) if self.numeric(&e) && self.numeric(&f) => Some(diag_help::NUMBERS),
+                (e, Ty::Option(_) | Ty::Result(..))
+                    if !matches!(e, Ty::Option(_) | Ty::Result(..)) =>
+                {
+                    Some(diag_help::OPTION_RESULT)
+                }
+                (_, Ty::Future(_)) => Some(diag_help::FUTURES),
+                _ => None,
+            };
             let msg = format!(
                 "mismatched types: expected `{}`, found `{}`{hint}",
                 self.describe(expected),
                 self.describe(found)
             );
-            self.error(n, msg);
+            match help {
+                Some(h) => self.error_help(n, msg, h),
+                None => self.error(n, msg),
+            }
         }
+    }
+
+    /// A number type, or a literal still deciding which (`{integer}` / `{float}`).
+    fn numeric(&self, t: &Ty) -> bool {
+        matches!(self.shallow(t), Ty::Int(_) | Ty::IntLit | Ty::Float { .. })
+            || matches!(self.var_kind(t), Some(VarKind::Int | VarKind::Float))
     }
 
     // ------------------------------------------------------------ scopes
@@ -1695,7 +1784,7 @@ impl<'a> Checker<'a> {
                     return Ty::Extern(name);
                 }
                 // `Server`, `RunOptions`: an interface of the NS bindings.
-                if self.bindings.is_interface(&name) {
+                if self.bindings.is_interface(&name) || self.bindings.is_enum(&name) {
                     return Ty::Extern(name);
                 }
                 // `js::JsValue`: any JS value, unchecked (what `js::global(..)` returns).
@@ -1751,6 +1840,144 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether `e` certainly owns its value, as rustc sees it: a local declared so, a value
+    /// made here (`x.clone()`, `format!(..)`, `vec![..]`, a struct literal, a literal), an NS
+    /// result (JS values hold no references), or the result of a function declared to return
+    /// an owned type. False when it may be a reference (`v[i]` of some `Vec<&str>`, a field, a
+    /// pattern binding).
+    pub(super) fn certainly_owned(&self, e: &ast::Expr) -> bool {
+        if self.certainly_js(e) {
+            return true;
+        }
+        let e = strip_parens(e);
+        if conv::expr_ref_hint(&e) == Some(crate::adt::ArgRef::Owned) {
+            return true;
+        }
+        match &e {
+            ast::Expr::PathExpr(p) => p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .and_then(|n| self.lookup(n.text().to_string().as_str()))
+                .is_some_and(|l| l.owned),
+            // `opt.unwrap()` of an owned option (an NS result) is its value.
+            ast::Expr::MethodCallExpr(m) => {
+                let Some(recv) = m.receiver() else {
+                    return false;
+                };
+                let name = m.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
+                match name.as_str() {
+                    "unwrap" | "expect" | "unwrap_or" | "unwrap_or_default" | "unwrap_or_else"
+                    | "unwrap_unchecked" => {
+                        matches!(
+                            self.raw.get(&self.range(recv.syntax())).map(|t| self.shallow(t)),
+                            Some(Ty::Option(_) | Ty::Result(..))
+                        ) && self.certainly_owned(&recv)
+                    }
+                    _ => match self.raw.get(&self.range(recv.syntax())).map(|t| self.shallow(t)) {
+                        // A method of your type declared to return an owned value.
+                        Some(Ty::Adt(n, _)) => self
+                            .adts
+                            .method(&n, &name)
+                            .is_some_and(|s| s.receiver.is_some() && s.ret_owned),
+                        _ => false,
+                    },
+                }
+            }
+            ast::Expr::TryExpr(t) => t.expr().is_some_and(|i| self.certainly_owned(&i)),
+            ast::Expr::AwaitExpr(a) => a.expr().is_some_and(|i| self.certainly_owned(&i)),
+            // A function declared to return an owned value.
+            ast::Expr::CallExpr(c) => {
+                let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+                    return false;
+                };
+                let Some(name) = p.path().and_then(|p| p.as_single_name_ref()) else {
+                    return false;
+                };
+                self.fns
+                    .get(name.text().to_string().as_str())
+                    .is_some_and(|s| s.ret_owned)
+            }
+            ast::Expr::RecordExpr(_) | ast::Expr::ArrayExpr(_) | ast::Expr::TupleExpr(_) => true,
+            ast::Expr::MacroExpr(m) => m
+                .macro_call()
+                .and_then(|c| c.path()?.segment()?.name_ref())
+                .is_some_and(|n| matches!(n.text().to_string().as_str(), "format" | "vec")),
+            _ => false,
+        }
+    }
+
+    /// Whether `e` is a value from the JS bindings (an NS method's result, `ns.args`, an
+    /// element or field of one, a local holding one): owned, and holding no references.
+    fn certainly_js(&self, e: &ast::Expr) -> bool {
+        let e = strip_parens(e);
+        let extern_recv = |me: &Self, r: &ast::Expr| {
+            matches!(
+                me.raw.get(&me.range(r.syntax())).map(|t| me.shallow(t)),
+                Some(Ty::Extern(_))
+            )
+        };
+        match &e {
+            ast::Expr::PathExpr(p) => p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .and_then(|n| self.lookup(n.text().to_string().as_str()))
+                .is_some_and(|l| l.js),
+            ast::Expr::MethodCallExpr(m) => {
+                let Some(recv) = m.receiver() else {
+                    return false;
+                };
+                let name = m.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
+                if extern_recv(self, &recv) {
+                    // (Not `clone`, which is a std method of the handle, nor the React
+                    // helpers, nor a bound `Fn` field being called.)
+                    return !matches!(name.as_str(), "clone" | "to_owned" | "into" | "to_string");
+                }
+                matches!(
+                    name.as_str(),
+                    "unwrap" | "expect" | "unwrap_or" | "unwrap_or_default" | "unwrap_or_else"
+                ) && self.certainly_js(&recv)
+            }
+            ast::Expr::FieldExpr(f) => f.expr().is_some_and(|r| extern_recv(self, &r) || self.certainly_js(&r)),
+            ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| self.certainly_js(&b)),
+            ast::Expr::AwaitExpr(a) => a.expr().is_some_and(|i| self.certainly_js(&i)),
+            ast::Expr::TryExpr(t) => t.expr().is_some_and(|i| self.certainly_js(&i)),
+            _ => false,
+        }
+    }
+
+    /// An owned argument where the parameter is declared `&T` (`shown`: `&str`, `&[i32]`):
+    /// rustc's E0308, at the argument, with its borrow suggestion.
+    pub(super) fn check_ref_arg(&mut self, a: &ast::Expr, shown: &str) {
+        if !self.certainly_owned(a) {
+            return;
+        }
+        let Some(found) = self.raw.get(&self.range(a.syntax())).cloned() else {
+            return;
+        };
+        let found = self.zonk(&found);
+        if matches!(
+            found,
+            Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_) | Ty::Closure { .. } | Ty::Fn | Ty::Never
+        ) {
+            return;
+        }
+        // (A `&dyn Trait` / `&impl Trait` parameter: the argument may be anything implementing it.)
+        if shown.contains("dyn ") || shown.contains("impl ") {
+            return;
+        }
+        let text = a.syntax().text().to_string();
+        let hint = if text.len() <= 40 && !text.contains('\n') {
+            format!(" (consider borrowing here: `&{text}`)")
+        } else {
+            " (consider borrowing here)".to_string()
+        };
+        let msg = format!(
+            "mismatched types: expected `{shown}`, found `{}`{hint}",
+            self.describe(&found)
+        );
+        self.error_help(a.syntax(), msg, diag_help::REFS);
+    }
+
     /// `Some(is_mut)` when a declared type is a reference.
     fn ref_kind(t: &ast::Type) -> Option<bool> {
         match t {
@@ -1798,6 +2025,8 @@ impl<'a> Checker<'a> {
                 mutable: false,
                 deferred: false,
                 reference: None,
+                owned: false,
+                js: false,
                 decl: None,
             };
             self.scopes[0].insert(n, local);
@@ -1823,11 +2052,18 @@ impl<'a> Checker<'a> {
                         let r = self.range(n.syntax());
                         self.copy_arrays.insert(r);
                     }
+                    // A by-value parameter owns its argument (unless its type may be a
+                    // reference: a type parameter, `impl Trait`).
+                    let owned = reference.is_none()
+                        && p.ty().is_some_and(|t| written_owned(&t))
+                        && !matches!(ty, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown | Ty::Closure { .. });
                     let local = Local {
                         ty,
                         mutable: ip.mut_token().is_some(),
                         deferred: false,
                         reference,
+                        owned,
+                        js: false,
                         decl: None,
                     };
                     self.declare(&n, local);
@@ -1838,18 +2074,36 @@ impl<'a> Checker<'a> {
             }
         }
         let Some(body) = f.body() else { return };
+        self.ret_declared = f.ret_type().is_some();
+        self.fn_name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
         let found = self.block(&body, Some(&ret));
         if !self.unify(&found, &ret) {
             let tail = body.stmt_list().and_then(|l| l.tail_expr());
+            let has_tail = tail.is_some();
             let node = tail
                 .map(|t| t.syntax().clone())
                 .unwrap_or_else(|| body.syntax().clone());
-            let msg = format!(
-                "mismatched types: expected `{}`, found `{}`",
-                self.describe(&ret),
-                self.describe(&found)
-            );
-            self.error(&node, msg);
+            let (expected_s, found_s) = (self.describe(&ret), self.describe(&found));
+            if !self.ret_declared && !matches!(self.shallow(&found), Ty::Unit) {
+                // `fn name() { String::from("x") }`: the `()` comes from the missing `-> T`,
+                // the mistake a JavaScript author makes most.
+                let msg = self.missing_ret_msg(&found_s);
+                self.error_help(&node, msg, diag_help::MISSING_RET);
+            } else if self.ret_declared && !has_tail && matches!(self.shallow(&found), Ty::Unit) {
+                // `fn name() -> String { String::from("x"); }`: the stray `;`.
+                let last = body
+                    .stmt_list()
+                    .and_then(|l| l.statements().last())
+                    .map(|s| s.syntax().clone())
+                    .unwrap_or(node);
+                let msg = format!(
+                    "mismatched types: expected `{expected_s}`, found `()` (the last line ends with `;`, so the function returns nothing; remove the `;` to return its value)"
+                );
+                self.error_help(&last, msg, diag_help::STRAY_SEMI);
+            } else {
+                let msg = format!("mismatched types: expected `{expected_s}`, found `{found_s}`");
+                self.error(&node, msg);
+            }
         }
         self.resolve_intos();
         self.resolve_try_intos();
@@ -1896,6 +2150,7 @@ impl<'a> Checker<'a> {
                 end: r.1,
                 message,
                 severity: "error",
+                help: None,
             });
         }
         for (r, adt, targs) in std::mem::take(&mut self.const_lits) {
@@ -1920,6 +2175,7 @@ impl<'a> Checker<'a> {
                         end: r.1,
                         message: format!("type annotations needed: cannot infer the value of the const parameter `{p}` declared on the {kind} `{adt}`"),
                         severity: "error",
+                        help: None,
                     });
                 }
             }
@@ -2211,6 +2467,9 @@ impl<'a> Checker<'a> {
             {
                 Some(true)
             }
+            // `let g = net.get_mut(0);` / `let s = find(&mut v, "a").unwrap();` with your own
+            // `fn get_mut(&mut self, ..) -> &mut Srv` / `-> Option<&mut Srv>`.
+            Some(e) if self.user_mut_ref_call(&e) => Some(true),
             _ => None,
         };
         let Some(pat) = l.pat() else { return };
@@ -2227,15 +2486,24 @@ impl<'a> Checker<'a> {
                 (None, Some(t)) => t,
                 (None, None) => self.fresh(VarKind::General),
             };
+            let reference = declared_ref.or(init_ref).or_else(|| {
+                // `let r = map.get_mut(k).unwrap();`: a `&mut` to the slot's value.
+                let r = self.range(name.syntax());
+                self.slot_bindings.contains(&r).then_some(true)
+            });
+            // `let s: String = ..` / `let s = String::from(..)`: the binding owns its value.
+            let js = l.initializer().is_some_and(|i| self.certainly_js(&i));
+            let owned = reference.is_none()
+                && !matches!(ty, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown | Ty::Closure { .. })
+                && (l.ty().is_some_and(|t| written_owned(&t))
+                    || l.initializer().is_some_and(|i| self.certainly_owned(&i)));
             let local = Local {
                 ty,
                 mutable: ip.mut_token().is_some(),
                 deferred,
-                reference: declared_ref.or(init_ref).or_else(|| {
-                    // `let r = map.get_mut(k).unwrap();`: a `&mut` to the slot's value.
-                    let r = self.range(name.syntax());
-                    self.slot_bindings.contains(&r).then_some(true)
-                }),
+                reference,
+                owned,
+                js,
                 decl: None,
             };
             let ty = local.ty.clone();
@@ -2283,6 +2551,18 @@ impl<'a> Checker<'a> {
             );
         }
         self.pat(&pat, &ty);
+        // `let Some(s) = net.find_mut("a") else { return };` (or `v.get_mut(0)`): `s` is a
+        // `&mut` into the collection, written through without `mut`.
+        if l.let_else().is_some()
+            && l.initializer().as_ref().is_some_and(|i| self.mut_ref_call(i))
+            && let Some(scope) = self.scopes.last_mut()
+        {
+            for ip in pat.syntax().descendants().filter_map(ast::IdentPat::cast) {
+                if let Some(local) = ip.name().and_then(|n| scope.get_mut(n.text())) {
+                    local.reference = Some(true);
+                }
+            }
+        }
         // `let (left, right) = v.split_at_mut(mid);`: both are `&mut` views.
         if let Some(ast::Expr::MethodCallExpr(m)) = l.initializer().as_ref().map(strip_parens)
             && m.name_ref().is_some_and(|n| n.text() == "split_at_mut")
@@ -2334,6 +2614,91 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether a value matched or bound from `e` is a `&mut` reference: `&mut x`, a std call
+    /// such as `map.get_mut(..)` / `v.last_mut()` / `it.next()` of an `iter_mut()`, or one of the
+    /// file's own functions returning `&mut T` / `Option<&mut T>`.
+    fn mut_ref_call(&self, e: &ast::Expr) -> bool {
+        (match ptr::unsafe_tail(e) {
+            ast::Expr::RefExpr(r) => r.mut_token().is_some(),
+            ast::Expr::MethodCallExpr(m) => {
+                m.name_ref().is_some_and(|n| {
+                    matches!(
+                        n.text(),
+                        "get_mut"
+                            | "get_index_mut"
+                            | "node_weight_mut"
+                            | "edge_weight_mut"
+                            | "first_mut"
+                            | "last_mut"
+                            | "as_mut"
+                            | "values_mut"
+                            | "iter_mut"
+                            | "split_at_mut"
+                            | "downcast_mut"
+                    )
+                }) || mut_element(&ast::Expr::MethodCallExpr(m.clone()), &|e| {
+                    self.typed_mut_iter(e)
+                })
+            }
+            _ => false,
+        })
+            // `if let Some(s) = net.find_mut("a")` with your own `-> Option<&mut Srv>`.
+            || self.user_mut_ref_call(e)
+    }
+
+    /// Whether `e` is a call of one of the file's own functions or methods whose declared return
+    /// type is `&mut T` / `Option<&mut T>` (also through `?`, `.unwrap()` and `.expect(..)`): a
+    /// binding of it holds a `&mut`, as `iter_mut()`'s items do, and is written through without
+    /// `mut`.
+    fn user_mut_ref_call(&self, e: &ast::Expr) -> bool {
+        let mut e = strip_parens(e);
+        loop {
+            match &e {
+                ast::Expr::TryExpr(t) => match t.expr() {
+                    Some(inner) => e = strip_parens(&inner),
+                    None => return false,
+                },
+                ast::Expr::MethodCallExpr(m)
+                    if m.name_ref().is_some_and(|n| matches!(n.text(), "unwrap" | "expect")) =>
+                {
+                    match m.receiver() {
+                        Some(r) => e = strip_parens(&r),
+                        None => return false,
+                    }
+                }
+                _ => break,
+            }
+        }
+        match &e {
+            ast::Expr::CallExpr(c) => {
+                let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+                    return false;
+                };
+                let Some(name) = p.path().and_then(|p| p.as_single_name_ref()) else {
+                    return false;
+                };
+                self.fns
+                    .get(name.text().to_string().as_str())
+                    .is_some_and(|s| s.ret_mut_ref)
+            }
+            ast::Expr::MethodCallExpr(m) => {
+                let (Some(r), Some(n)) = (m.receiver(), m.name_ref()) else {
+                    return false;
+                };
+                let Some(rt) = self.raw.get(&self.range(r.syntax())) else {
+                    return false;
+                };
+                let Ty::Adt(adt, _) = self.zonk(rt) else {
+                    return false;
+                };
+                self.adts
+                    .method(&adt, n.text().to_string().as_str())
+                    .is_some_and(|m| m.ret_mut_ref)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `e` was checked as a `&mut` iterator (`std::slice::IterMut`, `impl Iterator<Item =
     /// &mut T>`, a local holding `v.iter_mut()`).
     fn typed_mut_iter(&self, e: &ast::Expr) -> bool {
@@ -2369,31 +2734,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let mut_source = through_place
-            || match scrutinee.map(ptr::unsafe_tail) {
-                Some(ast::Expr::RefExpr(r)) => r.mut_token().is_some(),
-                Some(ast::Expr::MethodCallExpr(m)) => {
-                    m.name_ref().is_some_and(|n| {
-                        matches!(
-                            n.text(),
-                            "get_mut"
-                                | "get_index_mut"
-                                | "node_weight_mut"
-                                | "edge_weight_mut"
-                                | "first_mut"
-                                | "last_mut"
-                                | "as_mut"
-                                | "values_mut"
-                                | "iter_mut"
-                                | "split_at_mut"
-                                | "downcast_mut"
-                        )
-                    }) || mut_element(&ast::Expr::MethodCallExpr(m.clone()), &|e| {
-                        self.typed_mut_iter(e)
-                    })
-                }
-                _ => false,
-            };
+        let mut_source = through_place || scrutinee.is_some_and(|e| self.mut_ref_call(e));
         // `Some(x)` against a slot (`map.get_mut(..)` of numbers): `x` aliases the slot's value.
         if let Some(ast::Expr::MethodCallExpr(m)) = scrutinee.map(strip_parens)
             && self.slot_calls.contains(&self.range(m.syntax()))
@@ -2480,6 +2821,8 @@ impl<'a> Checker<'a> {
                         mutable: ip.mut_token().is_some(),
                         deferred: false,
                         reference,
+                        owned: false,
+                        js: false,
                         decl: None,
                     };
                     self.declare(&name, local);
@@ -2619,7 +2962,10 @@ impl<'a> Checker<'a> {
             ast::Pat::SlicePat(sp) => self.slice_pat(p, sp, expected),
             // Structs and enum variants.
             _ => {
-                self.adt_pat(p, expected);
+                // (A bindings enum's variant, `ScriptArg::Str(s)`, before the file's ADTs.)
+                if !self.extern_enum_pat(p, expected) {
+                    self.adt_pat(p, expected);
+                }
             }
         }
     }
@@ -2709,6 +3055,8 @@ impl<'a> Checker<'a> {
                             mutable: ip.mut_token().is_some(),
                             deferred: false,
                             reference: Some(false),
+                            owned: false,
+                            js: false,
                             decl: None,
                         };
                         self.declare(&name, local);
@@ -3016,7 +3364,10 @@ impl<'a> Checker<'a> {
                     })
                     .collect()
             }
-            other => self.adt_abstract(&other).unwrap_or(vec![Ap::Opaque]),
+            other => self
+                .extern_enum_abstract(&other)
+                .or_else(|| self.adt_abstract(&other))
+                .unwrap_or(vec![Ap::Opaque]),
         }
     }
 
@@ -3055,6 +3406,12 @@ impl<'a> Checker<'a> {
             (Ty::Tuple(es), _) => Family::Tuple(es),
             (Ty::Unknown, Some(Ap::Tuple(ps))) => Family::Tuple(vec![Ty::Unknown; ps.len()]),
             (Ty::Adt(n, targs), _) if self.adts.defs.contains_key(&n) => Family::Adt(n, targs),
+            // A bindings enum (a TS union): its variants, each over one payload.
+            (Ty::Extern(n), _)
+                if self.bindings.is_enum(&n) && !self.adts.defs.contains_key(&n) =>
+            {
+                Family::Extern(n)
+            }
             (Ty::Result(t, e), _) => Family::Result(*t, *e),
             (Ty::Vec(e), Some(Ap::Slice(..))) => Family::Slice(*e),
             (Ty::Coll(crate::ty::Coll::FixedArray(n), v), _) => match *v {
@@ -3077,7 +3434,7 @@ impl<'a> Checker<'a> {
             (Family::Option(_), Ap::None | Ap::Some(_)) => true,
             (Family::Tuple(_), Ap::Tuple(_))
             | (Family::Slice(_) | Family::Array(..), Ap::Slice(..)) => true,
-            (Family::Adt(..) | Family::Result(..), Ap::Ctor(..)) => true,
+            (Family::Adt(..) | Family::Result(..) | Family::Extern(_), Ap::Ctor(..)) => true,
             (Family::Int(_) | Family::Char | Family::Infinite, Ap::Int(..) | Ap::Other) => true,
             _ => false,
         };
@@ -3122,6 +3479,33 @@ impl<'a> Checker<'a> {
                 )?;
                 let head = crate::ty::describe_tuple(w[..n].to_vec());
                 Some([vec![head], w[n..].to_vec()].concat())
+            }
+            Family::Extern(n) => {
+                let b = self.bindings.clone();
+                let variants = &b.types[&n].variants;
+                if rows.iter().all(|r| matches!(r[0], Ap::Wild)) {
+                    let defaults: Vec<Vec<Ap>> = rows.iter().map(|r| r[1..].to_vec()).collect();
+                    let w = self.missing(&defaults, rest)?;
+                    let head = match variants.first() {
+                        Some(v) if rows.is_empty() => format!("{n}::{}(_)", v.name),
+                        _ => "_".to_string(),
+                    };
+                    return Some([vec![head], w].concat());
+                }
+                variants.iter().enumerate().find_map(|(v, variant)| {
+                    let rows_v = specialize(&Ap::Ctor(v, vec![]), 1);
+                    // (No row of this variant: every value of it is missing.)
+                    if rows_v.is_empty() {
+                        let head = format!("{n}::{}(_)", variant.name);
+                        return Some([vec![head], vec!["_".to_string(); rest.len()]].concat());
+                    }
+                    let w = self.missing(
+                        &rows_v,
+                        &[vec![variant.payload.clone()], rest.to_vec()].concat(),
+                    )?;
+                    let head = format!("{n}::{}({})", variant.name, w[0]);
+                    Some([vec![head], w[1..].to_vec()].concat())
+                })
             }
             Family::Adt(n, targs) => {
                 let variants: Vec<crate::adt::Variant> = (0..self.adts.defs[&n].variants.len())
@@ -3603,7 +3987,15 @@ impl<'a> Checker<'a> {
                             .map(|n| n.text().to_string())
                             .unwrap_or_default();
                         let msg = format!("no field `{name}` on type `{}`", self.describe(&other));
-                        self.error(f.syntax(), msg);
+                        // `s.length`: the JavaScript name.
+                        match diag_help::js_alias(&name, true) {
+                            Some(alias) => self.error_help(
+                                f.syntax(),
+                                format!("{msg} (`{name}` is {alias} in Rust)"),
+                                diag_help::JS_NAMES,
+                            ),
+                            None => self.error(f.syntax(), msg),
+                        }
                         Ty::Unknown
                     }
                 }
@@ -3692,12 +4084,14 @@ impl<'a> Checker<'a> {
                     .clone()
                     .unwrap_or_else(|| self.fresh(VarKind::General));
                 let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
+                let saved_declared = std::mem::replace(&mut self.ret_declared, true);
                 let saved_async = std::mem::replace(&mut self.in_async, true);
                 let t = self.block_body(b, inner.as_ref());
                 if t != Ty::Never {
                     self.unify(&t, &ret);
                 }
                 self.ret_ty = saved_ret;
+                self.ret_declared = saved_declared;
                 self.in_async = saved_async;
                 Ty::Future(Box::new(ret))
             }
@@ -3753,6 +4147,16 @@ impl<'a> Checker<'a> {
             ast::Expr::ReturnExpr(r) => {
                 let ret = self.ret_ty.clone();
                 match r.expr() {
+                    // `return String::from("x");` in a function with no `-> T`.
+                    Some(v) if !self.ret_declared => {
+                        let t = self.infer(&v, None);
+                        if !self.unify(&t, &ret)
+                            && !matches!(self.shallow(&t), Ty::Unit | Ty::Never | Ty::Unknown)
+                        {
+                            let msg = self.missing_ret_msg(&self.describe(&t));
+                            self.error_help(v.syntax(), msg, diag_help::MISSING_RET);
+                        }
+                    }
                     Some(v) => {
                         self.check(&v, &ret);
                     }
@@ -4251,7 +4655,7 @@ impl<'a> Checker<'a> {
             ),
             None if !local.mutable => self.error(
                 e.syntax(),
-                format!("cannot borrow `{n}` as mutable, as it is not declared as mutable"),
+                format!("cannot borrow `{n}` as mutable, as it is not declared as mutable (declare it with `let mut {n}`)"),
             ),
             None => {}
         }
@@ -4455,7 +4859,11 @@ impl<'a> Checker<'a> {
                 ArithOp::Div => format!("cannot divide `{l}` by `{r}`"),
                 _ => format!("no implementation for `{l} {op} {r}`"),
             };
-            self.error(b.syntax(), msg);
+            if self.numeric(lt) && self.numeric(&rt) {
+                self.error_help(b.syntax(), msg, diag_help::NUMBERS);
+            } else {
+                self.error(b.syntax(), msg);
+            }
             return lt.clone();
         }
         let resolved = self.shallow(lt);
@@ -4638,6 +5046,10 @@ impl<'a> Checker<'a> {
                 self.require_tokens(a.syntax(), &at);
             }
             return Ty::Adt("TokenStream".into(), vec![]);
+        }
+        // `ScriptArg::Str("x")`, `ScriptArg::try_from(v)`: a bindings enum's variant.
+        if let Some(t) = self.extern_enum_call(c, &names, &args) {
+            return t;
         }
         if let Some(t) = self.adt_call(c, &names, &args) {
             return t;
@@ -4998,12 +5410,27 @@ impl<'a> Checker<'a> {
             } else if matches!(&ty, Ty::Extern(n) if n == "ReactNode") {
                 // `ns.print_raw(x)`: a node, text, a number, ..
                 self.check_node_arg(a);
+            } else if let Ty::Extern(n) = &ty
+                && self.bindings.is_enum(n)
+            {
+                // `ns.run("x.rs", 4, "n00dles")`: the enum, or any variant's payload.
+                let n = n.clone();
+                self.check_enum_arg(a, &n);
             } else if matches!(ty, Ty::Float { .. }) && is_int_literal(a) {
                 // Deliberate extension: every NS number is `f64`, and `ns.sleep(100)` is how every
                 // Bitburner script reads, so unsuffixed integer literals are accepted here.
                 self.record(a.syntax(), ty);
             } else {
+                let before = self.diags.len();
                 self.check(a, &ty);
+                // `ns.hack(t)` with `t: String` where the parameter is `&str`: rustc's E0308.
+                if self.diags.len() == before
+                    && let Some(p) = sig.params.get(i)
+                    && p.shown.starts_with('&')
+                {
+                    let shown = p.shown.clone();
+                    self.check_ref_arg(a, &shown);
+                }
             }
         }
     }
@@ -5191,6 +5618,11 @@ impl<'a> Checker<'a> {
             .get(name)
             .map(|s| s.into_params.clone())
             .unwrap_or_default();
+        let ref_params = self
+            .fns
+            .get(name)
+            .map(|s| s.ref_params.clone())
+            .unwrap_or_default();
         for (i, a) in args.iter().enumerate() {
             if cell_params.get(i) == Some(&true) {
                 self.cell_arg(a);
@@ -5207,7 +5639,15 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Some(p) => {
+                    let before = self.diags.len();
                     self.check(a, p);
+                    // `f(s)` with `s: String` where `fn f(s: &str)`: rustc's E0308.
+                    if self.diags.len() == before
+                        && cell_params.get(i) != Some(&true)
+                        && let Some(Some(shown)) = ref_params.get(i)
+                    {
+                        self.check_ref_arg(a, shown);
+                    }
                 }
                 None => {
                     self.infer(a, None);
@@ -5649,6 +6089,15 @@ impl<'a> Checker<'a> {
             }
         };
         let no_method = |c: &mut Self, ty: &Ty| {
+            // `v.length()`: the JavaScript name.
+            if let Some(alias) = diag_help::js_alias(&method, false) {
+                let msg = format!(
+                    "no method named `{method}` found for `{}` (`{method}` is {alias} in Rust)",
+                    c.describe(ty)
+                );
+                c.error_help(m.syntax(), msg, diag_help::JS_NAMES);
+                return Ty::Unknown;
+            }
             let hint = if matches!(method.as_str(), "context" | "with_context")
                 && matches!(ty, Ty::Result(..) | Ty::Option(_))
             {
@@ -6664,6 +7113,7 @@ impl<'a> Checker<'a> {
                 end,
                 message,
                 severity: "error",
+                help: None,
             });
         }
         let Some(expr) = expr else { return Ty::Unknown };
@@ -6826,6 +7276,7 @@ impl<'a> Checker<'a> {
                             end: target.end(),
                             message: msg,
                             severity: "error",
+                            help: None,
                         });
                     }
                 }
@@ -6892,6 +7343,7 @@ impl<'a> Checker<'a> {
                             end,
                             message,
                             severity: "error",
+                            help: None,
                         });
                         None
                     }
@@ -6935,6 +7387,7 @@ impl<'a> Checker<'a> {
                         end,
                         message,
                         severity: "error",
+                        help: None,
                     });
                 }
             }
@@ -6967,6 +7420,7 @@ impl<'a> Checker<'a> {
                         end,
                         message,
                         severity: "error",
+                        help: None,
                     });
                     continue;
                 }
@@ -7004,6 +7458,7 @@ impl<'a> Checker<'a> {
                         end,
                         message,
                         severity: "error",
+                        help: None,
                     });
                 }
                 continue;
@@ -7026,6 +7481,7 @@ impl<'a> Checker<'a> {
                     end,
                     message,
                     severity: "error",
+                    help: None,
                 });
             }
         }
@@ -7056,6 +7512,11 @@ impl Checker<'_> {
                     || n == "anyhow::Error"
                     // (`{}` of a `JsValue` is JS's `String(v)`: an extension, as it was untyped.)
                     || n == "JsValue"
+                    // (A primitive union prints as JS's `String(v)`: `"n00dles"`, `5`, `true`.)
+                    || self
+                        .bindings
+                        .enum_of(n)
+                        .is_some_and(|t| t.repr == Some(bindings::Repr::Untagged))
                     || (bindings::is_js_type(n)
                         && self
                             .bindings
@@ -7099,7 +7560,7 @@ impl Checker<'_> {
 }
 
 /// An unsuffixed integer literal, possibly negated: `100`, `-5`.
-fn is_int_literal(e: &ast::Expr) -> bool {
+pub(super) fn is_int_literal(e: &ast::Expr) -> bool {
     match e {
         ast::Expr::Literal(l) => {
             matches!(l.kind(), LiteralKind::IntNumber(n) if n.suffix().is_none())
@@ -7155,6 +7616,8 @@ enum Ap {
 
 enum Family {
     Adt(String, Vec<Ty>),
+    /// A bindings enum (a TS union), by name.
+    Extern(String),
     Slice(Ty),
     /// `[T; N]` with `N` known.
     Array(Ty, usize),
@@ -8363,6 +8826,7 @@ impl Checker<'_> {
                     end: r.1,
                     message: format!("type annotations needed: cannot infer the value of the const parameter `{n}` declared on {on} (give it with `::<..>`: array lengths in types don't inform it here)"),
                     severity: "error",
+                    help: None,
                 });
             }
         }
@@ -8794,6 +9258,52 @@ pub fn entry_chained(m: &ast::MethodCallExpr) -> bool {
 
 /// Which of `f`'s parameters are `impl Into<X>` / `impl AsRef<X>` / `impl Borrow<X>`, or a type
 /// parameter bounded by one of them.
+/// A parameter type written as a reference (`&str`, `&[T]`, `&mut Vec<T>`): its text.
+pub(super) fn written_ref(t: &ast::Type) -> Option<String> {
+    match t {
+        ast::Type::RefType(_) => Some(t.syntax().text().to_string().split_whitespace().collect::<Vec<_>>().join(" ")),
+        _ => None,
+    }
+}
+
+/// Whether a type is written `&mut T` or `Option<&mut T>`.
+pub(super) fn written_mut_ref(t: &ast::Type) -> bool {
+    match t {
+        ast::Type::RefType(r) => r.mut_token().is_some(),
+        ast::Type::PathType(p) => p
+            .path()
+            .and_then(|p| p.segment())
+            .filter(|s| s.name_ref().is_some_and(|n| n.text() == "Option"))
+            .and_then(|s| s.generic_arg_list())
+            .and_then(|g| g.generic_args().next())
+            .is_some_and(|a| match a {
+                ast::GenericArg::TypeArg(t) => t
+                    .ty()
+                    .is_some_and(|t| matches!(t, ast::Type::RefType(r) if r.mut_token().is_some())),
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
+/// Whether a type is written as an owned value: not a reference, pointer, `impl Trait` or
+/// `dyn Trait`, and holding no reference or lifetime inside (`Option<&str>`, `Parser<'a>`).
+pub(super) fn written_owned(t: &ast::Type) -> bool {
+    if matches!(
+        t,
+        ast::Type::RefType(_)
+            | ast::Type::PtrType(_)
+            | ast::Type::ImplTraitType(_)
+            | ast::Type::DynTraitType(_)
+            | ast::Type::FnPtrType(_)
+            | ast::Type::InferType(_)
+    ) {
+        return false;
+    }
+    let text = t.syntax().text().to_string();
+    !text.contains('&') && !text.contains('\'') && !text.contains("dyn ") && !text.contains("impl ")
+}
+
 pub(super) fn into_param_flags(f: &ast::Fn) -> Vec<bool> {
     use ra_ap_syntax::ast::HasTypeBounds;
     let into_bound = |l: &ast::TypeBoundList| {

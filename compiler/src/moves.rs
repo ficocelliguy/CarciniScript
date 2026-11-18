@@ -114,6 +114,10 @@ struct Walker<'a> {
     targets: Vec<Target>,
     /// Every use that moves a tracked binding.
     move_sites: HashSet<(usize, usize)>,
+    /// Per function (by impl type and name): whether it takes `self` by reference, and which
+    /// parameters are declared `&T`. An argument there is borrowed, not moved (typeck reports
+    /// an owned one as rustc's E0308 where it's certain; here the move isn't recorded).
+    ref_params: HashMap<(Option<String>, String), (Option<bool>, Vec<bool>)>,
 }
 
 /// Where `break`/`continue` go: the states they leave with.
@@ -135,6 +139,7 @@ pub fn check(
     copy_arrays: &HashSet<Decl>,
 ) -> (Vec<RawDiag>, HashSet<(usize, usize)>) {
     let mut fns = HashMap::new();
+    let mut ref_params = HashMap::new();
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         let Some(n) = f.name() else { continue };
         let owned = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| {
@@ -144,6 +149,30 @@ pub fn check(
         fns.entry((impl_of(&f), n.text().to_string()))
             .and_modify(|o| *o &= owned)
             .or_insert(owned);
+        let self_ref = f
+            .param_list()
+            .and_then(|pl| pl.self_param())
+            .map(|sp| sp.amp_token().is_some());
+        let refs: Vec<bool> = f
+            .param_list()
+            .map(|pl| {
+                pl.params()
+                    .map(|p| matches!(p.ty(), Some(ast::Type::RefType(_))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ref_params
+            .entry((impl_of(&f), n.text().to_string()))
+            .and_modify(|(s, ps): &mut (Option<bool>, Vec<bool>)| {
+                if *s != self_ref {
+                    *s = None;
+                }
+                for (a, b) in ps.iter_mut().zip(&refs) {
+                    *a &= *b;
+                }
+                ps.truncate(refs.len());
+            })
+            .or_insert((self_ref, refs));
     }
     let mut w = Walker {
         src,
@@ -162,6 +191,7 @@ pub fn check(
         diags: Vec::new(),
         targets: Vec::new(),
         move_sites: HashSet::new(),
+        ref_params,
     };
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         if !crate::adt::test_only(f.syntax()) {
@@ -483,6 +513,7 @@ impl Walker<'_> {
                     )
                 },
                 severity: "error",
+                help: None,
             });
         }
         if let Mode::Move(how) = mode
@@ -596,6 +627,61 @@ impl Walker<'_> {
                 )
             }),
             _ => false,
+        }
+    }
+
+    /// Which arguments of the call `c` go to parameters declared `&T` (borrowed, not moved):
+    /// `f(..)` for a file's function, `Type::f(..)` for an associated function or method (the
+    /// receiver first).
+    fn call_ref_params(&self, c: &ast::CallExpr) -> Vec<bool> {
+        let Some(ast::Expr::PathExpr(p)) = c.expr().map(|e| strip(&e)) else {
+            return vec![];
+        };
+        let Some(path) = p.path() else { return vec![] };
+        let Some(name) = path.segment().and_then(|s| s.name_ref()) else {
+            return vec![];
+        };
+        let name = name.text().to_string();
+        let owner = match path.qualifier() {
+            None => None,
+            Some(q) if q.qualifier().is_none() => match q.segment().and_then(|s| s.name_ref()) {
+                Some(n) if n.text() == "Self" => self.cur_impl.clone(),
+                Some(n) => Some(n.text().to_string()),
+                None => return vec![],
+            },
+            Some(_) => return vec![],
+        };
+        let Some((self_ref, params)) = self.ref_params.get(&(owner, name)) else {
+            return vec![];
+        };
+        let mut out = params.clone();
+        if let Some(r) = self_ref {
+            out.insert(0, *r);
+        }
+        out
+    }
+
+    /// Which arguments of the method call `m` go to parameters declared `&T`: a method of your
+    /// type, or an NS / JS binding's (`ns.hack(host)`: `host: &str`).
+    fn method_ref_params(&self, m: &ast::MethodCallExpr) -> Vec<bool> {
+        let Some(name) = m.name_ref().map(|n| n.text().to_string()) else {
+            return vec![];
+        };
+        match m.receiver().and_then(|r| self.ty(r.syntax()).cloned()) {
+            Some(Ty::Adt(adt, _)) => self
+                .ref_params
+                .get(&(Some(adt), name))
+                .map(|(_, ps)| ps.clone())
+                .unwrap_or_default(),
+            Some(Ty::Extern(t)) => {
+                let b = crate::bindings::current();
+                b.types
+                    .get(&t)
+                    .and_then(|et| et.methods.get(&crate::bindings::bare(&name)))
+                    .map(|sig| sig.params.iter().map(|p| p.shown.starts_with('&')).collect())
+                    .unwrap_or_default()
+            }
+            _ => vec![],
         }
     }
 
@@ -748,8 +834,14 @@ impl Walker<'_> {
                 if let Some(f) = c.expr() {
                     self.expr(&f, st, Mode::Use);
                 }
-                for a in c.arg_list().into_iter().flat_map(|l| l.args()) {
-                    self.expr(&a, st, Mode::Move("as an argument"));
+                let refs = self.call_ref_params(c);
+                for (i, a) in c.arg_list().into_iter().flat_map(|l| l.args()).enumerate() {
+                    let mode = if refs.get(i) == Some(&true) {
+                        Mode::Use
+                    } else {
+                        Mode::Move("as an argument")
+                    };
+                    self.expr(&a, st, mode);
                 }
             }
             ast::Expr::MethodCallExpr(m) => {
@@ -761,8 +853,14 @@ impl Walker<'_> {
                     };
                     self.expr(&r, st, how);
                 }
-                for a in m.arg_list().into_iter().flat_map(|l| l.args()) {
-                    self.expr(&a, st, Mode::Move("as an argument"));
+                let refs = self.method_ref_params(m);
+                for (i, a) in m.arg_list().into_iter().flat_map(|l| l.args()).enumerate() {
+                    let mode = if refs.get(i) == Some(&true) {
+                        Mode::Use
+                    } else {
+                        Mode::Move("as an argument")
+                    };
+                    self.expr(&a, st, mode);
                 }
             }
             ast::Expr::FieldExpr(f) => {
@@ -1110,6 +1208,7 @@ impl Walker<'_> {
                     "cannot assign twice to immutable variable `{n}` (make it `let mut {n};` to assign it again)"
                 ),
                 severity: "error",
+                help: None,
             });
         }
         st.assigned.insert(d);

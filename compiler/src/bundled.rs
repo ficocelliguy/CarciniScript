@@ -2799,19 +2799,8 @@ const PETGRAPH_DIRECTION_IMPORTS: Renames = Renames {
     result_err: None,
 };
 
-/// The crates of `text` that are renamed, and the names its `use`s bring in from each.
-fn renamed_crates(text: &str) -> Vec<&'static Renames> {
-    let mut out: Vec<&'static Renames> = Vec::new();
-    // (A use of `std::io`'s items names `io::` somewhere, `std::io::Error`, `use std::{io::Write}`,
-    // or is `use std::io;` itself; `std::` alone says nothing.)
-    let has = |root: &str| {
-        let root = root.trim_start_matches("::");
-        let first = root.split("::").next().unwrap_or(root);
-        let last = root.rsplit("::").next().unwrap_or(root);
-        (text.contains(&format!("{last}::")) || text.contains(&format!("use {root}")))
-            && !text.contains(&format!("mod {first}"))
-    };
-    for r in [
+/// Every renamed crate and std module, in the order their `use`s are resolved.
+const ALL_RENAMES: &[&Renames] = &[
         &IO_RENAMES,
         &FMT_RENAMES,
         &TASK_RENAMES,
@@ -2835,7 +2824,41 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
         &REACT_RENAMES,
         &ORDERED_FLOAT_RENAMES,
         &PETGRAPH_RENAMES,
-    ] {
+];
+
+/// The crate's own name for a prelude's internal one (`PgGraph` is petgraph's `Graph`), as the
+/// language service shows it.
+pub(crate) fn user_name(internal: &str) -> Option<&'static str> {
+    // (Only the prelude's own spellings: `__pg_node_index`, `PgGraph`, `ChronoNaiveDate`. Some
+    // tables map a crate's name onto a std one, `par_iter` to `iter`, which stays as it is.)
+    let prefixed = internal.starts_with("__")
+        || internal
+            .strip_prefix(|c: char| c.is_ascii_uppercase())
+            .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_lowercase()))
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()));
+    if !prefixed {
+        return None;
+    }
+    ALL_RENAMES
+        .iter()
+        .flat_map(|r| r.names.iter())
+        .find(|(_, to)| *to == internal)
+        .map(|(from, _)| *from)
+}
+
+/// The crates of `text` that are renamed, and the names its `use`s bring in from each.
+fn renamed_crates(text: &str) -> Vec<&'static Renames> {
+    let mut out: Vec<&'static Renames> = Vec::new();
+    // (A use of `std::io`'s items names `io::` somewhere, `std::io::Error`, `use std::{io::Write}`,
+    // or is `use std::io;` itself; `std::` alone says nothing.)
+    let has = |root: &str| {
+        let root = root.trim_start_matches("::");
+        let first = root.split("::").next().unwrap_or(root);
+        let last = root.rsplit("::").next().unwrap_or(root);
+        (text.contains(&format!("{last}::")) || text.contains(&format!("use {root}")))
+            && !text.contains(&format!("mod {first}"))
+    };
+    for r in ALL_RENAMES.iter().copied() {
         if r.roots.iter().any(|root| has(root)) {
             out.push(r);
         }

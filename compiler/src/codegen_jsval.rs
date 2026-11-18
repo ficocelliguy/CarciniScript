@@ -14,16 +14,23 @@ use crate::ty::Ty;
 impl Codegen<'_> {
     /// `JsValue::as_string` as a value, `JsValue::NULL`; None for other paths.
     pub(super) fn emit_jsvalue_path(&mut self, segs: &[&str]) -> Option<(Frag, Ty)> {
-        let [.., "JsValue", item] = segs else {
+        let [.., owner, item] = segs else {
             return None;
         };
+        let b = crate::bindings::current();
+        if *owner != "JsValue" && !b.is_enum(owner) {
+            return None;
+        }
         match *item {
-            "NULL" => return Some((Frag::text("null"), Ty::Extern("JsValue".into()))),
-            "UNDEFINED" => return Some((Frag::text("undefined"), Ty::Extern("JsValue".into()))),
+            "NULL" if *owner == "JsValue" => {
+                return Some((Frag::text("null"), Ty::Extern("JsValue".into())));
+            }
+            "UNDEFINED" if *owner == "JsValue" => {
+                return Some((Frag::text("undefined"), Ty::Extern("JsValue".into())));
+            }
             _ => {}
         }
-        let b = crate::bindings::current();
-        let sig = b.types.get("JsValue")?.methods.get(*item)?;
+        let sig = b.types.get(*owner)?.methods.get(*item)?;
         let js = if sig.is_static {
             sig.js.clone()
         } else {

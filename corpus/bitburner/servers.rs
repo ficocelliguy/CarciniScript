@@ -20,7 +20,7 @@ impl Default for Config {
     }
 }
 
-fn parse_args(args: &[JsValue]) -> Result<Config> {
+fn parse_args(args: &[ScriptArg]) -> Result<Config> {
     let mut cfg = Config::default();
     let words: Vec<String> = args.iter().map(|a| a.as_string().unwrap_or_default()).collect();
     for pair in words.chunks(2) {

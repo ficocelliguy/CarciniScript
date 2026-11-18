@@ -563,11 +563,23 @@ impl Checker<'_> {
             }
             (_, m2) if shared(kind, m2) => return None,
             _ => {
-                let msg = format!(
-                    "no method named `{method}` found for `{}` (the std surface is still small; see docs/FEATURES.md)",
-                    self.describe(&this)
-                );
-                self.error(m.syntax(), msg);
+                // `v.length()`: the JavaScript name.
+                match crate::diag_help::js_alias(method, false) {
+                    Some(alias) => {
+                        let msg = format!(
+                            "no method named `{method}` found for `{}` (`{method}` is {alias} in Rust)",
+                            self.describe(&this)
+                        );
+                        self.error_help(m.syntax(), msg, crate::diag_help::JS_NAMES);
+                    }
+                    None => {
+                        let msg = format!(
+                            "no method named `{method}` found for `{}` (the std surface is still small; see docs/FEATURES.md)",
+                            self.describe(&this)
+                        );
+                        self.error(m.syntax(), msg);
+                    }
+                }
                 for a in args {
                     self.infer(a, None);
                 }

@@ -404,12 +404,34 @@ function mockNs(log) {
     stock: { getPosition: () => [10, 1.5, 0, 0] },
     getResetInfo: () => ({ ownedSF: new Map([[1, 3], [8, 2]]) }),
     go: { makeMove: async (x, y) => ({ type: "move", x: 3, y: null }) },
+    // The TS unions: an array of tagged requirements, a tagged task, a `Result` by `success`.
+    singularity: {
+      getFactionInviteRequirements: (faction) =>
+        faction === "CyberSec"
+          ? [{ type: "money", money: 1e6 }, { type: "skills", skills: { hacking: 50 } }, { type: "not", condition: { type: "employedBy", company: "FulcrumTech" } }]
+          : [],
+      getCurrentWork: () => ({ type: "CLASS", cyclesWorked: 3, classType: "Computer Science", location: "Rothman University", nextCompletion: Promise.resolve() }),
+    },
+    sleeve: {
+      getTask: (n) => (n === 0 ? { type: "CRIME", crimeType: "Shoplift", cyclesWorked: 1, cyclesNeeded: 5, tasksCompleted: 0, nextCompletion: Promise.resolve() } : null),
+      purchaseSleeve: () => ({ success: false, message: "You cannot afford a sleeve" }),
+      upgradeMemory: (n, amount) => ({ success: true }),
+    },
+    prompt: async (txt, options) => (options?.type === "text" ? "typed" : true),
+    kill: (filename, host, ...args) => {
+      log.push(`kill ${JSON.stringify(filename)} ${host} ${JSON.stringify(args)}`);
+      return true;
+    },
     codingcontract: {
       getData: () => [[1, 3], [2, 6]],
       attempt(answer, file, host) {
         log.push(`attempt ${JSON.stringify(answer)} ${file} ${host}`);
         return "reward";
       },
+      getContract: (file) =>
+        file === "a.cct"
+          ? { type: "Find Largest Prime Factor", data: 91, description: "Find it.", difficulty: 1, numTriesRemaining: () => 9, submit: (answer) => (answer === 13 ? "$1000" : "") }
+          : { type: "Merge Overlapping Intervals", data: [[1, 3], [2, 6]], description: "Merge.", difficulty: 2.5, numTriesRemaining: () => 4, submit: (answer) => `got ${JSON.stringify(answer)}` },
     },
   };
 }
@@ -534,11 +556,11 @@ const rejected = [
     "let mut v = Vec::new();\n    v.push(1u8);\n    v.push(\"x\");",
     "4:12 mismatched types: expected `u8`, found `String`",
   ],
-  ["mutating an immutable Vec", "let v = vec![1];\n    v.push(2);", "3:5 cannot borrow `v` as mutable, as it is not declared as mutable"],
+  ["mutating an immutable Vec", "let v = vec![1];\n    v.push(2);", "3:5 cannot borrow `v` as mutable, as it is not declared as mutable (declare it with `let mut v`)", "Variables are read-only unless declared `let mut`."],
   ["`&mut` of an immutable binding", "let v = vec![1];\n    let r = &mut v;", "3:18 cannot borrow `v` as mutable"],
   ["indexing with i32", "let v = vec![1];\n    let i: i32 = 0;\n    let x = v[i];", "4:15 the type `[{integer}]` cannot be indexed by `i32`"],
   ["Display of a Vec", "let v = vec![1];\n    println!(\"{}\", v);", "3:14 `Vec<{integer}>` doesn't implement `std::fmt::Display`"],
-  ["integer literal as f64", "let x: f64 = 1;", "2:18 mismatched types: expected `f64`, found `{integer}`"],
+  ["integer literal as f64", "let x: f64 = 1;", "2:18 mismatched types: expected `f64`, found `{integer}`", "Rust never converts between number types for you"],
   ["incompatible if/else", "let x = if true { 1 } else { \"no\" };", "2:32 `if` and `else` have incompatible types: expected `{integer}`, found `String`"],
   ["sorting floats", "let mut v = vec![1.5, 0.5];\n    v.sort();", "3:5 the trait bound `{float}: Ord` is not satisfied"],
   ["ambiguous numeric method", "let x = 2.pow(3);", "2:13 can't call method `pow` on ambiguous numeric type `{integer}`"],
@@ -708,6 +730,13 @@ const rejected = [
   ["a generic struct's type inferred from first use", "}\nstruct Stack<T> { items: Vec<T> }\nimpl<T> Stack<T> { fn new() -> Self { Stack { items: Vec::new() } } fn push(&mut self, x: T) { self.items.push(x); } }\nfn f() {\n    let mut s = Stack::new();\n    s.push(1);\n    s.push(2.5);", "8:12 mismatched types: expected `{integer}`, found `{float}`"],
   ["use after `let b = a`", "let a = vec![1];\n    let b = a;\n    println!(\"{:?} {:?}\", a, b);", "4:27 use of moved value: `a` (moved on line 3:13 by `let`"],
   ["use after passing to a function", "}\nfn take(v: Vec<i32>) -> usize { v.len() }\nfn f() {\n    let v = vec![1];\n    take(v);\n    v.len();", "7:5 use of moved value: `v` (moved on line 6:10 as an argument"],
+  // An owned value where the parameter is `&T`: rustc's E0308 at the argument, with the borrow
+  // suggestion (only where the value certainly owns itself: a `let` of a made value, an owned
+  // parameter, an NS result).
+  ["an owned String for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f() {\n    let t = String::from(\"abc\");\n    take(t);", "6:10 mismatched types: expected `&str`, found `String` (consider borrowing here: `&t`)"],
+  ["a Vec for a `&[T]` parameter", "}\nfn total(v: &[i32]) -> i32 { v.iter().sum() }\nfn f() {\n    let v = vec![1];\n    total(v);", "6:11 mismatched types: expected `&[i32]`, found `Vec<i32>` (consider borrowing here: `&v`)"],
+  ["a struct for a method's `&Self` parameter", "}\nstruct P { x: i32 }\nimpl P {\n    fn far(&self, o: &P) -> i32 { (self.x - o.x).abs() }\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = P { x: 2 };\n    p.far(q);", "10:11 mismatched types: expected `&P`, found `P` (consider borrowing here: `&q`)"],
+  ["a made value for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f(n: i32) {\n    take(format!(\"{}\", n));", "5:10 mismatched types: expected `&str`, found `String` (consider borrowing here: `&format!(\"{}\", n)`)"],
   ["use after a `for` loop", "let v = vec![1, 2];\n    for x in v { println!(\"{x}\"); }\n    v.len();", "4:5 use of moved value: `v` (moved on line 3:14 by a `for` loop"],
   ["use after `into_iter()`", "let v = vec![1];\n    let it = v.into_iter();\n    v.len();", "4:5 use of moved value: `v` (moved on line 3:14 by a method that takes `self`"],
   ["use after a partial move out of a tuple", "let p = (1, vec![1]);\n    let (_, v) = p;\n    println!(\"{:?} {}\", v, p.0);\n    println!(\"{:?}\", p);", "5:22 use of partially moved value: `p` (a field moved on line 3:18 by `let`"],
@@ -884,15 +913,33 @@ const rejected = [
     "4:5 mismatched types",
   ],
   ["`get_index_mut` on an `IndexMap` of numbers, not matched", "let mut m: indexmap::IndexMap<&str, i32> = indexmap::IndexMap::new();\n    m.insert(\"a\", 1);\n    *m.get_index_mut(0).unwrap().1 += 1;", "4:6 `IndexMap::get_index_mut` on a map of `i32` isn't supported here"],
+  // Help lines for players who don't know Rust (`diag_help.rs`): the rule under the message.
+  ["use after move", "let s = String::from(\"a\");\n    let t = s;\n    let u = s;\n    println!(\"{} {}\", t, u);", "4:13 use of moved value: `s` (moved on line 3:13 by `let`; `.clone()` it there to keep a copy)", "Passing or assigning a `String`, `Vec` or struct hands it over; the old name can't be used again."],
+  ["two `&mut` borrows", "let mut v = vec![1];\n    let a = &mut v;\n    let b = &mut v;\n    a.push(1);\n    b.push(2);", "4:13 cannot borrow `v` as mutable more than once at a time", "`&v` lends read access and `&mut v` write access; while a `&mut` is alive nothing else may touch `v`"],
+  ["push while borrowed", "let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);", "4:5 cannot borrow `v` as mutable because it is also borrowed as immutable", "`&v` lends read access and `&mut v` write access"],
+  ["f64 times i32", "let x = 2.0 * 3i32;", "2:13 cannot multiply `{float}` by `i32`", "Rust never converts between number types for you; all NS numbers are `f64`."],
+  ["an Option where a value is expected", "let v = vec![1];\n    let x: i32 = v.first();", "3:18 mismatched types: expected `i32`, found `Option<{integer}>`", "`Option<T>` is a value that may be missing (`null` in JavaScript)"],
+  ["JavaScript's `length` as a method", "let v = vec![1];\n    let n = v.length();", "3:13 no method named `length` found for `Vec<{integer}>` (`length` is `.len()` in Rust)", "Rust's std names differ from JavaScript's"],
+  ["JavaScript's `length` as a field", "let s = String::new();\n    let n = s.length;", "3:13 no field `length` on type `String` (`length` is `.len()` in Rust)", "Rust's std names differ from JavaScript's"],
+  ["JavaScript's `push_back`", "let mut v = vec![1];\n    v.push_back(2);", "3:5 no method named `push_back` found for `Vec<{integer}>` (`push_back` is `.push(x)` in Rust)", "Rust's std names differ from JavaScript's"],
+  ["a missing `;` (the parser's token name written as the token)", "let q = 1\n    let r = 2;", "2:14 expected `;`", "Every statement ends with `;`"],
+  ["an unknown method has the FEATURES pointer and no help", "let v = vec![1];\n    let x = v.frobnicate();", "3:13 no method named `frobnicate` found for `Vec<{integer}>` (the std surface is still small; see docs/FEATURES.md)", null],
 ];
-for (const [label, body, want] of rejected) {
-  const name = `rejects: ${label}`;
-  const out = compile(`fn main() {\n    ${body}\n}\n`, "bad.rs");
+// An optional fourth column is the expected `help` prefix (`null`: the diagnostic must carry none).
+function checkRejected(name, out, want, wantHelp) {
   const msgs = out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`);
   const matches = (m) => (/^\d/.test(want) ? m.startsWith(want) : m.includes(want));
-  if (out.code !== null || !msgs.some(matches)) {
-    fail(name, `want: ${want}\ngot:\n${msgs.join("\n") || "(no diagnostics)"}`);
+  const hit = out.diagnostics.find((d) => matches(`${d.line}:${d.column} ${d.message}`));
+  const helpOk =
+    wantHelp === undefined || (wantHelp === null ? hit?.help === undefined : (hit?.help ?? "").startsWith(wantHelp));
+  if (out.code !== null || !hit || !helpOk) {
+    const wantedHelp = wantHelp === undefined ? "" : `\nwant help: ${wantHelp}`;
+    const gotHelp = hit?.help ? `\nhelp: ${hit.help}` : "";
+    fail(name, `want: ${want}${wantedHelp}\ngot:\n${msgs.join("\n") || "(no diagnostics)"}${gotHelp}`);
   } else pass(name);
+}
+for (const [label, body, want, wantHelp] of rejected) {
+  checkRejected(`rejects: ${label}`, compile(`fn main() {\n    ${body}\n}\n`, "bad.rs"), want, wantHelp);
 }
 
 // Modules: each case is a set of files; the first is compiled.
@@ -1081,7 +1128,73 @@ for (const [label, files, want] of rejectedFiles) {
   ].join("\n");
   const checks = [
     ["hover on a binding", () => hover(src, "svc.rs", 6, 9)?.contents, "s: f64"],
-    ["hover on a method", () => hover(src, "svc.rs", 6, 15)?.contents, "fn score() -> f64"],
+    ["hover on a method", () => hover(src, "svc.rs", 6, 15)?.contents, "fn score(&self) -> f64\n```\n*Target*"],
+    // Std methods: the signature with the receiver's type arguments, the owner, and std's summary.
+    [
+      "hover on a std method",
+      () => hover(src.replace("    t.", "    let f = v.first();"), "svc.rs", 8, 17)?.contents,
+      "fn first(&self) -> Option<&i32>\n```\n*[i32]*\n\nReturns the first element of the slice, or `None` if it is empty.",
+    ],
+    [
+      "hover on an Option method",
+      () => hover(src.replace("    t.", "    let f = v.first().unwrap_or(&0);"), "svc.rs", 8, 25)?.contents,
+      "fn unwrap_or(self, default: i32) -> i32\n```\n*Option<i32>*\n\nReturns the contained `Some` value or a provided default.",
+    ],
+    [
+      "hover on an iterator method",
+      () => hover(src.replace("    t.", "    let n = v.iter().map(|x| x + 1);"), "svc.rs", 8, 23)?.contents,
+      "fn map<B>(self, f: impl FnMut(i32) -> B) -> impl Iterator<Item = B>\n```\n*impl Iterator<Item = i32>*\n\nTakes a closure",
+    ],
+    [
+      "hover on a std associated function",
+      () => hover(src, "svc.rs", 5, 37)?.contents,
+      "fn from(s: &str) -> String\n```\n*String*\n\nConverts a `&str` into a `String`.",
+    ],
+    [
+      "hover on an integer method",
+      () => hover(src.replace("    t.", "    let m = 3i32.pow(2);"), "svc.rs", 8, 19)?.contents,
+      "fn pow(self, exp: u32) -> i32\n```\n*i32*\n\nRaises self to the power of `exp`",
+    ],
+    [
+      "std completions carry signatures and docs",
+      () => {
+        const c = completions(src.replace("    t.", "    v."), "svc.rs", 8, 7).find((c) => c.label === "push");
+        return c && `${c.detail} | ${c.documentation}`;
+      },
+      "fn push(&mut self, value: i32) | Appends an element to the back of a collection.",
+    ],
+    [
+      "signature help on a std method",
+      () => {
+        const h = signatureHelp(src.replace("    t.", "    v.insert("), "svc.rs", 8, 14);
+        return h && `${h.label} ${JSON.stringify(h.params)} @${h.active} ${h.documentation}`;
+      },
+      'fn insert(&mut self, index: usize, element: i32) ["index: usize","element: i32"] @0 Inserts an element at position `index`',
+    ],
+    [
+      "hover on an itertools method",
+      () => {
+        const it = "use itertools::Itertools;\n" + src.replace("    t.", "    let s = v.iter().sorted();");
+        return hover(it, "svc.rs", 9, 25)?.contents;
+      },
+      "fn sorted(self) -> impl Iterator<Item = i32>\n```\n*impl Iterator<Item = i32>*\n\nSort all iterator elements",
+    ],
+    [
+      "hover on a bundled crate's method shows the crate's names",
+      () => {
+        const pg = "use petgraph::graph::Graph;\nfn main() {\n    let mut g: Graph<i32, ()> = Graph::new();\n    let a = g.add_node(1);\n}\n";
+        return hover(pg, "pg.rs", 4, 16)?.contents;
+      },
+      "fn add_node(&mut self, weight: N) -> NodeIndex\n```\n*Graph*",
+    ],
+    [
+      "signature help on a std associated function",
+      () => {
+        const h = signatureHelp(src.replace("    t.", "    let w = Vec::with_capacity("), "svc.rs", 8, 32);
+        return h && `${h.label} @${h.active}`;
+      },
+      "fn with_capacity(capacity: usize) -> Vec<T> @0",
+    ],
     ["hover on a Vec binding", () => hover(src, "svc.rs", 7, 9)?.contents, "v: Vec<i32>"],
     ["struct members after `.`", () => completions(src, "svc.rs", 8, 7).map((c) => c.label).join(","), "clone,host,money,score"],
     ["locals in scope", () => completions(src.replace("    t.", "    s"), "svc.rs", 8, 6).map((c) => c.label).join(","), "s"],
@@ -1091,7 +1204,7 @@ for (const [label, files, want] of rejectedFiles) {
         const h = signatureHelp(src.replace("    t.", "    let q = t.score("), "svc.rs", 8, 24);
         return h && `${h.label} @${h.active}`;
       },
-      "fn score() -> f64 @0",
+      "fn score(&self) -> f64 @0",
     ],
     [
       "Vec methods after `.`",
@@ -1279,7 +1392,9 @@ for (const [label, files, want] of rejectedFiles) {
 const warned = [
   ["loop that never awaits", "let mut n = 0;\n    loop {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
   ["while true that never awaits", "let mut n = 0;\n    while true {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
-  // Borrow conflicts rustc rejects (the JS still runs): rustc's message and position.
+];
+// --- borrow conflicts rustc rejects: errors with rustc's message and position, nothing emitted.
+const borrowRejected = [
   ["a push while a reference into the Vec is used later", "let mut v = vec![1, 2, 3];\n    let first = &v[0];\n    v.push(4);\n    println!(\"{}\", first);", "4:5 cannot borrow `v` as mutable because it is also borrowed as immutable"],
   ["assigning to a borrowed String", "let mut s = String::from(\"a\");\n    let r = &s;\n    s = String::from(\"b\");\n    println!(\"{} {}\", r, s);", "4:5 cannot assign to `s` because it is borrowed"],
   ["changing a Vec inside a `for` over it", "let mut v = vec![1, 2, 3];\n    for x in v.iter() {\n        v.push(*x);\n    }", "4:9 cannot borrow `v` as mutable because it is also borrowed as immutable"],
@@ -1321,18 +1436,36 @@ for (const [label, body, want] of warned) {
     fail(name, `want: ${want}\ngot:\n${out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n") || "(no diagnostics)"}`);
   } else pass(name);
 }
-// `setStrictBorrows(true)`: the same conflict is an error, and nothing is emitted.
+for (const [label, body, want] of borrowRejected) {
+  const name = `rejects: ${label}`;
+  const out = compile(`fn main() {\n    ${body}\n}\n`, "reject.rs");
+  const msgs = out.diagnostics.filter((d) => d.severity === "error").map((d) => `${d.line}:${d.column} ${d.message}`);
+  if (out.code !== null || !msgs.some((m) => m.startsWith(want))) {
+    fail(name, `want: ${want}\ngot:\n${out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n") || "(no diagnostics)"}`);
+  } else pass(name);
+}
+// `setStrictBorrows(false)`: the same conflict is a warning that says so, and the JS is emitted.
 {
-  setStrictBorrows(true);
-  const out = compile("fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}\n", "strict.rs");
   setStrictBorrows(false);
-  const d = out.diagnostics.find((x) => x.severity === "error");
-  if (out.code === null && d?.message === "cannot borrow `v` as mutable because it is also borrowed as immutable") {
-    pass("strict borrows: a conflict is an error");
-  } else fail("strict borrows: a conflict is an error", JSON.stringify(out.diagnostics));
+  const out = compile("fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}\n", "lax.rs");
+  setStrictBorrows(true);
+  const d = out.diagnostics.find((x) => x.severity === "warning");
+  // The message stays rustc's; the help says it runs anyway.
+  if (
+    out.code !== null &&
+    !out.diagnostics.some((x) => x.severity === "error") &&
+    d?.message === "cannot borrow `v` as mutable because it is also borrowed as immutable" &&
+    d.help?.startsWith("`&v` lends read access") &&
+    d.help.endsWith("This runs anyway here (rustc would refuse); turn on 'Rust: borrow conflicts are errors' to match rustc.")
+  ) {
+    pass("lax borrows: a conflict is a warning");
+  } else fail("lax borrows: a conflict is a warning", JSON.stringify(out.diagnostics));
 }
 const quiet = [
   ["loop that awaits", "pub async fn main(ns: NS) {\n    loop {\n        ns.sleep(10.0).await;\n    }\n}\n"],
+  // `&str` values for a `&str` parameter: a `&`, a literal, a slice method, a reference local, a
+  // `Vec<&str>` element, an iterated item; a borrowed argument isn't moved.
+  ["references for a `&str` parameter", "fn take(s: &str) -> usize { s.len() }\nfn main() {\n    let t = String::from(\"abc\");\n    let r = &t;\n    let names: Vec<&str> = vec![\"a\"];\n    let mut n = take(r) + take(\"lit\") + take(&t) + take(t.as_str()) + take(names[0]);\n    for name in names.iter() { n += take(name); }\n    n += take(&t);\n    println!(\"{} {}\", n, t);\n}\n"],
   ["loop that breaks", "fn main() {\n    let mut n = 0;\n    loop {\n        n += 1;\n        if n > 3 {\n            break;\n        }\n    }\n}\n"],
   // Borrows rustc accepts: one that ends before the change, a copy, other branches, indexing.
   ["a borrow that ends before the push", "fn main() {\n    let mut v = vec![1, 2, 3];\n    let first = &v[0];\n    println!(\"{}\", first);\n    v.push(4);\n    println!(\"{:?}\", v);\n}\n"],
@@ -1386,10 +1519,63 @@ for (const [label, src] of quiet) {
 
 const rejectedNs = [
   ["`.await` in a closure", "let f = || ns.sleep(10).await;", "2:16 `await` is only allowed inside `async` functions and blocks"],
+  ["an owned String for an NS `&str` parameter", "let target = ns.args[0].as_string().unwrap();\n    ns.nuke(target);", "3:13 mismatched types: expected `&str`, found `String` (consider borrowing here: `&target`)", "`&` in a parameter type means the function borrows the value instead of taking it; add `&` in front of the argument."],
+  ["an NS result's element for an NS `&str` parameter", "let servers = ns.scan(\"home\");\n    ns.nuke(servers[0]);", "3:13 mismatched types: expected `&str`, found `String` (consider borrowing here: `&servers[0]`)"],
   [
     "forgotten .await",
     'let stolen: f64 = ns.hack("n00dles");',
     "2:23 mismatched types: expected `f64`, found `impl Future<Output = f64>` (did you forget `.await`?)",
+    "An NS call returns a future, not its value, until it is awaited (like a Promise).",
+  ],
+  // The mistakes a JavaScript author makes first: a value in a function with no `-> T` (the `()`
+  // comes from the missing return type), and the stray `;` that makes a function return nothing.
+  [
+    "a value in a function with no return type",
+    'fn name() { String::from("x") }',
+    "2:13 mismatched types: expected `()`, found `String` (`name` has no return type: add `-> String` after the parameters, or end the line with `;`)",
+    "A function without `-> Type` returns nothing, and its last expression without `;` is its return value.",
+  ],
+  [
+    "`return` in a function with no return type",
+    'fn name() { return String::from("x"); }',
+    "2:20 mismatched types: expected `()`, found `String` (`name` has no return type: add `-> String` after the parameters, or end the line with `;`)",
+    "A function without `-> Type` returns nothing",
+  ],
+  [
+    "a number in a function with no return type",
+    "fn name() { 1 }",
+    "2:13 mismatched types: expected `()`, found `{integer}` (`name` has no return type: add `-> i32` after the parameters, or end the line with `;`)",
+    "A function without `-> Type` returns nothing",
+  ],
+  [
+    "a stray `;` before the closing brace",
+    'fn name() -> String { String::from("x"); }',
+    "2:23 mismatched types: expected `String`, found `()` (the last line ends with `;`, so the function returns nothing; remove the `;` to return its value)",
+    "A function's value is its last expression written without `;` (`return x;` also works).",
+  ],
+  [
+    "a wrong tail type with a declared return type keeps rustc's message alone",
+    "fn name() -> String { 1 }",
+    "2:23 mismatched types: expected `String`, found `{integer}`",
+    null,
+  ],
+  [
+    "returning a reference to a local",
+    "fn f() -> &String { let s = String::new(); &s }",
+    "2:44 cannot return reference to local variable `s`",
+    "A reference points at a variable that is deleted when the function ends.",
+  ],
+  [
+    "an argument count error stays bare",
+    "fn f(a: i32) {}\nfn g() { f(1, 2); }",
+    "3:10 this function takes 1 argument but 2 were supplied",
+    null,
+  ],
+  [
+    "JavaScript's `length` on an NS result",
+    'let servers = ns.scan("home");\n    let n = servers.length;',
+    "3:13 no field `length` on type `Vec<String>` (`length` is `.len()` in Rust)",
+    "Rust's std names differ from JavaScript's; docs/FEATURES.md lists what is supported.",
   ],
   [
     "typo'd NS method",
@@ -1413,9 +1599,9 @@ const rejectedNs = [
     "3:13 no field `maxRam` on type `ServerWithIsOnline`; did you mean `max_ram`?",
   ],
   // A `JsValue` is read with `as_string()` / `as_f64()`, not taken as a `String` or `f64`.
-  ["a JsValue argument as a String", "let a: String = ns.args[0];", "2:21 mismatched types: expected `String`, found `JsValue`"],
+  ["a JsValue argument as a String", "let a: String = ns.args[0];", "2:21 mismatched types: expected `String`, found `ScriptArg`"],
   ["a port read as a number", "let n: f64 = ns.read_port(1);", "2:18 mismatched types: expected `f64`, found `JsValue`"],
-  ["an unknown JsValue method", "let n = ns.args[0].as_strin();", "2:13 no method named `as_strin` found for `JsValue`; did you mean `as_string`?"],
+  ["an unknown JsValue method", "let n = ns.args[0].as_strin();", "2:13 no method named `as_strin` found for `ScriptArg`; did you mean `as_string`?"],
   [
     "a misspelled option field",
     "let o = RunOptions { thread: Some(2.0), ..Default::default() };",
@@ -1445,17 +1631,12 @@ const rejectedNs = [
   ],
   ["`?` on a non-Option", "fn f() -> Option<i32> {\n    let x = 5?;\n    Some(x)\n}", "3:13 the `?` operator can only be applied to `Option`"],
 ];
-for (const [label, body, want] of rejectedNs) {
-  const name = `rejects: ${label}`;
+for (const [label, body, want, wantHelp] of rejectedNs) {
   // A body starting with `fn` is a whole helper function placed before main.
   const src = body.startsWith("fn ")
     ? `pub async fn main(ns: NS) {}\n${body}\n`
     : `pub async fn main(ns: NS) {\n    ${body}\n}\n`;
-  const out = compile(src, "bad.rs");
-  const msgs = out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`);
-  if (out.code !== null || !msgs.some((m) => m.startsWith(want))) {
-    fail(name, `want: ${want}\ngot:\n${msgs.join("\n") || "(no diagnostics)"}`);
-  } else pass(name);
+  checkRejected(`rejects: ${label}`, compile(src, "bad.rs"), want, wantHelp);
 }
 
 // A mutation through `&` vs `&mut` parameters.
@@ -1504,12 +1685,27 @@ for (const [label, body, want] of rejectedNs) {
   check("overflow checks toggled", off !== null && on !== null && on !== off && compile(ovf, "ovf.rs").code === off, on);
 
   const conflict = "fn main() {\n    let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);\n}\n";
-  const lax = compile(conflict, "conflict.rs");
-  setStrictBorrows(true);
   const strict = compile(conflict, "conflict.rs");
   setStrictBorrows(false);
-  check("strict borrows toggled", lax.code !== null && strict.code === null && compile(conflict, "conflict.rs").code !== null, JSON.stringify(strict.diagnostics));
+  const lax = compile(conflict, "conflict.rs");
+  setStrictBorrows(true);
+  check("strict borrows toggled", strict.code === null && lax.code !== null && compile(conflict, "conflict.rs").code === null, JSON.stringify(lax.diagnostics));
 
+  // The TS unions in the editor: `ns.args` is a `Vec<ScriptArg>`, a variant shows its payload,
+  // the enum its TS union; a missing variant is reported like an enum's.
+  {
+    const u = "pub async fn main(ns: NS) {\n    let args = ns.args;\n    match &args[0] {\n        ScriptArg::Str(s) => ns.tprint(s),\n        ScriptArg::Num(n) => {}\n    }\n}\n";
+    const h1 = hover(u, "u.rs", 2, 9)?.contents ?? "";
+    const h2 = hover(u, "u.rs", 4, 21)?.contents ?? "";
+    const h3 = hover(u, "u.rs", 4, 12)?.contents ?? "";
+    const d = errs(compile(u, "u.rs"));
+    check(
+      "hover on the TS unions",
+      h1.includes("args: Vec<ScriptArg>") && h2.includes("ScriptArg::Str(String)") && h3.includes("enum ScriptArg { Str(String), Num(f64), Bool(bool) }") && h3.includes("TypeScript: `string | number | boolean`"),
+      JSON.stringify([h1, h2, h3]),
+    );
+    check("a union's missing variant", d.some((m) => m.includes("non-exhaustive patterns: `ScriptArg::Bool(_)` not covered")), JSON.stringify(d));
+  }
   // (Without typed bindings an NS method's result isn't checked.)
   const ns = "pub async fn main(ns: NS) {\n    let m: String = ns.get_server_money_available(\"home\");\n    ns.tprint(&format!(\"{}\", m));\n}\n";
   const full = compile(ns, "ns.rs");

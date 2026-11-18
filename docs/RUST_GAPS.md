@@ -545,8 +545,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Checking
 
-- **The borrow checker is rustc's NLL over an overlay.** Lifetimes are erased in the emitted JS,
-  so conflicts are warnings unless strict borrows are on (then errors, as in rustc). The
+- **The borrow checker is rustc's NLL over an overlay.** Conflicts are errors, as in rustc
+  (lifetimes are erased in the emitted JS, so `setStrictBorrows(false)` can make them warnings
+  and let the program run). The
   checker (`nll.rs`) rebuilds references from annotations, signatures, struct fields and a table
   of std's borrowing methods, and reports E0499, E0502, E0503, E0505, E0506, E0597, E0515, E0716
   and "lifetime may not live long enough" with rustc's wording: through `let`s, struct
@@ -564,8 +565,14 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   Definite initialization is checked for `let x;` (use before assignment, assigning an immutable
   one twice); names declared by a `let (a, b);` pattern aren't checked yet.
 - **Type checking covers the supported subset only.** Within it, mismatches and mutability
-  errors are reported like rustc's. NS calls are unchecked until typed bindings land, and trait
-  bounds don't exist yet (only `sort` on floats is special-cased).
+  errors are reported like rustc's. NS calls are checked against the typed bindings.
+- **An owned value for a `&T` parameter is reported only where ownership is certain.** `f(t)`
+  with `fn f(s: &str)` and `t: String` is rustc's "expected `&str`, found `String`" when `t` is
+  a by-value parameter, a `let` of a made value (`String::from(..)`, `x.clone()`, `format!`,
+  a struct literal, a function declared to return an owned type) or an NS result (nothing from
+  the bindings holds a reference). A `v[i]`, a field, a `match` binding or an `if` result may
+  be a reference as far as the checker can tell (`Vec<&str>` and `Vec<String>` are one type
+  here), so passing one bare is accepted and runs with the JS value shared.
 
 ## Traits on built-in types
 

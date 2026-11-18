@@ -36,8 +36,8 @@ fn main() {
     }));
     let (mut ok, mut rejected, mut panics, mut bytes) = (0, 0, Vec::new(), 0usize);
     let mut slowest = Vec::new();
-    // `SWEEP_STRICT=1`: borrow conflicts are errors (files with one count as rejected).
-    carciniscript::set_strict_borrows(std::env::var_os("SWEEP_STRICT").is_some());
+    // `SWEEP_LAX=1`: borrow conflicts are warnings (files with one count as OK).
+    carciniscript::set_strict_borrows(std::env::var_os("SWEEP_LAX").is_none());
     // `SWEEP_LIST=1`: print each file's outcome and first error (to diff two sweeps).
     let list = std::env::var_os("SWEEP_LIST").is_some();
     let start = std::time::Instant::now();

@@ -253,21 +253,38 @@ pub fn hover(
             }
             Some(Ty::Adt(n, _)) => {
                 if let Some(method) = types.adts.method(n, &name) {
-                    let params: Vec<(String, Ty)> = method
-                        .params
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| (format!("_{i}"), t.clone()))
-                        .collect();
-                    let sig = signature(&name, &params, &method.ret, method.is_async);
+                    // The declaration as written (parameter names, `&self`, `&` in the return
+                    // type); a bundled crate's prelude under the crate's own names.
+                    let sig = match fn_decl(file, Some(n), &name) {
+                        Some(f) => user_names(&fn_label(&f)),
+                        None => {
+                            let params: Vec<(String, Ty)> = method
+                                .params
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| (format!("_{i}"), t.clone()))
+                                .collect();
+                            signature(&name, &params, &method.ret, method.is_async)
+                        }
+                    };
+                    let owner = crate::bundled::user_name(n).unwrap_or(n);
                     let docs = fn_docs(file, Some(n), &name);
                     return Some(make(
-                        with_docs(format!("{}\n*{n}*", code(&sig)), &docs),
+                        with_docs(format!("{}\n*{owner}*", code(&sig)), &docs),
                         &node,
                     ));
                 }
             }
             _ => {}
+        }
+        // A std method (or the bundled `itertools`'s): its signature and summary.
+        if let Some(t) = &rt
+            && let Some((owner, sig, doc)) = std_show(t, &name)
+        {
+            return Some(make(
+                format!("{}\n*{owner}*\n\n{doc}", code(&sig)),
+                &node,
+            ));
         }
         let ret = type_at(types, m.syntax())?;
         return Some(make(
@@ -353,6 +370,64 @@ pub fn hover(
             .collect::<Vec<_>>()
             .join("\n");
         return Some(make(with_docs(code(&sig), &docs_of(&f)), &node));
+    }
+    // A bindings enum (a TS union) or one of its variants: `ScriptArg::Str(String)` with the
+    // union it stands for.
+    if node.kind() == SyntaxKind::NAME_REF
+        && let Some(seg) = node.parent().and_then(ast::PathSegment::cast)
+        && let Some(path) = seg.syntax().parent().and_then(ast::Path::cast)
+    {
+        let enum_hover = |et: &bindings::ExternType, name: &str| {
+            let variants: Vec<String> = et
+                .variants
+                .iter()
+                .map(|v| format!("{}({})", v.name, v.shown))
+                .collect();
+            format!(
+                "{}\n*NS bindings*\n\n{}",
+                code(&format!("enum {name} {{ {} }}", variants.join(", "))),
+                et.doc
+            )
+        };
+        let qualifier = path
+            .qualifier()
+            .and_then(|q| q.segment()?.name_ref())
+            .map(|n| n.text().to_string());
+        if let Some(q) = &qualifier
+            && let Some(et) = b.enum_of(q)
+            && let Some((_, v)) = et.variant(token.text())
+        {
+            let text = format!("{q}::{}({})", v.name, v.shown);
+            return Some(make(
+                with_docs(format!("{}\n*{q}*", code(&text)), &v.doc),
+                &node,
+            ));
+        }
+        if let Some(q) = &qualifier
+            && let Some(et) = b.enum_of(token.text())
+            && q.is_empty()
+        {
+            return Some(make(enum_hover(et, token.text()), &node));
+        }
+        if qualifier.is_none()
+            && let Some(et) = b.enum_of(token.text())
+        {
+            return Some(make(enum_hover(et, token.text()), &node));
+        }
+    }
+    // `String::from`, `Vec::with_capacity`, `i32::MAX`: a std type's associated function or
+    // constant.
+    if node.kind() == SyntaxKind::NAME_REF
+        && let Some(seg) = node.parent().and_then(ast::PathSegment::cast)
+        && let Some(path) = seg.syntax().parent().and_then(ast::Path::cast)
+        && let Some(q) = path.qualifier()
+        && let Some(qn) = q.segment().and_then(|s| s.name_ref())
+        && let Some((owner, sig, doc)) = crate::std_docs::show_assoc(&qn.text(), token.text())
+    {
+        return Some(make(
+            format!("{}\n*{owner}*\n\n{doc}", code(&sig)),
+            &node,
+        ));
     }
     // A binding or a path: the name and its type.
     for n in node.ancestors().take(5) {
@@ -535,7 +610,10 @@ fn scope_completions(
 /// `fn name(a: i32, b: &str) -> u32`, from the source text of the declaration.
 fn fn_label(f: &ast::Fn) -> String {
     let name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
-    let params = fn_params(f);
+    let mut params = fn_params(f);
+    if let Some(sp) = f.param_list().and_then(|pl| pl.self_param()) {
+        params.insert(0, sp.syntax().text().to_string());
+    }
     let ret = f
         .ret_type()
         .map(|r| format!(" {}", r.syntax().text()))
@@ -617,6 +695,20 @@ pub fn signature_help(
             let label = binding_signature(&name, method);
             return Some(help(label, params, method.doc.clone()));
         }
+        // A method of the receiver's own type (not any `fn` of that name).
+        if let Some(Ty::Adt(n, _)) = &rt
+            && let Some(f) = fn_decl(file, Some(n), &name)
+        {
+            let params = fn_params(&f).iter().map(|p| user_names(p)).collect();
+            return Some(help(user_names(&fn_label(&f)), params, docs_of(&f)));
+        }
+        // A std method (or the bundled `itertools`'s).
+        if let Some(t) = &rt
+            && let Some((_, sig, doc)) = std_show(t, &name)
+        {
+            let params = crate::std_docs::params(&sig);
+            return Some(help(sig, params, doc.to_string()));
+        }
         let f = find_fn(&name)?;
         return Some(help(fn_label(&f), fn_params(&f), String::new()));
     }
@@ -624,9 +716,21 @@ pub fn signature_help(
     let ast::Expr::PathExpr(p) = call.expr()? else {
         return None;
     };
-    let name = p.path()?.segment()?.name_ref()?.text().to_string();
-    let f = find_fn(&name)?;
-    Some(help(fn_label(&f), fn_params(&f), String::new()))
+    let path = p.path()?;
+    let name = path.segment()?.name_ref()?.text().to_string();
+    // `String::from(..)`, `Vec::with_capacity(..)`: a std type's associated function.
+    if let Some(q) = path.qualifier()
+        && let Some(qn) = q.segment().and_then(|s| s.name_ref())
+        && let Some((_, sig, doc)) = crate::std_docs::show_assoc(&qn.text(), &name)
+    {
+        let params = crate::std_docs::params(&sig);
+        return Some(help(sig, params, doc.to_string()));
+    }
+    let f = match path.qualifier().and_then(|q| q.segment()?.name_ref()) {
+        Some(owner) => fn_decl(file, Some(&owner.text()), &name).or_else(|| find_fn(&name))?,
+        None => find_fn(&name)?,
+    };
+    Some(help(fn_label(&f), fn_params(&f), docs_of(&f)))
 }
 
 fn method(label: &str, detail: String, doc: &str) -> Completion {
@@ -729,13 +833,74 @@ fn members(t: &Ty, types: &Types) -> Vec<Completion> {
         }
         other => {
             for name in std_methods(other) {
-                out.push(method(name, String::new(), ""));
+                match crate::std_docs::show(other, name) {
+                    Some((_, sig, doc)) => out.push(method(name, sig, doc)),
+                    None => out.push(method(name, String::new(), "")),
+                }
             }
         }
     }
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out.dedup_by(|a, b| a.label == b.label);
     out
+}
+
+/// The std method `name` of a value of type `t` (or the bundled `itertools`'s, on an iterator):
+/// the receiver as a hover names it, the signature with `t`'s arguments filled in, and a summary.
+fn std_show(t: &Ty, name: &str) -> Option<(String, String, &'static str)> {
+    crate::std_docs::show(t, name).or_else(|| {
+        if !matches!(t, Ty::Iter { .. } | Ty::Range(..)) {
+            return None;
+        }
+        let (_, args) = crate::std_docs::owners(t)?;
+        let d = crate::std_docs::lookup("Itertools", name)?;
+        Some((
+            crate::std_docs::receiver("Itertools", &args),
+            crate::std_docs::substitute(d.sig, &args),
+            d.doc,
+        ))
+    })
+}
+
+/// `text` with a bundled crate's prelude names replaced by the crate's own (`PgNodeIndex` is
+/// petgraph's `NodeIndex`).
+fn user_names(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(|c: char| c.is_alphanumeric() || c == '_') {
+        out.push_str(&rest[..i]);
+        let end = rest[i..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(rest.len(), |e| i + e);
+        let word = &rest[i..end];
+        out.push_str(crate::bundled::user_name(word).unwrap_or(word));
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The declaration of the function `name`: a free function (`ty` None), or a method of `ty`
+/// (from its impls, else from a trait declaring it).
+fn fn_decl(file: &SourceFile, ty: Option<&str>, name: &str) -> Option<ast::Fn> {
+    let mut in_trait = None;
+    for f in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .filter(|f| f.name().is_some_and(|n| n.text() == name))
+    {
+        let imp = f.syntax().ancestors().find_map(ast::Impl::cast);
+        let owner = imp.and_then(|i| crate::adt::impl_parts(&i).1);
+        let trait_decl = f.syntax().ancestors().any(|a| ast::Trait::can_cast(a.kind()));
+        match ty {
+            None if owner.is_none() && !trait_decl => return Some(f),
+            Some(t) if owner.as_deref() == Some(t) => return Some(f),
+            Some(_) if trait_decl && in_trait.is_none() => in_trait = Some(f),
+            _ => {}
+        }
+    }
+    in_trait
 }
 
 /// The std methods CarciniScript supports on each built-in type.

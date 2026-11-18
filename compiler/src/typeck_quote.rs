@@ -189,6 +189,7 @@ impl Checker<'_> {
             end,
             message: message.into(),
             severity: "error",
+            help: None,
         });
     }
 }

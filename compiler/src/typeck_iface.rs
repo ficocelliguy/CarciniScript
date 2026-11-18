@@ -97,9 +97,16 @@ impl Checker<'_> {
             }
             seen.push(key.clone());
             match f.expr() {
-                Some(e) => {
-                    self.check(&e, &field.ty);
-                }
+                Some(e) => match &field.ty {
+                    // (A union-typed field takes any variant's payload: `desired_sell_price: 5.0`.)
+                    Ty::Extern(n) if self.bindings.is_enum(n) => {
+                        let n = n.clone();
+                        self.check_enum_arg(&e, &n);
+                    }
+                    _ => {
+                        self.check(&e, &field.ty);
+                    }
+                },
                 None => match self.lookup(fname.text().to_string().as_str()).cloned() {
                     Some(local) => {
                         if !self.unify(&local.ty, &field.ty)
@@ -166,5 +173,188 @@ impl Checker<'_> {
             self.error(c.syntax(), msg);
         }
         Some(Ty::Extern(name.to_string()))
+    }
+}
+
+// ------------------------------------------------------------ bindings enums (TS unions)
+
+impl Checker<'_> {
+    /// A bindings enum named by a two-segment path (`ScriptArg::Str`), when the file doesn't
+    /// declare a type of that name itself.
+    fn extern_enum<'b>(&self, b: &'b std::rc::Rc<crate::bindings::Bindings>, segs: &[String]) -> Option<(&'b crate::bindings::ExternType, String, String)> {
+        let [e, v] = segs else { return None };
+        if self.adts.defs.contains_key(e) {
+            return None;
+        }
+        let et = b.enum_of(e)?;
+        Some((et, e.clone(), v.clone()))
+    }
+
+    /// `ScriptArg::Str(s)` as a pattern: the subject is the enum, the field the variant's
+    /// payload. False when the pattern names no bindings enum.
+    pub(super) fn extern_enum_pat(&mut self, p: &ast::Pat, expected: &Ty) -> bool {
+        let ast::Pat::TupleStructPat(tp) = p else {
+            return false;
+        };
+        let b = self.bindings.clone();
+        let Some((et, e, v)) = self.extern_enum(&b, &super::adt_check::path_segs(tp.path())) else {
+            return false;
+        };
+        let Some((_, variant)) = et.variant(&v) else {
+            let hint = crate::bindings::suggest(&v, et.variants.iter().map(|x| &x.name))
+                .map(|s| format!("; did you mean `{s}`?"))
+                .unwrap_or_default();
+            self.error(
+                p.syntax(),
+                format!("no variant named `{v}` found for enum `{e}`{hint}"),
+            );
+            for f in tp.fields() {
+                self.pat(&f, &Ty::Unknown);
+            }
+            return true;
+        };
+        if !self.unify(expected, &Ty::Extern(e.clone())) {
+            let msg = format!(
+                "mismatched types: expected `{}`, found `{e}`",
+                self.describe(expected)
+            );
+            self.error(p.syntax(), msg);
+        }
+        let fields: Vec<ast::Pat> = tp.fields().collect();
+        match fields.as_slice() {
+            [f] if !matches!(f, ast::Pat::RestPat(_)) => {
+                let payload = variant.payload.clone();
+                self.pat(f, &payload);
+            }
+            [] | [ast::Pat::RestPat(_)] => {}
+            _ => {
+                let msg = format!(
+                    "this pattern has {} fields, but the corresponding tuple variant `{e}::{v}` has 1 field",
+                    fields.len()
+                );
+                self.error(p.syntax(), msg);
+                for f in &fields {
+                    self.pat(f, &Ty::Unknown);
+                }
+            }
+        }
+        true
+    }
+
+    /// Exhaustiveness: a bindings enum's variant pattern as a constructor over its payload.
+    pub(super) fn extern_enum_abstract(&self, p: &ast::Pat) -> Option<Vec<super::Ap>> {
+        let ast::Pat::TupleStructPat(tp) = p else {
+            return None;
+        };
+        let b = self.bindings.clone();
+        let (et, _, v) = self.extern_enum(&b, &super::adt_check::path_segs(tp.path()))?;
+        let (idx, _) = et.variant(&v)?;
+        let sub = match tp.fields().next() {
+            Some(f) if !matches!(f, ast::Pat::RestPat(_)) => self.abstract_pat(&f),
+            _ => vec![super::Ap::Wild],
+        };
+        Some(sub.into_iter().map(|a| super::Ap::Ctor(idx, vec![a])).collect())
+    }
+
+    /// `ScriptArg::Str("x")` (the payload is the value), `ScriptArg::try_from(v)` (a
+    /// `Result<ScriptArg, JsValue>`: `Err` when the JS value fits no variant).
+    pub(super) fn extern_enum_call(
+        &mut self,
+        c: &ast::CallExpr,
+        segs: &[String],
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        let b = self.bindings.clone();
+        let (et, e, v) = self.extern_enum(&b, segs)?;
+        if v == "try_from" {
+            self.arg_count(c.syntax(), "function", 1, args.len());
+            if let Some(a) = args.first() {
+                self.infer(a, None);
+            }
+            return Some(Ty::Result(
+                Box::new(Ty::Extern(e)),
+                Box::new(Ty::Extern("JsValue".into())),
+            ));
+        }
+        let Some((_, variant)) = et.variant(&v) else {
+            let hint = crate::bindings::suggest(&v, et.variants.iter().map(|x| &x.name))
+                .map(|s| format!("; did you mean `{s}`?"))
+                .unwrap_or_default();
+            self.error(
+                c.syntax(),
+                format!("no variant or associated item named `{v}` found for enum `{e}`{hint}"),
+            );
+            for a in args {
+                self.infer(a, None);
+            }
+            return Some(Ty::Unknown);
+        };
+        self.arg_count(c.syntax(), "function", 1, args.len());
+        if let Some(a) = args.first() {
+            let payload = variant.payload.clone();
+            self.check_payload(a, &payload);
+        }
+        Some(Ty::Extern(e))
+    }
+
+    /// An argument for a variant's payload: as `check`, with an integer literal for an `f64`
+    /// (every NS number is `f64`).
+    fn check_payload(&mut self, a: &ast::Expr, payload: &Ty) {
+        if matches!(payload, Ty::Float { .. }) && super::is_int_literal(a) {
+            self.record(a.syntax(), payload.clone());
+        } else {
+            self.check(a, payload);
+        }
+    }
+
+    /// An argument (or field value) where a bindings enum is expected: the enum itself, or any
+    /// variant's payload directly (`ns.run("x.rs", 4, "n00dles")`: the representation is the
+    /// payload, so nothing converts). Reports a mismatch otherwise.
+    pub(super) fn check_enum_arg(&mut self, a: &ast::Expr, name: &str) {
+        let b = self.bindings.clone();
+        let Some(et) = b.enum_of(name) else {
+            self.check(a, &Ty::Extern(name.to_string()));
+            return;
+        };
+        let has_float = et.variants.iter().any(|v| matches!(v.payload, Ty::Float { .. }));
+        if has_float && super::is_int_literal(a) {
+            self.record(a.syntax(), Ty::Float { f32: false });
+            return;
+        }
+        let t = self.infer(a, None);
+        let found = self.shallow(&t);
+        if matches!(&found, Ty::Extern(n) if n == name || n == "JsValue") || matches!(found, Ty::Unknown | Ty::Never) {
+            return;
+        }
+        // (Deliberate extension, as for `f64` parameters: an integer that is a JS number, `ns.exec(..,
+        // threads, batch_id)`, is a number to the game.)
+        if has_float && matches!(found, Ty::Int(k) if !k.is_big()) {
+            return;
+        }
+        // (An unsettled literal: a number for an `f64` payload, else the first payload it fits.)
+        if let Ty::Var(_) = found {
+            let kind = self.var_kind(&t);
+            if kind == Some(super::VarKind::Int) || kind == Some(super::VarKind::Float) {
+                if has_float {
+                    self.unify(&t, &Ty::Float { f32: false });
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+        for v in &et.variants {
+            if self.could_be(&found, &v.payload) || self.iface_coerces(&found, &v.payload) {
+                self.unify(&t, &v.payload);
+                return;
+            }
+        }
+        let shown: Vec<String> = et.variants.iter().map(|v| format!("`{}`", v.shown)).collect();
+        let msg = format!(
+            "mismatched types: expected `{name}` (a {}), found `{}`",
+            super::adt_check::join_or(&shown),
+            self.describe(&found)
+        );
+        self.error(a.syntax(), msg);
     }
 }

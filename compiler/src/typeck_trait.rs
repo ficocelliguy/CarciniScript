@@ -591,6 +591,8 @@ impl Checker<'_> {
                                 mutable: sp.amp_token().is_none() && sp.mut_token().is_some(),
                                 deferred: false,
                                 reference: sp.amp_token().map(|_| sp.mut_token().is_some()),
+                                owned: false,
+                                js: false,
                                 decl: None,
                             },
                         ))
@@ -1230,5 +1232,8 @@ pub fn subst_method(m: &Method, sub: &HashMap<String, Ty>) -> Method {
         into_params: m.into_params.clone(),
         impl_args: m.impl_args.clone(),
         type_params: m.type_params.clone(),
+        ref_params: m.ref_params.clone(),
+        ret_owned: m.ret_owned,
+        ret_mut_ref: m.ret_mut_ref,
     }
 }
