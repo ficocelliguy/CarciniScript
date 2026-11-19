@@ -358,6 +358,7 @@ impl<'a> Checker<'a> {
             pending_intos: Vec::new(),
             pending_try_intos: Vec::new(),
             std_fns: HashMap::new(),
+            std_type_imports: Default::default(),
             assoc_output: None,
             impl_assoc: HashMap::new(),
             param_trait_args: HashMap::new(),
@@ -855,6 +856,9 @@ struct Checker<'a> {
     pending_try_intos: Vec<(Ty, Ty, Ty, SyntaxNode, usize)>,
     /// std functions imported by name (`use std::cmp::max;`): name -> path after `std`.
     std_fns: HashMap<String, Vec<String>>,
+    /// std types imported by name (`use std::cell::UnsafeCell;`), modeled or not: an unknown
+    /// one is "not supported" rather than "cannot find".
+    std_type_imports: std::collections::HashSet<String>,
     /// `type Output = ..;` of the operator impl being declared.
     assoc_output: Option<Ty>,
     /// The `impl`'s associated types (`type Err = String;`), for `Self::Err` in its signatures.
@@ -876,6 +880,38 @@ struct Checker<'a> {
 }
 
 const USIZE: Ty = Ty::Int(IntKind::Usize);
+
+/// Std and prelude type names the checker knows, for "a type with a similar name exists" on a
+/// misspelled one (`Strng`, `Hashmap`).
+const KNOWN_STD_TYPES: &[&str] = &[
+    "String", "Vec", "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell", "HashMap",
+    "HashSet", "BTreeMap", "BTreeSet", "VecDeque", "BinaryHeap", "Ordering", "Duration",
+    "Instant", "PathBuf", "Cow", "PhantomData", "usize", "isize", "u8", "u16", "u32", "u64",
+    "u128", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "char", "str",
+];
+
+/// Standard library types the checker has no model for, so a bare name (brought in by a `use`
+/// the checker didn't keep) is "not supported" rather than "cannot find".
+fn is_unmodeled_std_type(name: &str) -> bool {
+    matches!(
+        name,
+        "UnsafeCell"
+            | "ManuallyDrop"
+            | "MaybeUninit"
+            | "NonNull"
+            | "PhantomPinned"
+            | "Condvar"
+            | "Barrier"
+            | "Once"
+            | "Weak"
+            | "JoinHandle"
+            | "Thread"
+            | "TcpStream"
+            | "TcpListener"
+            | "UdpSocket"
+            | "AtomicPtr"
+    )
+}
 
 impl<'a> Checker<'a> {
     // ------------------------------------------------------------ positions & diagnostics
@@ -1817,27 +1853,122 @@ impl<'a> Checker<'a> {
                 }
                 let ty = Ty::from_name(&name);
                 if ty == Ty::Unknown {
-                    self.error(
-                        t.syntax(),
-                        format!(
-                            "type `{}` is not supported yet (planned for phase 1)",
-                            t.syntax().text()
-                        ),
-                    );
+                    self.unknown_type_error(t, &name);
                 }
                 ty
             }
+            // `impl Display` / `dyn Tr` of a trait the checker has no model for, `for<'a> ..`.
             _ => {
                 self.error(
                     t.syntax(),
-                    format!(
-                        "type `{}` is not supported yet (planned for phase 1)",
-                        t.syntax().text()
-                    ),
+                    format!("`{}` types are not supported yet", t.syntax().text()),
                 );
                 Ty::Unknown
             }
         }
+    }
+
+    /// `let x: Foo = ..` with no `Foo` in scope: rustc's E0412, with a close name suggested
+    /// (`Foo2`, or a std type's). A standard library type the checker has no model for
+    /// (`std::cell::UnsafeCell<i32>`, or `UnsafeCell` imported by name) is unsupported, named.
+    fn unknown_type_error(&mut self, t: &ast::Type, name: &str) {
+        let text = t.syntax().text().to_string();
+        let first = text
+            .split(|c: char| c == ':' || c == '<' || c == '(')
+            .next()
+            .unwrap_or("");
+        if matches!(first, "std" | "core" | "alloc")
+            || self.std_type_imports.contains(name)
+            || is_unmodeled_std_type(name)
+        {
+            let msg = format!("the standard library type `{text}` is not supported yet");
+            self.error(t.syntax(), msg);
+            return;
+        }
+        let hint = self
+            .similar_type_name(name, true)
+            .map(|(kind, s)| format!(" (a {kind} with a similar name exists: `{s}`)"))
+            .unwrap_or_default();
+        self.error(t.syntax(), format!("cannot find type `{name}` in this scope{hint}"));
+    }
+
+    /// The closest name to `name` among the file's structs, enums, type aliases and type
+    /// parameters (and, with `std`, the std types the checker knows), with what it is.
+    fn similar_type_name(&self, name: &str, std: bool) -> Option<(&'static str, String)> {
+        // (`T`: anything is two edits away.)
+        if name.len() < 3 {
+            return None;
+        }
+        let mut candidates: Vec<String> = self
+            .adts
+            .defs
+            .keys()
+            .chain(self.type_aliases.keys())
+            .chain(self.generics.keys())
+            .cloned()
+            .collect();
+        if std {
+            candidates.extend(KNOWN_STD_TYPES.iter().map(|s| s.to_string()));
+        }
+        let s = bindings::suggest(name, candidates.iter())?;
+        let kind = match self.adts.defs.get(&s) {
+            Some(d) if d.is_enum => "enum",
+            Some(_) => "struct",
+            None if self.type_aliases.contains_key(&s) => "type alias",
+            None if self.generics.contains_key(&s) => "type parameter",
+            None => "type",
+        };
+        Some((kind, s))
+    }
+
+    /// A value or function path the checker can't resolve (`what` is "value" or "function"): a
+    /// std path is an item it has no model for; `Stak::new()` under a type that isn't declared
+    /// but resembles one that is, rustc's E0433 with the name; `Stack::make()` under a declared
+    /// one names the missing item; anything else is E0425.
+    fn unresolved_path(&mut self, node: &SyntaxNode, what: &str, path: &str) {
+        let segs: Vec<&str> = path.split("::").collect();
+        let first = segs[0].split('<').next().unwrap_or("");
+        let last = segs[segs.len() - 1].split('<').next().unwrap_or("");
+        let under_type = segs.len() > 1 && first.starts_with(|c: char| c.is_ascii_uppercase());
+        let msg = if under_type
+            && !self.adts.defs.contains_key(first)
+            && (KNOWN_STD_TYPES.contains(&first) || Ty::from_name(first) != Ty::Unknown)
+        {
+            // `HashMap::neww()` / `Ordering::Lesss`: a std type the checker models, without that item.
+            let kind = match first {
+                "Option" | "Result" | "Ordering" => "enum",
+                _ => "struct",
+            };
+            let item = if what == "value" { "variant" } else { "function" };
+            format!(
+                "no {item} or associated item named `{last}` found for {kind} `{first}` in the current scope"
+            )
+        } else if matches!(first, "std" | "core" | "alloc")
+            || under_type
+                && (self.std_type_imports.contains(first) || is_unmodeled_std_type(first))
+        {
+            format!("the standard library {what} `{path}` is not supported yet")
+        } else if under_type && let Some(d) = self.adts.defs.get(first) {
+            let (kind, item) = match (d.is_enum, what) {
+                (true, "value") => ("enum", "variant"),
+                (true, _) => ("enum", "function"),
+                (false, _) => ("struct", "function"),
+            };
+            format!(
+                "no {item} or associated item named `{last}` found for {kind} `{first}` in the current scope"
+            )
+        } else if under_type
+            && !self.type_aliases.contains_key(first)
+            && !self.generics.contains_key(first)
+            && let Some((kind, s)) = self.similar_type_name(first, false)
+        {
+            format!(
+                "failed to resolve: use of undeclared type `{first}` (a {kind} with a similar name exists: `{s}`)"
+            )
+        } else {
+            format!("cannot find {what} `{path}` in this scope")
+        };
+        self.error(node, msg);
     }
 
     /// Whether `e` certainly owns its value, as rustc sees it: a local declared so, a value
@@ -2270,7 +2401,7 @@ impl<'a> Checker<'a> {
                 if let Ty::Param(p) = &t {
                     self.error(
                         &node,
-                        format!("`<{p} as {}>::{}(..)` on a type parameter isn't supported yet (planned for phase 4)", q.trait_name, q.method),
+                        format!("`<{p} as {}>::{}(..)` on a type parameter isn't supported yet", q.trait_name, q.method),
                     );
                     continue;
                 }
@@ -2313,7 +2444,12 @@ impl<'a> Checker<'a> {
             let t = if broke { value } else { t };
             return self.record(b.syntax(), t);
         }
-        if b.modifier().is_some() && !matches!(b.modifier(), Some(ast::BlockModifier::Unsafe(_))) {
+        if b.modifier().is_some()
+            && !matches!(
+                b.modifier(),
+                Some(ast::BlockModifier::Unsafe(_) | ast::BlockModifier::Const(_))
+            )
+        {
             return self.record(b.syntax(), Ty::Unknown); // async blocks: codegen reports
         }
         self.block_body(b, expected)
@@ -2551,10 +2687,17 @@ impl<'a> Checker<'a> {
             );
         }
         self.pat(&pat, &ty);
-        // `let Some(s) = net.find_mut("a") else { return };` (or `v.get_mut(0)`): `s` is a
-        // `&mut` into the collection, written through without `mut`.
-        if l.let_else().is_some()
-            && l.initializer().as_ref().is_some_and(|i| self.mut_ref_call(i))
+        // `let Some(ref mut n) = self.timer else { .. };` / `let (ref mut a, ref mut b) = pair;`
+        // / `let Some(n) = self.timer.as_mut() else { .. };`: as in `if let`, the bindings alias
+        // the place.
+        let through_mut = l
+            .initializer()
+            .is_some_and(|i| self.alias_place_bindings(Some(&i), &pat));
+        // `let Some(s) = net.find_mut("a") else { return };` (or `v.get_mut(0)`, `&mut pair`,
+        // `self.timer.as_mut()`): `s` is a `&mut` into the place, written through without `mut`.
+        if (through_mut
+            || l.let_else().is_some()
+                && l.initializer().as_ref().is_some_and(|i| self.mut_ref_call(i)))
             && let Some(scope) = self.scopes.last_mut()
         {
             for ip in pat.syntax().descendants().filter_map(ast::IdentPat::cast) {
@@ -2699,6 +2842,48 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `place.as_mut()` of an `Option` in a place (`self.timer.as_mut()`, `t.as_mut()`,
+    /// `v[i].as_mut()`): codegen emits the place itself for it, so a pattern against it can
+    /// alias the place.
+    pub(super) fn as_mut_of_place(&self, e: &ast::Expr) -> bool {
+        let ast::Expr::MethodCallExpr(m) = e else {
+            return false;
+        };
+        let Some(r) = m.receiver() else { return false };
+        m.name_ref().is_some_and(|n| n.text() == "as_mut")
+            && m.arg_list().is_none_or(|l| l.args().next().is_none())
+            && is_place_expr(&strip_parens(&r))
+            && self
+                .raw
+                .get(&self.range(r.syntax()))
+                .is_some_and(|t| matches!(self.zonk(t), Ty::Option(_)))
+    }
+
+    /// `*self.timer.as_mut().unwrap() += 1` / `let r = v[i].as_mut().unwrap();` of a number,
+    /// string or bool in a place: the call is a slot over the place (`κσ.$optSlot`, null for
+    /// `None`), as `get_mut`'s are, so the write reaches it. (Matched with `if let` / `match`,
+    /// the bindings alias the place instead: `mark_mut_ref_bindings`.) A local's slot needs the
+    /// local in a cell.
+    fn mark_as_mut_slot(&mut self, m: &ast::MethodCallExpr, inner: &Ty) {
+        let Some(recv) = m.receiver() else { return };
+        let recv = strip_parens(&recv);
+        if !is_place_expr(&recv)
+            || !unwrapped_position(m)
+            || !self.zonk(inner).is_js_primitive()
+        {
+            return;
+        }
+        if matches!(recv, ast::Expr::PathExpr(_)) {
+            self.box_if_needed(&recv);
+        }
+        let r = self.range(m.syntax());
+        self.slot_calls.insert(r);
+        if let Some(n) = slot_let_binding(m) {
+            let r = self.range(n.syntax());
+            self.slot_bindings.insert(r);
+        }
+    }
+
     /// Whether `e` was checked as a `&mut` iterator (`std::slice::IterMut`, `impl Iterator<Item =
     /// &mut T>`, a local holding `v.iter_mut()`).
     fn typed_mut_iter(&self, e: &ast::Expr) -> bool {
@@ -2707,11 +2892,12 @@ impl<'a> Checker<'a> {
             .is_some_and(|t| matches!(self.zonk(t), Ty::Iter { mutable: true, .. }))
     }
 
-    /// Bindings from a pattern matched against `map.get_mut(..)`, `v.last_mut()`, `&mut x` and
-    /// the like hold `&mut` references, so they can be mutated through without `mut`.
-    fn mark_mut_ref_bindings(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) {
-        // Matching on a place through `&mut` (`&mut x`, or `self` / a loop variable that is a
-        // `&mut` reference): bindings alias the matched place, so `*r += 1` writes back.
+    /// Bindings that alias the matched place rather than copy its value (codegen's
+    /// `emit_binds`): all of them when matching through `&mut` (`&mut x`, `self` / a loop
+    /// variable that is a `&mut` reference, `place.as_mut()`), so `*r += 1` writes back; the
+    /// `ref mut` ones when matching a place by value. Returns whether the match goes through
+    /// `&mut`. Also for `let` patterns (`let Some(ref mut n) = self.timer else { .. };`).
+    fn alias_place_bindings(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) -> bool {
         let through_place = match scrutinee.map(strip_parens) {
             Some(ast::Expr::RefExpr(r)) => r.mut_token().is_some(),
             Some(ast::Expr::PathExpr(p)) => p
@@ -2719,7 +2905,10 @@ impl<'a> Checker<'a> {
                 .and_then(|p| p.as_single_name_ref())
                 .and_then(|n| self.lookup(n.text().to_string().as_str()).cloned())
                 .is_some_and(|l| l.reference == Some(true)),
-            _ => false,
+            // `if let Some(n) = self.timer.as_mut()`: the `Option` in that place itself (codegen
+            // matches on the place), so `n` aliases it as it would through `&mut self.timer`.
+            Some(e) => self.as_mut_of_place(&e),
+            None => false,
         };
         if through_place {
             for ip in pat
@@ -2733,7 +2922,30 @@ impl<'a> Checker<'a> {
                     self.mut_bindings.insert(r);
                 }
             }
+        } else if scrutinee.map(strip_parens).is_some_and(|e| is_place_expr(&e)) {
+            // `match self.timer { Some(ref mut n) => *n -= 1, .. }`: a `ref mut` binding into a
+            // place (a field, an element, a local) aliases it, so the write reaches the place
+            // rather than a copy of the number.
+            for ip in pat
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_node())
+                .filter_map(ast::IdentPat::cast)
+                .filter(|ip| ip.ref_token().is_some() && ip.mut_token().is_some())
+            {
+                if let Some(n) = ip.name() {
+                    let r = self.range(n.syntax());
+                    self.mut_bindings.insert(r);
+                }
+            }
         }
+        through_place
+    }
+
+    /// Bindings from a pattern matched against `map.get_mut(..)`, `v.last_mut()`, `&mut x` and
+    /// the like hold `&mut` references, so they can be mutated through without `mut`.
+    fn mark_mut_ref_bindings(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) {
+        let through_place = self.alias_place_bindings(scrutinee, pat);
         let mut_source = through_place || scrutinee.is_some_and(|e| self.mut_ref_call(e));
         // `Some(x)` against a slot (`map.get_mut(..)` of numbers): `x` aliases the slot's value.
         if let Some(ast::Expr::MethodCallExpr(m)) = scrutinee.map(strip_parens)
@@ -4408,13 +4620,8 @@ impl<'a> Checker<'a> {
         if let Some(t) = self.jsvalue_path(&segs) {
             return t;
         }
-        self.error(
-            p.syntax(),
-            format!(
-                "cannot find value `{}` (paths are resolved in phase 2)",
-                path.syntax().text()
-            ),
-        );
+        let text = path.syntax().text().to_string();
+        self.unresolved_path(p.syntax(), "value", &text);
         Ty::Unknown
     }
 
@@ -5287,13 +5494,8 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
             _ => {
-                self.error(
-                    callee.syntax(),
-                    format!(
-                        "cannot find function `{}` (paths are resolved in phase 2)",
-                        path.syntax().text()
-                    ),
-                );
+                let text = path.syntax().text().to_string();
+                self.unresolved_path(callee.syntax(), "function", &text);
                 for a in &args {
                     self.infer(a, None);
                 }
@@ -6590,7 +6792,11 @@ impl<'a> Checker<'a> {
                         }
                         sig(self, &[], inner)
                     }
-                    "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" => sig(self, &[], t),
+                    "as_mut" => {
+                        self.mark_as_mut_slot(m, &inner);
+                        sig(self, &[], t)
+                    }
+                    "as_ref" | "as_deref" | "cloned" | "copied" => sig(self, &[], t),
                     // Zero or one item.
                     "iter" | "into_iter" | "iter_mut" => sig(
                         self,
@@ -6830,7 +7036,7 @@ impl<'a> Checker<'a> {
             (Ty::Iter { .. }, _) => {
                 self.error(
                     m.syntax(),
-                    format!("iterator adapters like `.{method}()` are not supported yet (planned for phase 1); use a `for` loop"),
+                    format!("the iterator adapter `.{method}()` is not supported yet; use a `for` loop"),
                 );
                 loose(self);
                 Ty::Unknown
@@ -8222,6 +8428,21 @@ pub(crate) fn strip_parens(e: &ast::Expr) -> ast::Expr {
     }
 }
 
+/// A place: a local, a field of one (`self.timer`, `a.b.c`) or an element (`v[i]`, `grid[r][c]`).
+pub(super) fn is_place_expr(e: &ast::Expr) -> bool {
+    match e {
+        // (`*o` of a `&mut` loop variable: the element it aliases.)
+        ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => {
+            p.expr().is_some_and(|i| is_place_expr(&i))
+        }
+        ast::Expr::PathExpr(p) => p.path().is_some_and(|p| p.as_single_name_ref().is_some()),
+        ast::Expr::ParenExpr(p) => p.expr().is_some_and(|i| is_place_expr(&i)),
+        ast::Expr::FieldExpr(f) => f.expr().is_some_and(|i| is_place_expr(&i)),
+        ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| is_place_expr(&b)),
+        _ => false,
+    }
+}
+
 /// `r` in `let r = v.get_mut(..).unwrap();`.
 fn slot_let_binding(m: &ast::MethodCallExpr) -> Option<ast::Name> {
     let u = ast::MethodCallExpr::cast(m.syntax().parent()?)?;
@@ -8263,6 +8484,20 @@ fn slot_position(m: &ast::MethodCallExpr) -> bool {
     if let Some(me) = ast::MatchExpr::cast(p.clone()) {
         return me.expr().is_some_and(|e| e.syntax() == &n);
     }
+    unwrapped_position(m)
+}
+
+/// Whether a call's result is unwrapped (`.unwrap()` / `.expect(..)`) right into a deref
+/// (`*v.get_mut(i).unwrap() += 1`) or a `let` (`let r = v.get_mut(i).unwrap();`).
+fn unwrapped_position(m: &ast::MethodCallExpr) -> bool {
+    let mut n = m.syntax().clone();
+    while let Some(p) = n
+        .parent()
+        .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+    {
+        n = p;
+    }
+    let Some(p) = n.parent() else { return false };
     if let Some(u) = ast::MethodCallExpr::cast(p)
         && u.receiver().is_some_and(|r| r.syntax() == &n)
         && u.name_ref()

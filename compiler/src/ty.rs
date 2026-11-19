@@ -1,5 +1,5 @@
-//! The spike's type lattice. Just enough to lower arithmetic, casts and formatting correctly;
-//! phase 1 replaces this with a real checker over prelude signatures.
+//! The type lattice the checker infers over and codegen lowers from: enough to lower
+//! arithmetic, casts and formatting correctly.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntKind {
@@ -245,7 +245,7 @@ pub enum Ty {
     Coll(Coll, Box<Ty>),
     /// A type-inference variable. Only exists inside the type checker; never reaches codegen.
     Var(u32),
-    /// No type information (e.g. NS return values until phase 2 bindings). Lowered with plain JS
+    /// No type information (e.g. an NS value without a binding, `JsValue`). Lowered with plain JS
     /// semantics.
     Unknown,
 }

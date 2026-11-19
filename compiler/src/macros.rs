@@ -4,6 +4,8 @@
 //! top-level commas and re-parse each argument from its source text, so the positions of the
 //! re-parsed nodes (offset by the argument's absolute start) agree between the two passes.
 
+use std::collections::HashMap;
+
 use ra_ap_syntax::{
     AstNode, AstToken, Edition, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxToken, T, ast,
 };
@@ -541,6 +543,18 @@ fn cfg_pred3(
     debug: bool,
     features_unknown: bool,
 ) -> Result<Option<bool>, String> {
+    let features = |_: &str| if features_unknown { None } else { Some(false) };
+    cfg_eval(toks, i, debug, &features)
+}
+
+/// The predicate at `toks[*i..]`, with each `feature = "x"` answered by `features("\"x\"")`
+/// (`None`: undecided, which `not` / `all` / `any` carry through as a third value).
+fn cfg_eval(
+    toks: &[String],
+    i: &mut usize,
+    debug: bool,
+    features: &dyn Fn(&str) -> Option<bool>,
+) -> Result<Option<bool>, String> {
     let name = toks.get(*i).ok_or("`cfg!` needs a predicate")?.clone();
     *i += 1;
     match name.as_str() {
@@ -551,7 +565,7 @@ fn cfg_pred3(
             *i += 1;
             let mut vals = Vec::new();
             while toks.get(*i).map(String::as_str) != Some(")") {
-                vals.push(cfg_pred3(toks, i, debug, features_unknown)?);
+                vals.push(cfg_eval(toks, i, debug, features)?);
                 if toks.get(*i).map(String::as_str) == Some(",") {
                     *i += 1;
                 }
@@ -582,18 +596,240 @@ fn cfg_pred3(
             }
             match (name.as_str(), value) {
                 ("debug_assertions", None) => Ok(Some(debug)),
-                ("feature", Some(_)) if features_unknown => Ok(None),
-                // `test`, features, and names nothing sets (`loom`, `fuzzing`, ..) are off.
+                ("feature", Some(v)) => Ok(features(&v)),
+                // `test`, and names nothing sets (`loom`, `fuzzing`, ..) are off.
                 _ => Ok(Some(false)),
             }
         }
     }
 }
 
+/// The `feature = ".."` values a predicate mentions (with their quotes), added to `out`.
+fn cfg_features(toks: &[String], out: &mut Vec<String>) {
+    for w in toks.windows(3) {
+        if w[0] == "feature" && w[1] == "=" && !out.contains(&w[2]) {
+            out.push(w[2].clone());
+        }
+    }
+}
+
+/// Whether two predicates are each other's negation however the features are set, so that
+/// exactly one of the two items they guard is ever compiled: `feature = "x"` and
+/// `not(feature = "x")`, or `all(feature = "std", not(feature = "ffi"))` and
+/// `any(not(feature = "std"), feature = "ffi")`.
+fn cfg_complementary(a: &[String], b: &[String], debug: bool) -> bool {
+    let mut feats = Vec::new();
+    cfg_features(a, &mut feats);
+    cfg_features(b, &mut feats);
+    if feats.len() > 8 {
+        return false;
+    }
+    (0..1u32 << feats.len()).all(|bits| {
+        let features = |f: &str| {
+            let k = feats.iter().position(|x| x == f)?;
+            Some(bits >> k & 1 == 1)
+        };
+        let eval = |t: &[String]| {
+            let mut i = 0;
+            match cfg_eval(t, &mut i, debug, &features) {
+                Ok(Some(v)) if i == t.len() => Some(v),
+                _ => None,
+            }
+        };
+        matches!((eval(a), eval(b)), (Some(x), Some(y)) if x != y)
+    })
+}
+
+/// How a node's own `#[cfg(..)]`s come out for a script, with features undecided.
+#[derive(Clone, Copy, PartialEq)]
+enum CfgState {
+    /// No `#[cfg]` at all.
+    Plain,
+    On,
+    Off,
+    /// Depends on a feature.
+    Undecided,
+}
+
+/// A node's `#[cfg]` state, whether it's on when every feature is off, and the tokens of its
+/// `#[cfg]` when it has exactly one.
+fn node_cfg(node: &ra_ap_syntax::SyntaxNode, debug: bool) -> (CfgState, bool, Option<Vec<String>>) {
+    let mut state = CfgState::Plain;
+    let mut all_off = true;
+    let mut cfgs = Vec::new();
+    for attr in node.children().filter_map(ast::Attr::cast) {
+        if attr.excl_token().is_some() {
+            continue;
+        }
+        let Some(toks) = attr_cfg_tokens(&attr) else {
+            continue;
+        };
+        let mut i = 0;
+        let v = match cfg_pred3(&toks, &mut i, debug, true) {
+            Ok(v) if i == toks.len() => v,
+            // Malformed: kept, as `strip_cfg` keeps it.
+            _ => Some(true),
+        };
+        let mut j = 0;
+        all_off &=
+            matches!(cfg_pred3(&toks, &mut j, debug, false), Ok(Some(true)) if j == toks.len());
+        state = match (state, v) {
+            (CfgState::Off, _) | (_, Some(false)) => CfgState::Off,
+            (CfgState::Undecided, _) | (_, None) => CfgState::Undecided,
+            _ => CfgState::On,
+        };
+        cfgs.push(toks);
+    }
+    let one = (cfgs.len() == 1).then(|| cfgs.remove(0));
+    (state, all_off, one)
+}
+
+/// What a node would collide with if a sibling of the same key were kept too: a named item
+/// (in its namespace), a field, a variant, or an `impl` with the same header (those collide
+/// only when both define an associated item of one name, see `assoc_names`).
+fn cfg_key(node: &ra_ap_syntax::SyntaxNode) -> Option<String> {
+    use ast::HasName;
+    fn named(space: &str, n: Option<ast::Name>) -> Option<String> {
+        n.map(|n| format!("{space} {}", n.text()))
+    }
+    if let Some(item) = ast::Item::cast(node.clone()) {
+        return match item {
+            ast::Item::Fn(x) => named("value", x.name()),
+            ast::Item::Const(x) => named("value", x.name()),
+            ast::Item::Static(x) => named("value", x.name()),
+            ast::Item::Struct(x) => named("type", x.name()),
+            ast::Item::Enum(x) => named("type", x.name()),
+            ast::Item::Union(x) => named("type", x.name()),
+            ast::Item::TypeAlias(x) => named("type", x.name()),
+            ast::Item::Trait(x) => named("type", x.name()),
+            ast::Item::Module(x) => named("mod", x.name()),
+            ast::Item::MacroRules(x) => named("macro", x.name()),
+            ast::Item::MacroDef(x) => named("macro", x.name()),
+            ast::Item::Impl(x) => {
+                // The header, without attributes, comments and whitespace.
+                let header: String = x
+                    .syntax()
+                    .children_with_tokens()
+                    .filter(|e| {
+                        !matches!(
+                            e.kind(),
+                            SyntaxKind::ATTR
+                                | SyntaxKind::ASSOC_ITEM_LIST
+                                | SyntaxKind::COMMENT
+                                | SyntaxKind::WHITESPACE
+                        )
+                    })
+                    .map(|e| e.to_string())
+                    .collect::<String>()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                Some(format!("impl {header}"))
+            }
+            _ => None,
+        };
+    }
+    if let Some(f) = ast::RecordField::cast(node.clone()) {
+        return named("field", f.name());
+    }
+    if let Some(v) = ast::Variant::cast(node.clone()) {
+        return named("variant", v.name());
+    }
+    None
+}
+
+/// The names an `impl` block defines.
+fn assoc_names(node: &ra_ap_syntax::SyntaxNode) -> Vec<String> {
+    use ast::HasName;
+    let Some(list) = ast::Impl::cast(node.clone()).and_then(|i| i.assoc_item_list()) else {
+        return Vec::new();
+    };
+    list.assoc_items()
+        .filter_map(|a| match a {
+            ast::AssocItem::Fn(f) => f.name(),
+            ast::AssocItem::Const(c) => c.name(),
+            ast::AssocItem::TypeAlias(t) => t.name(),
+            ast::AssocItem::MacroCall(_) => None,
+        })
+        .map(|n| n.text().to_string())
+        .collect()
+}
+
+/// A sibling that `strip_cfg` weighs an undecided node against.
+struct Alt {
+    node: ra_ap_syntax::SyntaxNode,
+    start: usize,
+    key: Option<String>,
+    state: CfgState,
+    all_off: bool,
+    cfg: Option<Vec<String>>,
+}
+
+/// Whether `node`, under the undecided `#[cfg]` `toks`, gives way to a sibling: one whose
+/// predicate is the complement of its own, or one of the same name (see `cfg_key`) that a
+/// script compiles instead. A script has no features, so of several same-named alternatives
+/// that depend on them, the ones on with every feature off win (`not(feature = "std")` over
+/// `feature = "std"`); when none is, or several are, the first written wins (the one rustc
+/// would compile with, say, only `--features std`, next to one that needs more).
+fn loses_to_alternative(
+    node: &ra_ap_syntax::SyntaxNode,
+    toks: &[String],
+    all_off: bool,
+    siblings: &[Alt],
+    debug: bool,
+) -> bool {
+    let start = usize::from(node.text_range().start());
+    let others = || siblings.iter().filter(|e| e.node != *node);
+    if !all_off
+        && others().any(|e| {
+            e.cfg
+                .as_deref()
+                .is_some_and(|t| cfg_complementary(toks, t, debug))
+        })
+    {
+        return true;
+    }
+    let Some(key) = cfg_key(node) else {
+        return false;
+    };
+    let is_impl = key.starts_with("impl ");
+    let mine = is_impl.then(|| assoc_names(node));
+    let rivals: Vec<&Alt> = others()
+        .filter(|e| e.key.as_deref() == Some(key.as_str()) && e.state != CfgState::Off)
+        .filter(|e| {
+            mine.as_ref()
+                .is_none_or(|mine| assoc_names(&e.node).iter().any(|n| mine.contains(n)))
+        })
+        .collect();
+    if rivals.is_empty() {
+        return false;
+    }
+    if rivals
+        .iter()
+        .any(|e| matches!(e.state, CfgState::Plain | CfgState::On))
+    {
+        return true;
+    }
+    let candidates = rivals
+        .iter()
+        .map(|e| (e.all_off, e.start))
+        .chain(std::iter::once((all_off, start)));
+    let winner = if all_off || rivals.iter().any(|e| e.all_off) {
+        candidates.filter(|c| c.0).map(|c| c.1).min()
+    } else {
+        candidates.map(|c| c.1).min()
+    };
+    winner != Some(start)
+}
+
 /// Blanks out (with spaces, so offsets stay put) every item, statement, field, variant, match
 /// arm or expression under a `#[cfg(..)]` that's off for a script, so `#[cfg(windows)] fn x`
 /// next to `#[cfg(not(windows))] fn x` leaves one `x`. Features count as unknown here (such
-/// items stay), as they may be on in the crate the code comes from.
+/// items stay), as they may be on in the crate the code comes from, except where two
+/// alternatives would both stay (`loses_to_alternative`): `#[cfg(feature = "x")] fn x` next
+/// to `#[cfg(not(feature = "x"))] fn x`, `all(feature = "std", not(feature = "ffi"))` next to
+/// `any(not(feature = "std"), feature = "ffi")`, or three `fn now()`s each under another
+/// combination of features.
 pub fn strip_cfg(text: &mut String) -> bool {
     if !text.contains("cfg(") {
         return false;
@@ -601,6 +837,7 @@ pub fn strip_cfg(text: &mut String) -> bool {
     let file = crate::macros::parse_tree(text);
     let debug = crate::codegen::overflow_checks();
     let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut scopes: HashMap<ra_ap_syntax::SyntaxNode, Vec<Alt>> = HashMap::new();
     for attr in file.syntax().descendants().filter_map(ast::Attr::cast) {
         if attr.excl_token().is_some() {
             continue;
@@ -611,33 +848,42 @@ pub fn strip_cfg(text: &mut String) -> bool {
         let mut i = 0;
         let val = cfg_pred3(&toks, &mut i, debug, true);
         let off = matches!(val, Ok(Some(false)) if i == toks.len());
-        // `#[cfg(feature = "x")] impl A {..}` next to `#[cfg(not(feature = "x"))] impl A {..}`:
-        // a script has no features, so the `not(..)` one stays.
-        let negated_twin = matches!(val, Ok(None)) && {
-            let mut negated = vec!["not".to_string(), "(".to_string()];
-            negated.extend(toks.iter().cloned());
-            negated.push(")".to_string());
-            attr.syntax()
-                .parent()
-                .and_then(|item| item.parent())
-                .is_some_and(|scope| {
-                    scope
-                        .descendants()
-                        .filter_map(ast::Attr::cast)
-                        .filter(|a| {
-                            a.syntax().parent().and_then(|p| p.parent()).as_ref() == Some(&scope)
-                        })
-                        .any(|a| attr_cfg_tokens(&a).is_some_and(|t| t == negated))
-                })
-        };
-        if !off && !negated_twin {
-            continue;
-        }
+        let undecided = matches!(val, Ok(None)) && i == toks.len();
         let Some(node) = attr.syntax().parent() else {
             continue;
         };
         if node.kind() == SyntaxKind::SOURCE_FILE {
             continue;
+        }
+        if !off {
+            let Some(scope) = node.parent().filter(|_| undecided) else {
+                continue;
+            };
+            let siblings = scopes.entry(scope.clone()).or_insert_with(|| {
+                scope
+                    .children()
+                    .filter_map(|c| {
+                        let (state, all_off, cfg) = node_cfg(&c, debug);
+                        let key = cfg_key(&c);
+                        (state != CfgState::Plain || key.is_some()).then(|| Alt {
+                            start: usize::from(c.text_range().start()),
+                            node: c,
+                            key,
+                            state,
+                            all_off,
+                            cfg,
+                        })
+                    })
+                    .collect()
+            });
+            let mut j = 0;
+            let all_off = matches!(
+                cfg_pred3(&toks, &mut j, debug, false),
+                Ok(Some(true)) if j == toks.len()
+            );
+            if !loses_to_alternative(&node, &toks, all_off, siblings, debug) {
+                continue;
+            }
         }
         let r = node.text_range();
         let (a, mut b) = (usize::from(r.start()), usize::from(r.end()));

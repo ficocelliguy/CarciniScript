@@ -1033,7 +1033,10 @@ fn forwards(f: &ast::Fn) -> bool {
             },
             ast::Expr::BlockExpr(b)
                 if b.label().is_none()
-                    && matches!(b.modifier(), None | Some(ast::BlockModifier::Unsafe(_)))
+                    && matches!(
+                        b.modifier(),
+                        None | Some(ast::BlockModifier::Unsafe(_) | ast::BlockModifier::Const(_))
+                    )
                     && b.stmt_list()
                         .is_some_and(|l| l.statements().next().is_none()) =>
             {

@@ -551,6 +551,13 @@ function decodeMappings(mappings) {
 const rejected = [
   ["assign to immutable", "let x = 1;\n    x = 2;", "3:5 cannot assign twice to immutable variable `x`"],
   ["unsupported construct", "let v = vec![1];\n    let r = v.as_ptr();", "3:13 no method named `as_ptr`"],
+  ["an unknown type", "let x: Foo = 1;", "2:12 cannot find type `Foo` in this scope"],
+  ["a misspelled type", "}\nstruct Stack { n: i32 }\nfn f() {\n    let s: Stak = Stack { n: 1 };", "5:12 cannot find type `Stak` in this scope (a struct with a similar name exists: `Stack`)"],
+  ["a misspelled std type", "let s: Strng = String::new();", "2:12 cannot find type `Strng` in this scope (a type with a similar name exists: `String`)"],
+  ["a std function the compiler doesn't model", "let c = std::cell::UnsafeCell::new(1);", "2:13 the standard library function `std::cell::UnsafeCell::new` is not supported yet"],
+  ["a std type the compiler doesn't model, imported by name", "}\nuse std::cell::UnsafeCell;\nfn f() {\n    let c: UnsafeCell<i32> = UnsafeCell::new(1);", "5:12 the standard library type `UnsafeCell<i32>` is not supported yet"],
+  ["a constructor of a misspelled type", "}\nstruct Stack { n: i32 }\nfn f() {\n    let s = Stak::make();", "5:13 failed to resolve: use of undeclared type `Stak` (a struct with a similar name exists: `Stack`)"],
+  ["a missing associated function", "}\nstruct Stack { n: i32 }\nfn f() {\n    let s = Stack::make();", "5:13 no function or associated item named `make` found for struct `Stack` in the current scope"],
   [
     "element type inferred from a later push",
     "let mut v = Vec::new();\n    v.push(1u8);\n    v.push(\"x\");",

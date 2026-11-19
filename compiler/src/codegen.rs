@@ -388,7 +388,10 @@ fn hoists(n: &SyntaxNode) -> bool {
 /// A block that is just a tail expression with nothing to hoist, so it can become a JS expression.
 fn simple_tail(block: &ast::BlockExpr) -> Option<ast::Expr> {
     let list = block.stmt_list()?;
-    if list.statements().next().is_some() || block.label().is_some() || block.modifier().is_some() {
+    if list.statements().next().is_some()
+        || block.label().is_some()
+        || !matches!(block.modifier(), None | Some(ast::BlockModifier::Const(_)))
+    {
         return None;
     }
     let tail = list.tail_expr()?;
@@ -1010,11 +1013,8 @@ impl<'a> Codegen<'a> {
         self.diag_range(s, e, message.into(), "warning");
     }
 
-    fn unsupported(&mut self, n: &SyntaxNode, what: &str, phase: u8) {
-        self.error(
-            n,
-            format!("{what} is not supported yet (planned for phase {phase})"),
-        );
+    fn unsupported(&mut self, n: &SyntaxNode, what: &str) {
+        self.error(n, format!("{what} is not supported yet"));
     }
 
     /// `file:line:col` for panic messages, 1-based like rustc.
@@ -1598,12 +1598,7 @@ impl<'a> Codegen<'a> {
                         ast::Item::MacroRules(_) => "`macro_rules!`",
                         _ => "this item",
                     };
-                    let phase = if matches!(other, ast::Item::MacroRules(_)) {
-                        4
-                    } else {
-                        1
-                    };
-                    self.unsupported(other.syntax(), kind, phase);
+                    self.unsupported(other.syntax(), kind);
                 }
             }
         }
@@ -1713,7 +1708,7 @@ impl<'a> Codegen<'a> {
         let mut destructured: Vec<(ast::Pat, String)> = Vec::new();
         if let Some(pl) = f.param_list() {
             if let Some(sp) = pl.self_param() {
-                self.unsupported(sp.syntax(), "methods (`self` parameters)", 1);
+                self.unsupported(sp.syntax(), "methods (`self` parameters)");
             }
             for (p, ty) in pl.params().zip(param_tys) {
                 match p.pat() {
@@ -1876,13 +1871,16 @@ impl<'a> Codegen<'a> {
         dest: &Dest,
         expected: Option<&Ty>,
     ) -> Ty {
-        // (`unsafe { .. }` is an ordinary block in JS; an `async` one's body is emitted here by
-        // `emit_async_block`.)
+        // (`unsafe { .. }` and `const { .. }` are ordinary blocks in JS: a const block's value is
+        // computed when it's reached rather than at compile time, which only moves the work; an
+        // `async` one's body is emitted here by `emit_async_block`.)
         let async_body = std::mem::take(&mut self.async_body);
         if let Some(m) = block.modifier()
             && !matches!(
                 m,
-                ast::BlockModifier::Label(_) | ast::BlockModifier::Unsafe(_)
+                ast::BlockModifier::Label(_)
+                    | ast::BlockModifier::Unsafe(_)
+                    | ast::BlockModifier::Const(_)
             )
             && !(async_body && matches!(m, ast::BlockModifier::Async(_)))
         {
@@ -1891,12 +1889,7 @@ impl<'a> Codegen<'a> {
                 ast::BlockModifier::Unsafe(_) => "`unsafe` blocks",
                 _ => "this block kind",
             };
-            let phase = if matches!(m, ast::BlockModifier::Async(_)) {
-                1
-            } else {
-                4
-            };
-            self.unsupported(block.syntax(), what, phase);
+            self.unsupported(block.syntax(), what);
             return Ty::Unknown;
         }
         let Some(list) = block.stmt_list() else {
@@ -2237,7 +2230,7 @@ impl<'a> Codegen<'a> {
             }
             Some(ast::Pat::WildcardPat(_)) => (None, false),
             Some(other) => {
-                self.unsupported(other.syntax(), "destructuring `let` patterns", 1);
+                self.unsupported(other.syntax(), "destructuring `let` patterns");
                 return;
             }
             None => return,
@@ -2884,7 +2877,7 @@ impl<'a> Codegen<'a> {
             _ => return self.emit_for_vec(f, &iterable, &label),
         };
         let (Some(lo), Some(hi)) = (range.start(), range.end()) else {
-            self.unsupported(range.syntax(), "open-ended ranges", 1);
+            self.unsupported(range.syntax(), "open-ended ranges");
             return;
         };
         let inclusive = range.op_kind() == Some(RangeOp::Inclusive);
@@ -2900,7 +2893,7 @@ impl<'a> Codegen<'a> {
             }
             Some(ast::Pat::WildcardPat(_)) => ("_".to_string(), None),
             Some(other) => {
-                self.unsupported(other.syntax(), "destructuring `for` patterns", 1);
+                self.unsupported(other.syntax(), "destructuring `for` patterns");
                 self.scopes.pop();
                 return;
             }
@@ -3144,7 +3137,7 @@ impl<'a> Codegen<'a> {
                     | Ty::Unknown
             )
         {
-            self.unsupported(iterable.syntax(), "`for` over this iterator", 1);
+            self.unsupported(iterable.syntax(), "`for` over this iterator");
             return;
         }
         let Some(pat) = f.pat() else { return };
@@ -3573,14 +3566,14 @@ impl<'a> Codegen<'a> {
                 (Frag::text("undefined"), Ty::Unit)
             }
             other => {
-                let (what, phase) = match other {
-                    ast::Expr::MatchExpr(_) => ("`match`", 1),
-                    ast::Expr::ClosureExpr(_) => ("closures", 1),
-                    ast::Expr::TupleExpr(_) => ("tuples", 1),
-                    ast::Expr::RecordExpr(_) => ("struct literals", 1),
-                    _ => ("this expression", 1),
+                let what = match other {
+                    ast::Expr::MatchExpr(_) => "`match`",
+                    ast::Expr::ClosureExpr(_) => "closures",
+                    ast::Expr::TupleExpr(_) => "tuples",
+                    ast::Expr::RecordExpr(_) => "struct literals",
+                    _ => "this expression",
                 };
-                self.unsupported(other.syntax(), what, phase);
+                self.unsupported(other.syntax(), what);
                 (Frag::text("undefined"), Ty::Unknown)
             }
         }
@@ -3661,7 +3654,7 @@ impl<'a> Codegen<'a> {
                 )
             }
             _ => {
-                self.unsupported(l.syntax(), "byte strings and C strings", 4);
+                self.unsupported(l.syntax(), "byte strings and C strings");
                 (Frag::text("undefined"), Ty::Unknown)
             }
         }
@@ -3854,13 +3847,15 @@ impl<'a> Codegen<'a> {
         if let Some(r) = self.emit_jsvalue_path(&segs) {
             return r;
         }
-        self.error(
-            p.syntax(),
-            format!(
-                "cannot find value `{}` (paths are resolved in phase 2)",
-                path.syntax().text()
-            ),
-        );
+        if !self.type_errors {
+            self.error(
+                p.syntax(),
+                format!(
+                    "cannot find value `{}` in this scope",
+                    path.syntax().text()
+                ),
+            );
+        }
         (Frag::text("undefined"), Ty::Unknown)
     }
 
@@ -4042,7 +4037,7 @@ impl<'a> Codegen<'a> {
                     _ => false,
                 };
                 if !assignable {
-                    self.unsupported(lhs.syntax(), "assignment to this place", 1);
+                    self.unsupported(lhs.syntax(), "assignment to this place");
                 }
                 let (lf, lt) = match &lhs {
                     // Destructuring targets are places, so no copies: `[a, b] = ...`.
@@ -4860,10 +4855,13 @@ impl<'a> Codegen<'a> {
                 .expr()
                 .map(|e| e.syntax().clone())
                 .unwrap_or_else(|| c.syntax().clone());
-            self.error(
-                &callee,
-                format!("cannot find function `{name}` in this scope"),
-            );
+            // (The type checker reported it, with the closer name or the std item.)
+            if !self.type_errors {
+                self.error(
+                    &callee,
+                    format!("cannot find function `{name}` in this scope"),
+                );
+            }
             return (Frag::text("undefined"), Ty::Unknown);
         };
         let (js, params, ret, is_async, writeback) = (
@@ -5647,13 +5645,15 @@ impl<'a> Codegen<'a> {
             // A `js` type's missing associated function: the type checker said so.
             [.., t, _] if bindings::is_js_type(t) => (Frag::text("undefined"), Ty::Unknown),
             _ => {
-                self.error(
-                    callee.syntax(),
-                    format!(
-                        "cannot find function `{}` (paths are resolved in phase 2)",
-                        path.syntax().text()
-                    ),
-                );
+                if !self.type_errors {
+                    self.error(
+                        callee.syntax(),
+                        format!(
+                            "cannot find function `{}` in this scope",
+                            path.syntax().text()
+                        ),
+                    );
+                }
                 (Frag::text("undefined"), Ty::Unknown)
             }
         }
@@ -5674,7 +5674,7 @@ impl<'a> Codegen<'a> {
                 f.append(Frag::mapped(self.off(name.syntax()), format!("[{i}]")));
                 return (f, ty);
             }
-            self.unsupported(fe.syntax(), "fields of this type", 1);
+            self.unsupported(fe.syntax(), "fields of this type");
         }
         match rt {
             Ty::Extern(type_name) => {
@@ -5885,7 +5885,7 @@ impl<'a> Codegen<'a> {
         };
         let lo_pure = r.start().is_none_or(|e| is_pure(&e));
         if !is_pure(&strip_refs(&base)) || !lo_pure {
-            self.unsupported(m.syntax(), "this in-place method on a range (assign the Vec and the range start to variables first)", 1);
+            self.unsupported(m.syntax(), "this in-place method on a range (assign the Vec and the range start to variables first)");
         }
         // The copy, with the usual range checks.
         let (copy, ty) = self.emit_index(ix);
@@ -6440,7 +6440,7 @@ impl<'a> Codegen<'a> {
             return self.emit_vec_method(m, rf, &elem, &method);
         }
 
-        // NS values are untyped until phase 2 bindings; NS numbers are f64, so assume that for
+        // NS values without a binding are untyped; NS numbers are f64, so assume that for
         // float-only method names.
         let rt = match rt {
             Ty::Unknown if is_float_method(&method) => Ty::Float { f32: false },
@@ -6617,7 +6617,7 @@ impl<'a> Codegen<'a> {
                 "push_str" | "push" => {
                     // Lowered as `s += x`, so the receiver must be an assignable JS place.
                     if !self.place_receiver(&recv) {
-                        self.unsupported(&node, "`push_str` on this expression", 1);
+                        self.unsupported(&node, "`push_str` on this expression");
                     }
                     let mut f = rf.clone();
                     f.push(" += ").append(a(0));
@@ -6625,7 +6625,7 @@ impl<'a> Codegen<'a> {
                 }
                 "write_str" | "write_char" => {
                     if !is_pure(&strip_refs(&recv)) {
-                        self.unsupported(&node, "`write_str` on this expression", 1);
+                        self.unsupported(&node, "`write_str` on this expression");
                     }
                     let mut f = Frag::text("(");
                     f.append(rf.clone())
@@ -6640,7 +6640,7 @@ impl<'a> Codegen<'a> {
                 }
                 "extend" => {
                     if !self.place_receiver(&recv) {
-                        self.unsupported(&node, "`extend` on this expression", 1);
+                        self.unsupported(&node, "`extend` on this expression");
                     }
                     let mut f = rf.clone();
                     f.push(" += Array.from(").append(a(0)).push(").join(\"\")");
@@ -6667,6 +6667,16 @@ impl<'a> Codegen<'a> {
     /// A name for the value being matched that's safe to repeat in conditions: the expression
     /// itself when it's pure, otherwise a `const` temporary.
     fn subject(&mut self, e: &ast::Expr) -> String {
+        // `if let Some(n) = self.timer.as_mut()`: the `Option` is the place's value, so match on
+        // the place (no temporary), and `n` aliases it (see `mark_mut_ref_bindings`).
+        if let ast::Expr::MethodCallExpr(m) = strip_parens_expr(e)
+            && m.name_ref().is_some_and(|n| n.text() == "as_mut")
+            && let Some(r) = m.receiver()
+            && is_pure(&r)
+            && matches!(self.ty_of(r.syntax()), Some(Ty::Option(_)))
+        {
+            return self.subject(&r);
+        }
         let (f, _) = self.emit_expr(e, None);
         // `match &prog[pc]` on a struct or enum: the element once, so the arms' tests don't
         // repeat the bounds check. (Bindings into its fields stay places of that same object.)
@@ -6788,7 +6798,7 @@ impl<'a> Codegen<'a> {
                                 cg.consts.get(n.text().to_string().as_str()).cloned()
                             });
                             let Some(js) = js else {
-                                cg.unsupported(ip.syntax(), "this range pattern bound", 1);
+                                cg.unsupported(ip.syntax(), "this range pattern bound");
                                 return None;
                             };
                             return Some(Frag::text(if is_char {
@@ -6805,7 +6815,7 @@ impl<'a> Codegen<'a> {
                                 (segs == ["char", "MAX"]).then(|| "\"\\u{10ffff}\"".to_string())
                             });
                             let Some(js) = js else {
-                                cg.unsupported(pp.syntax(), "this range pattern bound", 1);
+                                cg.unsupported(pp.syntax(), "this range pattern bound");
                                 return None;
                             };
                             return Some(Frag::text(if is_char {
@@ -6947,7 +6957,7 @@ impl<'a> Codegen<'a> {
                     ast::Pat::PathPat(_) => "constant and enum patterns",
                     _ => "this pattern",
                 };
-                self.unsupported(other.syntax(), what, 1);
+                self.unsupported(other.syntax(), what);
             }
         }
     }
@@ -7205,7 +7215,6 @@ impl<'a> Codegen<'a> {
                 self.unsupported(
                     m.syntax(),
                     &format!("`Option::{method}` on this expression"),
-                    1,
                 );
             }
             let f = self.option_fill(m, rf, inner, method);
@@ -7242,7 +7251,6 @@ impl<'a> Codegen<'a> {
                 cg.unsupported(
                     m.syntax(),
                     &format!("`Option::{method}` on this expression"),
-                    1,
                 );
             }
             let mut f = Frag::text("[");
@@ -7305,6 +7313,11 @@ impl<'a> Codegen<'a> {
             },
             "take" => (swap(self, Frag::text("null")), opt),
             "replace" => (swap(self, a(0)), opt),
+            // `*self.timer.as_mut().unwrap() += 1`: a slot over the place (null for `None`).
+            "as_mut" if self.types.slot_calls.contains(&self.range_of(m.syntax())) => {
+                let f = self.opt_slot(recv).unwrap_or(rf);
+                (f, opt)
+            }
             "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" | "upgrade" => (rf, opt),
             "flatten" => (
                 rf.wrap("κσ.$unsome(", ")"),
@@ -7532,6 +7545,43 @@ impl<'a> Codegen<'a> {
         Some(f)
     }
 
+    /// `κσ.$optSlot(..)` over the `Option` in the place `e`: a field, an element, or a local
+    /// (in a cell, or a loop's alias of an element) (see `typeck`'s `mark_as_mut_slot`).
+    fn opt_slot(&mut self, e: &ast::Expr) -> Option<Frag> {
+        match strip_parens_expr(e) {
+            ast::Expr::FieldExpr(fe) => {
+                let (b, n) = (fe.expr()?, fe.name_ref()?);
+                let (bf, _) = self.emit_expr(&b, None);
+                let key = js_string(&adt_gen::prop(n.text()));
+                let mut f = Frag::text("κσ.$optSlot(");
+                f.append(bf).push(format!(", {key}, null)"));
+                Some(f)
+            }
+            ast::Expr::IndexExpr(ix) => {
+                let (b, i) = (ix.base()?, ix.index()?);
+                let (bf, _) = self.emit_expr(&b, None);
+                let (xf, _) = self.emit_expr(&i, None);
+                let loc = js_string(&self.location(ix.syntax()));
+                let mut f = Frag::text("κσ.$optSlot(");
+                f.append(bf).push(", ").append(xf).push(format!(", {loc})"));
+                Some(f)
+            }
+            ast::Expr::PathExpr(p) => {
+                let name = p.path()?.as_single_name_ref()?;
+                let js = self.lookup(name.text())?.js.clone();
+                let cell = match js.strip_suffix("[0]") {
+                    Some(cell) => cell.to_string(),
+                    None if js.ends_with(']') || js.contains('.') => {
+                        format!("κσ.$cell(() => {js}, ($v) => {{ {js} = $v; }})")
+                    }
+                    None => return None,
+                };
+                Some(Frag::text(format!("κσ.$optSlot({cell}, 0, null)")))
+            }
+            _ => None,
+        }
+    }
+
     /// `entry_slot` for `*map.entry(..).or_insert(..)` (the deref is erased).
     fn entry_slot_of(&mut self, e: &ast::Expr) -> Option<Frag> {
         match e {
@@ -7598,7 +7648,7 @@ impl<'a> Codegen<'a> {
                 };
                 // (Values of a type defined elsewhere: the checker said so already.)
                 if !(*v == Ty::Unknown && self.type_errors && method != "entry") {
-                    self.unsupported(m.syntax(), &what, 1);
+                    self.unsupported(m.syntax(), &what);
                 }
                 (Frag::text("undefined"), Ty::Unknown)
             }
@@ -7713,7 +7763,6 @@ impl<'a> Codegen<'a> {
                 self.unsupported(
                     m.syntax(),
                     &format!("`.{method}()` outside a `for` loop"),
-                    1,
                 );
                 (Frag::text("undefined"), Ty::Unknown)
             }
@@ -8120,7 +8169,6 @@ impl<'a> Codegen<'a> {
                     self.unsupported(
                         m.syntax(),
                         &format!("`.{method}()` outside a `for` loop"),
-                        1,
                     );
                 }
                 (Frag::text("undefined"), Ty::Unknown)
@@ -8432,7 +8480,7 @@ impl<'a> Codegen<'a> {
                 (f, fmt_result)
             }
             _ => {
-                self.unsupported(mc.syntax(), &format!("macro `{name}!` (`macro_rules!`)"), 4);
+                self.unsupported(mc.syntax(), &format!("macro `{name}!` (`macro_rules!`)"));
                 (Frag::text("undefined"), Ty::Unknown)
             }
         }

@@ -3215,6 +3215,24 @@
         },
       };
     },
+    // `place.as_mut().unwrap()` of an `Option` of a number, string or bool in a field, an
+    // element or a cell: null when it's `None`, else a slot whose `[1]` reads and writes it.
+    $optSlot(o, k, loc) {
+      if (loc !== null && !(k >= 0 && k < o.length)) rt.$oob(o, k, loc);
+      if (o instanceof Deque) {
+        k = o.$p(k);
+        o = o.b;
+      }
+      if (o[k] == null) return null;
+      return {
+        get 1() {
+          return o[k];
+        },
+        set 1(v) {
+          o[k] = v;
+        },
+      };
+    },
     $vecSlot(a, i) {
       let j = i < 0 ? a.length + i : i;
       if (j < 0 || j >= a.length) return null;

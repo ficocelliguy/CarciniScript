@@ -59,7 +59,6 @@ impl Codegen<'_> {
             self.unsupported(
                 m.syntax(),
                 &format!("`String::{what}` on this expression"),
-                1,
             );
         }
         let mut f = Frag::text("(");
@@ -167,7 +166,6 @@ impl Codegen<'_> {
                     self.unsupported(
                         m.syntax(),
                         &format!("`String::{method}` on this expression"),
-                        1,
                     );
                 }
                 let mut f = Frag::text("(($r) => (");

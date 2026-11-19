@@ -788,6 +788,18 @@ impl Checker<'_> {
                         .insert(f.to_string(), vec!["rand".to_string(), f.to_string()]);
                 }
             }
+            // `use std::cell::UnsafeCell;`: a std type by name, modeled or not (an unknown one is
+            // then "not supported" rather than "cannot find").
+            ["std" | "core" | "alloc", .., t]
+                if t.starts_with(|ch: char| ch.is_ascii_uppercase()) =>
+            {
+                let alias = tree
+                    .rename()
+                    .and_then(|r| r.name())
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_else(|| t.to_string());
+                self.std_type_imports.insert(alias);
+            }
             // The `js` crate (`use js::{Date, JSON};`), serde's derives (accepted; `JSON` goes
             // by types, not traits), and the bundled crates' traits and types.
             [first, ..] if *first == "std" || super::crates::BUNDLED.contains(first) => {}

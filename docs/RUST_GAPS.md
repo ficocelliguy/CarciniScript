@@ -228,8 +228,6 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Exhaustiveness is approximate.** Catch-all arms, `true`/`false` and `None`/`Some(_)` are
   understood. Integer or char ranges that happen to cover a whole type still need a `_` arm, which
   rustc wouldn't require.
-- **`ref mut` bindings to primitives don't write back.** `Some(ref mut n) => *n += 1` changes a
-  copy. Write back through the original place (or use `take`/`replace`) instead.
 
 ## Strings
 
@@ -324,8 +322,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`cfg_if!` and `cfg` decide for a script**: features and every OS are off, so code that picks
   `#[cfg(windows)]` natively takes another branch here. The target is JS, described as rustc's
   `wasm32-unknown-unknown` but with `target_pointer_width = "64"` (`usize` is 64 bits here).
-  `#[cfg(feature = "..")]` items are kept (a crate's code may have the feature on), and
-  `#[cfg]`s inside macro arguments (`vec![#[cfg(x)] 1]`) aren't evaluated.
+  `#[cfg(feature = "..")]` items are kept (a crate's code may have the feature on), unless two
+  alternatives of one name would both stay: then the one on with every feature off is kept, or
+  the first written when none is (so a file that rustc builds only with some feature compiles
+  as with the first such feature set). `#[cfg]`s inside macro arguments (`vec![#[cfg(x)] 1]`)
+  aren't evaluated.
 - **Only their common surface of `rand` and `itertools`** (see FEATURES.md): no
   `itertools::iproduct!` / `izip!` macros, `minmax`, `exactly_one`, `fold_while`, `kmerge`.
 - **rand's distributions:** the built-in ones have `sample` / `sample_iter` methods but don't

@@ -1176,11 +1176,27 @@ number is the measured harm; the first is what a fix could touch.
     position (`it: impl Iterator<Item: Into<i64>>`) as a type parameter of the function
     (`Item = __Item0`, `__Item0: Into<i64>`) (`fixtures/assoc_type_bounds.rs`). Left alone:
     return position, `dyn`, nested bounds, and a subject that isn't a plain name
-- [ ] **Inline `const { .. }` blocks** (13 / 8 / 9): "this block kind is not supported yet".
-- [ ] **The same item under alternative `#[cfg]`s** (20 / 11 / 16, from "defined multiple
+- [x] **Inline `const { .. }` blocks** (13 / 8 / 9): "this block kind is not supported yet".
+  **Done (2026-11-18):** an ordinary block, like `unsafe { .. }` (the value is computed when the
+  block is reached rather than at compile time, which only moves the work): in expressions,
+  statements (`const { assert!(N > 0) };`), `[const { None }; N]` repeats (cloned per element as
+  any repeat), `static` initializers (`fixtures/const_blocks.rs`). The 13 files no longer hit it.
+- [x] **The same item under alternative `#[cfg]`s** (20 / 11 / 16, from "defined multiple
   times" / "duplicate definitions" on an item with a `#[cfg]`): combinations beyond `x` /
   `not(x)`, such as brotli's `#[cfg(any(not(feature = "std"), feature = "pass-through-ffi-panics"))]`
   next to its opposite, or anyhow's `#[cfg(any(feature = "std", not(anyhow_no_core_error)))]`.
+  **Done (2026-11-18):** `strip_cfg` weighs an item whose `#[cfg]` depends on a feature against
+  its siblings: one whose predicate is the logical complement over every feature setting
+  (`all(std, not(ffi))` next to `any(not(std), ffi)`) goes if it's off with no features; of
+  several of one name (items by namespace, fields, variants, `mod`s, methods of one impl,
+  `impl`s of one header that define one method), an unconditional or definitely-on sibling
+  wins, else those on with every feature off, else the first written (brotli's
+  `not(any(unsafe, not(std)))` next to `all(unsafe, std)`, which rustc with no features builds
+  neither of). 13 of the 20 corpus files are fixed; the rest aren't `#[cfg]` alternatives (jiff's and
+  zerocopy's hits were `#[cfg_attr]`s counted as `#[cfg]`s on names their `mod` files define
+  too, anyhow's `Chain` collides with the bundled anyhow, smallvec's `extend_from_slice` is a
+  specialization impl, bitvec's `pointer` is per-instantiation impls on marker types)
+  (`fixtures/cfg_alternatives.rs`, `js-node/cfg_first_alternative.rs`).
 - [ ] Smaller: your trait on a function pointer type (`impl Tr for fn() -> i32`, 1 file).
 
 Still uncategorized (1,814 file hits, none involving another file's names that the syntax step
@@ -1192,7 +1208,7 @@ operators on type parameters (41 + 28), a tuple-struct pattern of another crate'
 (`Bound::Included(&i)`, 39). Worth sorting next: several are probably std types the checker
 doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
 
-- [ ] **An unknown type is "not supported yet (planned for phase 1)".** `let x: Foo = 1;` with no
+- [x] **An unknown type is "not supported yet (planned for phase 1)".** `let x: Foo = 1;` with no
   `Foo` anywhere says "type `Foo` is not supported yet (planned for phase 1)" (`typeck.rs`, the
   two errors at the end of the path-type lowering). Phase 1 is done, and a typo or a missing
   `use` isn't a missing feature: rustc's E0412 is "cannot find type `Foo` in this scope", with a
@@ -1204,6 +1220,17 @@ doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
   "cannot find function `std::cell::UnsafeCell::new` (paths are resolved in phase 2)". (The
   opposite leniency: `HashMap::new()` with no `use std::collections::HashMap;` compiles, where
   rustc's E0433 asks for the import.)
+  **Done (2026-11-18):** "cannot find type `Foo` in this scope", with "(a struct with a similar
+  name exists: `Foo2`)" from the file's structs, enums, aliases, type parameters and the std
+  names the checker knows (`Strng` → `String`); a `std::` / `core::` path, a std name brought
+  in by `use`, or a std type the checker has no model for (`UnsafeCell`, `MaybeUninit`, ..) is
+  "the standard library type `..` is not supported yet". Paths the same way: "the standard
+  library function `std::mem::size_of::<u32>` is not supported yet", "failed to resolve: use of
+  undeclared type `Stak` (a struct with a similar name exists: `Stack`)", "no function or
+  associated item named `make` found for struct `Stack` in the current scope", else rustc's
+  "cannot find function `foo::bar` in this scope". `codegen.rs` `unsupported(..)`, the
+  `<T as Tr>::f(..)` and iterator-adapter messages no longer name a phase. (The
+  `HashMap::new()` leniency stays.)
 
 ### Std-library gaps
 
@@ -1321,13 +1348,24 @@ gaps document.
   `Option<&mut T>` with `T` not a number, string, bool or `Option`, which stay the slot gap); a
   `let` of such a call (also through `?`, `.unwrap()`, `.expect()`), and an `if let` / `match` /
   `let .. else` on one, bind a `&mut` (`fixtures/user_mut_ref_returns.rs`).
-- [ ] **2. Mutating an `Option<number>` field in place is silently a no-op or a crash**
+- [x] **2. Mutating an `Option<number>` field in place is silently a no-op or a crash**
   (crash undocumented). `if let Some(ref mut n) = self.timer { *n -= 1 }` and
   `match self.timer { Some(ref mut n) => .. }` change a copy (`RUST_GAPS.md`, "ref mut");
   `self.timer.as_mut()` (also in `for j in jobs.iter_mut() { if let Some(p) = j.pid.as_mut() .. }`)
   compiles and throws "Assignment to constant variable". Only `if let Some(n) = &mut self.timer`
   writes through. Compiles-but-wrong, the class `GAPS.md` ranks first. Fix: lower `ref mut` /
   `as_mut()` on a field's `Option` to the slot form `&mut self.timer` already uses.
+  **Done (2026-11-18):** `ref mut` bindings against a place (`match self.timer { Some(ref mut n)
+  => .. }`, `if let`, `let .. else`, `let (ref mut a, ref mut b) = pair;`) and every binding
+  against `place.as_mut()` of an `Option` alias the place, as those against `&mut self.timer`
+  already did (`alias_place_bindings` → codegen's `mut_bindings`; `as_mut()` is matched on the
+  place itself, no temporary). `*place.as_mut().unwrap() += 1` and `let r =
+  place.as_mut().unwrap();` of a number, string or bool are slot calls like `get_mut`'s
+  (`κσ.$optSlot`: null for `None`, else a slot over the place; a local goes into a cell).
+  Fields, nested fields, elements (`v[i]`, `grid[r][c]`, a `VecDeque`'s), locals and
+  `iter_mut()` loop variables (`fixtures/option_ref_mut.rs`). Still a copy, silently:
+  `as_mut()` passed on or mapped (`.as_mut().map(|n| *n += 1)`), as any `Option<&mut i32>`
+  value is.
 - [ ] **3. Cross-folder modules.** `mod x;` finds only a sibling `x.rs` or `x/mod.rs`
   (`typeck_mod.rs` `load_modules`); `#[path = "/lib/util.rs"]` is ignored, and `super::` doesn't
   work from a module file. A `/lib/` shared by scripts in `/hack/` and `/corp/`, the usual
