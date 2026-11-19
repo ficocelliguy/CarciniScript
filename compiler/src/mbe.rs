@@ -2053,9 +2053,12 @@ pub fn preprocess(src: &str) -> Result<Option<Preprocessed>, Vec<(usize, usize, 
 /// They go after `src`, so offsets in `src` stay put, and are dropped once expanded.
 /// `include_str!("path")` (and `include_bytes!`), read through the resolver that loads `mod`
 /// files, written in as a literal. (Found in the text, so also among other macros' arguments.)
+/// The path is from the directory of `filename` (or from the root as `/lib/words.txt`), else as
+/// written.
 fn include_strs(
     text: &mut String,
     map: &mut OffsetMap,
+    filename: &str,
     resolver: crate::typeck::Resolver,
 ) -> Result<bool, Vec<(usize, usize, String)>> {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
@@ -2093,8 +2096,8 @@ fn include_strs(
                 continue;
             };
             let b = text.len() - after.len();
-            match resolver(&path) {
-                Some(content) => {
+            match read_next_to(filename, &path, resolver) {
+                Some((_, content)) => {
                     let new = if name == "include_str" {
                         format!("{content:?}")
                     } else {
@@ -2275,23 +2278,34 @@ fn macro_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
 /// Its own `include!`s are read next to it (`include!("../data/mod.rs")` including
 /// `"tables.rs"` reads `../data/tables.rs`). A file that can't be read is left for `stdgaps`,
 /// which reports it.
+/// The file `path` names from `filename` (`include_str!("words.txt")`, `include!("a.rs")`): next
+/// to the file (`..` and `/from/root` as in `#[path]`), else, as earlier versions read it, by
+/// `path` as written.
+fn read_next_to(
+    filename: &str,
+    path: &str,
+    resolver: crate::typeck::Resolver,
+) -> Option<(String, String)> {
+    crate::typeck::relative_path(filename, path)
+        .and_then(|p| resolver(&p).map(|t| (p, t)))
+        .or_else(|| resolver(path).map(|t| (path.to_string(), t)))
+}
+
 fn include_items(
     text: &mut String,
     map: &mut OffsetMap,
+    filename: &str,
     resolver: crate::typeck::Resolver,
 ) -> bool {
-    fn inlined(src: &str, base: &str, resolver: crate::typeck::Resolver, depth: usize) -> String {
+    // `src` is the text of `file`, whose `include!`s are next to it.
+    fn inlined(src: &str, file: &str, resolver: crate::typeck::Resolver, depth: usize) -> String {
         let mut out = src.to_string();
         let mut edits = Vec::new();
         for (a, b, path) in include_calls(src) {
-            let full = format!("{base}{path}");
             if depth < 8
-                && let Some(content) = resolver(&full)
+                && let Some((full, content)) = read_next_to(file, &path, resolver)
             {
-                let dir = full
-                    .rfind('/')
-                    .map_or(String::new(), |k| full[..=k].to_string());
-                edits.push((a, b, inlined(&content, &dir, resolver, depth + 1)));
+                edits.push((a, b, inlined(&content, &full, resolver, depth + 1)));
             }
         }
         for (a, b, new) in edits.into_iter().rev() {
@@ -2301,13 +2315,10 @@ fn include_items(
     }
     let mut edits = Vec::new();
     for (a, b, path) in include_calls(text) {
-        let Some(content) = resolver(&path) else {
+        let Some((full, content)) = read_next_to(filename, &path, resolver) else {
             continue;
         };
-        let dir = path
-            .rfind('/')
-            .map_or(String::new(), |k| path[..=k].to_string());
-        edits.push((a, b, inlined(&content, &dir, resolver, 1)));
+        edits.push((a, b, inlined(&content, &full, resolver, 1)));
     }
     for (a, b, new) in edits.iter().rev() {
         text.replace_range(*a..*b, new);
@@ -2406,14 +2417,14 @@ pub fn preprocess_with(
     if let Some((filename, resolver)) = procs {
         // (`jsx!` components can be `pub fn`s of the `mod` files.)
         if text.contains("jsx!") {
-            crate::jsx::set_mod_sources(&text, resolver);
+            crate::jsx::set_mod_sources(&text, filename, resolver);
         }
         // `include_str!("words.txt")`: the file next to this one, as a string literal.
         if text.contains("include_str!") {
-            changed |= include_strs(&mut text, &mut map, resolver)?;
+            changed |= include_strs(&mut text, &mut map, filename, resolver)?;
         }
         // (`include!("tables.rs")` among the items may define and call macros.)
-        if text.contains("include!") && include_items(&mut text, &mut map, resolver) {
+        if text.contains("include!") && include_items(&mut text, &mut map, filename, resolver) {
             changed = true;
             crate::macros::strip_cfg(&mut text);
         }
@@ -2531,19 +2542,9 @@ fn crate_macros(src: &str, filename: &str, resolver: crate::typeck::Resolver) ->
         let macro_use = m
             .attrs()
             .any(|a| a.syntax().text().to_string().contains("macro_use"));
-        let stem = filename
-            .rsplit('/')
-            .next()
-            .and_then(|f| f.strip_suffix(".rs"))
-            .filter(|s| !matches!(*s, "mod" | "main" | "lib"));
-        let mut candidates = vec![
-            crate::typeck::module_path(filename, &n),
-            crate::typeck::module_path(filename, &format!("{n}/mod")),
-        ];
-        if let Some(st) = stem {
-            candidates.push(crate::typeck::module_path(filename, &format!("{st}/{n}")));
-        }
-        let Some(text) = candidates.iter().find_map(|p| resolver(p)) else {
+        let explicit = crate::typeck::path_attr(&m);
+        let candidates = crate::typeck::module_candidates(filename, &n, explicit.as_deref());
+        let Some(text) = candidates.iter().find_map(|(p, _)| resolver(p)) else {
             continue;
         };
         if !text.contains("macro_rules!") {
@@ -2635,20 +2636,11 @@ fn inherited_macros(filename: &str, resolver: crate::typeck::Resolver, depth: us
     }
     let mut out = inherited_macros(&parent, resolver, depth + 1);
     let file = crate::macros::parse_tree(&text);
-    let module_text = |n: &str| {
-        let stem = parent
-            .rsplit('/')
-            .next()
-            .and_then(|f| f.strip_suffix(".rs"))
-            .filter(|s| !matches!(*s, "mod" | "main" | "lib"));
-        let mut candidates = vec![
-            crate::typeck::module_path(&parent, n),
-            crate::typeck::module_path(&parent, &format!("{n}/mod")),
-        ];
-        if let Some(st) = stem {
-            candidates.push(crate::typeck::module_path(&parent, &format!("{st}/{n}")));
-        }
-        candidates.iter().find_map(|p| resolver(p))
+    let module_text = |m: &ast::Module, n: &str| {
+        let explicit = crate::typeck::path_attr(m);
+        crate::typeck::module_candidates(&parent, n, explicit.as_deref())
+            .iter()
+            .find_map(|(p, _)| resolver(p))
     };
     let mut before = true;
     for item in file.items() {
@@ -2664,7 +2656,7 @@ fn inherited_macros(filename: &str, resolver: crate::typeck::Resolver, depth: us
                 let macro_use = m
                     .attrs()
                     .any(|a| a.syntax().text().to_string().contains("macro_use"));
-                let Some(mt) = module_text(&n).filter(|t| t.contains("macro_rules!")) else {
+                let Some(mt) = module_text(m, &n).filter(|t| t.contains("macro_rules!")) else {
                     continue;
                 };
                 let module = crate::macros::parse_tree(&mt);

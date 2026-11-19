@@ -542,14 +542,17 @@ pub fn expand_inline_module_imports(
             _ => return None,
         };
         let mut cur = filename.to_string();
-        let mut src = None;
+        let mut src: Option<String> = None;
         let mut i = start;
         while i + 1 < segs.len() {
             let key = segs[start..=i].join("::");
             let found = srcs
                 .entry(key)
                 .or_insert_with(|| {
-                    crate::typeck::find_module(&cur, &segs[i], resolver).map(|(p, t, _)| (p, t))
+                    // (The `mod` is declared in `cur`, whose text has its `#[path]`.)
+                    let parent_text = src.as_deref().unwrap_or(text);
+                    crate::typeck::find_module_in(&cur, parent_text, &segs[i], resolver)
+                        .map(|(p, t, _)| (p, t))
                 })
                 .clone();
             let Some((p, t)) = found else { break };
@@ -771,13 +774,14 @@ pub fn expand_import_renames(
             return None;
         }
         let mut cur = filename.to_string();
-        let mut src = String::new();
+        let mut src: Option<String> = None;
         for m in mods {
-            let (p, t, _) = crate::typeck::find_module(&cur, m, resolver)?;
+            let parent_text = src.as_deref().unwrap_or(text);
+            let (p, t, _) = crate::typeck::find_module_in(&cur, parent_text, m, resolver)?;
             cur = p;
-            src = t;
+            src = Some(t);
         }
-        crate::typeck::pub_use_renames(&src).remove(name.as_str())
+        crate::typeck::pub_use_renames(&src?).remove(name.as_str())
     };
     let capital = crate::typeck::capitalized;
     // alias → (original name, its path); the original name → its paths.

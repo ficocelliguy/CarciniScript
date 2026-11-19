@@ -31,6 +31,7 @@ mod moves;
 mod nav;
 mod nested;
 mod procmacro;
+mod prune;
 pub mod service;
 mod sourcemap;
 mod std_docs;

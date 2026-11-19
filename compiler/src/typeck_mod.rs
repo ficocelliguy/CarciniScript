@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
     AstNode,
-    ast::{self, HasGenericParams, HasModuleItem, HasName, HasVisibility},
+    ast::{self, HasAttrs, HasGenericParams, HasModuleItem, HasName, HasVisibility},
 };
 
 use super::{Checker, FnSig};
@@ -112,30 +112,128 @@ pub fn module_path(current: &str, name: &str) -> String {
     }
 }
 
-/// The file of `mod n;` in `filename`: its path, text and import specifier. `n.rs` next to the
-/// file, else `n/mod.rs`, else (a module file's children live in a folder named after it)
-/// `geo/n.rs` next to `geo.rs`.
-pub fn find_module(
-    filename: &str,
-    n: &str,
-    resolver: Resolver,
-) -> Option<(String, String, String)> {
-    let flat = module_path(filename, n);
-    if let Some(t) = resolver(&flat) {
-        return Some((flat, t, format!("./{n}.rs")));
+/// `p` (a `#[path]` or `include_str!` argument) from the directory of `current`, as a path for
+/// the resolver (from the project root, like `current`), `.` and `..` folded: `../lib/util.rs`
+/// in `hack/main.rs` is `lib/util.rs`. A `/lib/util.rs` is from the root wherever `current` is.
+/// None when `..` climbs out of the root.
+pub fn relative_path(current: &str, p: &str) -> Option<String> {
+    let p = p.replace('\\', "/");
+    let mut parts: Vec<&str> = if p.starts_with('/') {
+        Vec::new()
+    } else {
+        match current.rfind('/') {
+            Some(i) => current[..i].split('/').collect(),
+            None => Vec::new(),
+        }
+    };
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
     }
-    let nested = module_path(filename, &format!("{n}/mod"));
-    if let Some(t) = resolver(&nested) {
-        return Some((nested, t, format!("./{n}/mod.rs")));
+    Some(parts.join("/"))
+}
+
+/// The import specifier of `#[path = "p"]`: `/lib/util.rs` as written (the host resolves it
+/// from the root, as Bitburner does its imports), a relative path from this file's directory as
+/// `./p`.
+fn path_specifier(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    if p.starts_with('/') || p.starts_with("./") || p.starts_with("../") {
+        p
+    } else {
+        format!("./{p}")
     }
+}
+
+/// The `#[path = "file.rs"]` of a `mod` item.
+pub fn path_attr(m: &ast::Module) -> Option<String> {
+    m.attrs().find_map(|a| {
+        let ast::Meta::KeyValueMeta(meta) = a.meta()? else {
+            return None;
+        };
+        if meta.path()?.syntax().text() != "path" {
+            return None;
+        }
+        match meta.expr()? {
+            ast::Expr::Literal(l) => match l.kind() {
+                ast::LiteralKind::String(s) => s.value().ok().map(|v| v.into_owned()),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+/// The `#[path]` of `mod n;` among the items of `text`.
+pub fn path_attr_in(text: &str, n: &str) -> Option<String> {
+    if !text.contains("#[path") {
+        return None;
+    }
+    let file = crate::macros::parse_tree(text);
+    file.items().find_map(|i| match i {
+        ast::Item::Module(m) if m.item_list().is_none() && m.name()?.text() == n => path_attr(&m),
+        _ => None,
+    })
+}
+
+/// Where `mod n;` in `filename` may live, each with its import specifier: its `#[path]` alone
+/// when it has one (`explicit`), else `n.rs` next to the file, `n/mod.rs`, and (a module file's
+/// children live in a folder named after it) `geo/n.rs` next to `geo.rs`.
+pub fn module_candidates(filename: &str, n: &str, explicit: Option<&str>) -> Vec<(String, String)> {
+    if let Some(p) = explicit {
+        return relative_path(filename, p)
+            .map(|r| (r, path_specifier(p)))
+            .into_iter()
+            .collect();
+    }
+    let mut out = vec![
+        (module_path(filename, n), format!("./{n}.rs")),
+        (
+            module_path(filename, &format!("{n}/mod")),
+            format!("./{n}/mod.rs"),
+        ),
+    ];
     let stem = filename
         .rsplit('/')
         .next()
         .and_then(|f| f.strip_suffix(".rs"))
-        .filter(|s| !matches!(*s, "mod" | "main" | "lib"))?;
-    let under = module_path(filename, &format!("{stem}/{n}"));
-    let t = resolver(&under)?;
-    Some((under, t, format!("./{stem}/{n}.rs")))
+        .filter(|s| !matches!(*s, "mod" | "main" | "lib"));
+    if let Some(stem) = stem {
+        out.push((
+            module_path(filename, &format!("{stem}/{n}")),
+            format!("./{stem}/{n}.rs"),
+        ));
+    }
+    out
+}
+
+/// The file of `mod n;` in `filename` (with `explicit` its `#[path]`, if any): its path, text
+/// and import specifier, the first of `module_candidates` the resolver has.
+pub fn find_module(
+    filename: &str,
+    n: &str,
+    explicit: Option<&str>,
+    resolver: Resolver,
+) -> Option<(String, String, String)> {
+    module_candidates(filename, n, explicit)
+        .into_iter()
+        .find_map(|(p, spec)| resolver(&p).map(|t| (p, t, spec)))
+}
+
+/// `find_module` for `mod n;` in the file `parent`, whose text is `parent_text` (where its
+/// `#[path]` would be).
+pub fn find_module_in(
+    parent: &str,
+    parent_text: &str,
+    n: &str,
+    resolver: Resolver,
+) -> Option<(String, String, String)> {
+    find_module(parent, n, path_attr_in(parent_text, n).as_deref(), resolver)
 }
 
 /// A type's, trait's or constant's name (`Point`, `MAX`, `__BenchFlags`), not a function's or
@@ -589,10 +687,33 @@ impl Checker<'_> {
                 );
                 continue;
             }
-            let nested = module_path(filename, &format!("{n}/mod"));
-            let (path, text, specifier) = match find_module(filename, &n, resolver) {
-                Some((path, text, specifier)) => (path, Some(text), specifier),
-                None => (module_path(filename, &n), None, String::new()),
+            let explicit = path_attr(m);
+            let candidates = module_candidates(filename, &n, explicit.as_deref());
+            let Some((path, text, specifier)) = candidates
+                .iter()
+                .find_map(|(p, s)| resolver(p).map(|t| (p.clone(), t, s.clone())))
+            else {
+                // (A `#[path]` is looked for on its own, like rustc; `..` past the root is
+                // nowhere.)
+                let looked: Vec<String> =
+                    candidates.iter().map(|(p, _)| format!("`{p}`")).collect();
+                let msg = match (explicit, looked.split_last()) {
+                    (Some(p), None) => {
+                        format!(
+                            "file not found for module `{n}` (`#[path = \"{p}\"]` leaves the project root)"
+                        )
+                    }
+                    (_, Some((last, []))) => {
+                        format!("file not found for module `{n}` (looked for {last})")
+                    }
+                    (_, Some((last, rest))) => format!(
+                        "file not found for module `{n}` (looked for {} and {last})",
+                        rest.join(", ")
+                    ),
+                    (None, None) => unreachable!(),
+                };
+                self.error(m.syntax(), msg);
+                continue;
             };
             if stack.contains(&path) {
                 self.error(
@@ -601,13 +722,6 @@ impl Checker<'_> {
                 );
                 continue;
             }
-            let Some(text) = text else {
-                self.error(
-                    m.syntax(),
-                    format!("file not found for module `{n}` (looked for `{path}` and `{nested}`)"),
-                );
-                continue;
-            };
             stack.push(path.clone());
             let exports = exports_of(&text, &path, resolver, stack);
             stack.pop();

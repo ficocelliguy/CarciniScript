@@ -9,8 +9,8 @@
 
   class CarciniPanic extends Error {
     constructor(message, location) {
-      super(`panicked at ${location}:\n${message}`);
-      this.name = "CarciniPanic";
+      super(`${location}: ${message}`);
+      this.name = "panic";
       this.panicMessage = message;
       this.location = location;
     }

@@ -31,7 +31,8 @@ export function initCarciniScriptSync(module) {
 
 /**
  * Compile Rust to an ES module. `resolve(path)` returns the source of another file, for `mod name;`
- * (which reads `name.rs` next to `filename`), or undefined when there's no such file.
+ * (which reads `name.rs` next to `filename`, or the file a `#[path]` names, from the directory of
+ * `filename` or from the root as `lib/util.rs`), or undefined when there is no such file.
  */
 export function compile(source, filename = "main.rs", resolve) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");

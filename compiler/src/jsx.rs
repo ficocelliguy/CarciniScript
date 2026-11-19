@@ -892,8 +892,9 @@ thread_local! {
     static MOD_SOURCES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The `mod name;` files of `text` (read with `resolver`), for components defined in them.
-pub(crate) fn set_mod_sources(text: &str, resolver: crate::typeck::Resolver) {
+/// The `mod name;` files of `text` (the file `filename`, read with `resolver`), for components
+/// defined in them.
+pub(crate) fn set_mod_sources(text: &str, filename: &str, resolver: crate::typeck::Resolver) {
     let file = crate::macros::parse_tree(text);
     let mut out = Vec::new();
     for m in file.syntax().descendants().filter_map(ast::Module::cast) {
@@ -903,8 +904,9 @@ pub(crate) fn set_mod_sources(text: &str, resolver: crate::typeck::Resolver) {
         let Some(name) = m.name().map(|n| n.text().to_string()) else {
             continue;
         };
-        if let Some(src) =
-            resolver(&format!("{name}.rs")).or_else(|| resolver(&format!("{name}/mod.rs")))
+        let explicit = crate::typeck::path_attr(&m);
+        if let Some((_, src, _)) =
+            crate::typeck::find_module(filename, &name, explicit.as_deref(), resolver)
         {
             out.push(src);
         }

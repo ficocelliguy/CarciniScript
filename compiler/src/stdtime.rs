@@ -50,13 +50,18 @@ pub(crate) fn has_word(text: &str, name: &str) -> bool {
 
 /// `text` with the preludes it needs after it, when it names their types and doesn't declare
 /// them itself.
-pub(crate) fn with_prelude(text: &str) -> Option<String> {
+pub(crate) fn with_prelude(
+    text: &str,
+    filename: &str,
+    resolver: crate::typeck::Resolver,
+    whole_impls: bool,
+) -> Option<String> {
     let declares = |name: &str| {
         ["struct", "enum", "type", "trait", "union"]
             .iter()
             .any(|kw| text.contains(&format!("{kw} {name}")))
     };
-    let mut out = String::new();
+    let mut out: Vec<&'static str> = Vec::new();
     // (After the rewrite: `chrono::NaiveDate` is `ChronoNaiveDate`, ..; its `TimeDelta::to_std`
     // needs `std::time::Duration`.)
     let chrono = [
@@ -88,31 +93,27 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
             .iter()
             .any(|n| declares(n))
     {
-        out.push('\n');
-        out.push_str(TIME);
+        out.push(TIME);
     }
     let cells = ["LazyLock", "LazyCell", "Lazy", "OnceLock", "OnceCell"];
     if cells.iter().any(|n| has_word(text, n))
         && !text.contains("// (sync prelude)")
         && !cells.iter().any(|n| declares(n))
     {
-        out.push('\n');
-        out.push_str(SYNC);
+        out.push(SYNC);
     }
     if has_word(text, "Either")
         && text.contains("either")
         && !text.contains("// (either prelude)")
         && !declares("Either")
     {
-        out.push('\n');
-        out.push_str(EITHER);
+        out.push(EITHER);
     }
     if text.contains("serde_json")
         && !text.contains("// (serde_json prelude)")
         && !declares("Value")
     {
-        out.push('\n');
-        out.push_str(SERDE_JSON);
+        out.push(SERDE_JSON);
     }
     // (After the rewrites: `regex::Error` is `RegexError`, `regex::escape` `__regex_escape`.)
     if (text.contains("regex::")
@@ -123,12 +124,10 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("mod regex")
         && !declares("Regex")
     {
-        out.push('\n');
-        out.push_str(REGEX);
+        out.push(REGEX);
     }
     if has_word(text, "Cow") && !text.contains("// (cow prelude)") && !declares("Cow") {
-        out.push('\n');
-        out.push_str(COW);
+        out.push(COW);
     }
     // (After the rewrite: `io::Error` is `IoError`, `io::stdout()` `__io_stdout()`, ..)
     let io_names = [
@@ -158,12 +157,10 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("// (io prelude)")
         && !declares("IoError")
     {
-        out.push('\n');
-        out.push_str(IO);
+        out.push(IO);
     }
     if crate::mbe::uses_log(text) && !text.contains("// (log prelude)") && !declares("LogLevel") {
-        out.push('\n');
-        out.push_str(LOG);
+        out.push(LOG);
     }
     // (After the rewrite: `num::Integer` is `NumInteger`, `num::integer::gcd` `__num_gcd`, ..)
     let num_names = [
@@ -177,13 +174,11 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         "__num_",
     ];
     if num_names.iter().any(|n| text.contains(n)) && !text.contains("// (num prelude)") {
-        out.push('\n');
-        out.push_str(NUM);
+        out.push(NUM);
     }
     let tokio_names = ["__tokio_", "TokioJoin"];
     if tokio_names.iter().any(|n| text.contains(n)) && !text.contains("// (tokio prelude)") {
-        out.push('\n');
-        out.push_str(TOKIO);
+        out.push(TOKIO);
     }
     // (After the rewrite: `rand_distr::Normal` is `RandNormal`, `Distribution` `RandDistribution`.)
     let rand_names = [
@@ -213,12 +208,10 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("// (rand_distr prelude)")
         && !declares("RandDistribution")
     {
-        out.push('\n');
-        out.push_str(RAND_DISTR);
+        out.push(RAND_DISTR);
     }
     if chrono {
-        out.push('\n');
-        out.push_str(CHRONO);
+        out.push(CHRONO);
     }
     // (After the rewrites: `jsx!` makes `__rx_h(..)` calls, `react::Node` is `ReactNode`, ..)
     let react_names = [
@@ -230,13 +223,11 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         "ReactIntoNode",
     ];
     if react_names.iter().any(|n| text.contains(n)) && !text.contains("// (react prelude)") {
-        out.push('\n');
-        out.push_str(REACT);
+        out.push(REACT);
     }
     // (After the rewrite: `hash_map::Entry` is `StdMapEntry`.)
     if text.contains("StdMapEntry") && !text.contains("// (map entry prelude)") {
-        out.push('\n');
-        out.push_str(ENTRY);
+        out.push(ENTRY);
     }
     // (After the derives and the rewrite: `clap::Command` is `ClapCommand`, ..)
     let clap_names = [
@@ -252,8 +243,7 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("// (clap prelude)")
         && !declares("ClapCommand")
     {
-        out.push('\n');
-        out.push_str(CLAP);
+        out.push(CLAP);
     }
     // (`use ordered_float::OrderedFloat as OF;` / `ordered_float::NotNan` are the names here.)
     if text.contains("ordered_float")
@@ -263,8 +253,7 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("// (ordered_float prelude)")
         && !declares("OrderedFloat")
     {
-        out.push('\n');
-        out.push_str(ORDERED_FLOAT);
+        out.push(ORDERED_FLOAT);
     }
     // (After the rewrites: `petgraph::Graph` is `PgGraph`, `dijkstra(&g, ..)` `(&g).__pg_dijkstra(..)`.)
     if (text.contains("Pg") || text.contains("__pg_"))
@@ -273,12 +262,10 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
             .any(|(_, n)| text.contains(n))
         && !text.contains("// (petgraph prelude)")
     {
-        out.push('\n');
-        out.push_str(PETGRAPH);
+        out.push(PETGRAPH);
     }
     if os {
-        out.push('\n');
-        out.push_str(OS);
+        out.push(OS);
     }
     // (After the rewrite: `std::net::IpAddr` is `NetIpAddr`, ..)
     if ["NetIp", "NetSocketAddr", "NetAddrParseError"]
@@ -287,8 +274,7 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("// (net prelude)")
         && !declares("NetIpAddr")
     {
-        out.push('\n');
-        out.push_str(NET);
+        out.push(NET);
     }
     // (After the rewrite: `std::task::Poll` is `TaskPoll`, `std::future::ready` `__future_ready`.)
     let task_names = [
@@ -304,10 +290,14 @@ pub(crate) fn with_prelude(text: &str) -> Option<String> {
         && !text.contains("// (task prelude)")
         && !declares("TaskPoll")
     {
-        out.push('\n');
-        out.push_str(TASK);
+        out.push(TASK);
     }
     // (`PhantomData`, `std::path`.)
-    out.push_str(&crate::stdgaps::preludes(text));
-    (!out.is_empty()).then(|| format!("{text}{out}"))
+    out.extend(crate::stdgaps::preludes(text));
+    if out.is_empty() {
+        return None;
+    }
+    let modules = crate::prune::module_texts(text, filename, resolver);
+    let trimmed = crate::prune::trimmed(text, &modules, &out, whole_impls);
+    Some(format!("{text}{trimmed}"))
 }

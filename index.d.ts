@@ -33,7 +33,8 @@ export function initCarciniScript(moduleOrPath?: string | URL | Request | Buffer
 export function initCarciniScriptSync(module: BufferSource | WebAssembly.Module): void;
 /**
  * Compile Rust to an ES module. `resolve(path)` returns the source of another file, for `mod name;`
- * (which reads `name.rs` next to `filename`); undefined when there's no such file.
+ * (which reads `name.rs` next to `filename`, or the file a `#[path]` names, from the directory of
+ * `filename` or from the root as `lib/util.rs`); undefined when there is no such file.
  */
 export function compile(
   source: string,

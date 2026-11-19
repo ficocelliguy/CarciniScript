@@ -106,7 +106,7 @@ fn analyze_uncached(src: &str, filename: &str, resolver: Resolver) -> Analysis {
     });
     if let Ok(Some(exp)) = pre {
         // (`std::time`'s prelude after the program, as it compiles.)
-        let text = crate::stdtime::with_prelude(&exp.text).unwrap_or(exp.text);
+        let text = crate::stdtime::with_prelude(&exp.text, filename, resolver, true).unwrap_or(exp.text);
         let file = crate::macros::parse_tree(&text);
         let map = std::rc::Rc::new(exp.map);
         let origin = typeck::Origin {
@@ -124,7 +124,7 @@ fn analyze_uncached(src: &str, filename: &str, resolver: Resolver) -> Analysis {
         map: None,
         len: src.len(),
     };
-    let with_time = crate::stdtime::with_prelude(src);
+    let with_time = crate::stdtime::with_prelude(src, filename, resolver, true);
     let src = with_time.as_deref().unwrap_or(src);
     let file = crate::macros::parse_tree(src);
     let (types, _) = typeck::check(&file, src, filename, resolver, &origin);
@@ -193,7 +193,7 @@ pub fn hover(
     // `jsx!` markup: a tag or an attribute.
     if src.contains("jsx!")
         && let Some((r, contents)) =
-            crate::jsx_service::hover(src, offset_of(src, line, column), resolver)
+            crate::jsx_service::hover(src, filename, offset_of(src, line, column), resolver)
     {
         let idx = LineIndex::new(src);
         let (l0, c0) = idx.line_col(usize::from(r.start()));
@@ -471,7 +471,7 @@ pub fn completions(
     let offset = offset_of(src, line, column);
     // `jsx!` markup: tag names and attributes.
     if src.contains("jsx!")
-        && let Some(out) = crate::jsx_service::completions(src, offset, resolver)
+        && let Some(out) = crate::jsx_service::completions(src, filename, offset, resolver)
     {
         return out;
     }

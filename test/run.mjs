@@ -160,6 +160,43 @@ for (const dir of fs.readdirSync(path.join(here, "modules"))) {
   }
 }
 
+// --- cross-folder modules by absolute path: `#[path = "/lib/util.rs"]` from a script in another
+// folder (Bitburner's `/lib/` layout), also `include_str!("/lib/..")`. The import is written
+// `/lib/util.rs` for the host to resolve from the root. rustc has no such root, so this case has
+// no native oracle; the expected output is written out.
+{
+  const name = "modules absolute #[path]";
+  try {
+    const files = {
+      "hack/main.rs":
+        '#[path = "/lib/util.rs"]\nmod util;\n\nfn main() {\n    println!("{}", util::greet("hack"));\n    println!("{}", util::FIRST.trim());\n}\n',
+      "lib/util.rs": 'pub const FIRST: &str = include_str!("/lib/first.txt");\n\npub fn greet(who: &str) -> String {\n    format!("hi {who}")\n}\n',
+      "lib/first.txt": "one\n",
+    };
+    const read = (p) => files[p];
+    const outRoot = path.join(outDir, "modules-absolute");
+    for (const f of Object.keys(files).filter((f) => f.endsWith(".rs"))) {
+      const out = compile(read(f), f, read);
+      const errors = out.diagnostics.filter((d) => d.severity === "error");
+      if (errors.length) throw new Error(errors.map((d) => `${f}:${d.line}:${d.column}: ${d.message}`).join("\n"));
+      if (f === "hack/main.rs" && !out.code.includes('from "/lib/util.rs"')) throw new Error(`the import isn't from the root:\n${out.code}`);
+      const dest = path.join(outRoot, f.replace(/\.rs$/, ".mjs"));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      // Node has no project root: an absolute import becomes a relative one.
+      const code = out.code
+        .replace(/from "\/(.*?)\.rs";/g, (_, p) => `from "${path.relative(path.dirname(f), p).replaceAll("\\", "/")}.mjs";`)
+        .replace(/\.rs";/g, '.mjs";');
+      fs.writeFileSync(dest, code);
+    }
+    const js = await runJs(path.join(outRoot, "hack/main.mjs"));
+    const want = "hi hack\none\n";
+    if (js.stdout !== want || js.code !== 0) fail(name, `want:\n${want}\njs (exit ${js.code}):\n${js.stdout}`);
+    else pass(name);
+  } catch (e) {
+    fail(name, e.message);
+  }
+}
+
 // --- proc macros: test/procmacro/<name>/main.rs plus proc-macro crates (`<crate>.rs`, the files
 // with `#[proc_macro..]` functions). Natively each crate is a `proc-macro = true` crate of a
 // cargo workspace; the build directory is shared between cases.
@@ -958,6 +995,9 @@ const rejectedFiles = [
     "6:5 recursion limit reached while expanding macros (130 levels",
   ],
   ["module file not found",{ "main.rs": "mod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `nope.rs` and `nope/mod.rs`)"],
+  // (A `#[path]` is looked for on its own, relative to the file's directory.)
+  ["a `#[path]` module file not found", { "hack/main.rs": "#[path = \"../lib/nope.rs\"]\nmod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (looked for `lib/nope.rs`)"],
+  ["a `#[path]` above the root", { "main.rs": "#[path = \"../nope.rs\"]\nmod nope;\nfn main() {}" }, "1:1 file not found for module `nope` (`#[path = \"../nope.rs\"]` leaves the project root)"],
   [
     "a proc macro that panics",
     {

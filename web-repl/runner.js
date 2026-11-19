@@ -110,7 +110,7 @@ self.onmessage = async ({ data }) => {
     globalThis.κσ?.$flush();
     if (e?.name === "CarciniExit") {
       post("done", { exitCode: e.exitCode });
-    } else if (e?.name === "CarciniPanic") {
+    } else if (e?.name === "panic") {
       post("panic", { message: e.panicMessage, location: e.location });
       post("done", { exitCode: 101 });
     } else {

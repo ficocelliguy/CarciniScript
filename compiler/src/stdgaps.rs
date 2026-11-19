@@ -25,8 +25,8 @@ fn declares(text: &str, name: &str) -> bool {
 }
 
 /// The preludes `text` needs (after `stdtime`'s), when it names their types.
-pub(crate) fn preludes(text: &str) -> String {
-    let mut out = String::new();
+pub(crate) fn preludes(text: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
     let path = (text.contains("PathBuf") || text.contains("__AsPath"))
         && !text.contains("// (path prelude)")
         && !declares(text, "PathBuf");
@@ -39,26 +39,22 @@ pub(crate) fn preludes(text: &str) -> String {
         && !declares(text, "PhantomData")
         && !declares(text, "Infallible")
     {
-        out.push('\n');
-        out.push_str(MARKER);
+        out.push(MARKER);
     }
     if path {
-        out.push('\n');
-        out.push_str(PATH);
+        out.push(PATH);
     }
     if text.contains("Wrapping")
         && !text.contains("// (wrapping prelude)")
         && !declares(text, "Wrapping")
     {
-        out.push('\n');
-        out.push_str(WRAPPING);
+        out.push(WRAPPING);
     }
     if crate::stdtime::has_word(text, "CStr")
         && !text.contains("// (cstr prelude)")
         && !declares(text, "CStr")
     {
-        out.push('\n');
-        out.push_str(CSTR);
+        out.push(CSTR);
     }
     out
 }

@@ -28,7 +28,7 @@ export async function main(ns) {
 }
 ```
 
-- [docs/PLAN.md](docs/PLAN.md): architecture, lowering decisions, phases
+- [docs/PLAN.md](docs/PLAN.md): architecture, lowering decisions, open work
 - [docs/FEATURES.md](docs/FEATURES.md): Rust feature support chart
 - [docs/RUST_GAPS.md](docs/RUST_GAPS.md): where behavior differs from rustc
 
@@ -103,7 +103,10 @@ const { code, sourceMap, diagnostics } = compile(source, "hack.rs");
 argument: `compile(source, "lib/main.rs", (path) => files.get(path))` (here it asks for
 `lib/util.rs`). Each file compiles to its own ES module, importing its modules as
 `import * as util from "./util.rs"`, so the host loads them the way it loads any import. Bitburner
-passes the server's scripts.
+passes the server's scripts. A module in another folder is loaded with rustc's `#[path]`: relative
+to the file's directory (`#[path = "../lib/util.rs"] mod util;`) or from the root
+(`#[path = "/lib/util.rs"]`, imported as `"/lib/util.rs"`, which Bitburner resolves from the
+root), so scripts in `/hack/` and `/corp/` can share one `/lib/`.
 
 ### Proc macros
 

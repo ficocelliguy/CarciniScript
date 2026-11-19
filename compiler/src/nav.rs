@@ -250,16 +250,13 @@ fn file_module(
     name: &str,
     resolver: Resolver,
 ) -> Option<(String, String)> {
-    file.items().find_map(|i| match i {
-        ast::Item::Module(m) if m.item_list().is_none() && m.name()?.text() == name => Some(()),
+    let m = file.items().find_map(|i| match i {
+        ast::Item::Module(m) if m.item_list().is_none() && m.name()?.text() == name => Some(m),
         _ => None,
     })?;
-    let flat = crate::typeck::module_path(filename, name);
-    if let Some(t) = resolver(&flat) {
-        return Some((flat, t));
-    }
-    let nested = crate::typeck::module_path(filename, &format!("{name}/mod"));
-    resolver(&nested).map(|t| (nested, t))
+    let explicit = crate::typeck::path_attr(&m);
+    let (p, t, _) = crate::typeck::find_module(filename, name, explicit.as_deref(), resolver)?;
+    Some((p, t))
 }
 
 /// `segs` (after a `mod x;` name) in that file: an item, or a type's associated item.

@@ -209,7 +209,7 @@ function runOnPage(code, sourceMap, filename, { onEvent = () => {} } = {}) {
       emit({ type: "done", exitCode: 0 });
     } catch (e) {
       globalThis.κσ?.$flush();
-      if (e?.name === "CarciniPanic") {
+      if (e?.name === "panic") {
         emit({ type: "panic", message: e.panicMessage, location: e.location });
         emit({ type: "done", exitCode: 101 });
       } else if (!stopped) {

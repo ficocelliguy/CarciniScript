@@ -59,8 +59,8 @@ pub use ext::{char_predicate, is_option_closure_method};
 pub use gaps::{delegated_fmt_is_debug, pin_identity};
 pub use jsval::swb_imports;
 pub use modules::{
-    Imported, ModuleRef, Resolver, capitalized, find_module, module_path, pub_use_renames,
-    qualified_key, use_leaves,
+    Imported, ModuleRef, Resolver, capitalized, find_module, find_module_in, module_candidates,
+    module_path, path_attr, path_attr_in, pub_use_renames, qualified_key, relative_path, use_leaves,
 };
 pub use ptr::{Ptrs, cellable as ptr_cellable, is_ptr_type, transmute_name};
 pub use quote::QuoteTok;

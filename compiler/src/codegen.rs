@@ -756,7 +756,7 @@ fn compile_text(
     resolver: typeck::Resolver,
 ) -> CompileOutput {
     // `std::time`'s types, compiled in after the program when it uses them.
-    let with_time = crate::stdtime::with_prelude(src);
+    let with_time = crate::stdtime::with_prelude(src, filename, resolver, false);
     let prelude_at = if with_time.is_some() {
         src.len()
     } else {

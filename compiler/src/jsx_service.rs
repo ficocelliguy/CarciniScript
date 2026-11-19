@@ -236,10 +236,15 @@ fn component<'a>(defs: &'a [(String, Def)], tag: &str) -> Option<&'a Def> {
 }
 
 /// Hover at `offset` of `src` in markup: the range it describes, and markdown.
-pub(crate) fn hover(src: &str, offset: usize, resolver: Resolver) -> Option<(TextRange, String)> {
+pub(crate) fn hover(
+    src: &str,
+    filename: &str,
+    offset: usize,
+    resolver: Resolver,
+) -> Option<(TextRange, String)> {
     let file = crate::macros::parse_tree(src);
     let (spot, scope) = spot(&file, TextSize::from(offset as u32))?;
-    jsx::set_mod_sources(src, resolver);
+    jsx::set_mod_sources(src, filename, resolver);
     let defs = jsx::defs_in_scope(&scope);
     match spot {
         Spot::Tag { name, range } => {
@@ -300,11 +305,16 @@ pub(crate) fn hover(src: &str, offset: usize, resolver: Resolver) -> Option<(Tex
 }
 
 /// Completions at `offset` of `src` in markup: tag names after `<`, attributes in a tag.
-pub(crate) fn completions(src: &str, offset: usize, resolver: Resolver) -> Option<Vec<Completion>> {
+pub(crate) fn completions(
+    src: &str,
+    filename: &str,
+    offset: usize,
+    resolver: Resolver,
+) -> Option<Vec<Completion>> {
     let file = crate::macros::parse_tree(src);
     let at = TextSize::from(offset as u32);
     let (spot, scope) = spot(&file, at)?;
-    jsx::set_mod_sources(src, resolver);
+    jsx::set_mod_sources(src, filename, resolver);
     let defs = jsx::defs_in_scope(&scope);
     let mut out = Vec::new();
     let mut push = |label: String, kind: &'static str, detail: String| {
