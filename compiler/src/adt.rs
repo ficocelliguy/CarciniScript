@@ -131,6 +131,14 @@ pub struct Method {
     pub ret_owned: bool,
     /// Whether it is written `&mut T` / `Option<&mut T>` (see `FnSig::ret_mut_ref`).
     pub ret_mut_ref: bool,
+    /// See `FnSig::ret_slot`.
+    pub ret_slot: Option<bool>,
+    /// See `FnSig::opt_slot_params`.
+    pub opt_slot_params: Vec<bool>,
+    /// A blanket impl's `&mut self` method that assigns to `*self` (`*self += by`): `self` may
+    /// be a number or a string, so the method takes the receiver's cell as `this` (like a
+    /// `&mut self` method of an `impl Tr for i32`), whatever the receiver is.
+    pub cell_self: bool,
 }
 
 impl Method {

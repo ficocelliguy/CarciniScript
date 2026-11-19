@@ -2350,7 +2350,9 @@ impl<'a> Codegen<'a> {
             && let Some(cell) = local.js.strip_suffix("[0]").map(str::to_string)
         {
             let js = self.fresh(name.text());
-            let mut f = Frag::mapped(start, "const ");
+            // (`let mut q = &mut n;`: `q = &mut other;` later re-points it.)
+            let kw = if mutable { "let" } else { "const" };
+            let mut f = Frag::mapped(start, format!("{kw} "));
             f.append(Frag::mapped(self.off(name.syntax()), js.clone()))
                 .push(format!(" = {cell};"));
             self.line(f);
@@ -3233,6 +3235,16 @@ impl<'a> Codegen<'a> {
         let start = self.off(e.syntax());
         let (frag, ty) = self.emit_expr_inner(e, expected);
         let ty = self.ty_of(e.syntax()).unwrap_or(ty);
+        let r = self.range_of(e.syntax());
+        // A slot-valued argument (`bump(s.at(0))`) to a `&mut i32` parameter: as a cell.
+        if self.types.slot_cell_args.contains(&r) {
+            return (frag.wrap("κσ.$slotCell(", ")").at(start), ty);
+        }
+        // A slot-valued expression (`s.at(0)` of your `-> &mut i32`, `w.n` of `n: &mut i32`,
+        // `o.unwrap()` of an `Option<&mut i32>`) read as its value, unless the slot is kept.
+        if self.types.slot_values.contains(&r) && !self.types.slot_keeps.contains(&r) {
+            return (frag.wrap("(", ")[1]").at(start), ty);
+        }
         // Auto-deref through `impl Deref`: `(stack).deref()`.
         if let Some((mutable, target)) = self.types.derefs.get(&self.range_of(e.syntax())).cloned()
         {
@@ -3322,6 +3334,31 @@ impl<'a> Codegen<'a> {
                     .append(pf)
                     .push(" = $v; })");
                 (f, t)
+            }
+            // `&mut x` of a local kept as a `&mut i32` value (`let r: &mut i32 = &mut x;`,
+            // `Some(&mut x)`, `W { n: &mut x }`): its box, as a slot over it; `&mut r` /
+            // `&mut *r` of a `&mut` local: that local's slot or cell passed on.
+            ast::Expr::RefExpr(r)
+                if self.types.slot_keeps.contains(&self.range_of(r.syntax())) =>
+            {
+                let Some(inner) = r.expr() else {
+                    return (Frag::text("undefined"), Ty::Unknown);
+                };
+                let mut inner = strip_parens_expr(&inner);
+                if let ast::Expr::PrefixExpr(pe) = &inner
+                    && pe.op_kind() == Some(UnaryOp::Deref)
+                    && let Some(x) = pe.expr()
+                {
+                    inner = strip_parens_expr(&x);
+                }
+                let kept_local = matches!(&inner, ast::Expr::PathExpr(p)
+                    if self.types.slot_keeps.contains(&self.range_of(p.syntax())));
+                let (f, t) = self.emit_expr(&inner, expected);
+                if kept_local {
+                    (f, t)
+                } else {
+                    (f.wrap("κσ.$cellSlot(", ")"), t)
+                }
             }
             // `let r = &mut v[i];` of a number or string: a slot over the element, made once
             // (`κσ.$placeSlot(v, i, loc)`; a field's is `κσ.$placeSlot(s, "count", null)`).
@@ -3429,8 +3466,14 @@ impl<'a> Codegen<'a> {
                     .ty_of(c.syntax())
                     .or_else(|| expected.cloned())
                     .unwrap_or(Ty::Unknown);
+                // (A generic struct: with the classes its values carry, `κσ.$cv(History, [..]).default()`.)
+                let adt_default = match &ty {
+                    Ty::Adt(..) => Some(format!("{}.default()", self.dict_of(&ty))),
+                    _ => None,
+                };
                 let js = self
                     .let_array_default(c)
+                    .or(adt_default)
                     .or_else(|| default_value(&ty))
                     .unwrap_or_else(|| "undefined".into());
                 (Frag::mapped(self.off(c.syntax()), js), ty)
@@ -3705,6 +3748,27 @@ impl<'a> Codegen<'a> {
         }
         if let Some(name) = path.as_single_name_ref() {
             if let Some(local) = self.lookup(name.text()) {
+                // A `&mut i32` local passed on as the `&mut` itself (`return r`, `W { n: r }`,
+                // `q = r`, `Some(r)`): its slot, or its box as a slot over it.
+                if self.types.slot_keeps.contains(&self.range_of(p.syntax())) {
+                    if let Some(slot) = local.js.strip_suffix("[1]") {
+                        return (Frag::text(slot.to_string()), local.ty.clone());
+                    }
+                    if let Some(cell) = local.js.strip_suffix("[0]") {
+                        return (
+                            Frag::text(format!("κσ.$cellSlot({cell})")),
+                            local.ty.clone(),
+                        );
+                    }
+                    // (A loop variable over a place, `a[$t1]`: a slot over that place.)
+                    if local.js.ends_with(']') || local.js.contains('.') {
+                        let js = local.js.clone();
+                        return (
+                            Frag::text(format!("κσ.$cell(() => {js}, ($v) => {{ {js} = $v; }})")),
+                            local.ty.clone(),
+                        );
+                    }
+                }
                 // `&mut n` / a `&mut` parameter passed on: the cell itself.
                 if self.types.cell_args.contains(&self.range_of(p.syntax()))
                     && let Some(cell) = local.js.strip_suffix("[0]")
@@ -4014,6 +4078,32 @@ impl<'a> Codegen<'a> {
                 };
                 let (rf, _) = self.emit_expr(&rhs, None);
                 let mut f = Frag::text(cell.unwrap_or_else(|| "undefined".into()));
+                f.push(" = ").append(rf);
+                (f, Ty::Unit)
+            }
+            // `r = &mut other;` / `r = s.at(1);` with `r` a `&mut i32` local: rebind its slot
+            // (or cell) rather than write through it.
+            BinaryOp::Assignment { op: None }
+                if self
+                    .types
+                    .slot_assigns
+                    .contains(&self.range_of(b.syntax())) =>
+            {
+                let target = match strip_parens_expr(&lhs) {
+                    ast::Expr::PathExpr(p) => p
+                        .path()
+                        .and_then(|p| p.as_single_name_ref())
+                        .and_then(|n| self.lookup(n.text().to_string().as_str()))
+                        .map(|l| {
+                            l.js.strip_suffix("[1]")
+                                .or_else(|| l.js.strip_suffix("[0]"))
+                                .unwrap_or(&l.js)
+                                .to_string()
+                        }),
+                    _ => None,
+                };
+                let (rf, _) = self.emit_expr(&rhs, None);
+                let mut f = Frag::text(target.unwrap_or_else(|| "undefined".into()));
                 f.push(" = ").append(rf);
                 (f, Ty::Unit)
             }
@@ -5775,6 +5865,20 @@ impl<'a> Codegen<'a> {
             f.push(")");
             return f;
         }
+        // `x.money()` on a `T` whose class is at hand, with impls on both an integer and a float
+        // type: by the class (`κσ.$dcallT`, or `$dcallMutT` with the receiver's cell for a
+        // `&mut self` method).
+        let by_class = if self
+            .types
+            .class_dispatch
+            .contains(&self.range_of(m.syntax()))
+            && let Some(recv) = m.receiver()
+            && let Some(Ty::Param(p)) = self.ty_of(recv.syntax())
+        {
+            Some(self.dict_of(&Ty::Param(p))).filter(|c| c != "undefined")
+        } else {
+            None
+        };
         let ext = self
             .types
             .adts
@@ -5800,10 +5904,23 @@ impl<'a> Codegen<'a> {
                 && self.lookup("self").is_some_and(|l| l.js == "this"))
         {
             let cell = self.recv_cell(&recv, rf.clone());
-            let mut f = Frag::mapped(name_off, "κσ.$dcallMut($extRegs, ");
+            let mut f = match &by_class {
+                Some(cls) => Frag::mapped(name_off, format!("κσ.$dcallMutT($extRegs, {cls}, ")),
+                None => Frag::mapped(name_off, "κσ.$dcallMut($extRegs, "),
+            };
             f.append(cell)
                 .push(", ")
                 .push(js_string(&adt_gen::prop(method)));
+            for a in args {
+                f.push(", ").append(a);
+            }
+            f.push(")");
+            return f;
+        }
+        if let Some(cls) = &by_class {
+            let mut f = Frag::mapped(name_off, format!("κσ.$dcallT($extRegs, {cls}, "));
+            f.append(rf.clone())
+                .push(format!(", {}", js_string(&adt_gen::prop(method))));
             for a in args {
                 f.push(", ").append(a);
             }
@@ -7272,7 +7389,9 @@ impl<'a> Codegen<'a> {
             .syntax()
             .parent()
             .is_some_and(|p| ast::LetStmt::can_cast(p.kind()));
-        if slot && matches!(method, "unwrap" | "expect") && !into_let {
+        // (Kept as the slot: `bump(o.as_mut().unwrap())`, `return v.get_mut(i).unwrap()`.)
+        let kept = self.types.slot_keeps.contains(&self.range_of(m.syntax()));
+        if slot && matches!(method, "unwrap" | "expect") && !into_let && !kept {
             let f = match method {
                 "unwrap" => helper("unwrap", vec![], Some(&loc)),
                 _ => {
@@ -8918,6 +9037,11 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
         Ty::Param(n) => Some(params.get(n).cloned().unwrap_or_else(|| {
             if DBG_SCOPE.with(|s| s.borrow().contains(n)) {
                 format!("($dbg${} ?? κσ.$dbgAny)", n.replace("::", "$"))
+            } else if let Some(cls) = const_js_of(n)
+                && cls.starts_with("this.$")
+            {
+                // (An `impl<T>`'s `T` in a method with `self`: the class the value carries.)
+                format!("κσ.$dbgOf({cls})")
             } else {
                 "κσ.$dbgAny".into()
             }

@@ -140,6 +140,29 @@ pub struct Types {
     /// `let r = &mut v[i];` / `&mut s.count` of a number, string, bool or `Option`: a slot over
     /// that element or field (`κσ.$placeSlot`), by the `&mut`; `r` is a slot binding.
     pub place_slots: std::collections::HashSet<(usize, usize)>,
+    /// Expressions whose JS value is a slot over a place (`[1]` reads and writes it): a call of
+    /// one of the file's functions declared `-> &mut i32`, a `&mut i32` field, `o.unwrap()` of
+    /// an `Option<&mut i32>` value. Codegen reads `[1]` unless the slot itself is kept.
+    pub slot_values: std::collections::HashSet<(usize, usize)>,
+    /// Positions that keep a slot rather than read it: the initializer of a `&mut i32`-typed
+    /// `let`, the right side of `r = &mut ..`, a `&mut i32` field's value, a return of a
+    /// function declared `-> &mut i32`, `Some(..)`'s payload for an `Option<&mut i32>`. A
+    /// local's slot is passed on there (not `r[1]`), a box as a slot over it.
+    pub slot_keeps: std::collections::HashSet<(usize, usize)>,
+    /// `r = &mut other;` with `r` holding a slot or cell: the assignment rebinds it.
+    pub slot_assigns: std::collections::HashSet<(usize, usize)>,
+    /// Slot-valued arguments to a `&mut i32` parameter (a cell): wrapped (`κσ.$slotCell`).
+    pub slot_cell_args: std::collections::HashSet<(usize, usize)>,
+    /// A function value given to `for_each` over `iter_mut()` whose parameter is a cell: each
+    /// element is passed as a cell over its place.
+    pub fn_cell_args: std::collections::HashSet<(usize, usize)>,
+    /// Struct fields written `&mut T` with `T` a number, string, bool or `Option` (by type and
+    /// field): they hold slots.
+    pub mut_ref_fields: std::collections::HashSet<(String, String)>,
+    /// Trait method calls on a type parameter's value whose trait has impls on both an integer
+    /// and a float type (or two integer types): dispatched by `T`'s class (`κσ.$dcallT`), since
+    /// the run-time value can't tell a whole `f64` from an `i32`.
+    pub class_dispatch: std::collections::HashSet<(usize, usize)>,
     /// Method calls that go to one of several impls of a generic trait: the method's key.
     pub method_keys: HashMap<(usize, usize), String>,
     /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
@@ -213,9 +236,15 @@ pub struct FnSig {
     /// Whether the return type is written as an owned value (no `&`, `impl`, `dyn` or type
     /// parameter): a call's result then certainly owns its value.
     pub ret_owned: bool,
-    /// Whether the return type is written `&mut T` or `Option<&mut T>` with `T` a struct, enum
-    /// or collection: a binding of the call's result can be written through without `mut`.
+    /// Whether the return type is written `&mut T` or `Option<&mut T>`: a binding of the call's
+    /// result can be written through without `mut`.
     pub ret_mut_ref: bool,
+    /// For `-> &mut T` / `-> Option<&mut T>` with `T` a number, string, bool or `Option`: the
+    /// call returns a slot (`Some(false)`) or `null` / a slot (`Some(true)`). See
+    /// `Checker::ret_slot_kind`.
+    pub ret_slot: Option<bool>,
+    /// Which parameters are written `Option<&mut T>` with such a `T`: `null` or a slot.
+    pub opt_slot_params: Vec<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -320,6 +349,15 @@ impl<'a> Checker<'a> {
             index_places: Default::default(),
             slice_views: Default::default(),
             place_slots: Default::default(),
+            slot_values: Default::default(),
+            slot_keeps: Default::default(),
+            slot_assigns: Default::default(),
+            slot_cell_args: Default::default(),
+            fn_cell_args: Default::default(),
+            mut_ref_fields: Default::default(),
+            class_dispatch: Default::default(),
+            ret_slot: None,
+            pending_cell_args: Vec::new(),
             method_keys: Default::default(),
             derefs: Default::default(),
             qualified_calls: Default::default(),
@@ -450,11 +488,9 @@ impl<'a> Checker<'a> {
                 let ret_owned = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| {
                     written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown)
                 });
-                let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t))
-                    && !self.cellable(match &ret {
-                        Ty::Option(t) => t,
-                        t => t,
-                    });
+                let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t));
+                let ret_slot = self.ret_slot_kind(f.ret_type().and_then(|r| r.ty()), &ret);
+                let opt_slot_params = self.opt_slot_params(f, &params);
                 let sig = FnSig {
                     params,
                     ret,
@@ -467,6 +503,8 @@ impl<'a> Checker<'a> {
                     ref_params,
                     ret_owned,
                     ret_mut_ref,
+                    ret_slot,
+                    opt_slot_params,
                 };
                 if self
                     .fns
@@ -603,6 +641,7 @@ pub fn check(
     // (Before the definitions move out: methods' type parameters are looked up there.)
     c.check_const_args();
     let dict_uses = std::mem::take(&mut c.dict_uses);
+    c.store_default_params();
     let (dict_params, dict_args) = c.finish_needs(dict_uses, true);
     let dbg_uses = std::mem::take(&mut c.dbg_uses);
     let (dbg_params, dbg_args) = c.finish_needs(dbg_uses, false);
@@ -627,6 +666,13 @@ pub fn check(
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
     let place_slots = std::mem::take(&mut c.place_slots);
+    let slot_values = std::mem::take(&mut c.slot_values);
+    let slot_keeps = std::mem::take(&mut c.slot_keeps);
+    let slot_assigns = std::mem::take(&mut c.slot_assigns);
+    let slot_cell_args = std::mem::take(&mut c.slot_cell_args);
+    let fn_cell_args = std::mem::take(&mut c.fn_cell_args);
+    let mut_ref_fields = std::mem::take(&mut c.mut_ref_fields);
+    let class_dispatch = std::mem::take(&mut c.class_dispatch);
     let method_keys = std::mem::take(&mut c.method_keys);
     let derefs = std::mem::take(&mut c.derefs);
     let qualified_calls = std::mem::take(&mut c.qualified_calls);
@@ -665,6 +711,13 @@ pub fn check(
             index_places,
             slice_views,
             place_slots,
+            slot_values,
+            slot_keeps,
+            slot_assigns,
+            slot_cell_args,
+            fn_cell_args,
+            mut_ref_fields,
+            class_dispatch,
             method_keys,
             derefs,
             qualified_calls,
@@ -781,6 +834,20 @@ struct Checker<'a> {
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
     place_slots: std::collections::HashSet<(usize, usize)>,
+    slot_values: std::collections::HashSet<(usize, usize)>,
+    slot_keeps: std::collections::HashSet<(usize, usize)>,
+    slot_assigns: std::collections::HashSet<(usize, usize)>,
+    slot_cell_args: std::collections::HashSet<(usize, usize)>,
+    fn_cell_args: std::collections::HashSet<(usize, usize)>,
+    pub(super) mut_ref_fields: std::collections::HashSet<(String, String)>,
+    pub(super) class_dispatch: std::collections::HashSet<(usize, usize)>,
+    /// What the function being checked returns when declared `-> &mut T` / `-> Option<&mut T>`
+    /// with `T` a number, string, bool or `Option`: a slot (`Some(false)`) or `None` / a slot
+    /// (`Some(true)`); `None` otherwise.
+    ret_slot: Option<bool>,
+    /// Arguments to `&mut i32` parameters that are neither `&mut x` nor a `&mut` local, checked
+    /// after the call's arguments are inferred (a slot-valued call, `o.unwrap()`).
+    pending_cell_args: Vec<ast::Expr>,
     method_keys: HashMap<(usize, usize), String>,
     derefs: HashMap<(usize, usize), (bool, Ty)>,
     qualified_calls: HashMap<(usize, usize), QualifiedCall>,
@@ -2149,6 +2216,9 @@ impl<'a> Checker<'a> {
         self.scopes = vec![HashMap::new()];
         self.slot_locals.clear();
         self.slot_options.clear();
+        // `-> &mut i32` / `-> Option<&mut i32>`: what's returned is kept as a slot (`keep_slot`).
+        self.ret_slot = self.ret_slot_kind(f.ret_type().and_then(|r| r.ty()), &ret);
+        let opt_slot = self.opt_slot_params(f, &params);
         // Const generic parameters: values in the body.
         for (n, ty) in self.const_tys.clone() {
             let local = Local {
@@ -2166,11 +2236,16 @@ impl<'a> Checker<'a> {
             self.declare(&n, local);
         }
         if let Some(pl) = f.param_list() {
-            for (p, ty) in pl.params().zip(params) {
+            for (i, (p, ty)) in pl.params().zip(params).enumerate() {
                 if let Some(ast::Pat::IdentPat(ip)) = p.pat()
                     && let Some(n) = ip.name()
                 {
                     let reference = p.ty().as_ref().and_then(Self::ref_kind);
+                    // `o: Option<&mut i32>`: `null` or a slot; `if let Some(n) = o` binds the slot.
+                    if opt_slot.get(i) == Some(&true) {
+                        self.slot_options
+                            .insert(n.text().to_string(), slots::SlotShape::Slot);
+                    }
                     if reference == Some(true) && self.cell_param(&ty) {
                         let r = self.range(n.syntax());
                         self.boxed.insert(r);
@@ -2469,6 +2544,18 @@ impl<'a> Checker<'a> {
             None if diverged => Ty::Never,
             None => Ty::Unit,
         };
+        // The tail of a function declared `-> &mut i32` / `-> Option<&mut i32>`: a slot (while
+        // the body's locals are still in scope).
+        if let Some(opt) = self.ret_slot
+            && b.syntax().parent().is_some_and(|p| ast::Fn::can_cast(p.kind()))
+            && let Some(tail) = list.tail_expr()
+        {
+            if opt {
+                self.keep_opt_slot(&tail);
+            } else {
+                self.keep_slot(&tail);
+            }
+        }
         self.scopes.pop();
         self.record(b.syntax(), ty)
     }
@@ -2687,12 +2774,19 @@ impl<'a> Checker<'a> {
             );
         }
         self.pat(&pat, &ty);
+        // `let Some(c) = s.maybe(true) else { return };` of your `-> Option<&mut i32>` (or an
+        // `Option<&mut i32>` local or parameter): `c` binds the slot.
         // `let Some(ref mut n) = self.timer else { .. };` / `let (ref mut a, ref mut b) = pair;`
         // / `let Some(n) = self.timer.as_mut() else { .. };`: as in `if let`, the bindings alias
         // the place.
         let through_mut = l
             .initializer()
             .is_some_and(|i| self.alias_place_bindings(Some(&i), &pat));
+        // (Else `let Some(c) = s.maybe(true) else { return };` of your `-> Option<&mut i32>`, or
+        // an `Option<&mut i32>` local or parameter: `c` binds the slot.)
+        if !through_mut && let Some(init) = l.initializer() {
+            self.bind_slot_option(Some(&init), &pat);
+        }
         // `let Some(s) = net.find_mut("a") else { return };` (or `v.get_mut(0)`, `&mut pair`,
         // `self.timer.as_mut()`): `s` is a `&mut` into the place, written through without `mut`.
         if (through_mut
@@ -2720,14 +2814,31 @@ impl<'a> Checker<'a> {
         // `let (src, dst) = (a, &mut *b);`: a name bound to a `&` / `&mut` field is a reference.
         if let (ast::Pat::TuplePat(tp), Some(ast::Expr::TupleExpr(te))) =
             (&pat, l.initializer().as_ref().map(strip_parens))
-            && let Some(scope) = self.scopes.last_mut()
         {
-            for (p, e) in tp.fields().zip(te.fields()) {
-                if let (ast::Pat::IdentPat(ip), ast::Expr::RefExpr(r)) = (&p, strip_parens(&e))
-                    && ip.pat().is_none()
+            let pairs: Vec<(ast::IdentPat, ast::RefExpr)> = tp
+                .fields()
+                .zip(te.fields())
+                .filter_map(|(p, e)| match (p, strip_parens(&e)) {
+                    (ast::Pat::IdentPat(ip), ast::Expr::RefExpr(r)) if ip.pat().is_none() => {
+                        Some((ip, r))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (ip, r) in pairs {
+                let mutable = r.mut_token().is_some();
+                if let Some(scope) = self.scopes.last_mut()
                     && let Some(local) = ip.name().and_then(|n| scope.get_mut(n.text()))
                 {
-                    local.reference = Some(r.mut_token().is_some());
+                    local.reference = Some(mutable);
+                }
+                // `let (a, b) = (&mut t.0, &mut t.1);` of numbers: slots over the places.
+                if mutable
+                    && let Some(n) = ip.name()
+                    && self.keep_slot(&ast::Expr::RefExpr(r))
+                {
+                    let nr = self.range(n.syntax());
+                    self.slot_bindings.insert(nr);
                 }
             }
         }
@@ -2868,7 +2979,7 @@ impl<'a> Checker<'a> {
         let Some(recv) = m.receiver() else { return };
         let recv = strip_parens(&recv);
         if !is_place_expr(&recv)
-            || !unwrapped_position(m)
+            || !slots::opt_slot_position(m)
             || !self.zonk(inner).is_js_primitive()
         {
             return;
@@ -3975,6 +4086,9 @@ impl<'a> Checker<'a> {
                         || ast::BinExpr::cast(p.clone()).is_some_and(|b| {
                             matches!(b.op_kind(), Some(BinaryOp::Assignment { op: None }))
                                 && b.rhs().is_some_and(|x| x.syntax() == r.syntax())
+                                // (`r = &mut other;` with `r` a `&mut i32` local rebinds its
+                                // slot: `slot_assigns`.)
+                                && !b.lhs().is_some_and(|l| self.is_ref_local(&l))
                         }))
                 {
                     let z = self.zonk(&t);
@@ -4169,6 +4283,13 @@ impl<'a> Checker<'a> {
                             let r = self.range(f.syntax());
                             self.array_reads.insert(r);
                         }
+                        // `w.n` with `n: &mut i32`: the field holds a slot.
+                        if let Some(field) = f.name_ref().map(|n| n.text().to_string())
+                            && self.mut_ref_fields.contains(&(name.clone(), field))
+                        {
+                            let r = self.range(f.syntax());
+                            self.slot_values.insert(r);
+                        }
                         self.adt_field(f, &name, &targs)
                     }
                     Ty::Unknown | Ty::Var(_) => Ty::Unknown,
@@ -4296,6 +4417,7 @@ impl<'a> Checker<'a> {
                     .clone()
                     .unwrap_or_else(|| self.fresh(VarKind::General));
                 let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
+                let saved_ret_slot = self.ret_slot.take();
                 let saved_declared = std::mem::replace(&mut self.ret_declared, true);
                 let saved_async = std::mem::replace(&mut self.in_async, true);
                 let t = self.block_body(b, inner.as_ref());
@@ -4303,6 +4425,7 @@ impl<'a> Checker<'a> {
                     self.unify(&t, &ret);
                 }
                 self.ret_ty = saved_ret;
+                self.ret_slot = saved_ret_slot;
                 self.ret_declared = saved_declared;
                 self.in_async = saved_async;
                 Ty::Future(Box::new(ret))
@@ -4371,6 +4494,15 @@ impl<'a> Checker<'a> {
                     }
                     Some(v) => {
                         self.check(&v, &ret);
+                        match self.ret_slot {
+                            Some(true) => {
+                                self.keep_opt_slot(&v);
+                            }
+                            Some(false) => {
+                                self.keep_slot(&v);
+                            }
+                            None => {}
+                        }
                     }
                     None if !self.unify(&Ty::Unit, &ret) => {
                         let msg = format!(
@@ -4825,6 +4957,10 @@ impl<'a> Checker<'a> {
                 self.slice_views.insert(r);
             }
         }
+        // `*w.n += 1` with `n: &mut i32`, `*s.at(i) = 0`: a write through the reference.
+        if self.through_slot(e) {
+            return;
+        }
         let Some((name, through)) = Self::place_root(e) else {
             return;
         };
@@ -4908,6 +5044,8 @@ impl<'a> Checker<'a> {
                     self.ptr_assign(b);
                 }
                 let through = Self::place_root(&lhs).is_some_and(|(_, t)| t);
+                // (The place first: `*w.n += 1` is checked by what `w.n` is.)
+                let lt = self.infer(&lhs, None);
                 self.check_mutable(
                     &lhs,
                     if through {
@@ -4916,7 +5054,6 @@ impl<'a> Checker<'a> {
                         Mutation::Assign
                     },
                 );
-                let lt = self.infer(&lhs, None);
                 match op {
                     Some(op) if matches!(self.shallow(&lt), Ty::Param(_)) => {
                         let Ty::Param(n) = self.shallow(&lt) else {
@@ -4933,6 +5070,12 @@ impl<'a> Checker<'a> {
                     None => {
                         self.check(&rhs, &lt);
                     }
+                }
+                // `r = &mut other;` / `r = s.at(1);` with `r` a `&mut i32` local: rebind its
+                // slot rather than write through it.
+                if op.is_none() && self.is_ref_local(&lhs) && self.keep_slot(&rhs) {
+                    let r = self.range(b.syntax());
+                    self.slot_assigns.insert(r);
                 }
                 Ty::Unit
             }
@@ -5810,6 +5953,16 @@ impl<'a> Checker<'a> {
             inst
         };
         self.arg_count(c.syntax(), "function", params.len(), args.len());
+        // `*at(&mut v, 0) += 1` with `fn at(..) -> &mut i32`: the call is a slot.
+        if self.fns.get(name).is_some_and(|s| s.ret_slot == Some(false)) {
+            let r = self.range(c.syntax());
+            self.slot_values.insert(r);
+        }
+        let opt_slot_params = self
+            .fns
+            .get(name)
+            .map(|s| s.opt_slot_params.clone())
+            .unwrap_or_default();
         let cell_params = self
             .fns
             .get(name)
@@ -5856,6 +6009,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.finish_slot_args(args, &opt_slot_params);
         self.check_byte_readers(name, args, &params);
         self.resolve_projections(false);
         if is_async {
@@ -6007,7 +6161,25 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            _ => {}
+            // `bump(s.at(0))` / `bump(o.unwrap())`: a slot-valued argument, wrapped as a cell
+            // once the arguments are inferred (`finish_slot_args`).
+            other => self.pending_cell_args.push(other.clone()),
+        }
+    }
+
+    /// After a call's arguments are checked: slot-valued arguments to `&mut i32` parameters
+    /// (`slot_cell_args`), and `Option<&mut i32>` arguments kept as `null` or a slot.
+    pub(super) fn finish_slot_args(&mut self, args: &[ast::Expr], opt_slot_params: &[bool]) {
+        for a in std::mem::take(&mut self.pending_cell_args) {
+            if self.keep_slot(&a) {
+                let r = self.range(a.syntax());
+                self.slot_cell_args.insert(r);
+            }
+        }
+        for (i, a) in args.iter().enumerate() {
+            if opt_slot_params.get(i) == Some(&true) {
+                self.keep_opt_slot(a);
+            }
         }
     }
 
@@ -6732,8 +6904,21 @@ impl<'a> Checker<'a> {
                     "is_some" | "is_none" => sig(self, &[], Ty::Bool),
                     // `weak.upgrade()` (a `Weak<T>` is an `Option<T>` here)
                     "upgrade" => sig(self, &[], Ty::Option(Box::new(inner))),
-                    "unwrap" => sig(self, &[], inner),
-                    "expect" => sig(self, &[Ty::Str], inner),
+                    "unwrap" | "expect" => {
+                        // `o.unwrap()` of an `Option<&mut i32>` value (a parameter, a local, a
+                        // call of your `-> Option<&mut i32>`; not a `get_mut`-style call, whose
+                        // unwrap codegen reads itself): the slot.
+                        if let Some(recv) = m.receiver()
+                            && self.option_slot_shape(&recv) == Some(slots::SlotShape::Slot)
+                            && !matches!(strip_parens(&recv), ast::Expr::MethodCallExpr(x)
+                                if self.slot_calls.contains(&self.range(x.syntax())))
+                        {
+                            let r = self.range(m.syntax());
+                            self.slot_values.insert(r);
+                        }
+                        let params: &[Ty] = if m2 == "unwrap" { &[] } else { &[Ty::Str] };
+                        sig(self, params, inner)
+                    }
                     "unwrap_or" => sig(self, &[inner.clone()], inner),
                     "unwrap_or_default" => {
                         let resolved = self.zonk(&inner);
@@ -8446,6 +8631,12 @@ pub(super) fn is_place_expr(e: &ast::Expr) -> bool {
 /// `r` in `let r = v.get_mut(..).unwrap();`.
 fn slot_let_binding(m: &ast::MethodCallExpr) -> Option<ast::Name> {
     let u = ast::MethodCallExpr::cast(m.syntax().parent()?)?;
+    if !u
+        .name_ref()
+        .is_some_and(|n| matches!(n.text(), "unwrap" | "expect"))
+    {
+        return None;
+    }
     let l = ast::LetStmt::cast(u.syntax().parent()?)?;
     match l.pat()? {
         ast::Pat::IdentPat(ip) => ip.name(),
@@ -8484,12 +8675,12 @@ fn slot_position(m: &ast::MethodCallExpr) -> bool {
     if let Some(me) = ast::MatchExpr::cast(p.clone()) {
         return me.expr().is_some_and(|e| e.syntax() == &n);
     }
-    unwrapped_position(m)
+    unwrapped_position(m) || slots::keep_position(m.syntax())
 }
 
 /// Whether a call's result is unwrapped (`.unwrap()` / `.expect(..)`) right into a deref
 /// (`*v.get_mut(i).unwrap() += 1`) or a `let` (`let r = v.get_mut(i).unwrap();`).
-fn unwrapped_position(m: &ast::MethodCallExpr) -> bool {
+pub(super) fn unwrapped_position(m: &ast::MethodCallExpr) -> bool {
     let mut n = m.syntax().clone();
     while let Some(p) = n
         .parent()
@@ -8504,9 +8695,9 @@ fn unwrapped_position(m: &ast::MethodCallExpr) -> bool {
             .is_some_and(|x| matches!(x.text(), "unwrap" | "expect"))
         && let Some(q) = u.syntax().parent()
     {
-        return ast::LetStmt::can_cast(q.kind())
-            || ast::PrefixExpr::cast(q)
-                .is_some_and(|pe| pe.op_kind() == Some(ast::UnaryOp::Deref));
+        return ast::PrefixExpr::cast(q)
+            .is_some_and(|pe| pe.op_kind() == Some(ast::UnaryOp::Deref))
+            || slots::keep_position(u.syntax());
     }
     false
 }
@@ -8759,8 +8950,9 @@ impl Checker<'_> {
         }
     }
 
-    /// In a method with `self` of `impl<T> S<T>`: `S`'s values carry `T`'s class (`this.$T`).
-    /// False where they can't (an enum, `impl<T> S<Vec<T>>`, a trait's default method).
+    /// In a method with `self` of `impl<T> S<T>` (a struct or an enum): `S`'s values carry
+    /// `T`'s class (`this.$T`). False where they can't (`impl<T> S<Vec<T>>`, a trait's default
+    /// method).
     fn store_class(&mut self, param: &str) -> bool {
         let Some(k) = self
             .cur_fn
@@ -8778,9 +8970,6 @@ impl Checker<'_> {
     fn stored_pos(&self, f: &str, param: &str) -> Option<(String, usize)> {
         let (ty, m) = f.split_once("::")?;
         let def = self.adts.defs.get(ty)?;
-        if def.is_enum {
-            return None;
-        }
         let sig = self.adts.method(ty, m)?;
         sig.receiver.as_ref()?;
         let i = sig
@@ -8803,8 +8992,19 @@ impl Checker<'_> {
         if param == "Self" {
             return;
         }
-        // A free function's type parameter, or a method's own (`fn parse<T: Parse>(&self)`);
-        // an `impl<T>`'s would need the class per value.
+        if !self.try_note_dict(param) {
+            self.error(
+                node,
+                format!("`{param}::..` on a type parameter of an `impl` isn't supported yet in methods with `self` of a trait or of `impl<T> S<Vec<T>>` (it works in a struct's or enum's `impl<T> S<T>`, on a function's or method's own type parameters, and in associated functions)"),
+            );
+        }
+    }
+
+    /// Note that the function being checked needs `param`'s class, when it can have one: a free
+    /// function's type parameter, a method's own (`fn parse<T: Parse>(&self)`), or an `impl<T>
+    /// S<T>`'s in a method with `self`, which the struct's or enum's values carry. False where
+    /// it can't (a trait's default method, an impl for a tuple or `Vec<T>`).
+    pub(super) fn try_note_dict(&mut self, param: &str) -> bool {
         let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
             Some((ty, m)) => self
                 .adts
@@ -8815,12 +9015,9 @@ impl Checker<'_> {
         match own {
             Some(f) => {
                 self.dict_uses.insert((f, param.to_string()));
+                true
             }
-            None if self.store_class(param) => {}
-            None => self.error(
-                node,
-                format!("`{param}::..` on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum or a trait (it works in a struct's `impl<T> S<T>`, on a function's or method's own type parameters, and in associated functions)"),
-            ),
+            None => self.store_class(param),
         }
     }
 
@@ -8932,7 +9129,31 @@ impl Checker<'_> {
         });
         if let Some(f) = own {
             self.dbg_uses.insert((f, param.to_string()));
+        } else {
+            // An `impl<T>`'s parameter in a method with `self`: the value carries `T`'s class,
+            // whose formatter prints it (`κσ.$dbgOf(this.$T)`).
+            self.store_class(param);
         }
+    }
+
+    /// A `#[derive(Default)]` struct with a bare `T` field (`last: T`): `default()` needs `T`'s
+    /// class (`T::default()`), so its values carry it (`stored`) and `S::<f64>::default()` /
+    /// `Default::default()` pass it.
+    fn store_default_params(&mut self) {
+        let mut uses = Vec::new();
+        for def in self.adts.defs.values() {
+            if def.is_enum || !def.derives("Default") {
+                continue;
+            }
+            for field in def.variants.iter().flat_map(|v| v.fields.iter()) {
+                if let Ty::Param(p) = &field.ty
+                    && let Some(i) = def.type_params.iter().position(|x| x == p)
+                {
+                    uses.push((def.name.clone(), i));
+                }
+            }
+        }
+        self.stored_uses.extend(uses);
     }
 
     /// The type parameters inside `t` (`Vec<Option<T>>` → `T`).
@@ -9519,6 +9740,11 @@ pub(super) fn written_mut_ref(t: &ast::Type) -> bool {
             }),
         _ => false,
     }
+}
+
+/// `&mut T` as written (not `Option<&mut T>`).
+pub(super) fn written_mut_ref_type(t: &ast::Type) -> bool {
+    matches!(t, ast::Type::RefType(r) if r.mut_token().is_some())
 }
 
 /// Whether a type is written as an owned value: not a reference, pointer, `impl Trait` or

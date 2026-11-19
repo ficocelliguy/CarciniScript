@@ -2859,6 +2859,12 @@
           return r.cls.prototype[name].call(r.cls.$mut?.has(name) ? c : x, ...args);
         }
       }
+      // (A blanket impl's method that assigns `*self` takes the cell too.)
+      for (const cls of regs.blankets) {
+        if (typeof cls.prototype[name] === "function") {
+          return cls.prototype[name].call(cls.$mut?.has(name) ? c : x, ...args);
+        }
+      }
       return rt.$dcall(regs, x, name, ...args);
     },
     $dcall(regs, x, name, ...args) {
@@ -3174,7 +3180,8 @@
       }
       return slot;
     },
-    // A place handed out by `index_mut`: `[0]` reads and writes it.
+    // A place handed out by `index_mut`, or a `&mut` to a field / element passed to a `&mut i32`
+    // parameter: `[0]` reads and writes it (`[1]` too, as a slot does).
     $cell(get, set) {
       return {
         get 0() {
@@ -3182,6 +3189,49 @@
         },
         set 0(v) {
           set(v);
+        },
+        get 1() {
+          return get();
+        },
+        set 1(v) {
+          set(v);
+        },
+      };
+    },
+    // A box (`[v]`: a local whose `&mut` is taken, a `&mut i32` parameter's cell) kept where a
+    // slot is (`let r = &mut x;` of a `&mut i32`-typed `r`, `Some(&mut x)`, a `&mut i32` field):
+    // `[1]` reads and writes it too.
+    $cellSlot(c) {
+      return {
+        get 0() {
+          return c[0];
+        },
+        set 0(v) {
+          c[0] = v;
+        },
+        get 1() {
+          return c[0];
+        },
+        set 1(v) {
+          c[0] = v;
+        },
+      };
+    },
+    // A slot (`[1]` is the value: a map entry, a `&mut i32` a function returned) passed to a
+    // `&mut i32` parameter, which reads `[0]`.
+    $slotCell(s) {
+      return {
+        get 0() {
+          return s[1];
+        },
+        set 0(v) {
+          s[1] = v;
+        },
+        get 1() {
+          return s[1];
+        },
+        set 1(v) {
+          s[1] = v;
         },
       };
     },
@@ -3207,6 +3257,12 @@
         o = o.b;
       }
       return {
+        get 0() {
+          return o[k];
+        },
+        set 0(v) {
+          o[k] = v;
+        },
         get 1() {
           return o[k];
         },
@@ -3225,6 +3281,12 @@
       }
       if (o[k] == null) return null;
       return {
+        get 0() {
+          return o[k];
+        },
+        set 0(v) {
+          o[k] = v;
+        },
         get 1() {
           return o[k];
         },
@@ -3241,6 +3303,12 @@
         a = a.b;
       }
       return {
+        get 0() {
+          return a[j];
+        },
+        set 0(v) {
+          a[j] = v;
+        },
         get 1() {
           return a[j];
         },
@@ -3271,6 +3339,12 @@
       return Iter.of(function* () {
         for (const s of slots) {
           const slot = {
+            get 0() {
+              return s[1];
+            },
+            set 0(v) {
+              s[1] = v;
+            },
             get 1() {
               return s[1];
             },
@@ -4633,14 +4707,48 @@
     },
     // Stand-ins for a built-in type's class, passed for `T::default()` and friends.
     $prims: {
-      num: { default: () => 0 },
-      big: { default: () => 0n },
-      str: { default: () => "", from_str: (s) => new Res(0, s) },
-      bool: { default: () => false, from_str: (s) => rt.$parseBool(s) },
-      char: { default: () => "\0", from_str: (s) => rt.$parseChar(s) },
+      num: { default: () => 0, dbg: String },
+      big: { default: () => 0n, dbg: String },
+      str: { default: () => "", from_str: (s) => new Res(0, s), dbg: (s) => rt.$dbgStr(s) },
+      bool: { default: () => false, from_str: (s) => rt.$parseBool(s), dbg: String },
+      char: { default: () => "\0", from_str: (s) => rt.$parseChar(s), dbg: (c) => rt.$dbgChar(c) },
       vec: { default: () => [] },
       option: { default: () => null },
       unit: { default: () => undefined },
+    },
+    // The `{:?}` formatter of a type parameter's class (`this.$T` of an `impl<T>`'s value): a
+    // number kind's or primitive's, a struct's or enum's `$dbg`, else by the run-time value.
+    $dbgOf(c) {
+      if (c == null) return rt.$dbgAny;
+      if (typeof c.dbg === "function") return c.dbg;
+      if (typeof c === "function" && c.prototype && typeof c.prototype.$dbg === "function") return (v) => v.$dbg();
+      return rt.$dbgAny;
+    },
+    // `x.money()` on a `T: Money` with `impl Money for i32` and `impl Money for f64`: `T`'s
+    // class says which impl (a whole `f64` would otherwise reach the integer impl).
+    // The same for a `&mut self` method, with the receiver's cell `c` (`$dcallMut`).
+    $dcallMutT(regs, cls, c, name, ...args) {
+      const kind = cls?.kind;
+      const x = c[0];
+      if (kind !== undefined) {
+        for (const r of regs.kinds[typeof x] ?? []) {
+          if (r.cls.name === "$ext$" + kind && typeof r.cls.prototype[name] === "function") {
+            return r.cls.prototype[name].call(r.cls.$mut?.has(name) ? c : x, ...args);
+          }
+        }
+      }
+      return rt.$dcallMut(regs, c, name, ...args);
+    },
+    $dcallT(regs, cls, x, name, ...args) {
+      const kind = cls?.kind;
+      if (kind !== undefined) {
+        for (const r of regs.kinds[typeof x] ?? []) {
+          if (r.cls.name === "$ext$" + kind && typeof r.cls.prototype[name] === "function") {
+            return r.cls.prototype[name].call(x, ...args);
+          }
+        }
+      }
+      return rt.$dcall(regs, x, name, ...args);
     },
     // A number type as a type parameter's class (`T = u8`): its `default()` and kind, for
     // generic arithmetic.
@@ -4672,6 +4780,7 @@
           big,
           bits,
           signed,
+          dbg: float ? dbgF : String,
           default: big ? () => 0n : () => 0,
           from_str: float
             ? (s) => rt.$parseFloat(s)

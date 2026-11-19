@@ -901,9 +901,25 @@ impl Checker<'_> {
     ) -> Ty {
         // A method of a user trait in `T`'s bounds.
         let bounds = self.param_bounds.get(name).cloned().unwrap_or_default();
-        if let Some(sig) = bounds.iter().find_map(|b| self.trait_method(b, method))
+        if let Some((b, sig)) = bounds
+            .iter()
+            .find_map(|b| self.trait_method(b, method).map(|s| (b.clone(), s)))
             && sig.receiver.is_some()
         {
+            // `x.money()` with `impl Money for i32` and `impl Money for f64`: JS can't tell a
+            // whole `f64` from an integer, so the call goes by `T`'s class (`κσ.$dcallT`).
+            let numeric_impls = self
+                .adts
+                .trait_impls
+                .iter()
+                .filter(|(ty, trs)| {
+                    trs.contains(&b) && matches!(Ty::from_name(ty), Ty::Int(_) | Ty::Float { .. })
+                })
+                .count();
+            if numeric_impls >= 2 && self.try_note_dict(name) {
+                let r = self.range(m.syntax());
+                self.class_dispatch.insert(r);
+            }
             return self.call_trait_method(m, recv, sig, Ty::Param(name.to_string()), args);
         }
         let t = Ty::Param(name.to_string());

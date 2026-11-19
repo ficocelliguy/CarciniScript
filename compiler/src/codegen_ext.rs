@@ -387,8 +387,16 @@ impl Codegen<'_> {
         let closure = match m.arg_list()?.args().next()? {
             ast::Expr::ClosureExpr(c) => self.emit_closure_aliased(&c, vec![i], subjects),
             other => {
-                // A function value gets a copy of the element; it can't write back.
+                // A function value taking `&mut i32` gets a cell over the element; another gets
+                // the element (a struct, written through; a number it can't write back).
                 let (f, _) = self.emit_expr(&other, None);
+                let cell = matches!(crate::typeck::strip_parens(&other), ast::Expr::PathExpr(p)
+                    if self.types.fn_cell_args.contains(&self.range_of(p.syntax())));
+                let element = if cell {
+                    format!("κσ.$cell(() => {element}, ($v) => {{ {element} = $v; }})")
+                } else {
+                    element
+                };
                 let call = if enumerate {
                     format!("[{i}, {element}]")
                 } else {

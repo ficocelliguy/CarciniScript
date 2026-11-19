@@ -95,7 +95,8 @@ pub(super) fn ext_self_ty(key: &str) -> Ty {
 /// A `&mut self` method of a trait implemented for a string, number, bool, char or `Option`: JS
 /// can't change those through `this`, so `this` is a cell (`this[0]` is `self`).
 pub(super) fn cell_self(sig: &crate::adt::Method, self_ty: &Ty) -> bool {
-    sig.receiver == Some(crate::adt::Receiver::MutRef) && crate::typeck::ptr_cellable(self_ty)
+    sig.receiver == Some(crate::adt::Receiver::MutRef)
+        && (crate::typeck::ptr_cellable(self_ty) || sig.cell_self)
 }
 
 impl Codegen<'_> {
@@ -1328,7 +1329,19 @@ impl Codegen<'_> {
                         .fields
                         .iter()
                         .enumerate()
-                        .map(|(k, f)| dbg_of(&f.ty, &format!("this{}", access(v, k)), &params))
+                        .map(|(k, f)| {
+                            // (A `&mut i32` field holds a slot: its value is `[1]`.)
+                            let slot = if self
+                                .types
+                                .mut_ref_fields
+                                .contains(&(def.name.clone(), f.name.clone()))
+                            {
+                                "[1]"
+                            } else {
+                                ""
+                            };
+                            dbg_of(&f.ty, &format!("this{}{slot}", access(v, k)), &params)
+                        })
                         .collect();
                     match v.shape {
                         Shape::Unit => {
@@ -1389,6 +1402,15 @@ impl Codegen<'_> {
                             .get(k)
                             .cloned()
                             .flatten()
+                            // (A bare `T` field: `T::default()` by the class passed in.)
+                            .or_else(|| match &f.ty {
+                                Ty::Param(p) => def
+                                    .type_params
+                                    .iter()
+                                    .position(|x| x == p)
+                                    .map(|i| format!("this?.$cargs?.[{i}]?.default()")),
+                                _ => None,
+                            })
                             .or_else(|| default_value(&f.ty))
                             .unwrap_or_else(|| "undefined".into())
                     })

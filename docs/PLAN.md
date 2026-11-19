@@ -1345,7 +1345,7 @@ gaps document.
   `mut` the message asks for. Fix: a binding of a call whose declared return type is `&mut T`
   / `Option<&mut T>` is mutable, as `iter_mut()`'s items are.
   **Done (2026-11-18):** `FnSig` / `Method` carry `ret_mut_ref` (a return type written `&mut T` /
-  `Option<&mut T>` with `T` not a number, string, bool or `Option`, which stay the slot gap); a
+  `Option<&mut T>`; `T` a number, string, bool or `Option` followed on 2026-11-18, see "Feature-parity gaps closed"); a
   `let` of such a call (also through `?`, `.unwrap()`, `.expect()`), and an `if let` / `match` /
   `let .. else` on one, bind a `&mut` (`fixtures/user_mut_ref_returns.rs`).
 - [x] **2. Mutating an `Option<number>` field in place is silently a no-op or a crash**
@@ -1393,15 +1393,46 @@ gaps document.
   into a struct fine. clap's `Args::parse()` already reads `ns.args` and matches
   `run x.rs --target n00dles`, so this is a docs item (point players to clap) plus a
   `&[(&str, ScriptArg)]`-style schema once typed unions land (see "Typed unions").
-- [ ] **8. A derived `Default` on a generic struct leaves `T` fields `undefined`**
+- [x] **8. A derived `Default` on a generic struct leaves `T` fields `undefined`**
   (`RUST_GAPS.md`), so a `History<f64, N>` ring buffer computes `NaN`. Rare, silent. Fix: the
   derived function takes `T`'s class like `T::default()` in associated functions does.
+  **Done (2026-11-18):** a bare `T` field of a `#[derive(Default)]` struct makes `T` a carried
+  class (`stored`), so `History::<f64>::default()` and `let h: History<f64> = Default::default()`
+  pass it (`κσ.$cv(History, [..]).default()`) and the field is `T::default()`
+  (`fixtures/generic_classes.rs`).
 - [ ] **9. An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
   are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
   Compile the tests to a `main` that runs each and prints libtest's summary.
 - [ ] **10. `u64` is BigInt**, documented, but players reach for `u64` for money and thread
   math: a 2M-iteration loop is 37 ms as `u64`, 3 ms as `usize`, 2 ms as `f64`. A hint on `u64`
   / `i64` locals that only hold NS numbers would do.
+
+### Feature-parity gaps closed (2026-11-18)
+
+The two largest remaining parity gaps, from a survey of `RUST_GAPS.md`:
+
+- [x] **A `&mut` to a number, string, bool or `Option` inside a struct, tuple or Vec, kept as a
+  value.** Was a compile error in a local, a silent copy through an `Option<&mut i32>`
+  parameter, `.as_mut().map(..)`, a `&mut i32` field or a function value given to `for_each`,
+  and a silent miscompile when re-pointed (`q = &mut x` wrote the wrong variable). Now a slot
+  object over the place (`κσ.$placeSlot` / `$optSlot`; a box or cell doubles as one through
+  `[1]`, `κσ.$cellSlot` / `$slotCell` convert at `&mut i32` parameter boundaries): the checker
+  marks where such a value is kept (`typeck_slots.rs` `keep_slot` / `keep_opt_slot`: `let`
+  initializers, `return`s and tails of `-> &mut T` / `-> Option<&mut T>` functions, arguments,
+  struct fields, assignments to a `&mut` local) and which expressions yield one (`slot_values`:
+  calls of such functions, `&mut i32` fields, `o.unwrap()` of an `Option<&mut i32>`), and
+  codegen reads `[1]` everywhere else. A blanket impl's method that assigns `*self` takes the
+  receiver's cell (`Method::cell_self`). `fixtures/mut_prim_refs.rs`; three `rejects` programs
+  that compile now were dropped. Still a copy: a `&mut i32` pushed into a `Vec<&mut i32>` by
+  hand, or inside a tuple / enum payload.
+- [x] **Erased generics that need the type's class.** An enum's `impl<T>` methods with `self`
+  carry `T`'s class like a struct's (`stored_pos` allows enums; constructions pass it), so
+  `/`, `%`, `<<`, `T::default()` and `parse::<T>()` work there; `impl<T> S<Vec<T>>` binds `T`
+  from the receiver (`bind_impl_arg`); `{:?}` of a `T` field in an `impl<T: Debug>` method uses
+  the carried class's formatter (`κσ.$dbgOf(this.$T)`); a trait implemented for several number
+  types called through `T: Trait` dispatches by `T`'s class (`κσ.$dcallT`), so `pay(2.0f64)`
+  reaches the `f64` impl. `fixtures/generic_classes.rs`. Left: `dyn Trait` on a float still
+  picks by the value, tuple impls by length, and `impl<T> S<Vec<T>>` carries no class.
 
 Stale in `RUST_GAPS.md` (works now, each confirmed by a probe): `HashMap::get_mut` on number
 values writes through (`if let Some(v) = m.get_mut("a") { *v += 2.0 }`, `*m.get_mut("a").unwrap() += 1.0`);

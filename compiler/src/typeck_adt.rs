@@ -372,6 +372,9 @@ impl Checker<'_> {
                     ref_params: vec![],
                     ret_owned: true,
                     ret_mut_ref: false,
+                    ret_slot: None,
+                    opt_slot_params: vec![],
+                    cell_self: false,
                 });
         }
     }
@@ -430,6 +433,42 @@ impl Checker<'_> {
         variant
     }
 
+    /// Bind an `impl`'s type argument pattern (`T`, or `Vec<T>` of `impl<T> S<Vec<T>>`) to the
+    /// receiver's argument (`arg`), or to fresh variables for an associated function call.
+    fn bind_impl_arg(
+        &mut self,
+        pat: &Ty,
+        arg: Option<&Ty>,
+        map: &mut HashMap<String, Ty>,
+        assoc: bool,
+    ) {
+        match pat {
+            Ty::Param(u) => {
+                let a = match arg {
+                    Some(a) => a.clone(),
+                    None => self.fresh(VarKind::General),
+                };
+                // (An associated function takes classes for its `impl`'s parameters too.)
+                if assoc && !map.contains_key(u) {
+                    self.last_type_args.push(a.clone());
+                }
+                map.insert(u.clone(), a);
+            }
+            other => {
+                let inner = other.inner_types();
+                if inner.is_empty() {
+                    return;
+                }
+                let arg_inner: Vec<Ty> = arg
+                    .map(|a| self.shallow(a).inner_types())
+                    .unwrap_or_default();
+                for (k, p) in inner.iter().enumerate() {
+                    self.bind_impl_arg(p, arg_inner.get(k), map, assoc);
+                }
+            }
+        }
+    }
+
     /// A method's signature for a receiver with type arguments `recv_args` (None for an
     /// associated function call, whose impl parameters get fresh variables).
     pub(super) fn method_inst(&mut self, m: &Method, recv_args: Option<&[Ty]>) -> Method {
@@ -442,17 +481,9 @@ impl Checker<'_> {
             map.insert(p.clone(), v);
         }
         for (i, ia) in m.impl_args.iter().enumerate() {
-            if let Ty::Param(u) = ia {
-                let arg = match recv_args {
-                    Some(args) => args.get(i).cloned().unwrap_or(Ty::Unknown),
-                    None => self.fresh(VarKind::General),
-                };
-                // (An associated function takes classes for its `impl`'s parameters too.)
-                if recv_args.is_none() && m.receiver.is_none() && !map.contains_key(u) {
-                    self.last_type_args.push(arg.clone());
-                }
-                map.insert(u.clone(), arg);
-            }
+            let arg = recv_args.map(|args| args.get(i).cloned().unwrap_or(Ty::Unknown));
+            let assoc = recv_args.is_none() && m.receiver.is_none();
+            self.bind_impl_arg(ia, arg.as_ref(), &mut map, assoc);
         }
         if map.is_empty() {
             return m.clone();
@@ -469,6 +500,9 @@ impl Checker<'_> {
             ref_params: m.ref_params.clone(),
             ret_owned: m.ret_owned,
             ret_mut_ref: m.ret_mut_ref,
+            ret_slot: m.ret_slot,
+            opt_slot_params: m.opt_slot_params.clone(),
+            cell_self: m.cell_self,
         }
     }
 
@@ -755,6 +789,13 @@ impl Checker<'_> {
                             self.shared_ref_fields
                                 .insert((variant_name.to_string(), name.clone()));
                         }
+                        // `n: &'a mut i32`: the field holds a slot over the borrowed place.
+                        if f.ty().as_ref().is_some_and(super::written_mut_ref_type)
+                            && self.cellable(&ty)
+                        {
+                            self.mut_ref_fields
+                                .insert((variant_name.to_string(), name.clone()));
+                        }
                         if let Some(t) = f.ty()
                             && super::is_ptr_type(&t)
                         {
@@ -790,6 +831,12 @@ impl Checker<'_> {
                         }
                         if f.ty().as_ref().is_some_and(shared_ref_type) {
                             self.shared_ref_fields
+                                .insert((variant_name.to_string(), i.to_string()));
+                        }
+                        if f.ty().as_ref().is_some_and(super::written_mut_ref_type)
+                            && self.cellable(&ty)
+                        {
+                            self.mut_ref_fields
                                 .insert((variant_name.to_string(), i.to_string()));
                         }
                         Field {
@@ -1451,11 +1498,9 @@ impl Checker<'_> {
             .ret_type()
             .and_then(|r| r.ty())
             .is_some_and(|t| super::written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown));
-        let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::written_mut_ref(&t))
-            && !self.cellable(match &ret {
-                Ty::Option(t) => t,
-                t => t,
-            });
+        let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::written_mut_ref(&t));
+        let ret_slot = self.ret_slot_kind(f.ret_type().and_then(|r| r.ty()), &ret);
+        let opt_slot_params = self.opt_slot_params(f, &params);
         let method = Method {
             params,
             ret,
@@ -1468,6 +1513,9 @@ impl Checker<'_> {
             ref_params,
             ret_owned,
             ret_mut_ref,
+            ret_slot,
+            opt_slot_params,
+            cell_self: false,
         };
         for p in &own {
             self.generics.remove(p);
@@ -1602,7 +1650,7 @@ impl Checker<'_> {
                 self.check_body(&f, m.params.clone(), m.ret.clone(), m.is_async, self_local);
                 self.cur_fn = saved_fn;
                 // A blanket impl's `*self = ..` / `*self += ..`: `self` may be a number or a
-                // string, which would need a cell per call.
+                // string, so the method takes the receiver's cell (`Method::cell_self`).
                 if type_name.ends_with("$all")
                     && m.receiver == Some(crate::adt::Receiver::MutRef)
                     && let Some(body) = f.body()
@@ -1613,7 +1661,14 @@ impl Checker<'_> {
                             if p.op_kind() == Some(ast::UnaryOp::Deref)
                                 && matches!(p.expr(), Some(ast::Expr::PathExpr(s)) if s.syntax().text() == "self"));
                         if assigns && to_self {
-                            self.error(e.syntax(), "assigning to `*self` in a blanket impl's method (`impl<T> Tr for T`) isn't supported yet: `self` may be a number or string there, which can't be changed in place");
+                            if let Some(sig) = self
+                                .adts
+                                .methods
+                                .get_mut(type_name.as_str())
+                                .and_then(|ms| ms.get_mut(key.as_str()))
+                            {
+                                sig.cell_self = true;
+                            }
                         }
                     }
                 }
@@ -1644,9 +1699,9 @@ impl Checker<'_> {
         self.adts.resolve(self_ty, segs)
     }
 
-    /// A generic struct's construction, for the classes its values may carry.
+    /// A generic struct's or enum's construction, for the classes its values may carry.
     fn note_ctor(&mut self, adt: &str, targs: &[Ty]) {
-        if !targs.is_empty() && !self.adts.defs[adt].is_enum {
+        if !targs.is_empty() {
             self.ctor_sites
                 .push((self.cur_fn.clone(), adt.to_string(), targs.to_vec()));
         }
@@ -2055,6 +2110,13 @@ impl Checker<'_> {
                     seen.push(key);
                     if let Some(e) = value {
                         self.check(&e, &field.ty);
+                        // `W { n: &mut s.count }` with `n: &mut i32`: the field keeps the slot.
+                        if self
+                            .mut_ref_fields
+                            .contains(&(adt.clone(), fname.text().to_string()))
+                        {
+                            self.keep_slot(&e);
+                        }
                     } else if let Some(local) =
                         self.lookup(fname.text().to_string().as_str()).cloned()
                     {
@@ -2176,6 +2238,11 @@ impl Checker<'_> {
                 self.check_mutable(recv, Mutation::Borrow);
             }
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
+            // `*s.at(i) += 1` with `fn at(&mut self, i: usize) -> &mut i32`: the call is a slot.
+            if sig.ret_slot == Some(false) {
+                let r = self.range(m.syntax());
+                self.slot_values.insert(r);
+            }
             for (i, (a, p)) in args.iter().zip(&sig.params).enumerate() {
                 if sig.cell_params.get(i) == Some(&true) {
                     self.cell_arg(a);
@@ -2197,6 +2264,7 @@ impl Checker<'_> {
             for a in args.iter().skip(sig.params.len()) {
                 self.infer(a, None);
             }
+            self.finish_slot_args(args, &sig.opt_slot_params);
             return if sig.is_async {
                 Ty::Future(Box::new(sig.ret))
             } else {

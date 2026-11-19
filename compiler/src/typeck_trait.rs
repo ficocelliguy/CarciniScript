@@ -1235,5 +1235,8 @@ pub fn subst_method(m: &Method, sub: &HashMap<String, Ty>) -> Method {
         ref_params: m.ref_params.clone(),
         ret_owned: m.ret_owned,
         ret_mut_ref: m.ret_mut_ref,
+        ret_slot: m.ret_slot,
+        opt_slot_params: m.opt_slot_params.clone(),
+        cell_self: m.cell_self,
     }
 }

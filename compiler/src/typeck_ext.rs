@@ -653,6 +653,17 @@ impl Checker<'_> {
             (Ty::Option(t), m2) if is_option_closure_method(m2) => {
                 let t = *t;
                 let opt = |x: Ty| Ty::Option(Box::new(x));
+                // `o.map(|n| *n += 1)` / `.filter(|n| **n > 0)` on an `Option<&mut i32>` value:
+                // the closure's parameter binds the slot.
+                let slot_recv = self.option_slot_shape(recv).is_some();
+                if slot_recv
+                    && matches!(
+                        m2,
+                        "map" | "and_then" | "filter" | "is_some_and" | "is_none_or" | "inspect"
+                    )
+                {
+                    self.closure_slots = vec![(0, super::slots::SlotShape::Slot)];
+                }
                 match m2 {
                     "map" => {
                         count(self, 1);
@@ -677,6 +688,9 @@ impl Checker<'_> {
                     "map_or" => {
                         count(self, 2);
                         let r = a0.map(|a| self.infer(a, None)).unwrap_or(Ty::Unknown);
+                        if slot_recv {
+                            self.closure_slots = vec![(0, super::slots::SlotShape::Slot)];
+                        }
                         self.closure_arg(a1, vec![t], r)
                     }
                     "map_or_else" => {
@@ -864,6 +878,19 @@ impl Checker<'_> {
             elem: Box::new(elem),
             mutable: false,
         };
+        // `v.iter_mut().for_each(bump)` with `fn bump(x: &mut i32)`: each element as a cell.
+        if method == "for_each"
+            && mutable
+            && let Some(ast::Expr::PathExpr(p)) = a0.map(super::strip_parens)
+            && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+            && self
+                .fns
+                .get(n.text().to_string().as_str())
+                .is_some_and(|s| s.cell_params.first() == Some(&true))
+        {
+            let r = self.range(p.syntax());
+            self.fn_cell_args.insert(r);
+        }
         let opt = |x: Ty| Ty::Option(Box::new(x));
         // Adapters that hand on the same items keep an `iter_mut()` mutable.
         let keep = |elem: Ty| Ty::Iter {
