@@ -312,6 +312,61 @@ impl Codegen<'_> {
                             continue;
                         };
                         let ty = k.ty().map(|t| self.lower_type(&t));
+                        let name = escape_ident(n.text());
+                        // `impl<const P: u128> U<P> { const PER: u128 = P * 1000; }`: a getter
+                        // reading `P` off the class view it's read through (`κσ.$cv(U, [7]).PER`,
+                        // see `param_consts`).
+                        if self
+                            .param_consts
+                            .contains(&(def.name.clone(), n.text().to_string()))
+                        {
+                            use ra_ap_syntax::ast::HasGenericArgs;
+                            let st_args: Vec<String> = match imp.self_ty() {
+                                Some(ast::Type::PathType(p)) => p
+                                    .path()
+                                    .and_then(|p| p.segment())
+                                    .and_then(|s| s.generic_arg_list())
+                                    .into_iter()
+                                    .flat_map(|l| l.generic_args())
+                                    .map(|a| a.syntax().text().to_string())
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            let saved_consts = super::set_const_scope(None);
+                            self.scopes.push(HashMap::new());
+                            for p in imp
+                                .generic_param_list()
+                                .into_iter()
+                                .flat_map(|l| l.generic_params())
+                            {
+                                if let ast::GenericParam::ConstParam(cp) = p
+                                    && let Some(pn) = cp.name()
+                                    && let Some(i) =
+                                        st_args.iter().position(|a| *a == pn.text().to_string())
+                                {
+                                    let js = format!("this.$cargs?.[{i}]");
+                                    super::CONST_SCOPE
+                                        .with(|s| s.borrow_mut().insert(pn.text().to_string(), js.clone()));
+                                    let pty = cp.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                                    // (A 128-bit parameter is a BigInt in the body.)
+                                    let js = match pty {
+                                        Ty::Int(k) if k.is_big() => format!("BigInt({js})"),
+                                        _ => js,
+                                    };
+                                    self.declare(pn.text().to_string().as_str(), None, Local { js, ty: pty });
+                                }
+                            }
+                            let (f, _) = self.emit_expr(&body, ty.as_ref());
+                            self.scopes.pop();
+                            super::set_const_scope(Some(saved_consts));
+                            let mut line = Frag::mapped(
+                                self.off(k.syntax()),
+                                format!("static get {name}() {{ return "),
+                            );
+                            line.append(f).push("; }");
+                            self.line(line);
+                            continue;
+                        }
                         let (f, _) = self.emit_expr(&body, ty.as_ref());
                         // A value naming other items (`W * 2` with `const W` below the class,
                         // another class's const) is computed on first read: they may not be
@@ -799,9 +854,36 @@ impl Codegen<'_> {
             .collect();
         for f in defaults {
             let Some(n) = f.name() else { continue };
+            // (`trait Cap<const N: usize>`: `N` is this impl's argument, `impl Cap<3> for i32`.)
+            let saved_extra = std::mem::take(&mut self.extra_consts);
+            if let Some(t) = f.syntax().ancestors().find_map(ast::Trait::cast)
+                && let Some(tn) = t.name()
+                && let Some(acc) = self
+                    .trait_const_args
+                    .get(&(key.to_string(), tn.text().to_string()))
+                    .cloned()
+            {
+                let cps: Vec<ast::ConstParam> = t
+                    .generic_param_list()
+                    .into_iter()
+                    .flat_map(|l| l.generic_params())
+                    .filter_map(|p| match p {
+                        ast::GenericParam::ConstParam(cp) => Some(cp),
+                        _ => None,
+                    })
+                    .collect();
+                let mut extra = Vec::new();
+                for (cp, a) in cps.iter().zip(acc) {
+                    let Some(cn) = cp.name() else { continue };
+                    let ty = cp.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                    extra.push((cn.text().to_string(), format!("({a})(this)"), ty));
+                }
+                self.extra_consts = extra;
+            }
             if let Some(sig) = self.types.adts.method(key, n.text()).cloned() {
                 self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
             }
+            self.extra_consts = saved_extra;
         }
         self.ext_class = saved_ext;
         self.out.indent -= 1;
@@ -856,8 +938,17 @@ impl Codegen<'_> {
                 continue;
             }
             let prefix = format!("{m}.{}", escape_ident(tr));
+            // (A trait with const parameters: its defaults are a factory over this impl's
+            // arguments, see `emit_trait_defaults`.)
+            let (defaults, statics) = match self.trait_const_args.get(&(key.to_string(), tr.clone())) {
+                Some(acc) => (
+                    format!("{prefix}$defaults?.({}) ?? {{}}", acc.join(", ")),
+                    format!("{prefix}$statics?.({})", acc.join(", ")),
+                ),
+                None => (format!("{prefix}$defaults ?? {{}}"), format!("{prefix}$statics")),
+            };
             self.line(Frag::text(format!(
-                "κσ.$mixin($ext${key}, {prefix}$defaults ?? {{}}, {}, {prefix}$statics);",
+                "κσ.$mixin($ext${key}, {defaults}, {}, {statics});",
                 super::js_string(tr)
             )));
             if !modules.contains(&m) {
@@ -902,6 +993,10 @@ impl Codegen<'_> {
             // (A range value is an `Iter` over a `RangeIt`.)
             "Range" => ("range", false),
             "RangeInclusive" => ("rangeincl", false),
+            // (`impl Tr for fn() -> i32`: any JS function.)
+            "FnPtr" => ("function", false),
+            "RefCell" => ("refcell", false),
+            "Iter" => ("iter", false),
             "f32" | "f64" => ("number", false),
             // (The 64- and 128-bit kinds are BigInts.)
             "i64" | "u64" | "i128" | "u128" => ("bigint", true),
@@ -926,13 +1021,40 @@ impl Codegen<'_> {
         let Some(def) = self.types.adts.traits.get(&tr).cloned() else {
             return;
         };
+        // `trait Buf<const N: usize>`: the defaults are a factory over `N`'s accessor, called per
+        // impl (`Buf$defaults(() => 4)`; `(s) => s.$M` for `impl<const M: usize> Buf<M> for
+        // Arr<M>`), so each class's copy reads its own `N` (`$N(this)`).
+        let cps = def.const_params.clone();
+        let (open, close) = if cps.is_empty() {
+            (" = {".to_string(), "};".to_string())
+        } else {
+            let params: Vec<String> = cps.iter().map(|n| format!("${n}")).collect();
+            (format!(" = ({}) => ({{", params.join(", ")), "});".to_string())
+        };
+        let saved_consts = super::set_const_scope(None);
+        for n in &cps {
+            super::CONST_SCOPE.with(|s| s.borrow_mut().insert(n.clone(), format!("${n}(this)")));
+        }
+        self.extra_consts = t
+            .generic_param_list()
+            .into_iter()
+            .flat_map(|l| l.generic_params())
+            .filter_map(|p| match p {
+                ast::GenericParam::ConstParam(cp) => {
+                    let n = cp.name()?.text().to_string();
+                    let ty = cp.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                    Some((n.clone(), format!("${n}(this)"), ty))
+                }
+                _ => None,
+            })
+            .collect();
         let mut header = Frag::mapped(self.item_start(t.syntax()), "export const ");
         header
             .append(Frag::mapped(
                 self.off(name.syntax()),
                 format!("{}$defaults", escape_ident(&tr)),
             ))
-            .push(" = {");
+            .push(&open);
         self.line(header);
         self.out.indent += 1;
         self.in_trait_default = true;
@@ -959,9 +1081,9 @@ impl Codegen<'_> {
             self.emit_method_fn(&f, sig, Ty::Param("Self".into()), "},", None);
         }
         self.out.indent -= 1;
-        self.line(Frag::text("};"));
+        self.line(Frag::text(close.clone()));
         self.line(Frag::text(format!(
-            "export const {}$statics = {{",
+            "export const {}$statics{open}",
             escape_ident(&tr)
         )));
         self.out.indent += 1;
@@ -990,7 +1112,9 @@ impl Codegen<'_> {
         }
         self.out.indent -= 1;
         self.in_trait_default = false;
-        self.line(Frag::text("};"));
+        self.line(Frag::text(close));
+        self.extra_consts.clear();
+        super::set_const_scope(Some(saved_consts));
         self.line(Frag::default());
     }
 
@@ -1027,10 +1151,96 @@ impl Codegen<'_> {
                     None => escape_ident(&tr),
                 };
                 let cls = self.class(&adt);
+                // (A trait with const parameters: its defaults are a factory over this impl's
+                // arguments, see `emit_trait_defaults`.)
+                let call = match self.trait_const_args.get(&(adt.clone(), tr.clone())) {
+                    Some(acc) => format!("({})", acc.join(", ")),
+                    None => String::new(),
+                };
                 self.line(Frag::text(format!(
-                    "κσ.$mixin({cls}, {prefix}$defaults, {}, {prefix}$statics);",
+                    "κσ.$mixin({cls}, {prefix}$defaults{call}, {}, {prefix}$statics{call});",
                     super::js_string(&tr)
                 )));
+            }
+        }
+    }
+
+    /// For each impl of a trait with const parameters, the JS accessors of its const arguments
+    /// (`trait_const_args`); and the associated consts whose value reads the impl's const
+    /// parameters (`param_consts`). Before any code is emitted: both are read at use sites.
+    pub(super) fn note_const_impls(&mut self, file: &ast::SourceFile) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        for item in crate::adt::all_items(file) {
+            let ast::Item::Impl(imp) = item else { continue };
+            let (trait_name, type_name) = crate::adt::impl_parts(&imp);
+            let Some(type_name) = type_name.or_else(|| crate::adt::impl_self_name(&imp)) else {
+                continue;
+            };
+            let impl_consts: Vec<String> = imp
+                .generic_param_list()
+                .into_iter()
+                .flat_map(|l| l.generic_params())
+                .filter_map(|p| match p {
+                    ast::GenericParam::ConstParam(cp) => Some(cp.name()?.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            // `impl Buf<4> for A` / `impl<const M: usize> Buf<M> for Arr<M>`.
+            if let Some(tr) = &trait_name
+                && self
+                    .types
+                    .adts
+                    .traits
+                    .get(tr)
+                    .is_some_and(|d| !d.const_params.is_empty())
+                && let Some(ast::Type::PathType(p)) = imp.trait_()
+                && let Some(seg) = p.path().and_then(|p| p.segment())
+            {
+                let n_types = self.types.adts.traits[tr].type_params.len();
+                let accessors: Vec<String> = seg
+                    .generic_arg_list()
+                    .into_iter()
+                    .flat_map(|l| l.generic_args())
+                    .skip(n_types)
+                    .map(|a| {
+                        let text: String = a.syntax().text().to_string().split_whitespace().collect();
+                        let text = text.trim_matches(|c| c == '{' || c == '}').to_string();
+                        if impl_consts.contains(&text) {
+                            match imp
+                                .self_ty()
+                                .and_then(|st| crate::adt::const_path(&st, &text, &self.types.adts))
+                            {
+                                Some(suffix) => format!("(s) => s{suffix}"),
+                                None => "() => undefined".to_string(),
+                            }
+                        } else {
+                            format!("() => {}", self.const_js(&text))
+                        }
+                    })
+                    .collect();
+                let key = (
+                    crate::adt::ext_key_any(&type_name)
+                        .filter(|k| self.types.adts.ext_types.contains(k))
+                        .unwrap_or_else(|| type_name.clone()),
+                    tr.clone(),
+                );
+                self.trait_const_args.insert(key, accessors);
+            }
+            // `impl<const P: u128> U<P> { const PER: u128 = P * 1000; }`
+            if !impl_consts.is_empty() {
+                for a in imp.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()) {
+                    if let ast::AssocItem::Const(k) = a
+                        && let (Some(n), Some(body)) = (k.name(), k.body())
+                        && body.syntax().descendants().filter_map(ast::PathExpr::cast).any(|p| {
+                            p.path()
+                                .and_then(|p| p.as_single_name_ref())
+                                .is_some_and(|r| impl_consts.contains(&r.text().to_string()))
+                        })
+                    {
+                        self.param_consts
+                            .insert((type_name.clone(), n.text().to_string()));
+                    }
+                }
             }
         }
     }
@@ -1558,7 +1768,11 @@ impl Codegen<'_> {
 
     /// A path naming a unit struct or variant, a tuple constructor, or an associated function
     /// used as a value.
-    pub(super) fn emit_adt_path(&mut self, segs: &[String]) -> Option<(Frag, Ty)> {
+    pub(super) fn emit_adt_path(
+        &mut self,
+        segs: &[String],
+        path: Option<&ast::Path>,
+    ) -> Option<(Frag, Ty)> {
         Some(match self.resolve(segs)? {
             Resolved::Ctor(adt, v) => {
                 let def = self.types.adts.defs[&adt].clone();
@@ -1589,6 +1803,35 @@ impl Codegen<'_> {
                         .is_some_and(|c| c.contains_key(&m)) =>
             {
                 let ty = self.types.adts.assoc_consts[&adt][&m].clone();
+                // A const reading the impl's const parameters: through a class view carrying
+                // them (`U::<3>::PER` → `κσ.$cv(U, [3]).PER`; `Self::PER` in a method, `this.$P`).
+                if self.param_consts.contains(&(adt.clone(), m.clone())) {
+                    use ra_ap_syntax::ast::HasGenericArgs;
+                    let params = self.types.adts.defs[&adt].type_params.clone();
+                    let written: Vec<String> = path
+                        .and_then(|p| {
+                            p.segments()
+                                .find(|s| s.name_ref().is_some_and(|n| n.text() == adt.as_str()))
+                        })
+                        .and_then(|s| s.generic_arg_list())
+                        .into_iter()
+                        .flat_map(|l| l.generic_args())
+                        .map(|a| {
+                            let t: String = a.syntax().text().to_string().split_whitespace().collect();
+                            t.trim_matches(|c| c == '{' || c == '}').to_string()
+                        })
+                        .collect();
+                    let args: Vec<Ty> = params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| match written.get(i) {
+                            Some(w) => Ty::ConstVal(w.clone()),
+                            None => Ty::Param(p.clone()),
+                        })
+                        .collect();
+                    let view = super::class_view(self.class(&adt), &args, &[]);
+                    return Some((Frag::text(format!("{view}.{}", escape_ident(&m))), ty));
+                }
                 (
                     Frag::text(format!("{}.{}", self.class(&adt), escape_ident(&m))),
                     ty,

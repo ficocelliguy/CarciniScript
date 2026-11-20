@@ -100,6 +100,8 @@ pub fn has_prim_paths(text: &str) -> bool {
         .iter()
         .chain(OTHERS)
         .any(|p| text.contains(&format!("{p}::")))
+        // (`Result::Ok(1)`, see `expand`.)
+        || text.contains("Result::")
 }
 
 /// Rewrite path calls and method values of built-in types in `text`, recording the edits in
@@ -131,6 +133,23 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0;
     while i + 3 < toks.len() {
+        // `Option::Some(3)`, `std::option::Option::None`, `Result::<i32, String>::Ok(1)` (also as
+        // patterns): the variant alone, as the prelude names it (a turbofish moves onto it).
+        // type settles it).
+        if let Some((first, variant, generics)) = variant_path(&toks, i)
+            && !skip(&toks[i])
+        {
+            match generics {
+                // `Result::<A, B>::Ok(1)` is `Ok::<A, B>(1)`.
+                Some((lt, gt)) => {
+                    edits.push((start(first), start(lt), format!("{}::", at(variant))));
+                    edits.push((end(gt), end(variant), String::new()));
+                }
+                None => edits.push((start(first), start(variant), String::new())),
+            }
+            i = variant + 1;
+            continue;
+        }
         let prim = at(i);
         // `u64` `:` `:` `pow` (a `::` is one token in paths but two in token trees)
         let (sep_len, ok) = if at(i + 1) == "::" {
@@ -450,4 +469,86 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
         map.replace(a, b, new.len());
     }
     changed
+}
+
+/// `Option::Some` / `Result::Err` at `toks[i]`, with an optional `std::option::` / `core::result::`
+/// prefix before it and a turbofish after the type (`Result::<A, B>::Ok`): the index of the
+/// path's first token and of the variant's, and the turbofish's `<` and `>` tokens when there is one.
+fn variant_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Option<(usize, usize)>)> {
+    let at = |k: usize| toks.get(k).map(|t| t.text().to_string()).unwrap_or_default();
+    let ident = |k: usize| toks.get(k).is_some_and(|t| t.kind() == SyntaxKind::IDENT);
+    // (`::` is one token in a path, two `:` in a macro's tokens.)
+    let sep = |k: usize| -> Option<usize> {
+        if at(k) == "::" {
+            Some(k + 1)
+        } else if at(k) == ":" && at(k + 1) == ":" {
+            Some(k + 2)
+        } else {
+            None
+        }
+    };
+    let sep_before = |k: usize| -> Option<usize> {
+        if k >= 1 && at(k - 1) == "::" {
+            Some(k - 1)
+        } else if k >= 2 && at(k - 1) == ":" && at(k - 2) == ":" {
+            Some(k - 2)
+        } else {
+            None
+        }
+    };
+    let ty = at(i);
+    let (module, variants): (&str, &[&str]) = match ty.as_str() {
+        "Option" => ("option", &["Some", "None"]),
+        "Result" => ("result", &["Ok", "Err"]),
+        _ => return None,
+    };
+    if !ident(i) {
+        return None;
+    }
+    let mut k = sep(i + 1)?;
+    let mut generics = None;
+    if at(k) == "<" {
+        let lt = k;
+        // (`>>` closes two levels in a token tree.)
+        let mut depth = 0i32;
+        loop {
+            let t = at(k);
+            if t.is_empty() {
+                return None;
+            }
+            depth += t.chars().filter(|c| *c == '<').count() as i32;
+            depth -= t.chars().filter(|c| *c == '>').count() as i32;
+            k += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+        generics = Some((lt, k - 1));
+        k = sep(k)?;
+    }
+    if !ident(k) || !variants.contains(&at(k).as_str()) {
+        return None;
+    }
+    // `std::option::` before the type.
+    let mut first = i;
+    if let Some(s) = sep_before(first)
+        && s >= 1
+        && at(s - 1) == module
+        && ident(s - 1)
+    {
+        first = s - 1;
+        if let Some(s) = sep_before(first)
+            && s >= 1
+            && matches!(at(s - 1).as_str(), "std" | "core" | "alloc")
+        {
+            first = s - 1;
+        }
+    }
+    // (`m::Option::Some`, `x.Option`: another `Option`.)
+    if sep_before(first).is_some()
+        || (first >= 1 && matches!(at(first - 1).as_str(), "." | "<" | "as"))
+    {
+        return None;
+    }
+    Some((first, k, generics))
 }

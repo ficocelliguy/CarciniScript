@@ -901,6 +901,94 @@ pub fn strip_cfg(text: &mut String) -> bool {
         }
         cuts.push((a, b));
     }
+    // `#[cfg(..)]` on a macro's arguments (`vec![#[cfg(unix)] 1, 2]`, `sum!(1, #[cfg(feature =
+    // "x")] 2)`): not items, so the attribute is read off the token tree. Off, the argument goes
+    // too (through its comma); otherwise just the attribute.
+    for mc in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
+        let Some(tt) = mc.token_tree() else { continue };
+        if mc.syntax().ancestors().skip(1).any(|a| ast::MacroCall::can_cast(a.kind())) {
+            continue;
+        }
+        // (`cfg_if! { if #[cfg(..)] { .. } }`: the attributes are its syntax.)
+        if mc
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|s| s.name_ref())
+            .is_some_and(|n| matches!(n.text().to_string().as_str(), "cfg_if" | "cfg_match"))
+        {
+            continue;
+        }
+        let toks: Vec<ra_ap_syntax::SyntaxToken> = tt
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() != SyntaxKind::WHITESPACE && t.kind() != SyntaxKind::COMMENT)
+            .collect();
+        let end = |k: usize| usize::from(toks[k].text_range().end());
+        let mut i = 0;
+        while i + 1 < toks.len() {
+            if toks[i].text() != "#" || toks[i + 1].text() != "[" {
+                i += 1;
+                continue;
+            }
+            // The attribute's tokens, to the `]` closing it.
+            let mut depth = 0i32;
+            let mut j = i + 1;
+            while j < toks.len() {
+                match toks[j].text() {
+                    "[" | "(" | "{" => depth += 1,
+                    "]" | ")" | "}" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j >= toks.len() {
+                break;
+            }
+            let attr: Vec<String> = toks[i..=j].iter().map(|t| t.text().to_string()).collect();
+            let n = attr.len();
+            if !(n >= 6 && attr[..4] == ["#", "[", "cfg", "("] && attr[n - 2..] == [")", "]"]) {
+                i = j + 1;
+                continue;
+            }
+            let pred = attr[4..n - 2].to_vec();
+            let mut k = 0;
+            let val = cfg_pred3(&pred, &mut k, debug, true);
+            let off = matches!(val, Ok(Some(false)) if k == pred.len());
+            let a = usize::from(toks[i].text_range().start());
+            let mut b = end(j);
+            if off {
+                // The argument: to its comma (taken too) or the end of its token tree.
+                let mut depth = 0i32;
+                let mut m = j + 1;
+                while m < toks.len() {
+                    match toks[m].text() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        "," | ";" if depth == 0 => {
+                            b = end(m);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    b = end(m);
+                    m += 1;
+                }
+            }
+            cuts.push((a, b));
+            i = j + 1;
+        }
+    }
     if cuts.is_empty() {
         return false;
     }

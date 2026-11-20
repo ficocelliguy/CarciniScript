@@ -153,10 +153,10 @@ field compare (`v.type === "money"`) for tagged ones, nothing is converted at th
 `ns.run("x.rs", 4, "n00dles")` doesn't change. `JsValue` stays only where the d.ts says `any`
 (port data, `codingcontract.getData`, `dynamicImport`, `flags`, `print` / `tprint` arguments).
 
-- [ ] **String-literal unions** (`CityName`, `CorpEmployeePosition`, `GymType`, ..) are `String`.
-  A Rust enum per union (`CityName::Aevum`, its value the string) would show the valid values
-  too, but would break `"Aevum"` literals unless those parameters also take a `&str`, and
-  `ns.enums` already lists the values. Needs a decision.
+**String-literal unions** (`CityName`, `CorpEmployeePosition`, `GymType`, ..) are `String`
+(decided 2026-11-20). A Rust enum per union (`CityName::Aevum`, its value the string) would show
+the valid values too, but would break `"Aevum"` literals unless those parameters also took a
+`&str`, and `ns.enums` already lists the values.
 
 ## Source maps
 
@@ -202,7 +202,6 @@ see the Bitburner player gaps below).
 
 **Open:**
 
-- [ ] Your trait on a function pointer type (`impl Tr for fn() -> i32`, 1 file).
 - [ ] Still uncategorized (1,814 file hits, none involving another file's names that the syntax
   step can see), by message and construct: "no method named" on a method call (166 files),
   mismatched types (85 on a name, 37 on a method call, 34 on a `&`), a `#[derive]` whose field
@@ -211,35 +210,24 @@ see the Bitburner player gaps below).
   and operators on type parameters (41 + 28), a tuple-struct pattern of another crate's enum
   (`Bound::Included(&i)`, 39). Worth sorting next: several are probably std types the checker
   doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
-- [ ] Left over from closed gaps (each a few files or a probe):
-  - a full std path to an enum variant or a generic std function (`std::option::Option::Some(3)`,
-    `std::mem::size_of::<u32>()`) is "not supported yet"; `HashMap::new()` with no `use` compiles
-    where rustc's E0433 asks for the import
-  - two different `Error`s renamed apart in one file (`use a::Error as AError; use b::Error as
-    BError;`), a renamed `Error` next to the file's own, a `use .. as` rename inside a block, one
-    new name for `#[cfg]` alternatives; re-exporting a `mod` file's item through an inline module
-    (`mod prelude { pub use crate::geo::Point; }`)
-  - associated type bounds in return position, `dyn` and nested bounds; generic associated types
-    (`type List<'a, T: 'a> = &'a [T];`); a struct literal's closure doesn't take its parameter
-    types from the struct's bound (`Memo { f: |x: u64| .. }` needs the annotation)
-  - a `&mut dyn Write` struct field; items that are tuples holding a `&mut` in a returned
-    iterator (`Item = (usize, &mut u8)`), `partition` over `iter_mut()`, `&mut` iterators over
-    generic elements
-  - an associated const reading its `impl`'s const parameter (`impl<const P: u128> U<P> { const
-    PER: u128 = P * 1000; }`); a trait's own default methods can't read its `const N`; a `const`
-    struct's method in a const argument (`{ Config::DEFAULT.encode() }`)
-  - your traits on std types with no value here (`RangeFrom` / `RangeTo` / `RangeFull`, `CStr` /
-    `CString`, `Cell`, `LinkedList`, iterator adapters like `Peekable` / `Chars` / `Keys`,
-    `Instant`, `Wrapping`, `ControlFlow`), `impl PartialOrd<Bytes> for str` (only `PartialEq`
-    takes your type as the argument), one trait for both a tuple and a `Vec` (borsh)
-  - a `#[cfg]` inside macro arguments isn't evaluated; a slice pattern of the wrong length on an
-    array is "non-exhaustive", not rustc's E0527
-  - a nested `Option<Option<_>>` through a generic `T: Tr` doesn't print its inner value right;
-    `dyn Trait` on a float picks the impl by the value, tuple impls by length, and
-    `impl<T> S<Vec<T>>` carries no class for `T`
-  - still a copy, silently: `as_mut()` of an `Option<number>` passed on or mapped
-    (`.as_mut().map(|n| *n += 1)`), a `&mut i32` pushed into a `Vec<&mut i32>` by hand or inside
-    a tuple / enum payload
+- [ ] Left over from closed gaps, after the 2026-11-20 pass (see RUST_GAPS.md "Traits on
+  built-in types" and FEATURES.md): the slot cases a generic function can't tell apart at run
+  time (a `-> Option<&mut T>` of a `T` that may be a number, `fn first_mut<T>(v: &mut [T])`;
+  items that are tuples holding a `&mut` in a *returned* iterator, `Item = (usize, &mut u8)`);
+  your traits on `RangeFrom` / `RangeTo` / `RangeFull` (a `3..` is an iterator here); one trait
+  for both a tuple and a `Vec` (borsh) and two tuples of one length; `dyn Trait` on a float
+  picking the impl by the value; `impl<T> S<Vec<T>>` carrying no class for `T`; a nested
+  `Option<Option<_>>` through a generic `T: Tr` reaching the inner type's impl for
+  `Some(Some(4))` (`None` and `Some(None)` are right now, and no longer overflow the stack).
+  Closed in that pass: full std paths and `Option::Some` / `Result::<A, B>::Ok`, E0433 for a std
+  type without its `use`, renamed `Error`s and a `use` in a block, re-exports through an inline
+  module, associated type bounds in return position and GATs, a struct literal's closure typed
+  by the struct's bound, `&mut dyn Write` fields, `partition` over `iter_mut()`, const
+  parameters in associated consts and trait defaults, `const` struct methods in const
+  arguments, your traits on `fn()` types, `Cell`, iterator types, `PartialOrd<T> for str`,
+  `LinkedList`, `ControlFlow`, `CString`, `#[cfg]` on macro arguments, E0527 / E0528 for array
+  patterns, a `Vec<&mut i32>` built by hand (also in a tuple or an enum payload), `as_mut()` of
+  an `Option<number>` passed on or mapped.
 
 ### Crates for Bitburner scripts
 

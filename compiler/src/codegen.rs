@@ -807,6 +807,9 @@ fn compile_text(
         view_args: Vec::new(),
         dict_scope: Vec::new(),
         blanket_this: None,
+        trait_const_args: HashMap::new(),
+        param_consts: Default::default(),
+        extra_consts: Vec::new(),
         ext_class: None,
         in_trait_default: false,
         loop_dests: Vec::new(),
@@ -946,6 +949,17 @@ struct Codegen<'a> {
     /// Emitting a blanket impl's associated function (`impl<T: Default> Make for T`): its `T`,
     /// whose class is `this`.
     pub(super) blanket_this: Option<String>,
+    /// For each impl of a trait with const parameters (`impl Buf<4> for A`), by (type key,
+    /// trait): the JS accessors of its const arguments (`() => 4`, `(s) => s.$M`), which its
+    /// copy of the trait's default methods takes (`Buf$defaults(..)`).
+    pub(super) trait_const_args: HashMap<(String, String), Vec<String>>,
+    /// Associated consts whose value reads the impl's const parameters (`impl<const P: u128>
+    /// U<P> { const PER: u128 = P * 1000; }`), by (type, name): getters read through a class
+    /// view (`κσ.$cv(U, [7]).PER`).
+    pub(super) param_consts: std::collections::HashSet<(String, String)>,
+    /// Const values every method emitted next has in scope besides its own (a trait's const
+    /// parameters in its default methods: `N` is `$N(this)`), as (name, JS, type).
+    pub(super) extra_consts: Vec<(String, String, Ty)>,
     /// Emitting the class of your trait impls for a built-in type (`$ext$i32`): its key.
     pub(super) ext_class: Option<String>,
     /// Emitting a trait's default methods: `Self::f()` is `this` (static) or `this.constructor`.
@@ -1445,6 +1459,7 @@ impl<'a> Codegen<'a> {
                 impls.entry(t).or_default().push(imp.clone());
             }
         }
+        self.note_const_impls(file);
         let mut ext_done: std::collections::HashSet<String> = Default::default();
         // Pass 2: code. Impls for built-in types register in this script's own registry. A file
         // with `pub` traits exports it: a file that loads this one with `mod` registers its
@@ -3821,7 +3836,7 @@ impl<'a> Codegen<'a> {
             if let Some(r) = self.unit_const_struct(p, &[name.text().to_string()]) {
                 return r;
             }
-            if let Some(r) = self.emit_adt_path(&[name.text().to_string()]) {
+            if let Some(r) = self.emit_adt_path(&[name.text().to_string()], None) {
                 return r;
             }
             if name.text() == "None" {
@@ -3861,7 +3876,7 @@ impl<'a> Codegen<'a> {
         if let Some(r) = self.unit_const_struct(p, &segs) {
             return r;
         }
-        if let Some(r) = self.emit_adt_path(&segs) {
+        if let Some(r) = self.emit_adt_path(&segs, Some(&path)) {
             // An associated function as a value that takes classes (`Stack::<T>::make`): bound.
             if let Some(tys) = self
                 .types
@@ -4056,6 +4071,18 @@ impl<'a> Codegen<'a> {
             // `a != b` through a `PartialEq<B>` impl's `eq`.
             if matches!(op, BinaryOp::CmpOp(ast::CmpOp::Eq { negated: true })) {
                 f = f.wrap("!", "");
+            }
+            // `a < b` through a `PartialOrd<B>` impl's `partial_cmp`: `None` compares false.
+            if key == "partial_cmp"
+                && let BinaryOp::CmpOp(ast::CmpOp::Ord { ordering, strict }) = op
+            {
+                let o = match (ordering, strict) {
+                    (ast::Ordering::Less, true) => "<",
+                    (ast::Ordering::Less, false) => "<=",
+                    (ast::Ordering::Greater, true) => ">",
+                    (ast::Ordering::Greater, false) => ">=",
+                };
+                f = f.wrap("κσ.$pord(", &format!(", \"{o}\")"));
             }
             return (f.at(self.off(b.syntax())), ty);
         }
@@ -5193,6 +5220,7 @@ impl<'a> Codegen<'a> {
         outer: Vec<(String, String, Ty)>,
     ) -> Vec<String> {
         let mut consts = outer;
+        consts.extend(self.extra_consts.clone());
         for p in f
             .generic_param_list()
             .into_iter()
@@ -5231,7 +5259,7 @@ impl<'a> Codegen<'a> {
             }
         }
         for (n, js, ty) in consts {
-            if js.starts_with('$') {
+            if js.starts_with('$') && !js.contains('(') {
                 let from = f
                     .param_list()
                     .into_iter()
@@ -5582,6 +5610,8 @@ impl<'a> Codegen<'a> {
                 .map(|n| n.text().to_string())
                 .collect()
         });
+        // (`std::vec::Vec::new()`: as `Vec::new()`.)
+        let segs = crate::ty::strip_prelude_modules(segs);
         // `i32::make()` through a blanket impl.
         if let Some(crate::adt::Conv::ExtDict { key, dict }) = self.conv_of(c.syntax())
             && let Some(f) = segs.last()
@@ -8566,7 +8596,8 @@ impl<'a> Codegen<'a> {
                 // `Vec<u8>` or a type parameter, which may be one).
                 if self.types.io_writes.contains(&target.start) {
                     let mut f = Frag::mapped(start, "");
-                    if crate::adt::ext_key_of(&tt).is_some() || matches!(tt, Ty::Param(_)) {
+                    // (Also a `&mut dyn Write` field or local: the value decides at run time.)
+                    if crate::adt::ext_key_of(&tt).is_some() || matches!(tt, Ty::Param(_) | Ty::Dyn(_)) {
                         f.push("κσ.$dcall($extRegs, ")
                             .append(tf)
                             .push(format!(", {}, ", js_string(&adt_gen::prop("__write_str"))))
@@ -8887,7 +8918,7 @@ fn const_value_js(v: &str) -> String {
 /// A struct's class with its const arguments (`Buf<4>` → `κσ.$cv(Buf, [4])`), for calling its
 /// associated functions as a value (`T::default()`, `Default::default()`), which read them as
 /// `this.$cargs`. Just the class when it has none.
-fn class_view(cls: String, args: &[Ty], stored: &[(usize, String)]) -> String {
+pub(super) fn class_view(cls: String, args: &[Ty], stored: &[(usize, String)]) -> String {
     let vals: Vec<Option<String>> = args
         .iter()
         .enumerate()
@@ -9371,10 +9402,11 @@ fn macro_arg_names(node: &SyntaxNode) -> Vec<String> {
     out
 }
 
-/// Whether a `Some` of a `t` needs a marker: `t` is an `Option` or `()`, whose own values
-/// include `null` / `undefined`.
+/// Whether a `Some` of this type needs the marker representation (`κσ.$some` / `κσ.$unsome`):
+/// an `Option` or `()` payload, or a type parameter, which may be one (`impl<T> Tr for
+/// Option<T>` reached with an `Option<Option<i32>>`; the helpers leave other values alone).
 fn nullable_payload(t: &Ty) -> bool {
-    matches!(t, Ty::Option(_) | Ty::Unit)
+    matches!(t, Ty::Option(_) | Ty::Unit | Ty::Param(_))
 }
 
 /// Whether parameter type `t` of `f` is an `R: Read` / `R: BufRead` (`f`'s or its impl's),

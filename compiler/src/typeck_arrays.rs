@@ -138,6 +138,33 @@ impl Checker<'_> {
         count_ok && fixed.iter().all(|p| self.irrefutable_pat(p))
     }
 
+    /// `let [x, y] = a;` with `a` an array of another length: rustc's E0527 (or E0528 with a
+    /// `..` that still asks for too many), as its message.
+    pub(super) fn array_pat_len_error(&self, l: &ast::LetStmt, pat: &ast::Pat) -> Option<String> {
+        let ast::Pat::SlicePat(sp) = super::strip_pat(pat) else {
+            return None;
+        };
+        let len = l
+            .ty()
+            .and_then(|t| array_type_len(&t))
+            .or_else(|| l.initializer().and_then(|e| array_len_in_file(&e, 0)))?;
+        let is_rest = |p: &ast::Pat| match p {
+            ast::Pat::RestPat(_) => true,
+            ast::Pat::IdentPat(ip) => matches!(ip.pat(), Some(ast::Pat::RestPat(_))),
+            _ => false,
+        };
+        let pats: Vec<ast::Pat> = sp.pats().collect();
+        let rest = pats.iter().any(is_rest);
+        let fixed = pats.iter().filter(|p| !is_rest(p)).count();
+        if rest && fixed > len {
+            Some(format!("pattern requires at least {fixed} elements but array has {len}"))
+        } else if !rest && fixed != len {
+            Some(format!("pattern requires {fixed} elements but array has {len}"))
+        } else {
+            None
+        }
+    }
+
     /// The dimensions of the array a `let` binds (`[[u8; 2]; 3]` → `[3, 2]`): from its type,
     /// else its initializer.
     pub(super) fn let_dims(&self, l: &ast::LetStmt) -> Vec<usize> {

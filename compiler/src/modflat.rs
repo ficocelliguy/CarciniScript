@@ -282,6 +282,15 @@ impl Flattener {
         }
         let skipped = segs.len() - rest.len() + i;
         let Some(mangled) = self.lookup(&module, name, 0) else {
+            // `prelude::Point` with `mod prelude { pub use crate::geo::Point; }` (an item of a
+            // `mod` file, or of std): the `use` is hoisted out with the module's items, so the
+            // name alone is it.
+            if (explicit || i > 0)
+                && let Some(m) = self.modules.get(&module)
+                && m.external.contains(name)
+            {
+                return Res::Rewrite(skipped, name.clone());
+            }
             // A path into one of our inline modules must name something there. (The file itself
             // may not be the crate root, so `crate::` and `super::` names there aren't checked.)
             if missing
@@ -495,6 +504,15 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
             .map(|l| l.items().collect())
             .unwrap_or_default();
         removed.extend(f.uses(&items, &path, &mut errors));
+    }
+    // `use`s inside function bodies (`fn main() { use geo::Point as P; .. }`): the alias is
+    // recorded with the module's (its scope is wider than the block, which is close enough).
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        if u.syntax().parent().is_none_or(|p| p.kind() != SyntaxKind::STMT_LIST) {
+            continue;
+        }
+        let path = module_path(u.syntax());
+        removed.extend(f.uses(&[ast::Item::Use(u)], &path, &mut errors));
     }
 
     let mut edits: Vec<(usize, usize, String)> = Vec::new();

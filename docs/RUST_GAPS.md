@@ -119,8 +119,13 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   destructured from a tuple (`let (a, b) = (&mut t.0, &mut t.1);`), or mapped
   (`self.timer.as_mut().map(|n| *n += 1)`, `.filter(..)`, `.is_some_and(..)`). As an argument to a
   `&mut i32` parameter it's a cell over the place, or a temp written back after the call when the
-  callee can't keep the borrow. Still a copy: a `&mut i32` pushed into a `Vec<&mut i32>` by hand,
-  or inside a tuple or enum payload other than the forms above.
+  callee can't keep the borrow. A `Vec<&mut i32>` (or `Vec<(usize, &mut i32)>`) written as the
+  type of a `let` holds slots too: `refs.push(&mut a)`, `vec![(0, &mut c)]`, `Slot::Live(&mut a)`
+  for a variant declared `Live(&'a mut i32)`, and `v.iter_mut().partition(..)` into two such
+  Vecs. Still a copy: a `&mut T` of a type parameter `T` that may be a number, returned
+  (`fn first_mut<T>(v: &mut [T]) -> Option<&mut T>`: the caller reads a value), and the items of
+  an iterator *returned* with a `&mut` inside a tuple (`-> impl Iterator<Item = (usize, &mut
+  u8)>`, an error).
 - **`*r = value` for a `&mut` struct (or `Vec`, map, set or other collection) replaces the
   object's contents in place** (`κσ.$replace`), since JS can't rebind the caller's variable. The
   result is the same as Rust's.
@@ -201,10 +206,9 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   needs `zeros::<4>()` (it's a "type annotations needed" error, not a wrong value). For the same
   reason a mismatched length (`sum::<2>([1, 2, 3])`) isn't an error. A const argument is a
   const parameter or a constant integer or `bool` expression the compiler works out: literals,
-  `const` items, associated consts, arithmetic, `as` casts, `size_of::<u32>()` and calls of the
-  file's `const fn`s; not a `const` struct's method (`{ CONFIG.encode() }`) or another crate's
-  `const fn`. A trait's const parameter read in the trait's default methods, and an associated
-  const reading its `impl`'s const parameter, aren't supported.
+  `const` items, associated consts, arithmetic, `as` casts, `size_of::<u32>()`, calls of the
+  file's `const fn`s, and a `const` struct's `const fn` methods (`{ CONFIG.encode() }`); not
+  another crate's `const fn`.
 - **Associated types are checked through function type parameters, not `impl<T>`'s or `dyn`.**
   In `fn f<S: Shape>`, `S::Unit` is its own type with the bounds the trait declares, as in
   rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
@@ -614,7 +618,16 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **An `Option` through a generic `T: Trait`** is `null` or its value at run time, so the
   `Option` impl serves `None` and any `Some(x)` whose value's own type has no impl of that
   method; when both `Option<u8>` and `u8` implement it, `Some(3u8)` reaches `u8`'s. A nested
-  `Option<Option<T>>` there doesn't print its inner value with `{:?}`.
+  `Option<Option<T>>` there reaches the `Option` impl for `None` and `Some(None)`, but
+  `Some(Some(4))` is `4`, which reaches the inner type's impl (`i4`, where rustc prints
+  `some(some(i4))`); `{:?}` prints it right.
+- **A trait on a function pointer type** (`impl Tr for fn() -> i32`) is one class for every
+  signature: `impl Tr for fn(i32) -> i32` next to it conflicts, and a closure reaches it too
+  (both are JS functions).
+- **A trait on an iterator type** (`impl Tr for Peekable<I>`, `Chars`, `Keys<K, V>`) is one
+  class for every iterator and adapter: a second iterator type's impl of the same trait
+  conflicts. `Cell<T>` shares `RefCell<T>`'s. `RangeFrom` / `RangeTo` / `RangeFull` take no
+  impls (a `3..` is an iterator here).
 - **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`, `Path` and `PathBuf`): one
   type in JS, so the borrowed type's impl serves both. The owned one must hand each call on to it
   (`self.as_str().f(a)`, `Tr::f(&self.as_str())`, `self[..].f()`); one that does something else
@@ -645,10 +658,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 - **Inline modules of `mod` files are reached by their items' flattened names.** `use
   geo::shapes::Circle;` (with `pub mod shapes { .. }` in `geo.rs`) works, but an error about
-  the type may name it `shapes__Circle`. Re-exporting a `mod` file's item from one of this
-  file's inline modules (`mod prelude { pub use crate::geo::Point; }`) isn't supported.
-- **`c"..."` is a `CStr` value only.** There's no C to pass it to: `as_ptr()` and `CString`
-  aren't there.
+  the type may name it `shapes__Circle`. A `use` inside a block (`fn main() { use geo::Point as
+  P; .. }`) is recorded with the enclosing module's, so the alias is visible past the block.
+- **`c"..."` is a `CStr` value, and `CString` an owned one.** There's no C to pass them to:
+  `as_ptr()` isn't there, and `CString::new` takes text, a `String` or a `Vec<u8>` (not a
+  `&[u8]` slice of one).
 - **`macro_rules!` hygiene covers local bindings.** Names a macro's body binds (`let`, `for`,
   closure parameters) are renamed per expansion, so they don't clash with the caller's; other
   names (functions, types, a `static` the body names) resolve at the call site, as in a textual

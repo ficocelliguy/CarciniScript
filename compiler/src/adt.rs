@@ -184,6 +184,9 @@ pub struct TraitDef {
     pub assoc_types: Vec<String>,
     /// Type parameters (`trait Convert<T>`).
     pub type_params: Vec<String>,
+    /// Const generic parameters (`trait Buf<const N: usize>`), which each impl names and the
+    /// default methods read.
+    pub const_params: Vec<String>,
     /// Each associated type's bounds (`type Unit: Debug + Copy;`).
     pub assoc_bounds: HashMap<String, Vec<String>>,
 }
@@ -325,6 +328,16 @@ pub fn ext_key(name: &str) -> Option<&'static str> {
         "VecDeque" => "VecDeque",
         "Range" => "Range",
         "RangeInclusive" => "RangeInclusive",
+        "FnPtr" => "FnPtr",
+        // (A `Cell` is a `RefCell` at run time.)
+        "Cell" | "RefCell" => "RefCell",
+        // Iterators and adapters are all the runtime's `Iter`: one class of impls.
+        "Iter" | "IterMut" | "IntoIter" | "Peekable" | "Chars" | "CharIndices" | "Bytes" | "Keys"
+        | "Values" | "ValuesMut" | "Enumerate" | "Rev" | "Skip" | "Take" | "Zip" | "Map" | "Filter"
+        | "FilterMap" | "Lines" | "Split" | "SplitWhitespace" | "Drain" | "Windows" | "Chunks"
+        | "ChunksExact" | "StepBy" | "Cycle" | "Chain" | "Flatten" | "FlatMap" | "Fuse" | "Inspect"
+        | "TakeWhile" | "SkipWhile" | "Scan" | "Once" | "Repeat" | "Empty" | "Successors" | "FromFn"
+        | "Cloned" | "Copied" => "Iter",
         k => return tuple_arity(k).and_then(tuple_key),
     })
 }
@@ -350,6 +363,9 @@ pub fn ext_key_of(t: &Ty) -> Option<&'static str> {
         Ty::Range(_, false) => Some("Range"),
         Ty::Range(_, true) => Some("RangeInclusive"),
         Ty::Tuple(es) => tuple_key(es.len()),
+        Ty::Closure { .. } | Ty::Fn => Some("FnPtr"),
+        Ty::RefCell(_) => Some("RefCell"),
+        Ty::Iter { .. } => Some("Iter"),
         _ => None,
     }
 }
@@ -465,6 +481,9 @@ pub fn impl_self_name(imp: &ast::Impl) -> Option<String> {
         ast::Type::ArrayType(_) | ast::Type::SliceType(_) => Some("Vec".into()),
         // `impl Tr for (A, B)`: a tuple's impls are by its length (`Tuple2`).
         ast::Type::TupleType(t) => tuple_key(t.fields().count()).map(str::to_string),
+        // `impl Tr for fn() -> i32`: a function pointer's impls (any signature) are one class, found
+        // by `typeof x === "function"`.
+        ast::Type::FnPtrType(_) => Some("FnPtr".into()),
         _ => None,
     }
 }

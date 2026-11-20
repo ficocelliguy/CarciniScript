@@ -712,6 +712,19 @@ impl Checker<'_> {
                 }
                 Ty::Unit
             }
+            // `size_of::<T>()` / `align_of::<T>()` / `size_of_val(&x)` as values (in a const
+            // argument, `consteval` works them out): the type's width in bytes.
+            ["mem", "size_of" | "align_of"] | ["size_of" | "align_of"] => {
+                count(self, 0);
+                USIZE
+            }
+            ["mem", "size_of_val" | "align_of_val"] | ["size_of_val" | "align_of_val"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.infer(a, None);
+                }
+                USIZE
+            }
             ["mem", "swap"] => {
                 count(self, 2);
                 let t = self.fresh(VarKind::General);

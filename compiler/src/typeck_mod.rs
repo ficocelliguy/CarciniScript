@@ -856,6 +856,17 @@ impl Checker<'_> {
             .map(String::as_str)
             .skip_while(|s| matches!(*s, "crate" | "self"))
             .collect();
+        // (What any `use` brings in, for the std-import check, see `require_std_import`.)
+        if tree.star_token().is_some() {
+            self.glob_imports = true;
+        } else if let Some(alias) = tree
+            .rename()
+            .and_then(|r| r.name())
+            .map(|n| n.text().to_string())
+            .or_else(|| path.last().cloned())
+        {
+            self.imported_names.insert(alias);
+        }
         match rel.as_slice() {
             // `use std::cmp::max;` / `use std::mem::{swap, take as grab};`: calls of the name are
             // calls of `cmp::max` etc.

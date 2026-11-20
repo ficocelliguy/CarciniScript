@@ -391,11 +391,11 @@ impl ChronoTimeDelta {
             Some(*self / rhs)
         }
     }
-    pub fn to_std(&self) -> Result<Duration, ChronoOutOfRangeError> {
+    pub fn to_std(&self) -> Result<std::time::Duration, ChronoOutOfRangeError> {
         if self.secs < 0 {
             return Err(ChronoOutOfRangeError {});
         }
-        Ok(Duration::new(self.secs as u64, self.nanos as u32))
+        Ok(std::time::Duration::new(self.secs as u64, self.nanos as u32))
     }
     pub fn from_std(d: Duration) -> Result<ChronoTimeDelta, ChronoOutOfRangeError> {
         Ok(ChronoTimeDelta {

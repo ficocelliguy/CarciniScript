@@ -2,7 +2,8 @@
 //! (`{ 2 * D_CODES + 1 }`, `{ CpuFeatures::NONE }`, `{ size_of::<u32>() }`, `{ elts(BITS) }`)
 //! and enum discriminants. Literals, `const` items (the file's own, and other files' through
 //! `Known`), associated consts of the file's impls, `u8::MAX` / `u32::BITS`, arithmetic,
-//! comparisons, `as` casts, `if`, and calls of the file's `const fn`s with simple bodies.
+//! comparisons, `as` casts, `if`, calls of the file's `const fn`s with simple bodies, and their
+//! methods on a constant struct value (`Config::DEFAULT.encode()`, reading `self`'s fields).
 //! `None` for anything else.
 use ra_ap_syntax::ast::{
     self, ArithOp, BinaryOp, CmpOp, HasArgList, HasGenericParams, HasName, LogicOp, UnaryOp,
@@ -102,6 +103,8 @@ struct Env {
     tys: HashMap<String, String>,
     /// The impl's type, for `Self::X`.
     self_ty: Option<String>,
+    /// In a `const fn` method called on a constant struct value: its fields (`self.w`).
+    self_fields: Option<HashMap<String, CVal>>,
 }
 
 enum Flow {
@@ -232,6 +235,20 @@ impl Eval<'_, '_> {
                     (false, _, None) => Some(Flow::Val(CVal::Bool(false))),
                     _ => None,
                 };
+            }
+            // `self.w` in a `const fn` method of a constant struct (`Config::DEFAULT.encode()`), or
+            // that constant's field itself (`Config::DEFAULT.w`).
+            ast::Expr::FieldExpr(f) => {
+                let name = f.name_ref()?.text().to_string();
+                let base = f.expr()?;
+                let is_self = matches!(&base, ast::Expr::PathExpr(p)
+                    if p.path().and_then(|p| p.as_single_name_ref()).is_some_and(|n| n.text() == "self"));
+                let fields = if is_self {
+                    env.self_fields.clone()?
+                } else {
+                    self.struct_const(&base, env)?.1
+                };
+                *fields.get(&name)?
             }
             ast::Expr::PathExpr(p) => self.path(&p.path()?, env)?,
             ast::Expr::CallExpr(c) => self.call(c, env)?,
@@ -563,11 +580,136 @@ impl Eval<'_, '_> {
         self.nested(&ast::Expr::BlockExpr(body), &fenv)
     }
 
+    /// A constant whose value is a struct literal (`Config::DEFAULT`, `const C: Config = Config {
+    /// .. }`): its type and its fields' values (each a constant too).
+    fn struct_const(
+        &mut self,
+        e: &ast::Expr,
+        env: &Env,
+    ) -> Option<(String, HashMap<String, CVal>)> {
+        let ast::Expr::PathExpr(p) = e else {
+            return None;
+        };
+        let segs = Self::segments(&p.path()?)?;
+        let body = match segs.as_slice() {
+            [name] => items(self.file).into_iter().find_map(|i| match i {
+                ast::Item::Const(k) if k.name().is_some_and(|n| n.text() == name.as_str()) => {
+                    k.body()
+                }
+                _ => None,
+            })?,
+            [ty, name] => {
+                let ty = if ty == "Self" {
+                    env.self_ty.clone()?
+                } else {
+                    ty.clone()
+                };
+                self.assoc_body(&ty, name)?
+            }
+            _ => return None,
+        };
+        let ast::Expr::RecordExpr(r) = body else {
+            return None;
+        };
+        let ty = r.path()?.segment()?.name_ref()?.text().to_string();
+        let ty = if ty == "Self" {
+            env.self_ty.clone()?
+        } else {
+            ty
+        };
+        let fenv = Env {
+            self_ty: Some(ty.clone()),
+            ..Env::default()
+        };
+        let mut fields = HashMap::new();
+        for f in r.record_expr_field_list()?.fields() {
+            let n = f.field_name()?.text().to_string();
+            let v = self.nested(&f.expr()?, &fenv)?;
+            fields.insert(n, v);
+        }
+        Some((ty, fields))
+    }
+
+    /// The body of the associated const `ty::name` in the file's impls.
+    fn assoc_body(&self, ty: &str, name: &str) -> Option<ast::Expr> {
+        items(self.file)
+            .into_iter()
+            .filter_map(|i| match i {
+                ast::Item::Impl(imp) => Some(imp),
+                _ => None,
+            })
+            .filter(|imp| imp.self_ty().and_then(|t| type_name(&t)).as_deref() == Some(ty))
+            .find_map(|imp| {
+                imp.assoc_item_list()?.assoc_items().find_map(|a| match a {
+                    ast::AssocItem::Const(k) if k.name().is_some_and(|n| n.text() == name) => {
+                        k.body()
+                    }
+                    _ => None,
+                })
+            })
+    }
+
+    /// `Config::DEFAULT.encode(..)`: the `const fn` method `name` of `ty` (taking `self`), with
+    /// the constant's fields as `self`.
+    fn struct_method(
+        &mut self,
+        ty: &str,
+        fields: HashMap<String, CVal>,
+        name: &str,
+        m: &ast::MethodCallExpr,
+        env: &Env,
+    ) -> Option<CVal> {
+        let f = items(self.file)
+            .into_iter()
+            .filter_map(|i| match i {
+                ast::Item::Impl(imp) => Some(imp),
+                _ => None,
+            })
+            .filter(|imp| imp.self_ty().and_then(|t| type_name(&t)).as_deref() == Some(ty))
+            .find_map(|imp| {
+                imp.assoc_item_list()?.assoc_items().find_map(|a| match a {
+                    ast::AssocItem::Fn(f)
+                        if f.const_token().is_some()
+                            && f.name().is_some_and(|n| n.text() == name) =>
+                    {
+                        Some(f)
+                    }
+                    _ => None,
+                })
+            })?;
+        let plist = f.param_list()?;
+        plist.self_param()?;
+        let params: Vec<ast::Param> = plist.params().collect();
+        let args: Vec<ast::Expr> = m.arg_list()?.args().collect();
+        if params.len() != args.len() {
+            return None;
+        }
+        let mut fenv = Env {
+            self_ty: Some(ty.to_string()),
+            self_fields: Some(fields),
+            ..Env::default()
+        };
+        for (p, a) in params.iter().zip(&args) {
+            let ast::Pat::IdentPat(ip) = p.pat()? else {
+                return None;
+            };
+            let v = self.expr(a, env)?;
+            fenv.vals.insert(ip.name()?.text().to_string(), v);
+        }
+        let body = f.body()?;
+        self.nested(&ast::Expr::BlockExpr(body), &fenv)
+    }
+
     /// Integer methods: `pow`, `min`, `max`, `div_ceil`, `ilog2`, `ilog10`, `count_ones`,
     /// `is_power_of_two`, `next_power_of_two`, `abs`.
     fn method(&mut self, m: &ast::MethodCallExpr, env: &Env) -> Option<CVal> {
         let name = m.name_ref()?.text().to_string();
-        let recv = match self.expr(&m.receiver()?, env)? {
+        let receiver = m.receiver()?;
+        // `Config::DEFAULT.encode()`: a `const fn` method of the constant's struct, over its fields.
+        if let Some((ty, fields)) = self.struct_const(&receiver, env) {
+            return self.struct_method(&ty, fields, &name, m, env);
+        }
+        let recv = match self.expr(&receiver, env)? {
             // (`u128::MAX.ilog10()`)
             CVal::U128(n) => {
                 if m.arg_list()?.args().next().is_some() {

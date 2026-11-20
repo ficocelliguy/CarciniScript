@@ -2848,7 +2848,7 @@
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
-      const kind = x instanceof Deque && regs.kinds.deque ? "deque" : Array.isArray(x) || x instanceof Deque ? "array" : typeof x;
+      const kind = x instanceof Deque && regs.kinds.deque ? "deque" : Array.isArray(x) || x instanceof Deque ? "array" : x instanceof RefCell ? "refcell" : x instanceof Iter ? "iter" : typeof x;
       for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
         if (r.arity !== undefined && !(Array.isArray(x) && x.length === r.arity)) continue;
@@ -2893,7 +2893,11 @@
                 ? "set"
                 : x instanceof Res
                   ? "result"
-                  : typeof x;
+                  : x instanceof RefCell
+                    ? "refcell"
+                    : x instanceof Iter
+                      ? "iter"
+                      : typeof x;
       let pick = null;
       for (const r of regs.kinds[kind] ?? []) {
         if (typeof r.cls.prototype[name] !== "function") continue;
@@ -3384,6 +3388,12 @@
     $cmp: cmp,
     $clone: clone,
     // `partial_cmp`: `None` when the values are incomparable (a NaN decides it).
+    // `a < b` through a `PartialOrd<B>` impl: its `partial_cmp`'s `Option<Ordering>` against the
+    // operator (`None` compares false, as in Rust).
+    $pord(o, op) {
+      if (o == null) return false;
+      return op === "<" ? o < 0 : op === "<=" ? o <= 0 : op === ">" ? o > 0 : o >= 0;
+    },
     $partialCmp(a, b) {
       const c = a instanceof Iter ? a.$cmpWith(b, false) : cmp(a, b);
       return Number.isNaN(c) ? null : c;

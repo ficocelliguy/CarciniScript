@@ -538,11 +538,33 @@ pub fn describe_tuple(parts: Vec<String>) -> String {
     }
 }
 
-/// Path segments with a leading `std::` / `core::` removed (`std::f64::consts::PI` → `f64::consts::PI`).
+/// Path segments with a leading `std::` / `core::` removed (`std::f64::consts::PI` → `f64::consts::PI`),
+/// and a prelude type's module with it (`std::vec::Vec::new` → `Vec::new`, as `Vec::new` is read).
 pub fn std_tail<'a>(segs: &'a [&'a str]) -> &'a [&'a str] {
     match segs {
-        ["std" | "core", rest @ ..] => rest,
+        ["std" | "core" | "alloc", rest @ ..] => match rest {
+            ["vec", "Vec", ..]
+            | ["string", "String" | "ToString", ..]
+            | ["boxed", "Box", ..]
+            | ["option", "Option", ..]
+            | ["result", "Result", ..] => &rest[1..],
+            _ => rest,
+        },
         all => all,
+    }
+}
+
+/// `names` with a prelude type's std module removed (`std::vec::Vec::new` → `Vec::new`, as
+/// `std_tail` reads such a path), for the handlers that match on the segments.
+pub fn strip_prelude_modules(names: Vec<String>) -> Vec<String> {
+    let s: Vec<&str> = names.iter().map(String::as_str).collect();
+    match s.as_slice() {
+        ["std" | "core" | "alloc", "vec", "Vec", ..]
+        | ["std" | "core" | "alloc", "string", "String" | "ToString", ..]
+        | ["std" | "core" | "alloc", "boxed", "Box", ..]
+        | ["std" | "core" | "alloc", "option", "Option", ..]
+        | ["std" | "core" | "alloc", "result", "Result", ..] => names[2..].to_vec(),
+        _ => names,
     }
 }
 

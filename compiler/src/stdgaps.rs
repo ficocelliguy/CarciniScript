@@ -16,6 +16,8 @@ const MARKER: &str = include_str!("marker_prelude.rs");
 const PATH: &str = include_str!("path_prelude.rs");
 const WRAPPING: &str = include_str!("wrapping_prelude.rs");
 const CSTR: &str = include_str!("cstr_prelude.rs");
+const LINKED_LIST: &str = include_str!("linked_list_prelude.rs");
+const CONTROL_FLOW: &str = include_str!("control_flow_prelude.rs");
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
 fn declares(text: &str, name: &str) -> bool {
@@ -50,11 +52,24 @@ pub(crate) fn preludes(text: &str) -> Vec<&'static str> {
     {
         out.push(WRAPPING);
     }
-    if crate::stdtime::has_word(text, "CStr")
+    if (crate::stdtime::has_word(text, "CStr") || crate::stdtime::has_word(text, "CString"))
         && !text.contains("// (cstr prelude)")
         && !declares(text, "CStr")
+        && !declares(text, "CString")
     {
         out.push(CSTR);
+    }
+    if crate::stdtime::has_word(text, "LinkedList")
+        && !text.contains("// (linked list prelude)")
+        && !declares(text, "LinkedList")
+    {
+        out.push(LINKED_LIST);
+    }
+    if crate::stdtime::has_word(text, "ControlFlow")
+        && !text.contains("// (control flow prelude)")
+        && !declares(text, "ControlFlow")
+    {
+        out.push(CONTROL_FLOW);
     }
     out
 }

@@ -2871,6 +2871,16 @@ pub(crate) fn uses_renamed(text: &str) -> bool {
     !renamed_crates(text).is_empty()
 }
 
+/// The std name a crate's alias is rewritten to (`FxHashMap` → `HashMap`), for the std-import
+/// check: `use rustc_hash::FxHashMap;` imports `HashMap`.
+pub(crate) fn renamed_target(alias: &str) -> Option<&'static str> {
+    ALL_RENAMES
+        .iter()
+        .flat_map(|r| r.names.iter())
+        .find(|(from, _)| *from == alias)
+        .map(|(_, to)| *to)
+}
+
 /// The names `use krate::{..}` brings in: alias -> the crate's name.
 fn renamed_imports(file: &SourceFile, r: &Renames) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();

@@ -620,6 +620,10 @@ const rejected = [
     "2:11 non-exhaustive patterns: `true` not covered",
   ],
   ["refutable let", "let Some(x) = Some(1);", "2:9 refutable pattern in local binding"],
+  ["an array pattern of the wrong length (E0527)", "let a = [1, 2, 3];\n    let [x, y] = a;", "3:9 pattern requires 2 elements but array has 3"],
+  ["an array pattern with `..` asking for too many (E0528)", "let a = [1, 2];\n    let [x, y, z, ..] = a;", "3:9 pattern requires at least 3 elements but array has 2"],
+  ["a std type used without its import (E0433)", "let mut m = HashMap::new();\n    m.insert(1, 2);", "2:17 failed to resolve: use of undeclared type `HashMap` (add `use std::collections::HashMap;`)"],
+  ["a std type in a type position without its import (E0412)", "let v: Vec<Rc<i32>> = Vec::new();", "2:16 cannot find type `Rc` in this scope (add `use std::rc::Rc;`)"],
   [
     "let-else that falls through",
     'let Some(x) = Some(1) else {\n        println!("no");\n    };',
@@ -869,7 +873,6 @@ const rejected = [
   ["a const argument nothing gives", "}\nfn zeros<const N: usize>() -> [f64; N] {\n    [0.0; N]\n}\nfn f() {\n    let z = zeros();", "7:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the function `zeros`"],
   ["mismatched const arguments", "}\nstruct M<const R: usize> {\n    d: [i32; R],\n}\nimpl<const R: usize> M<R> {\n    fn z() -> Self {\n        M { d: [0; R] }\n    }\n}\nfn f() {\n    let m: M<2> = M::<3>::z();", "12:19 mismatched types: expected `M<2>`, found `M<3>`"],
   ["an expression as a const argument", "}\nfn one<const N: usize>() -> usize {\n    N\n}\nfn two<const N: usize>() -> usize {\n    one::<{ N + 1 }>()\n}\nfn f() {", "7:13 generic parameters may not be used in const operations"],
-  ["a const method on a struct const as a const argument", "}\nstruct C {\n    n: usize,\n}\nimpl C {\n    const fn get(&self) -> usize {\n        self.n\n    }\n}\nconst K: C = C { n: 2 };\nfn mk<const N: usize>() -> [u8; N] {\n    [1; N]\n}\nfn f() {\n    let a = mk::<{ K.get() }>();", "16:20 this const argument isn't supported yet"],
   ["a struct's const argument nothing gives", "}\nstruct S<const N: usize> {\n    v: Vec<i32>,\n}\nfn f() {\n    let s = S { v: vec![] };", "7:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the struct `S`"],
   ["an enum's const argument nothing gives", "}\nenum E<const N: usize> {\n    A,\n    B([u8; N]),\n}\nfn f() {\n    let e = E::A;", "8:13 type annotations needed: cannot infer the value of the const parameter `N` declared on the enum `E`"],
   ["parse into a type without FromStr","}\nstruct P;\nfn f() {\n    let p = \"1\".parse::<P>();", "5:13 the trait bound `P: FromStr` is not satisfied"],
@@ -905,11 +908,6 @@ const rejected = [
     "}\nuse std::io::Read;\nfn r<R: Read>(r: &mut R) -> usize { 0 }\nfn f() {\n    let d = vec![1u8];\n    let mut s = &d[..];\n    r(&mut s);",
     "8:7 reading from a `&mut &[u8]` would advance the caller's slice",
   ],
-  [
-    "a trait's const parameter in a default method",
-    "}\ntrait B<const N: usize> { fn n(&self) -> usize { N } }\nfn f() {",
-    "3:50 a trait's const generic parameter (`N`) in its default methods is not supported yet",
-  ],
   // Std gaps (PLAN "Std-library gaps").
   ["`env!` of a variable the build doesn't have", 'let v = env!("CARCINI_NOPE");', "2:13 environment variable `CARCINI_NOPE` not defined at compile time"],
   ["`compile_error!` that's reached", 'compile_error!("boom");', "2:5 boom"],
@@ -921,11 +919,6 @@ const rejected = [
   ],
   ["`resize` with the wrong fill value", 'let mut v = vec![1u8];\n    v.resize(3, "x");', "3:17 mismatched types: expected `u8`, found `String`"],
   ["`next_power_of_two` on a signed integer", "let x = 5i32.next_power_of_two();", "2:13 no method named `next_power_of_two`"],
-  [
-    "`iter_mut()` over numbers into `partition`",
-    "let mut v = vec![1, 2, 3];\n    let (a, b): (Vec<&mut i32>, Vec<&mut i32>) = v.iter_mut().partition(|x| **x > 1);",
-    "3:50 `iter_mut()` followed by `.partition()` isn't supported yet over numbers",
-  ],
   [
     "itertools' `set_from` on `iter()`",
     "}\nuse itertools::Itertools;\nfn g() {\n    let mut v = vec![1];\n    v.iter().set_from(vec![2]);",

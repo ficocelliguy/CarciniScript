@@ -506,10 +506,7 @@ impl Codegen<'_> {
 
     /// `char::from_digit(..)`, `String::with_capacity(..)`, `u64::from(x)`, `std::mem::*`.
     pub(super) fn emit_std_call(&mut self, c: &ast::CallExpr, segs: &[&str]) -> Option<(Frag, Ty)> {
-        let tail = match segs {
-            ["std" | "core", rest @ ..] => rest,
-            all => all,
-        };
+        let tail = crate::ty::std_tail(segs);
         let tail = match tail {
             ["rc" | "sync", rest @ ..] => rest,
             t => t,
@@ -685,6 +682,28 @@ impl Codegen<'_> {
                 }
             }
             ["drop"] | ["mem", "drop"] => call("drop", vec![emit(self, 0)]),
+            // `size_of::<u32>()` / `size_of_val(&x)`: the width rustc gives the type (a JS value has
+            // none of its own).
+            ["mem", "size_of" | "align_of" | "size_of_val" | "align_of_val"]
+            | ["size_of" | "align_of" | "size_of_val" | "align_of_val"] => {
+                let t = if tail.last().is_some_and(|f| f.ends_with("_val")) {
+                    args.first().and_then(|a| self.ty_of(strip_refs(a).syntax()))
+                } else {
+                    turbofish_type(c).map(|t| self.lower_type(&t))
+                };
+                match t.as_ref().and_then(byte_width) {
+                    Some(n) => Frag::mapped(start, n.to_string()),
+                    None => {
+                        let what = format!(
+                            "`{}` of `{}`",
+                            tail.last().copied().unwrap_or("size_of"),
+                            t.map(|t| t.describe()).unwrap_or_else(|| "this type".into())
+                        );
+                        self.unsupported(c.syntax(), &what);
+                        Frag::text("0")
+                    }
+                }
+            }
             ["mem", "swap"] => {
                 let (a, b) = (args.first()?.clone(), args.get(1)?.clone());
                 let (af, _) = self.emit_expr(&strip_refs(&a), None);
@@ -741,6 +760,37 @@ fn is_place_ref(e: &ast::Expr) -> bool {
         ast::Expr::ParenExpr(p) => p.expr().is_some_and(|i| is_place_ref(&i)),
         _ => false,
     }
+}
+
+/// The type a call names with a turbofish (`size_of::<u32>()`).
+fn turbofish_type(c: &ast::CallExpr) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let ast::Expr::PathExpr(p) = c.expr()? else {
+        return None;
+    };
+    p.path()?
+        .segment()?
+        .generic_arg_list()?
+        .generic_args()
+        .find_map(|a| match a {
+            ast::GenericArg::TypeArg(t) => t.ty(),
+            _ => None,
+        })
+}
+
+/// `size_of::<T>()` for the types whose width is fixed in rustc: the number kinds, `bool`,
+/// `char` and `()`.
+fn byte_width(t: &Ty) -> Option<u32> {
+    Some(match t {
+        Ty::Int(k) => k.bits() / 8,
+        Ty::IntLit => 4,
+        Ty::Float { f32: true } => 4,
+        Ty::Float { f32: false } => 8,
+        Ty::Bool => 1,
+        Ty::Char => 4,
+        Ty::Unit => 0,
+        _ => return None,
+    })
 }
 
 fn int_bits(k: IntKind) -> u32 {

@@ -51,36 +51,17 @@ impl Checker<'_> {
                     _ => None,
                 })
                 .collect();
-            // `trait Buf<const N: usize>`: each impl names `N` (`impl Buf<4> for X`), which the
-            // trait's default methods can't read yet (they're shared by every impl in JS).
-            for p in t
+            // `trait Buf<const N: usize>`: each impl names `N` (`impl Buf<4> for X`); the default
+            // methods read it (each impl gets its own copy of them, see `Trait$defaults`).
+            let const_params: Vec<String> = t
                 .generic_param_list()
-                .iter()
+                .into_iter()
                 .flat_map(|l| l.generic_params())
-            {
-                let ast::GenericParam::ConstParam(cp) = p else {
-                    continue;
-                };
-                let Some(cn) = cp.name().map(|n| n.text().to_string()) else {
-                    continue;
-                };
-                let used = t
-                    .assoc_item_list()
-                    .into_iter()
-                    .flat_map(|l| l.assoc_items())
-                    .filter_map(|i| match i {
-                        ast::AssocItem::Fn(f) => f.body(),
-                        _ => None,
-                    })
-                    .flat_map(|b| b.syntax().descendants().filter_map(ast::NameRef::cast))
-                    .find(|r| r.text() == cn.as_str());
-                if let Some(r) = used {
-                    self.error(
-                        r.syntax(),
-                        format!("a trait's const generic parameter (`{cn}`) in its default methods is not supported yet (it is in impls: `impl<const {cn}: usize> ..`)"),
-                    );
-                }
-            }
+                .filter_map(|p| match p {
+                    ast::GenericParam::ConstParam(cp) => Some(cp.name()?.text().to_string()),
+                    _ => None,
+                })
+                .collect();
             let assoc_types: Vec<String> = t
                 .assoc_item_list()
                 .into_iter()
@@ -124,6 +105,7 @@ impl Checker<'_> {
                     module: None,
                     assoc_types,
                     type_params,
+                    const_params,
                     assoc_bounds,
                 },
             );
@@ -159,6 +141,7 @@ impl Checker<'_> {
             }
             let saved_assoc = std::mem::replace(&mut self.impl_assoc, assoc_tys);
             self.generics.clear();
+            self.enter_trait_const_params(t);
             for p in &params {
                 self.generics
                     .insert(p.clone(), Ty::Param(format!("{n}::{p}")));
@@ -214,11 +197,31 @@ impl Checker<'_> {
             self.self_ty = saved;
             self.impl_assoc = saved_assoc;
             self.generics.clear();
+            self.const_tys.clear();
             if let Some(def) = self.adts.traits.get_mut(&n) {
                 def.methods = methods;
                 def.consts = consts;
                 def.const_tys = const_tys;
                 def.const_defaults = const_defaults;
+            }
+        }
+    }
+
+    /// A trait's const generic parameters (`trait Buf<const N: usize>`), as values in its
+    /// signatures and default bodies.
+    fn enter_trait_const_params(&mut self, t: &ast::Trait) {
+        for p in t
+            .generic_param_list()
+            .into_iter()
+            .flat_map(|l| l.generic_params())
+        {
+            if let ast::GenericParam::ConstParam(cp) = p
+                && let Some(n) = cp.name()
+            {
+                let n = n.text().to_string();
+                let ty = self.const_param_ty(&cp, false);
+                self.generics.insert(n.clone(), Ty::Param(n.clone()));
+                self.const_tys.insert(n, ty);
             }
         }
     }
@@ -597,6 +600,8 @@ impl Checker<'_> {
                             },
                         ))
                     });
+                // (`trait Buf<const N: usize>`: `N` is a value in the body.)
+                self.enter_trait_const_params(t);
                 self.check_body(
                     &f,
                     tm.sig.params.clone(),
@@ -604,6 +609,7 @@ impl Checker<'_> {
                     tm.sig.is_async,
                     self_local,
                 );
+                self.const_tys.clear();
                 self.param_bounds.clear();
                 self.self_ty = saved;
             }

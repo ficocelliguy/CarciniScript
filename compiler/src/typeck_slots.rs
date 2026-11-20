@@ -710,6 +710,120 @@ impl Checker<'_> {
         }
     }
 
+    /// `let (evens, odds): (Vec<&mut i32>, Vec<&mut i32>) = v.iter_mut().partition(..);`: both
+    /// locals hold Vecs of slots. After the pattern's names are declared.
+    pub(super) fn note_slot_tuple_let(&mut self, pat: &ast::Pat, init: Option<&ast::Expr>) {
+        let (ast::Pat::TuplePat(tp), Some(init)) = (super::strip_pat(pat), init) else {
+            return;
+        };
+        let ast::Expr::MethodCallExpr(m) = strip_parens(init) else {
+            return;
+        };
+        if !m.name_ref().is_some_and(|n| n.text() == "partition") {
+            return;
+        }
+        let Some(shape) = m.receiver().and_then(|r| self.iter_slot_shape(&r)) else {
+            return;
+        };
+        for p in tp.fields() {
+            if let ast::Pat::IdentPat(ip) = p
+                && let Some(n) = ip.name()
+            {
+                self.slot_locals
+                    .insert(n.text().to_string(), (true, shape.clone()));
+            }
+        }
+    }
+
+    /// Whether `recv` is a local holding a Vec of slots (`let mut refs: Vec<&mut i32>`).
+    pub(super) fn slot_vec_local(&self, recv: &ast::Expr) -> bool {
+        let ast::Expr::PathExpr(p) = strip_parens(recv) else {
+            return false;
+        };
+        let Some(n) = p.path().and_then(|p| p.as_single_name_ref()) else {
+            return false;
+        };
+        self.slot_locals
+            .get(n.text().to_string().as_str())
+            .is_some_and(|(vec, s)| *vec && matches!(s, SlotShape::Slot))
+    }
+
+    /// The slot shape a written `Vec<&mut T>` / `Vec<(usize, &mut T)>` gives its elements, for a
+    /// `T` kept in cells (a number, string, bool or `Option`); None when there is none.
+    pub(super) fn written_slot_shape(&mut self, t: &ast::Type) -> Option<SlotShape> {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let ast::Type::PathType(p) = t else {
+            return None;
+        };
+        let seg = p.path()?.segment()?;
+        if seg.name_ref()?.text() != "Vec" {
+            return None;
+        }
+        let ast::GenericArg::TypeArg(a) = seg.generic_arg_list()?.generic_args().next()? else {
+            return None;
+        };
+        self.written_slot_elem(&a.ty()?)
+    }
+
+    /// `&mut T` → a slot; `(A, &mut T)` → a tuple with slots in those positions.
+    fn written_slot_elem(&mut self, t: &ast::Type) -> Option<SlotShape> {
+        match t {
+            ast::Type::RefType(r) if r.mut_token().is_some() => {
+                let ty = self.lower_type(&r.ty()?);
+                self.cellable(&ty).then_some(SlotShape::Slot)
+            }
+            ast::Type::TupleType(tt) => {
+                let fields: Vec<Option<SlotShape>> =
+                    tt.fields().map(|f| self.written_slot_elem(&f)).collect();
+                fields.iter().any(Option::is_some).then_some(SlotShape::Tuple(fields))
+            }
+            _ => None,
+        }
+    }
+
+    /// `let tagged: Vec<(usize, &mut i32)> = vec![(0, &mut c)];` (or an array literal): the
+    /// literal's `&mut` places are kept as slots where the written type says so.
+    pub(super) fn note_slot_literal(&mut self, init: &ast::Expr, shape: &SlotShape) {
+        match strip_parens(init) {
+            ast::Expr::ArrayExpr(a) => {
+                for e in a.exprs() {
+                    self.keep_slot_shape(&e, shape);
+                }
+            }
+            ast::Expr::MacroExpr(me) => {
+                let Some(mc) = me.macro_call() else { return };
+                if crate::macros::macro_name(&mc).as_deref() != Some("vec") {
+                    return;
+                }
+                for a in crate::macros::split_args(self.src, self.base, &mc) {
+                    let (expr, _) = crate::macros::parse_arg(&a);
+                    if let Some(expr) = expr {
+                        let saved = std::mem::replace(&mut self.base, a.start);
+                        self.keep_slot_shape(&expr, shape);
+                        self.base = saved;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn keep_slot_shape(&mut self, e: &ast::Expr, shape: &SlotShape) {
+        match (strip_parens(e), shape) {
+            (_, SlotShape::Slot) => {
+                self.keep_slot(e);
+            }
+            (ast::Expr::TupleExpr(t), SlotShape::Tuple(fields)) => {
+                for (f, s) in t.fields().zip(fields) {
+                    if let Some(s) = s {
+                        self.keep_slot_shape(&f, s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Bind the names of `pat` (already declared) that receive slots: they read and write `[1]`
     /// and are `&mut` references.
     pub(super) fn bind_slot_shape(&mut self, pat: &ast::Pat, shape: &SlotShape) {

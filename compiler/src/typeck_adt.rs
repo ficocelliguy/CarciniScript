@@ -198,9 +198,15 @@ impl Checker<'_> {
                     {
                         if let ast::TypeOrConstParam::Type(tp) = tp
                             && let Some(n) = tp.name()
-                            && let Some(it) = self.iter_param(&tp)
                         {
-                            self.generics.insert(n.text().to_string(), it);
+                            if let Some(it) = self.iter_param(&tp) {
+                                self.generics.insert(n.text().to_string(), it);
+                            } else if let Some(c) = self.fn_bound_param(&tp, s.where_clause()) {
+                                // `struct Memo<F: Fn(u64) -> u64> { f: F }` (or `where F: Fn(..)`):
+                                // the field is a closure, so a literal's closure takes its
+                                // parameter types from it.
+                                self.generics.insert(n.text().to_string(), c);
+                            }
                         }
                     }
                     let variant =
@@ -393,6 +399,18 @@ impl Checker<'_> {
     }
 
     /// `T`, `U` as type parameters for lowering field and signature types.
+    /// The closure type a struct's type parameter gets from an `Fn` bound, inline or in the
+    /// `where` clause.
+    fn fn_bound_param(&mut self, tp: &ast::TypeParam, wc: Option<ast::WhereClause>) -> Option<Ty> {
+        let n = tp.name()?.text().to_string();
+        let lists: Vec<ast::TypeBoundList> = tp
+            .type_bound_list()
+            .into_iter()
+            .chain(where_clause_bounds(wc, &n))
+            .collect();
+        lists.iter().find_map(|l| self.lower_fn_bounds(l))
+    }
+
     fn enter_type_params(&mut self, names: &[String]) {
         self.generics.clear();
         for n in names {
@@ -997,7 +1015,7 @@ impl Checker<'_> {
             && let Some(key) = crate::adt::ext_key_any(&type_name)
             && trait_name.as_deref().is_some_and(|t| {
                 self.adts.traits.contains_key(t)
-                    || matches!(t, "From" | "PartialEq")
+                    || matches!(t, "From" | "PartialEq" | "PartialOrd")
                     || crate::adt::op_method(t).is_some()
             })
         {
@@ -1596,6 +1614,19 @@ impl Checker<'_> {
                             .cloned()
                             .unwrap_or(Ty::Unknown);
                         self.scopes = vec![std::collections::HashMap::new()];
+                        // (`impl<const P: u128> U<P> { const PER: u128 = P * 1000; }`)
+                        for (n, ty) in self.const_tys.clone() {
+                            let local = Local {
+                                ty,
+                                mutable: false,
+                                deferred: false,
+                                reference: None,
+                                owned: false,
+                                js: false,
+                                decl: None,
+                            };
+                            self.scopes[0].insert(n, local);
+                        }
                         self.ret_ty = Ty::Unit;
                         self.in_async = false;
                         self.check(&body, &ty);
@@ -1951,6 +1982,13 @@ impl Checker<'_> {
                 );
                 for (a, f) in args.iter().zip(&variant.fields) {
                     self.check(a, &f.ty);
+                    // `Slot::Live(&mut a)` with `Live(&'a mut i32)`: the field keeps the slot.
+                    if self
+                        .mut_ref_fields
+                        .contains(&(variant.name.clone(), f.name.clone()))
+                    {
+                        self.keep_slot(a);
+                    }
                 }
                 Some(Ty::Adt(adt, targs))
             }
@@ -2414,6 +2452,13 @@ impl Checker<'_> {
                         _ => i,
                     };
                     self.pat(f, &variant.fields[index].ty);
+                    // `Slot::Live(r)` with `Live(&'a mut i32)`: `r` binds the field's slot.
+                    if self
+                        .mut_ref_fields
+                        .contains(&(variant.name.clone(), variant.fields[index].name.clone()))
+                    {
+                        self.bind_slot_shape(f, &super::slots::SlotShape::Slot);
+                    }
                 }
             }
             ast::Pat::RecordPat(rp) => {
@@ -2793,7 +2838,12 @@ fn type_param_names(item: &ast::Item) -> Vec<String> {
 
 /// The bound lists a `where` clause gives the type parameter `name` (`where S: Into<String>`).
 fn where_bounds(f: &ast::Fn, name: &str) -> Vec<ast::TypeBoundList> {
-    let Some(wc) = f.where_clause() else {
+    where_clause_bounds(f.where_clause(), name)
+}
+
+/// The bound lists `wc` gives the type parameter `name`.
+fn where_clause_bounds(wc: Option<ast::WhereClause>, name: &str) -> Vec<ast::TypeBoundList> {
+    let Some(wc) = wc else {
         return Vec::new();
     };
     wc.predicates()

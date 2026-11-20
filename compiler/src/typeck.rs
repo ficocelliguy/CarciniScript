@@ -397,6 +397,8 @@ impl<'a> Checker<'a> {
             pending_try_intos: Vec::new(),
             std_fns: HashMap::new(),
             std_type_imports: Default::default(),
+            imported_names: Default::default(),
+            glob_imports: false,
             assoc_output: None,
             impl_assoc: HashMap::new(),
             param_trait_args: HashMap::new(),
@@ -926,6 +928,11 @@ struct Checker<'a> {
     /// std types imported by name (`use std::cell::UnsafeCell;`), modeled or not: an unknown
     /// one is "not supported" rather than "cannot find".
     std_type_imports: std::collections::HashSet<String>,
+    /// Every name a `use` brings in (`use std::collections::HashMap;`, `use hashbrown::HashMap as
+    /// Map;`, a `mod` file's items), and whether some `use` is a glob (then nothing is known to be
+    /// missing). For rustc's E0433 on a std type used without its import.
+    imported_names: std::collections::HashSet<String>,
+    glob_imports: bool,
     /// `type Output = ..;` of the operator impl being declared.
     assoc_output: Option<Ty>,
     /// The `impl`'s associated types (`type Err = String;`), for `Self::Err` in its signatures.
@@ -1548,6 +1555,9 @@ impl<'a> Checker<'a> {
                     .and_then(|s| s.name_ref())
                     .map(|n| n.text().to_string())
                     .unwrap_or_default();
+                if p.path().is_some_and(|q| q.qualifier().is_none()) {
+                    self.require_std_import(p.syntax(), &name, true);
+                }
                 if let Some(kind) = crate::ty::Coll::from_name(&name) {
                     // (A trailing hasher or allocator argument, `IndexSet<K, S>`, is ignored.)
                     let keep = match kind {
@@ -1933,6 +1943,50 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
         }
+    }
+
+    /// A std type used by its bare name without the `use` rustc needs (`HashMap::new()` with no
+    /// `use std::collections::HashMap;`): E0433 (E0412 in a type position), naming the import.
+    /// Only when the file brings nothing in by glob and declares or imports no such name.
+    fn require_std_import(&mut self, node: &SyntaxNode, name: &str, in_type: bool) {
+        let module = match name {
+            "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque" | "BinaryHeap"
+            | "LinkedList" => "collections",
+            "Rc" => "rc",
+            "Arc" | "Mutex" | "RwLock" => "sync",
+            "RefCell" | "Cell" => "cell",
+            "Ordering" | "Reverse" => "cmp",
+            "Duration" | "Instant" => "time",
+            "PhantomData" => "marker",
+            "Wrapping" => "num",
+            "Cow" => "borrow",
+            "Path" | "PathBuf" => "path",
+            "ControlFlow" => "ops",
+            _ => return,
+        };
+        if self.glob_imports
+            || self.imported_names.contains(name)
+            // (`use rustc_hash::FxHashMap;`, rewritten to `HashMap` before the check.)
+            || self
+                .imported_names
+                .iter()
+                .any(|a| crate::bundled::renamed_target(a) == Some(name))
+            || self.adts.defs.contains_key(name)
+            || self.adts.traits.contains_key(name)
+            || self.adts.modules.contains(name)
+            || self.type_aliases.contains_key(name)
+            || self.generics.contains_key(name)
+        {
+            return;
+        }
+        let msg = if in_type {
+            format!("cannot find type `{name}` in this scope (add `use std::{module}::{name};`)")
+        } else {
+            format!(
+                "failed to resolve: use of undeclared type `{name}` (add `use std::{module}::{name};`)"
+            )
+        };
+        self.error(node, msg);
     }
 
     /// `let x: Foo = ..` with no `Foo` in scope: rustc's E0412, with a close name suggested
@@ -2704,6 +2758,17 @@ impl<'a> Checker<'a> {
             let Some(name) = ip.name() else { return };
             let deferred = l.initializer().is_none();
             self.note_slot_let(&name, l.initializer().as_ref());
+            // `let mut refs: Vec<&mut i32> = Vec::new();` / `let tagged: Vec<(usize, &mut i32)> =
+            // vec![(0, &mut c)];`: a Vec of slots, filled by `push` or the literal.
+            if let Some(t) = l.ty()
+                && let Some(shape) = self.written_slot_shape(&t)
+            {
+                self.slot_locals
+                    .insert(name.text().to_string(), (true, shape.clone()));
+                if let Some(init) = l.initializer() {
+                    self.note_slot_literal(&init, &shape);
+                }
+            }
             let ty = match (declared, init_ty) {
                 (Some(d), _) => d,
                 (None, Some(t)) => t,
@@ -2763,6 +2828,8 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+        } else if let Some(msg) = self.array_pat_len_error(l, &pat) {
+            self.error(pat.syntax(), msg);
         } else if !self.irrefutable_pat(&pat)
             && !self.or_pat_covers(&pat, &ty)
             && !self.array_pat_fits(l, &pat)
@@ -2774,6 +2841,7 @@ impl<'a> Checker<'a> {
             );
         }
         self.pat(&pat, &ty);
+        self.note_slot_tuple_let(&pat, l.initializer().as_ref());
         // `let Some(c) = s.maybe(true) else { return };` of your `-> Option<&mut i32>` (or an
         // `Option<&mut i32>` local or parameter): `c` binds the slot.
         // `let Some(ref mut n) = self.timer else { .. };` / `let (ref mut a, ref mut b) = pair;`
@@ -4736,6 +4804,9 @@ impl<'a> Checker<'a> {
                 ret: Box::new(Ty::Char),
             };
         }
+        if segs.len() >= 2 {
+            self.require_std_import(p.syntax(), &segs[0].clone(), false);
+        }
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         // `T::SIDES`: an associated const of a bound of `T`.
         if let [param, konst] = segs.as_slice()
@@ -5087,6 +5158,31 @@ impl<'a> Checker<'a> {
             BinaryOp::CmpOp(cmp) => {
                 let lt = self.infer(&lhs, None);
                 let rt = self.infer(&rhs, Some(&lt));
+                // `*"a" < b` / `b > *"a"` with `impl PartialOrd<Bytes> for str` / `impl PartialOrd<str>
+                // for Bytes`: that impl's `partial_cmp` (codegen reads the operator off its result).
+                if matches!(cmp, CmpOp::Ord { .. })
+                    && !self.could_be(&lt, &rt)
+                    && let Some(k) = match self.shallow(&lt) {
+                        Ty::Adt(n, _) => Some(n),
+                        t => crate::adt::ext_key_of(&t)
+                            .filter(|k| self.adts.ext_types.contains(*k))
+                            .map(str::to_string),
+                    }
+                    && let Some(sig) = self.adts.method(&k, "partial_cmp").cloned()
+                    && sig.params.first().is_some_and(|p| self.could_be(p, &rt))
+                {
+                    if let Some(p) = sig.params.first() {
+                        self.unify(p, &rt);
+                    }
+                    let r = self.range(b.syntax());
+                    self.conversions.insert(
+                        r,
+                        crate::adt::Conv::Method {
+                            key: "partial_cmp".into(),
+                        },
+                    );
+                    return Ty::Bool;
+                }
                 // `"home" == host` / `id == 3` with `impl PartialEq<Host> for &str` /
                 // `impl PartialEq<u32> for Id`: that impl's `eq`.
                 if matches!(cmp, CmpOp::Eq { .. })
@@ -5340,12 +5436,18 @@ impl<'a> Checker<'a> {
         if let Some(t) = self.array_try_from(c, &path, &args) {
             return t;
         }
+        let from_alias = std_alias.is_some();
         let names: Vec<String> = std_alias.unwrap_or_else(|| {
             segs.iter()
                 .filter_map(|s| s.name_ref())
                 .map(|n| n.text().to_string())
                 .collect()
         });
+        // (`std::vec::Vec::new()`: as `Vec::new()`.)
+        let names = crate::ty::strip_prelude_modules(names);
+        if names.len() >= 2 && !from_alias {
+            self.require_std_import(callee.syntax(), &names[0].clone(), false);
+        }
         // `Self::make()` in a blanket impl (`T::make()`), or in an impl for a built-in type,
         // also in a default copied there (`i32::make()`).
         let names: Vec<String> = match (names.as_slice(), self.self_ty.clone()) {
@@ -6797,7 +6899,16 @@ impl<'a> Checker<'a> {
                 match m2 {
                     "len" => sig(self, &[], USIZE),
                     "is_empty" => sig(self, &[], Ty::Bool),
-                    "push" => sig(self, &[elem], Ty::Unit),
+                    "push" => {
+                        let t = sig(self, &[elem], Ty::Unit);
+                        // `refs.push(&mut a)` into a `Vec<&mut i32>`: the slot over `a`.
+                        if let Some(a) = args.first()
+                            && self.slot_vec_local(&recv)
+                        {
+                            self.keep_slot(a);
+                        }
+                        t
+                    }
                     "insert" => sig(self, &[USIZE, elem], Ty::Unit),
                     "remove" => sig(self, &[USIZE], elem),
                     "swap" => sig(self, &[USIZE, USIZE], Ty::Unit),
@@ -9372,7 +9483,7 @@ impl Checker<'_> {
             _ => {
                 self.error(
                     e.syntax(),
-                    "this const argument isn't supported yet (constant integer and `bool` expressions are: literals, `const` items, associated consts, arithmetic, `as` casts and calls of this file's `const fn`s)",
+                    "this const argument isn't supported yet (constant integer and `bool` expressions are: literals, `const` items, associated consts, arithmetic, `as` casts, and calls of this file's `const fn`s, also as methods of a `const` struct value)",
                 );
                 Ty::Unknown
             }
@@ -9617,6 +9728,9 @@ impl Checker<'_> {
                 | "Chars"
                 | "CharIndices"
                 | "SplitWhitespace"
+                | "Keys"
+                | "Values"
+                | "ValuesMut"
         ) || (qualified
             && matches!(
                 name,
@@ -9655,6 +9769,14 @@ impl Checker<'_> {
             },
             "Chars" => iter(Ty::Char, false),
             "CharIndices" => iter(Ty::Tuple(vec![USIZE, Ty::Char]), false),
+            // (`hash_map::Keys<K, V>` and friends: the key or value type.)
+            "Keys" | "Values" | "ValuesMut" => match args.as_slice() {
+                [k, v] => iter(
+                    if name == "Keys" { k.clone() } else { v.clone() },
+                    name == "ValuesMut",
+                ),
+                _ => return None,
+            },
             "Bytes" => iter(Ty::Int(IntKind::U8), false),
             "Lines" | "SplitWhitespace" | "Split" => iter(Ty::Str, false),
             "Iter" | "IntoIter" | "IterMut" => {

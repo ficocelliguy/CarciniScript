@@ -161,3 +161,110 @@ impl std::fmt::Debug for CStr {
         write!(f, "{}", s)
     }
 }
+
+/// `std::ffi::CString`: an owned `CStr`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CString {
+    c: CStr,
+}
+
+/// `CString::new`'s error: a nul byte inside the data (its position, and the data).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NulError(usize, Vec<u8>);
+
+impl NulError {
+    pub fn nul_position(&self) -> usize {
+        self.0
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.1
+    }
+}
+
+impl std::fmt::Display for NulError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "nul byte found in provided data at position: {}", self.0)
+    }
+}
+
+impl std::error::Error for NulError {}
+
+/// What `CString::new` takes: text or bytes.
+pub trait __CStringBytes {
+    fn __c_bytes(&self) -> Vec<u8>;
+}
+
+impl __CStringBytes for String {
+    fn __c_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+
+impl __CStringBytes for Vec<u8> {
+    fn __c_bytes(&self) -> Vec<u8> {
+        self.clone()
+    }
+}
+
+impl CString {
+    /// `CString::new("text")` / `CString::new(bytes)`: `Err` when a nul byte is inside.
+    pub fn new<T: __CStringBytes>(t: T) -> Result<CString, NulError> {
+        let bytes = t.__c_bytes();
+        match bytes.iter().position(|b| *b == 0) {
+            Some(i) => Err(NulError(i, bytes)),
+            None => Ok(CString {
+                c: CStr::__lit(&bytes),
+            }),
+        }
+    }
+
+    pub fn as_c_str(&self) -> &CStr {
+        &self.c
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        self.c.to_bytes()
+    }
+
+    pub fn as_bytes_with_nul(&self) -> Vec<u8> {
+        self.c.to_bytes_with_nul()
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.c.to_bytes()
+    }
+
+    pub fn into_bytes_with_nul(self) -> Vec<u8> {
+        self.c.to_bytes_with_nul()
+    }
+
+    pub fn into_string(self) -> Result<String, std::str::Utf8Error> {
+        self.c.to_str()
+    }
+}
+
+impl std::ops::Deref for CString {
+    type Target = CStr;
+    fn deref(&self) -> &CStr {
+        &self.c
+    }
+}
+
+impl std::fmt::Debug for CString {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self.c)
+    }
+}
+
+impl From<&CStr> for CString {
+    fn from(c: &CStr) -> CString {
+        CString { c: c.clone() }
+    }
+}
+
+impl From<CString> for Vec<u8> {
+    fn from(s: CString) -> Vec<u8> {
+        s.c.to_bytes()
+    }
+}

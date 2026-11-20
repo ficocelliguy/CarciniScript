@@ -916,7 +916,7 @@ impl Checker<'_> {
         let closure_params: &[usize] = match method {
             "filter" | "find" | "position" | "any" | "all" | "map" | "filter_map" | "inspect"
             | "skip_while" | "take_while" | "max_by_key" | "min_by_key" | "for_each"
-            | "try_for_each" | "find_map" => &[0],
+            | "try_for_each" | "find_map" | "partition" => &[0],
             "fold" | "try_fold" => &[1],
             "max_by" | "min_by" => &[0, 1],
             _ => &[],
@@ -939,6 +939,7 @@ impl Checker<'_> {
                         | "fuse"
                         | "zip"
                         | "collect"
+                        | "partition"
                         | "count"
                         | "nth"
                         | "nth_back"
