@@ -227,10 +227,10 @@ fn plan(ns: &NS, target: &Host, fraction: f64, cores: u32) -> Result<BatchPlan> 
         ..prepped.clone()
     };
     threads[Step::Grow] = f
-        .grow_threads(after_hack, player.clone(), max, cores as f64)
+        .grow_threads(after_hack, player.clone(), max, cores as i32)
         .ceil() as u32;
 
-    let weaken_per = ns.weaken_analyze(1, cores as f64);
+    let weaken_per = ns.weaken_analyze(1, cores as i32);
     threads[Step::Weaken1] = (threads[Step::Hack] as f64 * HACK_SEC / weaken_per).ceil() as u32;
     threads[Step::Weaken2] = (threads[Step::Grow] as f64 * GROW_SEC / weaken_per).ceil() as u32;
 
@@ -267,7 +267,7 @@ fn bisect(mut lo: f64, mut hi: f64, iterations: usize, ok: impl Fn(f64) -> bool)
 fn score(ns: &NS, host: &Host) -> Option<f64> {
     let server = ns.get_server(host);
     let required = server.required_hacking_skill?;
-    if server.purchased_by_player || required > ns.get_hacking_level() / 2.0 {
+    if server.purchased_by_player || required > ns.get_hacking_level() / 2 {
         return None;
     }
     let plan = plan(ns, host, 0.1, 1).ok()?;
@@ -289,7 +289,7 @@ fn choose_target(ns: &NS) -> Option<Host> {
 }
 
 /// Grows and weakens until the target is at min security and max money.
-async fn prep(ns: &NS, target: &Host, pids: &Rc<RefCell<Vec<f64>>>) -> Result<()> {
+async fn prep(ns: &NS, target: &Host, pids: &Rc<RefCell<Vec<i32>>>) -> Result<()> {
     let ram = ns.get_script_ram(WORKER);
     loop {
         let server = ns.get_server(target);
@@ -335,7 +335,7 @@ async fn prep(ns: &NS, target: &Host, pids: &Rc<RefCell<Vec<f64>>>) -> Result<()
     }
 }
 
-fn spawn(ns: &NS, host: &Host, op: Op, target: &Host, delay: Duration, batch: u32, threads: u32) -> Option<f64> {
+fn spawn(ns: &NS, host: &Host, op: Op, target: &Host, delay: Duration, batch: u32, threads: u32) -> Option<i32> {
     if !ns.file_exists(WORKER, host) {
         ns.scp(WORKER, host, "home");
     }
@@ -343,7 +343,7 @@ fn spawn(ns: &NS, host: &Host, op: Op, target: &Host, delay: Duration, batch: u3
         WORKER,
         host,
         RunOptions {
-            threads: Some(threads as f64),
+            threads: Some(threads as i32),
             temporary: Some(true),
             ..Default::default()
         },
@@ -353,12 +353,12 @@ fn spawn(ns: &NS, host: &Host, op: Op, target: &Host, delay: Duration, batch: u3
         batch,
         REPORT_PORT,
     );
-    (pid > 0.0).then_some(pid)
+    (pid > 0).then_some(pid)
 }
 
 /// Reads every pending report off the port.
 fn drain_reports(ns: &NS) -> impl Iterator<Item = Report> + '_ {
-    let port = ns.get_port_handle(REPORT_PORT as f64);
+    let port = ns.get_port_handle(REPORT_PORT as i32);
     std::iter::from_fn(move || {
         if port.empty() {
             return None;
@@ -420,7 +420,7 @@ pub async fn main(ns: NS) {
 }
 
 async fn run(ns: &NS, opts: Options) -> Result<()> {
-    let pids: Rc<RefCell<Vec<f64>>> = Rc::default();
+    let pids: Rc<RefCell<Vec<i32>>> = Rc::default();
     {
         let pids = Rc::clone(&pids);
         let ns2 = ns.clone();

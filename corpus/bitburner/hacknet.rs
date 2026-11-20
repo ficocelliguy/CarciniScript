@@ -39,9 +39,9 @@ impl Purchase {
 
     fn buy(&self, ns: &NS) -> bool {
         match *self {
-            Purchase::Node => ns.hacknet.purchase_node() >= 0.0,
+            Purchase::Node => ns.hacknet.purchase_node() >= 0,
             Purchase::Upgrade { node, part, .. } => {
-                let i = node as f64;
+                let i = node as i32;
                 match part {
                     Part::Level => ns.hacknet.upgrade_level(i, 1),
                     Part::Ram => ns.hacknet.upgrade_ram(i, 1),
@@ -75,13 +75,13 @@ fn candidates(ns: &NS, mult: f64) -> Vec<Purchase> {
     let nodes = ns.hacknet.num_nodes() as usize;
     let mut out = Vec::with_capacity(nodes * 4 + 1);
     for node in 0..nodes {
-        let i = node as f64;
+        let i = node as i32;
         let s = ns.hacknet.get_node_stats(i);
-        let now = production(s.level, s.ram, s.cores, mult);
+        let now = production(s.level as f64, s.ram, s.cores as f64, mult);
         let options = [
-            (Part::Level, ns.hacknet.get_level_upgrade_cost(i, 1), production(s.level + 1.0, s.ram, s.cores, mult)),
-            (Part::Ram, ns.hacknet.get_ram_upgrade_cost(i, 1), production(s.level, s.ram * 2.0, s.cores, mult)),
-            (Part::Cores, ns.hacknet.get_core_upgrade_cost(i, 1), production(s.level, s.ram, s.cores + 1.0, mult)),
+            (Part::Level, ns.hacknet.get_level_upgrade_cost(i, 1), production((s.level + 1) as f64, s.ram, s.cores as f64, mult)),
+            (Part::Ram, ns.hacknet.get_ram_upgrade_cost(i, 1), production(s.level as f64, s.ram * 2.0, s.cores as f64, mult)),
+            (Part::Cores, ns.hacknet.get_core_upgrade_cost(i, 1), production(s.level as f64, s.ram, (s.cores + 1) as f64, mult)),
         ];
         out.extend(
             options
@@ -90,7 +90,7 @@ fn candidates(ns: &NS, mult: f64) -> Vec<Purchase> {
                 .map(|(part, cost, after)| Purchase::Upgrade { node, part, cost, gain: after - now }),
         );
     }
-    if (nodes as f64) < ns.hacknet.max_num_nodes() {
+    if (nodes as i32) < ns.hacknet.max_num_nodes() {
         out.push(Purchase::Node);
     }
     out
@@ -134,7 +134,7 @@ pub async fn main(ns: NS) {
             production(1.0, 1.0, 1.0, mult)
         } else {
             (0..nodes)
-                .map(|i| ns.hacknet.get_node_stats(i as f64).production)
+                .map(|i| ns.hacknet.get_node_stats(i as i32).production)
                 .sum::<f64>()
                 / nodes as f64
         };

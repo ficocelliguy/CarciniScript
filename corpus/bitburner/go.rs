@@ -216,7 +216,7 @@ pub async fn main(ns: NS) {
             };
             let valid = ns.go.analysis.get_valid_moves();
             let outcome = match best_move(&board, &valid, Color::Black) {
-                Some((x, y)) => ns.go.make_move(x as f64, y as f64).await,
+                Some((x, y)) => ns.go.make_move(x as i32, y as i32).await,
                 None => ns.go.pass_turn().await,
             };
             if outcome.r#type == "gameOver" {

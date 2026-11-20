@@ -67,9 +67,12 @@ See [FEATURES.md](FEATURES.md) for the per-feature chart. The load-bearing decis
 
 - **Borrows and lifetimes** are erased in codegen. Exceptions: `&mut` taken on a primitive local
   boxes that local into a cell; `Copy` structs are cloned on assignment and by-value passing.
-- **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). `usize`/`isize` are JS numbers
-  (exact to 2^53). `i64`/`u64` and `i128`/`u128` are BigInt, wrapped to their width. Integer `/` truncates and panics on zero;
-  JS `%` already matches Rust's truncated remainder.
+- **Integers:** `i8..i32`/`u8..u32` wrap (`|0`, `>>>0`, masks). The 64-bit kinds (`i64`/`u64`,
+  `usize`/`isize`) are JS numbers, exact to 2^53: `+ - *` are plain, bit operations and shifts go
+  through BigInt past 32 bits and wrap to 64, and nothing else wraps at 2^64 (a `u64` is what a
+  player reaches for, and a number is 10x a BigInt). Only `i128`/`u128` are BigInt, wrapped to
+  their width; that is where exact 64-bit hashes and generators go. Integer `/` truncates and
+  panics on zero; JS `%` already matches Rust's truncated remainder.
 - **Option:** `None` is `null`, `Some(x)` is `x`; `Some(None)` (per depth) and `Some(())` are markers (`κσ.$some` / `$unsome`).
   The NS boundary is free: `undefined` results read as `None`.
 - **Result:** tagged object; `?` is an early return.
@@ -126,7 +129,11 @@ must stay quiet. Keep rustc's exact wording, since the editor shows it.
 ## NS bindings
 
 `tools/dts2rs.mjs` uses the TypeScript compiler API on `NetscriptDefinitions.d.ts`:
-`number` → `f64`, `string` → `String`, `T[]` → `Vec<T>` (parameters borrow: `&str`, `&[T]`, since
+`number` → `f64`, except whole numbers → `i32` (TS has one number type, so `isWholeNumber` picks
+them out by name: threads, pids, ports, cores, levels, counts, indexes, Go / Stanek coordinates,
+with an explicit `Owner.member` list for the rest; money, RAM, time, rates, multipliers,
+reputation, hashes and shares stay `f64`, and so does anything that can be `Infinity`, like
+`getActionCountRemaining`), `string` → `String`, `T[]` → `Vec<T>` (parameters borrow: `&str`, `&[T]`, since
 no NS function changes or keeps a string or array it's given), optional / `T | undefined` → `Option<T>`,
 `Promise<T>` → `impl Future<Output = T>`, interfaces → extern structs (with `#[extends = ".."]`
 for `interface X extends Y`), tuples → `[T; N]` / `(A, B)`, `Map` / `Record` → `HashMap`, inline
@@ -271,11 +278,14 @@ items and the idioms of the corpus scripts); **undocumented** means in neither g
   ignored.** An internally tagged enum is written externally tagged, then fails to read its own
   output (`unknown variant `type``). Tagged enums are the natural port-message protocol between
   scripts. `serialize_with` already errors; these should work or error the same way.
-- [ ] **3. Integer-valued NS results are all `f64`**: ports required, pids, thread counts,
-  `hacknet.numNodes()`, levels. So `n == 3`, `pid == 0`, `for i in 0..ns.hacknet.num_nodes()`
-  and `v[n as usize]` each need a cast. rustc-consistent given the bindings, so the fix is in
-  `tools/dts2rs.mjs`: a curated list of names (`num*`, `*Count`, `pid`, `threads`, `port`,
-  `*Level`) typed as integers (same JS number; `|0` wrapping is harmless there).
+- [x] **3. Integer-valued NS results are all `f64`** (done 2026-11-20): ports required, pids,
+  thread counts, `hacknet.numNodes()`, levels, Go coordinates and the rest are `i32` now
+  (`isWholeNumber` in `tools/dts2rs.mjs`, see "NS bindings"), so `pid == 0`,
+  `for i in 0..ns.hacknet.num_nodes()` and `v[n as usize]` type-check as written. The same JS
+  number; `|0` wrapping is harmless there. A whole-number argument of any JS-number integer type
+  is accepted for an `i32` enum payload (`ns.exec(.., threads)` with a `usize`), as for `f64`.
+  Left as `f64` on purpose: shares (past 2^31), hashes (fractional), favor and HP (unsure they
+  stay whole), contract `data` (one is up to 2^57).
 - [ ] **4. `std::sync` and tokio's sync primitives as single-threaded shims.** `Mutex`, `RwLock`,
   the atomics, `thread_local!`, `std::sync::mpsc`, `tokio::sync::mpsc`, `tokio::select!` and
   `tokio::time::timeout` all error, though `Arc` is already erased and the lazy / once cells are
@@ -293,9 +303,11 @@ items and the idioms of the corpus scripts); **undocumented** means in neither g
 - [ ] **6. An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
   are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
   Compile the tests to a `main` that runs each and prints libtest's summary.
-- [ ] **7. `u64` is BigInt**, documented, but players reach for `u64` for money and thread
-  math: a 2M-iteration loop is 37 ms as `u64`, 3 ms as `usize`, 2 ms as `f64`. A hint on `u64`
-  / `i64` locals that only hold NS numbers would do.
+- [x] **7. `u64` is BigInt** (done 2026-11-20): players reach for `u64` for money and thread
+  math, and a 2M-iteration loop was 37 ms as `u64`, 3 ms as `usize`, 2 ms as `f64`. `i64` /
+  `u64` are JS numbers now, like `usize` (see "Lowering decisions"); only `i128` / `u128` are
+  BigInt. The cost is exactness past 2^53 (`RUST_GAPS.md`); `int128_methods.rs` keeps the
+  BigInt paths diff-tested and `int64_numbers.rs` the number ones.
 
 Not caught at all (probed 2026-11-18), so no message to improve: `let r = &v[0]` over a
 `Vec<i32>` then `v.push` (the index copies), `"a" + "b"`, an un-awaited `ns.hack(..)`, and a
@@ -349,7 +361,6 @@ loops, `?` and panics are returns and throws (try/finally only for `Drop` types)
   reached type. Left: merging the read-only pre-pass rewrites into one walk, and the remaining
   cost in chrono's formatter (`__chrono_format` handles every specifier, so `{}` on a date
   reaches `NaiveTime`, `TimeDelta` and `Weekday`).
-- [ ] `for i in 0..n` over `u64` iterates BigInts: the representation is the cost (player gap 7).
 - [ ] `match` as a `switch` on `$tag` (the `else if` chain is cheap once the subject is a name,
   so not pressing); skipping a `Copy` struct's clone at its last use; unit-variant singletons
   (blocked: `*r = Dir::E` through a `&mut` is `κσ.$replace`, which rewrites the object in place,

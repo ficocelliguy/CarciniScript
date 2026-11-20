@@ -155,7 +155,7 @@ pub fn try_root(ns: &NS, host: &str) -> Result<bool, RootError> {
 #[derive(Debug)]
 pub enum RootError {
     NotEnoughPorts { needed: usize, opened: usize },
-    LevelTooLow { level: f64, required: f64 },
+    LevelTooLow { level: i32, required: i32 },
 }
 
 impl fmt::Display for RootError {

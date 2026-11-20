@@ -32,7 +32,7 @@ pub async fn main(ns: NS) {
 
     // A union parameter takes any payload, or the enum.
     ns.run("hack.rs", 4, "n00dles", true);
-    ns.run("hack.rs", RunOptions { threads: Some(2.0), ..Default::default() }, ScriptArg::Num(7.0));
+    ns.run("hack.rs", RunOptions { threads: Some(2), ..Default::default() }, ScriptArg::Num(7.0));
     let args: Vec<ScriptArg> = vec![ScriptArg::Str("a".into()), ScriptArg::Num(1.0)];
     ns.exec("hack.rs", "home", 1, args[0].clone(), args[1].clone());
     ns.kill(7, "home");

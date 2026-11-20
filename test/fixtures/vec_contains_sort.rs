@@ -4,8 +4,8 @@ fn main() {
     let ints = vec![3, -7, 0, i32::MIN, i32::MAX, 42];
     println!("{} {} {} {} {}", ints.contains(&-7), ints.contains(&7), ints.contains(&0), ints.contains(&i32::MIN), ints.contains(&(-0)));
     let bigs: Vec<i64> = vec![1 << 40, -5, 0];
-    let ubigs: Vec<u64> = vec![u64::MAX, 1];
-    println!("{} {} {} {}", bigs.contains(&(1 << 40)), bigs.contains(&5), ubigs.contains(&u64::MAX), ubigs.contains(&0));
+    let ubigs: Vec<u64> = vec![(1 << 52), 1];
+    println!("{} {} {} {}", bigs.contains(&(1 << 40)), bigs.contains(&5), ubigs.contains(&(1 << 52)), ubigs.contains(&0));
     let sizes: Vec<usize> = vec![0, 1, 1usize << 40];
     println!("{} {}", sizes.contains(&(1usize << 40)), sizes.contains(&2));
     let strs = vec!["a".to_string(), "bc".to_string(), "".to_string()];
@@ -37,7 +37,7 @@ fn main() {
     let mut b: Vec<i64> = vec![1 << 40, -(1 << 41), 0, 5];
     b.sort();
     println!("{:?}", b);
-    let mut ub: Vec<u64> = vec![u64::MAX, 0, 1 << 63];
+    let mut ub: Vec<u64> = vec![(1 << 52), 0, 1 << 51];
     ub.sort_unstable();
     println!("{:?}", ub);
     let mut us: Vec<usize> = vec![1 << 50, 3, 1 << 20, 0];

@@ -29,7 +29,7 @@ enum DnError {
     #[error("{host} went offline")]
     Offline { host: String },
     #[error("need {need} charisma for {host}")]
-    Charisma { host: String, need: f64 },
+    Charisma { host: String, need: i32 },
     #[error("unsupported model {0}")]
     Unsupported(Model),
     #[error(transparent)]
@@ -173,7 +173,7 @@ impl<'a> Session<'a> {
     async fn logs(&self, count: u32) -> Vec<LogEntry> {
         let opts = HeartbleedOptions {
             peek: Some(true),
-            logs_to_capture: Some(count as f64),
+            logs_to_capture: Some(count as i32),
             ..Default::default()
         };
         let result = self.ns.dnet.heartbleed(&self.host, opts).await;
@@ -679,7 +679,7 @@ fn spread(ns: &NS, host: &str) -> bool {
         temporary: Some(true),
         ..Default::default()
     };
-    ns.exec(SELF, host, opts) > 0.0
+    ns.exec(SELF, host, opts) > 0
 }
 
 #[derive(Default)]

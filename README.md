@@ -180,7 +180,7 @@ rename providers for `.rs` files; a definition in another script opens it in a t
 (`bindings/ns.rs`), which the compiler loads with `setNsBindings(text)`. With them, every `ns.*`
 call, field and namespace is type-checked: wrong argument types, misspelled methods ("did you
 mean"), and a forgotten `.await` are compile errors. The interfaces are Rust structs a script can
-name and build (`RunOptions { threads: Some(4.0), ..Default::default() }`), a `Player` is accepted
+name and build (`RunOptions { threads: Some(4), ..Default::default() }`), a `Player` is accepted
 where a `Person` is, the d.ts's unions are enums over the JS value itself (`ns.args` is a
 `Vec<ScriptArg>`: `match a { ScriptArg::Str(s) => .., ScriptArg::Num(n) => .., ScriptArg::Bool(b) => .. }`,
 or `a.as_string()` as before; `PlayerRequirement::Money(m)`, `NsResult::Success(..)`), and only

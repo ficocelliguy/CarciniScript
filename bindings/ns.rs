@@ -65,7 +65,7 @@ pub struct NS {
     pub args: Vec<ScriptArg>,
     /// The current script's PID
     #[js = "pid"]
-    pub pid: f64,
+    pub pid: i32,
     #[js = "heart"]
     pub heart: NSHeart,
     #[js = "enums"]
@@ -87,7 +87,7 @@ impl NS {
     /// Predict the effect of weaken.
     /// RAM cost: 1 GB
     #[js = "weakenAnalyze"]
-    pub fn weaken_analyze(&self, threads: f64, #[optional] cores: f64) -> f64;
+    pub fn weaken_analyze(&self, threads: i32, #[optional] cores: i32) -> f64;
     /// Calculate the decimal number of threads needed to hack a specified amount of money from a target host.
     /// RAM cost: 1 GB
     #[js = "hackAnalyzeThreads"]
@@ -99,7 +99,7 @@ impl NS {
     /// Get the security increase for a number of threads.
     /// RAM cost: 1 GB
     #[js = "hackAnalyzeSecurity"]
-    pub fn hack_analyze_security(&self, threads: f64, #[optional] host: &str) -> f64;
+    pub fn hack_analyze_security(&self, threads: i32, #[optional] host: &str) -> f64;
     /// Get the chance of successfully hacking a server.
     /// RAM cost: 1 GB
     #[js = "hackAnalyzeChance"]
@@ -107,11 +107,11 @@ impl NS {
     /// Calculate the number of grow threads needed for a given multiplicative growth factor.
     /// RAM cost: 1 GB
     #[js = "growthAnalyze"]
-    pub fn growth_analyze(&self, host: &str, multiplier: f64, #[optional] cores: f64) -> f64;
+    pub fn growth_analyze(&self, host: &str, multiplier: f64, #[optional] cores: i32) -> f64;
     /// Calculate the security increase for a number of grow threads.
     /// RAM cost: 1 GB
     #[js = "growthAnalyzeSecurity"]
-    pub fn growth_analyze_security(&self, threads: f64, #[optional] host: &str, #[optional] cores: f64) -> f64;
+    pub fn growth_analyze_security(&self, threads: i32, #[optional] host: &str, #[optional] cores: i32) -> f64;
     /// Suspends the script for n milliseconds.
     /// RAM cost: 0 GB
     #[js = "sleep"]
@@ -203,11 +203,11 @@ impl NS {
     /// Start another script on the current server.
     /// RAM cost: 1 GB
     #[js = "run"]
-    pub fn run(&self, script: &str, #[optional] thread_or_options: RunThreadOrOptions, #[variadic] args: ScriptArg) -> f64;
+    pub fn run(&self, script: &str, #[optional] thread_or_options: RunThreadOrOptions, #[variadic] args: ScriptArg) -> i32;
     /// Start another script on any server.
     /// RAM cost: 1.3 GB
     #[js = "exec"]
-    pub fn exec(&self, script: &str, host: &str, #[optional] thread_or_options: ExecThreadOrOptions, #[variadic] args: ScriptArg) -> f64;
+    pub fn exec(&self, script: &str, host: &str, #[optional] thread_or_options: ExecThreadOrOptions, #[variadic] args: ScriptArg) -> i32;
     /// Terminate current script and start another in a defined number of milliseconds.
     /// RAM cost: 2 GB
     #[js = "spawn"]
@@ -255,7 +255,7 @@ impl NS {
     /// Returns the player’s current hacking level.
     /// RAM cost: 0.05 GB
     #[js = "getHackingLevel"]
-    pub fn get_hacking_level(&self) -> f64;
+    pub fn get_hacking_level(&self) -> i32;
     /// Get hacking related multipliers.
     /// RAM cost: 0.25 GB
     #[js = "getHackingMultipliers"]
@@ -303,11 +303,11 @@ impl NS {
     /// Returns the required hacking level of the target server.
     /// RAM cost: 0.1 GB
     #[js = "getServerRequiredHackingLevel"]
-    pub fn get_server_required_hacking_level(&self, #[optional] host: &str) -> f64;
+    pub fn get_server_required_hacking_level(&self, #[optional] host: &str) -> i32;
     /// Returns the number of open ports required to successfully run NUKE.exe on the specified server.
     /// RAM cost: 0.1 GB
     #[js = "getServerNumPortsRequired"]
-    pub fn get_server_num_ports_required(&self, #[optional] host: &str) -> f64;
+    pub fn get_server_num_ports_required(&self, #[optional] host: &str) -> i32;
     /// Given a hostname, returns its IP address; or given an IP address, returns its hostname.
     /// RAM cost: 0.05 GB
     #[js = "dnsLookup"]
@@ -339,11 +339,11 @@ impl NS {
     /// Attempt to write to a port.
     /// RAM cost: 0 GB
     #[js = "tryWritePort"]
-    pub fn try_write_port(&self, port_number: f64, data: JsValue) -> bool;
+    pub fn try_write_port(&self, port_number: i32, data: JsValue) -> bool;
     /// Listen for a port write.
     /// RAM cost: 0 GB
     #[js = "nextPortWrite"]
-    pub async fn next_port_write(&self, port: f64);
+    pub async fn next_port_write(&self, port: i32);
     /// Read content of a file.
     /// RAM cost: 0 GB
     #[js = "read"]
@@ -355,7 +355,7 @@ impl NS {
     /// Get a copy of the data from a port without popping it.
     /// RAM cost: 0 GB
     #[js = "peek"]
-    pub fn peek(&self, port_number: f64) -> JsValue;
+    pub fn peek(&self, port_number: i32) -> JsValue;
     /// Clear data from a file.
     /// RAM cost: 0 GB
     #[js = "clear"]
@@ -363,27 +363,27 @@ impl NS {
     /// Clear data from a port.
     /// RAM cost: 0 GB
     #[js = "clearPort"]
-    pub fn clear_port(&self, port_number: f64);
+    pub fn clear_port(&self, port_number: i32);
     /// Write data to a port.
     /// RAM cost: 0 GB
     #[js = "writePort"]
-    pub fn write_port(&self, port_number: f64, data: JsValue) -> JsValue;
+    pub fn write_port(&self, port_number: i32, data: JsValue) -> JsValue;
     /// Read data from a port.
     /// RAM cost: 0 GB
     #[js = "readPort"]
-    pub fn read_port(&self, port_number: f64) -> JsValue;
+    pub fn read_port(&self, port_number: i32) -> JsValue;
     /// Get all data on a port.
     /// RAM cost: 0 GB
     #[js = "getPortHandle"]
-    pub fn get_port_handle(&self, port_number: f64) -> NetscriptPort;
+    pub fn get_port_handle(&self, port_number: i32) -> NetscriptPort;
     /// Check if a port is full.
     /// RAM cost: 0 GB
     #[js = "isFullPort"]
-    pub fn is_full_port(&self, port_number: f64) -> bool;
+    pub fn is_full_port(&self, port_number: i32) -> bool;
     /// Check if a port is empty.
     /// RAM cost: 0 GB
     #[js = "isEmptyPort"]
-    pub fn is_empty_port(&self, port_number: f64) -> bool;
+    pub fn is_empty_port(&self, port_number: i32) -> bool;
     /// Delete a file.
     /// RAM cost: 0.6 GB
     #[js = "rm"]
@@ -463,7 +463,7 @@ impl NS {
     /// Get the current BitNode multipliers.
     /// RAM cost: 4 GB
     #[js = "getBitNodeMultipliers"]
-    pub fn get_bit_node_multipliers(&self, #[optional] n: f64, #[optional] lvl: f64) -> BitNodeMultipliers;
+    pub fn get_bit_node_multipliers(&self, #[optional] n: i32, #[optional] lvl: i32) -> BitNodeMultipliers;
     /// Get information about the player.
     /// RAM cost: 0.5 GB
     #[js = "getPlayer"]
@@ -510,7 +510,7 @@ impl NS {
 pub struct ActiveFragment {
     /// A unique integer ID assigned to the combination of a fragment's shape, effect, and power.
     #[js = "id"]
-    pub id: f64,
+    pub id: i32,
     /// A two-dimensional array representing with `true` the slots a fragment will obstruct, with no rotations applied.
     #[js = "shape"]
     pub shape: Vec<Vec<bool>>,
@@ -522,7 +522,7 @@ pub struct ActiveFragment {
     pub power: f64,
     /// The maximum number of concurrent placements allowed, for fragments with this ID.
     #[js = "limit"]
-    pub limit: f64,
+    pub limit: i32,
     /// The fragment's effect description.
     #[js = "effect"]
     pub effect: String,
@@ -531,16 +531,16 @@ pub struct ActiveFragment {
     pub highest_charge: f64,
     /// The current charge value in play for this fragment. This is the cumulative effective threads used to charge across all cycles, divided by the (current) highestCharge.
     #[js = "numCharge"]
-    pub num_charge: f64,
+    pub num_charge: i32,
     /// A non-negative integer representing the number of clockwise 90-degree turns to apply. Values greater than 3 wrap around to the 0–3 range.
     #[js = "rotation"]
-    pub rotation: f64,
+    pub rotation: i32,
     /// The root x coordinate against which the top left of the fragment was aligned.
     #[js = "x"]
-    pub x: f64,
+    pub x: i32,
     /// The root y coordinate against which the top left of the fragment was aligned.
     #[js = "y"]
-    pub y: f64,
+    pub y: i32,
     /// This is the raw value of the modifier used to calculate the effect on your multipliers. It may not be a multiplier.
     #[js = "chargedEffect"]
     pub charged_effect: f64,
@@ -608,7 +608,7 @@ pub struct BaseTask {
 pub struct BasicHGWOptions {
     /// Number of threads to use for this function. Must be less than or equal to the number of threads the script is running with. Accepts positive non integer values. Defaults to the number of threads th...
     #[js = "threads"]
-    pub threads: Option<f64>,
+    pub threads: Option<i32>,
     /// Whether to make this action affect the stock market. Defaults to false.
     #[js = "stock"]
     pub stock: Option<bool>,
@@ -813,7 +813,7 @@ pub struct BitNodeOptions {
     #[js = "disableSleeveExpAndAugmentation"]
     pub disable_sleeve_exp_and_augmentation: bool,
     #[js = "sourceFileOverrides"]
-    pub source_file_overrides: HashMap<i32, f64>,
+    pub source_file_overrides: HashMap<i32, i32>,
     #[js = "intelligenceOverride"]
     pub intelligence_override: Option<f64>,
 }
@@ -823,7 +823,7 @@ pub struct BitNodeRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "bitNodeN"]
-    pub bit_node_n: f64,
+    pub bit_node_n: i32,
 }
 
 /// Bladeburner API
@@ -877,19 +877,19 @@ impl Bladeburner {
     /// Get estimate success chance of an action.
     /// RAM cost: 4 GB
     #[js = "getActionEstimatedSuccessChance"]
-    pub fn get_action_estimated_success_chance(&self, r#type: &str, name: &str, #[optional] sleeve_number: f64) -> [f64; 2];
+    pub fn get_action_estimated_success_chance(&self, r#type: &str, name: &str, #[optional] sleeve_number: i32) -> [f64; 2];
     /// Get the reputation gain of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRepGain"]
-    pub fn get_action_rep_gain(&self, r#type: &str, name: &str, #[optional] level: f64) -> f64;
+    pub fn get_action_rep_gain(&self, r#type: &str, name: &str, #[optional] level: i32) -> f64;
     /// Get the rank gain of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRankGain"]
-    pub fn get_action_rank_gain(&self, r#type: &str, name: &str, #[optional] level: f64) -> f64;
+    pub fn get_action_rank_gain(&self, r#type: &str, name: &str, #[optional] level: i32) -> f64;
     /// Get the rank loss of an action.
     /// RAM cost: 4 GB
     #[js = "getActionRankLoss"]
-    pub fn get_action_rank_loss(&self, r#type: &str, name: &str, #[optional] level: f64) -> f64;
+    pub fn get_action_rank_loss(&self, r#type: &str, name: &str, #[optional] level: i32) -> f64;
     /// Get action count remaining.
     /// RAM cost: 4 GB
     #[js = "getActionCountRemaining"]
@@ -897,11 +897,11 @@ impl Bladeburner {
     /// Get the maximum level of an action.
     /// RAM cost: 4 GB
     #[js = "getActionMaxLevel"]
-    pub fn get_action_max_level(&self, r#type: &str, name: &str) -> f64;
+    pub fn get_action_max_level(&self, r#type: &str, name: &str) -> i32;
     /// Get the current level of an action.
     /// RAM cost: 4 GB
     #[js = "getActionCurrentLevel"]
-    pub fn get_action_current_level(&self, r#type: &str, name: &str) -> f64;
+    pub fn get_action_current_level(&self, r#type: &str, name: &str) -> i32;
     /// Get whether an action is set to autolevel.
     /// RAM cost: 4 GB
     #[js = "getActionAutolevel"]
@@ -909,7 +909,7 @@ impl Bladeburner {
     /// Get action successes.
     /// RAM cost: 4 GB
     #[js = "getActionSuccesses"]
-    pub fn get_action_successes(&self, r#type: &str, name: &str) -> f64;
+    pub fn get_action_successes(&self, r#type: &str, name: &str) -> i32;
     /// Set an action autolevel.
     /// RAM cost: 4 GB
     #[js = "setActionAutolevel"]
@@ -917,7 +917,7 @@ impl Bladeburner {
     /// Set the level of an action.
     /// RAM cost: 4 GB
     #[js = "setActionLevel"]
-    pub fn set_action_level(&self, r#type: &str, name: &str, level: f64);
+    pub fn set_action_level(&self, r#type: &str, name: &str, level: i32);
     /// Get player bladeburner rank.
     /// RAM cost: 4 GB
     #[js = "getRank"]
@@ -925,31 +925,31 @@ impl Bladeburner {
     /// Get black op required rank.
     /// RAM cost: 2 GB
     #[js = "getBlackOpRank"]
-    pub fn get_black_op_rank(&self, name: &str) -> f64;
+    pub fn get_black_op_rank(&self, name: &str) -> i32;
     /// Get bladeburner skill points.
     /// RAM cost: 4 GB
     #[js = "getSkillPoints"]
-    pub fn get_skill_points(&self) -> f64;
+    pub fn get_skill_points(&self) -> i32;
     /// Get skill level.
     /// RAM cost: 4 GB
     #[js = "getSkillLevel"]
-    pub fn get_skill_level(&self, skill_name: &str) -> f64;
+    pub fn get_skill_level(&self, skill_name: &str) -> i32;
     /// Get cost to upgrade skill.
     /// RAM cost: 4 GB
     #[js = "getSkillUpgradeCost"]
-    pub fn get_skill_upgrade_cost(&self, skill_name: &str, #[optional] count: f64) -> f64;
+    pub fn get_skill_upgrade_cost(&self, skill_name: &str, #[optional] count: i32) -> f64;
     /// Upgrade skill.
     /// RAM cost: 4 GB
     #[js = "upgradeSkill"]
-    pub fn upgrade_skill(&self, skill_name: &str, #[optional] count: f64) -> bool;
+    pub fn upgrade_skill(&self, skill_name: &str, #[optional] count: i32) -> bool;
     /// Get team size.
     /// RAM cost: 4 GB
     #[js = "getTeamSize"]
-    pub fn get_team_size(&self, #[optional] r#type: &str, #[optional] name: &str) -> f64;
+    pub fn get_team_size(&self, #[optional] r#type: &str, #[optional] name: &str) -> i32;
     /// Set team size.
     /// RAM cost: 4 GB
     #[js = "setTeamSize"]
-    pub fn set_team_size(&self, r#type: &str, name: &str, size: f64) -> f64;
+    pub fn set_team_size(&self, r#type: &str, name: &str, size: i32) -> i32;
     /// Get estimated population in city.
     /// RAM cost: 4 GB
     #[js = "getCityEstimatedPopulation"]
@@ -957,7 +957,7 @@ impl Bladeburner {
     /// Get number of communities in a city.
     /// RAM cost: 4 GB
     #[js = "getCityCommunities"]
-    pub fn get_city_communities(&self, city: &str) -> f64;
+    pub fn get_city_communities(&self, city: &str) -> i32;
     /// Get chaos of a city.
     /// RAM cost: 4 GB
     #[js = "getCityChaos"]
@@ -1080,7 +1080,7 @@ pub struct BladeburnerFormulas {
 impl BladeburnerFormulas {
     /// Calculate the number of times that you can upgrade a skill.
     #[js = "skillMaxUpgradeCount"]
-    pub fn skill_max_upgrade_count(&self, name: &str, level: f64, skill_points: f64) -> f64;
+    pub fn skill_max_upgrade_count(&self, name: &str, level: i32, skill_points: i32) -> i32;
 }
 
 /// General action names of Bladeburner
@@ -1265,7 +1265,7 @@ impl Cloud {
     /// Returns the maximum number of cloud servers you can purchase.
     /// RAM cost: 0.05 GB
     #[js = "getServerLimit"]
-    pub fn get_server_limit(&self) -> f64;
+    pub fn get_server_limit(&self) -> i32;
     /// Returns the maximum RAM that a cloud server can have.
     /// RAM cost: 0.05 GB
     #[js = "getRamLimit"]
@@ -1299,7 +1299,7 @@ impl CodingContract {
     /// Get the number of attempts remaining.
     /// RAM cost: 2 GB
     #[js = "getNumTriesRemaining"]
-    pub fn get_num_tries_remaining(&self, filename: &str, #[optional] host: &str) -> f64;
+    pub fn get_num_tries_remaining(&self, filename: &str, #[optional] host: &str) -> i32;
     /// Generate a dummy contract.
     /// RAM cost: 2 GB
     #[js = "createDummyContract"]
@@ -1841,7 +1841,7 @@ impl Corporation {
     /// Get the number of times you have hired AdVert.
     /// RAM cost: 10 GB
     #[js = "getHireAdVertCount"]
-    pub fn get_hire_ad_vert_count(&self, division_name: &str) -> f64;
+    pub fn get_hire_ad_vert_count(&self, division_name: &str) -> i32;
     /// Get the cost to unlock a research.
     /// RAM cost: 10 GB
     #[js = "getResearchCost"]
@@ -1881,7 +1881,7 @@ impl Corporation {
     /// Get the level of a levelable upgrade.
     /// RAM cost: 10 GB
     #[js = "getUpgradeLevel"]
-    pub fn get_upgrade_level(&self, upgrade_name: &str) -> f64;
+    pub fn get_upgrade_level(&self, upgrade_name: &str) -> i32;
     /// Get the cost to unlock the next level of a levelable upgrade.
     /// RAM cost: 10 GB
     #[js = "getUpgradeLevelCost"]
@@ -2110,7 +2110,7 @@ pub struct CrimeStats {
     pub karma: f64,
     /// How many people die as a result of this crime
     #[js = "kills"]
-    pub kills: f64,
+    pub kills: i32,
     /// How much money is given
     #[js = "money"]
     pub money: f64,
@@ -2211,7 +2211,7 @@ impl Darknet {
     /// Returns the maximum number of stasis links that can be applied globally, based on the player's current status. Stasis link limit can be increased by finding special augmentations in the deep darknet.
     /// RAM cost: 0 GB
     #[js = "getStasisLinkLimit"]
-    pub fn get_stasis_link_limit(&self) -> f64;
+    pub fn get_stasis_link_limit(&self) -> i32;
     /// Returns the hostnames/IPs of servers that have a stasis link applied.
     /// RAM cost: 0 GB
     #[js = "getStasisLinkedServers"]
@@ -2262,7 +2262,7 @@ impl Darknet {
     /// Gets the required charisma level to target the server with heartbleed().
     /// RAM cost: 0.1 GB
     #[js = "getServerRequiredCharismaLevel"]
-    pub fn get_server_required_charisma_level(&self, host: &str) -> f64;
+    pub fn get_server_required_charisma_level(&self, host: &str) -> i32;
     /// Not all who wander are lost.
     /// RAM cost: 0 GB
     #[js = "labreport"]
@@ -2279,16 +2279,16 @@ pub struct DarknetFormulas {
 impl DarknetFormulas {
     /// Gets the time it will take to authenticate a server.
     #[js = "getAuthenticateTime"]
-    pub fn get_authenticate_time(&self, server_details: DarknetServerDetails, #[optional] threads: f64, #[optional] player: Person, #[optional] correct_characters_in_password: f64) -> f64;
+    pub fn get_authenticate_time(&self, server_details: DarknetServerDetails, #[optional] threads: i32, #[optional] player: Person, #[optional] correct_characters_in_password: i32) -> f64;
     /// Gets the time it will take to scrape logs from a server.
     #[js = "getHeartbleedTime"]
-    pub fn get_heartbleed_time(&self, server_details: DarknetServerDetails, #[optional] threads: f64, #[optional] player: Person) -> f64;
+    pub fn get_heartbleed_time(&self, server_details: DarknetServerDetails, #[optional] threads: i32, #[optional] player: Person) -> f64;
     /// Gets the expected amount of ram that will be freed by a call to memoryReallocation()
     #[js = "getExpectedRamBlockRemoved"]
-    pub fn get_expected_ram_block_removed(&self, server_details: DarknetServerDetails, #[optional] threads: f64, #[optional] player: Person) -> f64;
+    pub fn get_expected_ram_block_removed(&self, server_details: DarknetServerDetails, #[optional] threads: i32, #[optional] player: Person) -> f64;
     /// Gets the expected amount of charge that will be gained by a call to induceServerMigration()
     #[js = "getExpectedMigrationCharge"]
-    pub fn get_expected_migration_charge(&self, server_details: DarknetServerDetails, player: Person, #[optional] threads: f64) -> f64;
+    pub fn get_expected_migration_charge(&self, server_details: DarknetServerDetails, player: Person, #[optional] threads: i32) -> f64;
 }
 
 /// Instability penalties caused by excessive backdoor installations on the darknet.
@@ -2358,7 +2358,7 @@ pub struct DarknetServerDetails {
     pub log_traffic_interval: f64,
     /// The number of characters in the password
     #[js = "passwordLength"]
-    pub password_length: f64,
+    pub password_length: i32,
     /// The character set used in the password
     #[js = "passwordFormat"]
     pub password_format: String,
@@ -2370,10 +2370,10 @@ pub struct DarknetServerDetails {
     pub difficulty: f64,
     /// The current depth in the darknet of the server
     #[js = "depth"]
-    pub depth: f64,
+    pub depth: i32,
     /// The charisma skill required to authenticate on the server
     #[js = "requiredCharismaSkill"]
-    pub required_charisma_skill: f64,
+    pub required_charisma_skill: i32,
     /// If this darknet server cannot be moved. True for fixed/story servers.
     #[js = "isStationary"]
     pub is_stationary: bool,
@@ -2413,7 +2413,7 @@ pub struct Division {
     pub this_cycle_expenses: f64,
     /// Number of times AdVert has been bought
     #[js = "numAdVerts"]
-    pub num_ad_verts: f64,
+    pub num_ad_verts: i32,
     /// Cities in which this division has expanded
     #[js = "cities"]
     pub cities: Vec<String>,
@@ -2425,7 +2425,7 @@ pub struct Division {
     pub makes_products: bool,
     /// How many products this division can support
     #[js = "maxProducts"]
-    pub max_products: f64,
+    pub max_products: i32,
 }
 
 /// Options for opening the code editor
@@ -2619,15 +2619,15 @@ impl Format {
     /// Format a number.
     /// RAM cost: 0 GB
     #[js = "number"]
-    pub fn number(&self, n: f64, #[optional] fractional_digits: f64, #[optional] suffix_start: f64, #[optional] is_integer: bool) -> String;
+    pub fn number(&self, n: f64, #[optional] fractional_digits: i32, #[optional] suffix_start: f64, #[optional] is_integer: bool) -> String;
     /// Format a number as an amount of ram.
     /// RAM cost: 0 GB
     #[js = "ram"]
-    pub fn ram(&self, n: f64, #[optional] fractional_digits: f64) -> String;
+    pub fn ram(&self, n: f64, #[optional] fractional_digits: i32) -> String;
     /// Format a number as a percentage.
     /// RAM cost: 0 GB
     #[js = "percent"]
-    pub fn percent(&self, n: f64, #[optional] fractional_digits: f64, #[optional] suffix_start: f64) -> String;
+    pub fn percent(&self, n: f64, #[optional] fractional_digits: i32, #[optional] suffix_start: f64) -> String;
     /// Format time to a readable string.
     /// RAM cost: 0 GB
     #[js = "time"]
@@ -2680,7 +2680,7 @@ impl Formulas {
 pub struct Fragment {
     /// A unique integer ID assigned to the combination of a fragment's shape, effect, and power.
     #[js = "id"]
-    pub id: f64,
+    pub id: i32,
     /// A two-dimensional array representing with `true` the slots a fragment will obstruct, with no rotations applied.
     #[js = "shape"]
     pub shape: Vec<Vec<bool>>,
@@ -2692,7 +2692,7 @@ pub struct Fragment {
     pub power: f64,
     /// The maximum number of concurrent placements allowed, for fragments with this ID.
     #[js = "limit"]
-    pub limit: f64,
+    pub limit: i32,
     /// The fragment's effect description.
     #[js = "effect"]
     pub effect: String,
@@ -2740,7 +2740,7 @@ pub struct GameInfo {
     pub version: String,
     /// Internal version number that increments during releases. E.g.: 43
     #[js = "versionNumber"]
-    pub version_number: f64,
+    pub version_number: i32,
     /// Git commit hash that the release was built from. E.g.: "d0d776700"
     #[js = "commit"]
     pub commit: String,
@@ -2788,7 +2788,7 @@ impl Gang {
     /// Check how many gang members you can currently recruit.
     /// RAM cost: 1 GB
     #[js = "getRecruitsAvailable"]
-    pub fn get_recruits_available(&self) -> f64;
+    pub fn get_recruits_available(&self) -> i32;
     /// Check the amount of Respect needed for your next gang recruit.
     /// RAM cost: 1 GB
     #[js = "respectForNextRecruit"]
@@ -3319,7 +3319,7 @@ impl Go {
     /// Make a move on the IPvGO subnet game board, and await the opponent's response. \{"x":0,"y":0\} represents the bottom-left corner of the board in the UI.
     /// RAM cost: 4 GB
     #[js = "makeMove"]
-    pub async fn make_move(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
+    pub async fn make_move(&self, x: i32, y: i32, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Pass the player's turn rather than making a move, and await the opponent's response. This ends the game if the opponent passed on the previous turn, or if the opponent passes on their following turn.
     /// RAM cost: 0 GB
     #[js = "passTurn"]
@@ -3365,11 +3365,11 @@ impl GoAnalysis {
     /// Returns an ID for each point. All points that share an ID are part of the same network (or "chain"). Empty points are also given chain IDs to represent continuous empty space. Dead nodes are given ...
     /// RAM cost: 16 GB
     #[js = "getChains"]
-    pub fn get_chains(&self, #[optional] board_state: &[String]) -> Vec<Vec<f64>>;
+    pub fn get_chains(&self, #[optional] board_state: &[String]) -> Vec<Vec<i32>>;
     /// Returns a number for each point, representing how many open nodes its network/chain is connected to. Empty nodes and dead nodes are shown as -1 liberties.
     /// RAM cost: 16 GB
     #[js = "getLiberties"]
-    pub fn get_liberties(&self, #[optional] board_state: &[String]) -> Vec<Vec<f64>>;
+    pub fn get_liberties(&self, #[optional] board_state: &[String]) -> Vec<Vec<i32>>;
     /// Returns 'X' for black, 'O' for white, or '?' for each empty point to indicate which player controls that empty point. If no single player fully encircles the empty space, it is shown as contested w...
     /// RAM cost: 16 GB
     #[js = "getControlledEmptyNodes"]
@@ -3389,11 +3389,11 @@ impl GoAnalysis {
     /// Adds a colored circle indicator to the specified point. These indicators are removed once a move is played.
     /// RAM cost: 0 GB
     #[js = "highlightPoint"]
-    pub fn highlight_point(&self, x: f64, y: f64, #[optional] color: &str, #[optional] text: &str);
+    pub fn highlight_point(&self, x: i32, y: i32, #[optional] color: &str, #[optional] text: &str);
     /// Removes the highlight color and text from the specified node.
     /// RAM cost: 0 GB
     #[js = "clearPointHighlight"]
-    pub fn clear_point_highlight(&self, x: f64, y: f64);
+    pub fn clear_point_highlight(&self, x: i32, y: i32);
     /// Removes all highlights from the board.
     /// RAM cost: 0 GB
     #[js = "clearAllPointHighlights"]
@@ -3407,27 +3407,27 @@ impl GoCheat {
     /// Returns your chance of successfully playing one of the special moves in the ns.go.cheat API. Scales up with your crime success rate stat. Scales down with the number of times you've attempted to ch...
     /// RAM cost: 1 GB
     #[js = "getCheatSuccessChance"]
-    pub fn get_cheat_success_chance(&self, #[optional] cheat_count: f64, #[optional] play_as_white: bool) -> f64;
+    pub fn get_cheat_success_chance(&self, #[optional] cheat_count: i32, #[optional] play_as_white: bool) -> f64;
     /// Returns the number of times you've attempted to cheat in the current game.
     /// RAM cost: 1 GB
     #[js = "getCheatCount"]
-    pub fn get_cheat_count(&self, #[optional] play_as_white: bool) -> f64;
+    pub fn get_cheat_count(&self, #[optional] play_as_white: bool) -> i32;
     /// Attempts to remove an existing router, leaving an empty node behind.
     /// RAM cost: 8 GB
     #[js = "removeRouter"]
-    pub async fn remove_router(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
+    pub async fn remove_router(&self, x: i32, y: i32, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Attempts to place two routers at once on empty nodes. Note that this ignores other move restrictions, so you can suicide your own routers if they have no access to empty ports and do not capture an...
     /// RAM cost: 8 GB
     #[js = "playTwoMoves"]
-    pub async fn play_two_moves(&self, x1: f64, y1: f64, x2: f64, y2: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
+    pub async fn play_two_moves(&self, x1: i32, y1: i32, x2: i32, y2: i32, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Attempts to repair an offline node, leaving an empty playable node behind.
     /// RAM cost: 8 GB
     #[js = "repairOfflineNode"]
-    pub async fn repair_offline_node(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
+    pub async fn repair_offline_node(&self, x: i32, y: i32, #[optional] play_as_white: bool) -> GoMakeMoveResult;
     /// Attempts to destroy an empty node, leaving an offline dead space that does not count as territory or provide open node access to adjacent routers.
     /// RAM cost: 8 GB
     #[js = "destroyNode"]
-    pub async fn destroy_node(&self, x: f64, y: f64, #[optional] play_as_white: bool) -> GoMakeMoveResult;
+    pub async fn destroy_node(&self, x: i32, y: i32, #[optional] play_as_white: bool) -> GoMakeMoveResult;
 }
 
 /// Grafting API
@@ -3511,13 +3511,13 @@ impl HackingFormulas {
     pub fn hack_percent(&self, server: Server, player: Person) -> f64;
     /// Calculate the growth multiplier constant for a given server and threads.
     #[js = "growPercent"]
-    pub fn grow_percent(&self, server: Server, threads: f64, player: Person, #[optional] cores: f64) -> f64;
+    pub fn grow_percent(&self, server: Server, threads: i32, player: Person, #[optional] cores: i32) -> f64;
     /// Calculate how many threads it will take to grow server to targetMoney. Starting money is server.moneyAvailable. Note that when simulating the effect of grow, what matters is the s...
     #[js = "growThreads"]
-    pub fn grow_threads(&self, server: Server, player: Person, target_money: f64, #[optional] cores: f64) -> f64;
+    pub fn grow_threads(&self, server: Server, player: Person, target_money: f64, #[optional] cores: i32) -> f64;
     /// Calculate the amount of money a grow action will leave a server with. Starting money is server.moneyAvailable. Note that when simulating the effect of grow, what matters is the st...
     #[js = "growAmount"]
-    pub fn grow_amount(&self, server: Server, player: Person, threads: f64, #[optional] cores: f64) -> f64;
+    pub fn grow_amount(&self, server: Server, player: Person, threads: i32, #[optional] cores: i32) -> f64;
     /// Calculate hack time.
     #[js = "hackTime"]
     pub fn hack_time(&self, server: Server, player: Person) -> f64;
@@ -3529,7 +3529,7 @@ impl HackingFormulas {
     pub fn weaken_time(&self, server: Server, player: Person) -> f64;
     /// Calculate the security decrease from a weaken operation. Unlike other hacking formulas, weaken effect depends only on thread count and core count, not on server or player properties. The core bonus...
     #[js = "weakenEffect"]
-    pub fn weaken_effect(&self, threads: f64, #[optional] cores: f64) -> f64;
+    pub fn weaken_effect(&self, threads: i32, #[optional] cores: i32) -> f64;
 }
 
 /// Hack related multipliers.
@@ -3555,15 +3555,15 @@ impl Hacknet {
     /// Get the number of hacknet nodes you own.
     /// RAM cost: 0.5 GB
     #[js = "numNodes"]
-    pub fn num_nodes(&self) -> f64;
+    pub fn num_nodes(&self) -> i32;
     /// Get the maximum number of hacknet nodes.
     /// RAM cost: 0.5 GB
     #[js = "maxNumNodes"]
-    pub fn max_num_nodes(&self) -> f64;
+    pub fn max_num_nodes(&self) -> i32;
     /// Purchase a new hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "purchaseNode"]
-    pub fn purchase_node(&self) -> f64;
+    pub fn purchase_node(&self) -> i32;
     /// Get the price of the next hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "getPurchaseNodeCost"]
@@ -3571,39 +3571,39 @@ impl Hacknet {
     /// Get the stats of a hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "getNodeStats"]
-    pub fn get_node_stats(&self, index: f64) -> NodeStats;
+    pub fn get_node_stats(&self, index: i32) -> NodeStats;
     /// Upgrade the level of a hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "upgradeLevel"]
-    pub fn upgrade_level(&self, index: f64, #[optional] n: f64) -> bool;
+    pub fn upgrade_level(&self, index: i32, #[optional] n: i32) -> bool;
     /// Upgrade the RAM of a hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "upgradeRam"]
-    pub fn upgrade_ram(&self, index: f64, #[optional] n: f64) -> bool;
+    pub fn upgrade_ram(&self, index: i32, #[optional] n: i32) -> bool;
     /// Upgrade the core of a hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "upgradeCore"]
-    pub fn upgrade_core(&self, index: f64, #[optional] n: f64) -> bool;
+    pub fn upgrade_core(&self, index: i32, #[optional] n: i32) -> bool;
     /// Upgrade the cache of a hacknet node.
     /// RAM cost: 0.5 GB
     #[js = "upgradeCache"]
-    pub fn upgrade_cache(&self, index: f64, #[optional] n: f64) -> bool;
+    pub fn upgrade_cache(&self, index: i32, #[optional] n: i32) -> bool;
     /// Calculate the cost of upgrading hacknet node levels.
     /// RAM cost: 0.5 GB
     #[js = "getLevelUpgradeCost"]
-    pub fn get_level_upgrade_cost(&self, index: f64, #[optional] n: f64) -> f64;
+    pub fn get_level_upgrade_cost(&self, index: i32, #[optional] n: i32) -> f64;
     /// Calculate the cost of upgrading hacknet node RAM.
     /// RAM cost: 0.5 GB
     #[js = "getRamUpgradeCost"]
-    pub fn get_ram_upgrade_cost(&self, index: f64, #[optional] n: f64) -> f64;
+    pub fn get_ram_upgrade_cost(&self, index: i32, #[optional] n: i32) -> f64;
     /// Calculate the cost of upgrading hacknet node cores.
     /// RAM cost: 0.5 GB
     #[js = "getCoreUpgradeCost"]
-    pub fn get_core_upgrade_cost(&self, index: f64, #[optional] n: f64) -> f64;
+    pub fn get_core_upgrade_cost(&self, index: i32, #[optional] n: i32) -> f64;
     /// Calculate the cost of upgrading hacknet node cache.
     /// RAM cost: 0.5 GB
     #[js = "getCacheUpgradeCost"]
-    pub fn get_cache_upgrade_cost(&self, index: f64, #[optional] n: f64) -> f64;
+    pub fn get_cache_upgrade_cost(&self, index: i32, #[optional] n: i32) -> f64;
     /// Get the total number of hashes stored.
     /// RAM cost: 0.5 GB
     #[js = "numHashes"]
@@ -3615,11 +3615,11 @@ impl Hacknet {
     /// Get the cost of a hash upgrade.
     /// RAM cost: 0.5 GB
     #[js = "hashCost"]
-    pub fn hash_cost(&self, upg_name: &str, #[optional] count: f64) -> f64;
+    pub fn hash_cost(&self, upg_name: &str, #[optional] count: i32) -> f64;
     /// Purchase a hash upgrade.
     /// RAM cost: 0.5 GB
     #[js = "spendHashes"]
-    pub fn spend_hashes(&self, upg_name: &str, #[optional] upg_target: &str, #[optional] count: f64) -> bool;
+    pub fn spend_hashes(&self, upg_name: &str, #[optional] upg_target: &str, #[optional] count: i32) -> bool;
     /// Get the list of hash upgrades
     /// RAM cost: 0 GB
     #[js = "getHashUpgrades"]
@@ -3627,7 +3627,7 @@ impl Hacknet {
     /// Get the level of a hash upgrade.
     /// RAM cost: 0.5 GB
     #[js = "getHashUpgradeLevel"]
-    pub fn get_hash_upgrade_level(&self, upg_name: &str) -> f64;
+    pub fn get_hash_upgrade_level(&self, upg_name: &str) -> i32;
     /// Get the multiplier to study.
     /// RAM cost: 0.5 GB
     #[js = "getStudyMult"]
@@ -3643,7 +3643,7 @@ pub struct HacknetCoresRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "hacknetCores"]
-    pub hacknet_cores: f64,
+    pub hacknet_cores: i32,
 }
 
 /// Player's Hacknet devices must have at least this many total levels.
@@ -3651,7 +3651,7 @@ pub struct HacknetLevelsRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "hacknetLevels"]
-    pub hacknet_levels: f64,
+    pub hacknet_levels: i32,
 }
 
 /// Hacknet related multipliers.
@@ -3704,13 +3704,13 @@ pub struct HacknetNodeConstants {
     pub upgrade_core_mult: f64,
     /// Max node level
     #[js = "MaxLevel"]
-    pub max_level: f64,
+    pub max_level: i32,
     /// Max amount of RAM in GB
     #[js = "MaxRam"]
     pub max_ram: f64,
     /// Max number of cores
     #[js = "MaxCores"]
-    pub max_cores: f64,
+    pub max_cores: i32,
 }
 
 /// Hacknet Node formulas
@@ -3719,19 +3719,19 @@ pub struct HacknetNodesFormulas {
 impl HacknetNodesFormulas {
     /// Calculate money gain rate.
     #[js = "moneyGainRate"]
-    pub fn money_gain_rate(&self, level: f64, ram: f64, cores: f64, #[optional] mult: f64) -> f64;
+    pub fn money_gain_rate(&self, level: i32, ram: f64, cores: i32, #[optional] mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet node level.
     #[js = "levelUpgradeCost"]
-    pub fn level_upgrade_cost(&self, starting_level: f64, #[optional] extra_levels: f64, #[optional] cost_mult: f64) -> f64;
+    pub fn level_upgrade_cost(&self, starting_level: i32, #[optional] extra_levels: i32, #[optional] cost_mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet node ram.
     #[js = "ramUpgradeCost"]
-    pub fn ram_upgrade_cost(&self, starting_ram: f64, #[optional] extra_levels: f64, #[optional] cost_mult: f64) -> f64;
+    pub fn ram_upgrade_cost(&self, starting_ram: f64, #[optional] extra_levels: i32, #[optional] cost_mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet node cores.
     #[js = "coreUpgradeCost"]
-    pub fn core_upgrade_cost(&self, starting_core: f64, #[optional] extra_cores: f64, #[optional] cost_mult: f64) -> f64;
+    pub fn core_upgrade_cost(&self, starting_core: i32, #[optional] extra_cores: i32, #[optional] cost_mult: f64) -> f64;
     /// Calculate the cost of a hacknet node.
     #[js = "hacknetNodeCost"]
-    pub fn hacknet_node_cost(&self, n: f64, #[optional] mult: f64) -> f64;
+    pub fn hacknet_node_cost(&self, n: i32, #[optional] mult: f64) -> f64;
     /// All constants used by the game.
     #[js = "constants"]
     pub fn constants(&self) -> HacknetNodeConstants;
@@ -3779,19 +3779,19 @@ pub struct HacknetServerConstants {
     pub upgrade_cache_mult: f64,
     /// Max number of servers
     #[js = "MaxServers"]
-    pub max_servers: f64,
+    pub max_servers: i32,
     /// Max level for a server
     #[js = "MaxLevel"]
-    pub max_level: f64,
+    pub max_level: i32,
     /// Max amount of RAM in GB
     #[js = "MaxRam"]
     pub max_ram: f64,
     /// Max number of cores
     #[js = "MaxCores"]
-    pub max_cores: f64,
+    pub max_cores: i32,
     /// Max cache size
     #[js = "MaxCache"]
-    pub max_cache: f64,
+    pub max_cache: i32,
 }
 
 pub struct HacknetServerHashUpgradeEnumType {
@@ -3825,25 +3825,25 @@ pub struct HacknetServersFormulas {
 impl HacknetServersFormulas {
     /// Calculate hash gain rate.
     #[js = "hashGainRate"]
-    pub fn hash_gain_rate(&self, level: f64, ram_used: f64, max_ram: f64, cores: f64, #[optional] mult: f64) -> f64;
+    pub fn hash_gain_rate(&self, level: i32, ram_used: f64, max_ram: f64, cores: i32, #[optional] mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet server level.
     #[js = "levelUpgradeCost"]
-    pub fn level_upgrade_cost(&self, starting_level: f64, #[optional] extra_levels: f64, #[optional] cost_mult: f64) -> f64;
+    pub fn level_upgrade_cost(&self, starting_level: i32, #[optional] extra_levels: i32, #[optional] cost_mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet server ram.
     #[js = "ramUpgradeCost"]
-    pub fn ram_upgrade_cost(&self, starting_ram: f64, #[optional] extra_levels: f64, #[optional] cost_mult: f64) -> f64;
+    pub fn ram_upgrade_cost(&self, starting_ram: f64, #[optional] extra_levels: i32, #[optional] cost_mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet server cores.
     #[js = "coreUpgradeCost"]
-    pub fn core_upgrade_cost(&self, starting_core: f64, #[optional] extra_cores: f64, #[optional] cost_mult: f64) -> f64;
+    pub fn core_upgrade_cost(&self, starting_core: i32, #[optional] extra_cores: i32, #[optional] cost_mult: f64) -> f64;
     /// Calculate cost of upgrading hacknet server cache.
     #[js = "cacheUpgradeCost"]
-    pub fn cache_upgrade_cost(&self, starting_cache: f64, #[optional] extra_cache: f64) -> f64;
+    pub fn cache_upgrade_cost(&self, starting_cache: i32, #[optional] extra_cache: i32) -> f64;
     /// Calculate hash cost of an upgrade.
     #[js = "hashUpgradeCost"]
-    pub fn hash_upgrade_cost(&self, upg_name: &str, level: f64) -> f64;
+    pub fn hash_upgrade_cost(&self, upg_name: &str, level: i32) -> f64;
     /// Calculate the cost of a hacknet server.
     #[js = "hacknetServerCost"]
-    pub fn hacknet_server_cost(&self, n: f64, #[optional] mult: f64) -> f64;
+    pub fn hacknet_server_cost(&self, n: i32, #[optional] mult: f64) -> f64;
     /// All constants used by the game.
     #[js = "constants"]
     pub fn constants(&self) -> HacknetServerConstants;
@@ -3856,7 +3856,7 @@ pub struct HeartbleedOptions {
     pub peek: Option<bool>,
     /// The number of log lines to remove from the server. Default is 1. Must be a positive integer.
     #[js = "logsToCapture"]
-    pub logs_to_capture: Option<f64>,
+    pub logs_to_capture: Option<i32>,
     /// The number of additional milliseconds to add to the run time of the heartbleed request. Default is 0. Must be a non-negative integer.
     #[js = "additionalMsec"]
     pub additional_msec: Option<f64>,
@@ -3930,7 +3930,7 @@ pub struct InfiltrationLocation {
     #[js = "difficulty"]
     pub difficulty: f64,
     #[js = "maxClearanceLevel"]
-    pub max_clearance_level: f64,
+    pub max_clearance_level: i32,
     #[js = "startingSecurityLevel"]
     pub starting_security_level: f64,
 }
@@ -3954,7 +3954,7 @@ pub struct InvestmentOffer {
     pub shares: f64,
     /// Current round of funding (max 4)
     #[js = "round"]
-    pub round: f64,
+    pub round: i32,
 }
 
 /// Interface Styles
@@ -4460,7 +4460,7 @@ pub struct NodeStats {
     pub name: String,
     /// Node's level
     #[js = "level"]
-    pub level: f64,
+    pub level: i32,
     /// Node's RAM (GB)
     #[js = "ram"]
     pub ram: f64,
@@ -4469,10 +4469,10 @@ pub struct NodeStats {
     pub ram_used: Option<f64>,
     /// Node's number of cores
     #[js = "cores"]
-    pub cores: f64,
+    pub cores: i32,
     /// Cache level. Only applicable for Hacknet Servers
     #[js = "cache"]
-    pub cache: Option<f64>,
+    pub cache: Option<i32>,
     /// Hash Capacity provided by this Node. Only applicable for Hacknet Servers
     #[js = "hashCapacity"]
     pub hash_capacity: Option<f64>,
@@ -4547,7 +4547,7 @@ pub struct NumAugmentationsRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "numAugmentations"]
-    pub num_augmentations: f64,
+    pub num_augmentations: i32,
 }
 
 /// Player must have completed this many infiltrations.
@@ -4555,7 +4555,7 @@ pub struct NumInfiltrationsRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "numInfiltrations"]
-    pub num_infiltrations: f64,
+    pub num_infiltrations: i32,
 }
 
 /// Office for a division in a city.
@@ -4565,7 +4565,7 @@ pub struct Office {
     pub city: String,
     /// Maximum number of employee
     #[js = "size"]
-    pub size: f64,
+    pub size: i32,
     /// Maximum amount of energy of the employees
     #[js = "maxEnergy"]
     pub max_energy: f64,
@@ -4574,7 +4574,7 @@ pub struct Office {
     pub max_morale: f64,
     /// Amount of employees
     #[js = "numEmployees"]
-    pub num_employees: f64,
+    pub num_employees: i32,
     /// Average energy of the employees
     #[js = "avgEnergy"]
     pub avg_energy: f64,
@@ -4589,7 +4589,7 @@ pub struct Office {
     pub employee_production_by_job: HashMap<String, f64>,
     /// Positions of the employees
     #[js = "employeeJobs"]
-    pub employee_jobs: HashMap<String, f64>,
+    pub employee_jobs: HashMap<String, i32>,
 }
 
 /// Corporation Office API
@@ -4603,7 +4603,7 @@ impl OfficeAPI {
     /// Upgrade office size.
     /// RAM cost: 20 GB
     #[js = "upgradeOfficeSize"]
-    pub fn upgrade_office_size(&self, division_name: &str, city: &str, size: f64);
+    pub fn upgrade_office_size(&self, division_name: &str, city: &str, size: i32);
     /// Throw a party for your employees.
     /// RAM cost: 20 GB
     #[js = "throwParty"]
@@ -4631,7 +4631,7 @@ impl OfficeAPI {
     /// Get the number of times you have hired AdVert.
     /// RAM cost: 10 GB
     #[js = "getHireAdVertCount"]
-    pub fn get_hire_ad_vert_count(&self, division_name: &str) -> f64;
+    pub fn get_hire_ad_vert_count(&self, division_name: &str) -> i32;
     /// Get the cost to unlock a research.
     /// RAM cost: 10 GB
     #[js = "getResearchCost"]
@@ -4643,11 +4643,11 @@ impl OfficeAPI {
     /// Set the job assignment for a job.
     /// RAM cost: 20 GB
     #[js = "setJobAssignment"]
-    pub fn set_job_assignment(&self, division_name: &str, city: &str, job: &str, amount: f64) -> bool;
+    pub fn set_job_assignment(&self, division_name: &str, city: &str, job: &str, amount: i32) -> bool;
     /// Get the cost to upgrade an office.
     /// RAM cost: 10 GB
     #[js = "getOfficeSizeUpgradeCost"]
-    pub fn get_office_size_upgrade_cost(&self, division_name: &str, city: &str, size: f64) -> f64;
+    pub fn get_office_size_upgrade_cost(&self, division_name: &str, city: &str, size: i32) -> f64;
 }
 
 pub struct OrderEnumType {
@@ -4666,7 +4666,7 @@ pub struct PeopleKilledRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "numPeopleKilled"]
-    pub num_people_killed: f64,
+    pub num_people_killed: i32,
 }
 
 pub struct Person {
@@ -4697,9 +4697,9 @@ pub struct Player {
     #[js = "money"]
     pub money: f64,
     #[js = "numPeopleKilled"]
-    pub num_people_killed: f64,
+    pub num_people_killed: i32,
     #[js = "entropy"]
-    pub entropy: f64,
+    pub entropy: i32,
     #[js = "jobs"]
     pub jobs: HashMap<String, String>,
     #[js = "factions"]
@@ -4730,39 +4730,39 @@ impl Port {
     /// Get all data on a port.
     /// RAM cost: 0 GB
     #[js = "getHandle"]
-    pub fn get_handle(&self, port_number: f64) -> NetscriptPort;
+    pub fn get_handle(&self, port_number: i32) -> NetscriptPort;
     /// Check if a port is full.
     /// RAM cost: 0 GB
     #[js = "isFull"]
-    pub fn is_full(&self, port_number: f64) -> bool;
+    pub fn is_full(&self, port_number: i32) -> bool;
     /// Check if a port is empty.
     /// RAM cost: 0 GB
     #[js = "isEmpty"]
-    pub fn is_empty(&self, port_number: f64) -> bool;
+    pub fn is_empty(&self, port_number: i32) -> bool;
     /// Get a copy of the data from a port without popping it.
     /// RAM cost: 0 GB
     #[js = "peek"]
-    pub fn peek(&self, port_number: f64) -> JsValue;
+    pub fn peek(&self, port_number: i32) -> JsValue;
     /// Read data from a port.
     /// RAM cost: 0 GB
     #[js = "read"]
-    pub fn read(&self, port_number: f64) -> JsValue;
+    pub fn read(&self, port_number: i32) -> JsValue;
     /// Write data to a port.
     /// RAM cost: 0 GB
     #[js = "write"]
-    pub fn write(&self, port_number: f64, data: JsValue) -> JsValue;
+    pub fn write(&self, port_number: i32, data: JsValue) -> JsValue;
     /// Attempt to write to a port.
     /// RAM cost: 0 GB
     #[js = "tryWrite"]
-    pub fn try_write(&self, port_number: f64, data: JsValue) -> bool;
+    pub fn try_write(&self, port_number: i32, data: JsValue) -> bool;
     /// Listen for a port write.
     /// RAM cost: 0 GB
     #[js = "nextWrite"]
-    pub async fn next_write(&self, port: f64);
+    pub async fn next_write(&self, port: i32);
     /// Clear data from a port.
     /// RAM cost: 0 GB
     #[js = "clear"]
-    pub fn clear(&self, port_number: f64);
+    pub fn clear(&self, port_number: i32);
 }
 
 pub struct PositionEnumType {
@@ -4779,13 +4779,13 @@ pub struct ProcessInfo {
     pub filename: String,
     /// Number of threads script is running with
     #[js = "threads"]
-    pub threads: f64,
+    pub threads: i32,
     /// Script's arguments
     #[js = "args"]
     pub args: Vec<ScriptArg>,
     /// Process ID
     #[js = "pid"]
-    pub pid: f64,
+    pub pid: i32,
     /// Whether this process is excluded from saves
     #[js = "temporary"]
     pub temporary: bool,
@@ -4913,10 +4913,10 @@ pub struct RecentScript {
     pub online_running_time: f64,
     /// A Process ID unique to this script across all hosts. Must be an integer starting from 1 for the first process spawned at game launch and incrementing from there. Note that PIDs are not saved in the...
     #[js = "pid"]
-    pub pid: f64,
+    pub pid: i32,
     /// Process ID of the parent process.
     #[js = "parent"]
-    pub parent: f64,
+    pub parent: i32,
     /// How much RAM this script uses for ONE thread. Also known as "static RAM usage," this value does not change once the script is started, unless you call ns.ramOverride().
     #[js = "ramUsage"]
     pub ram_usage: f64,
@@ -4931,7 +4931,7 @@ pub struct RecentScript {
     pub title: JsValue,
     /// Number of threads that this script runs with
     #[js = "threads"]
-    pub threads: f64,
+    pub threads: i32,
     /// Whether this RunningScript is excluded from saves
     #[js = "temporary"]
     pub temporary: bool,
@@ -4958,7 +4958,7 @@ impl ReputationFormulas {
     pub fn donation_for_rep(&self, reputation: f64, player: Person) -> f64;
     /// Calculate the share power if you call ns.share with the specified number of threads on a server having the specified number of CPU cores.
     #[js = "sharePower"]
-    pub fn share_power(&self, threads: f64, #[optional] cpu_cores: f64) -> f64;
+    pub fn share_power(&self, threads: i32, #[optional] cpu_cores: i32) -> f64;
 }
 
 /// Various info about resets
@@ -4971,13 +4971,13 @@ pub struct ResetInfo {
     pub last_node_reset: f64,
     /// The current BitNode
     #[js = "currentNode"]
-    pub current_node: f64,
+    pub current_node: i32,
     /// A map of owned augmentations to their levels. Keyed by the augmentation name. Map values are the augmentation level (e.g. for NeuroFlux governor).
     #[js = "ownedAugs"]
-    pub owned_augs: HashMap<String, f64>,
+    pub owned_augs: HashMap<String, i32>,
     /// A map of owned source files. Its keys are the SF numbers. Its values are the active SF levels. This map takes BitNode options into account.
     #[js = "ownedSF"]
-    pub owned_sf: HashMap<i32, f64>,
+    pub owned_sf: HashMap<i32, i32>,
     /// Current BitNode options
     #[js = "bitNodeOptions"]
     pub bit_node_options: BitNodeOptions,
@@ -5016,10 +5016,10 @@ pub struct RunningScript {
     pub online_running_time: f64,
     /// A Process ID unique to this script across all hosts. Must be an integer starting from 1 for the first process spawned at game launch and incrementing from there. Note that PIDs are not saved in the...
     #[js = "pid"]
-    pub pid: f64,
+    pub pid: i32,
     /// Process ID of the parent process.
     #[js = "parent"]
-    pub parent: f64,
+    pub parent: i32,
     /// How much RAM this script uses for ONE thread. Also known as "static RAM usage," this value does not change once the script is started, unless you call ns.ramOverride().
     #[js = "ramUsage"]
     pub ram_usage: f64,
@@ -5034,7 +5034,7 @@ pub struct RunningScript {
     pub title: JsValue,
     /// Number of threads that this script runs with
     #[js = "threads"]
-    pub threads: f64,
+    pub threads: i32,
     /// Whether this RunningScript is excluded from saves
     #[js = "temporary"]
     pub temporary: bool,
@@ -5043,7 +5043,7 @@ pub struct RunningScript {
 pub struct RunOptions {
     /// Number of threads that the script will run with, defaults to 1
     #[js = "threads"]
-    pub threads: Option<f64>,
+    pub threads: Option<i32>,
     /// Whether this script is excluded from saves and the "Recently Killed" tab in Active Scripts, defaults to false
     #[js = "temporary"]
     pub temporary: Option<bool>,
@@ -5083,7 +5083,7 @@ pub struct Server {
     pub has_admin_rights: bool,
     /// How many CPU cores this server has. Affects magnitude of grow and weaken ran from this server.
     #[js = "cpuCores"]
-    pub cpu_cores: f64,
+    pub cpu_cores: i32,
     /// Flag indicating whether player is currently connected to this server
     #[js = "isConnectedTo"]
     pub is_connected_to: bool,
@@ -5119,13 +5119,13 @@ pub struct Server {
     pub money_max: Option<f64>,
     /// Number of open ports required in order to gain admin/root access
     #[js = "numOpenPortsRequired"]
-    pub num_open_ports_required: Option<f64>,
+    pub num_open_ports_required: Option<i32>,
     /// How many ports are currently opened on the server
     #[js = "openPortCount"]
-    pub open_port_count: Option<f64>,
+    pub open_port_count: Option<i32>,
     /// Hacking level required to hack this server
     #[js = "requiredHackingSkill"]
-    pub required_hacking_skill: Option<f64>,
+    pub required_hacking_skill: Option<i32>,
     /// Growth effectiveness statistic. Higher values produce more growth with ns.grow()
     #[js = "serverGrowth"]
     pub server_growth: Option<f64>,
@@ -5134,16 +5134,16 @@ pub struct Server {
 pub struct SimpleOpponentStats {
     /// Number of wins since last reset
     #[js = "wins"]
-    pub wins: f64,
+    pub wins: i32,
     /// Number of losses since last reset
     #[js = "losses"]
-    pub losses: f64,
+    pub losses: i32,
     /// Current winstreak
     #[js = "winStreak"]
-    pub win_streak: f64,
+    pub win_streak: i32,
     /// Highest winstreak since last reset
     #[js = "highestWinStreak"]
-    pub highest_win_streak: f64,
+    pub highest_win_streak: i32,
     /// Favor gain from winstreaks, calculated as converted rep
     #[js = "rep"]
     pub rep: f64,
@@ -5299,7 +5299,7 @@ impl Singularity {
     /// Get the hacking level requirement of a program.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "getHackingLevelRequirementOfProgram"]
-    pub fn get_hacking_level_requirement_of_program(&self, program_name: &str) -> f64;
+    pub fn get_hacking_level_requirement_of_program(&self, program_name: &str) -> i32;
     /// Commit a crime.
     /// RAM cost: 5 GB * 16/4/1
     #[js = "commitCrime"]
@@ -5407,11 +5407,11 @@ impl Singularity {
     /// b1t_flum3 into a different BN.
     /// RAM cost: 16 GB * 16/4/1
     #[js = "b1tflum3"]
-    pub fn b1tflum3(&self, next_bn: f64, #[optional] callback_script: &str, #[optional] bit_node_options: BitNodeOptions);
+    pub fn b1tflum3(&self, next_bn: i32, #[optional] callback_script: &str, #[optional] bit_node_options: BitNodeOptions);
     /// Destroy the w0r1d_d43m0n and move on to the next BN.
     /// RAM cost: 32 GB * 16/4/1
     #[js = "destroyW0r1dD43m0n"]
-    pub fn destroy_w0r1d_d43m0n(&self, #[optional] next_bn: f64, #[optional] callback_script: &str, #[optional] bit_node_options: BitNodeOptions);
+    pub fn destroy_w0r1d_d43m0n(&self, #[optional] next_bn: i32, #[optional] callback_script: &str, #[optional] bit_node_options: BitNodeOptions);
     /// Get the current work the player is doing.
     /// RAM cost: 0.5 GB * 16/4/1
     #[js = "getCurrentWork"]
@@ -5431,17 +5431,17 @@ pub struct SkillRequirement {
 
 pub struct Skills {
     #[js = "hacking"]
-    pub hacking: f64,
+    pub hacking: i32,
     #[js = "strength"]
-    pub strength: f64,
+    pub strength: i32,
     #[js = "defense"]
-    pub defense: f64,
+    pub defense: i32,
     #[js = "dexterity"]
-    pub dexterity: f64,
+    pub dexterity: i32,
     #[js = "agility"]
-    pub agility: f64,
+    pub agility: i32,
     #[js = "charisma"]
-    pub charisma: f64,
+    pub charisma: i32,
     #[js = "intelligence"]
     pub intelligence: f64,
 }
@@ -5452,10 +5452,10 @@ pub struct SkillsFormulas {
 impl SkillsFormulas {
     /// Calculate skill level.
     #[js = "calculateSkill"]
-    pub fn calculate_skill(&self, exp: f64, #[optional] skill_mult: f64) -> f64;
+    pub fn calculate_skill(&self, exp: f64, #[optional] skill_mult: f64) -> i32;
     /// Calculate exp for skill level.
     #[js = "calculateExp"]
-    pub fn calculate_exp(&self, skill: f64, #[optional] skill_mult: f64) -> f64;
+    pub fn calculate_exp(&self, skill: i32, #[optional] skill_mult: f64) -> f64;
 }
 
 /// Sleeve API
@@ -5465,55 +5465,55 @@ impl Sleeve {
     /// Get the number of sleeves you own.
     /// RAM cost: 4 GB
     #[js = "getNumSleeves"]
-    pub fn get_num_sleeves(&self) -> f64;
+    pub fn get_num_sleeves(&self) -> i32;
     /// Get information about a sleeve.
     /// RAM cost: 4 GB
     #[js = "getSleeve"]
-    pub fn get_sleeve(&self, sleeve_number: f64) -> SleevePerson;
+    pub fn get_sleeve(&self, sleeve_number: i32) -> SleevePerson;
     /// Get task of a sleeve.
     /// RAM cost: 4 GB
     #[js = "getTask"]
-    pub fn get_task(&self, sleeve_number: f64) -> Option<SleeveTask>;
+    pub fn get_task(&self, sleeve_number: i32) -> Option<SleeveTask>;
     /// Set a sleeve to idle.
     /// RAM cost: 4 GB
     #[js = "setToIdle"]
-    pub fn set_to_idle(&self, sleeve_number: f64);
+    pub fn set_to_idle(&self, sleeve_number: i32);
     /// Set a sleeve to shock recovery.
     /// RAM cost: 4 GB
     #[js = "setToShockRecovery"]
-    pub fn set_to_shock_recovery(&self, sleeve_number: f64) -> bool;
+    pub fn set_to_shock_recovery(&self, sleeve_number: i32) -> bool;
     /// Set a sleeve to synchronize.
     /// RAM cost: 4 GB
     #[js = "setToSynchronize"]
-    pub fn set_to_synchronize(&self, sleeve_number: f64) -> bool;
+    pub fn set_to_synchronize(&self, sleeve_number: i32) -> bool;
     /// Set a sleeve to commit crime.
     /// RAM cost: 4 GB
     #[js = "setToCommitCrime"]
-    pub fn set_to_commit_crime(&self, sleeve_number: f64, crime_type: &str) -> bool;
+    pub fn set_to_commit_crime(&self, sleeve_number: i32, crime_type: &str) -> bool;
     /// Set a sleeve to work for a faction.
     /// RAM cost: 4 GB
     #[js = "setToFactionWork"]
-    pub fn set_to_faction_work(&self, sleeve_number: f64, faction_name: &str, faction_work_type: &str) -> Option<bool>;
+    pub fn set_to_faction_work(&self, sleeve_number: i32, faction_name: &str, faction_work_type: &str) -> Option<bool>;
     /// Set a sleeve to work for a company.
     /// RAM cost: 4 GB
     #[js = "setToCompanyWork"]
-    pub fn set_to_company_work(&self, sleeve_number: f64, company_name: &str) -> bool;
+    pub fn set_to_company_work(&self, sleeve_number: i32, company_name: &str) -> bool;
     /// Set a sleeve to take a class at a university.
     /// RAM cost: 4 GB
     #[js = "setToUniversityCourse"]
-    pub fn set_to_university_course(&self, sleeve_number: f64, university_name: &str, course_name: &str) -> bool;
+    pub fn set_to_university_course(&self, sleeve_number: i32, university_name: &str, course_name: &str) -> bool;
     /// Set a sleeve to workout at the gym.
     /// RAM cost: 4 GB
     #[js = "setToGymWorkout"]
-    pub fn set_to_gym_workout(&self, sleeve_number: f64, gym_name: &str, stat: &str) -> bool;
+    pub fn set_to_gym_workout(&self, sleeve_number: i32, gym_name: &str, stat: &str) -> bool;
     /// Make a sleeve travel to another city. The cost for using this function is the same as for a player.
     /// RAM cost: 4 GB
     #[js = "travel"]
-    pub fn travel(&self, sleeve_number: f64, city: &str) -> bool;
+    pub fn travel(&self, sleeve_number: i32, city: &str) -> bool;
     /// Get augmentations installed on a sleeve.
     /// RAM cost: 4 GB
     #[js = "getSleeveAugmentations"]
-    pub fn get_sleeve_augmentations(&self, sleeve_number: f64) -> Vec<String>;
+    pub fn get_sleeve_augmentations(&self, sleeve_number: i32) -> Vec<String>;
     /// Get price of an augmentation.
     /// RAM cost: 4 GB
     #[js = "getSleeveAugmentationPrice"]
@@ -5525,15 +5525,15 @@ impl Sleeve {
     /// List purchasable augs for a sleeve.
     /// RAM cost: 4 GB
     #[js = "getSleevePurchasableAugs"]
-    pub fn get_sleeve_purchasable_augs(&self, sleeve_number: f64) -> Vec<AugmentPair>;
+    pub fn get_sleeve_purchasable_augs(&self, sleeve_number: i32) -> Vec<AugmentPair>;
     /// Purchase an aug for a sleeve.
     /// RAM cost: 4 GB
     #[js = "purchaseSleeveAug"]
-    pub fn purchase_sleeve_aug(&self, sleeve_number: f64, aug_name: &str) -> bool;
+    pub fn purchase_sleeve_aug(&self, sleeve_number: i32, aug_name: &str) -> bool;
     /// Set a sleeve to perform Bladeburner actions.
     /// RAM cost: 4 GB
     #[js = "setToBladeburnerAction"]
-    pub fn set_to_bladeburner_action(&self, sleeve_number: f64, action: &str, #[optional] contract: &str) -> bool;
+    pub fn set_to_bladeburner_action(&self, sleeve_number: i32, action: &str, #[optional] contract: &str) -> bool;
     /// Purchase a sleeve. You must be in BitNode 10 to use this API.
     /// RAM cost: 4 GB
     #[js = "purchaseSleeve"]
@@ -5541,7 +5541,7 @@ impl Sleeve {
     /// Upgrade memory of a sleeve. You must be in BitNode 10 to use this API.
     /// RAM cost: 4 GB
     #[js = "upgradeMemory"]
-    pub fn upgrade_memory(&self, sleeve_number: f64, amount: f64) -> NsResult;
+    pub fn upgrade_memory(&self, sleeve_number: i32, amount: i32) -> NsResult;
     /// Get the cost of the next sleeve.
     /// RAM cost: 4 GB
     #[js = "getSleeveCost"]
@@ -5549,7 +5549,7 @@ impl Sleeve {
     /// Get the cost of memory upgrades.
     /// RAM cost: 4 GB
     #[js = "getMemoryUpgradeCost"]
-    pub fn get_memory_upgrade_cost(&self, sleeve_number: f64, amount: f64) -> f64;
+    pub fn get_memory_upgrade_cost(&self, sleeve_number: i32, amount: i32) -> f64;
 }
 
 #[extends = "BaseTask"]
@@ -5568,7 +5568,7 @@ pub struct SleeveBladeburnerTask {
     #[js = "cyclesNeeded"]
     pub cycles_needed: f64,
     #[js = "tasksCompleted"]
-    pub tasks_completed: f64,
+    pub tasks_completed: i32,
 }
 
 #[extends = "BaseTask"]
@@ -5609,7 +5609,7 @@ pub struct SleeveCrimeTask {
     #[js = "cyclesNeeded"]
     pub cycles_needed: f64,
     #[js = "tasksCompleted"]
-    pub tasks_completed: f64,
+    pub tasks_completed: i32,
 }
 
 #[extends = "BaseTask"]
@@ -5658,7 +5658,7 @@ pub struct SleevePerson {
     pub sync: f64,
     /// Number 1-100 initial Value of sync on BN start
     #[js = "memory"]
-    pub memory: f64,
+    pub memory: i32,
     /// Number of 200ms cycles which are stored as bonus time
     #[js = "storedCycles"]
     pub stored_cycles: f64,
@@ -5702,10 +5702,10 @@ pub struct SomeRequirement {
 pub struct SourceFileLvl {
     /// The number of the source file
     #[js = "n"]
-    pub n: f64,
+    pub n: i32,
     /// The level of the source file
     #[js = "lvl"]
-    pub lvl: f64,
+    pub lvl: i32,
 }
 
 /// Player must have this Source File.
@@ -5713,14 +5713,14 @@ pub struct SourceFileRequirement {
     #[js = "type"]
     pub r#type: String,
     #[js = "sourceFile"]
-    pub source_file: f64,
+    pub source_file: i32,
 }
 
 #[extends = "RunOptions"]
 pub struct SpawnOptions {
     /// Number of threads that the script will run with, defaults to 1
     #[js = "threads"]
-    pub threads: Option<f64>,
+    pub threads: Option<i32>,
     /// Whether this script is excluded from saves and the "Recently Killed" tab in Active Scripts, defaults to false
     #[js = "temporary"]
     pub temporary: Option<bool>,
@@ -5752,15 +5752,15 @@ impl Stanek {
     /// Stanek's Gift width.
     /// RAM cost: 0.4 GB
     #[js = "giftWidth"]
-    pub fn gift_width(&self) -> f64;
+    pub fn gift_width(&self) -> i32;
     /// Stanek's Gift height.
     /// RAM cost: 0.4 GB
     #[js = "giftHeight"]
-    pub fn gift_height(&self) -> f64;
+    pub fn gift_height(&self) -> i32;
     /// Charge a fragment, increasing its effect strength.
     /// RAM cost: 0.4 GB
     #[js = "chargeFragment"]
-    pub async fn charge_fragment(&self, root_x: f64, root_y: f64);
+    pub async fn charge_fragment(&self, root_x: i32, root_y: i32);
     /// List possible fragments.
     /// RAM cost: 0 GB
     #[js = "fragmentDefinitions"]
@@ -5776,19 +5776,19 @@ impl Stanek {
     /// Check if fragment can be placed at specified location.
     /// RAM cost: 0.5 GB
     #[js = "canPlaceFragment"]
-    pub fn can_place_fragment(&self, root_x: f64, root_y: f64, rotation: f64, fragment_id: f64) -> bool;
+    pub fn can_place_fragment(&self, root_x: i32, root_y: i32, rotation: i32, fragment_id: i32) -> bool;
     /// Place fragment on Stanek's Gift.
     /// RAM cost: 5 GB
     #[js = "placeFragment"]
-    pub fn place_fragment(&self, root_x: f64, root_y: f64, rotation: f64, fragment_id: f64) -> bool;
+    pub fn place_fragment(&self, root_x: i32, root_y: i32, rotation: i32, fragment_id: i32) -> bool;
     /// Get placed fragment at location.
     /// RAM cost: 2 GB
     #[js = "getFragment"]
-    pub fn get_fragment(&self, root_x: f64, root_y: f64) -> Option<ActiveFragment>;
+    pub fn get_fragment(&self, root_x: i32, root_y: i32) -> Option<ActiveFragment>;
     /// Remove fragment at location.
     /// RAM cost: 0.15 GB
     #[js = "removeFragment"]
-    pub fn remove_fragment(&self, root_x: f64, root_y: f64) -> bool;
+    pub fn remove_fragment(&self, root_x: i32, root_y: i32) -> bool;
     /// Accept Stanek's Gift by joining the Church of the Machine God
     /// RAM cost: 2 GB
     #[js = "acceptGift"]
@@ -6045,23 +6045,23 @@ impl UserInterface {
     /// Render a tail window.
     /// RAM cost: 0 GB
     #[js = "renderTail"]
-    pub fn render_tail(&self, #[optional] pid: f64);
+    pub fn render_tail(&self, #[optional] pid: i32);
     /// Move a tail window.
     /// RAM cost: 0 GB
     #[js = "moveTail"]
-    pub fn move_tail(&self, x: f64, y: f64, #[optional] pid: f64);
+    pub fn move_tail(&self, x: f64, y: f64, #[optional] pid: i32);
     /// Resize a tail window.
     /// RAM cost: 0 GB
     #[js = "resizeTail"]
-    pub fn resize_tail(&self, width: f64, height: f64, #[optional] pid: f64);
+    pub fn resize_tail(&self, width: f64, height: f64, #[optional] pid: i32);
     /// Close the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "closeTail"]
-    pub fn close_tail(&self, #[optional] pid: f64);
+    pub fn close_tail(&self, #[optional] pid: i32);
     /// Set the title of the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailTitle"]
-    pub fn set_tail_title(&self, title: ReactNode, #[optional] pid: f64);
+    pub fn set_tail_title(&self, title: ReactNode, #[optional] pid: i32);
     /// Set the font size of the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailFontSize"]
@@ -6069,7 +6069,7 @@ impl UserInterface {
     /// Minimize or expand the tail window of a script.
     /// RAM cost: 0 GB
     #[js = "setTailMinimized"]
-    pub fn set_tail_minimized(&self, minimized: bool, #[optional] pid: f64);
+    pub fn set_tail_minimized(&self, minimized: bool, #[optional] pid: i32);
     /// Get the current window size
     /// RAM cost: 0 GB
     #[js = "windowSize"]
@@ -6216,7 +6216,7 @@ pub struct UserInterfaceTheme {
 pub struct Warehouse {
     /// Amount of size upgrade bought
     #[js = "level"]
-    pub level: f64,
+    pub level: i32,
     /// City in which the warehouse is located
     #[js = "city"]
     pub city: String,
@@ -6382,7 +6382,7 @@ impl AlgorithmicStockTraderIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct AlgorithmicStockTraderIIContract {
@@ -6399,7 +6399,7 @@ impl AlgorithmicStockTraderIIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct AlgorithmicStockTraderIIIContract {
@@ -6416,7 +6416,7 @@ impl AlgorithmicStockTraderIIIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct AlgorithmicStockTraderIVContract {
@@ -6433,7 +6433,7 @@ impl AlgorithmicStockTraderIVContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct ArrayJumpingGameContract {
@@ -6450,7 +6450,7 @@ impl ArrayJumpingGameContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct ArrayJumpingGameIIContract {
@@ -6467,7 +6467,7 @@ impl ArrayJumpingGameIIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct BladeburnerGetNextBlackOpResult {
@@ -6491,7 +6491,7 @@ impl CompressionIIILZCompressionContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct CompressionIILZDecompressionContract {
@@ -6508,7 +6508,7 @@ impl CompressionIILZDecompressionContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct CompressionIRLECompressionContract {
@@ -6525,7 +6525,7 @@ impl CompressionIRLECompressionContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct CorpProductDataRatingWeights {
@@ -6601,7 +6601,7 @@ pub struct DarknetServerDetailsWithIsOnline {
     pub log_traffic_interval: f64,
     /// The number of characters in the password
     #[js = "passwordLength"]
-    pub password_length: f64,
+    pub password_length: i32,
     /// The character set used in the password
     #[js = "passwordFormat"]
     pub password_format: String,
@@ -6613,10 +6613,10 @@ pub struct DarknetServerDetailsWithIsOnline {
     pub difficulty: f64,
     /// The current depth in the darknet of the server
     #[js = "depth"]
-    pub depth: f64,
+    pub depth: i32,
     /// The charisma skill required to authenticate on the server
     #[js = "requiredCharismaSkill"]
-    pub required_charisma_skill: f64,
+    pub required_charisma_skill: i32,
     /// If this darknet server cannot be moved. True for fixed/story servers.
     #[js = "isStationary"]
     pub is_stationary: bool,
@@ -6638,7 +6638,7 @@ impl EncryptionICaesarCipherContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct EncryptionIIVigenereCipherContract {
@@ -6655,7 +6655,7 @@ impl EncryptionIIVigenereCipherContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct FindAllValidMathExpressionsContract {
@@ -6672,7 +6672,7 @@ impl FindAllValidMathExpressionsContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[String]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct FindLargestPrimeFactorContract {
@@ -6689,7 +6689,7 @@ impl FindLargestPrimeFactorContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct GenerateIPAddressesContract {
@@ -6706,7 +6706,7 @@ impl GenerateIPAddressesContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[String]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct GoGetGameStateResult {
@@ -6717,20 +6717,20 @@ pub struct GoGetGameStateResult {
     #[js = "blackScore"]
     pub black_score: f64,
     #[js = "previousMove"]
-    pub previous_move: Option<[f64; 2]>,
+    pub previous_move: Option<[i32; 2]>,
     #[js = "komi"]
     pub komi: f64,
     #[js = "bonusCycles"]
-    pub bonus_cycles: f64,
+    pub bonus_cycles: i32,
 }
 
 pub struct GoMakeMoveResult {
     #[js = "type"]
     pub r#type: String,
     #[js = "x"]
-    pub x: Option<f64>,
+    pub x: Option<i32>,
     #[js = "y"]
-    pub y: Option<f64>,
+    pub y: Option<i32>,
 }
 
 pub struct HammingCodesEncodedBinaryToIntegerContract {
@@ -6747,7 +6747,7 @@ impl HammingCodesEncodedBinaryToIntegerContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct HammingCodesIntegerToEncodedBinaryContract {
@@ -6764,7 +6764,7 @@ impl HammingCodesIntegerToEncodedBinaryContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct LargestRectangleInAMatrixContract {
@@ -6781,7 +6781,7 @@ impl LargestRectangleInAMatrixContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[[f64; 2]; 2]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct MergeOverlappingIntervalsContract {
@@ -6798,7 +6798,7 @@ impl MergeOverlappingIntervalsContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[[f64; 2]]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct MinimumPathSumInATriangleContract {
@@ -6815,7 +6815,7 @@ impl MinimumPathSumInATriangleContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct NSHeart {
@@ -6829,17 +6829,17 @@ impl NSHeart {
 
 pub struct PartialSkills {
     #[js = "hacking"]
-    pub hacking: Option<f64>,
+    pub hacking: Option<i32>,
     #[js = "strength"]
-    pub strength: Option<f64>,
+    pub strength: Option<i32>,
     #[js = "defense"]
-    pub defense: Option<f64>,
+    pub defense: Option<i32>,
     #[js = "dexterity"]
-    pub dexterity: Option<f64>,
+    pub dexterity: Option<i32>,
     #[js = "agility"]
-    pub agility: Option<f64>,
+    pub agility: Option<i32>,
     #[js = "charisma"]
-    pub charisma: Option<f64>,
+    pub charisma: Option<i32>,
     #[js = "intelligence"]
     pub intelligence: Option<f64>,
 }
@@ -6880,7 +6880,7 @@ impl Proper2ColoringOfAGraphContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[f64]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct SanitizeParenthesesInExpressionContract {
@@ -6897,7 +6897,7 @@ impl SanitizeParenthesesInExpressionContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[String]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 #[extends = "Server"]
@@ -6928,7 +6928,7 @@ pub struct ServerWithIsOnline {
     pub has_admin_rights: bool,
     /// How many CPU cores this server has. Affects magnitude of grow and weaken ran from this server.
     #[js = "cpuCores"]
-    pub cpu_cores: f64,
+    pub cpu_cores: i32,
     /// Flag indicating whether player is currently connected to this server
     #[js = "isConnectedTo"]
     pub is_connected_to: bool,
@@ -6964,13 +6964,13 @@ pub struct ServerWithIsOnline {
     pub money_max: Option<f64>,
     /// Number of open ports required in order to gain admin/root access
     #[js = "numOpenPortsRequired"]
-    pub num_open_ports_required: Option<f64>,
+    pub num_open_ports_required: Option<i32>,
     /// How many ports are currently opened on the server
     #[js = "openPortCount"]
-    pub open_port_count: Option<f64>,
+    pub open_port_count: Option<i32>,
     /// Hacking level required to hack this server
     #[js = "requiredHackingSkill"]
-    pub required_hacking_skill: Option<f64>,
+    pub required_hacking_skill: Option<i32>,
     /// Growth effectiveness statistic. Higher values produce more growth with ns.grow()
     #[js = "serverGrowth"]
     pub server_growth: Option<f64>,
@@ -6992,7 +6992,7 @@ impl ShortestPathInAGridContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &str) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct SpiralizeMatrixContract {
@@ -7009,7 +7009,7 @@ impl SpiralizeMatrixContract {
     #[js = "submit"]
     pub fn submit(&self, answer: &[f64]) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct SquareRootContract {
@@ -7026,7 +7026,7 @@ impl SquareRootContract {
     #[js = "submit"]
     pub fn submit(&self, answer: i128) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct SubarrayWithMaximumSumContract {
@@ -7043,7 +7043,7 @@ impl SubarrayWithMaximumSumContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct SuccessResult {
@@ -7067,7 +7067,7 @@ impl TotalNumberOfPrimesContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct TotalWaysToSumContract {
@@ -7084,7 +7084,7 @@ impl TotalWaysToSumContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct TotalWaysToSumIIContract {
@@ -7101,7 +7101,7 @@ impl TotalWaysToSumIIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct UniquePathsInAGridIContract {
@@ -7118,7 +7118,7 @@ impl UniquePathsInAGridIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct UniquePathsInAGridIIContract {
@@ -7135,7 +7135,7 @@ impl UniquePathsInAGridIIContract {
     #[js = "submit"]
     pub fn submit(&self, answer: f64) -> String;
     #[js = "numTriesRemaining"]
-    pub fn num_tries_remaining(&self) -> f64;
+    pub fn num_tries_remaining(&self) -> i32;
 }
 
 pub struct UserInterfaceGetAllAliasesResult {
@@ -7234,7 +7234,7 @@ impl CorporationExportMaterialAmt {
 /// TypeScript: `number | RunOptions`
 #[untagged]
 pub enum ExecThreadOrOptions {
-    Num(f64),
+    Num(i32),
     RunOptions(RunOptions),
 }
 impl ExecThreadOrOptions {
@@ -7252,7 +7252,7 @@ impl ExecThreadOrOptions {
 /// TypeScript: `number | string`
 #[untagged]
 pub enum FilenameOrPID {
-    Num(f64),
+    Num(i32),
     Str(String),
 }
 impl FilenameOrPID {
@@ -7288,10 +7288,10 @@ impl GoAnalysisGetValidMovesBoardState {
     pub fn to_string(&self) -> String;
 }
 
-/// TypeScript: `f64 | String`
+/// TypeScript: `i32 | String`
 #[untagged]
 pub enum KillFilename {
-    Num(f64),
+    Num(i32),
     Str(String),
 }
 impl KillFilename {
@@ -7501,7 +7501,7 @@ impl PromptResult {
 /// TypeScript: `number | RunOptions`
 #[untagged]
 pub enum RunThreadOrOptions {
-    Num(f64),
+    Num(i32),
     RunOptions(RunOptions),
 }
 impl RunThreadOrOptions {
@@ -7588,7 +7588,7 @@ pub enum SleeveTask {
 /// TypeScript: `number | SpawnOptions`
 #[untagged]
 pub enum SpawnThreadOrOptions {
-    Num(f64),
+    Num(i32),
     SpawnOptions(SpawnOptions),
 }
 impl SpawnThreadOrOptions {

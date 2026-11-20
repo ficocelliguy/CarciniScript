@@ -3636,7 +3636,7 @@ impl<'a> Codegen<'a> {
                         0
                     }
                 };
-                // `i64` / `u64` / `i128` / `u128` are BigInts.
+                // `i128` / `u128` are BigInts.
                 let ty = match self.ty_of(l.syntax()) {
                     Some(t @ Ty::Int(k)) if k.is_big() => t,
                     _ => ty,
@@ -4478,7 +4478,7 @@ impl<'a> Codegen<'a> {
                     plain(l, r)
                 }
             }
-            // `i64` / `u64` / `i128` / `u128`: BigInt arithmetic, wrapped to the width.
+            // `i128` / `u128`: BigInt arithmetic, wrapped to the width.
             Ty::Int(k) if k.is_big() => {
                 let signed = k.is_signed();
                 let bits = k.bits();
@@ -5249,7 +5249,7 @@ impl<'a> Codegen<'a> {
                 }
             }
             CONST_SCOPE.with(|s| s.borrow_mut().insert(n.clone(), js.clone()));
-            // A `u64` / `i128` .. parameter is a BigInt in the body, whichever number came in.
+            // An `i128` / `u128` parameter is a BigInt in the body, whichever number came in.
             let js = match ty {
                 Ty::Int(k) if k.is_big() => format!("BigInt({js})"),
                 _ => js,
@@ -6236,7 +6236,7 @@ impl<'a> Codegen<'a> {
             let f = self.by_value(&recv, f, &from);
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
             let mut out = self.convert(conv, f);
-            // A smaller integer into a BigInt kind (`i32` into `i64`).
+            // A smaller integer into a BigInt kind (`i32` into `i128`).
             if let Ty::Int(to) = &ty
                 && to.is_big()
                 && matches!(from.default_lit(), Ty::Int(k) if !k.is_big())
@@ -8875,9 +8875,10 @@ fn const_value_js(v: &str) -> String {
         };
         return js_string(&c.to_string());
     }
-    // (Past 2^53 only a 64/128-bit parameter's value, exact as a BigInt.)
+    // (Past 2^64 only a 128-bit parameter's value, exact as a BigInt; a 128-bit parameter's body
+    // converts a number argument with `BigInt(..)`.)
     match v.parse::<i128>() {
-        Ok(n) if n.unsigned_abs() > 1 << 53 => format!("{n}n"),
+        Ok(n) if n.unsigned_abs() > u64::MAX as u128 => format!("{n}n"),
         Err(_) if v.parse::<u128>().is_ok() => format!("{v}n"),
         _ => v.to_string(),
     }

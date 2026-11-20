@@ -161,7 +161,7 @@ fn main() {
     // integers
     println!("{:?} {:?}", 258u16.to_le_bytes(), 258u32.to_be_bytes());
     println!("{:?} {:?}", (-2i32).to_le_bytes(), 1u64.to_be_bytes());
-    println!("{:?}", 0x0102030405060708u64.to_le_bytes());
+    println!("{:?}", 0x0001020304050607u64.to_le_bytes());
     println!("{} {}", u32::from_le_bytes([2, 1, 0, 0]), u16::from_be_bytes([1, 2]));
     println!("{} {}", i16::from_le_bytes([0xfe, 0xff]), u64::from_be_bytes([0, 0, 0, 0, 0, 0, 1, 0]));
     println!("{} {} {}", (-5i32).unsigned_abs(), i32::MIN.unsigned_abs(), (-7i64).unsigned_abs());

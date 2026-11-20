@@ -8,6 +8,11 @@
 //
 // Mapping (TS → Rust):
 //   number → f64, string → String, boolean → bool, bigint → i128, void → (), never → !
+//   number → i32 for whole-number values picked out by name (`isWholeNumber`): threads, pids,
+//   ports, cores, levels, counts, indexes, Go / Stanek coordinates (`RunningScript.threads`,
+//   `getServerNumPortsRequired()`, `hacknet.numNodes()`, `RunThreadOrOptions::Num(i32)`,
+//   `FilenameOrPID::Num(i32)`); money, RAM, time, rates, multipliers, reputation, hashes and
+//   shares stay f64
 //   T[] / readonly T[] → Vec<T> (parameters borrow them: string → &str, T[] → &[T], [T, T] → &[T; 2])
 //   Promise<T> return → `async fn` returning T; a `Promise<T>` property → `impl Future<Output = T>`
 //   T | undefined, `x?:` → Option<T> for fields; `#[optional]` for parameters (may be omitted)
@@ -49,6 +54,83 @@ const RUST_KEYWORDS = new Set(
     .split(" "),
 );
 const RESERVED_TYPE_NAMES = new Set(["Vec", "Option", "String", "JsValue", "Result", "Box", "Self"]);
+
+// Whole-number NS values are `i32`, not `f64` (TS has one `number` type), so `pid == 0`,
+// `for i in 0..ns.hacknet.num_nodes()` and `v[n as usize]` need no cast. Names that are whole
+// numbers anywhere in the API, by exact name or pattern; the rest by `Owner.member` or
+// `Owner.method(param)`. Everything else stays `f64`: money, RAM, time, rates, multipliers,
+// reputation, favor, hashes (fractional), shares (past 2^31) and `getActionCountRemaining`
+// (`Infinity` for general actions).
+const INT_NAMES = new Set(
+  (
+    "threads threadOrOptions pid parent cores cpuCores port portNumber sleeveNumber index level lvl nextBN " +
+    "fractionalDigits rootX rootY rotation fragmentId giftWidth giftHeight count cheatCount extraCores " +
+    "extraCache startingCore startingCache skillPoints correctCharactersInPassword logsToCapture " +
+    "passwordLength depth tasksCompleted kills entropy wins losses winStreak highestWinStreak round " +
+    "bonusCycles maxProducts bitNodeN sourceFile hacknetCores versionNumber cache memory"
+  ).split(" "),
+);
+const INT_MEMBERS = new Set([
+  "NS.run",
+  "NS.exec",
+  "NS.getBitNodeMultipliers(n)",
+  "Hacknet.purchaseNode",
+  "Hacknet.upgradeLevel(n)",
+  "Hacknet.upgradeRam(n)",
+  "Hacknet.upgradeCore(n)",
+  "Hacknet.upgradeCache(n)",
+  "Hacknet.getLevelUpgradeCost(n)",
+  "Hacknet.getRamUpgradeCost(n)",
+  "Hacknet.getCoreUpgradeCost(n)",
+  "Hacknet.getCacheUpgradeCost(n)",
+  "HacknetNodesFormulas.hacknetNodeCost(n)",
+  "HacknetServersFormulas.hacknetServerCost(n)",
+  "SourceFileLvl.n",
+  "Bladeburner.getSkillPoints",
+  "Bladeburner.getCityCommunities",
+  "Bladeburner.getActionSuccesses",
+  "Bladeburner.getBlackOpRank",
+  "Bladeburner.setTeamSize(size)",
+  "Gang.getRecruitsAvailable",
+  "Singularity.getHackingLevelRequirementOfProgram",
+  "SkillsFormulas.calculateSkill",
+  "SkillsFormulas.calculateExp(skill)",
+  "Office.employeeJobs",
+  "ResetInfo.currentNode",
+  "ResetInfo.ownedSF",
+  "ResetInfo.ownedAugs",
+  "BitNodeOptions.sourceFileOverrides",
+  "Sleeve.upgradeMemory(amount)",
+  "Sleeve.getMemoryUpgradeCost(amount)",
+  "GoAnalysis.getChains",
+  "GoAnalysis.getLiberties",
+]);
+/** Whether `owner`'s `member` (a field or a method's result), or its parameter `param`, is a
+ * whole number (`i32`). `owner` is the TS interface, or the struct made for an inline type. */
+export function isWholeNumber(owner, member, param) {
+  const name = param ?? member;
+  if (INT_MEMBERS.has(param === undefined ? `${owner}.${member}` : `${owner}.${member}(${param})`)) return true;
+  if (/Multipliers$|Constants$|^Stock|Signatures$/.test(owner) && !/^Max(Level|Cores|Servers|Cache)$/.test(name)) return false;
+  if (/hashes$|shares|Ram(?=[A-Z]|$)|^ram|RAM|security|wanted|intelligence|population|rank$|productionLimit/i.test(name)) return false;
+  if (/Skills$/.test(owner) && param === undefined) return true;
+  if (INT_NAMES.has(name)) return true;
+  if (/(^|[a-z])[nN]um[A-Z]/.test(name)) return true;
+  if (/Count$|Levels?$|Limit$|TeamSize$|^required\w+Skill$|^Max(Level|Cores|Servers|Cache)$/.test(name)) return true;
+  if (/^Go|^ActiveFragment$|^Fragment$/.test(owner) && /^(x|y|x1|y1|x2|y2|id|limit|previousMove)$/.test(name)) return true;
+  if (/^(Office|OfficeAPI)$/.test(owner) && /^(size|amount)$/.test(name)) return true;
+  return false;
+}
+// While set, `number` maps to `i32` (a whole-number member's type, unions and tuples included).
+let wholeNumber = false;
+function asWholeNumber(on, f) {
+  const prev = wholeNumber;
+  wholeNumber = prev || on;
+  try {
+    return f();
+  } finally {
+    wholeNumber = prev;
+  }
+}
 
 export function snakeCase(name) {
   const s = name
@@ -236,7 +318,7 @@ export function dtsToRust(text) {
    * can't be told apart (`JsValue`). */
   function jsKind(ty) {
     if (ty === "String") return "string";
-    if (ty === "f64") return "number";
+    if (ty === "f64" || ty === "i32") return "number";
     if (ty === "bool") return "boolean";
     if (ty === "i128") return "bigint";
     if (/^Vec<|^\[.*; \d+\]$|^\(.*\)$/.test(ty)) return "array";
@@ -383,7 +465,7 @@ export function dtsToRust(text) {
     if (!node) return { ty: "JsValue", optional: false };
     switch (node.kind) {
       case ts.SyntaxKind.NumberKeyword:
-        return { ty: "f64", optional: false };
+        return { ty: wholeNumber ? "i32" : "f64", optional: false };
       case ts.SyntaxKind.StringKeyword:
         return { ty: "String", optional: false };
       case ts.SyntaxKind.BooleanKeyword:
@@ -422,7 +504,7 @@ export function dtsToRust(text) {
     if (ts.isLiteralTypeNode(node)) {
       const l = node.literal;
       if (ts.isStringLiteral(l)) return { ty: "String", optional: false };
-      if (ts.isNumericLiteral(l) || ts.isPrefixUnaryExpression(l)) return { ty: "f64", optional: false };
+      if (ts.isNumericLiteral(l) || ts.isPrefixUnaryExpression(l)) return { ty: wholeNumber ? "i32" : "f64", optional: false };
       if (l.kind === ts.SyntaxKind.TrueKeyword || l.kind === ts.SyntaxKind.FalseKeyword) return { ty: "bool", optional: false };
       if (l.kind === ts.SyntaxKind.NullKeyword) return { ty: "()", optional: true };
       return { ty: "JsValue", optional: false };
@@ -492,7 +574,7 @@ export function dtsToRust(text) {
       if ((name === "Map" || name === "Record") && args.length === 2) {
         const k = map(args[0], undefined, env);
         const v = map(args[1], hint, env);
-        const key = k.ty === "f64" ? "i32" : k.ty === "String" ? "String" : null;
+        const key = k.ty === "f64" || k.ty === "i32" ? "i32" : k.ty === "String" ? "String" : null;
         if (!key || v.ty === "JsValue" || v.ty === "()") return { ty: "JsValue", optional: false };
         return { ty: `HashMap<${key}, ${v.optional ? `Option<${v.ty}>` : v.ty}>`, optional: false };
       }
@@ -528,8 +610,11 @@ export function dtsToRust(text) {
         resolving.add(name);
         let r;
         if (ts.isUnionTypeNode(alias.type)) {
-          // A union alias: an enum named after it (`ScriptArg`), or `String` for literals.
-          const parts = alias.type.types.filter((t) => !isNullish(t)).map((t) => map(t, name, env));
+          // A union alias: an enum named after it (`ScriptArg`), or `String` for literals. (A
+          // `FilenameOrPID`'s number is a pid.)
+          const parts = asWholeNumber(/PID$/.test(name), () =>
+            alias.type.types.filter((t) => !isNullish(t)).map((t) => map(t, name, env)),
+          );
           const tys = [...new Set(parts.map((p) => p.ty))];
           const optional = parts.length !== alias.type.types.length;
           if (tys.length === 1) r = { ty: tys[0], optional };
@@ -607,7 +692,7 @@ export function dtsToRust(text) {
     m.name && (ts.isIdentifier(m.name) || ts.isStringLiteral(m.name)) ? m.name.text : undefined;
 
   /** `hint`: names an enum or struct made for a parameter's inline type (`RunThreadOrOptions`). */
-  function paramList(sig, hint, env) {
+  function paramList(sig, hint, env, owner, member) {
     return sig.parameters.map((p, i) => {
       const name = ts.isIdentifier(p.name) ? snakeCase(p.name.text) : `arg${i}`;
       const ph = hint ? `${hint}${pascal(name)}` : undefined;
@@ -615,24 +700,31 @@ export function dtsToRust(text) {
         const t = p.type && ts.isArrayTypeNode(p.type) ? map(p.type.elementType, ph, env).ty : "JsValue";
         return { name, ty: t, optional: true, variadic: true };
       }
-      const m = map(p.type, ph, env);
+      const whole = ts.isIdentifier(p.name) && isWholeNumber(owner, member, p.name.text);
+      const m = asWholeNumber(whole, () => map(p.type, ph, env));
       return { name, ty: m.ty === "()" ? "JsValue" : m.ty, optional: !!p.questionToken || !!p.initializer || m.optional };
     });
   }
 
-  function returnOf(sig, hint, env) {
+  function returnOf(sig, hint, env, owner, member) {
+    const whole = isWholeNumber(owner, member);
     const t = sig.type;
     if (t && ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName) && t.typeName.text === "Promise") {
-      const inner = t.typeArguments?.[0] ? map(t.typeArguments[0], hint, env) : { ty: "()", optional: false };
+      const inner = t.typeArguments?.[0]
+        ? asWholeNumber(whole, () => map(t.typeArguments[0], hint, env))
+        : { ty: "()", optional: false };
       return { ...inner, isAsync: true };
     }
-    return { ...map(t, hint, env), isAsync: false };
+    return { ...asWholeNumber(whole, () => map(t, hint, env)), isAsync: false };
   }
 
-  /** One Rust signature for a set of TS overloads. */
-  function mergeOverloads(sigs, hint, env) {
-    if (sigs.length === 1) return { params: paramList(sigs[0], hint, env), ret: returnOf(sigs[0], `${hint}Result`, env) };
-    const lists = sigs.map((s) => paramList(s, hint, env));
+  /** One Rust signature for a set of TS overloads. `owner` and `member` name the method, for
+   * `isWholeNumber`. */
+  function mergeOverloads(sigs, hint, env, owner, member) {
+    if (sigs.length === 1) {
+      return { params: paramList(sigs[0], hint, env, owner, member), ret: returnOf(sigs[0], `${hint}Result`, env, owner, member) };
+    }
+    const lists = sigs.map((s) => paramList(s, hint, env, owner, member));
     const longest = lists.reduce((a, b) => (b.length > a.length ? b : a));
     const minLen = Math.min(...lists.map((l) => l.filter((p) => !p.optional).length));
     const params = longest.map((p, i) => {
@@ -642,7 +734,7 @@ export function dtsToRust(text) {
         tys.length === 1 ? p.ty : (enumFor(tys, `${hint}${pascal(p.name)}`, `overloads:${hint}:${p.name}:${tys.join("|")}`, tys.join(" | ")) ?? "JsValue");
       return { ...p, ty, optional: p.optional || i >= minLen };
     });
-    const rets = sigs.map((sg) => returnOf(sg, `${hint}Result`, env));
+    const rets = sigs.map((sg) => returnOf(sg, `${hint}Result`, env, owner, member));
     const sameRet = rets.every((r) => r.ty === rets[0].ty && r.isAsync === rets[0].isAsync);
     return { params, ret: sameRet ? rets[0] : { ty: "JsValue", optional: false, isAsync: rets.every((r) => r.isAsync) } };
   }
@@ -676,7 +768,7 @@ export function dtsToRust(text) {
         const rust = snakeCase(js);
         if (used.has(rust)) continue;
         used.add(rust);
-        const t = map(m.type, `${name}${pascal(js)}`, env);
+        const t = asWholeNumber(isWholeNumber(name, js), () => map(m.type, `${name}${pascal(js)}`, env));
         // (A field that may hold a node, like a script's `title`, is read as any JS value.)
         if (t.ty === "ReactNode") t.ty = "JsValue";
         const ty = rustType({ ...t, optional: t.optional || !!m.questionToken }, true);
@@ -697,6 +789,8 @@ export function dtsToRust(text) {
         overloads.map((o) => o.sig),
         `${name === "NS" ? "" : name}${pascal(js)}`,
         env,
+        name,
+        js,
       );
       const ps = params.map((p) => {
         const attr = p.variadic ? "#[variadic] " : p.optional ? "#[optional] " : "";

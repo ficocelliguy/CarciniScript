@@ -132,10 +132,10 @@ fn main() {
     println!("{}", below::<{ u128::MAX }>());
     println!("{}", make::<{ u8::MAX as usize % 7 }>().len());
     println!("{}", Big::<5>.get());
-    println!("{}", Big::<{ u64::MAX / 4 }>.get());
+    println!("{}", Big::<{ (1u64 << 50) - 1 }>.get());
     println!("{}", wide::<{ -170141183460469231731687303715884105727 }>());
     println!("{}", wide::<12>());
-    println!("{}", neg::<{ i64::MAX }>());
+    println!("{}", neg::<{ -1_000_000_000_000 }>());
     println!("{}", Unit::<1_000_000_000_000_000_000_000>.per());
     let a: A = A;
     println!("{} {}", a.n(), A::<3>.n());

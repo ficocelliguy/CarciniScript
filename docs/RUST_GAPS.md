@@ -9,9 +9,16 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **Overflow wraps by default.** Arithmetic follows rustc's release-mode semantics (two's-complement
   wrapping). With overflow checks on (`setOverflowChecks(true)`, or Bitburner's "Rust: panic on
   integer overflow" option) it panics like a debug build.
-- **`usize` and `isize` are JS numbers**, exact up to 2^53 (lengths and indexes never get near).
-  They don't wrap at 2^64, and casting a negative value to `usize` keeps the sign. `i64` and `u64`
-  are exact BigInts, which makes their arithmetic several times slower than `i32`'s or `f64`'s.
+- **The 64-bit integers (`i64`, `u64`, `usize`, `isize`) are JS numbers**, exact up to 2^53
+  (lengths, indexes and every figure the game hands out stay far below). Past that, values round
+  (a literal that would warns), `+ - *` and the `wrapping_*` methods don't wrap at 2^64, `MAX` /
+  `MIN` are ±(2^53 − 1), and casting a negative value to `u64` / `usize` keeps the sign. Bit
+  operations and shifts are exact and do wrap to 64 bits. So a 64-bit hash or random number
+  generator (FNV-1a, xorshift, SplitMix, `wrapping_mul` by a large odd constant) doesn't give
+  rustc's values as `u64`; write it over `u128` (exact BigInts, wrapping at 128 bits) and mask
+  with `& 0xffff_ffff_ffff_ffff` where the width matters. The trade is speed: a `u64` loop runs
+  at `f64`'s pace instead of 10x slower as a BigInt, and `u64` is what players write for money
+  and thread math. `DefaultHasher::finish()` and `rng.next_u64()` give 53-bit values.
 - **"Type annotations needed" is reported for `let` bindings only.** `let v = Vec::new();` that
   nothing types is rustc's error (also `HashMap<_, _>`, `Option<_>`, `Stack<_>`), but a value
   that's never bound (`Vec::new().len()`) or an unused closure parameter is treated as untyped.
@@ -238,14 +245,24 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 
 ## Netscript values
 
-- **NS numbers are `f64`.** TypeScript has one number type, so ports, threads and counts are
-  `f64` too. Convert with `as u32` before matching on integer patterns or indexing.
+- **NS numbers are `f64`, except whole numbers, which are `i32`.** TypeScript has one number
+  type; the bindings generator picks the whole-number members out by name (threads, pids, ports,
+  cores, levels, counts, indexes, Go and Stanek coordinates: `RunningScript.threads`,
+  `ns.get_server_num_ports_required()`, `ns.hacknet.num_nodes()`, `Server.cpu_cores`, the
+  `Skills` fields; `isWholeNumber` in `tools/dts2rs.mjs`), so `pid == 0` and
+  `for i in 0..ns.hacknet.num_nodes()` type-check and `v[n as usize]` is the only cast. Money,
+  RAM, time, rates, multipliers, reputation, favor, hashes, shares, contract data and anything that
+  can be `Infinity` stay `f64`; convert with `as i32` / `as usize` before matching on integer
+  patterns or indexing. An `i32` result is the same JS number: `/` is integer division on it, as
+  in Rust, so write `threads as f64 / cores as f64` for a ratio.
 - **Deliberate extensions over Rust for NS calls:**
   - Trailing optional parameters may be omitted (`ns.hack(target)`). When passed, they take the
     plain type, not `Option<T>`.
   - A `...rest` parameter takes any number of arguments (`ns.tprint(a, b, c)`).
   - An unsuffixed integer literal is accepted for an `f64` parameter (`ns.sleep(100)`). Integer
-    *variables* still need `as f64`.
+    *variables* still need `as f64`. For an enum payload that is a number (`ns.exec(.., threads)`
+    with `RunThreadOrOptions::Num(i32)`, `FilenameOrPID::Num(i32)`), any integer that is a JS
+    number (`usize`, `i64`, ..) is accepted as it is.
 - **Some NS values are `JsValue`s.** Unions of different types, generics, callbacks and inline
   object types in parameters have no Rust equivalent yet. A `JsValue` result is read with
   wasm-bindgen's `as_string()` / `as_f64()` / `as_bool()` (or `serde_wasm_bindgen::from_value`);
@@ -412,7 +429,7 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   and `RawWaker` aren't there.
 - **`dyn Any` tests values at run time**: a struct or enum by its class (not its type
   arguments), numbers by their JS type and the target's range (so a boxed `5u8` is also an
-  `i32` and an `f64`; `i64` / `u64` are BigInts and tell apart), a `String` and a `&str` alike
+  `i32`, a `u64` and an `f64`; `i128` / `u128` are BigInts and tell apart), a `String` and a `&str` alike
   (also a one-char string and a `char`). `Option` / `Result` / closures can't be told apart (an
   error). `type_id()` of a `dyn Any` isn't known (use `is::<T>()`); `TypeId`'s `{:?}` is the
   type's name, not a hash, and `String` / `&str` share one. `type_name` puts the file's name as
@@ -496,7 +513,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   needed, and only the `#[serde(..)]` attributes listed in FEATURES apply (no `flatten`,
   `tag`/`untagged` enums, `with`, or custom `Serialize` impls).
 - **Integers past `u64` / `i64` are floats to serde_json**, so they're rejected with its "invalid
-  type: floating point" error (`i128` / `u128` read them exactly).
+  type: floating point" error, and a JSON integer past 2^53 read as `u64` / `i64` rounds like any
+  64-bit number here (`i128` / `u128` read them exactly).
 - **`JsonError` has no position.** serde_json says `missing field `x` at line 1 column 8`; here
   it's `missing field `x``. Some syntax errors are worded differently.
 - **`HashMap` keys come out in insertion order** (serde_json's follow its hash order, which
@@ -584,8 +602,8 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   (`pay(2.0f64)` reaches the `f64` impl, `pay(2u8)` the `u8` one; `κσ.$dcallT`), as a call on a
   value of known type does. Through `dyn Trait` (`Box<dyn Money>`, `&dyn Money`), or a `T` no
   caller passes a class for (a function value), the impl is picked by the value: a whole number
-  (`2.0f64` included) goes to the integer impl (`i64` / `u64` / `i128` / `u128` values are
-  BigInts and always reach their own impl).
+  (`2.0f64` included) goes to the integer impl (`i128` / `u128` values are BigInts and always
+  reach their own impl; an `i64` / `u64` is a number like any other).
 - **A tuple is a JS array**, so through a generic `T: Trait` its impl is picked by length:
   one trait implemented for both a tuple and a slice, array or `Vec` is an error, and two
   impls for tuples of one length (`(u8, u8)` and `(String, String)`) conflict.

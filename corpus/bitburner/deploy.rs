@@ -31,7 +31,7 @@ fn strategies() -> HashMap<&'static str, Rank> {
 fn eligible(ns: &NS, host: &str) -> bool {
     ns.has_root_access(host)
         && ns.get_server_max_money(host) > 0.0
-        && ns.get_server_required_hacking_level(host) <= (ns.get_hacking_level() / 2.0).max(1.0)
+        && ns.get_server_required_hacking_level(host) <= (ns.get_hacking_level() / 2).max(1)
 }
 
 /// Starts as many worker threads as fit; returns how many.
@@ -45,8 +45,8 @@ fn fill(ns: &NS, host: &Host, target: &str, script_ram: f64) -> u32 {
     if &**host != "home" {
         ns.scp(WORKER, host, "home");
     }
-    match ns.exec(WORKER, host, threads as f64, target) {
-        0.0 => 0,
+    match ns.exec(WORKER, host, threads as i32, target) {
+        0 => 0,
         _ => threads,
     }
 }

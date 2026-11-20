@@ -9,7 +9,7 @@ heartbleed dark {"peek":true}
 logs ["a", "b"] model ZeroLogon online true
 position 10 1.5 0 0
 sf8 2 owned [1, 8]
-go move Some(3.0) None
+go move Some(3) None
 attempt [[1,3],[2,6]] c.cct home
 reward Err("invalid type: string \"x\", expected a sequence")
 int answer 6

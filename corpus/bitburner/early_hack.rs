@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-const DASHBOARD_PORT: f64 = 1.0;
+const DASHBOARD_PORT: i32 = 1;
 
 #[derive(Debug, Clone, Copy)]
 enum Action {

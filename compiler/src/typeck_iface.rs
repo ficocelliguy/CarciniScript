@@ -327,8 +327,10 @@ impl Checker<'_> {
             return;
         }
         // (Deliberate extension, as for `f64` parameters: an integer that is a JS number, `ns.exec(..,
-        // threads, batch_id)`, is a number to the game.)
-        if has_float && matches!(found, Ty::Int(k) if !k.is_big()) {
+        // threads, batch_id)`, is a number to the game, for an `f64` payload and for an `i32` one
+        // (`RunThreadOrOptions::Num(i32)` takes a `usize` thread count as it is).)
+        let has_int = et.variants.iter().any(|v| matches!(v.payload, Ty::Int(k) if !k.is_big()));
+        if (has_float || has_int) && matches!(found, Ty::Int(k) if !k.is_big()) {
             return;
         }
         // (An unsettled literal: a number for an `f64` payload, else the first payload it fits.)

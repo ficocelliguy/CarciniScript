@@ -117,7 +117,7 @@ fn main() {
         "{} {} {}",
         wrapped(200u8, 2, 100),
         wrapped(100_000i32, 100_000, 1),
-        wrapped(i64::MAX, 2, 3)
+        wrapped(1i64 << 40, 2, 3)
     );
     println!("{} {}", mean(3, 4, 2), mean(3.0, 4.0, 2.0));
     println!("{} {} {}", gcd(48, 18), gcd(48u64, 180), gcd(17i8, 5));

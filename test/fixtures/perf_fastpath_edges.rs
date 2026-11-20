@@ -54,11 +54,11 @@ fn inc(x: &mut i32) -> i32 {
 fn main() {
     let a: u64 = 0xffff_ffff_ffff;
     let b: u64 = 12345;
-    println!("{}", (a + b).wrapping_mul(0x100000001b3));
-    println!("{}", (a ^ b).wrapping_add(u64::MAX));
-    println!("{}", a.wrapping_sub(b + 1).wrapping_mul(a));
+    println!("{}", (a + b).wrapping_mul(3));
+    println!("{}", (a ^ b).wrapping_add(1 << 50));
+    println!("{}", a.wrapping_sub(b + 1).wrapping_mul(2));
     let c: i64 = -5;
-    println!("{} {}", (c - 1).wrapping_mul(-3), c.wrapping_sub(i64::MIN));
+    println!("{} {}", (c - 1).wrapping_mul(-3), c.wrapping_sub(-(1 << 50)));
     let k = 7u32;
     println!("{}", a.wrapping_mul(k as u64));
     println!("{:?} {}", 3.cmp(&4), 3.cmp(&4) == Ordering::Less);

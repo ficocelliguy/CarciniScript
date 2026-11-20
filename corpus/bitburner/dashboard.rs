@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::time::{Duration, Instant};
 
-const PORT: f64 = 1.0;
+const PORT: i32 = 1;
 const CYAN: &str = "\u{1b}[36m";
 const GREEN: &str = "\u{1b}[32m";
 const RED: &str = "\u{1b}[31m";

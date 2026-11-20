@@ -540,7 +540,7 @@ function decodeMappings(mappings) {
     const srcLines = src.split(/\r?\n/);
     // Each probe: a JS snippet whose line must map back to the Rust line containing the needle.
     const probes = [
-      ["return BigInt.asUintN(64, fib(", "fib(n - 1) + fib(n - 2)"],
+      ["return fib(", "fib(n - 1) + fib(n - 2)"],
       ["n = ((", "n = if n % 2 == 0"],
       ["$outer: for", "'outer: for a in 1..20"],
       ["break $outer;", "break 'outer;"],
@@ -556,7 +556,7 @@ function decodeMappings(mappings) {
       }
     }
     // Column check: the second `fib(` call maps to its exact Rust column.
-    const gl = genLines.findIndex((l) => l.includes("return BigInt.asUintN(64, fib("));
+    const gl = genLines.findIndex((l) => l.includes("return fib("));
     const genCol = genLines[gl].lastIndexOf("fib(");
     const srcLine = srcLines.findIndex((l) => l.includes("fib(n - 1) + fib(n - 2)"));
     const want = srcLines[srcLine].lastIndexOf("fib(");
@@ -946,7 +946,7 @@ const rejected = [
   ["use after move", "let s = String::from(\"a\");\n    let t = s;\n    let u = s;\n    println!(\"{} {}\", t, u);", "4:13 use of moved value: `s` (moved on line 3:13 by `let`; `.clone()` it there to keep a copy)", "Passing or assigning a `String`, `Vec` or struct hands it over; the old name can't be used again."],
   ["two `&mut` borrows", "let mut v = vec![1];\n    let a = &mut v;\n    let b = &mut v;\n    a.push(1);\n    b.push(2);", "4:13 cannot borrow `v` as mutable more than once at a time", "`&v` lends read access and `&mut v` write access; while a `&mut` is alive nothing else may touch `v`"],
   ["push while borrowed", "let mut v = vec![1];\n    let r = &v[0];\n    v.push(2);\n    println!(\"{}\", r);", "4:5 cannot borrow `v` as mutable because it is also borrowed as immutable", "`&v` lends read access and `&mut v` write access"],
-  ["f64 times i32", "let x = 2.0 * 3i32;", "2:13 cannot multiply `{float}` by `i32`", "Rust never converts between number types for you; all NS numbers are `f64`."],
+  ["f64 times i32", "let x = 2.0 * 3i32;", "2:13 cannot multiply `{float}` by `i32`", "Rust never converts between number types for you; NS numbers are `f64` (whole ones, like threads and pids, `i32`)."],
   ["an Option where a value is expected", "let v = vec![1];\n    let x: i32 = v.first();", "3:18 mismatched types: expected `i32`, found `Option<{integer}>`", "`Option<T>` is a value that may be missing (`null` in JavaScript)"],
   ["JavaScript's `length` as a method", "let v = vec![1];\n    let n = v.length();", "3:13 no method named `length` found for `Vec<{integer}>` (`length` is `.len()` in Rust)", "Rust's std names differ from JavaScript's"],
   ["JavaScript's `length` as a field", "let s = String::new();\n    let n = s.length;", "3:13 no field `length` on type `String` (`length` is `.len()` in Rust)", "Rust's std names differ from JavaScript's"],
@@ -1622,8 +1622,13 @@ const rejectedNs = [
   ],
   [
     "NS numbers are f64",
+    'let ram: u32 = ns.get_server_max_ram("a");',
+    "2:20 mismatched types: expected `u32`, found `f64` (NS numbers are `f64`; convert with `as`)",
+  ],
+  [
+    "NS whole numbers are i32",
     'let ports: u32 = ns.get_server_num_ports_required("a");',
-    "2:22 mismatched types: expected `u32`, found `f64` (NS numbers are `f64`; convert with `as`)",
+    "2:22 mismatched types: expected `u32`, found `i32`",
   ],
   [
     "camelCase field name",

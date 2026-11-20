@@ -21,12 +21,12 @@ fn fnv1a(s: &str) -> Wrapping<u32> {
     h
 }
 
-struct Lcg(Wrapping<u64>);
+struct Lcg(Wrapping<u32>);
 
 impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0 * Wrapping(6364136223846793005) + Wrapping(1442695040888963407);
-        self.0 .0 >> 33
+    fn next(&mut self) -> u32 {
+        self.0 = self.0 * Wrapping(1664525) + Wrapping(1013904223);
+        self.0 .0 >> 16
     }
 }
 

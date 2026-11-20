@@ -516,7 +516,7 @@ ${p.message}` : null;
     const maps = decodeMappings(JSON.parse(out.sourceMap).mappings);
     const gen = out.code.split("\n");
     const rs = src.split(/\r?\n/);
-    const gl = gen.findIndex((l) => l.includes("return BigInt.asUintN(64, fib("));
+    const gl = gen.findIndex((l) => l.includes("return fib("));
     const sl = rs.findIndex((l) => l.includes("fib(n - 1) + fib(n - 2)"));
     const pos = originalPosition(maps, gl, gen[gl].lastIndexOf("fib("));
     const ok = pos && pos.srcLine === sl && pos.srcCol === rs[sl].lastIndexOf("fib(");

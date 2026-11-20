@@ -18,7 +18,7 @@ impl Encode for u8 {
     }
 }
 
-impl Encode for i64 {
+impl Encode for i128 {
     fn encode(&self, out: &mut String) {
         write!(out, "i{}", self).unwrap();
     }
@@ -69,10 +69,10 @@ fn total_area<T: Area>(xs: &[T]) -> f64 {
 }
 
 fn main() {
-    println!("{}", (3u8, 4i64).encoded());
-    println!("{}", (String::from("ab"), 9u8, -2i64).encoded());
+    println!("{}", (3u8, 4i128).encoded());
+    println!("{}", (String::from("ab"), 9u8, -2i128).encoded());
     println!("{}", twice(&(1u8, String::from("x"))));
-    println!("{}", twice(&((1u8, 2u8), 7i64)));
+    println!("{}", twice(&((1u8, 2u8), 7i128)));
     println!("{}", (2.0, 3.5).area());
     println!("{}", total_area(&[(1.0, 2.0), (3.0, 4.0)]));
     let pairs = vec![(1u8, 2u8), (3, 4)];

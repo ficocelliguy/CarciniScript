@@ -16,7 +16,7 @@ fn describe(s: &CStr) -> String {
     format!("{:?} {} {}", s, s.count_bytes(), s.is_empty())
 }
 
-fn negate(r: &mut [u64], a: &[u64]) {
+fn negate(r: &mut [i64], a: &[i64]) {
     r.iter_mut().zip(a.iter()).for_each(|(r, &a)| {
         *r = !a;
     });
@@ -88,7 +88,7 @@ fn main() {
     println!("{:?}", words);
 
     // `iter_mut()` chains over numbers, strings and bools
-    let mut r = [0u64; 3];
+    let mut r = [0i64; 3];
     negate(&mut r, &[1, 2, 3]);
     println!("{:?}", r);
     let mut res = [9u32; 5];

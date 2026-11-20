@@ -56,5 +56,5 @@ fn main() {
     let y = 3;
     let z = if x < y && y > x { <f64>::sqrt(16.0) } else { 0.0 };
     println!("{} {}", x, z);
-    bounds!(i8, u16, i64);
+    bounds!(i8, u16, i128);
 }

@@ -236,7 +236,8 @@
   }
 
   // A `std::hash::Hasher`: collects the values written to it. `finish()` is FNV-1a (64-bit) of
-  // them, which differs from Rust's SipHash (its values aren't specified anyway).
+  // them, which differs from Rust's SipHash (its values aren't specified anyway), kept to its low
+  // 53 bits: a `u64` is a JS number, and an exact one keeps `h % buckets` exact.
   class Hasher {
     constructor() {
       this.parts = [];
@@ -251,7 +252,7 @@
         h ^= BigInt(s.charCodeAt(i));
         h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
       }
-      return h;
+      return Number(h & 0x1fffffffffffffn);
     }
   }
 
@@ -2916,8 +2917,7 @@
       }
       return x[name](...args);
     },
-    // `i64` / `u64` / `i128` / `u128` are BigInts, wrapped to their width like Rust's release
-    // builds.
+    // `i128` / `u128` are BigInts, wrapped to their width like Rust's release builds.
     $w128(x, signed, bits = 128) {
       return signed ? BigInt.asIntN(bits, x) : BigInt.asUintN(bits, x);
     },
@@ -3910,8 +3910,8 @@
         case "char": return String.fromCodePoint(dv.getUint32(0, true));
         case "f32": return dv.getFloat32(0, true);
         case "f64": return dv.getFloat64(0, true);
-        case "i64": return dv.getBigInt64(0, true);
-        case "u64": return dv.getBigUint64(0, true);
+        case "i64": return Number(dv.getBigInt64(0, true));
+        case "u64": return Number(dv.getBigUint64(0, true));
         default: {
           const v = dv.getBigUint64(0, true) | (dv.getBigUint64(8, true) << 64n);
           return to === "i128" ? BigInt.asIntN(128, v) : v;
@@ -4095,7 +4095,7 @@
       return new Res(0, Number(v));
     },
     // `i32::from_str_radix(s, 16)`: digits up to the radix (either case), an optional sign.
-    // `u64::from_str_radix(s, 16)`: a BigInt.
+    // `u128::from_str_radix(s, 16)`: a BigInt.
     $fromStrRadixBig(s, radix, signed, bits) {
       const B = BigInt(bits);
       const min = signed ? -(1n << (B - 1n)) : 0n;
@@ -4771,7 +4771,8 @@
       let t = NUM_TYPES[kind];
       if (t === undefined) {
         const float = kind[0] === "f";
-        const big = /^[iu](64|128)$/.test(kind);
+        // (Only the 128-bit kinds are BigInts; `i64` / `u64` are numbers like `usize`.)
+        const big = /^[iu]128$/.test(kind);
         const bits = float ? 64 : kind.endsWith("size") ? 64 : Number(kind.slice(1));
         const signed = kind[0] !== "u";
         t = NUM_TYPES[kind] = {
@@ -5223,7 +5224,7 @@
       }
       if (T.big) return rt.$w128(rng.big(T.bits), T.signed, T.bits);
       if (T.bits === 64) {
-        // (`usize` / `isize` are JS numbers: 53 bits of them.)
+        // (The 64-bit kinds are JS numbers: 53 bits of them.)
         return (rng.u32() >>> 11) * 4294967296 + rng.u32();
       }
       return wrapInt(rng.u32(), T);
@@ -5332,8 +5333,9 @@
     randomRatio(num, den) {
       return rand.ratio(rand.thread(), num, den);
     },
+    // (A `u64` is a JS number: 53 random bits, as `gen::<u64>()` gives.)
     nextU64(rng) {
-      return rng.big(64);
+      return (rng.u32() >>> 11) * 4294967296 + rng.u32();
     },
     // `rng.sample(d)` / `rng.sample_iter(d)`: the distribution's own `sample`.
     sampleDist(rng, d) {
@@ -6625,7 +6627,7 @@
     }
     return R;
   };
-  // A child as React takes it: Rust's numbers as text (`i64`s are BigInts), `None` as nothing,
+  // A child as React takes it: Rust's numbers as text (`i128`s are BigInts), `None` as nothing,
   // `Vec`s as arrays.
   const reactChild = (v) => {
     if (v == null || typeof v === "string") return v ?? null;

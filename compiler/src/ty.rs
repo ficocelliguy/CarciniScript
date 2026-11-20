@@ -56,13 +56,10 @@ impl IntKind {
         )
     }
 
-    /// The kinds that are JS BigInts: `i64` / `u64` (exact over all 64 bits, which hashes and
-    /// random number generators rely on) and `i128` / `u128`. `isize` / `usize` stay numbers.
+    /// The kinds that are JS BigInts: `i128` / `u128` only. The 64-bit kinds (`i64` / `u64`, like
+    /// `isize` / `usize`) are JS numbers, exact to 2^53, so their arithmetic runs at number speed.
     pub fn is_big(self) -> bool {
-        matches!(
-            self,
-            IntKind::I64 | IntKind::U64 | IntKind::I128 | IntKind::U128
-        )
+        matches!(self, IntKind::I128 | IntKind::U128)
     }
 
     /// Prefix/suffix that wrap a JS integer-valued number into this kind, or None for wide kinds,
@@ -557,15 +554,14 @@ pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
     }
     if let [ty_name, konst] = tail {
         if let Ty::Int(k) = Ty::from_name(ty_name) {
-            // `i128` / `u128` are BigInts.
+            // `i128` / `u128` are BigInts; the 64-bit kinds are JS numbers, so their `MIN` /
+            // `MAX` are the safe-integer bounds, as `usize`'s are.
             let (min, max) = match k {
                 IntKind::I128 => (
                     "-170141183460469231731687303715884105728n",
                     "170141183460469231731687303715884105727n",
                 ),
                 IntKind::U128 => ("0n", "340282366920938463463374607431768211455n"),
-                IntKind::I64 => ("-9223372036854775808n", "9223372036854775807n"),
-                IntKind::U64 => ("0n", "18446744073709551615n"),
                 _ => k.min_max(),
             };
             match *konst {

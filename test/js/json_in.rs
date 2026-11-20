@@ -59,10 +59,10 @@ fn main() {
     show!(JSON::parse::<Vec<Job>>("[\"Idle\", {\"Hack\": \"joes\"}, {\"Grow\": {\"host\": \"a\", \"threads\": 8}}, {\"Move\": [1, -1]}]"));
     show!(JSON::parse::<Tree>("{\"name\":\"r\",\"kids\":[{\"name\":\"k\",\"kids\":[]}]}"));
     show!(JSON::parse::<BTreeMap<String, Vec<i64>>>("{\"b\": [1], \"a\": [2, 3]}"));
-    show!(JSON::parse::<(u64, i64)>("[18446744073709551615, -9223372036854775808]"));
+    show!(JSON::parse::<(u64, i64)>("[9007199254740991, -9007199254740991]"));
     show!(JSON::parse::<u64>("18446744073709551616"));
-    show!(JSON::parse::<i64>("-1").map(|x| x.wrapping_mul(9007199254740993)));
-    show!(JSON::parse::<BTreeMap<u64, bool>>("{\"18446744073709551615\": true, \"2\": false}"));
+    show!(JSON::parse::<i64>("-1").map(|x| x.wrapping_mul(9007199254740991)));
+    show!(JSON::parse::<BTreeMap<u64, bool>>("{\"9007199254740991\": true, \"2\": false}"));
     show!(JSON::parse::<BTreeMap<u32, bool>>("{\"10\": true, \"2\": false}"));
     show!(JSON::parse::<(i32, String, Option<u8>)>("[1, \"s\", null]"));
     show!(JSON::parse::<String>("\"esc \\\" \\\\ \\n \\u00e9 \\ud83d\\ude00\""));

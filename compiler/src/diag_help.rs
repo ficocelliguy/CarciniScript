@@ -24,7 +24,7 @@ pub const BEHIND_REF: &str = "A `&T` parameter lends the value read-only. Declar
 
 pub const REFS: &str = "`&` in a parameter type means the function borrows the value instead of taking it; add `&` in front of the argument.";
 
-pub const NUMBERS: &str = "Rust never converts between number types for you; all NS numbers are `f64`. Write `1.0`, or cast with `as f64` / `as usize`.";
+pub const NUMBERS: &str = "Rust never converts between number types for you; NS numbers are `f64` (whole ones, like threads and pids, `i32`). Write `1.0`, or cast with `as f64` / `as usize`.";
 
 pub const OPTION_RESULT: &str = "`Option<T>` is a value that may be missing (`null` in JavaScript); `Result<T, E>` is a value or an error. Get the inside with `.unwrap()` (panics if missing), `if let Some(x) = ..`, or `?` inside a function returning the same wrapper.";
 

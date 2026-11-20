@@ -28,7 +28,7 @@ struct Plan {
 pub async fn main(ns: NS) {
     // A2: arguments.
     let target = ns.args.first().and_then(|a| a.as_string()).unwrap_or_default();
-    let threads = ns.args.get(1).and_then(ScriptArg::as_f64).unwrap_or(1.0);
+    let threads = ns.args.get(1).and_then(ScriptArg::as_f64).unwrap_or(1.0) as i32;
     let words: Vec<String> = ns.args.iter().map(arg_text).collect();
     ns.tprint(&format!("{target} {threads} {words:?} {}", ns.args[2].is_string()));
 
@@ -61,11 +61,11 @@ pub async fn main(ns: NS) {
     let [long, avg, short, short_avg]: [f64; 4] = ns.stock.get_position("ECP");
     ns.tprint(&format!("position {long} {avg} {short} {short_avg}"));
     let reset = ns.get_reset_info();
-    let sf8 = reset.owned_sf.get(&8).copied().unwrap_or(0.0);
+    let sf8 = reset.owned_sf.get(&8).copied().unwrap_or(0);
     let mut sfs: Vec<i32> = reset.owned_sf.keys().copied().collect();
     sfs.sort();
     ns.tprint(&format!("sf8 {sf8} owned {sfs:?}"));
-    let outcome = ns.go.make_move(1.0, 2.0).await;
+    let outcome = ns.go.make_move(1, 2).await;
     ns.tprint(&format!("go {} {:?} {:?}", outcome.r#type, outcome.x, outcome.y));
 
     // B5: serde_wasm_bindgen.

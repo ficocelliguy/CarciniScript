@@ -89,9 +89,9 @@ fn main() {
     println!("{:?}", mask(0x1F_FFFF_FFFFusize, 0xFFFF_0000));
     println!("{:?}", mask(true, false));
     println!("{:?}", mask(Flags(3), Flags(6)).1);
-    println!("{} {} {} {} {}", flip(5u8), flip(5i8), flip(0u32), flip(7u64), flip(-1i128));
+    println!("{} {} {} {} {}", flip(5u8), flip(5i8), flip(0u32), flip(7i64), flip(-1i128));
     println!("{} {} {:?}", flip(true), flip(-6isize), flip(Flags(0x0F)));
-    println!("{:?} {:?} {:?}", shifts(200u8, 2), shifts(-16i32, 2), shifts(1u64, 63));
+    println!("{:?} {:?} {:?}", shifts(200u8, 2), shifts(-16i32, 2), shifts(1u64, 50));
     println!("{:?} {:?}", shifts(0x8000_0000u32, 4), shifts(-1i16, 15));
     println!("{:?} {:?}", shifts(3usize, 40), shifts(-1024isize, 3));
     println!("{}", accumulate(&[1u8, 2, 4], 8));

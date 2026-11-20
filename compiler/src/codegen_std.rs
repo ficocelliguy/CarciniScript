@@ -235,7 +235,11 @@ impl Codegen<'_> {
                 let (kind, op) = m2.split_once('_')?;
                 let (min, max) = k.min_max();
                 let a = self.arg_frags(m);
-                let b = a.into_iter().next().unwrap_or_else(|| Frag::text("0"));
+                // (Parenthesized: `x.wrapping_sub(y + 1)` is `x - (y + 1)`.)
+                let b = a
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| Frag::text("0"), |b| b.wrap("(", ")"));
                 let raw = match op {
                     "add" | "add_signed" => Frag::text("(")
                         .append(rf.clone())
@@ -554,7 +558,7 @@ impl Codegen<'_> {
             }
             [t, "from_str_radix"] if matches!(Ty::from_name(t), Ty::Int(k) if k.is_big()) => {
                 let (s, r) = (emit(self, 0), emit(self, 1));
-                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I64);
+                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I128);
                 call(
                     "fromStrRadixBig",
                     vec![s, r, Frag::text(format!("{}, {}", k.is_signed(), k.bits()))],
@@ -577,9 +581,9 @@ impl Codegen<'_> {
                 let b = emit(self, 0);
                 call("fromUtf8Lossy", vec![b])
             }
-            // `u64::from(x)`: a BigInt from a smaller kind.
+            // `u128::from(x)`: a BigInt from a smaller kind.
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(k) if k.is_big()) => {
-                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I64);
+                let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I128);
                 let x = emit(self, 0);
                 let mut f = Frag::text("κσ.$to128(");
                 f.append(x)

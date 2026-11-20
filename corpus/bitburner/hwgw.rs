@@ -82,5 +82,5 @@ pub async fn main(ns: NS) {
     };
     let json = serde_json::to_string(&report).expect("report serializes");
     // A full port drops the oldest message; the batcher only uses reports for stats.
-    ns.try_write_port(port as f64, json);
+    ns.try_write_port(port as i32, json);
 }

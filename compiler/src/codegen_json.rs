@@ -208,8 +208,6 @@ impl Codegen<'_> {
         match t {
             Ty::Int(k) if k.is_big() => {
                 let (min, max): (i128, u128) = match k {
-                    IntKind::I64 => (i64::MIN.into(), i64::MAX as u128),
-                    IntKind::U64 => (0, u64::MAX.into()),
                     IntKind::I128 => (i128::MIN, i128::MAX as u128),
                     _ => (0, u128::MAX),
                 };

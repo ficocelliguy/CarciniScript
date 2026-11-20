@@ -130,15 +130,15 @@ fn count_lines<R: BufRead>(r: R) -> usize {
 }
 
 #[derive(Default)]
-struct Fnv(u64);
+struct Fnv(u32);
 
 impl Hasher for Fnv {
     fn finish(&self) -> u64 {
-        self.0
+        self.0 as u64
     }
     fn write(&mut self, bytes: &[u8]) {
         for b in bytes {
-            self.0 = (self.0 ^ *b as u64).wrapping_mul(0x100000001b3);
+            self.0 = (self.0 ^ *b as u32).wrapping_mul(16777619);
         }
     }
 }
@@ -149,7 +149,7 @@ struct FnvBuild;
 impl BuildHasher for FnvBuild {
     type Hasher = Fnv;
     fn build_hasher(&self) -> Fnv {
-        Fnv(0xcbf29ce484222325)
+        Fnv(0x811c9dc5)
     }
 }
 
@@ -242,7 +242,7 @@ fn main() -> io::Result<()> {
     println!("{}", count_lines(reader));
 
     // Hasher / BuildHasher
-    let mut h = Fnv(0xcbf29ce484222325);
+    let mut h = Fnv(0x811c9dc5);
     h.write(b"abc");
     println!("{}", h.finish());
     let mut h2 = FnvBuild.build_hasher();
