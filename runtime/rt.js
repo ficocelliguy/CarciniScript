@@ -3239,6 +3239,32 @@
         },
       };
     },
+    // A call of a generic `-> Option<&mut T>` (`null` or a slot) whose `T` is a struct or
+    // collection: `null` or the object.
+    $unslot(s) {
+      return s == null ? null : s[1];
+    },
+    // What such a function returns where it has no place to point at (`m.get_mut(k)` of a
+    // map): a slot holding the value, or `null` for `None` (`$optValSlot`).
+    $valSlot(v) {
+      return {
+        get 0() {
+          return v;
+        },
+        set 0(x) {
+          v = x;
+        },
+        get 1() {
+          return v;
+        },
+        set 1(x) {
+          v = x;
+        },
+      };
+    },
+    $optValSlot(v) {
+      return v == null ? null : rt.$valSlot(v);
+    },
     // The map entry prelude's `get_mut` / `insert` / `or_insert(_with)`: the slot for its key.
     $entrySlot(e, mode, v) {
       const map = e.__m();

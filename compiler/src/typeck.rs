@@ -144,6 +144,12 @@ pub struct Types {
     /// one of the file's functions declared `-> &mut i32`, a `&mut i32` field, `o.unwrap()` of
     /// an `Option<&mut i32>` value. Codegen reads `[1]` unless the slot itself is kept.
     pub slot_values: std::collections::HashSet<(usize, usize)>,
+    /// Calls of a generic `-> &mut T` (`false`) / `-> Option<&mut T>` (`true`) whose `T` is a
+    /// struct or collection there: the function returns a slot, read as the value it holds.
+    pub slot_unwraps: HashMap<(usize, usize), bool>,
+    /// What a generic `-> &mut T` (`false`) / `-> Option<&mut T>` (`true`) returns where it isn't
+    /// a slot (`m.get_mut(k)` of a map): wrapped in a slot holding the value.
+    pub slot_wraps: HashMap<(usize, usize), bool>,
     /// Positions that keep a slot rather than read it: the initializer of a `&mut i32`-typed
     /// `let`, the right side of `r = &mut ..`, a `&mut i32` field's value, a return of a
     /// function declared `-> &mut i32`, `Some(..)`'s payload for an `Option<&mut i32>`. A
@@ -350,6 +356,11 @@ impl<'a> Checker<'a> {
             slice_views: Default::default(),
             place_slots: Default::default(),
             slot_values: Default::default(),
+            slot_unwraps: Default::default(),
+            slot_wraps: Default::default(),
+            ret_item_slots: Default::default(),
+            ret_slot_param: false,
+            slot_param_ok: false,
             slot_keeps: Default::default(),
             slot_assigns: Default::default(),
             slot_cell_args: Default::default(),
@@ -493,8 +504,9 @@ impl<'a> Checker<'a> {
                     written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown)
                 });
                 let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t));
-                let ret_slot = self.ret_slot_kind(f.ret_type().and_then(|r| r.ty()), &ret);
+                let ret_slot = self.ret_slot_kind(f, &ret);
                 let opt_slot_params = self.opt_slot_params(f, &params);
+                self.note_ret_item_slots(f, name.text().to_string());
                 let sig = FnSig {
                     params,
                     ret,
@@ -671,6 +683,8 @@ pub fn check(
     let slice_views = std::mem::take(&mut c.slice_views);
     let place_slots = std::mem::take(&mut c.place_slots);
     let slot_values = std::mem::take(&mut c.slot_values);
+    let slot_unwraps = std::mem::take(&mut c.slot_unwraps);
+    let slot_wraps = std::mem::take(&mut c.slot_wraps);
     let slot_keeps = std::mem::take(&mut c.slot_keeps);
     let slot_assigns = std::mem::take(&mut c.slot_assigns);
     let slot_cell_args = std::mem::take(&mut c.slot_cell_args);
@@ -716,6 +730,8 @@ pub fn check(
             slice_views,
             place_slots,
             slot_values,
+            slot_unwraps,
+            slot_wraps,
             slot_keeps,
             slot_assigns,
             slot_cell_args,
@@ -839,6 +855,17 @@ struct Checker<'a> {
     slice_views: std::collections::HashSet<(usize, usize)>,
     place_slots: std::collections::HashSet<(usize, usize)>,
     slot_values: std::collections::HashSet<(usize, usize)>,
+    slot_unwraps: HashMap<(usize, usize), bool>,
+    slot_wraps: HashMap<(usize, usize), bool>,
+    /// Functions (by name) and methods (`Adt::name`) declared `-> impl Iterator<Item = (usize,
+    /// &mut T)>`: where their items hold slots.
+    ret_item_slots: HashMap<String, slots::SlotShape>,
+    /// The function being checked is declared `-> &mut T` / `-> Option<&mut T>` with `T` a type
+    /// parameter (`ret_slot` is set): it returns a slot on every path (`keep_generic_ret`).
+    ret_slot_param: bool,
+    /// While marking what a function declared `-> &mut T` returns: a type parameter `T` counts
+    /// as a slot referent (`slot_elem`).
+    slot_param_ok: bool,
     slot_keeps: std::collections::HashSet<(usize, usize)>,
     slot_assigns: std::collections::HashSet<(usize, usize)>,
     slot_cell_args: std::collections::HashSet<(usize, usize)>,
@@ -1507,9 +1534,9 @@ impl<'a> Checker<'a> {
                 if iterator_item(t).is_some() =>
             {
                 let item = iterator_item(t).unwrap();
-                // `impl Iterator<Item = &mut T>`: what `v.iter_mut()` returns.
-                let mutable =
-                    matches!(&item, Some(ast::Type::RefType(r)) if r.mut_token().is_some());
+                // `impl Iterator<Item = &mut T>`: what `v.iter_mut()` returns (`Item = (usize, &mut
+                // T)`: `iter_mut().enumerate()`).
+                let mutable = item.as_ref().is_some_and(holds_mut_ref);
                 let elem = match item {
                     Some(item) => self.lower_type(&item),
                     None => self.fresh(VarKind::General),
@@ -2279,7 +2306,14 @@ impl<'a> Checker<'a> {
         self.slot_locals.clear();
         self.slot_options.clear();
         // `-> &mut i32` / `-> Option<&mut i32>`: what's returned is kept as a slot (`keep_slot`).
-        self.ret_slot = self.ret_slot_kind(f.ret_type().and_then(|r| r.ty()), &ret);
+        self.ret_slot = self.ret_slot_kind(f, &ret);
+        self.ret_slot_param = self.ret_slot.is_some_and(|opt| {
+            let r = match self.zonk(&ret) {
+                Ty::Option(i) if opt => *i,
+                r => r,
+            };
+            matches!(r, Ty::Param(_))
+        });
         let opt_slot = self.opt_slot_params(f, &params);
         // Const generic parameters: values in the body.
         for (n, ty) in self.const_tys.clone() {
@@ -2612,11 +2646,7 @@ impl<'a> Checker<'a> {
             && b.syntax().parent().is_some_and(|p| ast::Fn::can_cast(p.kind()))
             && let Some(tail) = list.tail_expr()
         {
-            if opt {
-                self.keep_opt_slot(&tail);
-            } else {
-                self.keep_slot(&tail);
-            }
+            self.keep_ret_slot(&tail, opt);
         }
         self.scopes.pop();
         self.record(b.syntax(), ty)
@@ -4602,14 +4632,8 @@ impl<'a> Checker<'a> {
                     }
                     Some(v) => {
                         self.check(&v, &ret);
-                        match self.ret_slot {
-                            Some(true) => {
-                                self.keep_opt_slot(&v);
-                            }
-                            Some(false) => {
-                                self.keep_slot(&v);
-                            }
-                            None => {}
+                        if let Some(opt) = self.ret_slot {
+                            self.keep_ret_slot(&v, opt);
                         }
                     }
                     None if !self.unify(&Ty::Unit, &ret) => {
@@ -6101,11 +6125,6 @@ impl<'a> Checker<'a> {
             inst
         };
         self.arg_count(c.syntax(), "function", params.len(), args.len());
-        // `*at(&mut v, 0) += 1` with `fn at(..) -> &mut i32`: the call is a slot.
-        if self.fns.get(name).is_some_and(|s| s.ret_slot == Some(false)) {
-            let r = self.range(c.syntax());
-            self.slot_values.insert(r);
-        }
         let opt_slot_params = self
             .fns
             .get(name)
@@ -6156,6 +6175,11 @@ impl<'a> Checker<'a> {
                     self.infer(a, None);
                 }
             }
+        }
+        // `*at(&mut v, 0) += 1` with `fn at(..) -> &mut i32`: the call is a slot.
+        if let Some(s) = self.fns.get(name) {
+            let (kind, declared) = (s.ret_slot, s.ret.clone());
+            self.note_call_slot(&ast::Expr::CallExpr(c.clone()), kind, &declared, &ret);
         }
         self.finish_slot_args(args, &opt_slot_params);
         self.check_byte_readers(name, args, &params);
@@ -8628,6 +8652,15 @@ fn names_std_error(t: &ast::Type) -> bool {
             _ => false,
         })
     })
+}
+
+/// `&mut T`, or a tuple holding one (`(usize, &mut u8)`).
+fn holds_mut_ref(t: &ast::Type) -> bool {
+    match t {
+        ast::Type::RefType(r) => r.mut_token().is_some(),
+        ast::Type::TupleType(tt) => tt.fields().any(|f| holds_mut_ref(&f)),
+        _ => false,
+    }
 }
 
 /// For `impl Iterator<Item = T>` / `dyn Iterator<..>`: `Some(Some(T))`, or `Some(None)` without an

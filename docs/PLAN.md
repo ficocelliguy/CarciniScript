@@ -210,15 +210,21 @@ see the Bitburner player gaps below).
   and operators on type parameters (41 + 28), a tuple-struct pattern of another crate's enum
   (`Bound::Included(&i)`, 39). Worth sorting next: several are probably std types the checker
   doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
-- [ ] Left over from closed gaps, after the 2026-11-20 pass (see RUST_GAPS.md "Traits on
-  built-in types" and FEATURES.md): the slot cases a generic function can't tell apart at run
-  time (a `-> Option<&mut T>` of a `T` that may be a number, `fn first_mut<T>(v: &mut [T])`;
-  items that are tuples holding a `&mut` in a *returned* iterator, `Item = (usize, &mut u8)`);
-  your traits on `RangeFrom` / `RangeTo` / `RangeFull` (a `3..` is an iterator here); one trait
-  for both a tuple and a `Vec` (borsh) and two tuples of one length; `dyn Trait` on a float
-  picking the impl by the value; `impl<T> S<Vec<T>>` carrying no class for `T`; a nested
-  `Option<Option<_>>` through a generic `T: Tr` reaching the inner type's impl for
-  `Some(Some(4))` (`None` and `Some(None)` are right now, and no longer overflow the stack).
+- Left over from closed gaps, after the 2026-11-20 pass (see RUST_GAPS.md "Traits on
+  built-in types" and FEATURES.md):
+  - [x] A generic `-> Option<&mut T>` of a `T` that may be a number (`fn first_mut<T>(v: &mut
+    [T])`): the caller reads a copy, since the function can't tell at run time whether to hand
+    out a slot.
+  - [x] Items that are tuples holding a `&mut` in a *returned* iterator (`-> impl
+    Iterator<Item = (usize, &mut u8)>`, rejected as mismatched types).
+  - [ ] Your traits on `RangeFrom` / `RangeTo` / `RangeFull` (a `3..` is an iterator here).
+  - [ ] One trait for both a tuple and a `Vec` (borsh), and for two tuples of one length.
+  - [ ] `dyn Trait` on a float picking the impl by the value.
+  - [ ] `impl<T> S<Vec<T>>` carrying no class for `T`.
+  - [ ] A nested `Option<Option<_>>` through a generic `T: Tr` reaching the inner type's impl
+    for `Some(Some(4))` (`None` and `Some(None)` are right now, and no longer overflow the
+    stack).
+
   Closed in that pass: full std paths and `Option::Some` / `Result::<A, B>::Ok`, E0433 for a std
   type without its `use`, renamed `Error`s and a `use` in a block, re-exports through an inline
   module, associated type bounds in return position and GATs, a struct literal's closure typed

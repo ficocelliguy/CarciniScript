@@ -88,11 +88,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`iter_mut()` over numbers, strings or bools outside a loop yields slots** (objects whose
   `[1]` is the element), followed through `next()`, adapters (with closures too: `filter`, `map`,
   `find`, `try_for_each`, `try_fold`, `find_map`, ..), `collect()` into a `Vec<&mut T>`, and
-  functions, parameters and fields that hand on a `&mut` iterator; so is a map's `values_mut()` /
-  `iter_mut()`. A slot passed on to a function that takes `&mut i32`, or printed with `{:?}`, is a
-  copy of the element or the slot object. Not yet: indexing a collected `Vec<&mut T>` (`*rs[1] =
-  9`; loop over it instead), `partition`, and a returned iterator whose items are tuples holding a
-  `&mut` (`impl Iterator<Item = (usize, &mut u8)>`, rejected as mismatched types).
+  functions, parameters and fields that hand on a `&mut` iterator (also one whose items are tuples
+  holding a `&mut`: `-> impl Iterator<Item = (usize, &mut u8)>`, boxed or from a method); so is a
+  map's `values_mut()` / `iter_mut()`. A slot passed on to a function that takes `&mut i32`, or
+  printed with `{:?}`, is a copy of the element or the slot object. Not yet: indexing a collected
+  `Vec<&mut T>` (`*rs[1] = 9`; loop over it instead).
 - **`sum()` / `product()` without a type use the element type** where rustc asks for an
   annotation.
 - **Generic functions take only `Fn`-bounded type parameters**, and each one is a single concrete
@@ -122,10 +122,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   callee can't keep the borrow. A `Vec<&mut i32>` (or `Vec<(usize, &mut i32)>`) written as the
   type of a `let` holds slots too: `refs.push(&mut a)`, `vec![(0, &mut c)]`, `Slot::Live(&mut a)`
   for a variant declared `Live(&'a mut i32)`, and `v.iter_mut().partition(..)` into two such
-  Vecs. Still a copy: a `&mut T` of a type parameter `T` that may be a number, returned
-  (`fn first_mut<T>(v: &mut [T]) -> Option<&mut T>`: the caller reads a value), and the items of
-  an iterator *returned* with a `&mut` inside a tuple (`-> impl Iterator<Item = (usize, &mut
-  u8)>`, an error).
+  Vecs. Your generic `-> &mut T` / `-> Option<&mut T>` (`fn first_mut<T>(v: &mut [T])`, an
+  `impl<T>` method) returns a slot whatever `T` is, which the caller reads the value out of when
+  `T` is a struct or collection; where it has no place to point at (`m.get_mut(k)` of a map) it
+  returns a slot holding the value, so writes to a number there are still a copy. Trait methods
+  (`deref_mut`, `index_mut`) aren't made slots this way.
 - **`*r = value` for a `&mut` struct (or `Vec`, map, set or other collection) replaces the
   object's contents in place** (`κσ.$replace`), since JS can't rebind the caller's variable. The
   result is the same as Rust's.

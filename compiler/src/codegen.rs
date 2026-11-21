@@ -3304,6 +3304,21 @@ impl<'a> Codegen<'a> {
         if self.types.slot_values.contains(&r) && !self.types.slot_keeps.contains(&r) {
             return (frag.wrap("(", ")[1]").at(start), ty);
         }
+        // A generic `-> &mut T` / `-> Option<&mut T>` returns a slot, whatever `T` is: with a
+        // struct or collection for `T`, the object it holds.
+        if let Some(&opt) = self.types.slot_unwraps.get(&r) {
+            let f = if opt {
+                frag.wrap("κσ.$unslot(", ")")
+            } else {
+                frag.wrap("(", ")[1]")
+            };
+            return (f.at(start), ty);
+        }
+        // What such a function returns where it isn't a slot: one holding the value.
+        if let Some(&opt) = self.types.slot_wraps.get(&r) {
+            let h = if opt { "κσ.$optValSlot(" } else { "κσ.$valSlot(" };
+            return (frag.wrap(h, ")").at(start), ty);
+        }
         // Auto-deref through `impl Deref`: `(stack).deref()`.
         if let Some((mutable, target)) = self.types.derefs.get(&self.range_of(e.syntax())).cloned()
         {

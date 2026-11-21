@@ -1587,7 +1587,12 @@ impl Checker<'_> {
             .and_then(|r| r.ty())
             .is_some_and(|t| super::written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown));
         let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::written_mut_ref(&t));
-        let ret_slot = self.ret_slot_kind(f.ret_type().and_then(|r| r.ty()), &ret);
+        let ret_slot = self.ret_slot_kind(f, &ret);
+        if let Some(Ty::Adt(adt, _)) = self.self_ty.clone()
+            && let Some(n) = f.name()
+        {
+            self.note_ret_item_slots(f, format!("{adt}::{n}"));
+        }
         let opt_slot_params = self.opt_slot_params(f, &params);
         let method = Method {
             params,
@@ -2322,6 +2327,7 @@ impl Checker<'_> {
             && sig.receiver.is_some()
         {
             let own_params = sig.type_params.len();
+            let declared = sig.ret.clone();
             let sig = self.method_inst(&sig, Some(targs));
             if own_params > 0 {
                 let own = std::mem::take(&mut self.last_type_args);
@@ -2346,11 +2352,6 @@ impl Checker<'_> {
                 self.check_mutable(recv, Mutation::Borrow);
             }
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
-            // `*s.at(i) += 1` with `fn at(&mut self, i: usize) -> &mut i32`: the call is a slot.
-            if sig.ret_slot == Some(false) {
-                let r = self.range(m.syntax());
-                self.slot_values.insert(r);
-            }
             for (i, (a, p)) in args.iter().zip(&sig.params).enumerate() {
                 if sig.cell_params.get(i) == Some(&true) {
                     self.cell_arg(a);
@@ -2372,6 +2373,9 @@ impl Checker<'_> {
             for a in args.iter().skip(sig.params.len()) {
                 self.infer(a, None);
             }
+            // `*s.at(i) += 1` with `fn at(&mut self, i: usize) -> &mut i32`: the call is a slot.
+            let call = ast::Expr::MethodCallExpr(m.clone());
+            self.note_call_slot(&call, sig.ret_slot, &declared, &sig.ret);
             self.finish_slot_args(args, &sig.opt_slot_params);
             return if sig.is_async {
                 Ty::Future(Box::new(sig.ret))

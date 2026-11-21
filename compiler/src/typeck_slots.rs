@@ -35,6 +35,24 @@ pub(super) fn opt_slot_position(m: &ast::MethodCallExpr) -> bool {
         || keep_position(top.syntax())
 }
 
+/// Whether `f`, declared `-> &mut T` / `-> Option<&mut T>` with `T` a type parameter, returns
+/// a slot whatever `T` is: one of your free functions or inherent methods. (A trait method's
+/// result is also reached through `deref_mut` / `index_mut` / `dyn` calls, which don't read a
+/// slot, and the bundled preludes, after the program, return what their JS helpers give.)
+fn generic_slot_fn(f: &ast::Fn, src: &str) -> bool {
+    let in_trait = f.syntax().ancestors().any(|a| {
+        ast::Trait::can_cast(a.kind())
+            || ast::Impl::cast(a).is_some_and(|i| i.trait_().is_some())
+    });
+    let at = usize::from(f.syntax().text_range().start());
+    !in_trait
+        && !src
+            .get(..at)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.starts_with("// (") && l.ends_with("prelude)"))
+}
+
 /// The method call `m` is the receiver of, if any.
 fn method_parent(m: &ast::MethodCallExpr) -> Option<ast::MethodCallExpr> {
     let mut n = m.syntax().clone();
@@ -170,18 +188,131 @@ impl Checker<'_> {
     /// What a function declared `-> &mut T` / `-> Option<&mut T>` returns when `T` is a number,
     /// string, bool or `Option` (`written`: the return type as written, `ret`: lowered): a slot
     /// over the place (`Some(false)`), or `null` / a slot (`Some(true)`). `None` for other
-    /// return types: a struct or collection is shared by reference anyway.
-    pub(super) fn ret_slot_kind(&self, written: Option<ast::Type>, ret: &Ty) -> Option<bool> {
-        let w = written?;
+    /// return types: a struct or collection is shared by reference anyway. A type parameter
+    /// `T` counts too in your own functions and inherent methods (`generic_slot_fn`).
+    pub(super) fn ret_slot_kind(&self, f: &ast::Fn, ret: &Ty) -> Option<bool> {
+        let w = f.ret_type()?.ty()?;
         if !super::written_mut_ref(&w) {
             return None;
         }
+        let referent = |t: &Ty| {
+            self.cellable(t) || matches!(self.zonk(t), Ty::Param(_)) && generic_slot_fn(f, self.src)
+        };
         if matches!(w, ast::Type::RefType(_)) {
-            return self.cellable(ret).then_some(false);
+            return referent(ret).then_some(false);
         }
         match self.zonk(ret) {
-            Ty::Option(inner) if self.cellable(&inner) => Some(true),
+            Ty::Option(inner) if referent(&inner) => Some(true),
             _ => None,
+        }
+    }
+
+    /// What a call of a function declared with slot return `kind` (`ret`: its return type as
+    /// declared, `inst`: the call's) hands back. With `T` a type parameter (`fn first_mut<T>(v:
+    /// &mut [T]) -> Option<&mut T>`) the function always returns a slot, which the call keeps
+    /// when `T` is a number, string, bool or `Option` there (or still a type parameter); `None`
+    /// when it reads the value out (`slot_unwraps`).
+    pub(super) fn call_ret_slot(&self, kind: Option<bool>, ret: &Ty, inst: &Ty) -> Option<bool> {
+        let kind = kind?;
+        let strip = |t: Ty| match t {
+            Ty::Option(i) if kind => *i,
+            t => t,
+        };
+        if !matches!(strip(ret.clone()), Ty::Param(_)) {
+            return Some(kind);
+        }
+        self.cell_param(&strip(self.zonk(inst))).then_some(kind)
+    }
+
+    /// After a call of a function declared with slot return `kind` (`ret`: as declared, `inst`:
+    /// the call's type): a `-> &mut i32` call is a slot value; a generic one whose `T` is a
+    /// struct or collection here is read out of its slot.
+    pub(super) fn note_call_slot(&mut self, e: &ast::Expr, kind: Option<bool>, ret: &Ty, inst: &Ty) {
+        let r = self.range(e.syntax());
+        match (kind, self.call_ret_slot(kind, ret, inst)) {
+            (_, Some(false)) => {
+                self.slot_values.insert(r);
+            }
+            (Some(k), None) => {
+                self.slot_unwraps.insert(r, k);
+            }
+            _ => {}
+        }
+    }
+
+    /// A number, string, bool or `Option`, or (while checking what a generic `-> &mut T`
+    /// returns, which is always a slot) a type parameter.
+    fn slot_elem(&self, t: &Ty) -> bool {
+        self.cellable(t) || (self.slot_param_ok && matches!(self.zonk(t), Ty::Param(_)))
+    }
+
+    /// `ret` returned from a function declared `-> &mut T` / `-> Option<&mut T>` (`opt`) whose
+    /// referent is a number, string, bool, `Option` or type parameter: kept as a slot.
+    pub(super) fn keep_ret_slot(&mut self, ret: &ast::Expr, opt: bool) {
+        if !self.ret_slot_param {
+            if opt {
+                self.keep_opt_slot(ret);
+            } else {
+                self.keep_slot(ret);
+            }
+            return;
+        }
+        self.slot_param_ok = true;
+        self.keep_generic_ret(ret, opt);
+        self.slot_param_ok = false;
+    }
+
+    /// What a generic `-> &mut T` returns is a slot on every path: each branch's slot, or one
+    /// holding the value where it isn't a slot (`m.get_mut(k)` of a map; `slot_wraps`), which
+    /// writes reach when `T` is a struct or collection, as before.
+    fn keep_generic_ret(&mut self, e: &ast::Expr, opt: bool) {
+        let e = strip_parens(e);
+        match &e {
+            ast::Expr::IfExpr(i) => {
+                if let Some(b) = i.then_branch() {
+                    self.keep_generic_ret(&ast::Expr::BlockExpr(b), opt);
+                }
+                match i.else_branch() {
+                    Some(ast::ElseBranch::Block(b)) => {
+                        self.keep_generic_ret(&ast::Expr::BlockExpr(b), opt)
+                    }
+                    Some(ast::ElseBranch::IfExpr(e)) => {
+                        self.keep_generic_ret(&ast::Expr::IfExpr(e), opt)
+                    }
+                    None => {}
+                }
+            }
+            ast::Expr::MatchExpr(m) => {
+                let arms: Vec<ast::Expr> = m
+                    .match_arm_list()
+                    .into_iter()
+                    .flat_map(|l| l.arms())
+                    .filter_map(|a| a.expr())
+                    .collect();
+                for a in arms {
+                    self.keep_generic_ret(&a, opt);
+                }
+            }
+            ast::Expr::BlockExpr(b) => {
+                if let Some(t) = b.stmt_list().and_then(|l| l.tail_expr()) {
+                    self.keep_generic_ret(&t, opt);
+                }
+            }
+            ast::Expr::PathExpr(p) if opt && p.syntax().text() == "None" => {}
+            _ => {
+                let r = self.range(e.syntax());
+                if self.raw.get(&r).is_some_and(|t| self.zonk(t) == Ty::Never) {
+                    return;
+                }
+                let kept = if opt {
+                    self.keep_opt_slot(&e)
+                } else {
+                    self.keep_slot(&e)
+                };
+                if !kept {
+                    self.slot_wraps.insert(r, opt);
+                }
+            }
         }
     }
 
@@ -219,7 +350,7 @@ impl Checker<'_> {
                 let Some(t) = self.raw.get(&self.range(inner.syntax())).cloned() else {
                     return false;
                 };
-                if !self.cellable(&t) {
+                if !self.slot_elem(&t) {
                     return false;
                 }
                 match &inner {
@@ -330,7 +461,12 @@ impl Checker<'_> {
             return false;
         };
         self.lookup(name.text().to_string().as_str())
-            .is_some_and(|l| l.reference == Some(true) && self.cellable(&l.ty))
+            .is_some_and(|l| {
+                l.reference == Some(true)
+                    && (self.cellable(&l.ty)
+                        // A `&mut T` parameter: a cell.
+                        || self.slot_elem(&l.ty) && l.decl.is_some_and(|d| self.boxed.contains(&d)))
+            })
     }
 
     /// `e` sits where an `Option<&mut T>` value is kept: `Some(&mut place)`, `place.as_mut()`,
@@ -354,6 +490,17 @@ impl Checker<'_> {
                 let name = m.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
                 if name == "as_mut" && self.as_mut_of_place(&e) {
                     return self.mark_as_mut_slot_kept(m);
+                }
+                // `v.first_mut()` of a `Vec<T>` returned from a generic `-> Option<&mut T>`.
+                if self.slot_param_ok
+                    && matches!(name.as_str(), "get_mut" | "first_mut" | "last_mut")
+                    && let Some(r) = m.receiver()
+                    && let Some(t) = self.raw.get(&self.range(r.syntax()))
+                    && matches!(self.zonk(t), Ty::Vec(el) if matches!(*el, Ty::Param(_)))
+                {
+                    let r = self.range(m.syntax());
+                    self.slot_calls.insert(r);
+                    return true;
                 }
                 // `o.as_mut().filter(..)`: the same `Option<&mut T>`, handed on.
                 if matches!(name.as_str(), "filter" | "inspect" | "take_if")
@@ -431,7 +578,9 @@ impl Checker<'_> {
                     return None;
                 };
                 let name = p.path()?.as_single_name_ref()?.text().to_string();
-                self.fns.get(name.as_str())?.ret_slot
+                let sig = self.fns.get(name.as_str())?;
+                let inst = self.raw.get(&self.range(c.syntax())).unwrap_or(&Ty::Unknown);
+                self.call_ret_slot(sig.ret_slot, &sig.ret, inst)
             }
             ast::Expr::MethodCallExpr(m) => {
                 let recv = m.receiver()?;
@@ -440,7 +589,9 @@ impl Checker<'_> {
                     return None;
                 };
                 let name = m.name_ref()?.text().to_string();
-                self.adts.method(&adt, &name)?.ret_slot
+                let sig = self.adts.method(&adt, &name)?;
+                let inst = self.raw.get(&self.range(m.syntax())).unwrap_or(&Ty::Unknown);
+                self.call_ret_slot(sig.ret_slot, &sig.ret, inst)
             }
             _ => None,
         }
@@ -590,7 +741,54 @@ impl Checker<'_> {
                 elem,
                 mutable: true,
             } if elem.is_js_primitive() => Some(SlotShape::Slot),
+            // `-> impl Iterator<Item = (usize, &mut u8)>`: the call's items hold slots where
+            // the declared type says.
+            Ty::Iter {
+                elem,
+                mutable: true,
+            } if matches!(*elem, Ty::Tuple(_)) => {
+                let key = match strip_parens(e) {
+                    ast::Expr::CallExpr(c) => match c.expr()? {
+                        ast::Expr::PathExpr(p) => p.path()?.as_single_name_ref()?.text().to_string(),
+                        _ => return None,
+                    },
+                    ast::Expr::MethodCallExpr(m) => {
+                        let rt = self.raw.get(&self.range(m.receiver()?.syntax()))?;
+                        let Ty::Adt(adt, _) = self.zonk(rt) else {
+                            return None;
+                        };
+                        format!("{adt}::{}", m.name_ref()?.text())
+                    }
+                    _ => return None,
+                };
+                self.ret_item_slots.get(&key).cloned()
+            }
             _ => None,
+        }
+    }
+
+    /// `f` declared `-> impl Iterator<Item = (usize, &mut T)>` with `T` a number, string, bool
+    /// or `Option`: its items' slot shape, under `key` (`returned_slots`).
+    pub(super) fn note_ret_item_slots(&mut self, f: &ast::Fn, key: String) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let Some(mut ret) = f.ret_type().and_then(|r| r.ty()) else {
+            return;
+        };
+        // `Box<dyn Iterator<..>>`
+        if let ast::Type::PathType(p) = &ret
+            && let Some(seg) = p.path().and_then(|p| p.segment())
+            && seg.name_ref().is_some_and(|n| n.text() == "Box")
+            && let Some(ast::GenericArg::TypeArg(a)) =
+                seg.generic_arg_list().and_then(|l| l.generic_args().next())
+            && let Some(t) = a.ty()
+        {
+            ret = t;
+        }
+        let item = super::iterator_item(&ret);
+        if let Some(Some(t @ ast::Type::TupleType(_))) = item
+            && let Some(shape) = self.written_slot_elem(&t)
+        {
+            self.ret_item_slots.insert(key, shape);
         }
     }
 

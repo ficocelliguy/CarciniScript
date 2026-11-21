@@ -945,11 +945,6 @@ const rejected = [
     "let mut w = vec![1, 2];\n    let mut rs: Vec<&mut i32> = w.iter_mut().collect();\n    *rs[1] = 9;",
     "4:6 indexing a `Vec<&mut T>` collected from `iter_mut()` over numbers, strings or bools isn't supported yet",
   ],
-  [
-    "returning a `&mut` iterator with `&mut` inside tuple items",
-    "}\nfn f(v: &mut Vec<u8>) -> impl Iterator<Item = (usize, &mut u8)> {\n    v.iter_mut().enumerate()\n}\nfn g() {",
-    "4:5 mismatched types",
-  ],
   ["`get_index_mut` on an `IndexMap` of numbers, not matched", "let mut m: indexmap::IndexMap<&str, i32> = indexmap::IndexMap::new();\n    m.insert(\"a\", 1);\n    *m.get_index_mut(0).unwrap().1 += 1;", "4:6 `IndexMap::get_index_mut` on a map of `i32` isn't supported here"],
   // Help lines for players who don't know Rust (`diag_help.rs`): the rule under the message.
   ["use after move", "let s = String::from(\"a\");\n    let t = s;\n    let u = s;\n    println!(\"{} {}\", t, u);", "4:13 use of moved value: `s` (moved on line 3:13 by `let`; `.clone()` it there to keep a copy)", "Passing or assigning a `String`, `Vec` or struct hands it over; the old name can't be used again."],
