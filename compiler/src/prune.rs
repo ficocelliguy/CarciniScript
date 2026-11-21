@@ -40,7 +40,8 @@ use ra_ap_syntax::{
 /// makes for a `JoinHandle`'s result or `serde_json::from_str`, `rng.gen::<Adt>()` through
 /// `RandStandard`, the `jsx!` attribute marker traits, the `json!` value constructors the
 /// `JSON` schema names, and what the runtime calls back into (`e.__m()` on an entry, the
-/// context a hand-written future is polled with).
+/// context a hand-written future is polled with and the
+/// waker it wakes when a polled promise settles).
 const IMPLICIT: &[&str] = &[
     "__std_map_entry",
     "__m",
@@ -64,6 +65,7 @@ const IMPLICIT: &[&str] = &[
     "IoError",
     "TaskPoll",
     "__task_context",
+    "wake_by_ref",
     "TokioJoinError",
     "RandStandard",
     "RandStandardNormal",

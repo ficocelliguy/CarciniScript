@@ -20,6 +20,7 @@ pub fn uses_bundled(text: &str) -> bool {
         || text.contains("bitflags!")
         || text.contains("cfg_if!")
         || text.contains("lazy_static!")
+        || text.contains("thread_local!")
         || text.contains("rayon")
         || text.contains("serde_json")
         || text.contains("regex")
@@ -50,6 +51,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
             .get("Map")
             .is_some_and(|(k, i)| k == "serde_json" && i == "Map");
     let mut edits: Vec<(TextRange, String)> = Vec::new();
+    let mut select_arities: std::collections::BTreeSet<usize> = Default::default();
     let mut errors: Vec<(TextRange, String)> = Vec::new();
     rename_crate_items(&file, text, &mut edits);
     if text.contains("petgraph") && !text.contains("mod petgraph") {
@@ -237,7 +239,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
         else {
             continue;
         };
-        if !matches!(name.as_str(), "bitflags" | "cfg_if" | "lazy_static") {
+        let select = name == "select"
+            && tokio_used
+            && mc
+                .path()
+                .is_some_and(|p| matches!(p.syntax().text().to_string().as_str(), "tokio::select" | "select"));
+        if !select && !matches!(name.as_str(), "bitflags" | "cfg_if" | "lazy_static" | "thread_local") {
             continue;
         }
         let Some(tt) = mc.token_tree() else { continue };
@@ -274,6 +281,8 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
             "bitflags" => bitflags(&edited),
             "cfg_if" => cfg_if(&edited),
             "lazy_static" => lazy_static(&edited),
+            "thread_local" => thread_local(&edited),
+            "select" => tokio_select(&edited, &mut select_arities),
             _ => None,
         };
         if out.is_some() {
@@ -287,6 +296,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
             }
             edits.push((r, out));
         }
+    }
+    // (`select!`'s branch enums, one per number of branches.)
+    if !select_arities.is_empty() {
+        let end = TextRange::empty(ra_ap_syntax::TextSize::from(text.len() as u32));
+        let enums: String = select_arities.iter().map(|&n| select_enum(n)).collect();
+        edits.push((end, enums));
     }
     if !errors.is_empty() {
         return Err(errors
@@ -1217,6 +1232,49 @@ fn lazy_static(body: &str) -> Option<String> {
             n.trim(),
             ty.trim(),
             value.trim()
+        ));
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------- thread_local
+
+/// `thread_local! { static NAME: T = expr; }` as `static NAME: LocalKey<T> = LocalKey::new(expr);`
+/// (one thread, so a `static`: the value is made when the script loads). A `const { .. }`
+/// initializer is its block.
+fn thread_local(body: &str) -> Option<String> {
+    let mut out = String::new();
+    for item in split_top(&strip_comments(body), ';') {
+        let (attrs, item) = take_attrs(&item);
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let at = item.find("static")?;
+        let vis = item[..at].trim();
+        let decl = item[at + "static".len()..].trim();
+        let (head, value) = decl.split_once('=')?;
+        let (n, ty) = head.split_once(':')?;
+        let value = value.trim();
+        let value = value
+            .strip_prefix("const")
+            .map(str::trim_start)
+            .filter(|v| v.starts_with('{'))
+            .unwrap_or(value);
+        for a in attrs {
+            out.push_str(&a);
+            out.push('\n');
+        }
+        let vis = if vis.is_empty() {
+            String::new()
+        } else {
+            format!("{vis} ")
+        };
+        out.push_str(&format!(
+            "{vis}static {}: LocalKey<{}> = LocalKey::new({});\n",
+            n.trim(),
+            ty.trim(),
+            value
         ));
     }
     Some(out)
@@ -2279,6 +2337,73 @@ const NET_RENAMES: Renames = Renames {
     result_err: None,
 };
 
+// `std::sync::atomic::Ordering`: the lock prelude's `AtomicOrdering` (`std::cmp::Ordering` keeps
+// its name).
+const ATOMIC_RENAMES: Renames = Renames {
+    roots: &[
+        "atomic",
+        "std::sync::atomic",
+        "::std::sync::atomic",
+        "core::sync::atomic",
+        "::core::sync::atomic",
+        "sync::atomic",
+    ],
+    names: &[("Ordering", "AtomicOrdering"), ("fence", "__atomic_fence"), ("compiler_fence", "__atomic_fence")],
+    star: &[],
+    result_err: None,
+};
+
+// `std::sync::mpsc`: the lock prelude's channel (tokio's `mpsc` is the tokio prelude's, below).
+const MPSC_RENAMES: Renames = Renames {
+    roots: &["mpsc", "std::sync::mpsc", "::std::sync::mpsc", "sync::mpsc"],
+    names: &[
+        ("Sender", "MpscSender"),
+        ("SyncSender", "MpscSender"),
+        ("Receiver", "MpscReceiver"),
+        ("channel", "__mpsc_channel"),
+        ("sync_channel", "__mpsc_sync_channel"),
+        ("SendError", "MpscSendError"),
+        ("TrySendError", "MpscTrySendError"),
+        ("RecvError", "MpscRecvError"),
+        ("TryRecvError", "MpscTryRecvError"),
+        ("RecvTimeoutError", "MpscRecvTimeoutError"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
+// `tokio::sync::mpsc`: the tokio prelude's channel. (A file that names `tokio::sync::mpsc` gets
+// this one for `mpsc::..`, else std's; see `renamed_crates`.)
+const TOKIO_MPSC_RENAMES: Renames = Renames {
+    roots: &[
+        "mpsc",
+        "tokio::sync::mpsc",
+        "mpsc::error",
+        "tokio::sync::mpsc::error",
+    ],
+    names: &[
+        ("Sender", "TokioSender"),
+        ("UnboundedSender", "TokioUnboundedSender"),
+        ("Receiver", "TokioReceiver"),
+        ("UnboundedReceiver", "TokioReceiver"),
+        ("channel", "__tokio_channel"),
+        ("unbounded_channel", "__tokio_unbounded_channel"),
+        ("SendError", "TokioSendError"),
+        ("TrySendError", "TokioTrySendError"),
+        ("TryRecvError", "TokioTryRecvError"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
+// `std::thread::LocalKey` (what `thread_local!` declares).
+const THREAD_RENAMES: Renames = Renames {
+    roots: &["thread", "std::thread", "::std::thread"],
+    names: &[("LocalKey", "LocalKey"), ("AccessError", "AccessError")],
+    star: &[],
+    result_err: None,
+};
+
 const PROCESS_RENAMES: Renames = Renames {
     roots: &["process", "std::process", "::std::process"],
     names: &[
@@ -2386,6 +2511,8 @@ const TOKIO_RENAMES: Renames = Renames {
         "tokio",
         "tokio::time",
         "tokio::task",
+        "tokio::sync",
+        "tokio::time::error",
         "futures",
         "futures::future",
         "futures_util::future",
@@ -2398,6 +2525,11 @@ const TOKIO_RENAMES: Renames = Renames {
         ("join_all", "js::Promise::all"),
         ("Duration", "Duration"),
         ("Instant", "Instant"),
+        ("Mutex", "TokioMutex"),
+        ("RwLock", "TokioRwLock"),
+        ("TryLockError", "TokioTryLockError"),
+        ("timeout", "__tokio_timeout"),
+        ("Elapsed", "TokioElapsed"),
     ],
     star: &[],
     result_err: None,
@@ -2808,6 +2940,10 @@ const ALL_RENAMES: &[&Renames] = &[
         &ALLOC_RENAMES,
         &FS_RENAMES,
         &PROCESS_RENAMES,
+        &ATOMIC_RENAMES,
+        &MPSC_RENAMES,
+        &TOKIO_MPSC_RENAMES,
+        &THREAD_RENAMES,
         &NET_RENAMES,
         &RUSTC_HASH_RENAMES,
         &LOG_RENAMES,
@@ -2858,12 +2994,30 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
         (text.contains(&format!("{last}::")) || text.contains(&format!("use {root}")))
             && !text.contains(&format!("mod {first}"))
     };
+    // (`mpsc::channel` is tokio's in a file that imports tokio's `mpsc`.)
+    let tokio_mpsc = text.contains("tokio::sync::mpsc")
+        || (text.contains("tokio::sync::{") && has_mpsc_in_tokio_use(text));
     for r in ALL_RENAMES.iter().copied() {
+        // (Consts have no one address: told apart by a root.)
+        if r.roots.contains(&"std::sync::mpsc") && tokio_mpsc
+            || r.roots.contains(&"tokio::sync::mpsc") && !tokio_mpsc
+        {
+            continue;
+        }
         if r.roots.iter().any(|root| has(root)) {
             out.push(r);
         }
     }
     out
+}
+
+/// Whether a `use tokio::sync::{..}` brings in `mpsc`.
+fn has_mpsc_in_tokio_use(text: &str) -> bool {
+    text.match_indices("tokio::sync::{").any(|(at, _)| {
+        let rest = &text[at..];
+        let end = rest.find('}').unwrap_or(rest.len());
+        crate::stdtime::has_word(&rest[..end], "mpsc")
+    })
 }
 
 /// Whether `text` uses a renamed crate.
@@ -3078,6 +3232,170 @@ fn tokio_rewrite(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, St
         TextRange::new(r.end(), call.syntax().text_range().end()),
         ").await) }".into(),
     ));
+}
+
+/// One branch of a `select!`: `pattern = future, if precondition => handler`.
+struct SelectBranch {
+    pat: String,
+    fut: String,
+    cond: Option<String>,
+    handler: String,
+}
+
+/// Where the top-level `=` of a `select!` branch is in `s` (not `==`, `=>`, `<=`, `..=`, ..),
+/// and the end of the handler that starts at `from`: these scan outside brackets and strings.
+fn select_scan(s: &str, from: usize, want: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut i) = (0i32, from);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ if depth == 0 => {
+                let prev = if i > 0 { b[i - 1] } else { b' ' };
+                let next = b.get(i + 1).copied().unwrap_or(b' ');
+                let hit = match want {
+                    "=" => b[i] == b'=' && !b"=!<>.".contains(&prev) && !b"=>".contains(&next),
+                    "=>" => b[i] == b'=' && next == b'>',
+                    _ => b[i] == b',',
+                };
+                if hit {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The branches of a `select!` body, its `else` handler, and whether it's `biased;`.
+fn select_branches(body: &str) -> Option<(Vec<SelectBranch>, Option<String>)> {
+    let mut rest = body.trim_start();
+    if let Some(r) = rest.strip_prefix("biased") {
+        rest = r.trim_start().strip_prefix(';')?.trim_start();
+    }
+    let mut branches = Vec::new();
+    let mut otherwise = None;
+    // The handler after `=>`, and what follows it.
+    let handler = |s: &str| -> Option<(String, String)> {
+        let s = s.trim_start();
+        if s.starts_with('{') {
+            let (inside, after) = braced(s)?;
+            let after = after.trim_start();
+            Some((
+                format!("{{{inside}}}"),
+                after.strip_prefix(',').unwrap_or(after).to_string(),
+            ))
+        } else {
+            match select_scan(s, 0, ",") {
+                Some(at) => Some((s[..at].to_string(), s[at + 1..].to_string())),
+                None => Some((s.to_string(), String::new())),
+            }
+        }
+    };
+    let mut owned;
+    while !rest.trim().is_empty() {
+        if let Some(r) = rest.strip_prefix("else") {
+            let r = r.trim_start().strip_prefix("=>")?;
+            let (h, after) = handler(r)?;
+            otherwise = Some(h);
+            owned = after;
+            rest = owned.trim_start();
+            continue;
+        }
+        let eq = select_scan(rest, 0, "=")?;
+        let arrow = select_scan(rest, eq + 1, "=>")?;
+        let pat = rest[..eq].trim().to_string();
+        let mid = rest[eq + 1..arrow].trim();
+        let (fut, cond) = match select_scan(mid, 0, ",") {
+            Some(c) => {
+                let cond = mid[c + 1..].trim().strip_prefix("if")?.trim().to_string();
+                (mid[..c].trim().to_string(), Some(cond))
+            }
+            None => (mid.to_string(), None),
+        };
+        let (h, after) = handler(&rest[arrow + 2..])?;
+        branches.push(SelectBranch {
+            pat,
+            fut,
+            cond,
+            handler: h,
+        });
+        owned = after;
+        rest = owned.trim_start();
+    }
+    (!branches.is_empty()).then_some((branches, otherwise))
+}
+
+/// `tokio::select! { pat = fut => handler, .. }`: a future polling each branch's future in turn
+/// (as `biased;`; tokio picks a random order) until one is ready with a value its pattern takes.
+/// A ready value the pattern doesn't take disables its branch, as does a false precondition;
+/// with all disabled, the `else` handler runs (or it panics, as tokio does). The futures that
+/// lose are dropped unfinished, so a channel's `recv()` (a hand-written future) loses nothing;
+/// an `async fn`'s promise keeps running in JS.
+fn tokio_select(body: &str, arities: &mut std::collections::BTreeSet<usize>) -> Option<String> {
+    let (branches, otherwise) = select_branches(body)?;
+    let n = branches.len();
+    arities.insert(n);
+    let mut out = String::from("{\n");
+    for (i, b) in branches.iter().enumerate() {
+        out.push_str(&format!("let mut __sel_f{i} = Box::pin({});\n", b.fut));
+    }
+    let offs: Vec<String> = branches
+        .iter()
+        .map(|b| match &b.cond {
+            Some(c) => format!("!({c})"),
+            None => "false".into(),
+        })
+        .collect();
+    out.push_str(&format!("let mut __sel_off = [{}];\n", offs.join(", ")));
+    out.push_str("match __future_poll_fn(move |__sel_cx| {\n");
+    for (i, b) in branches.iter().enumerate() {
+        out.push_str(&format!(
+            "if !__sel_off[{i}] {{ if let TaskPoll::Ready(__sel_v) = __sel_f{i}.as_mut().poll(__sel_cx) {{ if matches!(__sel_v, {pat}) {{ return TaskPoll::Ready(Some(__Select{n}::B{i}(__sel_v))); }} __sel_off[{i}] = true; }} }}\n",
+            pat = b.pat
+        ));
+    }
+    out.push_str(
+        "if __sel_off.iter().all(|o| *o) { return TaskPoll::Ready(None); }\nTaskPoll::Pending\n}).await {\n",
+    );
+    for (i, b) in branches.iter().enumerate() {
+        out.push_str(&format!(
+            "Some(__Select{n}::B{i}({})) => {},\n",
+            b.pat, b.handler
+        ));
+    }
+    let none = otherwise
+        .unwrap_or_else(|| "panic!(\"all branches are disabled and there is no else branch\")".into());
+    out.push_str(&format!("None => {none},\n"));
+    if branches.iter().any(|b| b.pat.trim() != "_" && !b.pat.trim().chars().all(|c| c.is_alphanumeric() || c == '_')) {
+        out.push_str("_ => unreachable!(),\n");
+    }
+    out.push('}');
+    out.push_str("\n}");
+    Some(out)
+}
+
+/// `enum __Select2<T0, T1> { B0(T0), B1(T1) }`: which branch of a 2-branch `select!` won.
+fn select_enum(n: usize) -> String {
+    let params: Vec<String> = (0..n).map(|i| format!("T{i}")).collect();
+    let variants: Vec<String> = (0..n).map(|i| format!("B{i}(T{i})")).collect();
+    format!(
+        "\nenum __Select{n}<{}> {{ {} }}\n",
+        params.join(", "),
+        variants.join(", ")
+    )
 }
 
 // ---------------------------------------------------------------- chrono-tz

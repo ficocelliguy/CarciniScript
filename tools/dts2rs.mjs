@@ -24,6 +24,8 @@
 //   name), `#[tag = "type"]` when every member is an interface with a distinct literal in one
 //   field (`#[js = "money"] Money(MoneyRequirement)`). The value is the JS value itself; a
 //   parameter of an enum type also takes any variant's payload directly.
+//   `flags(schema)` (`[string, any][]` in the d.ts) → `schema: &[(&str, FlagValue)]` returning
+//   `Flags` (`get_str(name)`, `rest`, ..)
 //   Bitburner's `Result<T>` → `NsResult { Success(SuccessResult), Failure(FailureResult) }` by
 //   `success`, with `into_result()`.
 //   `CodingContractObject` (a mapped type over the contract names) → one struct per contract
@@ -785,6 +787,10 @@ export function dtsToRust(text) {
       const rust = snakeCase(js);
       if (used.has(rust)) continue;
       used.add(rust);
+      if (js === "flags" && (name === "NS" || name === "AutocompleteData")) {
+        fns.push(`${docLines(overloads[0].node, "    ")}${name === "NS" ? FLAGS_DOC : FLAGS_DOC.replace("ns.flags", "data.flags")}    #[js = "flags"]\n    pub fn flags(&self, schema: &[(&str, ${flagValue()})]) -> Flags;\n`);
+        continue;
+      }
       const { params, ret } = mergeOverloads(
         overloads.map((o) => o.sig),
         `${name === "NS" ? "" : name}${pascal(js)}`,
@@ -806,6 +812,41 @@ export function dtsToRust(text) {
     if (fns.length) out += `impl ${name} {\n${fns.join("")}}\n`;
     return out;
   }
+
+  // `ns.flags(schema)`: the d.ts says `[string, any][]` and an index signature, so the schema's
+  // defaults are a `FlagValue` (what the game parses by: a string, number, boolean or string
+  // list) and the result is `Flags`, read by name through the runtime (`κσ.$jsv.$flagStr`).
+  const FLAGS_DOC = [
+    "",
+    "In Rust: `let f = ns.flags(&[(\"target\", \"n00dles\"), (\"threads\", 1), (\"loop\", false), (\"exclude\", vec![])]);`",
+    "then `f.get_str(\"target\")`, `f.get_f64(\"threads\")`, `f.get_bool(\"loop\")`, `f.get_list(\"exclude\")` and",
+    "`f.rest` (the arguments that aren't flags). For typed fields, `--help` and error messages, clap's",
+    "`#[derive(Parser)]` reads the script's arguments too (`Args::parse()`).",
+  ]
+    .map((l) => `    ///${l && " "}${l}\n`)
+    .join("");
+  function flagValue() {
+    return enumFor(["String", "f64", "bool", "Vec<String>"], "FlagValue", "flags", "string | number | boolean | string[]");
+  }
+  const FLAGS_STRUCT = [
+    "/// The result of `ns.flags(schema)`: each flag's value by name, and the other arguments.",
+    "#[debug_keys]",
+    "pub struct Flags {",
+    "    /// The arguments that aren't flags (`run x.rs --threads 4 n00dles` has `[\"n00dles\"]`).",
+    '    #[js = "_"]',
+    "    pub rest: Vec<ScriptArg>,",
+    "}",
+    "impl Flags {",
+    ...[
+      ["get", "flag", "Option<FlagValue>", "The flag's value, if the schema names it."],
+      ["get_str", "flagStr", "Option<String>", "The flag's value, if it's a string."],
+      ["get_f64", "flagF64", "Option<f64>", "The flag's value, if it's a number."],
+      ["get_bool", "flagBool", "Option<bool>", "The flag's value, if it's a boolean."],
+      ["get_list", "flagList", "Option<Vec<String>>", "The flag's values, if it's a list (a `vec![]` default; `--x a --x b`)."],
+    ].map(([rust, js, ret, doc]) => `    /// ${doc}\n    #[js = "${js}"]\n    #[runtime]\n    pub fn ${rust}(&self, name: &str) -> ${ret};`),
+    "}",
+    "",
+  ].join("\n");
 
   /** The readers an untagged enum gets, by the JS kinds of its payloads (what `JsValue` has). */
   const READERS = {
@@ -871,6 +912,7 @@ export function dtsToRust(text) {
       emitted.push(emitType(n));
     }
   }
+  if (enums.has("FlagValue")) emitted.push(FLAGS_STRUCT);
   for (const n of [...enums.keys()].sort()) emitted.push(emitEnum(n));
   return header + emitted.join("\n");
 }

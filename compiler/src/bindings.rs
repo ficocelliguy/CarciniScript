@@ -52,6 +52,9 @@ pub struct Method {
     pub getter: bool,
     /// `#[array]`: the result is array-like (a `NodeList`): made a JS array (`null` → empty).
     pub array: bool,
+    /// `#[runtime]`: the runtime's `κσ.$jsv.$<js>(value, ..)`, not a JS method of the value
+    /// (`flags.get_str("target")`, read off the game's plain object).
+    pub runtime: bool,
 }
 
 // Parameter names and docs are kept for the language service (hover, signature help).
@@ -138,6 +141,9 @@ pub struct ExternType {
     /// Whether it's declared as a struct (an interface a script can name and build), not only
     /// through an `impl`.
     pub is_struct: bool,
+    /// `#[debug_keys]`: `{:?}` also prints the object's other own keys (`Flags`: each flag by
+    /// name, which no field declares).
+    pub debug_keys: bool,
     /// Whether it's declared as an enum (a TS union), with `repr` and `variants`.
     pub is_enum: bool,
     pub repr: Option<Repr>,
@@ -562,6 +568,7 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
                 let Some(name) = s.name() else { continue };
                 let ty = bindings.types.entry(name.text().to_string()).or_default();
                 ty.is_struct = true;
+                ty.debug_keys = attr_value(&s, "debug_keys").is_some();
                 if let Some(bases) = attr_value(&s, "extends") {
                     ty.extends = bases
                         .split(',')
@@ -623,7 +630,7 @@ pub fn parse(text: &str) -> (Bindings, Vec<String>) {
     }
     let mut ram = HashSet::new();
     for t in bindings.types.values() {
-        ram.extend(t.methods.values().map(|m| m.js.clone()));
+        ram.extend(t.methods.values().filter(|m| !m.runtime).map(|m| m.js.clone()));
     }
     if let Some(ns) = bindings.types.get("NS") {
         ram.extend(ns.fields.values().map(|f| f.js.clone()));
@@ -686,6 +693,7 @@ fn method_of(f: &ast::Fn, structs: &HashSet<String>) -> Method {
         is_static: f.param_list().and_then(|l| l.self_param()).is_none(),
         getter: attr_value(f, "getter").is_some(),
         array: attr_value(f, "array").is_some(),
+        runtime: attr_value(f, "runtime").is_some(),
     }
 }
 

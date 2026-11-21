@@ -299,6 +299,7 @@ impl Checker<'_> {
                 }
                 _ => {}
             }
+            self.check_serde(&item);
         }
         // Hand-written comparison impls need their supertraits, as in rustc.
         let mut missing = Vec::new();
@@ -931,6 +932,75 @@ impl Checker<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// serde's attributes the JSON schema can't honour, reported where serde itself would
+    /// (at compile time for a tagged enum's tuple variants, at run time for the rest):
+    /// `#[serde(flatten)]` on anything but a struct or map, a tagged newtype variant whose
+    /// payload isn't one, and `with` / `serialize_with` / `deserialize_with`.
+    fn check_serde(&mut self, item: &ast::Item) {
+        let Some((name, info)) = crate::json::info_of(item) else {
+            return;
+        };
+        let Some(def) = self.adts.defs.get(&name).cloned() else {
+            return;
+        };
+        let node = item.syntax();
+        for v in &def.variants {
+            let variant = if def.is_enum { v.name.as_str() } else { "" };
+            for f in &v.fields {
+                let Some(a) = info.fields.get(&(variant.to_string(), f.name.clone())) else {
+                    continue;
+                };
+                if let Some(k) = &a.with {
+                    self.error(
+                        node,
+                        format!("`#[serde({k} = \"..\")]` is not supported (field `{}` of `{name}`): JSON goes by the field's type", f.name),
+                    );
+                }
+                if a.flatten && !self.flattenable(&f.ty) {
+                    self.error(
+                        node,
+                        format!("can only flatten structs and maps (field `{}` of `{name}` is `{}`)", f.name, f.ty.describe()),
+                    );
+                }
+            }
+        }
+        if info.content.is_some() && info.tag.is_none() {
+            self.error(node, "`#[serde(content = \"..\")]` can only be used together with `tag = \"..\"`");
+        }
+        if info.untagged && info.tag.is_some() {
+            self.error(node, "enum cannot be both untagged and internally tagged");
+        }
+        if def.is_enum && info.tag.is_some() && info.content.is_none() {
+            for v in &def.variants {
+                if v.shape != Shape::Tuple {
+                    continue;
+                }
+                if v.fields.len() > 1 {
+                    self.error(node, "#[serde(tag = \"...\")] cannot be used with tuple variants");
+                } else if !self.flattenable(&v.fields[0].ty) {
+                    self.error(
+                        node,
+                        format!("cannot serialize tagged newtype variant `{name}::{}` containing `{}` (its fields would have to be written next to the tag)", v.name, v.fields[0].ty.describe()),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a value of `ty` is written as a JSON object (so it can be flattened into another).
+    fn flattenable(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Map(..) | Ty::Param(_) | Ty::Unknown => true,
+            Ty::Coll(_, inner) | Ty::Option(inner) | Ty::RefCell(inner) => self.flattenable(inner),
+            Ty::Adt(n, _) => self
+                .adts
+                .defs
+                .get(n)
+                .is_none_or(|d| d.is_enum || d.variants[0].shape == Shape::Named),
+            _ => false,
         }
     }
 

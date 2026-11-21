@@ -182,6 +182,8 @@ function runOnPage(code, sourceMap, filename, { onEvent = () => {} } = {}) {
           return undefined;
         }
         emit({ type: "call", text: `ns.${path}(${args.map((a) => JSON.stringify(a)).join(", ")})` });
+        // (`ns.flags(schema)` with no arguments to parse: each flag's default.)
+        if (name === "flags") return { _: [], ...Object.fromEntries(args[0] ?? []) };
         if (!asyncFns.has(name)) return undefined;
         const ms = name === "sleep" ? Number(args[0]) || 0 : 50;
         return new Promise((r) => setTimeout(r, ms));
@@ -437,6 +439,7 @@ async function populateExamples() {
     ["fixtures/rust_tour.rs", "Rust tour for JS devs"],
     ["unsupported", "Unsupported features (diagnostics)"],
     ["ns/hack.rs", "ns/hack.rs"],
+    ["ns/flags.rs", "ns/flags.rs: typed ns.flags"],
     ["react/hack_monitor.rs", "React: a tail-window dashboard (jsx!)"],
     ...manifest.map((m) => [`fixtures/${m.file}`, `fixtures/${m.file}`]),
   ];

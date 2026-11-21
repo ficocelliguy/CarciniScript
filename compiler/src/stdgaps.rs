@@ -110,6 +110,9 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
         "Arguments",
         "Ref",
         "RefMut",
+        "MutexGuard",
+        "RwLockReadGuard",
+        "RwLockWriteGuard",
         "Infallible",
         "Read",
         "BufRead",
@@ -141,6 +144,7 @@ fn std_module(name: &str) -> Option<&'static str> {
         "OsStr" | "OsString" => "ffi",
         "Arguments" => "fmt",
         "Ref" | "RefMut" => "cell",
+        "MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard" => "sync",
         "Infallible" => "convert",
         "Read" | "BufRead" | "Cursor" => "io",
         n if nonzero_int(n).is_some() || n == "NonZero" => "num",
@@ -166,6 +170,9 @@ fn std_imports(file: &SourceFile) -> Vec<String> {
         "Arguments",
         "Ref",
         "RefMut",
+        "MutexGuard",
+        "RwLockReadGuard",
+        "RwLockWriteGuard",
         "Infallible",
         "NonZero",
         "NonZeroU8",
@@ -511,8 +518,9 @@ fn rewrite_other(
         return Some(next);
     }
     match name {
-        // `Ref<'_, T>` / `RefMut<'a, T>`: what `borrow()` / `borrow_mut()` give, the `T`.
-        "Ref" | "RefMut" => {
+        // `Ref<'_, T>` / `RefMut<'a, T>` (and the lock prelude's `MutexGuard<'_, T>`, ..): what
+        // `borrow()` / `borrow_mut()` (`lock().unwrap()`) give, the `T`.
+        "Ref" | "RefMut" | "MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard" => {
             if txt(i + 1) != "<" {
                 return Some(i + 1);
             }

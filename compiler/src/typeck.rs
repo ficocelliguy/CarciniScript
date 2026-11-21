@@ -389,6 +389,8 @@ impl<'a> Checker<'a> {
             js_imports: HashMap::new(),
             opaque_index_mut: Default::default(),
             static_muts: Default::default(),
+            macro_in_unsafe: false,
+            enum_payloads: false,
             statics: Default::default(),
             modules: Vec::new(),
             module_exports: HashMap::new(),
@@ -910,6 +912,12 @@ struct Checker<'a> {
     opaque_index_mut: std::collections::HashSet<String>,
     /// `static mut` items, by name: using one takes an `unsafe` block or function.
     static_muts: std::collections::HashSet<String>,
+    /// Checking the arguments of a macro called in an `unsafe` block (they are parsed on their
+    /// own, so the block isn't among their ancestors).
+    macro_in_unsafe: bool,
+    /// Checking an NS call's argument: its array and tuple literals take a variant's payload where
+    /// a bindings enum is expected (`ns.flags(&[("target", "home")])`), as the argument itself does.
+    enum_payloads: bool,
     /// The other `static` items, which can't be assigned to.
     statics: std::collections::HashSet<String>,
     /// Enclosing loops, innermost last: (label, the value type for a `loop`; None for
@@ -4058,7 +4066,15 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------ expressions
 
     fn infer(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> Ty {
+        // (`enum_payloads` reaches through `&`, parentheses, arrays and tuples only.)
+        let payloads = std::mem::take(&mut self.enum_payloads);
+        self.enum_payloads = payloads
+            && matches!(
+                e,
+                ast::Expr::RefExpr(_) | ast::Expr::ParenExpr(_) | ast::Expr::ArrayExpr(_) | ast::Expr::TupleExpr(_)
+            );
         let ty = self.infer_inner(e, expected);
+        self.enum_payloads = payloads;
         self.record(e.syntax(), ty)
     }
 
@@ -4084,6 +4100,30 @@ impl<'a> Checker<'a> {
         }
         self.expect(e.syntax(), &t, expected);
         t
+    }
+
+    /// A tuple field: inside an NS argument, a bindings enum takes a variant's payload.
+    fn infer_payload(&mut self, f: &ast::Expr, hint: Option<&Ty>) -> Ty {
+        if self.enum_payloads
+            && let Some(Ty::Extern(n)) = hint.map(|h| self.shallow(h))
+            && self.bindings.is_enum(&n)
+        {
+            self.check_enum_arg(f, &n);
+            return Ty::Extern(n);
+        }
+        self.infer(f, hint)
+    }
+
+    /// An array element: as `check`, or as `infer_payload` inside an NS argument.
+    fn check_payload_or(&mut self, item: &ast::Expr, elem: &Ty) {
+        if self.enum_payloads
+            && let Ty::Extern(n) = self.shallow(elem)
+            && self.bindings.is_enum(&n)
+        {
+            self.check_enum_arg(item, &n);
+        } else {
+            self.check(item, elem);
+        }
     }
 
     /// Mark `e` (of type `adt`) as auto-dereferenced to `target`.
@@ -4601,7 +4641,7 @@ impl<'a> Checker<'a> {
                     fields
                         .iter()
                         .enumerate()
-                        .map(|(i, f)| self.infer(f, hints.get(i)))
+                        .map(|(i, f)| self.infer_payload(f, hints.get(i)))
                         .collect(),
                 )
             }
@@ -4628,7 +4668,7 @@ impl<'a> Checker<'a> {
                 match a.kind() {
                     ast::ArrayExprKind::ElementList(items) => {
                         for item in items {
-                            self.check(&item, &elem);
+                            self.check_payload_or(&item, &elem);
                         }
                     }
                     ast::ArrayExprKind::Repeat {
@@ -4691,7 +4731,9 @@ impl<'a> Checker<'a> {
                 return local.ty;
             }
             if let Some(t) = self.consts.get(name.text().to_string().as_str()).cloned() {
-                if self.static_muts.contains(name.text()) && !in_unsafe(p.syntax()) {
+                if self.static_muts.contains(name.text())
+                    && !self.macro_in_unsafe
+                    && !in_unsafe(p.syntax()) {
                     self.error(
                         p.syntax(),
                         "use of mutable static is unsafe and requires unsafe block",
@@ -4758,7 +4800,9 @@ impl<'a> Checker<'a> {
             .collect();
         if let [single] = self.strip_modules(&segs).as_slice() {
             if let Some(t) = self.consts.get(single).cloned() {
-                if self.static_muts.contains(single) && !in_unsafe(p.syntax()) {
+                if self.static_muts.contains(single)
+                    && !self.macro_in_unsafe
+                    && !in_unsafe(p.syntax()) {
                     self.error(
                         p.syntax(),
                         "use of mutable static is unsafe and requires unsafe block",
@@ -5869,7 +5913,9 @@ impl<'a> Checker<'a> {
                 self.record(a.syntax(), ty);
             } else {
                 let before = self.diags.len();
+                self.enum_payloads = true;
                 self.check(a, &ty);
+                self.enum_payloads = false;
                 // `ns.hack(t)` with `t: String` where the parameter is `&str`: rustc's E0308.
                 if self.diags.len() == before
                     && let Some(p) = sig.params.get(i)
@@ -7629,6 +7675,14 @@ impl<'a> Checker<'a> {
     }
 
     fn macro_call(&mut self, mc: &ast::MacroCall, expected: Option<&Ty>) -> Ty {
+        let saved = self.macro_in_unsafe;
+        self.macro_in_unsafe |= in_unsafe(mc.syntax());
+        let t = self.macro_call_inner(mc, expected);
+        self.macro_in_unsafe = saved;
+        t
+    }
+
+    fn macro_call_inner(&mut self, mc: &ast::MacroCall, expected: Option<&Ty>) -> Ty {
         let Some(name) = macros::macro_name(mc) else {
             return Ty::Unknown;
         };

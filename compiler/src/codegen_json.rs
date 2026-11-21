@@ -340,12 +340,13 @@ impl Codegen<'_> {
                                 super::adt_gen::prop(&f.js)
                             };
                             format!(
-                                "{{key:{},js:{},s:{},def:{def},skipOut:{},skipIn:{}}}",
+                                "{{key:{},js:{},s:{},def:{def},skipOut:{},skipIn:{}{}}}",
                                 js_string(&key),
                                 js_string(&js),
                                 cg.json_schema(&ft, stack),
                                 attrs.skip_serializing,
-                                attrs.skip_deserializing
+                                attrs.skip_deserializing,
+                                if attrs.flatten { ",flatten:true" } else { "" }
                             )
                         })
                         .collect();
@@ -357,6 +358,12 @@ impl Codegen<'_> {
                     Shape::Unit => "unit",
                 };
                 let cls = self.class(n);
+                // `#[serde(tag = "type")]` (and `content = "c"`): the variant's (or struct's)
+                // name as a field of the object.
+                let tagging = [("tag", &info.tag), ("content", &info.content)]
+                    .into_iter()
+                    .filter_map(|(k, v)| v.as_ref().map(|v| format!(",{k}:{}", js_string(v))))
+                    .collect::<String>();
                 let body = if def.is_enum {
                     let vs: Vec<String> = def
                         .variants
@@ -377,7 +384,7 @@ impl Codegen<'_> {
                         })
                         .collect();
                     format!(
-                        "{{t:\"enum\",name:{},cls:{cls},variants:[{}]{}}}",
+                        "{{t:\"enum\",name:{},cls:{cls},variants:[{}]{}{tagging}}}",
                         js_string(n),
                         vs.join(","),
                         if info.untagged { ",untagged:true" } else { "" }
@@ -385,7 +392,7 @@ impl Codegen<'_> {
                 } else {
                     let v = &def.variants[0];
                     format!(
-                        "{{t:\"struct\",name:{},cls:{cls},shape:\"{}\",fields:{}}}",
+                        "{{t:\"struct\",name:{},cls:{cls},shape:\"{}\",fields:{}{tagging}}}",
                         js_string(n),
                         shape(v.shape),
                         fields_js(self, "", v, info.rename_all.as_deref(), stack)

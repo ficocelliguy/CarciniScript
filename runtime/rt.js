@@ -5031,6 +5031,15 @@
     f.$caps = caps;
     return f;
   };
+  // An `async move` block that owns captured values with a `Drop` impl: they drop when it
+  // finishes (before whoever awaits it goes on).
+  rt.$ownAsync = (p, caps) => {
+    const done = () => {
+      for (const x of caps) rt.$drop(x);
+    };
+    p.then(done, done);
+    return p;
+  };
   // The end of a block: its values, last declared first.
   rt.$dropAll = (list) => {
     for (let i = list.length - 1; i >= 0; i--) list[i]();
@@ -5099,38 +5108,77 @@
       case "result":
         return obj([[v.$tag === 0 ? "Ok" : "Err", sub(v[0], v.$tag === 0 ? s.ok : s.err)]]);
       case "struct":
+        // `#[serde(tag = "..")]` on a struct: its name as a field before its own.
+        if (s.tag !== undefined) return obj(jsonPairs(v, s, sub));
         return jsonFields(v, s.shape, s.fields, pretty, ind, obj, arr, sub);
       case "enum": {
         const variant = s.variants[v.$tag];
         // `#[serde(untagged)]`: the content alone (`null` for a unit variant).
-        if (s.untagged) {
-          if (variant.shape === "unit") return "null";
-          return jsonFields(v, variant.shape, variant.fields, pretty, ind, obj, arr, sub);
-        }
+        if (s.untagged) return jsonFields(v, variant.shape, variant.fields, pretty, ind, obj, arr, sub);
+        // `#[serde(tag = "..")]`: an object with the variant's name as a field.
+        if (s.tag !== undefined) return obj(jsonPairs(v, s, sub));
         if (variant.shape === "unit") return JSON.stringify(variant.key);
-        const content = (ind2) =>
-          jsonFields(v, variant.shape, variant.fields, pretty, ind2, objAt(ind2), arrAt(ind2), (x, ss) =>
-            jsonOut(x, ss, pretty, ind2 + "  "),
-          );
-        return obj([[variant.key, content(inner)]]);
+        return obj([[variant.key, sub(v, variantSchema(variant))]]);
       }
       default:
         return JSON.stringify(v) ?? "null";
     }
-    function objAt(i2) {
-      return (pairs) => {
-        if (pairs.length === 0) return "{}";
-        const sep = pretty ? ": " : ":";
-        const items = pairs.map(([k, x]) => JSON.stringify(k) + sep + x);
-        return pretty ? `{\n${items.map((i) => i2 + "  " + i).join(",\n")}\n${i2}}` : `{${items.join(",")}}`;
-      };
+  }
+
+  // A variant's content as a struct schema (the variant object has the same properties).
+  const variantSchema = (variant) => ({ t: "struct", shape: variant.shape, fields: variant.fields });
+
+  // The `key: text` pairs of a value written as a JSON object (`sub` writes a nested value), or
+  // `null` for a value that isn't one: a struct's fields, a map's entries, a tagged enum's tag
+  // and content, a `#[serde(flatten)]` field's pairs in place of its own key.
+  function jsonPairs(v, s, sub) {
+    s = jsonSchema(s);
+    const tag = (key) => [s.tag, JSON.stringify(key)];
+    switch (s.t) {
+      case "struct": {
+        if (s.shape !== "named") return null;
+        const pairs = fieldPairs(v, s.fields, sub);
+        return s.tag === undefined ? pairs : [tag(s.name), ...pairs];
+      }
+      case "map":
+        return Array.from(v.$entries(), ([k, x]) => [String(k), sub(x, s.v)]);
+      case "opt":
+        return v == null ? [] : jsonPairs(unsome(v), s.s, sub);
+      case "cell":
+        return jsonPairs(v.v, s.s, sub);
+      case "enum": {
+        const variant = s.variants[v.$tag];
+        const content = () => {
+          if (variant.shape === "named") return fieldPairs(v, variant.fields, sub);
+          if (variant.shape === "unit") return [];
+          return variant.fields.length === 1 ? jsonPairs(v[0], variant.fields[0].s, sub) : null;
+        };
+        if (s.untagged) return content();
+        if (s.tag === undefined) return variant.shape === "unit" ? null : [[variant.key, sub(v, variantSchema(variant))]];
+        // Adjacently tagged (`content = ".."`): the content under its own key.
+        if (s.content !== undefined) {
+          return variant.shape === "unit" ? [tag(variant.key)] : [tag(variant.key), [s.content, sub(v, variantSchema(variant))]];
+        }
+        // Internally tagged: the content's own pairs after the tag (a newtype variant's struct).
+        const c = content();
+        return c && [tag(variant.key), ...c];
+      }
+      default:
+        return null;
     }
-    function arrAt(i2) {
-      return (items) => {
-        if (items.length === 0) return "[]";
-        return pretty ? `[\n${items.map((i) => i2 + "  " + i).join(",\n")}\n${i2}]` : `[${items.join(",")}]`;
-      };
+  }
+
+  function fieldPairs(v, fields, sub) {
+    const out = [];
+    for (const f of fields) {
+      if (f.skipOut) continue;
+      if (f.flatten) {
+        const pairs = jsonPairs(v[f.js], f.s, sub);
+        if (pairs === null) throw new JsonError("can only flatten structs and maps");
+        out.push(...pairs);
+      } else out.push([f.key, sub(v[f.js], f.s)]);
     }
+    return out;
   }
 
   // A struct's (or variant's) fields: an object, an array (tuple), the value itself (one
@@ -5141,7 +5189,7 @@
       if (fields.length === 1) return jsonOut(v[0], fields[0].s, pretty, ind);
       return arr(fields.map((f, i) => sub(v[i], f.s)));
     }
-    return obj(fields.filter((f) => !f.skipOut).map((f) => [f.key, sub(v[f.js], f.s)]));
+    return obj(fieldPairs(v, fields, sub));
   }
 
   rt.$jsonStringify = (v, schema, pretty) => jsonOut(v, schema, pretty, "");
@@ -5912,10 +5960,19 @@
   // `{:?}` of an NS interface value: `Server { hostname: "home", max_ram: 8.0 }` over its
   // declared fields (`[[jsName, rustName, fmt], ..]`); a field the object lacks is left out
   // (an `Option` one prints `None`).
-  rt.$dbgIface = (name, o, fields) => {
+  // With `keys` (`#[debug_keys]`), the object's other own keys come first, their values as JS
+  // has them (`Flags { target: "n00dles", threads: 8.0, rest: [] }`).
+  rt.$dbgIface = (name, o, fields, keys) => {
     if (o === null || typeof o !== "object") return rt.$dbg(o);
     const shown = fields.filter(([js, , fmt]) => js in o || /\$dbgOpt/.test(String(fmt)));
-    return rt.$dbgStruct(name, shown.map(([, rust]) => rust), shown.map(([js, , fmt]) => fmt(o[js] ?? null)));
+    const declared = new Set(fields.map(([js]) => js));
+    const extra = keys ? Object.keys(o).filter((k) => !declared.has(k)) : [];
+    const plain = (v) => (Array.isArray(v) ? `[${v.map(plain).join(", ")}]` : rt.$dbg(v));
+    return rt.$dbgStruct(
+      name,
+      [...extra, ...shown.map(([, rust]) => rust)],
+      [...extra.map((k) => plain(o[k])), ...shown.map(([js, , fmt]) => fmt(o[js] ?? null))],
+    );
   };
   // `ScriptArg::try_from(v)`: `Ok(v)` when the value fits a variant, else `Err(v)`.
   rt.$jsEnumTry = (v, variants, tag) => (jsEnumVariant(v, variants, tag) ? rt.Ok(v) : rt.Err(v));
@@ -5926,6 +5983,12 @@
     $asText: (v) => String(v),
     // (`NsResult::into_result()`: the game's `{ success, message }` as a `Result`.)
     $nsResult: (v) => (v != null && v.success ? rt.Ok(v) : rt.Err(v == null ? "" : String(v.message ?? ""))),
+    // (`Flags`' readers: `ns.flags(..)`'s plain object, by flag name.)
+    $flag: (o, k) => (o != null && Object.hasOwn(o, k) && k !== "_" ? o[k] : null),
+    $flagStr: (o, k) => (typeof o?.[k] === "string" ? o[k] : null),
+    $flagF64: (o, k) => (typeof o?.[k] === "number" ? o[k] : null),
+    $flagBool: (o, k) => (typeof o?.[k] === "boolean" ? o[k] : null),
+    $flagList: (o, k) => (k !== "_" && Array.isArray(o?.[k]) ? o[k] : null),
     $asString: (v) => (typeof v === "string" ? v : null),
     $asF64: (v) => (typeof v === "number" ? v : null),
     $asBool: (v) => (typeof v === "boolean" ? v : null),
@@ -5971,7 +6034,15 @@
     const ws = () => {
       while (i < text.length && " \t\n\r".includes(text[i])) i++;
     };
+    // (`b`: where a value begins, for "trailing characters" after a tuple's last element.)
     const value = (what) => {
+      ws();
+      const b = i;
+      const node = value0(what);
+      node.b = b;
+      return node;
+    };
+    const value0 = (what) => {
       ws();
       if (i >= text.length) fail(`EOF while parsing ${what}`);
       const c = text[i];
@@ -6150,7 +6221,7 @@
         if (s.shape === "tuple") return s.fields.length === 1 ? `tuple struct ${s.name}` : `tuple struct ${s.name}`;
         return `struct ${s.name}`;
       case "enum":
-        return `enum ${s.name}`;
+        return s.tag === undefined ? `enum ${s.name}` : s.content === undefined ? `internally tagged enum ${s.name}` : `adjacently tagged enum ${s.name}`;
       case "jsonvalue":
         return "any valid JSON value";
       default:
@@ -6342,23 +6413,77 @@
           e.noPos = true;
           throw e;
         }
+        const unknown = (key) => new JsonError(`unknown variant \`${key}\`, ${oneOf(s.variants.map((v) => v.key))}`);
+        // (An error in the content is placed at its end, as serde_json places it.)
+        const err = (node, e) => {
+          if (e instanceof JsonError && e.at === undefined) {
+            e.at = node.e;
+            e.kind = "data";
+          }
+          return e;
+        };
+        const build = (variant, content) => {
+          const expecting = variant.shape === "named" ? `struct variant ${s.name}::${variant.js}` : `tuple variant ${s.name}::${variant.js}`;
+          try {
+            return jsonBuild(content, variant.shape, variant.fields, expecting, (args) => s.cls[variant.js](...args));
+          } catch (e) {
+            throw err(content, e);
+          }
+        };
+        // `#[serde(tag = "..")]`: an object whose tag field names the variant; the content is
+        // the other fields (internally tagged) or the `content` field (adjacently tagged).
+        if (s.tag !== undefined) {
+          let entry;
+          let rest;
+          if (n.k === "obj") {
+            entry = n.v.find(([k]) => k === s.tag);
+            if (!entry) throw new JsonError(`missing field \`${s.tag}\``);
+            entry = entry[1];
+            rest = { k: "obj", v: n.v.filter(([k]) => k !== s.tag), e: n.e };
+          } else if (n.k === "arr" && s.content === undefined && n.v.length > 0) {
+            // (Internally tagged, from a sequence: the tag first, then the content.)
+            entry = n.v[0];
+            rest = n.v[1] ?? { k: "obj", v: [], e: n.e };
+          } else throw jsonInvalid(n, s);
+          if (entry.k !== "str") throw err(entry, jsonInvalid(entry, "variant identifier"));
+          const variant = s.variants.find((v) => v.key === entry.v);
+          if (!variant) throw err(entry, unknown(entry.v));
+          if (s.content === undefined) {
+            // serde reads the content from a buffer once the text is read: its errors have no
+            // position.
+            try {
+              if (variant.shape === "unit") return s.cls[variant.js];
+              if (variant.shape === "tuple" && variant.fields.length === 1) return s.cls[variant.js](jsonIn(rest, variant.fields[0].s));
+              return build(variant, rest);
+            } catch (e) {
+              if (e instanceof JsonError) e.noPos = true;
+              throw e;
+            }
+          }
+          const content = n.v.find(([k]) => k === s.content);
+          if (variant.shape === "unit") {
+            if (content && content[1].k !== "null") throw err(content[1], jsonInvalid(content[1], `unit variant ${s.name}::${variant.js}`));
+            return s.cls[variant.js];
+          }
+          if (!content) throw new JsonError(`missing field \`${s.content}\``);
+          return build(variant, content[1]);
+        }
         let key;
         let content = null;
         if (n.k === "str") key = n.v;
         else if (n.k === "obj" && n.v.length === 1) [key, content] = n.v[0];
         else throw jsonInvalid(n, s);
         const variant = s.variants.find((v) => v.key === key);
-        if (!variant) throw new JsonError(`unknown variant \`${key}\`, ${oneOf(s.variants.map((v) => v.key))}`);
+        if (!variant) throw unknown(key);
         if (variant.shape === "unit") {
-          if (content !== null && content.k !== "null") throw jsonInvalid(content, "unit variant");
+          if (content !== null && content.k !== "null") throw err(content, jsonInvalid(content, "unit"));
           return s.cls[variant.js];
         }
         if (content === null) {
           const what = variant.shape === "named" ? "struct variant" : variant.fields.length === 1 ? "newtype variant" : "tuple variant";
           throw new JsonError(`invalid type: unit variant, expected ${what}`);
         }
-        const expecting = variant.shape === "named" ? `struct variant ${s.name}::${variant.js}` : `tuple variant ${s.name}::${variant.js}`;
-        return jsonBuild(content, variant.shape, variant.fields, expecting, (args) => s.cls[variant.js](...args));
+        return build(variant, content);
       }
       default:
         return jsonPlain(n);
@@ -6378,28 +6503,95 @@
       if (n.v.length < live.length) {
         throw new JsonError(`invalid length ${n.v.length}, expected ${expect} with ${live.length} element${live.length === 1 ? "" : "s"}`);
       }
-      if (n.v.length > live.length) throw new JsonError("trailing characters");
+      if (n.v.length > live.length) {
+        // (A syntax error to serde_json, where it finds the extra element.)
+        const e = new JsonError("trailing characters");
+        e.at = n.v[live.length].b + 1;
+        e.kind = "syntax";
+        throw e;
+      }
       let k = 0;
       return make(fields.map((f) => (f.skipIn ? f.def() : jsonIn(n.v[k++], f.s))));
     }
     if (shape === "tuple" || n.k !== "obj") throw jsonInvalid(n, expect);
     const seen = new Set();
     const got = new Map();
+    // (The entries no named field takes: a `#[serde(flatten)]` field's.)
+    const rest = [];
     for (const [k, x] of n.v) {
-      const f = fields.find((f) => f.key === k && !f.skipIn);
-      if (!f) continue;
+      const f = fields.find((f) => f.key === k && !f.skipIn && !f.flatten);
+      if (!f) {
+        rest.push([k, x]);
+        continue;
+      }
       if (seen.has(k)) throw new JsonError(`duplicate field \`${k}\``);
       seen.add(k);
       got.set(f, x);
     }
     return make(
       fields.map((f) => {
+        if (f.flatten && !f.skipIn) return jsonFlat(rest, f.s, n.e);
         if (got.has(f)) return jsonIn(got.get(f), f.s);
         if (f.def) return f.def();
         if (jsonSchema(f.s).t === "opt") return null;
         throw new JsonError(`missing field \`${f.key}\``);
       }),
     );
+  }
+
+  // A `#[serde(flatten)]` field from the entries no named field took (`rest`, which it takes its
+  // own from, in field order: a struct its fields', a map all that are left). An `Option` is
+  // `None` when they don't fit.
+  function jsonFlat(rest, s, end) {
+    s = jsonSchema(s);
+    const node = { k: "obj", v: rest.slice(), e: end };
+    let out;
+    try {
+      out = jsonIn(node, s.t === "opt" ? s.s : s);
+    } catch (e) {
+      if (!(e instanceof JsonError)) throw e;
+      if (s.t === "opt") return null;
+      // (serde reads it from a buffer of the entries once the object is read: the error is at
+      // the object's end.)
+      e.at = end;
+      e.noPos = false;
+      throw e;
+    }
+    if (s.t === "opt") out = some(out);
+    const taken = jsonTakes(s);
+    if (taken === null) rest.length = 0;
+    else for (let i = rest.length - 1; i >= 0; i--) if (taken.has(rest[i][0])) rest.splice(i, 1);
+    return out;
+  }
+
+  // The keys a flattened value takes from the object: a struct's fields' (and its own flattened
+  // fields'), or `null` for all of them (a map).
+  function jsonTakes(s) {
+    s = jsonSchema(s);
+    switch (s.t) {
+      case "map":
+        return null;
+      case "opt":
+      case "cell":
+        return jsonTakes(s.s);
+      case "struct": {
+        const out = new Set();
+        if (s.shape !== "named") return out;
+        if (s.tag !== undefined) out.add(s.tag);
+        for (const f of s.fields) {
+          if (!f.flatten) {
+            out.add(f.key);
+            continue;
+          }
+          const inner = jsonTakes(f.s);
+          if (inner === null) return null;
+          for (const k of inner) out.add(k);
+        }
+        return out;
+      }
+      default:
+        return new Set();
+    }
   }
 
   // `mode`: undefined for `js::JSON` (its `JsonError`), "pos" for `serde_json::from_str` (a

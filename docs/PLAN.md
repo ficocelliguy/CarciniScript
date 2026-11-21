@@ -262,10 +262,18 @@ items and the idioms of the corpus scripts); **undocumented** means in neither g
   `mod`s and `include_str!`s are next to it; `include_str!` / `include!` now read next to the
   file they're in (also `/lib/..`), falling back to the path as written. `super::` from a module
   file stays not planned (above).
-- [ ] **2. `#[serde(tag = "..")]`, `#[serde(content = "..")]` and `#[serde(flatten)]` are silently
-  ignored.** An internally tagged enum is written externally tagged, then fails to read its own
-  output (`unknown variant `type``). Tagged enums are the natural port-message protocol between
-  scripts. `serialize_with` already errors; these should work or error the same way.
+- [x] **2. `#[serde(tag = "..")]`, `#[serde(content = "..")]` and `#[serde(flatten)]`** (done
+  2026-11-20): were silently ignored, so an internally tagged enum was written externally tagged
+  and failed to read its own output. Now the schema carries the tagging and the flattened fields
+  (`json.rs`, `codegen_json.rs`), the runtime writes an object's pairs through one function
+  (`jsonPairs`: a struct's fields, a map's entries, a tagged enum's tag and content, a flattened
+  field's pairs in place) and reads a tagged enum from its tag field (or the tag-first sequence
+  form) and a flattened field from the keys no named field took, with serde_json's messages and
+  positions (an internally tagged enum's content errors have none, serde reads it from a buffer).
+  What serde rejects is a compile error (`typeck_adt.rs` `check_serde`): tuple variants and
+  non-struct newtype payloads in an internally tagged enum, `flatten` on anything but a struct,
+  map or `Option` of one, `content` without `tag`, and `with` / `serialize_with` /
+  `deserialize_with`. Diff-tested in `test/fixtures/serde_tagged.rs`.
 - [x] **3. Integer-valued NS results are all `f64`** (done 2026-11-20): ports required, pids,
   thread counts, `hacknet.numNodes()`, levels, Go coordinates and the rest are `i32` now
   (`isWholeNumber` in `tools/dts2rs.mjs`, see "NS bindings"), so `pid == 0`,
@@ -274,20 +282,34 @@ items and the idioms of the corpus scripts); **undocumented** means in neither g
   is accepted for an `i32` enum payload (`ns.exec(.., threads)` with a `usize`), as for `f64`.
   Left as `f64` on purpose: shares (past 2^31), hashes (fractional), favor and HP (unsure they
   stay whole), contract `data` (one is up to 2^57).
-- [ ] **4. `std::sync` and tokio's sync primitives as single-threaded shims.** `Mutex`, `RwLock`,
-  the atomics, `thread_local!`, `std::sync::mpsc`, `tokio::sync::mpsc`, `tokio::select!` and
-  `tokio::time::timeout` all error, though `Arc` is already erased and the lazy / once cells are
-  a prelude (`sync_prelude.rs`). The only way to hold mutable module-level state in valid Rust
-  today is `static mut` plus `unsafe`, and reading a `static mut` inside a macro inside an
-  `unsafe` block is rejected ("requires unsafe block", undocumented). `select!` / `timeout` are
-  how a Rust author writes "wait for a port write or a deadline" (`Promise::race` exists, but
-  isn't what they reach for). `Mutex` = `RefCell` with `lock()` as `Ok(borrow_mut())`; a channel
-  = a `VecDeque` with an awaitable `recv`.
-- [ ] **5. `ns.flags` ergonomics.** The schema needs `JsValue::from(("target", "home"))` per
-  entry and the result is a `JsValue`; `serde_wasm_bindgen::from_value::<Flags>(..)` reads it
-  into a struct fine. clap's `Args::parse()` already reads `ns.args` and matches
-  `run x.rs --target n00dles`, so this is a docs item (point players to clap) plus a
-  `&[(&str, ScriptArg)]`-style schema now that the unions are typed (see "NS bindings").
+- [x] **4. `std::sync` and tokio's sync primitives as single-threaded shims** (done 2026-11-21).
+  `Mutex`, `RwLock`, the atomics, `thread_local!`, `std::sync::mpsc`, `tokio::sync::{Mutex,
+  RwLock, mpsc}`, `tokio::select!` and `tokio::time::timeout` all errored, leaving `static mut`
+  plus `unsafe` as the only mutable module-level state. Now a lock prelude
+  (`lock_prelude.rs`): a lock is a `RefCell` and `m.lock().unwrap()` / `m.lock().await` is its
+  value in place (`codegen.rs` `lock_place`), an atomic a `Cell`, `thread_local!` a `static`
+  `LocalKey` (`bundled.rs`), `atomic::Ordering` renamed `AtomicOrdering` (`std::cmp::Ordering`
+  keeps its name), `MutexGuard<'_, T>` the `T` (`stdgaps.rs`, as `RefMut`). std `mpsc` is a
+  shared queue whose empty `recv` is an error; tokio's is a hand-written future woken by
+  `send`, closing when its last sender drops, so `select!` (rewritten to a `poll_fn` over the
+  branches, `bundled.rs` `tokio_select`) loses nothing to a losing `recv()`. Along the way: an
+  `async move` block now owns and drops its `Drop` captures (a sender moved into a spawned task
+  closes the channel when the task ends); an expression-bodied closure whose body hoists a
+  statement (`|m| *m.entry(k).or_insert(0) += 1`) keeps it inside; a `static mut` read in a
+  macro's arguments inside `unsafe` is accepted; the runtime's waker for a polled promise
+  (`wake_by_ref`) is never pruned. Diff-tested in `sync_locks.rs` and `sync_mpsc.rs`, tokio
+  in `test/ns/tokio_sync.rs`. Left: see RUST_GAPS.md "`std::sync` is single-threaded".
+- [x] **5. `ns.flags` ergonomics** (done 2026-11-21). The schema was `&[JsValue]` built with
+  `JsValue::from(("target", "home"))` and the result a `JsValue`. Now `dts2rs.mjs` emits
+  `flags(&self, schema: &[(&str, FlagValue)]) -> Flags` (`FlagValue`: string, number, boolean or
+  string list), so `ns.flags(&[("target", "home"), ("threads", 1), ("exclude", vec![])])` type-checks
+  (an NS argument's array and tuple literals take a variant's payload, `typeck.rs`
+  `enum_payloads`) and `Flags` reads by name (`get_str` / `get_f64` / `get_bool` / `get_list`,
+  `#[runtime]` bindings methods over `κσ.$jsv.$flagStr` ..) with `rest` for `_`. Its hover docs
+  and the README point to clap for typed fields and `--help`. A default built ahead of time is
+  `"home".into()` or `FlagValue::from(..)` (any bindings enum, from a variant's payload), and
+  `{:?}` of `Flags` shows each flag (`#[debug_keys]`). Tested in `test/ns/flags.rs` (wrong-type
+  defaults in `test/run.mjs`'s NS rejects), an example in the web REPL.
 - [ ] **6. An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
   are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
   Compile the tests to a `main` that runs each and prints libtest's summary.

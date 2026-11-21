@@ -316,9 +316,19 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `BigInt`, `Rational` or `Complex`). `Signed::abs(&x)` written as a trait path doesn't work on
   a built-in type; `x.abs()` does.
 - **tokio runs on the script's event loop.** `join!` awaits its futures in turn after starting
-  them all (they run together, as in tokio); a spawned task starts when `spawn` is called; there's
-  no `tokio::sync` (`Mutex`, channels), `select!`, `interval` or `timeout`, and a panicking task
-  ends the script instead of giving `Err(JoinError)`.
+  them all (they run together, as in tokio); a spawned task starts when `spawn` is called; a
+  panicking task ends the script instead of giving `Err(JoinError)`. `select!` polls its branches
+  in order (tokio picks at random) and can't cancel a losing `async fn` (a JS promise runs on;
+  a channel's `recv()` is cancel-safe). Locks never wait, so a tokio `Mutex` held across an
+  `.await` doesn't keep other tasks out. No `interval`, `oneshot`, `broadcast`, `watch` or
+  `Notify`, and `time::timeout` with `use tokio::time;` must be spelled `tokio::time::timeout`.
+- **`std::sync` is single-threaded.** Locks never block, fail or poison (`try_lock` is always
+  `Ok`, a second `lock()` while the first guard lives is no deadlock), atomics ignore their
+  `Ordering`, and a std `mpsc` `recv()` on an empty channel is `Err(RecvError)` instead of
+  waiting. A guard bound by a pattern (`if let Ok(mut g) = m.lock()`, `match m.lock()`) holds
+  a copy when the value is a number or `String`, so writes through it are lost; `lock().unwrap()`
+  in an expression or a `let` writes through. `LockResult<T>` / `TryLockResult<T>` aren't
+  names here (write the `Result`).
 - **rayon runs on one thread.** Results are what one thread gives, so they match rayon's except
   where rayon's own order isn't fixed (`par_bridge`, `for_each` side effects). There's no
   `ThreadPoolBuilder`, `rayon::scope` or `par_iter().update(..)`, and rayon's method names
@@ -514,8 +524,11 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **`JSON` goes by the static type.** It writes and reads what serde_json would for the type in
   the source, so a value behind a type parameter in a generic function is written as JS sees it
   (`JSON::stringify(&x)` with `x: T` gives JS's `JSON.stringify`). The serde derives aren't
-  needed, and only the `#[serde(..)]` attributes listed in FEATURES apply (no `flatten`,
-  `tag`/`untagged` enums, `with`, or custom `Serialize` impls).
+  needed, and only the `#[serde(..)]` attributes listed in FEATURES apply (`with` /
+  `serialize_with` / `deserialize_with` and custom `Serialize` impls are compile errors;
+  `deny_unknown_fields`, `alias`, `borrow`, `bound`, `transparent`, `from` / `into` and
+  `skip_serializing_if` are ignored). A flattened field's errors are at the end of its object,
+  as serde's; a flattened externally tagged enum reads only when no other key is left for it.
 - **Integers past `u64` / `i64` are floats to serde_json**, so they're rejected with its "invalid
   type: floating point" error, and a JSON integer past 2^53 read as `u64` / `i64` rounds like any
   64-bit number here (`i128` / `u128` read them exactly).

@@ -1,6 +1,6 @@
 //! serde's attributes for `JSON::stringify` / `JSON::parse`: `#[serde(rename = "..")]`,
-//! `#[serde(rename_all = "camelCase")]`, `#[serde(skip)]`, `#[serde(default)]` on the structs
-//! and enums of a file. (`#[derive(Serialize, Deserialize)]` itself is accepted and not needed:
+//! `#[serde(rename_all = "camelCase")]`, `#[serde(skip)]`, `#[serde(default)]`, `#[serde(flatten)]`,
+//! `#[serde(tag = "..")]` / `content` / `untagged` on the structs and enums of a file. (`#[derive(Serialize, Deserialize)]` itself is accepted and not needed:
 //! JSON goes by the static type.)
 
 use std::collections::HashMap;
@@ -17,6 +17,12 @@ pub struct FieldAttrs {
     pub skip_serializing: bool,
     pub skip_deserializing: bool,
     pub default: bool,
+    /// `#[serde(flatten)]`: the field's own keys are written into (and read from) the
+    /// struct's object.
+    pub flatten: bool,
+    /// `#[serde(with = "..")]`, `serialize_with` / `deserialize_with`: a custom conversion
+    /// (not supported, reported by the type checker).
+    pub with: Option<String>,
 }
 
 /// A struct's or enum's attributes, and its fields' and variants'.
@@ -30,6 +36,11 @@ pub struct SerdeInfo {
     /// `#[serde(untagged)]` on an enum: a variant is written as its content alone and read as
     /// the first variant whose content matches.
     pub untagged: bool,
+    /// `#[serde(tag = "type")]`: an internally tagged enum (the variant name as a field next to
+    /// its content's), or a struct written with its name as that field.
+    pub tag: Option<String>,
+    /// `#[serde(content = "c")]` with `tag`: adjacently tagged (the content under its own key).
+    pub content: Option<String>,
 }
 
 /// `key = "value"` and bare `key` items of the `#[serde(..)]` attributes.
@@ -84,6 +95,8 @@ fn field_attrs(f: &impl HasAttrs) -> Option<FieldAttrs> {
             ("skip_serializing", None) => out.skip_serializing = true,
             ("skip_deserializing", None) => out.skip_deserializing = true,
             ("default", _) => out.default = true,
+            ("flatten", None) => out.flatten = true,
+            (k @ ("with" | "serialize_with" | "deserialize_with"), _) => out.with = Some(k.into()),
             _ => {}
         }
     }
@@ -119,48 +132,59 @@ pub fn collect(src: &str) -> HashMap<String, SerdeInfo> {
     }
     let file = crate::macros::parse_tree(src);
     for item in file.syntax().descendants().filter_map(ast::Item::cast) {
-        let mut info = SerdeInfo::default();
-        let name = match &item {
-            ast::Item::Struct(s) => {
-                record_fields(&mut info, "", s.field_list());
-                s.name()
-            }
-            ast::Item::Enum(e) => {
-                for v in e.variant_list().into_iter().flat_map(|l| l.variants()) {
-                    let Some(vn) = v.name() else { continue };
-                    let vn = vn.text().to_string();
-                    let mut rename = None;
-                    let mut rename_all = None;
-                    for (k, val) in serde_items(&v) {
-                        match (k.as_str(), val) {
-                            ("rename", Some(x)) => rename = Some(x),
-                            ("rename_all", Some(x)) => rename_all = Some(x),
-                            _ => {}
-                        }
-                    }
-                    info.variants.insert(vn.clone(), (rename, rename_all));
-                    record_fields(&mut info, &vn, v.field_list());
-                }
-                e.name()
-            }
-            _ => continue,
-        };
-        let Some(name) = name else { continue };
-        let holder = ast::AnyHasAttrs::cast(item.syntax().clone());
-        if let Some(h) = holder {
-            for (k, v) in serde_items(&h) {
-                if k == "rename_all"
-                    && let Some(v) = v
-                {
-                    info.rename_all = Some(v);
-                } else if k == "untagged" && v.is_none() {
-                    info.untagged = true;
-                }
-            }
+        if let Some((name, info)) = info_of(&item) {
+            out.insert(name, info);
         }
-        out.insert(name.text().to_string(), info);
     }
     out
+}
+
+/// The serde attributes of one struct or enum, with its name.
+pub fn info_of(item: &ast::Item) -> Option<(String, SerdeInfo)> {
+    let mut info = SerdeInfo::default();
+    let name = match item {
+        ast::Item::Struct(s) => {
+            record_fields(&mut info, "", s.field_list());
+            s.name()
+        }
+        ast::Item::Enum(e) => {
+            for v in e.variant_list().into_iter().flat_map(|l| l.variants()) {
+                let Some(vn) = v.name() else { continue };
+                let vn = vn.text().to_string();
+                let mut rename = None;
+                let mut rename_all = None;
+                for (k, val) in serde_items(&v) {
+                    match (k.as_str(), val) {
+                        ("rename", Some(x)) => rename = Some(x),
+                        ("rename_all", Some(x)) => rename_all = Some(x),
+                        _ => {}
+                    }
+                }
+                info.variants.insert(vn.clone(), (rename, rename_all));
+                record_fields(&mut info, &vn, v.field_list());
+            }
+            e.name()
+        }
+        _ => return None,
+    };
+    let name = name?;
+    let holder = ast::AnyHasAttrs::cast(item.syntax().clone());
+    if let Some(h) = holder {
+        for (k, v) in serde_items(&h) {
+            if k == "rename_all"
+                && let Some(v) = v
+            {
+                info.rename_all = Some(v);
+            } else if k == "untagged" && v.is_none() {
+                info.untagged = true;
+            } else if k == "tag" && v.is_some() {
+                info.tag = v;
+            } else if k == "content" && v.is_some() {
+                info.content = v;
+            }
+        }
+    }
+    Some((name.text().to_string(), info))
 }
 
 /// serde's `rename_all` on a field name (snake_case in Rust).

@@ -1883,6 +1883,12 @@ impl Codegen<'_> {
                 ),
             ));
         }
+        // `FlagValue::from("home")`: the payload is the value.
+        if v == "from" {
+            let a = c.arg_list()?.args().next()?;
+            let (f, ty) = self.emit_expr(&a, None);
+            return Some((self.by_value(&a, f, &ty).at(start), Ty::Extern(e.clone())));
+        }
         // (An unknown variant: the type checker has reported it.)
         let Some((_, variant)) = et.variant(v) else {
             return Some((Frag::text("undefined"), Ty::Unknown));

@@ -48,6 +48,8 @@ function genericNs() {
           return undefined;
         }
         post("call", { text: `ns.${path}(${args.map((a) => JSON.stringify(a)).join(", ")})` });
+        // (`ns.flags(schema)` with no arguments to parse: each flag's default.)
+        if (name === "flags") return { _: [], ...Object.fromEntries(args[0] ?? []) };
         const v = values[name]?.() ?? 0;
         if (!asyncFns.has(name)) return v;
         const ms = name === "sleep" ? Math.min(Number(args[0]) || 0, 200) : 50;

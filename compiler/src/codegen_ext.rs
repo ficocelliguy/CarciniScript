@@ -153,16 +153,23 @@ impl Codegen<'_> {
                 ast::Expr::BlockExpr(blk) => simple_tail(blk).is_some(),
                 other => !needs_hoist(other.syntax()),
             });
-        let frag = match (&body, expression_body) {
+        // (An expression body that still wrote statements, `|m| *m.entry(k).or_insert(0) += 1`
+        // hoisting the entry's slot, gets a block so they stay inside.)
+        let expr_frag = match (&body, expression_body) {
             (Some(b), true) => {
                 let b = match b {
                     ast::Expr::BlockExpr(blk) => simple_tail(blk).unwrap(),
                     other => other.clone(),
                 };
-                let (f, _) = self.emit_expr(&b, Some(&ret));
-                Frag::mapped(start, head).append(f).clone()
+                let mut f = None;
+                let lines = self.capture(|cg| f = Some(cg.emit_expr(&b, Some(&ret)).0));
+                if lines.plain().trim().is_empty() { f } else { None }
             }
-            _ => {
+            _ => None,
+        };
+        let frag = match expr_frag {
+            Some(f) => Frag::mapped(start, head).append(f).clone(),
+            None => {
                 let inner = self.capture(|cg| {
                     cg.emit_binds(binds);
                     match &body {

@@ -1,0 +1,8 @@
+total 60 Mutex { data: 60 }
+["a", "b"] 2
+Ok(7)
+err deadline has elapsed
+got [3, 2, 1] Err(Disconnected)
+seen [0, 1, 2] ticks 2
+quick 7
+99

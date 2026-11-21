@@ -2039,17 +2039,25 @@ impl<'a> Codegen<'a> {
         let Some(body) = c.body() else {
             return Vec::new();
         };
+        self.owned_captures_in(c.syntax(), body.syntax(), c.move_token().is_some())
+    }
+
+    /// `owned_captures` of a closure or `async` block `whole` (its body `body`).
+    fn owned_captures_in(
+        &self,
+        whole: &SyntaxNode,
+        body: &SyntaxNode,
+        by_move: bool,
+    ) -> Vec<(String, String)> {
         // Names bound inside the closure shadow the outer ones (conservatively, anywhere in it).
-        let inner: std::collections::HashSet<String> = c
-            .syntax()
+        let inner: std::collections::HashSet<String> = whole
             .descendants()
             .filter_map(ast::IdentPat::cast)
             .filter_map(|ip| ip.name())
             .map(|n| n.text().to_string())
             .collect();
-        let by_move = c.move_token().is_some();
         let mut names: Vec<(String, bool)> = Vec::new();
-        for p in body.syntax().descendants().filter_map(ast::PathExpr::cast) {
+        for p in body.descendants().filter_map(ast::PathExpr::cast) {
             if let Some(n) = p.path().and_then(|p| p.as_single_name_ref()) {
                 let moved = self.types.move_sites.contains(&self.range_of(p.syntax()));
                 // (Rust 2021 captures `tag.0` itself: a field with nothing to drop is copied
@@ -2072,7 +2080,7 @@ impl<'a> Codegen<'a> {
         // (Macro arguments are tokens: `println!("{}", g.name)`, `"{g:?}"`.)
         if by_move {
             names.extend(
-                macro_arg_names(body.syntax())
+                macro_arg_names(body)
                     .into_iter()
                     .map(|n| (n, true)),
             );
@@ -2096,9 +2104,12 @@ impl<'a> Codegen<'a> {
     }
 
     /// `async { .. }`: an async arrow function called at once, so the promise it returns is the
-    /// future. (It starts running there, where a Rust future waits for its first poll.)
+    /// future. (It starts running there, where a Rust future waits for its first poll.) Like a
+    /// closure, it owns the values with a `Drop` impl it captures by value, and drops them when
+    /// it finishes.
     fn emit_async_block(&mut self, b: &ast::BlockExpr) -> (Frag, Ty) {
         let start = self.off(b.syntax());
+        let owned = self.owned_captures_in(b.syntax(), b.syntax(), b.move_token().is_some());
         let ty = self.ty_of(b.syntax()).unwrap_or(Ty::Unknown);
         let ret = match &ty {
             Ty::Future(t) => (**t).clone(),
@@ -2119,7 +2130,18 @@ impl<'a> Codegen<'a> {
         let mut f = Frag::mapped(start, "(async () => {\n");
         f.append(inner)
             .push(format!("{}}})()", "  ".repeat(self.out.indent)));
-        (f, ty)
+        if owned.is_empty() {
+            return (f, ty);
+        }
+        let mut out = Frag::text("(");
+        for (_, flag) in &owned {
+            out.push(format!("{flag} = false, "));
+        }
+        let caps: Vec<&str> = owned.iter().map(|(js, _)| js.as_str()).collect();
+        out.push("κσ.$ownAsync(")
+            .append(f)
+            .push(format!(", [{}]))", caps.join(", ")));
+        (out, ty)
     }
 
     /// Whether a type holds a value with a `Drop` impl (in a field, element, ..).
@@ -2344,6 +2366,28 @@ impl<'a> Codegen<'a> {
                 .push(";");
             self.line(f);
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            self.declare(
+                name.text(),
+                Some(name.syntax()),
+                Local {
+                    js: format!("{js}.v"),
+                    ty,
+                },
+            );
+            return;
+        }
+        // `let mut g = m.lock().unwrap();`: `g` aliases the lock's value.
+        if let Some(lock) = self.lock_place(&init) {
+            let (mut rf, _) = self.emit_expr(&lock, None);
+            rf.push(".__c");
+            let js = self.fresh(name.text());
+            let mut f = Frag::mapped(start, "const ");
+            f.append(Frag::mapped(self.off(name.syntax()), js.clone()))
+                .push(" = ")
+                .append(rf)
+                .push(";");
+            self.line(f);
+            let ty = self.ty_of(init.syntax()).unwrap_or(Ty::Unknown);
             self.declare(
                 name.text(),
                 Some(name.syntax()),
@@ -3509,6 +3553,13 @@ impl<'a> Codegen<'a> {
                 let Some(inner) = a.expr() else {
                     return (Frag::text("undefined"), Ty::Unknown);
                 };
+                // `m.lock().await` on tokio's `Mutex`: the value in place (locking never waits).
+                if let Some(lock) = self.lock_place(e) {
+                    let (mut f, _) = self.emit_expr(&lock, None);
+                    f.push(".__c.v");
+                    let ty = self.ty_of(a.syntax()).unwrap_or(Ty::Unknown);
+                    return (f, ty);
+                }
                 let (f, t) = self.receiver(&inner);
                 let ty = match t {
                     Ty::Future(t) => *t,
@@ -6061,10 +6112,74 @@ impl<'a> Codegen<'a> {
         (Frag::text(out), ret)
     }
 
+    /// `m.lock().unwrap()` (or `read` / `write` / `get_mut` / `try_*`, then `unwrap` / `expect`)
+    /// on the lock prelude's `Mutex` / `RwLock`: the lock. Its value is `<lock>.__c.v`, a place,
+    /// so `*m.lock().unwrap() += 1` and a guard in a `let` write through.
+    fn lock_place(&self, e: &ast::Expr) -> Option<ast::Expr> {
+        // (tokio's: `m.lock().await`, `m.write().await`.)
+        if let ast::Expr::AwaitExpr(aw) = strip_parens_expr(e) {
+            let ast::Expr::MethodCallExpr(lk) = strip_parens_expr(&aw.expr()?) else {
+                return None;
+            };
+            if !lk
+                .name_ref()
+                .is_some_and(|n| matches!(&*n.text(), "lock" | "read" | "write"))
+            {
+                return None;
+            }
+            let lock = lk.receiver()?;
+            let Some(Ty::Adt(n, _)) = self.raw_ty_of(lock.syntax()) else {
+                return None;
+            };
+            let def = self.types.adts.defs.get(&n)?;
+            let prelude = matches!(n.as_str(), "TokioMutex" | "TokioRwLock")
+                && def.variants.first().is_some_and(|v| v.field("__c").is_some());
+            return prelude.then_some(lock);
+        }
+        let ast::Expr::MethodCallExpr(un) = strip_parens_expr(e) else {
+            return None;
+        };
+        if !un
+            .name_ref()
+            .is_some_and(|n| matches!(&*n.text(), "unwrap" | "expect"))
+        {
+            return None;
+        }
+        let ast::Expr::MethodCallExpr(lk) = strip_parens_expr(&un.receiver()?) else {
+            return None;
+        };
+        if !lk.name_ref().is_some_and(|n| {
+            matches!(
+                &*n.text(),
+                "lock" | "read" | "write" | "get_mut" | "try_lock" | "try_read" | "try_write"
+            )
+        }) {
+            return None;
+        }
+        let lock = lk.receiver()?;
+        let Some(Ty::Adt(n, _)) = self.raw_ty_of(lock.syntax()) else {
+            return None;
+        };
+        // (Only the prelude's: a `struct Mutex` of your own has its own methods.)
+        let def = self.types.adts.defs.get(&n)?;
+        let prelude = matches!(
+            n.as_str(),
+            "Mutex" | "RwLock" | "TokioMutex" | "TokioRwLock"
+        )
+            && def.variants.first().is_some_and(|v| v.field("__c").is_some());
+        prelude.then_some(lock)
+    }
+
     fn emit_method(&mut self, m: &ast::MethodCallExpr) -> (Frag, Ty) {
         let (Some(recv), Some(name)) = (m.receiver(), m.name_ref()) else {
             return (Frag::text("undefined"), Ty::Unknown);
         };
+        if let Some(lock) = self.lock_place(&ast::Expr::MethodCallExpr(m.clone())) {
+            let (mut f, _) = self.emit_expr(&lock, None);
+            f.push(".__c.v");
+            let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            return (f, ty);
+        }
         let name_off = self.off(name.syntax());
         let method = name.text().to_string();
         let node = m.syntax().clone();
@@ -6416,9 +6531,10 @@ impl<'a> Codegen<'a> {
                 return (rf.wrap("κσ.$clone(", ")"), rt.clone());
             }
             // `v.as_string()`: the runtime's `κσ.$jsv.asString(v)` (any JS value has them). A
-            // bindings enum's readers (`arg.as_f64()`, `res.into_result()`) are the same helpers.
-            if (type_name == "JsValue" || b.is_enum(type_name))
-                && let Some(s) = sig
+            // bindings enum's readers (`arg.as_f64()`, `res.into_result()`) and a `#[runtime]` method
+            // (`flags.get_str("target")`) are the same helpers.
+            if let Some(s) = sig
+                && (type_name == "JsValue" || b.is_enum(type_name) || s.runtime)
             {
                 let args = self.emit_args(m.arg_list(), &[]);
                 let mut f = Frag::mapped(name_off, format!("κσ.$jsv.${}(", s.js));
@@ -9040,9 +9156,10 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
                 .collect();
             DBG_EXTERN.with(|s| s.borrow_mut().pop());
             Some(format!(
-                "(function {fn_name}(o) {{ return κσ.$dbgIface({}, o, [{}]); }})",
+                "(function {fn_name}(o) {{ return κσ.$dbgIface({}, o, [{}], {}); }})",
                 js_string(n),
-                items.join(", ")
+                items.join(", "),
+                et.debug_keys
             ))
         }
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),

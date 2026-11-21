@@ -276,6 +276,14 @@ impl Checker<'_> {
                 Box::new(Ty::Extern("JsValue".into())),
             ));
         }
+        // `FlagValue::from("home")`: any variant's payload, as an NS argument takes it.
+        if v == "from" {
+            self.arg_count(c.syntax(), "function", 1, args.len());
+            if let Some(a) = args.first() {
+                self.check_enum_arg(a, &e);
+            }
+            return Some(Ty::Extern(e));
+        }
         let Some((_, variant)) = et.variant(&v) else {
             let hint = crate::bindings::suggest(&v, et.variants.iter().map(|x| &x.name))
                 .map(|s| format!("; did you mean `{s}`?"))

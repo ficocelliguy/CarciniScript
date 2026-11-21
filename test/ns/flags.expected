@@ -1,0 +1,7 @@
+flags [["target","n00dles"],["threads",1],["fast",false],["exclude",[]],["delay",2.5]]
+n00dles x8 fast=true exclude=["a", "b"] rest=[Str("n00dles")]
+Some(2.5) None None
+threads is a number: 8
+Flags { target: "n00dles", threads: 8.0, fast: true, exclude: ["a", "b"], delay: 2.5, rest: [Str("n00dles")] }
+flags [["fast",false],["target","home"],["threads",2],["exclude",[]],["from","n00dles"]]
+Some(true) Some("n00dles")

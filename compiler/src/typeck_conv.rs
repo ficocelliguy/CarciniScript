@@ -774,6 +774,28 @@ impl Checker<'_> {
                 {
                     Some(Conv::Identity)
                 }
+                // `"home".into()` / `1.0.into()` / `vec![].into()` as a bindings enum (`FlagValue`):
+                // a variant's payload is the value itself.
+                (src, Ty::Extern(n))
+                    if self.bindings.is_enum(n) && !matches!(src, Ty::Extern(_)) =>
+                {
+                    let b = self.bindings.clone();
+                    let variants = b.enum_of(n).map(|et| et.variants.as_slice()).unwrap_or_default();
+                    let float = variants.iter().any(|v| matches!(v.payload, Ty::Float { .. }));
+                    if matches!(src, Ty::Var(_))
+                        && matches!(self.var_kind(&s), Some(VarKind::Float | VarKind::Int))
+                    {
+                        float.then(|| {
+                            self.unify(&s, &Ty::Float { f32: false });
+                            Conv::Identity
+                        })
+                    } else {
+                        variants.iter().find(|v| self.could_be(&s, &v.payload)).map(|fit| {
+                            self.unify(&s, &fit.payload);
+                            Conv::Identity
+                        })
+                    }
+                }
                 // `"x".into()` / `2.5.into()` / `true.into()` as a `JsValue`: the JS value itself.
                 (
                     Ty::Str

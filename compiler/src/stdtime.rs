@@ -1,12 +1,14 @@
 //! Rust-source preludes compiled in after a program that uses them: `std::time` (`Duration`,
 //! `Instant`, `SystemTime`), the lazy and once cells (`std::sync::{LazyLock, OnceLock}`,
-//! `std::cell::{LazyCell, OnceCell}`, the bundled `once_cell`'s `Lazy` / `OnceCell`) and the
+//! `std::cell::{LazyCell, OnceCell}`, the bundled `once_cell`'s `Lazy` / `OnceCell`), the locks,
+//! atomics and channels (`std::sync::{Mutex, RwLock, mpsc}`, `thread_local!`) and the
 //! bundled `either`, `serde_json` (`Value`, `Number`) and `regex` (`Regex`, `Match`,
 //! `Captures`). Paths like `std::time::Duration` and `use std::time::{..}` resolve to the
 //! prelude's top-level items; positions in the program are unchanged.
 
 const TIME: &str = include_str!("time_prelude.rs");
 const SYNC: &str = include_str!("sync_prelude.rs");
+const LOCK: &str = include_str!("lock_prelude.rs");
 const EITHER: &str = include_str!("either_prelude.rs");
 const SERDE_JSON: &str = include_str!("serde_json_prelude.rs");
 const REGEX: &str = include_str!("regex_prelude.rs");
@@ -87,7 +89,11 @@ pub(crate) fn with_prelude(
     .any(|n| text.contains(n))
         && !text.contains("// (chrono prelude)")
         && !declares("ChronoNaiveDate");
-    if (has_word(text, "time::") || chrono)
+    // (The tokio prelude and std `mpsc`'s `recv_timeout` take a `Duration`.)
+    let needs_duration = ["__tokio_", "TokioJoin", "TokioMutex", "TokioRwLock", "TokioElapsed", "MpscReceiver"]
+        .iter()
+        .any(|n| text.contains(n));
+    if (has_word(text, "time::") || chrono || needs_duration)
         && !text.contains("// (std::time prelude)")
         && !["Duration", "Instant", "SystemTime"]
             .iter()
@@ -101,6 +107,37 @@ pub(crate) fn with_prelude(
         && !cells.iter().any(|n| declares(n))
     {
         out.push(SYNC);
+    }
+    // (After the rewrites: `atomic::Ordering` is `AtomicOrdering`, `thread_local!` declares
+    // `LocalKey`s.)
+    let locks = [
+        "Mutex",
+        "RwLock",
+        "AtomicOrdering",
+        "AtomicBool",
+        "AtomicUsize",
+        "AtomicIsize",
+        "AtomicU8",
+        "AtomicU16",
+        "AtomicU32",
+        "AtomicU64",
+        "AtomicI8",
+        "AtomicI16",
+        "AtomicI32",
+        "AtomicI64",
+        "LocalKey",
+        "PoisonError",
+        "__atomic_fence",
+        "MpscSender",
+        "MpscReceiver",
+        "__mpsc_channel",
+        "__mpsc_sync_channel",
+    ];
+    if locks.iter().any(|n| has_word(text, n))
+        && !text.contains("// (lock prelude)")
+        && !["Mutex", "RwLock", "AtomicOrdering"].iter().any(|n| declares(n))
+    {
+        out.push(LOCK);
     }
     if has_word(text, "Either")
         && text.contains("either")
@@ -176,7 +213,16 @@ pub(crate) fn with_prelude(
     if num_names.iter().any(|n| text.contains(n)) && !text.contains("// (num prelude)") {
         out.push(NUM);
     }
-    let tokio_names = ["__tokio_", "TokioJoin"];
+    let tokio_names = [
+        "__tokio_",
+        "TokioJoin",
+        "TokioMutex",
+        "TokioRwLock",
+        "TokioElapsed",
+        "TokioSender",
+        "TokioUnboundedSender",
+        "TokioReceiver",
+    ];
     if tokio_names.iter().any(|n| text.contains(n)) && !text.contains("// (tokio prelude)") {
         out.push(TOKIO);
     }
@@ -277,8 +323,12 @@ pub(crate) fn with_prelude(
         out.push(NET);
     }
     // (After the rewrite: `std::task::Poll` is `TaskPoll`, `std::future::ready` `__future_ready`.)
+    // (The tokio prelude's channel is a hand-written future.)
     let task_names = [
         "TaskPoll",
+        "TokioReceiver",
+        "__tokio_channel",
+        "__tokio_unbounded_channel",
         "TaskContext",
         "TaskWaker",
         "__future_",

@@ -490,8 +490,13 @@ impl NS {
     pub fn get_function_ram_cost(&self, name: &str) -> f64;
     /// Parse command line flags.
     /// RAM cost: 0 GB
+    ///
+    /// In Rust: `let f = ns.flags(&[("target", "n00dles"), ("threads", 1), ("loop", false), ("exclude", vec![])]);`
+    /// then `f.get_str("target")`, `f.get_f64("threads")`, `f.get_bool("loop")`, `f.get_list("exclude")` and
+    /// `f.rest` (the arguments that aren't flags). For typed fields, `--help` and error messages, clap's
+    /// `#[derive(Parser)]` reads the script's arguments too (`Args::parse()`).
     #[js = "flags"]
-    pub fn flags(&self, schema: &[JsValue]) -> JsValue;
+    pub fn flags(&self, schema: &[(&str, FlagValue)]) -> Flags;
     /// Multiplies the reputation gain rate of faction work by sharing the server's RAM with the faction.
     /// RAM cost: 2.4 GB
     #[js = "share"]
@@ -585,8 +590,13 @@ pub struct AutocompleteData {
 }
 impl AutocompleteData {
     /// Parses the flags schema on the already inputted flags
+    ///
+    /// In Rust: `let f = data.flags(&[("target", "n00dles"), ("threads", 1), ("loop", false), ("exclude", vec![])]);`
+    /// then `f.get_str("target")`, `f.get_f64("threads")`, `f.get_bool("loop")`, `f.get_list("exclude")` and
+    /// `f.rest` (the arguments that aren't flags). For typed fields, `--help` and error messages, clap's
+    /// `#[derive(Parser)]` reads the script's arguments too (`Args::parse()`).
     #[js = "flags"]
-    pub fn flags(&self, schema: &[JsValue]) -> JsValue;
+    pub fn flags(&self, schema: &[(&str, FlagValue)]) -> Flags;
 }
 
 /// Player must have installed a backdoor on this server.
@@ -7145,6 +7155,36 @@ pub struct UserInterfaceGetAllAliasesResult {
     pub is_global: bool,
 }
 
+/// The result of `ns.flags(schema)`: each flag's value by name, and the other arguments.
+#[debug_keys]
+pub struct Flags {
+    /// The arguments that aren't flags (`run x.rs --threads 4 n00dles` has `["n00dles"]`).
+    #[js = "_"]
+    pub rest: Vec<ScriptArg>,
+}
+impl Flags {
+    /// The flag's value, if the schema names it.
+    #[js = "flag"]
+    #[runtime]
+    pub fn get(&self, name: &str) -> Option<FlagValue>;
+    /// The flag's value, if it's a string.
+    #[js = "flagStr"]
+    #[runtime]
+    pub fn get_str(&self, name: &str) -> Option<String>;
+    /// The flag's value, if it's a number.
+    #[js = "flagF64"]
+    #[runtime]
+    pub fn get_f64(&self, name: &str) -> Option<f64>;
+    /// The flag's value, if it's a boolean.
+    #[js = "flagBool"]
+    #[runtime]
+    pub fn get_bool(&self, name: &str) -> Option<bool>;
+    /// The flag's values, if it's a list (a `vec![]` default; `--x a --x b`).
+    #[js = "flagList"]
+    #[runtime]
+    pub fn get_list(&self, name: &str) -> Option<Vec<String>>;
+}
+
 /// TypeScript: `{ [T in keyof CodingContractSignatures]: { type: T; data: CodingContractSignatures[T][0]; submit: (answer: CodingContrac..` (one variant per contract)
 #[tag = "type"]
 pub enum CodingContractObject {
@@ -7265,6 +7305,35 @@ impl FilenameOrPID {
     /// Whether the value is a string.
     #[js = "isString"]
     pub fn is_string(&self) -> bool;
+    /// The value as JS text (`"n00dles"`, `"5"`, `"true"`), as `{}` prints it.
+    #[js = "asText"]
+    pub fn to_string(&self) -> String;
+}
+
+/// TypeScript: `string | number | boolean | string[]`
+#[untagged]
+pub enum FlagValue {
+    Str(String),
+    Num(f64),
+    Bool(bool),
+    List(Vec<String>),
+}
+impl FlagValue {
+    /// The string, if the value is one.
+    #[js = "asString"]
+    pub fn as_string(&self) -> Option<String>;
+    /// Whether the value is a string.
+    #[js = "isString"]
+    pub fn is_string(&self) -> bool;
+    /// The number, if the value is one.
+    #[js = "asF64"]
+    pub fn as_f64(&self) -> Option<f64>;
+    /// The boolean, if the value is one.
+    #[js = "asBool"]
+    pub fn as_bool(&self) -> Option<bool>;
+    /// Whether the value is an array.
+    #[js = "isArray"]
+    pub fn is_array(&self) -> bool;
     /// The value as JS text (`"n00dles"`, `"5"`, `"true"`), as `{}` prints it.
     #[js = "asText"]
     pub fn to_string(&self) -> String;

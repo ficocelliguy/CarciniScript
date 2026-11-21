@@ -413,6 +413,22 @@ function mockNs(log) {
     hacknet: { numNodes: () => 3 },
     // (For typed_values.rs: arguments, option objects, intersections, tuples and maps.)
     args: ["n00dles", 4, "--fast"],
+    // (For flags.rs: the game's parse, enough of it: defaults by type, `--x v`, the rest in `_`.)
+    flags(schema) {
+      log.push(`flags ${JSON.stringify(schema)}`);
+      const out = { _: [] };
+      for (const [k, d] of schema) out[k] = Array.isArray(d) ? [...d] : d;
+      const argv = ["--threads", "8", "--fast", "n00dles", "--exclude", "a", "--exclude", "b"];
+      for (let i = 0; i < argv.length; i++) {
+        const k = argv[i].replace(/^--/, "");
+        if (k === argv[i] || !(k in out)) out._.push(argv[i]);
+        else if (typeof out[k] === "boolean") out[k] = true;
+        else if (typeof out[k] === "number") out[k] = Number(argv[++i]);
+        else if (Array.isArray(out[k])) out[k].push(argv[++i]);
+        else out[k] = argv[++i];
+      }
+      return out;
+    },
     exec(script, host, opts, ...args) {
       log.push(`exec ${script} ${host} ${JSON.stringify(opts)} ${JSON.stringify(args)}`);
       return 7;
@@ -1660,6 +1676,11 @@ const rejectedNs = [
     "2:13 the `?` operator can only be used in a function that returns `Option` (this function returns `()`)",
   ],
   ["`?` on a non-Option", "fn f() -> Option<i32> {\n    let x = 5?;\n    Some(x)\n}", "3:13 the `?` operator can only be applied to `Option`"],
+  ["a flag default of the wrong type", `ns.flags(&[("x", 'c')]);`, "2:22 mismatched types: expected `FlagValue` (a `String`, `f64`, `bool` or `Vec<String>`), found `char`"],
+  ["a flag default that is a list of numbers", `ns.flags(&[("x", vec![1.5])]);`, "2:22 mismatched types: expected `FlagValue` (a `String`, `f64`, `bool` or `Vec<String>`), found `Vec<{float}>`"],
+  ["a payload as an enum outside an NS argument", `let s: (&str, FlagValue) = ("x", "home");`, "2:32 mismatched types: expected `(String, FlagValue)`, found `(String, String)`"],
+  ["`.into()` of a char as a FlagValue", `let v: FlagValue = 'c'.into();`, "2:24 the trait bound `FlagValue: From<char>` is not satisfied"],
+  ["`FlagValue::from` of a char", "let v = FlagValue::from('c');", "2:29 mismatched types: expected `FlagValue` (a `String`, `f64`, `bool` or `Vec<String>`), found `char`"],
 ];
 for (const [label, body, want, wantHelp] of rejectedNs) {
   // A body starting with `fn` is a whole helper function placed before main.

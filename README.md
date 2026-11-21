@@ -185,6 +185,10 @@ where a `Person` is, the d.ts's unions are enums over the JS value itself (`ns.a
 `Vec<ScriptArg>`: `match a { ScriptArg::Str(s) => .., ScriptArg::Num(n) => .., ScriptArg::Bool(b) => .. }`,
 or `a.as_string()` as before; `PlayerRequirement::Money(m)`, `NsResult::Success(..)`), and only
 `any` is wasm-bindgen's `JsValue` (`serde_wasm_bindgen::from_value(data)`).
+`ns.flags` takes typed pairs (`ns.flags(&[("target", "n00dles"), ("threads", 1), ("exclude", vec![])])`)
+and returns `Flags` (`f.get_str("target")`, `get_f64`, `get_bool`, `get_list`, `f.rest`); for typed
+fields, `--help` and error messages, use clap's `#[derive(Parser)]` and `Args::parse()`, which read
+the script's arguments.
 Regenerate after NS API changes:
 
 ```sh
