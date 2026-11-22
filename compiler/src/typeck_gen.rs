@@ -920,7 +920,30 @@ impl Checker<'_> {
                     trs.contains(&b) && matches!(Ty::from_name(ty), Ty::Int(_) | Ty::Float { .. })
                 })
                 .count();
-            if numeric_impls >= 2 && self.try_note_dict(name) {
+            // The same with an impl on `Option` next to others: `Some(4)` is `4` at run time, so
+            // only the class tells `Option<i32>`'s impl from `i32`'s.
+            let option_impl = self
+                .adts
+                .trait_impls
+                .get("Option")
+                .is_some_and(|trs| trs.contains(&b))
+                && self
+                    .adts
+                    .trait_impls
+                    .iter()
+                    .any(|(ty, trs)| ty != "Option" && trs.contains(&b));
+            // And with impls on a tuple and a `Vec` (slice, array): all of them are JS arrays.
+            let has = |k: &str| {
+                self.adts
+                    .trait_impls
+                    .get(k)
+                    .is_some_and(|trs| trs.contains(&b))
+            };
+            let array_impls =
+                has("Vec") && (1..=12).filter_map(crate::adt::tuple_key).any(has);
+            if (numeric_impls >= 2 || option_impl || array_impls)
+                && (self.try_note_dict(name) || array_impls && self.elem_class(name))
+            {
                 let r = self.range(m.syntax());
                 self.class_dispatch.insert(r);
             }

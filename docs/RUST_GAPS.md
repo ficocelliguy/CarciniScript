@@ -149,8 +149,7 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
   `parse::<T>()`, `T::from(x)` and `sum::<T>()`. In a struct's or enum's `impl<T> S<T>`, methods
   with `self` read `T`'s class off the value (`this.$T`), which each construction stores when
   some method needs it (also for a derived `Default`'s bare `T` field). `impl<T> S<Vec<T>>`
-  binds `T` from the receiver's argument, but its values carry no class: there `/`, `%`, `<<`,
-  `>>`, `!` and `parse::<T>()` are errors, and `+`, `-`, `*` are JS arithmetic (no wrapping).
+  (or `S<Option<T>>`) reads `T`'s class off the `Vec`'s, which the value stores.
   A struct built where its `T` isn't known (an unannotated empty `Vec` field nothing settles)
   carries no class, and its `/` divides like a float. Overflow on a `T` wraps even in a debug
   build (`--debug` comparisons), where Rust panics. `T::Err` of a `T: FromStr` and `T::Error`
@@ -618,30 +617,32 @@ produce a compile error) are tracked in [FEATURES.md](FEATURES.md) instead.
 - **A trait implemented for both an integer type and a float type** (or two integer types),
   called through a generic `T: Trait`, goes by `T`'s class when the caller passes it
   (`pay(2.0f64)` reaches the `f64` impl, `pay(2u8)` the `u8` one; `κσ.$dcallT`), as a call on a
-  value of known type does. Through `dyn Trait` (`Box<dyn Money>`, `&dyn Money`), or a `T` no
-  caller passes a class for (a function value), the impl is picked by the value: a whole number
-  (`2.0f64` included) goes to the integer impl (`i128` / `u128` values are BigInts and always
-  reach their own impl; an `i64` / `u64` is a number like any other).
-- **A tuple is a JS array**, so through a generic `T: Trait` its impl is picked by length:
-  one trait implemented for both a tuple and a slice, array or `Vec` is an error, and two
-  impls for tuples of one length (`(u8, u8)` and `(String, String)`) conflict.
+  value of known type does. Through `dyn Trait` (`Box<dyn Money>`, `&dyn Money`) the number
+  carries its type from where it was coerced (`κσ.$dynNum`). Through a `T` no caller passes a
+  class for (a function value), the impl is picked by the value: a whole number (`2.0f64`
+  included) goes to the integer impl (`i128` / `u128` values are BigInts and always reach their
+  own impl; an `i64` / `u64` is a number like any other).
+- **A tuple is a JS array**, as are a slice, array and `Vec`. Through a generic `T: Trait` whose
+  trait has impls on both, the impl goes by `T`'s class when the caller passes it
+  (`κσ.$tupT`, `$dcallT`); through a `T` no caller passes a class for (a function value), or
+  `dyn Trait`, by the value: a tuple's impl takes any array of its length. Two impls for tuples
+  of one length (`(u8, u8)` and `(String, String)`) conflict.
 - **A `mod` file's traits implemented for built-in types in the file that loads it** join the
   module's registry, which is shared by every script that loads that module: when two
   scripts implement one of its traits for the same type, the module's generic functions use
   the last script's impl (a re-exported trait's module isn't reached).
-- **An `Option` through a generic `T: Trait`** is `null` or its value at run time, so the
+- **An `Option` through a generic `T: Trait`** is `null` or its value at run time, so it goes
+  by the class the caller passes for `T` (`Some(Some(4))` reaches the `Option` impl twice).
+  Where no class comes with it (a `T` the caller can't name, a `dyn Trait`), by the value: the
   `Option` impl serves `None` and any `Some(x)` whose value's own type has no impl of that
-  method; when both `Option<u8>` and `u8` implement it, `Some(3u8)` reaches `u8`'s. A nested
-  `Option<Option<T>>` there reaches the `Option` impl for `None` and `Some(None)`, but
-  `Some(Some(4))` is `4`, which reaches the inner type's impl (`i4`, where rustc prints
-  `some(some(i4))`); `{:?}` prints it right.
+  method, and `Some(3u8)` reaches `u8`'s impl when there is one.
 - **A trait on a function pointer type** (`impl Tr for fn() -> i32`) is one class for every
   signature: `impl Tr for fn(i32) -> i32` next to it conflicts, and a closure reaches it too
   (both are JS functions).
 - **A trait on an iterator type** (`impl Tr for Peekable<I>`, `Chars`, `Keys<K, V>`) is one
   class for every iterator and adapter: a second iterator type's impl of the same trait
-  conflicts. `Cell<T>` shares `RefCell<T>`'s. `RangeFrom` / `RangeTo` / `RangeFull` take no
-  impls (a `3..` is an iterator here).
+  conflicts. `Cell<T>` shares `RefCell<T>`'s. (Each range type has its own: `Range`,
+  `RangeFrom`, `RangeTo`, `RangeFull`, ..)
 - **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`, `Path` and `PathBuf`): one
   type in JS, so the borrowed type's impl serves both. The owned one must hand each call on to it
   (`self.as_str().f(a)`, `Tr::f(&self.as_str())`, `self[..].f()`); one that does something else

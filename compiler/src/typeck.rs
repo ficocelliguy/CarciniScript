@@ -16,6 +16,7 @@ use std::rc::Rc;
 mod adt_check;
 #[path = "typeck_arrays.rs"]
 mod arrays;
+pub(crate) use arrays::{Decl, array_dims_in_file, array_type_len, decl_at};
 #[path = "typeck_coll.rs"]
 mod coll;
 pub(crate) use coll::index_method as coll_index_method;
@@ -78,7 +79,7 @@ use crate::diag_help;
 use crate::bindings::{self, Bindings, bare};
 use crate::fmt::{self, ArgRef, Piece};
 use crate::macros::{self, MacroArg};
-use crate::ty::{IntKind, Ty, is_float_method, std_const, std_tail};
+use crate::ty::{IntKind, RangeKind, Ty, is_float_method, std_const, std_tail};
 
 pub struct RawDiag {
     pub start: usize,
@@ -169,6 +170,13 @@ pub struct Types {
     /// and a float type (or two integer types): dispatched by `T`'s class (`κσ.$dcallT`), since
     /// the run-time value can't tell a whole `f64` from an `i32`.
     pub class_dispatch: std::collections::HashSet<(usize, usize)>,
+    /// Methods of `impl<T> Tr for Option<T>` (`"Option::depth"`) that use `T`'s class: a caller
+    /// that knows the `Option`'s type hands them its element's (`κσ.$callElem`, `$dcallT`).
+    pub elem_methods: std::collections::HashSet<String>,
+    /// Numbers coerced to a `dyn Trait` whose trait has impls on two number types: tagged with
+    /// their type (`κσ.$dynNum(x, "f64")`), since the value can't tell a whole `f64` from an
+    /// `i32`. By the expression's range, the type's impl key.
+    pub dyn_nums: HashMap<(usize, usize), String>,
     /// Method calls that go to one of several impls of a generic trait: the method's key.
     pub method_keys: HashMap<(usize, usize), String>,
     /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
@@ -367,6 +375,8 @@ impl<'a> Checker<'a> {
             fn_cell_args: Default::default(),
             mut_ref_fields: Default::default(),
             class_dispatch: Default::default(),
+            elem_methods: Default::default(),
+            dyn_num_coercions: Vec::new(),
             ret_slot: None,
             pending_cell_args: Vec::new(),
             method_keys: Default::default(),
@@ -668,6 +678,7 @@ pub fn check(
     for v in stored.values_mut() {
         v.sort();
     }
+    let dyn_nums = c.finish_dyn_nums();
     let adts = std::mem::take(&mut c.adts);
     let mut_bindings = std::mem::take(&mut c.mut_bindings);
     let boxed = std::mem::take(&mut c.boxed);
@@ -691,6 +702,7 @@ pub fn check(
     let fn_cell_args = std::mem::take(&mut c.fn_cell_args);
     let mut_ref_fields = std::mem::take(&mut c.mut_ref_fields);
     let class_dispatch = std::mem::take(&mut c.class_dispatch);
+    let elem_methods = std::mem::take(&mut c.elem_methods);
     let method_keys = std::mem::take(&mut c.method_keys);
     let derefs = std::mem::take(&mut c.derefs);
     let qualified_calls = std::mem::take(&mut c.qualified_calls);
@@ -738,6 +750,8 @@ pub fn check(
             fn_cell_args,
             mut_ref_fields,
             class_dispatch,
+            elem_methods,
+            dyn_nums,
             method_keys,
             derefs,
             qualified_calls,
@@ -872,6 +886,9 @@ struct Checker<'a> {
     fn_cell_args: std::collections::HashSet<(usize, usize)>,
     pub(super) mut_ref_fields: std::collections::HashSet<(String, String)>,
     pub(super) class_dispatch: std::collections::HashSet<(usize, usize)>,
+    pub(super) elem_methods: std::collections::HashSet<String>,
+    /// Number-typed expressions checked against a `dyn Trait`, with that trait (see `dyn_nums`).
+    dyn_num_coercions: Vec<((usize, usize), Ty, String)>,
     /// What the function being checked returns when declared `-> &mut T` / `-> Option<&mut T>`
     /// with `T` a number, string, bool or `Option`: a slot (`Some(false)`) or `None` / a slot
     /// (`Some(true)`); `None` otherwise.
@@ -1254,6 +1271,21 @@ impl<'a> Checker<'a> {
             // (Never a cyclic type, `?0 = Regex<?0>`: a struct used without its type arguments
             // then overflowed the stack.)
             (Ty::Var(v), t) | (t, Ty::Var(v)) if self.occurs(*v, t) => true,
+            // An unsuffixed literal into a `dyn Trait` (`Box::new(10.0)`): rustc's fallback
+            // type, `f64` or `i32`.
+            (Ty::Var(v), Ty::Dyn(tr)) | (Ty::Dyn(tr), Ty::Var(v)) if tr != "Any" => {
+                let lit = match self.var_kind(&Ty::Var(*v)) {
+                    Some(VarKind::Int) => Ty::Int(IntKind::I32),
+                    Some(VarKind::Float) => Ty::Float { f32: false },
+                    _ => {
+                        self.vars[*v as usize] = VarState::Bound(Ty::Dyn(tr.clone()));
+                        return true;
+                    }
+                };
+                let tr = tr.clone();
+                self.vars[*v as usize] = VarState::Bound(lit.clone());
+                self.unify(&lit, &Ty::Dyn(tr))
+            }
             (Ty::Var(v), t) | (t, Ty::Var(v)) => {
                 let ok = match self.var_kind(&Ty::Var(*v)).unwrap() {
                     VarKind::General => true,
@@ -1395,6 +1427,15 @@ impl<'a> Checker<'a> {
 
     /// Unify `found` with `expected`, reporting rustc's "mismatched types" on failure.
     fn expect(&mut self, n: &SyntaxNode, found: &Ty, expected: &Ty) {
+        if let Ty::Dyn(tr) = self.shallow(expected)
+            && matches!(
+                self.shallow(found),
+                Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Var(_)
+            )
+        {
+            let r = self.range(n);
+            self.dyn_num_coercions.push((r, found.clone(), tr));
+        }
         if let (Ty::Dyn(tr), Ty::Adt(adt, _)) = (self.shallow(expected), self.shallow(found))
             && tr != "Any"
             && !self.unify(found, expected)
@@ -1649,10 +1690,13 @@ impl<'a> Checker<'a> {
                         Box::new(Ty::Adt("TokioJoinError".into(), vec![])),
                     )));
                 }
-                // `Range<usize>` / `RangeInclusive<i32>` (`std::ops::..`).
-                if (name == "Range" || name == "RangeInclusive")
+                // `Range<usize>`, `RangeInclusive<i32>`, `RangeFrom<u8>`, `RangeFull` (`std::ops`).
+                if let Some(kind) = RangeKind::from_name(&name)
                     && !self.adts.defs.contains_key(&name)
                 {
+                    if kind == RangeKind::Full {
+                        return Ty::Range(Box::new(Ty::Unit), kind);
+                    }
                     let elem = seg
                         .clone()
                         .and_then(|s| s.generic_arg_list())
@@ -1663,7 +1707,7 @@ impl<'a> Checker<'a> {
                         })
                         .map(|t| self.lower_type(&t))
                         .unwrap_or_else(|| self.fresh(VarKind::General));
-                    return Ty::Range(Box::new(elem), name == "RangeInclusive");
+                    return Ty::Range(Box::new(elem), kind);
                 }
                 if name == "HashSet" {
                     let arg = seg
@@ -4132,6 +4176,27 @@ impl<'a> Checker<'a> {
         t
     }
 
+    /// `dyn_nums`: the coercions whose trait has impls on two or more number types.
+    fn finish_dyn_nums(&mut self) -> HashMap<(usize, usize), String> {
+        let mut out = HashMap::new();
+        for (r, t, tr) in std::mem::take(&mut self.dyn_num_coercions) {
+            let numeric_impls = self
+                .adts
+                .trait_impls
+                .iter()
+                .filter(|(ty, trs)| {
+                    trs.contains(&tr) && matches!(Ty::from_name(ty), Ty::Int(_) | Ty::Float { .. })
+                })
+                .count();
+            if numeric_impls >= 2
+                && let Some(k) = crate::adt::ext_key_of(&self.zonk(&t).default_lit())
+            {
+                out.insert(r, k.to_string());
+            }
+        }
+        out
+    }
+
     /// A tuple field: inside an NS argument, a bindings enum takes a variant's payload.
     fn infer_payload(&mut self, f: &ast::Expr, hint: Option<&Ty>) -> Ty {
         if self.enum_payloads
@@ -4432,9 +4497,12 @@ impl<'a> Checker<'a> {
                     }
                     Ty::Unknown | Ty::Var(_) => Ty::Unknown,
                     // `r.start` / `r.end` (an inclusive range's are methods).
-                    Ty::Range(e, false)
-                        if f.name_ref()
-                            .is_some_and(|n| matches!(n.text(), "start" | "end")) =>
+                    Ty::Range(e, k)
+                        if f.name_ref().is_some_and(|n| match &*n.text() {
+                            "start" => k.has_start() && k != RangeKind::Inclusive,
+                            "end" => k.has_end() && k != RangeKind::Inclusive,
+                            _ => false,
+                        }) =>
                     {
                         *e
                     }
@@ -4506,6 +4574,7 @@ impl<'a> Checker<'a> {
             ast::Expr::RangeExpr(r) => {
                 use ra_ap_syntax::ast::RangeItem;
                 let inclusive = r.op_kind() == Some(ast::RangeOp::Inclusive);
+                let kind = RangeKind::of(r.start().is_some(), r.end().is_some(), inclusive);
                 let wanted = matches!(expected.map(|t| self.shallow(t)), Some(Ty::Range(..)));
                 // (`let r = 0..n;`: a value, whose `start` / `contains` / `{:?}` work.)
                 let bound = r.start().is_some()
@@ -4517,13 +4586,16 @@ impl<'a> Checker<'a> {
                                 && l.initializer().is_some_and(|i| i.syntax() == r.syntax())
                                 && matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
                         });
-                if wanted || bound || self.range_ext_value(r, inclusive) {
+                if wanted || bound || self.range_ext_value(r, kind) {
+                    if kind == RangeKind::Full {
+                        return Ty::Range(Box::new(Ty::Unit), kind);
+                    }
                     // (Any ordered bounds: floats too, for `contains`.)
                     let elem = self.fresh(VarKind::General);
                     for b in [r.start(), r.end()].into_iter().flatten() {
                         self.check(&b, &elem);
                     }
-                    return Ty::Range(Box::new(elem), inclusive);
+                    return Ty::Range(Box::new(elem), kind);
                 }
                 let elem = self.range_elem(r);
                 Ty::Iter {
@@ -6194,8 +6266,8 @@ impl<'a> Checker<'a> {
     /// Whether the range `r` is a `Range` value for your `impl Tr for Range<..>` rather than an
     /// iterator: the receiver of one of those impls' methods (`(0..10).width()`), under `&`
     /// (`w(&(1..2))`), or an array element (`[0..2, 3..9]`).
-    fn range_ext_value(&self, r: &ast::RangeExpr, inclusive: bool) -> bool {
-        let key = if inclusive { "RangeInclusive" } else { "Range" };
+    fn range_ext_value(&self, r: &ast::RangeExpr, kind: RangeKind) -> bool {
+        let key = kind.name();
         if !self.adts.ext_types.contains(key) {
             return false;
         }
@@ -6595,7 +6667,7 @@ impl<'a> Checker<'a> {
                         }
                         return Ty::Bool;
                     }
-                    "start" | "end" if incl => {
+                    "start" | "end" if incl == crate::ty::RangeKind::Inclusive => {
                         self.arg_count(m.syntax(), "method", 0, args.len());
                         return *e;
                     }
@@ -9149,9 +9221,20 @@ impl Checker<'_> {
     }
 
     /// In a method with `self` of `impl<T> S<T>` (a struct or an enum): `S`'s values carry
-    /// `T`'s class (`this.$T`). False where they can't (`impl<T> S<Vec<T>>`, a trait's default
-    /// method).
+    /// `T`'s class (`this.$T`; in `impl<T> S<Vec<T>>`, on the `Vec`'s, `this.$T.elem`). False
+    /// where they can't (a trait's default method).
     fn store_class(&mut self, param: &str) -> bool {
+        // `impl<T> Tr for Option<T>`: a caller that knows the `Option`'s type hands its methods
+        // `T`'s class.
+        if let Some(f) = self.cur_fn.clone()
+            && let Some(("Option", m)) = f.split_once("::")
+            && self.adts.method("Option", m).is_some_and(|s| {
+                s.receiver.is_some() && s.impl_args == [Ty::Param(param.to_string())]
+            })
+        {
+            self.elem_methods.insert(f);
+            return true;
+        }
         let Some(k) = self
             .cur_fn
             .as_deref()
@@ -9161,6 +9244,28 @@ impl Checker<'_> {
         };
         self.stored_uses.insert(k);
         true
+    }
+
+    /// In a method with `self` of `impl<T> Tr for Vec<T>` or `impl<A, B> Tr for (A, B)`: a caller
+    /// that knows the value's type hands it `param`'s class, as for an `Option` (see
+    /// `store_class`). Only for calls dispatched by class: anyone else leaves none.
+    pub(super) fn elem_class(&mut self, param: &str) -> bool {
+        let Some(f) = self.cur_fn.clone() else {
+            return false;
+        };
+        let Some((ty, m)) = f.split_once("::") else {
+            return false;
+        };
+        if ty != "Vec" && crate::adt::tuple_arity(ty).is_none() {
+            return false;
+        }
+        let bare = self.adts.method(ty, m).is_some_and(|s| {
+            s.receiver.is_some() && s.impl_args.iter().any(|a| matches!(a, Ty::Param(p) if p == param))
+        });
+        if bare {
+            self.elem_methods.insert(f);
+        }
+        bare
     }
 
     /// (struct, position) of `param` when `f` is a method with `self` of `impl<.., param, ..>
@@ -9173,7 +9278,7 @@ impl Checker<'_> {
         let i = sig
             .impl_args
             .iter()
-            .position(|a| *a == Ty::Param(param.to_string()))?;
+            .position(|a| class_param(a) == Some(param))?;
         // (Const parameters are carried as values already: `this.$N`.)
         let name = def.type_params.get(i)?;
         let is_const = self
@@ -9672,10 +9777,10 @@ impl Checker<'_> {
                 for (f, adt, targs) in &self.ctor_sites {
                     let Some(f) = f else { continue };
                     for (i, t) in targs.iter().enumerate() {
-                        if let Ty::Param(p) = t
+                        if let Some(p) = class_param(t)
                             && self.stored_uses.contains(&(adt.clone(), i))
                         {
-                            uses.push((f.clone(), p.clone()));
+                            uses.push((f.clone(), p.to_string()));
                         }
                     }
                 }
@@ -10081,4 +10186,17 @@ pub(super) fn bounds_future_output(list: &ast::TypeBoundList) -> Option<Option<a
         }
         _ => None,
     })
+}
+
+/// The type parameter whose class a struct's values can carry at an argument of this type: `T`,
+/// or the element of a `Vec<T>` / `Option<T>`, whose classes hold their element's (`.elem`).
+pub(crate) fn class_param(t: &Ty) -> Option<&str> {
+    match t {
+        Ty::Param(p) => Some(p),
+        Ty::Vec(e) | Ty::Option(e) => match &**e {
+            Ty::Param(p) => Some(p),
+            _ => None,
+        },
+        _ => None,
+    }
 }

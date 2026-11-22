@@ -3,12 +3,13 @@
 //! `std::mem::{swap, replace, take}`. A child module of `codegen`.
 
 use ra_ap_syntax::{
-    AstNode,
+    AstNode, SyntaxNode,
     ast::{self, HasArgList},
 };
 
 use super::{Codegen, Frag, default_value, is_pure, js_string, strip_refs};
 use crate::ty::{IntKind, Ty};
+use crate::typeck;
 
 impl Codegen<'_> {
     /// Whether the one argument of `x.wrapping_add(y)` on a BigInt kind is surely a BigInt:
@@ -699,17 +700,41 @@ impl Codegen<'_> {
             // none of its own).
             ["mem", "size_of" | "align_of" | "size_of_val" | "align_of_val"]
             | ["size_of" | "align_of" | "size_of_val" | "align_of_val"] => {
-                let t = if tail.last().is_some_and(|f| f.ends_with("_val")) {
-                    args.first().and_then(|a| self.ty_of(strip_refs(a).syntax()))
+                let f = tail.last().copied().unwrap_or("size_of");
+                let align = f.starts_with("align");
+                let m = if f.ends_with("_val") {
+                    args.first().and_then(|a| self.measure_val(a))
                 } else {
-                    turbofish_type(c).map(|t| self.lower_type(&t))
+                    turbofish_type(c).and_then(|t| {
+                        let root = self.file_root.clone()?;
+                        type_layout(&t, &root, 0)
+                            .or_else(|| {
+                                let ty = self.lower_type(&t);
+                                self.ty_layout(&ty, &root)
+                            })
+                            .map(Measure::Fixed)
+                    })
                 };
-                match t.as_ref().and_then(byte_width) {
-                    Some(n) => Frag::mapped(start, n.to_string()),
+                match m {
+                    Some(Measure::Fixed(l)) => {
+                        Frag::mapped(start, (if align { l.align } else { l.size }).to_string())
+                    }
+                    Some(Measure::Slice(l)) if align => Frag::mapped(start, l.align.to_string()),
+                    // A slice: its length's worth of elements.
+                    Some(Measure::Slice(l)) => {
+                        let (s, _) = self.emit_expr(&strip_refs(args.first()?), None);
+                        let mut f = Frag::mapped(start, "(");
+                        f.append(s).push(format!(".length * {})", l.size));
+                        f
+                    }
                     None => {
+                        let t = if f.ends_with("_val") {
+                            args.first().and_then(|a| self.ty_of(strip_refs(a).syntax()))
+                        } else {
+                            turbofish_type(c).map(|t| self.lower_type(&t))
+                        };
                         let what = format!(
-                            "`{}` of `{}`",
-                            tail.last().copied().unwrap_or("size_of"),
+                            "`{f}` of `{}`",
                             t.map(|t| t.describe()).unwrap_or_else(|| "this type".into())
                         );
                         self.unsupported(c.syntax(), &what);
@@ -764,6 +789,215 @@ impl Codegen<'_> {
         };
         Some((f, ty))
     }
+
+    /// What `size_of_val(arg)` measures: what `arg` points to. The checker erases boxes,
+    /// references and array lengths, so a local's declared type (or a `Box::new` / `vec!`
+    /// initializer, or the array's length as the file gives it) says first.
+    fn measure_val(&self, arg: &ast::Expr) -> Option<Measure> {
+        use typeck::Decl;
+        let root = self.file_root.clone()?;
+        let decl = |e: &ast::Expr| {
+            let at = ra_ap_syntax::TextSize::from(self.off(e.syntax()) as u32);
+            typeck::decl_at(&root, e, at)
+        };
+        let elem_of = |e: &ast::Expr| match self.ty_of(e.syntax()) {
+            Some(Ty::Vec(t)) => self.ty_layout(&t, &root),
+            _ => None,
+        };
+        let place = match super::strip_parens_expr(arg) {
+            ast::Expr::RefExpr(r) => r.expr()?,
+            // A reference value: `s: &[T]` or `&T`.
+            other => {
+                if let Some(Decl::Let(Some(t), _) | Decl::Param(Some(t))) = decl(&other)
+                    && let ast::Type::RefType(r) = &t
+                {
+                    return match r.ty()? {
+                        ast::Type::SliceType(s) => {
+                            type_layout(&s.ty()?, &root, 0).map(Measure::Slice)
+                        }
+                        t => type_layout(&t, &root, 0).map(Measure::Fixed),
+                    };
+                }
+                return match self.ty_of(other.syntax())? {
+                    Ty::Vec(_) => elem_of(&other).map(Measure::Slice),
+                    t => self.ty_layout(&t, &root).map(Measure::Fixed),
+                };
+            }
+        };
+        let mut dims = Vec::new();
+        match decl(&place) {
+            Some(Decl::Let(Some(t), _) | Decl::Param(Some(t))) => {
+                return type_layout(&t, &root, 0).map(Measure::Fixed);
+            }
+            Some(Decl::Let(None, Some(init))) => {
+                let text = init.syntax().text().to_string();
+                if text.starts_with("Box::new(") {
+                    return Some(Measure::Fixed(POINTER));
+                }
+                if text.starts_with("vec!") || text.starts_with("Vec::") {
+                    return Some(Measure::Fixed(VEC));
+                }
+                dims = typeck::array_dims_in_file(&init, 0);
+            }
+            _ => {}
+        }
+        let ty = self.ty_of(place.syntax())?;
+        let Ty::Vec(_) = ty else {
+            return self.ty_layout(&ty, &root).map(Measure::Fixed);
+        };
+        if dims.is_empty() {
+            dims = typeck::array_dims_in_file(&place, 0);
+        }
+        if !dims.is_empty() {
+            let mut elem = ty;
+            for _ in &dims {
+                let Ty::Vec(t) = elem else {
+                    return None;
+                };
+                elem = *t;
+            }
+            let l = self.ty_layout(&elem, &root)?;
+            let n: u32 = dims.iter().map(|&d| d as u32).product();
+            return Some(Measure::Fixed(Layout {
+                size: n * l.size,
+                align: l.align,
+            }));
+        }
+        // `&xs[1..4]`
+        if let ast::Expr::IndexExpr(ix) = super::strip_parens_expr(&place)
+            && matches!(ix.index(), Some(ast::Expr::RangeExpr(_)))
+        {
+            return elem_of(&place).map(Measure::Slice);
+        }
+        None
+    }
+
+    /// The layout rustc gives a checked type: the number kinds, `bool`, `char`, tuples and the
+    /// file's structs of those.
+    fn ty_layout(&self, t: &Ty, root: &SyntaxNode) -> Option<Layout> {
+        match t {
+            Ty::Unit => Some(Layout { size: 0, align: 1 }),
+            Ty::Tuple(ts) => combine(
+                ts.iter()
+                    .map(|t| self.ty_layout(t, root))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Ty::Adt(n, args) if args.is_empty() => struct_layout(n, root, 0),
+            t => byte_width(t).map(|n| Layout { size: n, align: n }),
+        }
+    }
+}
+
+/// A type's size and alignment in rustc (64-bit).
+#[derive(Clone, Copy)]
+struct Layout {
+    size: u32,
+    align: u32,
+}
+
+const POINTER: Layout = Layout { size: 8, align: 8 };
+const FAT_POINTER: Layout = Layout { size: 16, align: 8 };
+/// `Vec<T>` and `String`: pointer, capacity, length.
+const VEC: Layout = Layout { size: 24, align: 8 };
+
+/// What `size_of_val` / `align_of_val` find.
+enum Measure {
+    Fixed(Layout),
+    /// A slice, by its element's layout: its size is known when the code runs.
+    Slice(Layout),
+}
+
+/// Fields laid out as rustc does: largest alignment first, so there's no padding between them
+/// (every size is a multiple of its alignment), then rounded up to the largest.
+fn combine(fields: Vec<Layout>) -> Option<Layout> {
+    let align = fields.iter().map(|l| l.align).max().unwrap_or(1);
+    let size: u32 = fields.iter().map(|l| l.size).sum();
+    Some(Layout {
+        size: size.div_ceil(align) * align,
+        align,
+    })
+}
+
+/// The layout of a written type: also references and boxes (a pointer, two words to a slice,
+/// `str` or `dyn Trait`), `Vec` / `String`, arrays of a known length, and the file's own
+/// non-generic structs.
+fn type_layout(t: &ast::Type, root: &SyntaxNode, depth: usize) -> Option<Layout> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    if depth > 8 {
+        return None;
+    }
+    let pointer_to = |t: Option<ast::Type>| match t {
+        Some(ast::Type::SliceType(_) | ast::Type::DynTraitType(_)) => Some(FAT_POINTER),
+        Some(ast::Type::PathType(p)) if p.syntax().text() == "str" => Some(FAT_POINTER),
+        Some(_) => Some(POINTER),
+        None => None,
+    };
+    match t {
+        ast::Type::ParenType(p) => type_layout(&p.ty()?, root, depth + 1),
+        ast::Type::RefType(r) => pointer_to(r.ty()),
+        ast::Type::PtrType(p) => pointer_to(p.ty()),
+        ast::Type::TupleType(tt) => combine(
+            tt.fields()
+                .map(|t| type_layout(&t, root, depth + 1))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        ast::Type::ArrayType(a) => {
+            let n = typeck::array_type_len(t)? as u32;
+            let l = type_layout(&a.ty()?, root, depth + 1)?;
+            Some(Layout {
+                size: n * l.size,
+                align: l.align,
+            })
+        }
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            let name = seg.name_ref()?.text().to_string();
+            if let Some(g) = seg.generic_arg_list() {
+                let arg = g.generic_args().find_map(|a| match a {
+                    ast::GenericArg::TypeArg(t) => t.ty(),
+                    _ => None,
+                });
+                return match name.as_str() {
+                    "Box" | "Rc" | "Arc" => pointer_to(arg),
+                    "Vec" => Some(VEC),
+                    _ => None,
+                };
+            }
+            let width = |n| Some(Layout { size: n, align: n });
+            match name.as_str() {
+                "i8" | "u8" | "bool" => width(1),
+                "i16" | "u16" => width(2),
+                "i32" | "u32" | "f32" | "char" => width(4),
+                "i64" | "u64" | "f64" | "isize" | "usize" => width(8),
+                "i128" | "u128" => width(16),
+                "String" => Some(VEC),
+                _ => struct_layout(&name, root, depth + 1),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The layout of the file's struct `name`, when it isn't generic and every field's is known.
+fn struct_layout(name: &str, root: &SyntaxNode, depth: usize) -> Option<Layout> {
+    use ra_ap_syntax::ast::{HasGenericParams, HasName};
+    let s = root
+        .descendants()
+        .filter_map(ast::Struct::cast)
+        .find(|s| s.name().is_some_and(|n| n.text() == name))?;
+    if s.generic_param_list().is_some() {
+        return None;
+    }
+    let tys: Vec<Option<ast::Type>> = match s.field_list() {
+        Some(ast::FieldList::RecordFieldList(l)) => l.fields().map(|f| f.ty()).collect(),
+        Some(ast::FieldList::TupleFieldList(l)) => l.fields().map(|f| f.ty()).collect(),
+        None => Vec::new(),
+    };
+    combine(
+        tys.into_iter()
+            .map(|t| type_layout(&t?, root, depth + 1))
+            .collect::<Option<Vec<_>>>()?,
+    )
 }
 
 /// `&mut x`, `&mut v[i]`, `&mut self.f`: a place JS can assign.

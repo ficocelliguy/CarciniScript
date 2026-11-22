@@ -26,10 +26,11 @@ fn declares(text: &str, name: &str) -> bool {
         .any(|kw| text.contains(&format!("{kw} {name}")))
 }
 
-/// The preludes `text` needs (after `stdtime`'s), when it names their types.
-pub(crate) fn preludes(text: &str) -> Vec<&'static str> {
+/// The preludes `text` needs (after `stdtime`'s), when it names their types; `paths`: another
+/// prelude it gets names `PathBuf`.
+pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     let mut out = Vec::new();
-    let path = (text.contains("PathBuf") || text.contains("__AsPath"))
+    let path = (paths || text.contains("PathBuf") || text.contains("__AsPath"))
         && !text.contains("// (path prelude)")
         && !declares(text, "PathBuf");
     // (The path prelude's `FromStr` names `Infallible`.)

@@ -83,8 +83,9 @@ pub(super) fn ext_self_ty(key: &str) -> Ty {
             crate::ty::Coll::VecDeque,
             Box::new(Ty::Vec(Box::new(Ty::Unknown))),
         ),
-        "Range" => Ty::Range(Box::new(Ty::Unknown), false),
-        "RangeInclusive" => Ty::Range(Box::new(Ty::Unknown), true),
+        k if let Some(r) = crate::ty::RangeKind::from_name(k) => {
+            Ty::Range(Box::new(Ty::Unknown), r)
+        }
         "Option" => Ty::Option(Box::new(Ty::Unknown)),
         "bool" => Ty::Bool,
         "char" => Ty::Char,
@@ -625,16 +626,44 @@ impl Codegen<'_> {
         {
             let struct_params = self.types.adts.defs[adt].type_params.clone();
             for &i in pos {
-                if let Some(Ty::Param(n)) = sig.impl_args.get(i)
+                if let Some(a) = sig.impl_args.get(i)
+                    && let Some(n) = crate::typeck::class_param(a)
                     && let Some(x) = struct_params.get(i)
                 {
-                    super::CONST_SCOPE
-                        .with(|s| s.borrow_mut().insert(n.clone(), format!("this.${x}")));
+                    // (`impl<T> S<Vec<T>>`: on the `Vec`'s class.)
+                    let js = match a {
+                        Ty::Param(_) => format!("this.${x}"),
+                        _ => format!("this.${x}?.elem"),
+                    };
+                    super::CONST_SCOPE.with(|s| s.borrow_mut().insert(n.to_string(), js));
                 }
             }
         }
         let mut const_lines = self.enter_consts(f, outer);
         const_lines.extend(view_lines);
+        // `impl<T> Tr for Option<T>` (or `Vec<T>`): `T`'s class, handed over by a caller that
+        // knows it; `impl<A, B> Tr for (A, B)`: the elements' classes, in an array.
+        let elem_key = match &self_ty {
+            Ty::Option(_) => Some("Option"),
+            Ty::Vec(_) => Some("Vec"),
+            Ty::Tuple(es) => crate::adt::tuple_key(es.len()),
+            _ => None,
+        };
+        if let Some(key) = elem_key
+            && self.types.elem_methods.contains(&format!(
+                "{key}::{}",
+                js_name.clone().unwrap_or_else(|| name.text().to_string())
+            ))
+        {
+            let tuple = matches!(self_ty, Ty::Tuple(_));
+            for (i, a) in sig.impl_args.iter().enumerate() {
+                if let Ty::Param(p) = a {
+                    let js = if tuple { format!("$elem?.[{i}]") } else { "$elem".into() };
+                    super::CONST_SCOPE.with(|s| s.borrow_mut().insert(p.clone(), js));
+                }
+            }
+            const_lines.insert(0, "const $elem = κσ.$takeElem();".into());
+        }
         // A hand-written `impl<T: Debug> Debug for Wrapper<T>`: the formatters for the type's
         // arguments come in on the Formatter (`f.$fs`), as a derived `$dbg` gets them.
         if js_name.as_deref() == Some("fmt$dbg")
@@ -767,7 +796,8 @@ impl Codegen<'_> {
                 crate::ty::Coll::BTreeSet,
                 Box::new(Ty::Set(Box::new(Ty::Unknown))),
             ),
-            "VecDeque" | "Range" | "RangeInclusive" => ext_self_ty(key),
+            "VecDeque" => ext_self_ty(key),
+            k if crate::ty::RangeKind::from_name(k).is_some() => ext_self_ty(k),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             k => Ty::from_name(k),
@@ -918,6 +948,21 @@ impl Codegen<'_> {
                 muts.join(", ")
             )));
         }
+        // The methods that take `T`'s class (`κσ.$dcallT` hands it over).
+        let mut elems: Vec<String> = self
+            .types
+            .elem_methods
+            .iter()
+            .filter_map(|m| m.strip_prefix(&format!("{key}::")))
+            .map(|n| super::js_string(&prop(n)))
+            .collect();
+        if !elems.is_empty() {
+            elems.sort();
+            self.line(Frag::text(format!(
+                "$ext${key}.$elem = new Set([{}]);",
+                elems.join(", ")
+            )));
+        }
         // `Box<dyn Shape>`'s `from`s: called by name only.
         if key.starts_with("dyn$") {
             self.line(Frag::default());
@@ -999,8 +1044,7 @@ impl Codegen<'_> {
             "BTreeSet" => ("btreeset", false),
             "VecDeque" => ("deque", false),
             // (A range value is an `Iter` over a `RangeIt`.)
-            "Range" => ("range", false),
-            "RangeInclusive" => ("rangeincl", false),
+            k if let Some(r) = crate::ty::RangeKind::from_name(k) => (r.rt_kind(), false),
             // (`impl Tr for fn() -> i32`: any JS function.)
             "FnPtr" => ("function", false),
             "RefCell" => ("refcell", false),

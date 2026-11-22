@@ -510,6 +510,12 @@
     "panic": null
   },
   {
+    "file": "dyn_number_impls.rs",
+    "stdout": "f64 1\ni32 2\nf32 3.5\nf64 4\nf64 1.5 / 1.5 / 1.5\ni32 3 / 3 / 3\nf32 7 / 7 / 7.0\nf64 4.5 / 4.5 / 4.5\nf64 2\ni32 7 / 7 / 7\nf64 8 / 8 / 8.0\nf64 2\nf64 10 i32 10\n6.0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "dyn_writers.rs",
     "stdout": "n=1; doneline\nN=2; DONE\n[n=3; done]\na:(1, \"x\") b:2.5 /B:(1, \"X\") A:2.5 \n[x][y]| N=2; DONE[X][Y]|\n\"<x>!<y>!\"\n<z>!\n",
     "exitCode": 0,
@@ -764,6 +770,12 @@
   {
     "file": "impl_iter_fns.rs",
     "stdout": "[2, 4, 6] [1, 4, 9, 16]\n[3, 6, 9, 12]\n7\n20 60\n1 [\"a\"]\n2 [\"hi\", \"yo\"]\n3 [\"hey\"]\n165\n14 [1, 3, 5, 7, 9] [0, 2]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "impl_vec_param_class.rs",
+    "stdout": "[(2, 1), (2, 2)]\n[(2.25, 1.0)]\n[(3, 1), (-3, -1), (4, 1)]\n[(3.5, 1.0), (4.5, 1.0)]\n[64, 248] [55, 224] [144, 62]\n[-6, -1]\ntrue false false\n[12] [2.5, 3.0]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1098,6 +1110,12 @@
     "panic": null
   },
   {
+    "file": "nested_option_impls.rs",
+    "stdout": "Some(Some(i32 4))\nSome(None)\nNone\nSome(i32 4)\ni32 4\nSome(Some(#i32 5))\nSome(Some(Some(i32 6)))\nSome(Some(~i32 7))\nSome(Some(\"hi\"))\nSome(Some(P(3)))\nSome(Some(i32 1)) / Some(None)\nSome(Some(i32 8))\nSome(None)\nNone\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "net_addrs.rs",
     "stdout": "\"127.0.0.1\" -> 127.0.0.1 127.0.0.1 v4=true loop=true\n\"10.1.2.3\" -> 10.1.2.3 10.1.2.3 v4=true loop=false\n\"256.1.1.1\" -> error: invalid IP address syntax / AddrParseError(Ip)\n\"01.2.3.4\" -> error: invalid IP address syntax / AddrParseError(Ip)\n\"1.2.3\" -> error: invalid IP address syntax / AddrParseError(Ip)\n\"::1\" -> ::1 ::1 v4=false loop=true\n\"::\" -> :: :: v4=false loop=false\n\"2001:db8::8a2e:370:7334\" -> 2001:db8::8a2e:370:7334 2001:db8::8a2e:370:7334 v4=false loop=false\n\"fe80::1:0:0:1\" -> fe80::1:0:0:1 fe80::1:0:0:1 v4=false loop=false\n\"1:0:0:2:0:0:0:3\" -> 1:0:0:2::3 1:0:0:2::3 v4=false loop=false\n\"::ffff:192.168.1.9\" -> ::ffff:192.168.1.9 ::ffff:192.168.1.9 v4=false loop=false\n\"::1.2.3.4\" -> ::102:304 ::102:304 v4=false loop=false\n\"1::2::3\" -> error: invalid IP address syntax / AddrParseError(Ip)\n\"a:b:c:d:e:f:1:2\" -> a:b:c:d:e:f:1:2 a:b:c:d:e:f:1:2 v4=false loop=false\n\"0:0:1:0:0:0:0:0\" -> 0:0:1:: 0:0:1:: v4=false loop=false\n\"hello\" -> error: invalid IP address syntax / AddrParseError(Ip)\n\"\" -> error: invalid IP address syntax / AddrParseError(Ip)\n127.0.0.1:8080 -> 127.0.0.1:8080 127.0.0.1:8080 ip=127.0.0.1 port=8080\n[::1]:443 -> [::1]:443 [::1]:443 ip=::1 port=443\n[fe80::1%3]:22 -> [fe80::1%3]:22 [fe80::1%3]:22 ip=fe80::1 port=22\n1.2.3.4:70000 -> invalid socket address syntax\n1.2.3.4 -> invalid socket address syntax\n[::1] -> invalid socket address syntax\nlocalhost:80 -> invalid socket address syntax\n192.168.0.7 [192, 168, 0, 7] private=true ::ffff:192.168.0.7\n[     192.168.0.7] [127.0.0.1   ]\n2001:db8::1:0:0:1\n::1\n0.0.0.0:8000 false\n1.2.3.4:9 1.2.3.4\ntrue\nErr(\"invalid IPv6 address syntax\")\n[1.1.1.1, 9.9.9.9, ::2]\n127.0.0.1\nv4 1\n",
     "exitCode": 0,
@@ -1184,6 +1202,12 @@
   {
     "file": "or_pattern_bindings.rs",
     "stdout": "Circle(1.5) -> 1.5\nSquare(2.0) -> 2\nRect(3.0, 4.0) -> 12\nRect(2.0, 150.0) -> 150\nDot -> 0\nSome(1) Some(5) None\nsmall, picked 7\nsmall, picked 1\nsmall, picked 3\n1..4\nempty\n(1, 2) (4, 3) (0, 0)\n1\nb\n3\n42\n6 []\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "os_pipes_dir_entries.rs",
+    "stdout": "! NotFound\ncouldn't run wc\nno child\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1302,6 +1326,12 @@
     "panic": null
   },
   {
+    "file": "range_kind_impls.rs",
+    "stdout": "from 3\nbelow 7\nup to 7\neverything\n2 to 5\nbelow 7; below 7\nfrom 5\nbelow 2\nup to 2\neverything\n1 to 4\ndyn: from 9\ndyn: below 1\ndyn: everything\ndyn: 0 to 1\n[10, 11, 12]\n15\n..2 1.. .. ..=3\n2 1 3\n[10, 20] [20, 30, 40, 50] [10, 20, 30, 40, 50] [10, 20, 30, 40]\ntrue false\n[40, 50] [10] 4\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "range_values.rs",
     "stdout": "0..5 0 5 5 false\n[30, 40] true false\nSpan { name: \"mid\", r: 2..4 }\n2 3 \n1..=3 1 3 true\n4..=6 sum 15\nworld\n[0..2, 5..7, 3..3]\n[false, false, true]\n12\ntrue false\n1..4 true\n[0, 1, 4, 9]\n",
     "exitCode": 0,
@@ -1364,6 +1394,12 @@
   {
     "file": "simulation.rs",
     "stdout": "[403, 657, 551, 36, 712]\n0 hackers; [(5, Grow), (4, Weaken), (2, Grow), (1, Weaken)]\n50\n  5 Grow      50\n  4 Weaken    40\n  2 Grow      20\n  1 Weaken    10\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "size_of_val.rs",
+    "stdout": "20\n500\n24\n12\n12\n8\n24\nPoint occupies 16 bytes on the stack\nRectangle occupies 32 bytes on the stack\nBoxed point occupies 8 bytes on the stack\nBoxed rectangle occupies 8 bytes on the stack\nBoxed box occupies 8 bytes on the stack\nUnboxed point occupies 16 bytes on the stack\n8 4\n0 1\n16 12\n16 16\n4\n2\n16\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1604,6 +1640,12 @@
   {
     "file": "tuple_trait_impls.rs",
     "stdout": "(u3,i4)\n<s2:abu9i-2>\n(u1,s1:x)(u1,s1:x)\n((u1,u2),i7)((u1,u2),i7)\n7\n14\n(u1,u2) (u3,u4)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "tuple_vec_impls.rs",
+    "stdout": "( u8 1 u8 2 )\nvec 2 u8 1 u8 2\n3( u8 1 str \"a\" u8 3 )\nvec 3 u8 1 u8 2 u8 3\nvec 2 ( u8 1 u8 2 ) ( u8 3 u8 4 )\n( vec 2 u8 5 u8 6 u8 7 )\n( ( u8 1 u8 2 ) vec 1 ( u8 3 u8 4 ) )\nvec 2 u8 8 u8 9 | vec 0\n( u8 8 u8 9 ) | ( u8 0 u8 1 )\n( u8 1 u8 2 ) vec 2 u8 1 u8 2\n(3, 6) [3, 4] [(3, 5), (7, 9)]\n2 102\n102\n",
     "exitCode": 0,
     "panic": null
   },

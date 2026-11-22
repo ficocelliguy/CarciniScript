@@ -302,6 +302,22 @@
     }
   }
 
+  // A number as a `dyn Trait` whose trait has impls on two number types (`impl Name for i32`,
+  // `impl Name for f64`): the value `v` and its type's impl key `k`, since a whole `f64` looks
+  // like an integer. `$dcall` takes `k`'s impl.
+  class DynNum {
+    constructor(v, k) {
+      this.v = v;
+      this.k = k;
+    }
+    toString() {
+      return typeof this.v === "number" ? fmtF(this.v) : String(this.v);
+    }
+    $dbg() {
+      return this.k === "f32" || this.k === "f64" ? dbgF(this.v) : String(this.v);
+    }
+  }
+
   // Rust's VecDeque<T>: a ring buffer. `b` is the backing array, `h` the head's position in it and
   // `n` the length; element `i` is at `b[(h + i) % b.length]`, so `pop_front` and `push_front`
   // are O(1). The compiler indexes a deque through `$i` (checked) / `$p`; everything a `Vec`
@@ -1019,14 +1035,21 @@
   }
   // An integer range (`lo..hi`, `lo..=hi`, `lo..`: `end` is Infinity); BigInts for `i128`.
   class RangeIt extends AdapterIt {
-    // (`hi` and `incl`: the bounds as written, for a range used as a value.)
-    constructor(i, end, one, hi, incl) {
+    // (`hi` and `incl`: the bounds as written, for a range used as a value; `open`: no start,
+    // `..hi` / `..`, which counts from 0.)
+    constructor(i, end, one, hi, incl, open = false) {
       super();
       this.i = i;
       this.end = end;
       this.one = one;
       this.hi = hi;
       this.incl = incl;
+      this.open = open;
+    }
+    // The `kind` your impls of its range type are registered under (`$extReg`).
+    get kind() {
+      if (this.open) return this.hi === null ? "rangefull" : this.incl ? "rangetoincl" : "rangeto";
+      return this.hi === null ? "rangefrom" : this.incl ? "rangeincl" : "range";
     }
     next() {
       if (this.i < this.end) {
@@ -1151,18 +1174,18 @@
     $dbg(f = rt.$dbg) {
       const r = this.it;
       if (!(r instanceof RangeIt)) return "Iter { .. }";
-      return `${f(r.i)}${r.incl ? "..=" : ".."}${r.hi === null ? "" : f(r.hi)}`;
+      return `${r.open ? "" : f(r.i)}${r.incl ? "..=" : ".."}${r.hi === null ? "" : f(r.hi)}`;
     }
     $eq(o) {
       const a = this.it;
       const b = o?.it;
-      return a instanceof RangeIt && b instanceof RangeIt && a.i === b.i && a.hi === b.hi && a.incl === b.incl;
+      return a instanceof RangeIt && b instanceof RangeIt && a.i === b.i && a.hi === b.hi && a.incl === b.incl && a.open === b.open;
     }
     // `it.clone()`: an iterator over what's left, independent of this one.
     $clone() {
       if (this.it instanceof RangeIt) {
         const r = this.it;
-        return new Iter(new RangeIt(r.i, r.end, r.one, r.hi, r.incl));
+        return new Iter(new RangeIt(r.i, r.end, r.one, r.hi, r.incl, r.open));
       }
       const all = Array.from(iterable(this.it));
       this.it = all[Symbol.iterator]();
@@ -2795,6 +2818,9 @@
     // User trait impls for built-in types (`impl Money for f64`), by JS kind, for calls through
     // a type parameter or `dyn Trait` (`$dcall`). Each compiled script has its own registry
     // (`$newRegs`), so one script's impls never answer another's calls.
+    $dynNum(v, k) {
+      return new DynNum(v, k);
+    },
     $newRegs() {
       return { kinds: {}, blankets: [] };
     },
@@ -2845,6 +2871,13 @@
     // number (listed in its class's `$mut`) gets the cell as `this`, others the value.
     $dcallMut(regs, c, name, ...args) {
       const x = c[0];
+      // (Through a cell over its value, written back.)
+      if (x instanceof DynNum) {
+        const cell = [x.v];
+        const r = rt.$dcallMutT(regs, { kind: x.k }, cell, name, ...args);
+        x.v = cell[0];
+        return r;
+      }
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
         return x[name](...args);
       }
@@ -2869,9 +2902,10 @@
       return rt.$dcall(regs, x, name, ...args);
     },
     $dcall(regs, x, name, ...args) {
+      if (x instanceof DynNum) return rt.$dcallT(regs, { kind: x.k }, x.v, name, ...args);
       // (A range value is an `Iter` over a `RangeIt`: your `Range` impls before its own methods.)
       if (x instanceof Iter && x.it instanceof RangeIt) {
-        for (const r of regs.kinds[x.it.incl ? "rangeincl" : "range"] ?? []) {
+        for (const r of regs.kinds[x.it.kind] ?? []) {
           if (typeof r.cls.prototype[name] === "function") return r.cls.prototype[name].call(x, ...args);
         }
       }
@@ -3659,9 +3693,9 @@
         });
       }
       // `i128` / `u128` ranges step in BigInts.
-      const one = typeof lo === "bigint" ? 1n : 1;
+      const one = typeof (lo ?? hi) === "bigint" ? 1n : 1;
       const end = hi === null ? Infinity : inclusive ? hi + one : hi;
-      return new Iter(new RangeIt(lo, end, one, hi, inclusive));
+      return new Iter(new RangeIt(lo ?? one - one, end, one, hi, inclusive, lo === null));
     },
     $split(s, p) {
       return new Iter(rt.$strPieces(s, p)[Symbol.iterator]());
@@ -4752,9 +4786,39 @@
       str: { default: () => "", from_str: (s) => new Res(0, s), dbg: (s) => rt.$dbgStr(s) },
       bool: { default: () => false, from_str: (s) => rt.$parseBool(s), dbg: String },
       char: { default: () => "\0", from_str: (s) => rt.$parseChar(s), dbg: (c) => rt.$dbgChar(c) },
-      vec: { default: () => [] },
-      option: { default: () => null },
+      vec: { default: () => [], vec: true },
+      option: { default: () => null, opt: true },
       unit: { default: () => undefined },
+    },
+    // A `Vec<T>`'s or `Option<T>`'s class with `T`'s (`impl<T> S<Vec<T>>` reads it as `.elem`).
+    $withElem(prim, elem) {
+      return { ...prim, elem };
+    },
+    // A tuple's class: its length, and its elements' classes as `elem` (for a tuple impl's
+    // methods, see `$dcallT`).
+    $tupT(elem) {
+      return { tup: elem.length, elem };
+    },
+    // A tuple's or `Vec`'s class `cls`: the impl of `name` among the array ones (a tuple's of its
+    // length, a `Vec`'s of none), which all JS arrays reach by value alike.
+    $arrayImpl(regs, cls, name) {
+      if (cls?.tup === undefined && !cls?.vec) return null;
+      for (const r of regs.kinds.array ?? []) {
+        if (typeof r.cls.prototype[name] === "function" && r.arity === cls.tup) return r.cls;
+      }
+      return null;
+    },
+    // `impl<T> Tr for Option<T>`'s methods that use `T`'s class take it on their first line
+    // (`$takeElem`) from the caller that knows it (`$callElem`); anyone else leaves none.
+    $nextElem: undefined,
+    $callElem(elem, f, self, ...args) {
+      rt.$nextElem = elem;
+      return f.call(self, ...args);
+    },
+    $takeElem() {
+      const e = rt.$nextElem;
+      rt.$nextElem = undefined;
+      return e;
     },
     // The `{:?}` formatter of a type parameter's class (`this.$T` of an `impl<T>`'s value): a
     // number kind's or primitive's, a struct's or enum's `$dbg`, else by the run-time value.
@@ -4770,6 +4834,11 @@
     $dcallMutT(regs, cls, c, name, ...args) {
       const kind = cls?.kind;
       const x = c[0];
+      const arr = rt.$arrayImpl(regs, cls, name);
+      if (arr) {
+        const f = arr.prototype[name];
+        return arr.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
+      }
       if (kind !== undefined) {
         for (const r of regs.kinds[typeof x] ?? []) {
           if (r.cls.name === "$ext$" + kind && typeof r.cls.prototype[name] === "function") {
@@ -4780,6 +4849,19 @@
       return rt.$dcallMut(regs, c, name, ...args);
     },
     $dcallT(regs, cls, x, name, ...args) {
+      // (An `Option`'s class: its impl, whatever the value, handed the element's class.)
+      if (cls?.opt) {
+        for (const r of regs.kinds.option ?? []) {
+          const f = r.cls.prototype[name];
+          if (typeof f === "function") return r.cls.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
+        }
+      }
+      // (A tuple's or `Vec`'s: the impl for it, handed the elements' classes.)
+      const arr = rt.$arrayImpl(regs, cls, name);
+      if (arr) {
+        const f = arr.prototype[name];
+        return arr.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
+      }
       const kind = cls?.kind;
       if (kind !== undefined) {
         for (const r of regs.kinds[typeof x] ?? []) {

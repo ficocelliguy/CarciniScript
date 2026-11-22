@@ -44,7 +44,7 @@ use crate::fmt::{self, ArgRef, Piece, Spec};
 use crate::lineindex::{LineIndex, utf16_len};
 use crate::macros::{self, MacroArg};
 use crate::sourcemap::{self, Mapping};
-use crate::ty::{IntKind, Ty, is_float_method, std_const, std_tail};
+use crate::ty::{IntKind, RangeKind, Ty, is_float_method, std_const, std_tail};
 use crate::typeck::{self, Types, is_none_binding, path_is};
 
 #[derive(Serialize, Debug, Clone)]
@@ -801,6 +801,7 @@ fn compile_text(
         consts: HashMap::new(),
         local_adts: Default::default(),
         file_traits: Vec::new(),
+        file_root: None,
         display_names,
         slice_view: false,
         view_params: HashMap::new(),
@@ -936,6 +937,9 @@ struct Codegen<'a> {
     /// The file's trait declarations (their default methods are compiled again for built-in
     /// types that implement them).
     file_traits: Vec<ast::Trait>,
+    /// The file being compiled (a macro argument is parsed on its own: its nodes don't reach
+    /// it).
+    file_root: Option<SyntaxNode>,
     /// Types renamed when inline modules were flattened (`util__Point`), by their written name.
     display_names: HashMap<String, String>,
     /// The range index being emitted is `&mut v[a..b]`'s: a view, not a copy.
@@ -1291,6 +1295,7 @@ impl<'a> Codegen<'a> {
     // ---------------------------------------------------------------- items
 
     fn emit_file(&mut self, file: &ast::SourceFile) {
+        self.file_root = Some(file.syntax().clone());
         // Pass 1: signatures, so calls can be lowered before the callee is emitted.
         // (Types with lifetime parameters, which a return type can name with the lifetime
         // elided: `-> Holder`.)
@@ -3325,6 +3330,10 @@ impl<'a> Codegen<'a> {
             let m = if mutable { "deref_mut" } else { "deref" };
             return (frag.wrap("(", &format!(").{m}()")).at(start), target);
         }
+        // A number into a `dyn Trait` with impls on two number types: tagged with its own.
+        if let Some(k) = self.types.dyn_nums.get(&r) {
+            return (frag.wrap("κσ.$dynNum(", &format!(", \"{k}\")")).at(start), ty);
+        }
         (frag.at(start), ty)
     }
 
@@ -5261,8 +5270,19 @@ impl<'a> Codegen<'a> {
             Ty::Str => "κσ.$prims.str".into(),
             Ty::Bool => "κσ.$prims.bool".into(),
             Ty::Char => "κσ.$prims.char".into(),
-            Ty::Vec(_) => "κσ.$prims.vec".into(),
-            Ty::Option(_) => "κσ.$prims.option".into(),
+            // (With the element's class when it has one, for `impl<T> S<Vec<T>>`.)
+            Ty::Vec(e) | Ty::Option(e) => {
+                let prim = if matches!(t, Ty::Vec(_)) { "vec" } else { "option" };
+                match self.dict_of(e) {
+                    d if d == "undefined" => format!("κσ.$prims.{prim}"),
+                    d => format!("κσ.$withElem(κσ.$prims.{prim}, {d})"),
+                }
+            }
+            // (A tuple's elements', for its impl's methods: see `κσ.$dcallT`.)
+            Ty::Tuple(es) if !es.is_empty() => format!(
+                "κσ.$tupT([{}])",
+                es.iter().map(|e| self.dict_of(e)).collect::<Vec<_>>().join(", ")
+            ),
             // (`()`: `N::default()` for `Graph::<(), u32>::from_edges`'s new nodes.)
             Ty::Unit => "κσ.$prims.unit".into(),
             _ => "undefined".into(),
@@ -6240,8 +6260,9 @@ impl<'a> Codegen<'a> {
                 "contains" => Some(("κσ.$rangeHas(", Ty::Bool)),
                 "is_empty" => Some(("κσ.$rangeEmpty(", Ty::Bool)),
                 "len" => Some(("κσ.$rangeLen(", Ty::Int(IntKind::Usize))),
-                "start" if incl => Some(("κσ.$rangeOf(", (*elem).clone())),
-                "end" if incl => Some(("κσ.$rangeOf(", (*elem).clone())),
+                "start" | "end" if incl == RangeKind::Inclusive => {
+                    Some(("κσ.$rangeOf(", (*elem).clone()))
+                }
                 _ => None,
             };
             if let Some((head, ty)) = helper {
@@ -6490,10 +6511,33 @@ impl<'a> Codegen<'a> {
                 let d = debug_fn(&rt).unwrap_or_else(|| "String".into());
                 args.push(Frag::text(d));
             }
-            let mut f = Frag::mapped(
-                self.off(m.syntax()),
-                format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&method)),
-            );
+            // (`impl<T> Tr for Option<T>`'s methods that use `T`'s class: handed over. A
+            // `Vec`'s or tuple's alike.)
+            let elem = if self.types.elem_methods.contains(&format!("{key}::{method}")) {
+                match &rt {
+                    Ty::Option(e) | Ty::Vec(e) => Some(self.dict_of(e)),
+                    Ty::Tuple(es) => Some(format!(
+                        "[{}]",
+                        es.iter().map(|e| self.dict_of(e)).collect::<Vec<_>>().join(", ")
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut f = match elem {
+                Some(d) => Frag::mapped(
+                    self.off(m.syntax()),
+                    format!(
+                        "κσ.$callElem({d}, $ext${key}.prototype.{}, ",
+                        adt_gen::prop(&method)
+                    ),
+                ),
+                None => Frag::mapped(
+                    self.off(m.syntax()),
+                    format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&method)),
+                ),
+            };
             f.append(Frag::join([vec![rf], args].concat(), ", "))
                 .push(")");
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);

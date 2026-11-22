@@ -123,6 +123,85 @@ pub enum Coll {
     FixedArray(usize),
 }
 
+/// Which of std's range types a `Ty::Range` is. All are the runtime's range iterator; a range
+/// without a start (`..7`, `..`) is marked so, and starts at 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeKind {
+    /// `a..b`
+    Range,
+    /// `a..=b`
+    Inclusive,
+    /// `a..`
+    From,
+    /// `..b`
+    To,
+    /// `..=b`
+    ToInclusive,
+    /// `..`
+    Full,
+}
+
+impl RangeKind {
+    pub fn from_name(name: &str) -> Option<RangeKind> {
+        Some(match name {
+            "Range" => RangeKind::Range,
+            "RangeInclusive" => RangeKind::Inclusive,
+            "RangeFrom" => RangeKind::From,
+            "RangeTo" => RangeKind::To,
+            "RangeToInclusive" => RangeKind::ToInclusive,
+            "RangeFull" => RangeKind::Full,
+            _ => return None,
+        })
+    }
+
+    /// The kind a range expression makes, by which bounds it has.
+    pub fn of(start: bool, end: bool, inclusive: bool) -> RangeKind {
+        match (start, end, inclusive) {
+            (true, true, false) => RangeKind::Range,
+            (true, true, true) => RangeKind::Inclusive,
+            (true, false, _) => RangeKind::From,
+            (false, true, false) => RangeKind::To,
+            (false, true, true) => RangeKind::ToInclusive,
+            (false, false, _) => RangeKind::Full,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RangeKind::Range => "Range",
+            RangeKind::Inclusive => "RangeInclusive",
+            RangeKind::From => "RangeFrom",
+            RangeKind::To => "RangeTo",
+            RangeKind::ToInclusive => "RangeToInclusive",
+            RangeKind::Full => "RangeFull",
+        }
+    }
+
+    pub fn inclusive(self) -> bool {
+        matches!(self, RangeKind::Inclusive | RangeKind::ToInclusive)
+    }
+
+    pub fn has_start(self) -> bool {
+        matches!(self, RangeKind::Range | RangeKind::Inclusive | RangeKind::From)
+    }
+
+    pub fn has_end(self) -> bool {
+        !matches!(self, RangeKind::From | RangeKind::Full)
+    }
+
+    /// The `kind` its impls are registered under at run time (`κσ.$extReg`).
+    pub fn rt_kind(self) -> &'static str {
+        match self {
+            RangeKind::Range => "range",
+            RangeKind::Inclusive => "rangeincl",
+            RangeKind::From => "rangefrom",
+            RangeKind::To => "rangeto",
+            RangeKind::ToInclusive => "rangetoincl",
+            RangeKind::Full => "rangefull",
+        }
+    }
+}
+
 impl Coll {
     pub fn from_name(name: &str) -> Option<Coll> {
         Some(match name {
@@ -233,10 +312,11 @@ pub enum Ty {
         elem: Box<Ty>,
         mutable: bool,
     },
-    /// A range as a value (`Range<T>`, `RangeInclusive<T>` when `.1`): a `let r = a..b`, a field
-    /// or a return type. At run time the same iterator a range expression makes, so codegen sees
-    /// it as an iterator (`view`); `start` / `end`, `contains`, `{:?}` and slicing are its own.
-    Range(Box<Ty>, bool),
+    /// A range as a value (`Range<T>`, `RangeInclusive<T>`, `RangeFrom<T>`, .. by `.1`): a
+    /// `let r = a..b`, a field or a return type. At run time the same iterator a range
+    /// expression makes, so codegen sees it as an iterator (`view`); `start` / `end`,
+    /// `contains`, `{:?}` and slicing are its own.
+    Range(Box<Ty>, RangeKind),
     /// `VecDeque<T>`, `BinaryHeap<T>`, `BTreeMap<K, V>`, `BTreeSet<T>`: the collection over the
     /// type it behaves like at run time (`Vec<T>`, `HashMap<K, V>`, `HashSet<T>`).
     Coll(Coll, Box<Ty>),
@@ -510,8 +590,8 @@ impl Ty {
                 mutable: true,
             } => format!("std::slice::IterMut<'_, {}>", elem.describe()),
             Ty::IntoIter(e) => format!("impl IntoIterator<Item = {}>", e.describe()),
-            Ty::Range(e, false) => format!("Range<{}>", e.describe()),
-            Ty::Range(e, true) => format!("RangeInclusive<{}>", e.describe()),
+            Ty::Range(_, RangeKind::Full) => "RangeFull".into(),
+            Ty::Range(e, k) => format!("{}<{}>", k.name(), e.describe()),
             Ty::MutRef(t) => format!("&mut {}", t.describe()),
             Ty::Var(_) => "_".into(),
             Ty::Unknown => "{unknown}".into(),

@@ -342,8 +342,9 @@ pub(crate) fn with_prelude(
     {
         out.push(TASK);
     }
-    // (`PhantomData`, `std::path`.)
-    out.extend(crate::stdgaps::preludes(text));
+    // (`PhantomData`, `std::path`, which `DirEntry::path()` returns.)
+    let dir_entries = os && (text.contains("FsDirEntry") || text.contains("__fs_read_dir"));
+    out.extend(crate::stdgaps::preludes(text, dir_entries));
     if out.is_empty() {
         return None;
     }

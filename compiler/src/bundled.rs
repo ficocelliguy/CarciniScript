@@ -2412,8 +2412,20 @@ const PROCESS_RENAMES: Renames = Renames {
         ("ExitStatus", "ProcExitStatus"),
         ("Output", "ProcOutput"),
         ("Child", "ProcChild"),
+        ("ChildStdin", "ProcChildStdin"),
+        ("ChildStdout", "ProcChildStdout"),
+        ("ChildStderr", "ProcChildStderr"),
     ],
-    star: &["Command", "Stdio", "ExitStatus", "Output", "Child"],
+    star: &[
+        "Command",
+        "Stdio",
+        "ExitStatus",
+        "Output",
+        "Child",
+        "ChildStdin",
+        "ChildStdout",
+        "ChildStderr",
+    ],
     result_err: None,
 };
 

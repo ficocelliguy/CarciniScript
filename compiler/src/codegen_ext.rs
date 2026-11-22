@@ -335,7 +335,8 @@ impl Codegen<'_> {
         let is_char = matches!(lo.as_ref().or(hi.as_ref()).map(|(_, t)| t), Some(Ty::Char));
         let inclusive = r.op_kind() == Some(RangeOp::Inclusive);
         let mut f = Frag::text("κσ.$range(");
-        f.append(lo.map(|x| x.0).unwrap_or_else(|| Frag::text("0")))
+        // (No start is `null`, which the runtime takes for 0 and marks: `..b`, `..`.)
+        f.append(lo.map(|x| x.0).unwrap_or_else(|| Frag::text("null")))
             .push(", ")
             .append(hi.map(|x| x.0).unwrap_or_else(|| Frag::text("null")))
             .push(format!(", {inclusive}, {is_char})"));

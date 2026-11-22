@@ -242,8 +242,9 @@ impl Checker<'_> {
                 crate::ty::Coll::VecDeque,
                 Box::new(Ty::Vec(Box::new(Ty::Unknown))),
             ),
-            "Range" => Ty::Range(Box::new(Ty::Unknown), false),
-            "RangeInclusive" => Ty::Range(Box::new(Ty::Unknown), true),
+            k if let Some(r) = crate::ty::RangeKind::from_name(k) => {
+                Ty::Range(Box::new(Ty::Unknown), r)
+            }
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             "f64" => Ty::Float { f32: false },
@@ -451,29 +452,6 @@ impl Checker<'_> {
                 .entry(type_name.to_string())
                 .or_default()
                 .insert(tm.name.clone(), sig);
-        }
-        // Tuples and `Vec`s (slices, arrays) are all JS arrays: a call through a type parameter
-        // tells tuples apart by length, but not a tuple from a `Vec`.
-        let has = |k: &str| {
-            self.adts
-                .trait_impls
-                .get(k)
-                .is_some_and(|ts| ts.iter().any(|t| t == tr))
-        };
-        let clash = if crate::adt::tuple_arity(type_name).is_some() {
-            has("Vec")
-        } else {
-            type_name == "Vec" && (1..=12).filter_map(crate::adt::tuple_key).any(has)
-        };
-        if clash {
-            let node = imp
-                .self_ty()
-                .map(|t| t.syntax().clone())
-                .unwrap_or_else(|| imp.syntax().clone());
-            self.error(
-                &node,
-                format!("`{tr}` for both a tuple and a slice, array or `Vec` isn't supported yet (all of them are JS arrays, which a call through a type parameter can't tell apart)"),
-            );
         }
         let impls = self
             .adts

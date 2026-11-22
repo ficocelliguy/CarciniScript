@@ -309,41 +309,18 @@ pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
             else {
                 return Vec::new();
             };
-            // The nearest `let name ..` before it, else a parameter `name: [T; N]`.
-            let at = e.syntax().text_range().start();
-            let mut best: Option<ast::LetStmt> = None;
-            for l in root.descendants().filter_map(ast::LetStmt::cast) {
-                if l.syntax().text_range().end() > at {
-                    continue;
-                }
-                if let Some(ast::Pat::IdentPat(ip)) = l.pat()
-                    && name_of(ip.name()).as_deref() == Some(name.as_str())
-                    && e.syntax().ancestors().any(|a| {
-                        a.text_range().contains_range(l.syntax().text_range())
-                            && ast::BlockExpr::can_cast(a.kind())
-                    })
-                {
-                    best = Some(l);
-                }
-            }
-            if let Some(l) = best {
-                let dims = type_dims(l.ty());
-                if !dims.is_empty() {
-                    return dims;
-                }
-                return l
-                    .initializer()
-                    .map(|i| array_dims_in_file(&i, depth + 1))
-                    .unwrap_or_default();
-            }
-            for f in e.syntax().ancestors().filter_map(ast::Fn::cast) {
-                for prm in f.param_list().into_iter().flat_map(|pl| pl.params()) {
-                    if let Some(ast::Pat::IdentPat(ip)) = prm.pat()
-                        && name_of(ip.name()).as_deref() == Some(name.as_str())
-                    {
-                        return type_dims(prm.ty());
+            match decl_of(e) {
+                Some(Decl::Let(ty, init)) => {
+                    let dims = type_dims(ty);
+                    if !dims.is_empty() {
+                        return dims;
                     }
+                    return init
+                        .map(|i| array_dims_in_file(&i, depth + 1))
+                        .unwrap_or_default();
                 }
+                Some(Decl::Param(ty)) => return type_dims(ty),
+                None => {}
             }
             // `const ARR: [T; N] = ..`
             type_dims(
@@ -380,6 +357,65 @@ pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Where the local a path expression names is declared.
+pub enum Decl {
+    /// `let name: ty = init;`
+    Let(Option<ast::Type>, Option<ast::Expr>),
+    /// A parameter `name: ty`.
+    Param(Option<ast::Type>),
+}
+
+/// The nearest `let name ..` before `e` in a block around it, else a parameter `name` of a
+/// function around it.
+pub fn decl_of(e: &ast::Expr) -> Option<Decl> {
+    let root = e.syntax().ancestors().last()?;
+    decl_at(&root, e, e.syntax().text_range().start())
+}
+
+/// `decl_of` for `e` found at `at` in the file `root` (`e` may be a macro argument parsed on
+/// its own).
+pub fn decl_at(
+    root: &ra_ap_syntax::SyntaxNode,
+    e: &ast::Expr,
+    at: ra_ap_syntax::TextSize,
+) -> Option<Decl> {
+    use ast::HasName;
+    let ast::Expr::PathExpr(p) = super::strip_parens(e) else {
+        return None;
+    };
+    let name = p.path()?.as_single_name_ref()?.text().to_string();
+    let name_of = |n: Option<ast::Name>| n.map(|n| n.text().to_string());
+    let here = root.token_at_offset(at).right_biased()?.parent()?;
+    let mut best: Option<ast::LetStmt> = None;
+    for l in root.descendants().filter_map(ast::LetStmt::cast) {
+        if l.syntax().text_range().end() > at {
+            continue;
+        }
+        if let Some(ast::Pat::IdentPat(ip)) = l.pat()
+            && name_of(ip.name()).as_deref() == Some(name.as_str())
+            && here.ancestors().any(|a| {
+                a.text_range().contains_range(l.syntax().text_range())
+                    && ast::BlockExpr::can_cast(a.kind())
+            })
+        {
+            best = Some(l);
+        }
+    }
+    if let Some(l) = best {
+        return Some(Decl::Let(l.ty(), l.initializer()));
+    }
+    for f in here.ancestors().filter_map(ast::Fn::cast) {
+        for prm in f.param_list().into_iter().flat_map(|pl| pl.params()) {
+            if let Some(ast::Pat::IdentPat(ip)) = prm.pat()
+                && name_of(ip.name()).as_deref() == Some(name.as_str())
+            {
+                return Some(Decl::Param(prm.ty()));
+            }
+        }
+    }
+    None
 }
 
 /// `e` without the wrappers `array_expr_len` looks through.

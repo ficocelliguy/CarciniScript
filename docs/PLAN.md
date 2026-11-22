@@ -217,13 +217,31 @@ see the Bitburner player gaps below).
     out a slot.
   - [x] Items that are tuples holding a `&mut` in a *returned* iterator (`-> impl
     Iterator<Item = (usize, &mut u8)>`, rejected as mismatched types).
-  - [ ] Your traits on `RangeFrom` / `RangeTo` / `RangeFull` (a `3..` is an iterator here).
-  - [ ] One trait for both a tuple and a `Vec` (borsh), and for two tuples of one length.
-  - [ ] `dyn Trait` on a float picking the impl by the value.
-  - [ ] `impl<T> S<Vec<T>>` carrying no class for `T`.
-  - [ ] A nested `Option<Option<_>>` through a generic `T: Tr` reaching the inner type's impl
-    for `Some(Some(4))` (`None` and `Some(None)` are right now, and no longer overflow the
-    stack).
+  - [x] Your traits on `RangeFrom` / `RangeTo` / `RangeFull` (a `3..` is an iterator here).
+    `Ty::Range` has a `RangeKind` for each of std's six range types, and a range without a start
+    is marked (`RangeIt.open`), so `$dcall` finds the impl for its kind and `{:?}` prints `..7`
+    (`fixtures/range_kind_impls.rs`).
+  - [x] One trait for both a tuple and a `Vec` (borsh). A call through a generic `T: Tr` goes by
+    `T`'s class: a tuple's is `κσ.$tupT([..])` with its elements' classes, a `Vec`'s is marked
+    (`$prims.vec`), and `$dcallT` / `$dcallMutT` take the array impl for it (`$arrayImpl`). A
+    tuple or `Vec` impl's methods get the elements' classes the way an `Option` impl's do
+    (`typeck::elem_class`, `$callElem`), so `(vec![1], 2)` reaches both impls
+    (`fixtures/tuple_vec_impls.rs`).
+  - [ ] One trait for two tuples of one length (`(u8, u8)` and `(String, String)`). Both impls
+    are keyed `Tuple2` (one `$ext$Tuple2` class, methods by name), so this needs a key per
+    element types before the class can pick between them.
+  - [x] `dyn Trait` on a float picking the impl by the value. A number coerced to a `dyn Trait`
+    whose trait has impls on two number types is tagged with its type there (`dyn_nums`,
+    `κσ.$dynNum`), and `$dcall` takes that type's impl; `Box::new(10.0)` into a `Box<dyn Tr>` is
+    an `f64`, as in rustc (`fixtures/dyn_number_impls.rs`).
+  - [x] `impl<T> S<Vec<T>>` carrying no class for `T`. A `Vec<T>`'s (and `Option<T>`'s) class
+    carries `T`'s (`κσ.$withElem`), the struct stores it, and the methods read `this.$T?.elem`
+    (`typeck::class_param`; `fixtures/impl_vec_param_class.rs`).
+  - [x] A nested `Option<Option<_>>` through a generic `T: Tr` reaching the inner type's impl
+    for `Some(Some(4))`. A trait with an `Option` impl next to others dispatches by `T`'s class,
+    and `$dcallT` hands an `Option` class's element class to the `Option` impl's methods
+    (`elem_methods`, `κσ.$callElem` / `$takeElem`), as does a direct call
+    (`fixtures/nested_option_impls.rs`).
 
   Closed in that pass: full std paths and `Option::Some` / `Result::<A, B>::Ok`, E0433 for a std
   type without its `use`, renamed `Error`s and a `use` in a block, re-exports through an inline
@@ -322,9 +340,12 @@ rustc's builds print (`tools/diff-one.mjs`).
   `lines()` already yielded `io::Result<String>`; the type `io::Lines<B>` (a type argument, unlike
   `str::Lines<'a>`) was the one taken for `String`s, and `flatten` didn't take `Result` items
   (`fixtures/io_lines_results.rs`).
-- [ ] `mem::size_of_val` (`primitives/array`, `std/box`); `DirEntry::path()` (`std_misc/fs`);
-  `Child`'s `stdin` / `stdout` fields (`std_misc/process/pipe`). These matter little for
-  scripts.
+- [x] `mem::size_of_val` (`primitives/array`, `std/box`); `DirEntry::path()` (`std_misc/fs`);
+  `Child`'s `stdin` / `stdout` fields (`std_misc/process/pipe`). `size_of_val` / `size_of` lay
+  out tuples, references, boxes, `Vec`s, arrays and the file's structs as rustc does, from the
+  written types where boxes and array lengths are erased (`codegen_std.rs` `type_layout`); a
+  slice's size is its length's worth (`fixtures/size_of_val.rs`). The os prelude has
+  `DirEntry::path()` and `Child`'s pipes (`fixtures/os_pipes_dir_entries.rs`).
 
 **Expected:** `thread::spawn` and `mpsc` (4 files), `Rc::strong_count` (no reference counts in
 JS), and the not-planned unsafe features (raw pointers, `slice::from_raw_parts`, `union`, FFI).

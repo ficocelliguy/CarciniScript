@@ -143,6 +143,9 @@ impl FsDirEntry {
     pub fn file_name(&self) -> String {
         self.__name.clone()
     }
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(self.__name.clone())
+    }
     pub fn metadata(&self) -> Result<FsMetadata, IoError> {
         Err(__fs_unsupported("DirEntry::metadata"))
     }
@@ -303,6 +306,42 @@ pub struct ProcOutput {
 #[derive(Debug)]
 pub struct ProcChild {
     __id: u32,
+    pub stdin: Option<ProcChildStdin>,
+    pub stdout: Option<ProcChildStdout>,
+    pub stderr: Option<ProcChildStderr>,
+}
+
+/// `std::process::ChildStdin`: never made.
+#[derive(Debug)]
+pub struct ProcChildStdin {}
+
+impl IoWrite for ProcChildStdin {
+    fn write(&mut self, _buf: &[u8]) -> Result<usize, IoError> {
+        Err(__proc_unsupported("ChildStdin::write"))
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
+        Err(__proc_unsupported("ChildStdin::flush"))
+    }
+}
+
+/// `std::process::ChildStdout`: never made.
+#[derive(Debug)]
+pub struct ProcChildStdout {}
+
+impl IoRead for ProcChildStdout {
+    fn read(&mut self, _buf: &mut [u8]) -> Result<usize, IoError> {
+        Err(__proc_unsupported("ChildStdout::read"))
+    }
+}
+
+/// `std::process::ChildStderr`: never made.
+#[derive(Debug)]
+pub struct ProcChildStderr {}
+
+impl IoRead for ProcChildStderr {
+    fn read(&mut self, _buf: &mut [u8]) -> Result<usize, IoError> {
+        Err(__proc_unsupported("ChildStderr::read"))
+    }
 }
 
 impl ProcChild {
