@@ -754,6 +754,10 @@ impl Checker<'_> {
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
+            // A trait of the file's own named like an operator trait (`trait Add { .. }`).
+            tr if crate::adt::op_method(tr).is_some() && self.adts.traits.contains_key(tr) => {
+                self.implements_user_trait(t, tr)
+            }
             // (`From<X>`'s `X` is checked at `T::from(x)`, `Into<Y>`'s at `.into()`; JSON's
             // traits where it's read or written. A `TryFrom<X>` without a fitting impl fails
             // at run time.)
@@ -920,6 +924,7 @@ impl Checker<'_> {
                 let r = self.range(m.syntax());
                 self.class_dispatch.insert(r);
             }
+            self.note_split_method(m, &b, method);
             return self.call_trait_method(m, recv, sig, Ty::Param(name.to_string()), args);
         }
         let t = Ty::Param(name.to_string());

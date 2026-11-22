@@ -250,6 +250,85 @@ rustc_hash, smallvec, indexmap), plus two for players: `ordered-float` (`f64` sc
   tooling (criterion, quickcheck, proptest, insta), system and FFI crates, zero-copy and binary
   serialization, thread crates, and networking.
 
+## Rust by Example survey (2026-11-21)
+
+The `rust` code blocks of [Rust by Example](https://github.com/rust-lang/rust-by-example) (284
+after dropping `compile_fail`), with rustdoc's hidden `# ` lines shown and fragments wrapped in
+`fn main`, run through the corpus survey above (`corpus-classify.mjs <root>`, then `corpus_ast`
+and `corpus-report.mjs` on its output). The 40 blocks rustc rejects (deliberate error demos, x86
+`asm!`, multi-file `mod` layouts) are left out. Of the other 244, 219 compile as-is and 233
+(95.5%) have no language gap. The report calls an unresolved name "another crate or file", which
+can't be true of a single-file example, so those are listed below as std gaps. Each gap has a
+minimal repro that rustc accepts. Not yet checked: whether the 219 that compile print what
+rustc's builds print (`tools/diff-one.mjs`).
+
+**Open, compiler:**
+
+- [x] Two traits with the same method name on one type (`impl A for F { fn get(&self) ->
+  String }`, `impl B for F { fn get(&self) -> u8 }`, called as `<F as A>::get(&f)` /
+  `B::get(&f)`): "mismatched types: expected `u8`, found `String`" (`trait/disambiguating`).
+- [x] A blanket impl of a generic trait (`impl<T, U> DoubleDrop<T> for U`, then
+  `empty.double_drop(null)`): "mismatched types: expected `T`, found `Null`"
+  (`generics/gen_trait`).
+- [x] Inside an inline `mod`, `let ln = ln(x)?;` sees the new binding in its own initializer:
+  "cannot find function `ln`". The same at the top level works (`std/result/question_mark`).
+  The flattener (`modflat.rs` `is_local`) took any binding of the name anywhere in the function
+  as a local; now only one in scope there (`fixtures/mod_local_shadowing.rs`).
+- [x] Inside an inline `mod`, enum patterns in a `match` that's an argument of `panic!`:
+  "constant and enum patterns is not supported yet". The same at the top level works (also
+  `std/result/question_mark`). In macro tokens `=>` is `=` `>`, so `E::A =>` was taken for a
+  format argument name and not rewritten to the module's mangled name.
+- [x] A trait of the file's own named like an operator trait (`trait Add { fn add(&self, n: i32)
+  -> i32; }`, `impl Add for C`), called through the type: `C::add(&c, 2)` is "no function or
+  associated item named `add` found for struct `C`". The checker takes any trait named `Add` for
+  `std::ops::Add` (`adt::op_method`), so the impl's method is stored as `add$0`. `Add::add(&c, 2)`
+  works, as does the same trait under another name. Found while doing the operator-traits item
+  below; not from a Rust by Example file. Now a declared trait of that name wins in
+  `collect_impl` and in bound checks (`typeck_gen.rs` `satisfies`)
+  (`fixtures/user_op_named_trait.rs`).
+
+**Open, std:**
+
+- [x] Methods as function values: `Result::is_ok`, `Result::unwrap`, `Result::unwrap_err`,
+  `Result::ok` passed to `filter` / `map` (`error/iter_result`, `std_misc/file/read_lines`),
+  `From::from` (`error/multiple_error_types/boxing_errors`), and `u64::from_str` with `FromStr`
+  imported (`flow_control/let_else`). Written as closures by the path pre-pass (`ufcs.rs`), as
+  `Option::is_some` already was; `From::from` is `.into()`, `u64::from_str(s)` is
+  `s.parse::<u64>()` (`fixtures/method_value_paths.rs`). `map_err(From::from)` to a
+  `Box<dyn Error>` works since the `Box<dyn Error>: From<E>` item below.
+- [x] Operator traits called by path: `Add::add(a, b)`, also from a macro
+  (`$trait::$method(..)`, `macros/dry`). The same pre-pass writes `Add::add(a, b)`,
+  `<V as Add>::add`, `i32::add` and `V::add` (when `V` has no inherent `add`) as `((a) + (b))`, and
+  as a value `(|a, b| a + b)`; also `Neg` / `Not` and `PartialEq` / `PartialOrd`'s methods, not a
+  trait of the file's own named like one (`fixtures/op_trait_paths.rs`).
+- [x] `impl Into<T> for X` (`conversion/from_into`), and `E.into()` to `Box<dyn Error>` ("the
+  trait bound `dyn Error: From<E>` is not satisfied"). The std-gaps pre-pass (`stdgaps.rs`
+  `into_impls`) writes the impl as `impl From<X> for T` (`self` as a `self__: X` parameter, `Self`
+  as `X`); an `impl Error` type `.into()` a `Box<dyn Error>` is the identity, as for `?`
+  (`typeck_conv.rs` `boxes_as_dyn_error`). `map_err(From::from)` to a `Box<dyn Error>` works now
+  (`fixtures/impl_into_box_error.rs`).
+- [x] Iterator adapter types written out: `iter::Cycle<iter::Chain<IntoIter<i32>,
+  IntoIter<i32>>>` as a return type (`trait/impl_trait`). `Chain` and `Zip` are known now, and
+  `IntoIter` / `Iter` / .. unqualified after a `use std::..` of them (`typeck.rs` `std_iter_type`;
+  `fixtures/iter_adapter_types.rs`).
+- [x] A char slice or array as a pattern: `s.trim_matches(&[' ', ','])`, or a `&[char]` local
+  (`std/str`). Taken by every pattern method (`split` too, which now also takes a closure) and
+  emitted as a predicate (`κσ.$charPat`), which the runtime's pattern helpers already took
+  (`fixtures/char_slice_patterns.rs`).
+- [x] `.eq()` called as a method on a `String` or `Rc<String>` (`std/rc`). Also `ne` / `lt` /
+  `le` / `gt` / `ge` on any non-ADT type (`κσ.$eq`, `$partialCmp`), as derived types had.
+- [x] `BufReader::lines()` yields `String` here, not `io::Result<String>`, so
+  `.lines().flatten()` / `.map_while(Result::ok)` don't type (`std_misc/file/read_lines`).
+  `lines()` already yielded `io::Result<String>`; the type `io::Lines<B>` (a type argument, unlike
+  `str::Lines<'a>`) was the one taken for `String`s, and `flatten` didn't take `Result` items
+  (`fixtures/io_lines_results.rs`).
+- [ ] `mem::size_of_val` (`primitives/array`, `std/box`); `DirEntry::path()` (`std_misc/fs`);
+  `Child`'s `stdin` / `stdout` fields (`std_misc/process/pipe`). These matter little for
+  scripts.
+
+**Expected:** `thread::spawn` and `mpsc` (4 files), `Rc::strong_count` (no reference counts in
+JS), and the not-planned unsafe features (raw pointers, `slice::from_raw_parts`, `union`, FFI).
+
 ## Bitburner player gaps (2026-11-18)
 
 What a Bitburner player still misses, now that every item in `corpus/bitburner/GAPS.md` is

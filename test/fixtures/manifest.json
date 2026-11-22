@@ -90,6 +90,12 @@
     "panic": null
   },
   {
+    "file": "blanket_generic_trait.rs",
+    "stdout": "pairing Empty with 3\nEmpty 4\npairing Empty with \"two\"\nEmpty 3\npairing 7 with \"seven\"\n14 SEVEN\ndone\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "blanket_impls_more.rs",
     "stdout": "[1, 3, 5, 7] [10, 30, 50]\n2.5 3\n3 3\n14 14\nHI! 5! P(1, 2)!\nYO! 2.5! P(3, 4)!\n[3, 4]\narea 9.0 own [\"area 1.0\", \"area 4.0\"]\n0 \"\" false\n[] Cfg { level: 0, name: \"\" } None\n[0, 0] [\"\", \"\"] [Cfg { level: 0, name: \"\" }, Cfg { level: 0, name: \"\" }]\n[0.0, 0.0, 0.0] true (Cfg { level: 0, name: \"\" }, Cfg { level: 0, name: \"\" }) (0, 0)\nfive=5 1=\"s\" c=Cfg { level: 2, name: \"x\" }\n3 3 ss (3, 3) 3\n7! X! area 4.0\n",
     "exitCode": 0,
@@ -144,6 +150,12 @@
     "panic": null
   },
   {
+    "file": "cfg_alternatives.rs",
+    "stdout": "pass through None 0\n1\nConfig { level: 3 } Fast(4) Slow\nnone fallback no help\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "cfg_feature_twins.rs",
     "stdout": "plain 0\n",
     "exitCode": 0,
@@ -164,6 +176,18 @@
   {
     "file": "char_exhaustive.rs",
     "stdout": "[Lower, Digit, Upper, Other, Other]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "char_slice_patterns.rs",
+    "stdout": "[hello, world]\n[hello, world]\n[hello, world]\n[hello, world,, ]\n[ ,hello, worl]\n[\"a\", \"b\", \"c\", \"d\"]\n[\"a\", \"b\", \"c\"]\nSome(1) None\na b c\na+b+c\ntrue false\ntrue\nSome((\"k\", \"v=w\"))\n[\"c\", \"b\", \"a\"]\ntrue true false\ntrue false\ntrue false\ntrue true false\ntrue true\n[\"a\", \"b\", \"\", \"c\"]\n5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "closed_gaps.rs",
+    "stdout": "Err(Error(1)) Err(Error(\"x\")) Err(Error { msg: \"y\" })\n3\n1\nslow 4\n0,2,4\n0\n0,10\n6\nSome(\"hi\")\n10 1\n5\n0: a\n1: b\n5: c\n[1, 3]\nsome(none) none some(none) none\nSome(None) None Some(Some(4))\nSome(25)\n22 12 103\n[2, 20, 4, 40, 6, 60]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -210,6 +234,12 @@
     "panic": null
   },
   {
+    "file": "const_blocks.rs",
+    "stdout": "3\n[None, None, None]\n[[1], []] 0\n[0, 1, 4, 9, 16, 25, 36, 49]\n7\ntrue\n81 hi\nthree\n30\n()\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "const_generic_enums.rs",
     "stdout": "4 Buf<4>(0/4)\nPartial { data: [1, 2] } Buf<4>(2/4)\nFull([1, 2, 3, 4]) Buf<4>(4/4) 4\ntrue 4\nFull([7, 7, 7]) 3\nBuf<2>(0/2) 2\nBuf<5>(1/5) 5\n3 [2, 2, 2]\nSome(['x', 'x', 'x']) 3\nSome(['x', 'x', 'x']) Vacant 3\nVacant 2\nSome([5, 5, 5, 5, 5]) 5 Some([5, 5]) 2\n[Full([1, 2]), Full([3, 4])] [2, 2]\nlow (max 10) Low true\nhigh 6 of 10 High(6) true\nhigh 10 of 10 High(10) true\n",
     "exitCode": 0,
@@ -242,6 +272,12 @@
   {
     "file": "const_generics_traits.rs",
     "stdout": "3\n5 false\n5 50\n30\n50\n4 Slots { used: [], name: \"\" }\n2 [0, 2]\n2\n28 Vector { c: [2.0, 4.0, 6.0] } false\nSome(9) None\n5\n....\n..#.\n4x2\n..\n..\n..\n2x3\n5 0\n[[1, 1, 1], [1, 1, 1]]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "const_param_consts.rs",
+    "stdout": "7000\n3000 8\n8 (10, 4)\n4 8 8 100\ncap 4 cap 8\n6 12\n3 6\nhi x\n52 12 12 5 18\n",
     "exitCode": 0,
     "panic": null
   },
@@ -558,6 +594,12 @@
     "panic": null
   },
   {
+    "file": "fn_ptr_impls.rs",
+    "stdout": "2 4 2\nfnptr -> 2\n4\n60 80\n9\n20\n8\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "format.rs",
     "stdout": "crab has 10 legs\na b a\ncrab!\n[    crab] [crab    ] [  crab  ] [**crab***]\n[   10] [10   ] [-0010] [+10]\n3.14 3    3.142|\n\"crab\" 'c' \"tab\\there \\\"quoted\\\"\"\n1 1.0 0.30000000000000004 1e21\ninf -inf\n0.0000001 1e-7\n{literal} braces\n10-crab has len 7\n6\ntru\nCRAB\npadded\ntrue\n",
     "exitCode": 0,
@@ -600,6 +642,12 @@
     "panic": null
   },
   {
+    "file": "generic_classes.rs",
+    "stdout": "3 0 Some(5)\n1.75 Some(2.5) None\nTwo(144, 6) 4 144\nOne(-21) -3 -14\nHistory { items: [], last: 0.0, n: 0 } History { items: [], last: 0, n: 0 } Pair { a: 0, b: \"\", o: None } 1.5 History { items: [\"y\"], last: \"x\", n: 0 }\n1.0 1 'c' 2.0 \"s\"\n3.0 0.5\n$2.00 $2 2c $3.00\n[\"$1.00\", \"$2.50\"] [\"$1\", \"$2\"]\n6 4\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "generic_debug.rs",
     "stdout": "Some(\"a\") 1.0 [Some(2)] 'x'\nNone (2.0, \"s\", true)\n(Some(1.5), [None, Some('c')])\n[Some(4.0)] [Some(4.0), Some(4.0)]\nSome(1.0) [(1.0, 1), (2.5, 1)]\ndbg: Some(\"s\") dbg: [0.5, 1.0]\nPair { a: 1.0, b: Some(2.0) } Pair { a: 1.0, b: Some(2.0) }\nPair { a: 1.0, b: Some(2.0) }\n",
     "exitCode": 0,
@@ -626,6 +674,12 @@
   {
     "file": "generic_mut_refs.rs",
     "stdout": "23 0.75 V(5, 7)\nb true None\nyx V(3, 4) V(1, 2)\nStats { hp: 3.5, name: \"bot\", tags: [7, 7] } [1, 42, 3] [\"q\"]\ntaken None 9\n9 abab\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "generic_mut_returns.rs",
+    "stdout": "[P { hp: 22 }, P { hp: 51 }] true\n[3.0, 10.0]\n[None, Some(7)]\n1 42 P { hp: 3 } P { hp: 0 }\n[101, 7] 5 [P { hp: 10 }] P { hp: 3 }\nP { hp: 6 } true\n[1, 102] [130] true\n[-1, 102] [P { hp: 8 }]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -702,6 +756,12 @@
     "panic": null
   },
   {
+    "file": "impl_into_box_error.rs",
+    "stdout": "My number is Number { value: 5 }\nFahrenheit(212.0)\nFahrenheit(-40.0)\nThe first doubled is 84\nError: invalid first item to double\nError: invalid digit found in string\nThe first doubled is 7\nError: invalid first item to double\nError: invalid digit found in string\nboxed: invalid first item to double\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "impl_iter_fns.rs",
     "stdout": "[2, 4, 6] [1, 4, 9, 16]\n[3, 6, 9, 12]\n7\n20 60\n1 [\"a\"]\n2 [\"hi\", \"yo\"]\n3 [\"hey\"]\n165\n14 [1, 3, 5, 7, 9] [0, 2]\n",
     "exitCode": 0,
@@ -762,6 +822,12 @@
     "panic": null
   },
   {
+    "file": "io_lines_results.rs",
+    "stdout": "one\ntwo\nthree\n> one\n> two\n> three\n3\n3\n5\n[\"one\", \"two\", \"three\"]\n[1, 3]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "io_std.rs",
     "stdout": "\"x=5!\\nraw\" true\nx=5!\nraw1. a\n2. b\n\nto stdout 1\nbuffered 2\nno newline, \npartial line\nOk(8)\nnegative: -1 | Custom { kind: InvalidInput, error: \"negative: -1\" } | InvalidInput\ncustom true\nentity not found | Kind(NotFound)\nboxed: negative: -3\nread 0 \"\"\nlines 0\n",
     "exitCode": 0,
@@ -770,6 +836,12 @@
   {
     "file": "io_write_vec.rs",
     "stdout": "\"5-x\\nabcd\" 2\n19 [114, 97, 119, 10]\nline 3\nraw\n  1 a; 22 bb;\n[108, 105, 110, 101, 32, 52, 10, 114, 97, 119, 10]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_adapter_types.rs",
+    "stdout": "[3, 4, 5, 1]\n1 a\n2 b\nall done\n",
     "exitCode": 0,
     "panic": null
   },
@@ -818,6 +890,12 @@
   {
     "file": "iter_mut_outside_for.rs",
     "stdout": "[9, 20, 3, 4, 5]\n[9, 21, 5, 7, 9]\n[-1, 1, -25, 7, 9]\n[19, 41, 35, 7, 9]\n[38, 82, 70, 14, 18]\n5 [39, 83, 71, 15, 19]\n[-1, 83, 71, 15, 0]\n[-1, 83, 333, 15, 0] 5\n[-1, 183, 333, 115, 0]\n[\"A!\", \"B!\"]\n[true, false, true]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_mut_tuple_returns.rs",
+    "stdout": "[100, 2, 26, 4, 50]\n[\"a\", \"b1\", \"c2\"]\n[0, 103, 6]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -954,6 +1032,18 @@
     "panic": null
   },
   {
+    "file": "method_value_paths.rs",
+    "stdout": "Numbers: [42, 93, 18]\nErrors: [ParseIntError { kind: InvalidDigit }]\n[1, 3]\n1\nOk(12)\nOk(7) Ok(2.5) Ok(true)\n[Some(1), None]\n[None, Some(\"e\")]\n[\"a\", \"b\"]\nx\n[true, false]\ntrue 9\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "mod_local_shadowing.rs",
+    "stdout": "1.609\ndivision by zero\nlogarithm of non-positive number\n[2, 3, 10, 20, 6, 101, 8, 3, 7, 12, 99]\n[2, 4, 10, 20, 6, 101, 8, 10, 7, 12, 99]\n42\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "more_std_type_impls.rs",
     "stdout": "6 900\ntotal=6 total=900\n[\"b\", \"c\", \"a\"]\n[\"a\", \"b\", \"c\"]\n42\n42\nABC HEY\nABC ABC X X\n1 3\n4.25\n9\n",
     "exitCode": 0,
@@ -968,6 +1058,12 @@
   {
     "file": "mut_place_writeback.rs",
     "stdout": "9\n9 109\nOk(117) Err(ParseIntError { kind: InvalidDigit }) 118\n6\n359 120\n45 [4, 3, 3] 20 [12, 9, 9]\n0 91\n0 91\n(true, false) Some(4)\n[8, 2, 3] [7, 1] 2 1\n12 2 1\nk 3\n8\n16 16 15\n33 33\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "mut_prim_refs.rs",
+    "stdout": "[1, 2, 3]\n2 101 [6, 7, 3, 9] ab\n30 102 [16, 7, 4, 8] 2 7\nSome(5.0) [0, 7, 4, 8] Some(42) 32\ntrue false\nSome(53) Some(12) 3 [0, 8, 4, 8]\nSome(158) Some(\"x!\") true 103\n1 11 (2, 3)\n12 W { n: 12, tag: 1 }\n33 12\n13 38 [2.5] 15\n[11, 12] {\"a\": 11} [\"p!\"]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1032,6 +1128,12 @@
     "panic": null
   },
   {
+    "file": "op_trait_paths.rs",
+    "stdout": "3\n7\n6\n11 30\nV(4, 6)\nV(4, 6)\nV(4, 6)\nV(-1, -2)\nW(499)\nW(4)\n3\n255\n3\n7\n3\n-5 false\n-6\ntrue true\n9\n6\n6\n-6\n8\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "operators.rs",
     "stdout": "Vec2 { x: 4.0, y: 1.0 } Vec2 { x: -2.0, y: 3.0 } a unchanged: Vec2 { x: 1.0, y: 2.0 }\nVec2 { x: 2.0, y: 4.0 } 1 Vec2 { x: -1.0, y: -2.0 }\nVec2 { x: 3.5, y: 3.5 }\nVec2 { x: 2.5, y: 5.5 } a still Vec2 { x: 1.0, y: 2.0 }\nVec2 { x: 8.0, y: 2.0 } [Vec2 { x: 10.0, y: 20.0 }, Vec2 { x: 30.0, y: -10.0 }, Vec2 { x: 40.0, y: 10.0 }]\nOff On true\nMoney(42)\n",
     "exitCode": 0,
@@ -1064,6 +1166,12 @@
   {
     "file": "option_ordering.rs",
     "stdout": "true\ntrue true true false\ntrue true\n[None, None, Some(-1), Some(2), Some(3)] true\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "option_ref_mut.rs",
+    "stdout": "Some(9)\nSome(8)\nSome(7)\nSome(6)\n16 Some(16)\n26 Some(26)\nSome(125)\nSome(100)\nSome(200) Some(2)\n29 Some(-3)\nSome(\">n!?\")\nSome(9)\nSome(8)\n-1 None\nSome(0)\nSome(100)\n(Some(5), 3)\nSome(true)\n[Some(1021), None, Some(42)]\n[[Some(0), Some(4)], [Some(9), Some(0)]]\n[Some(42), Some(23)]\n[Job { pid: Some(0), timer: Some(6), name: None, inner: Inner { retries: None } }, Job { pid: None, timer: None, name: Some(\"xy\"), inner: Inner { retries: Some(3) } }]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1230,6 +1338,12 @@
     "panic": null
   },
   {
+    "file": "serde_tagged.rs",
+    "stdout": "{\"type\":\"Ping\"} -> Ping true\n{\"type\":\"Hack\",\"target\":\"n00dles\",\"threads\":12} -> Hack { target: \"n00dles\", threads: 12 } true\n{\"type\":\"grow\",\"host\":\"joesguns\",\"threads\":3} -> Grow(Target { host: \"joesguns\", threads: 3 }) true\n{\"type\":\"Report\",\"totalMoney\":1500000.0,\"servers\":[\"a\",\"b\"]} -> Report { total_money: 1500000.0, servers: [\"a\", \"b\"] } true\n[\n  {\n    \"type\": \"Ping\"\n  },\n  {\n    \"type\": \"Hack\",\n    \"target\": \"n00dles\",\n    \"threads\": 12\n  },\n  {\n    \"type\": \"grow\",\n    \"host\": \"joesguns\",\n    \"threads\": 3\n  },\n  {\n    \"type\": \"Report\",\n    \"totalMoney\": 1500000.0,\n    \"servers\": [\n      \"a\",\n      \"b\"\n    ]\n  }\n]\n{\"kind\":\"started\"} -> Started true\n{\"kind\":\"scanned\",\"data\":[\"home\",\"n00dles\"]} -> Scanned([\"home\", \"n00dles\"]) true\n{\"kind\":\"money\",\"data\":[10.0,2.5]} -> Money(10.0, 2.5) true\n{\"kind\":\"done\",\"data\":{\"ok\":true}} -> Done { ok: true } true\n[\n  {\n    \"kind\": \"started\"\n  },\n  {\n    \"kind\": \"scanned\",\n    \"data\": [\n      \"home\",\n      \"n00dles\"\n    ]\n  },\n  {\n    \"kind\": \"money\",\n    \"data\": [\n      10.0,\n      2.5\n    ]\n  },\n  {\n    \"kind\": \"done\",\n    \"data\": {\n      \"ok\": true\n    }\n  }\n]\n{\"type\":\"Config\",\"name\":\"x\",\"retries\":3} -> Config { name: \"x\", retries: 3 } true\n{\"id\":7,\"host\":\"home\",\"threads\":1,\"delay\":250,\"port\":1} -> Envelope { id: 7, target: Target { host: \"home\", threads: 1 }, extra: {\"delay\": 250, \"port\": 1} } true\n{\"seq\":1,\"type\":\"Ping\"} -> Tagged { seq: 1, message: Ping, retry: None } true\n{\"seq\":2,\"type\":\"Hack\",\"target\":\"n00dles\",\"threads\":2,\"after\":500,\"max\":9} -> Tagged { seq: 2, message: Hack { target: \"n00dles\", threads: 2 }, retry: Some(Retry { after: 500, max: 9 }) } true\n{\n  \"seq\": 3,\n  \"type\": \"grow\",\n  \"host\": \"j\",\n  \"threads\": 1\n}\nOk(Hack { target: \"foodnstuff\", threads: 4 })\nOk(Ping)\nErr(\"invalid type: string \\\"2\\\", expected u32\")\nErr(\"missing field `threads`\")\nErr(\"missing field `threads`\")\nErr(\"missing field `type` at line 1 column 13\")\nErr(\"unknown variant `Nuke`, expected one of `Ping`, `Hack`, `grow`, `Report` at line 1 column 14\")\nErr(\"invalid type: integer `5`, expected variant identifier at line 1 column 9\")\nErr(\"invalid type: string \\\"Ping\\\", expected internally tagged enum Message at line 1 column 6\")\nErr(\"invalid type: integer `1`, expected variant identifier at line 1 column 2\")\nOk(Scanned([\"a\"]))\nOk(Started)\nOk(Started)\nErr(\"invalid type: integer `1`, expected unit variant Event::Started at line 1 column 26\")\nErr(\"missing field `data` at line 1 column 15\")\nErr(\"invalid length 1, expected tuple variant Event::Money with 2 elements at line 1 column 28\")\nOk(Done { ok: false })\nErr(\"missing field `kind` at line 1 column 21\")\nErr(\"unknown variant `finished`, expected one of `started`, `scanned`, `money`, `done` at line 1 column 18\")\nErr(\"invalid type: integer `7`, expected adjacently tagged enum Event at line 1 column 1\")\nOk(Envelope { id: 1, target: Target { host: \"h\", threads: 2 }, extra: {\"a\": 1, \"b\": 2} })\nErr(\"missing field `threads` at line 1 column 25\")\nErr(\"missing field `id` at line 1 column 24\")\nOk(Tagged { seq: 1, message: Ping, retry: None })\nOk(Tagged { seq: 1, message: Hack { target: \"t\", threads: 1 }, retry: Some(Retry { after: 5, max: 1 }) })\nOk(Tagged { seq: 1, message: Hack { target: \"t\", threads: 1 }, retry: None })\nOk(Tagged { seq: 1, message: Ping, retry: None })\nErr(\"missing field `type` at line 1 column 9\")\nErr(\"missing field `target` at line 1 column 23\")\nOk(Config { name: \"n\", retries: 1 })\nOk(Config { name: \"n\", retries: 1 })\nOk(Config { name: \"n\", retries: 1 })\nErr(\"invalid length 1, expected tuple variant Plain::Money with 2 elements at line 1 column 14\")\nErr(\"invalid type: integer `1`, expected unit at line 1 column 9\")\nErr(\"invalid type: string \\\"x\\\", expected u8 at line 1 column 17\")\nErr(\"missing field `a` at line 1 column 11\")\nErr(\"trailing characters at line 1 column 19\")\nOk(Unit)\n{\"target\":\"t\",\"threads\":1,\"type\":\"Hack\"} Hack { target: \"t\", threads: 1 }\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "serde_untagged.rs",
     "stdout": "6 -> Int(6) true\n\"()()\" -> Text(\"()()\") true\n[1,-2,3] -> Ints([1, -2, 3]) true\n[[1,3],[5,9]] -> Pairs([[1, 3], [5, 9]]) true\n{\"x\":1.5,\"y\":-2.0} -> Point { x: 1.5, y: -2.0 } true\nnull -> Nothing true\n{\n  \"id\": 3,\n  \"answer\": 42,\n  \"alternatives\": [\n    6,\n    \"()()\",\n    [\n      1,\n      -2,\n      3\n    ],\n    [\n      [\n        1,\n        3\n      ],\n      [\n        5,\n        9\n      ]\n    ],\n    {\n      \"x\": 1.5,\n      \"y\": -2.0\n    },\n    null\n  ]\n}\nAttempt { id: 3, answer: Int(42), alternatives: [Int(6), Text(\"()()\"), Ints([1, -2, 3]), Pairs([[1, 3], [5, 9]]), Point { x: 1.5, y: -2.0 }, Nothing] }\nPairs([[1, 2]])\nInts([1, 2])\nErr(\"data did not match any variant of untagged enum Answer\")\n\"x\"\n",
     "exitCode": 0,
@@ -1338,6 +1452,12 @@
     "panic": null
   },
   {
+    "file": "std_prelude_paths.rs",
+    "stdout": "Some(3) 4 Ok(1) 2\nSome(3) None Ok(1) 17 12 [] a Some(1) 0\nOk(1) None Some(3) Err(\"e\")\nsome 2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "std_surface_gaps.rs",
     "stdout": "3 [1, 2]\n1 [2, 3]\n[1, 2, 3]\n[1, 2] [3, 4]\n[(\"a\", 11), (\"b\", 5), (\"c\", 7)]\n[1]\nSome(3) None\ntrue false\n[7, 7, 7]\n[1, 2]\nhi\n[1.0, 2.0]\ntrue\ntrue true\n",
     "exitCode": 0,
@@ -1386,6 +1506,12 @@
     "panic": null
   },
   {
+    "file": "std_type_trait_impls.rs",
+    "stdout": "cell 7 cell 8\npeekable peekable\n1\nnow\nwrap 4\nlist 3 [0, 1, 2] list 3 [0, 1, 2]\nSome(0) Some(2) true false\n[1, 2, 5, 6] 0 [10, 20, 50, 60]\nbreak 3 cont\ntrue Some(3) Some(())\ncstring \"abc\" cstr 3\n[97, 98, 99] 1\ntrue true true\ntrue true true false\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "std_wrapping.rs",
     "stdout": "4 16 196 250\n-2147483648 2147483647 -1\n3308841181 3961931517\n16537 5775 37832\n65532 false 2027808484\n",
     "exitCode": 0,
@@ -1422,8 +1548,26 @@
     "panic": null
   },
   {
+    "file": "sync_locks.rs",
+    "stdout": "bump 2\ncounter 2\nrunning false\ncache [\"a\", \"b\"]\nfirst Some(\"a\")\nlen 2\ntarget n00dles\nshared 30\nMutex { data: 30, poisoned: false, .. }\nread [1, 2, 3]\nlen 4\nRwLock { data: [1, 2, 3, 4], poisoned: false, .. }\nn00dles Stats { hacks: 2, money: 3.5 } 2\nvisit 1\nvisit 2\nvisit 1\nseen 2\nx 2\ndepth 3\nswap 5\ncas Ok(9)\ncas Err(11)\nupd Ok(11)\nmax 22 100\ninto 100\nneg -5\nnot false true\npoisoned false\n[1, 2]\n2\n[3]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "sync_mpsc.rs",
+    "stdout": "Ok(\"a\")\n[\"b\"]\nErr(Empty)\nempty: receiving on an empty channel\ntotal 30\nv 1\nv 2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "trait_default_consts.rs",
     "stdout": "4 3 6\n8 6 100\nshape square has 4 sides (x1)\nshape triangle has 3 sides (x0.5)\npolygon hexagon has 6 sides (x1) 2\n8 6 100\n12 9 106\nshape 2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "trait_same_method_name.rs",
+    "stdout": "rustacean 28\n28 rustacean\ninherent -1\n28 0\nrustacean\n29 1\n0\n28\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1508,6 +1652,18 @@
   {
     "file": "user_cell_type.rs",
     "stdout": "bad symbol '?'\nBlack Empty true\n4 stones\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "user_mut_ref_returns.rs",
+    "stdout": "12.5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "user_op_named_trait.rs",
+    "stdout": "7\n8\n9\n6\n11\n19\n-5 -5\n34 62\n",
     "exitCode": 0,
     "panic": null
   },

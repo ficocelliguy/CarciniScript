@@ -12,8 +12,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken,
-    ast::{self, HasModuleItem, HasName, HasVisibility},
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextSize,
+    ast::{self, HasLoopBody, HasModuleItem, HasName, HasVisibility},
 };
 
 use crate::mbe::OffsetMap;
@@ -601,16 +601,17 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
             continue;
         };
         // A single name inside a function may be a local, which wins over items.
-        let (skipped, mangled) =
-            match f.resolve(&module_path(n), &names_seg, true, |name| is_local(n, name)) {
-                Res::Keep => continue,
-                Res::Error(e) => {
-                    let (a, b) = range(n);
-                    errors.push((a, b, e));
-                    continue;
-                }
-                Res::Rewrite(k, m) => (k, m),
-            };
+        let (skipped, mangled) = match f.resolve(&module_path(n), &names_seg, true, |name| {
+            is_local(n, n.text_range().start(), name)
+        }) {
+            Res::Keep => continue,
+            Res::Error(e) => {
+                let (a, b) = range(n);
+                errors.push((a, b, e));
+                continue;
+            }
+            Res::Rewrite(k, m) => (k, m),
+        };
         // Replace from the path's start through the name (keeping generics and what follows).
         let first = &segs[0];
         let Some(last) = segs.get(skipped).and_then(|s| s.name_ref()) else {
@@ -684,12 +685,17 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
             let seg_names: Vec<String> = run.iter().map(|&k| toks[k].text().to_string()).collect();
             i = j;
             // `name = value` in a format macro is an argument name; `name!` a macro.
-            if next == "!" || (next == "=" && toks.get(j + 1).is_none_or(|t| t.text() != "=")) {
+            if next == "!"
+                || (next == "="
+                    && toks
+                        .get(j + 1)
+                        .is_none_or(|t| !matches!(t.text(), "=" | ">")))
+            {
                 continue;
             }
             let a: usize = toks[run[0]].text_range().start().into();
             let (skipped, mangled) = match f.resolve(&module_path(&tt), &seg_names, true, |name| {
-                is_local(&tt, name)
+                is_local(&tt, toks[run[0]].text_range().start(), name)
             }) {
                 Res::Keep => continue,
                 Res::Error(e) => {
@@ -720,8 +726,9 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
     Flattened { names, errors }
 }
 
-/// Whether `name` is bound by a pattern or parameter in the function around `n`.
-fn is_local(n: &SyntaxNode, name: &str) -> bool {
+/// Whether `name` is bound by a pattern or parameter in the function around `n` that is in scope
+/// at `at` (`let ln = ln(x)?;` calls the item `ln`).
+fn is_local(n: &SyntaxNode, at: TextSize, name: &str) -> bool {
     let Some(f) = n
         .ancestors()
         .find(|a| ast::Fn::can_cast(a.kind()) || ast::ClosureExpr::can_cast(a.kind()))
@@ -735,5 +742,49 @@ fn is_local(n: &SyntaxNode, name: &str) -> bool {
         .unwrap_or(f);
     f.descendants()
         .filter_map(ast::IdentPat::cast)
-        .any(|ip| ip.name().is_some_and(|x| x.text() == name))
+        .filter(|ip| ip.name().is_some_and(|x| x.text() == name))
+        .any(|ip| binding_in_scope(ip.syntax(), at))
+}
+
+/// Whether the binding `pat` is visible at `at`. Unknown binders count as visible.
+fn binding_in_scope(pat: &SyntaxNode, at: TextSize) -> bool {
+    let inside = |n: Option<SyntaxNode>| n.is_some_and(|n| n.text_range().contains(at));
+    for a in pat.ancestors().skip(1) {
+        if let Some(l) = ast::LetStmt::cast(a.clone()) {
+            // After the statement, in the same block.
+            return l.syntax().text_range().end() <= at && inside(l.syntax().parent());
+        }
+        if ast::Param::can_cast(a.kind()) || ast::ClosureExpr::can_cast(a.kind()) {
+            let body = a.ancestors().find_map(|b| {
+                ast::Fn::cast(b.clone())
+                    .and_then(|f| f.body().map(|b| b.syntax().clone()))
+                    .or_else(|| {
+                        ast::ClosureExpr::cast(b).and_then(|c| c.body().map(|b| b.syntax().clone()))
+                    })
+            });
+            return inside(body);
+        }
+        if let Some(arm) = ast::MatchArm::cast(a.clone()) {
+            return inside(arm.guard().map(|g| g.syntax().clone()))
+                || inside(arm.expr().map(|e| e.syntax().clone()));
+        }
+        if let Some(fe) = ast::ForExpr::cast(a.clone()) {
+            return inside(fe.loop_body().map(|b| b.syntax().clone()));
+        }
+        if let Some(le) = ast::LetExpr::cast(a.clone()) {
+            // `if let` / `while let` (also in `&&` chains): after the `let`, before any `else`.
+            let Some(owner) = le
+                .syntax()
+                .ancestors()
+                .find(|b| ast::IfExpr::can_cast(b.kind()) || ast::WhileExpr::can_cast(b.kind()))
+            else {
+                return true;
+            };
+            let in_else = ast::IfExpr::cast(owner.clone())
+                .and_then(|i| i.else_branch())
+                .is_some_and(|e| e.syntax().text_range().contains(at));
+            return le.syntax().text_range().end() <= at && inside(Some(owner)) && !in_else;
+        }
+    }
+    true
 }

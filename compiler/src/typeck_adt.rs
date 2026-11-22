@@ -1076,6 +1076,17 @@ impl Checker<'_> {
         {
             type_name = format!("{tr}$all");
             self.adts.ext_types.insert(type_name.clone());
+            let others = imp
+                .generic_param_list()
+                .into_iter()
+                .flat_map(|l| l.generic_params())
+                .filter_map(|p| match p {
+                    ast::GenericParam::TypeParam(tp) => Some(tp.name()?.text().to_string()),
+                    _ => None,
+                })
+                .filter(|n| *n != param)
+                .collect();
+            self.adts.blanket_others.insert(tr.clone(), others);
             self.adts.blanket_params.insert(tr.clone(), param);
             self.adts.blankets.insert(tr, bounds);
         }
@@ -1105,7 +1116,7 @@ impl Checker<'_> {
                 && !self.adts.traits.contains_key(&tr)
             {
                 let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
-                self.error(&node, format!("`impl {tr} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"));
+                self.error(&node, format!("`impl {tr} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `Into`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file work)"));
                 return;
             }
             // `impl Format for u8` with `Format` neither declared here, imported from a `mod`
@@ -1140,7 +1151,7 @@ impl Checker<'_> {
                     d.manual.push(t.to_string());
                 }
             }
-            Some(t) if crate::adt::op_method(t).is_some() => {}
+            Some(t) if crate::adt::op_method(t).is_some() && !self.adts.traits.contains_key(t) => {}
             // `impl Sum for T`: its `sum(iter)` is what `iter.sum::<T>()` calls.
             Some("Sum" | "Product") => {}
             // Marker traits (`unsafe impl Send for T {}`): nothing to do in JS.
@@ -1245,7 +1256,11 @@ impl Checker<'_> {
         });
         // `impl Add<R> for T`: the right operand's type (`Self` by default), and the impl's
         // `type Output = ..;`, which `-> Self::Output` names.
-        let op = trait_name.as_deref().and_then(crate::adt::op_method);
+        // (A trait of the file's own named `Add` is that trait, not `std::ops::Add`.)
+        let op = trait_name
+            .as_deref()
+            .filter(|t| !self.adts.traits.contains_key(*t))
+            .and_then(crate::adt::op_method);
         let op_rhs = op.map(|_| {
             let arg = match imp.trait_() {
                 Some(ast::Type::PathType(p)) => p
@@ -1462,6 +1477,28 @@ impl Checker<'_> {
                 self.adts
                     .alt_arg_refs
                     .insert(format!("{type_name}::{}", name.text()), w);
+            }
+            // A second user trait with a method of this name (`impl UsernameWidget for Form {
+            // fn get }` next to `impl AgeWidget for Form { fn get }`), or one an inherent method
+            // has: under `Trait$method`, what `Trait::method(&x)` calls (the plain name stays
+            // the first one's, or the inherent one's).
+            if let Some(tr) = trait_name.as_deref()
+                && self.adts.traits.contains_key(tr)
+                && self
+                    .adts
+                    .methods
+                    .get(&type_name)
+                    .is_some_and(|ms| ms.contains_key(name.text().to_string().as_str()))
+            {
+                let key = format!("{tr}${}", name.text());
+                let at = self.range(name.syntax()).0;
+                self.adts.alt_keys_at.insert(at, key.clone());
+                self.adts
+                    .methods
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(key, method);
+                continue;
             }
             // An inherent impl for another instantiation (`impl W<String> { fn get }` next to
             // `impl W<i32> { fn get }`): its methods under keys of their own, picked by the
@@ -3004,7 +3041,7 @@ fn impl_std_trait(t: &str) -> bool {
 /// that can be implemented.
 fn unknown_impl_trait(t: &str) -> String {
     format!(
-        "`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file or a loaded `mod` file work)"
+        "`impl {t} for ..` is not supported yet (of the std traits, `Display`, `Debug`, `Default`, `From`, `Into`, `TryFrom`, `FromStr`, `FromIterator`, `Extend`, `Ord`, `PartialOrd`, `PartialEq`, `Eq`, `Hash`, `Clone`, `Copy`, `Drop`, `Iterator`, `Deref`, `AsRef` and the `std::ops` operators can be implemented; derive the others; user traits declared in the file or a loaded `mod` file work)"
     )
 }
 

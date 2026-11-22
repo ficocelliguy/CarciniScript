@@ -135,6 +135,7 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
         ]
         .iter()
         .any(|n| text.contains(n))
+        || (text.contains("impl") && text.contains("Into<"))
 }
 
 /// The std module a name this pass rewrites lives in.
@@ -251,6 +252,7 @@ pub(crate) fn expand(
     let mut edits: Vec<(usize, usize, String)> = write_fmt_calls(&file);
     edits.extend(writer_params(&file));
     edits.extend(c_string_literals(&file));
+    edits.extend(into_impls(&file, text));
     let txt = |i: usize| toks.get(i).map(|t| t.text.clone()).unwrap_or_default();
     let mut errors = Vec::new();
     let mut i = 0;
@@ -632,6 +634,89 @@ fn tokens(file: &SourceFile, uses: &[TextRange]) -> Vec<Tok> {
             in_use: uses.iter().any(|u| u.contains_range(r)),
             string,
         });
+    }
+    out
+}
+
+/// `impl Into<Y> for X { fn into(self) -> Y { .. } }` as `impl From<X> for Y { fn from(self__: X)
+/// -> Y { .. } }`, `self` in the body as `self__` and `Self` as `X`: std's blanket `Into` from
+/// `From` then gives `x.into()` too. Not for a trait of the file's own named `Into`.
+fn into_impls(file: &SourceFile, text: &str) -> Vec<(usize, usize, String)> {
+    use ast::{HasGenericArgs, HasName};
+    let mut out = Vec::new();
+    if declares(text, "Into") {
+        return out;
+    }
+    let range = |n: &ra_ap_syntax::SyntaxNode| {
+        let r = n.text_range();
+        (usize::from(r.start()), usize::from(r.end()))
+    };
+    for imp in file.syntax().descendants().filter_map(ast::Impl::cast) {
+        let (Some(ast::Type::PathType(tr)), Some(x)) = (imp.trait_(), imp.self_ty()) else {
+            continue;
+        };
+        let Some(path) = tr.path() else { continue };
+        let Some(seg) = path.segment() else { continue };
+        let qual = path.qualifier().map(|q| q.syntax().text().to_string());
+        if seg.name_ref().is_none_or(|n| n.text() != "Into")
+            || qual.is_some_and(|q| !matches!(q.as_str(), "std::convert" | "core::convert" | "convert"))
+        {
+            continue;
+        }
+        let Some(y) = seg
+            .generic_arg_list()
+            .and_then(|l| l.generic_args().next())
+            .and_then(|g| match g {
+                ast::GenericArg::TypeArg(t) => t.ty(),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(items) = imp.assoc_item_list() else { continue };
+        let fns: Vec<ast::Fn> = items
+            .assoc_items()
+            .filter_map(|i| match i {
+                ast::AssocItem::Fn(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        let [f] = fns.as_slice() else { continue };
+        let (Some(name), Some(sp)) = (f.name(), f.param_list().and_then(|p| p.self_param()))
+        else {
+            continue;
+        };
+        if name.text() != "into" || sp.amp_token().is_some() || sp.ty().is_some() {
+            continue;
+        }
+        let (x, y) = (x.syntax().text().to_string(), y.syntax().text().to_string());
+        let (a, b) = range(tr.syntax());
+        out.push((a, b, format!("From<{x}>")));
+        let (a, b) = range(imp.self_ty().unwrap().syntax());
+        out.push((a, b, y));
+        let (a, b) = range(name.syntax());
+        out.push((a, b, "from".into()));
+        let (a, b) = range(sp.syntax());
+        let m = if sp.mut_token().is_some() { "mut " } else { "" };
+        out.push((a, b, format!("{m}self__: {x}")));
+        for t in f
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !sp.syntax().text_range().contains_range(t.text_range()))
+        {
+            let r = t.text_range();
+            let (a, b) = (usize::from(r.start()), usize::from(r.end()));
+            match (t.kind(), t.text()) {
+                (SyntaxKind::SELF_KW, _) | (SyntaxKind::IDENT, "self") => {
+                    out.push((a, b, "self__".into()))
+                }
+                (SyntaxKind::SELF_TYPE_KW, _) | (SyntaxKind::IDENT, "Self") => {
+                    out.push((a, b, x.clone()))
+                }
+                _ => {}
+            }
+        }
     }
     out
 }

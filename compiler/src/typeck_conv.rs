@@ -768,6 +768,15 @@ impl Checker<'_> {
                 {
                     Some(Conv::Identity)
                 }
+                // `MyError.into()` as a `Box<dyn Error>`, with `impl Error for MyError`: unchanged,
+                // as `?` converts it.
+                (_, Ty::Dyn(tr))
+                    if tr == "Error"
+                        && !self.adts.traits.contains_key("Error")
+                        && self.boxes_as_dyn_error(&s) =>
+                {
+                    Some(Conv::Identity)
+                }
                 // `arg.into()` of a bindings enum (`ScriptArg`) as a `JsValue`: the value itself.
                 (Ty::Extern(src), Ty::Extern(n))
                     if n == "JsValue" && self.bindings.is_enum(src) =>
@@ -1259,6 +1268,21 @@ impl Checker<'_> {
 
     /// `?` on a `Result<_, E1>` in a function returning `Result<_, E2>`: when `E2: From<E1>`,
     /// the error is converted. Returns whether a conversion was recorded.
+    /// Whether a `Box<dyn Error>` holds `e` as it is: a std error, your `impl Error` type, or
+    /// another `dyn Error`.
+    pub(super) fn boxes_as_dyn_error(&mut self, e: &Ty) -> bool {
+        match self.shallow(e) {
+            Ty::Extern(n) => super::res::is_std_error(&n),
+            Ty::Adt(n, _) => self
+                .adts
+                .defs
+                .get(&n)
+                .is_some_and(|d| d.implements("Error")),
+            Ty::Dyn(tr) => tr == "Error",
+            _ => false,
+        }
+    }
+
     pub(super) fn try_convert(&mut self, t: &ast::TryExpr, e: &Ty, re: &Ty) -> bool {
         // Into `anyhow::Error`: any error, wrapped (`{:?}` shows it as the cause chain).
         if self.shallow(re) == super::crates::anyhow_error() {
@@ -1285,20 +1309,8 @@ impl Checker<'_> {
             }
         }
         // Into `Box<dyn Error>`: std errors and your `impl Error` types, unchanged.
-        if self.shallow(re) == Ty::Dyn("Error".into()) {
-            let ok = match self.shallow(e) {
-                Ty::Extern(n) => super::res::is_std_error(&n),
-                Ty::Adt(n, _) => self
-                    .adts
-                    .defs
-                    .get(&n)
-                    .is_some_and(|d| d.implements("Error")),
-                Ty::Dyn(tr) => tr == "Error",
-                _ => false,
-            };
-            if ok {
-                return true;
-            }
+        if self.shallow(re) == Ty::Dyn("Error".into()) && self.boxes_as_dyn_error(e) {
+            return true;
         }
         let Ty::Adt(adt, _) = self.shallow(re) else {
             return false;

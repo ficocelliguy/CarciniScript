@@ -532,7 +532,13 @@ impl Codegen<'_> {
             // ---- sources
             (Ty::Str, "chars") => out(helper("iter", vec![])),
             (Ty::Str, "split") => {
-                let p = self.fn_arg(a0);
+                let p = match a0 {
+                    Some(a) => {
+                        let f = self.emit_expr(&a, None).0;
+                        self.char_set_pattern(&a, f)
+                    }
+                    None => Frag::text("undefined"),
+                };
                 out(helper("split", vec![p]))
             }
             (Ty::Str, "split_whitespace") => out(helper("splitWhitespace", vec![])),
@@ -745,6 +751,24 @@ impl Codegen<'_> {
                 let other = self.fn_arg(a0);
                 out(helper("partialCmp", vec![other]))
             }
+            (t, "eq" | "ne") if !matches!(t, Ty::Iter { .. } | Ty::Closure { .. }) => {
+                let other = self.fn_arg(a0);
+                let f = helper("eq", vec![other]);
+                out(if method == "ne" { f.wrap("!", "") } else { f })
+            }
+            (t, op @ ("lt" | "le" | "gt" | "ge"))
+                if !matches!(t, Ty::Iter { .. } | Ty::Closure { .. }) =>
+            {
+                let other = self.fn_arg(a0);
+                let op = match op {
+                    "lt" => "<",
+                    "le" => "<=",
+                    "gt" => ">",
+                    _ => ">=",
+                };
+                let f = helper("partialCmp", vec![other]);
+                out(f.wrap("κσ.$pord(", &format!(", \"{op}\")")))
+            }
             (Ty::Ordering, m2) => {
                 let f = match m2 {
                     "reverse" => helper("ordReverse", vec![]),
@@ -866,6 +890,8 @@ impl Codegen<'_> {
             "flatten" => {
                 if matches!(elem, Ty::Option(_)) {
                     call("filterMap", vec![Frag::text("(x) => x")])
+                } else if matches!(elem, Ty::Result(..)) {
+                    call("flatMap", vec![Frag::text("(r) => (r.$tag ? [] : [r[0]])")])
                 } else {
                     call("flatten", vec![])
                 }

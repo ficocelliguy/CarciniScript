@@ -284,11 +284,19 @@ impl Codegen<'_> {
                     .into_iter()
                     .flat_map(|l| l.assoc_items())
                 {
+                    let js = |n: &ast::Name| format!("{tr}${}", n.text());
                     if let ast::AssocItem::Fn(f) = item
                         && let Some(n) = f.name()
-                        && let Some(sig) = self.types.adts.method(&def.name, n.text()).cloned()
+                        && let key = self.types.adts.method_key(
+                            &def.name,
+                            n.text().to_string().as_str(),
+                            self.off(n.syntax()),
+                        )
+                        // (Stored as `Trait$method` already: emitted under that name below.)
+                        && key != js(&n)
+                        && let Some(sig) = self.types.adts.method(&def.name, &key).cloned()
                     {
-                        let js = format!("{tr}${}", n.text());
+                        let js = js(&n);
                         self.emit_method_fn(
                             &f,
                             sig,
@@ -1118,12 +1126,20 @@ impl Codegen<'_> {
         self.line(Frag::default());
     }
 
-    /// Traits named by a qualified call in this file (`Trait::m(..)`, `<T as Trait>::m(..)`).
+    /// Traits named by a qualified call in this file (`Trait::m(..)`, `<T as Trait>::m(..)`), or
+    /// with a method some type has as `Trait$method` (see `Adts::split_methods`).
     fn qualified_traits(&self) -> std::collections::HashSet<String> {
         self.types
             .qualified_calls
             .values()
             .map(|q| q.trait_name.clone())
+            .chain(
+                self.types
+                    .adts
+                    .split_methods()
+                    .into_iter()
+                    .map(|(tr, _)| tr),
+            )
             .collect()
     }
 

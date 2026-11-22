@@ -227,6 +227,9 @@ pub struct Adts {
     pub blankets: HashMap<String, Vec<String>>,
     /// The type parameter each blanket impl is for (`T`), by trait.
     pub blanket_params: HashMap<String, String>,
+    /// A blanket impl's other type parameters (`U` of `impl<U, T> Tr<U> for T`), by trait: fresh at
+    /// each call.
+    pub blanket_others: HashMap<String, Vec<String>>,
     /// Each impl's associated types (`type Unit = f64;`), by (type, trait).
     pub impl_assoc: HashMap<(String, String), HashMap<String, Ty>>,
     /// Each user-trait impl's self type arguments and trait arguments (`impl<T> Store<T> for
@@ -626,6 +629,23 @@ pub enum Conv {
 impl Adts {
     pub fn method(&self, ty: &str, name: &str) -> Option<&Method> {
         self.methods.get(ty)?.get(name)
+    }
+
+    /// The (trait, method)s some type stores as `Trait$method`, apart from another trait's or an
+    /// inherent method of the same name: generic and `dyn` calls go by that name, so every impl
+    /// of the trait has it.
+    pub fn split_methods(&self) -> std::collections::HashSet<(String, String)> {
+        self.methods
+            .values()
+            .flat_map(|ms| ms.keys())
+            .filter_map(|k| {
+                let (tr, m) = k.split_once('$')?;
+                self.traits
+                    .get(tr)
+                    .is_some_and(|d| d.methods.iter().any(|x| x.name == m))
+                    .then(|| (tr.to_string(), m.to_string()))
+            })
+            .collect()
     }
 
     /// The key a method is stored (and emitted) under: its name, except for the `from` of a

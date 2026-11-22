@@ -31,12 +31,15 @@ fn unsigned(k: IntKind) -> IntKind {
 }
 
 impl Checker<'_> {
-    /// A string pattern: `&str`, `char`, or a `char` predicate closure.
-    fn str_pattern(&mut self, a: Option<&ast::Expr>) {
+    /// A string pattern: `&str`, `char`, a `char` predicate closure, or a `[char]` (any of them).
+    pub(super) fn str_pattern(&mut self, a: Option<&ast::Expr>) {
         let Some(a) = a else { return };
         let t = self.infer(a, None);
         match self.shallow(&t) {
             Ty::Str | Ty::Char | Ty::Unknown => {}
+            Ty::Vec(e) if matches!(self.shallow(&e), Ty::Char | Ty::Unknown | Ty::Var(_)) => {
+                self.unify(&e, &Ty::Char);
+            }
             Ty::Closure { params, ret } if params.len() == 1 => {
                 self.unify(&params[0], &Ty::Char);
                 if !self.unify(&ret, &Ty::Bool) {
@@ -53,7 +56,7 @@ impl Checker<'_> {
             }
             other => {
                 let msg = format!(
-                    "expected a `&str`, `char` or `|c: char| -> bool` pattern, found `{}`",
+                    "expected a `&str`, `char`, `&[char]` or `|c: char| -> bool` pattern, found `{}`",
                     self.describe(&other)
                 );
                 self.error(a.syntax(), msg);

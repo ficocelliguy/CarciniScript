@@ -3664,7 +3664,7 @@
       return new Iter(new RangeIt(lo, end, one, hi, inclusive));
     },
     $split(s, p) {
-      return new Iter(s.split(p)[Symbol.iterator]());
+      return new Iter(rt.$strPieces(s, p)[Symbol.iterator]());
     },
     $splitWhitespace(s) {
       return new Iter(s.split(/\s+/).filter((w) => w !== "")[Symbol.iterator]());
@@ -4288,6 +4288,10 @@
       return s.slice(unit(lo), unit(end));
     },
     // ---- std surface: strings
+    // A `[char]` pattern as the predicate the pattern helpers below take.
+    $charPat(cs) {
+      return (c) => cs.includes(c);
+    },
     // A string pattern as a predicate over one char, or null for a `&str` pattern.
     $strFind(s, p, rev) {
       let at;

@@ -618,6 +618,26 @@ impl Checker<'_> {
 
     /// Method `m` of trait `tr` or one of its supertraits.
     pub(super) fn trait_method(&self, tr: &str, m: &str) -> Option<Method> {
+        self.trait_method_of(tr, m).map(|(_, s)| s)
+    }
+
+    /// `x.get()` through a type parameter or `dyn` bound by `tr`, when some type has another
+    /// trait's (or an inherent) `get` too: called as `Trait$get`, which every impl of the
+    /// trait has (see `Adts::split_methods`).
+    pub(super) fn note_split_method(&mut self, m: &ast::MethodCallExpr, tr: &str, method: &str) {
+        if let Some((owner, _)) = self.trait_method_of(tr, method)
+            && self
+                .adts
+                .split_methods()
+                .contains(&(owner.clone(), method.to_string()))
+        {
+            let r = self.range(m.syntax());
+            self.method_keys.insert(r, format!("{owner}${method}"));
+        }
+    }
+
+    /// `trait_method`, with the trait that declares it.
+    pub(super) fn trait_method_of(&self, tr: &str, m: &str) -> Option<(String, Method)> {
         let mut seen = Vec::new();
         let mut todo = vec![tr.to_string()];
         while let Some(t) = todo.pop() {
@@ -629,7 +649,7 @@ impl Checker<'_> {
                 continue;
             };
             if let Some(tm) = def.methods.iter().find(|x| x.name == m) {
-                return Some(tm.sig.clone());
+                return Some((t.clone(), tm.sig.clone()));
             }
             todo.extend(def.supers.iter().cloned());
         }
@@ -691,8 +711,21 @@ impl Checker<'_> {
         if let Some(p) = key
             .strip_suffix("$all")
             .and_then(|tr| self.adts.blanket_params.get(tr))
+            .cloned()
         {
             map.insert(p.clone(), ty.clone());
+            // (`impl<U, T> DoubleDrop<U> for T`: `U` is whatever each call passes.)
+            let tr = key.strip_suffix("$all").unwrap_or_default();
+            for o in self
+                .adts
+                .blanket_others
+                .get(tr)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let v = self.fresh(super::VarKind::General);
+                map.insert(o, v);
+            }
             let item = match self.zonk(ty) {
                 Ty::Iter { elem, .. } | Ty::Range(elem, _) => Some(*elem),
                 Ty::Adt(n, _) => self.adts.iter_items.get(&n).cloned(),
@@ -1204,6 +1237,7 @@ impl Checker<'_> {
     ) -> Ty {
         match self.trait_method(tr, method) {
             Some(sig) if sig.receiver.is_some() => {
+                self.note_split_method(m, tr, method);
                 self.call_trait_method(m, recv, sig, Ty::Dyn(tr.to_string()), args)
             }
             // `boxed.as_ref()`: the `dyn` value itself (boxes are erased).

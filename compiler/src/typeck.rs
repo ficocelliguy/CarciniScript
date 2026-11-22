@@ -9797,6 +9797,17 @@ impl Checker<'_> {
 }
 
 impl Checker<'_> {
+    /// Whether a `use std::..` item imports `name` (`use std::vec::IntoIter;`), so an
+    /// unqualified `IntoIter<T>` is std's.
+    fn std_imported(&self, name: &str) -> bool {
+        self.src.lines().any(|l| {
+            let l = l.trim_start();
+            (l.starts_with("use std::") || l.starts_with("use core::"))
+                && l.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|w| w == name)
+        })
+    }
+
     /// std's iterator types by name (for parameters like `chars: &mut Peekable<Chars>`).
     fn std_iter_type(&mut self, name: &str, seg: Option<&ast::PathSegment>) -> Option<Ty> {
         // (Names crates reuse only with their module: `slice::Iter`, `vec::IntoIter`,
@@ -9811,6 +9822,8 @@ impl Checker<'_> {
                 | "Take"
                 | "StepBy"
                 | "Cycle"
+                | "Chain"
+                | "Zip"
                 | "Enumerate"
                 | "Chars"
                 | "CharIndices"
@@ -9818,7 +9831,7 @@ impl Checker<'_> {
                 | "Keys"
                 | "Values"
                 | "ValuesMut"
-        ) || (qualified
+        ) || ((qualified || self.std_imported(name))
             && matches!(
                 name,
                 "Iter" | "IntoIter" | "IterMut" | "Bytes" | "Lines" | "Split"
@@ -9850,6 +9863,14 @@ impl Checker<'_> {
         };
         Some(match name {
             "Peekable" | "Fuse" | "Rev" | "Skip" | "Take" | "StepBy" | "Cycle" => inner(&args),
+            // (`Chain<A, B>`: `A`'s items; `Zip<A, B>`: pairs of both.)
+            "Chain" => inner(&args),
+            "Zip" => match args.as_slice() {
+                [Ty::Iter { elem: a, .. }, Ty::Iter { elem: b, .. }] => {
+                    iter(Ty::Tuple(vec![(**a).clone(), (**b).clone()]), false)
+                }
+                _ => iter(Ty::Unknown, false),
+            },
             "Enumerate" => match inner(&args) {
                 Ty::Iter { elem, mutable } => iter(Ty::Tuple(vec![USIZE, *elem]), mutable),
                 other => other,
@@ -9865,6 +9886,14 @@ impl Checker<'_> {
                 _ => return None,
             },
             "Bytes" => iter(Ty::Int(IntKind::U8), false),
+            // (`io::Lines<BufReader<File>>`, with a type argument: `io::Result<String>`s.)
+            "Lines" if !args.is_empty() => iter(
+                Ty::Result(
+                    Box::new(Ty::Str),
+                    Box::new(Ty::Adt("IoError".into(), vec![])),
+                ),
+                false,
+            ),
             "Lines" | "SplitWhitespace" | "Split" => iter(Ty::Str, false),
             "Iter" | "IntoIter" | "IterMut" => {
                 let elem = match args.as_slice() {

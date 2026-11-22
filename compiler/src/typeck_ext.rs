@@ -525,16 +525,7 @@ impl Checker<'_> {
             }
             (Ty::Str, "split") => {
                 count(self, 1);
-                if let Some(a) = a0 {
-                    let at = self.infer(a, None);
-                    if !matches!(self.shallow(&at), Ty::Str | Ty::Char | Ty::Unknown) {
-                        let msg = format!(
-                            "expected a `&str` or `char` pattern, found `{}`",
-                            self.describe(&at)
-                        );
-                        self.error(a.syntax(), msg);
-                    }
-                }
+                self.str_pattern(a0);
                 iter(Ty::Str)
             }
             (Ty::Str, "split_whitespace" | "lines") => {
@@ -796,6 +787,16 @@ impl Checker<'_> {
                 }
                 Ty::Option(Box::new(Ty::Ordering))
             }
+            // `PartialEq` / `PartialOrd`'s methods (`a.eq(&b)` on a `String` or `Rc<String>`).
+            (t, "eq" | "ne" | "lt" | "le" | "gt" | "ge")
+                if !matches!(t, Ty::Iter { .. } | Ty::Closure { .. }) =>
+            {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &t);
+                }
+                Ty::Bool
+            }
             (Ty::Ordering, m2) => match m2 {
                 "reverse" => {
                     count(self, 0);
@@ -1009,7 +1010,12 @@ impl Checker<'_> {
             }
             "flatten" => {
                 count(self, 0);
-                match self.iter_elem(&e) {
+                // (`Result`s: their `Ok` values.)
+                let ok = match self.shallow(&e) {
+                    Ty::Result(ok, _) => Some(*ok),
+                    _ => self.iter_elem(&e),
+                };
+                match ok {
                     Some(x) => iter(x),
                     None => {
                         let msg = format!(

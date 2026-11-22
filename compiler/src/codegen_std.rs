@@ -41,12 +41,25 @@ impl Codegen<'_> {
 
     fn arg_frags(&mut self, m: &ast::MethodCallExpr) -> Vec<Frag> {
         let args: Vec<ast::Expr> = m.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+        let on_str = m
+            .receiver()
+            .is_some_and(|r| self.ty_of(r.syntax()) == Some(Ty::Str));
         args.iter()
             .map(|a| {
                 let (f, t) = self.emit_expr(a, None);
-                self.by_value(a, f, &t)
+                let f = self.by_value(a, f, &t);
+                if on_str { self.char_set_pattern(a, f) } else { f }
             })
             .collect()
+    }
+
+    /// A `[char]` string pattern (`s.trim_matches(&[' ', ','])`) as the predicate the runtime's
+    /// pattern helpers take.
+    pub(super) fn char_set_pattern(&self, a: &ast::Expr, f: Frag) -> Frag {
+        match self.ty_of(a.syntax()) {
+            Some(Ty::Vec(e)) if *e == Ty::Char => f.wrap("κσ.$charPat(", ")"),
+            _ => f,
+        }
     }
 
     /// `recv = <value>`, for `String` methods that change the string (JS strings are immutable).

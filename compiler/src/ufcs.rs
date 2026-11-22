@@ -5,7 +5,10 @@
 //! traits (`.map(Vec::len)`, `.map(Into::into)`, `std::error::Error::source(&e)`). An `OffsetMap`
 //! keeps positions pointing at the original text.
 
-use ra_ap_syntax::{AstNode, SyntaxKind, SyntaxToken};
+use ra_ap_syntax::{
+    AstNode, SyntaxKind, SyntaxToken,
+    ast::{self, HasName},
+};
 
 use crate::mbe::OffsetMap;
 
@@ -16,7 +19,33 @@ const PRIMS: &[&str] = &[
 
 /// Other types and std traits whose methods are named by path (`Vec::len`,
 /// `std::error::Error::source`); their receivers' types aren't written into the closures.
-const OTHERS: &[&str] = &["Vec", "Option", "Into", "Clone", "ToString", "Error"];
+const OTHERS: &[&str] = &[
+    "Vec", "Option", "Result", "Into", "From", "Clone", "ToString", "Error",
+];
+
+/// The `std::ops` / `std::cmp` traits whose methods are an operator: `Add::add(a, b)`,
+/// `<V as Add>::add(a, b)` and `i32::add(1, 2)` are `((a) + (b))`, and `.fold(0, Add::add)` takes
+/// `(|a, b| a + b)`. With the operator, and whether it's unary.
+const OP_TRAITS: &[(&str, &str, &str, bool)] = &[
+    ("Add", "add", "+", false),
+    ("Sub", "sub", "-", false),
+    ("Mul", "mul", "*", false),
+    ("Div", "div", "/", false),
+    ("Rem", "rem", "%", false),
+    ("BitAnd", "bitand", "&", false),
+    ("BitOr", "bitor", "|", false),
+    ("BitXor", "bitxor", "^", false),
+    ("Shl", "shl", "<<", false),
+    ("Shr", "shr", ">>", false),
+    ("Neg", "neg", "-", true),
+    ("Not", "not", "!", true),
+    ("PartialEq", "eq", "==", false),
+    ("PartialEq", "ne", "!=", false),
+    ("PartialOrd", "lt", "<", false),
+    ("PartialOrd", "le", "<=", false),
+    ("PartialOrd", "gt", ">", false),
+    ("PartialOrd", "ge", ">=", false),
+];
 
 /// The methods (taking `self`) these types have, with how many more arguments they take.
 fn arity(prim: &str, method: &str) -> Option<usize> {
@@ -29,9 +58,21 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
         ("Option", "is_some" | "is_none" | "unwrap" | "unwrap_or_default" | "flatten") => {
             return Some(0);
         }
+        ("Option", "expect" | "unwrap_or" | "ok_or") => return Some(1),
+        (
+            "Result",
+            "is_ok" | "is_err" | "ok" | "err" | "unwrap" | "unwrap_err" | "unwrap_or_default",
+        ) => return Some(0),
+        ("Result", "expect" | "expect_err" | "unwrap_or") => return Some(1),
+        // (`From::from(x)` is `x.into()`, see `emitted`.)
+        ("From", "from") => return Some(0),
         ("Into", "into") | ("Clone", "clone") | ("ToString", "to_string") => return Some(0),
         ("Error", "source" | "description") => return Some(0),
-        ("Vec" | "Option" | "Into" | "Clone" | "ToString" | "Error", _) => return None,
+        ("Vec" | "Option" | "Result" | "Into" | "From" | "Clone" | "ToString" | "Error", _) => {
+            return None;
+        }
+        // `u64::from_str(s)` is `s.parse::<u64>()`, see `emitted`.
+        (p, "from_str") if p != "str" => return Some(0),
         _ => {}
     }
     let numeric = !matches!(prim, "char" | "bool" | "str" | "String");
@@ -95,6 +136,172 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
     })
 }
 
+/// The method call written for `prim::method`: `u64::from_str(s)` is `s.parse::<u64>()` and
+/// `From::from(x)` is `x.into()`.
+fn emitted(prim: &str, method: &str) -> String {
+    match (prim, method) {
+        ("From", "from") => "into".to_string(),
+        (p, "from_str") => format!("parse::<{p}>"),
+        _ => method.to_string(),
+    }
+}
+
+/// An operator trait's method named by path at `toks[i]`: `Add::add`, `std::ops::Add::add`,
+/// `<V as Add>::add`, `<i32 as std::ops::Add<i32>>::add` or `i32::add`. The index of the path's
+/// first token and of the method's, the operator, whether it's unary, and the primitive type that
+/// names it (for literal suffixes). Not a trait of the file's own (`traits`). Also `V::add` for a
+/// type of the file's with that operator (`op_types`, (type, trait) pairs).
+fn op_path(
+    toks: &[SyntaxToken],
+    i: usize,
+    traits: &[String],
+    op_types: &[(String, String)],
+) -> Option<(usize, usize, &'static str, bool, Option<String>)> {
+    let at = |k: usize| {
+        toks.get(k)
+            .map(|t| t.text().to_string())
+            .unwrap_or_default()
+    };
+    let ident = |k: usize| toks.get(k).is_some_and(|t| t.kind() == SyntaxKind::IDENT);
+    // (`::` is one token in a path, two `:` in a macro's tokens.)
+    let sep = |k: usize| -> Option<usize> {
+        if at(k) == "::" {
+            Some(k + 1)
+        } else if at(k) == ":" && at(k + 1) == ":" {
+            Some(k + 2)
+        } else {
+            None
+        }
+    };
+    let sep_before = |k: usize| -> Option<usize> {
+        if k >= 1 && at(k - 1) == "::" {
+            Some(k - 1)
+        } else if k >= 2 && at(k - 1) == ":" && at(k - 2) == ":" {
+            Some(k - 2)
+        } else {
+            None
+        }
+    };
+    let op = |tr: &str, m: &str| {
+        OP_TRAITS
+            .iter()
+            .find(|(t, n, _, _)| (tr.is_empty() || *t == tr) && *n == m)
+            .filter(|(t, ..)| !traits.iter().any(|u| u == t))
+            .map(|(_, _, o, u)| (*o, *u))
+    };
+    if at(i) == "<" {
+        // `<X as [path::]Trait[<..>]>::method`
+        let mut depth = 0i32;
+        let mut k = i;
+        let mut as_at = None;
+        loop {
+            let t = at(k);
+            if t.is_empty() || matches!(t.as_str(), ";" | "{" | "}" | "(" | ")") {
+                return None;
+            }
+            if t == "as" && depth == 1 {
+                as_at = Some(k);
+            }
+            depth += t.chars().filter(|c| *c == '<').count() as i32;
+            depth -= t.chars().filter(|c| *c == '>').count() as i32;
+            if depth <= 0 {
+                break;
+            }
+            k += 1;
+        }
+        let (close, as_at) = (k, as_at?);
+        // The trait's name: the last segment before its generic arguments.
+        let mut tr = as_at + 1;
+        let mut j = as_at + 1;
+        while j < close && at(j) != "<" {
+            if ident(j) {
+                tr = j;
+            }
+            j += 1;
+        }
+        let m = sep(close + 1)?;
+        if !ident(m) {
+            return None;
+        }
+        let (o, u) = op(&at(tr), &at(m))?;
+        let prim = (as_at == i + 2 && PRIMS.contains(&at(i + 1).as_str())).then(|| at(i + 1));
+        return Some((i, m, o, u, prim));
+    }
+    if !ident(i) {
+        return None;
+    }
+    let name = at(i);
+    let m = sep(i + 1)?;
+    if !ident(m) {
+        return None;
+    }
+    let prim = PRIMS.contains(&name.as_str()) && !matches!(name.as_str(), "str" | "String");
+    let (o, u) = if prim {
+        op("", &at(m))?
+    } else if let Some((_, tr)) = op_types.iter().find(|(t, tr)| {
+        *t == name && OP_TRAITS.iter().any(|(x, n, ..)| x == tr && *n == at(m))
+    }) {
+        op(tr, &at(m))?
+    } else {
+        op(&name, &at(m))?
+    };
+    // `std::ops::` before the trait.
+    let mut first = i;
+    if !prim {
+        while let Some(s) = sep_before(first)
+            && s >= 1
+            && matches!(at(s - 1).as_str(), "std" | "core" | "ops" | "cmp")
+        {
+            first = s - 1;
+        }
+    }
+    if sep_before(first).is_some()
+        || (first >= 1 && matches!(at(first - 1).as_str(), "." | "<" | "as" | "impl" | "for"))
+    {
+        return None;
+    }
+    Some((first, m, o, u, prim.then_some(name)))
+}
+
+/// The (type, trait) pairs of the file's `impl Add for V`s (`std::ops::Add<V>`, `impl<T> Add for
+/// V<T>`), where `V` has no inherent method of the trait's (which `V::add` would call).
+fn op_impl_types(file: &ast::SourceFile, traits: &[String]) -> Vec<(String, String)> {
+    let last = |p: Option<ast::Path>| {
+        p.and_then(|p| p.segment())
+            .and_then(|s| s.name_ref())
+            .map(|n| n.text().to_string())
+    };
+    let self_name = |i: &ast::Impl| match i.self_ty() {
+        Some(ast::Type::PathType(p)) => last(p.path()),
+        _ => None,
+    };
+    let impls: Vec<ast::Impl> = file.syntax().descendants().filter_map(ast::Impl::cast).collect();
+    let inherent: Vec<(String, String)> = impls
+        .iter()
+        .filter(|i| i.trait_().is_none())
+        .filter_map(|i| Some((self_name(i)?, i.assoc_item_list()?)))
+        .flat_map(|(t, l)| {
+            l.assoc_items().filter_map(move |a| match a {
+                ast::AssocItem::Fn(f) => Some((t.clone(), f.name()?.text().to_string())),
+                _ => None,
+            })
+        })
+        .collect();
+    impls
+        .iter()
+        .filter_map(|i| {
+            let tr = match i.trait_()? {
+                ast::Type::PathType(p) => last(p.path())?,
+                _ => return None,
+            };
+            let ty = self_name(i)?;
+            let (_, m, ..) = OP_TRAITS.iter().find(|(t, ..)| *t == tr)?;
+            let shadowed = inherent.iter().any(|(t, n)| *t == ty && n == m);
+            (!shadowed && !traits.contains(&tr)).then_some((ty, tr))
+        })
+        .collect()
+}
+
 pub fn has_prim_paths(text: &str) -> bool {
     PRIMS
         .iter()
@@ -102,6 +309,11 @@ pub fn has_prim_paths(text: &str) -> bool {
         .any(|p| text.contains(&format!("{p}::")))
         // (`Result::Ok(1)`, see `expand`.)
         || text.contains("Result::")
+        || OP_TRAITS.iter().any(|(t, ..)| {
+            text.contains(&format!("{t}::"))
+                || text.contains(&format!("as {t}"))
+                || text.contains(&format!("ops::{t}"))
+        })
 }
 
 /// Rewrite path calls and method values of built-in types in `text`, recording the edits in
@@ -121,6 +333,17 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
     };
     let start = |i: usize| usize::from(toks[i].text_range().start());
     let end = |i: usize| usize::from(toks[i].text_range().end());
+    // How deep `toks[j]` leaves a scan in turbofish brackets (`Ok::<i32, ()>(1)` is one argument).
+    let turbofish = |j: usize, angle: &mut usize| {
+        let colons =
+            j >= 1 && (at(j - 1) == "::" || (j >= 2 && at(j - 1) == ":" && at(j - 2) == ":"));
+        match at(j).as_str() {
+            "<" if *angle > 0 || colons => *angle += 1,
+            ">" => *angle = angle.saturating_sub(1),
+            ">>" => *angle = angle.saturating_sub(2),
+            _ => {}
+        }
+    };
     // Don't touch `macro_rules!` bodies or `use` items.
     let skip = |t: &SyntaxToken| {
         t.parent_ancestors().any(|a| {
@@ -130,6 +353,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             )
         })
     };
+    // The file's own traits (a `trait Add` isn't `std::ops::Add`).
+    let traits: Vec<String> = (1..toks.len())
+        .filter(|&k| toks[k - 1].kind() == SyntaxKind::TRAIT_KW)
+        .map(at)
+        .collect();
+    let op_types = op_impl_types(&file, &traits);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0;
     while i + 3 < toks.len() {
@@ -149,6 +378,79 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             }
             i = variant + 1;
             continue;
+        }
+        // `Add::add(a, b)` is `((a) + (b))`, `Add::add` as a value `(|a, b| a + b)`.
+        if let Some((first, m, op, unary, prim)) = op_path(&toks, i, &traits, &op_types)
+            && !skip(&toks[i])
+        {
+            let n = if unary { 1 } else { 2 };
+            if at(m + 1) == "(" {
+                // The arguments' separating commas and the closing `)`.
+                let open = m + 1;
+                let mut commas = Vec::new();
+                let mut depth = 0;
+                let mut angle = 0;
+                let mut j = open + 1;
+                while j < toks.len() {
+                    turbofish(j, &mut angle);
+                    match at(j).as_str() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" if depth == 0 => break,
+                        ")" | "]" | "}" => depth -= 1,
+                        "," if depth == 0 && angle == 0 => commas.push(j),
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                // (A trailing comma.)
+                if commas.last().is_some_and(|&c| c + 1 == j) {
+                    commas.pop();
+                }
+                if j >= toks.len() || commas.len() + 1 != n || j == open + 1 {
+                    i += 1;
+                    continue;
+                }
+                // `u8::add(200, 100)`: the literal gets the type's suffix.
+                let suffix = prim
+                    .filter(|p| {
+                        let lit = if at(open + 1) == "-" {
+                            open + 2
+                        } else {
+                            open + 1
+                        };
+                        let kind = toks[lit].kind();
+                        let float = matches!(p.as_str(), "f32" | "f64");
+                        lit + 1 == commas.first().copied().unwrap_or(j)
+                            && !PRIMS.iter().any(|q| at(lit).ends_with(q))
+                            && !matches!(p.as_str(), "char" | "bool")
+                            && ((kind == SyntaxKind::INT_NUMBER && !float)
+                                || (kind == SyntaxKind::FLOAT_NUMBER && float))
+                    })
+                    .unwrap_or_default();
+                let last = if at(j - 1) == "," { j - 2 } else { j - 1 };
+                if unary {
+                    edits.push((start(first), end(open), format!("({op}(")));
+                    edits.push((end(last), end(j), "))".to_string()));
+                } else {
+                    let c = commas[0];
+                    edits.push((start(first), end(open), "((".to_string()));
+                    edits.push((end(c - 1), start(c + 1), format!("{suffix}) {op} (")));
+                    edits.push((end(last), end(j), "))".to_string()));
+                }
+                i = j + 1;
+                continue;
+            }
+            if !matches!(at(m + 1).as_str(), "::" | ":" | "!") {
+                let ty = prim.map(|p| format!(": {p}")).unwrap_or_default();
+                let closure = if n == 1 {
+                    format!("(|__ufcs0{ty}| {op}__ufcs0)")
+                } else {
+                    format!("(|__ufcs0{ty}, __ufcs1| __ufcs0 {op} __ufcs1)")
+                };
+                edits.push((start(first), end(m), closure));
+                i = m + 1;
+                continue;
+            }
         }
         let prim = at(i);
         // `u64` `:` `:` `pow` (a `::` is one token in paths but two in token trees)
@@ -178,6 +480,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                             | "convert"
                             | "clone"
                             | "string"
+                            | "result"
                     )
             };
             loop {
@@ -223,13 +526,15 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             let open = m + 1;
             let mut j = open + 1;
             let mut depth = 0;
+            let mut angle = 0;
             while j < toks.len() {
+                turbofish(j, &mut angle);
                 let t = at(j);
                 match t.as_str() {
                     "(" | "[" | "{" => depth += 1,
                     ")" | "]" | "}" if depth > 0 => depth -= 1,
                     ")" if depth == 0 => break,
-                    "," if depth == 0 => break,
+                    "," if depth == 0 && angle == 0 => break,
                     _ => {}
                 }
                 j += 1;
@@ -278,9 +583,17 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             }
             if at(j) == "," {
                 // (up to the next argument, or the `)` after a trailing comma)
-                edits.push((end(last), start(j + 1), format!("{suffix}).{method}(")));
+                edits.push((
+                    end(last),
+                    start(j + 1),
+                    format!("{suffix}).{}(", emitted(&prim, &method)),
+                ));
             } else {
-                edits.push((end(last), end(last), format!("{suffix}).{method}(")));
+                edits.push((
+                    end(last),
+                    end(last),
+                    format!("{suffix}).{}(", emitted(&prim, &method)),
+                ));
             }
             i = j;
             continue;
@@ -289,16 +602,18 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         if !matches!(at(m + 1).as_str(), "::" | ":" | "!") {
             let params: Vec<String> = (0..=n_args).map(|k| format!("__ufcs{k}")).collect();
             // The receiver's type, as rustc knows it from the path (`i32::abs` takes an `i32`).
-            let typed = if matches!(prim.as_str(), "str" | "String") || other {
-                params.join(", ")
-            } else {
-                let mut all = params.clone();
-                all[0] = format!("{}: {prim}", params[0]);
-                all.join(", ")
-            };
+            let typed =
+                if matches!(prim.as_str(), "str" | "String") || other || method == "from_str" {
+                    params.join(", ")
+                } else {
+                    let mut all = params.clone();
+                    all[0] = format!("{}: {prim}", params[0]);
+                    all.join(", ")
+                };
             let closure = format!(
-                "(|{typed}| {}.{method}({}))",
+                "(|{typed}| {}.{}({}))",
                 params[0],
+                emitted(&prim, &method),
                 params[1..].join(", ")
             );
             edits.push((start(first_tok), end(m), closure));

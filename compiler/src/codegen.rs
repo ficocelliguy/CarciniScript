@@ -5945,6 +5945,9 @@ impl<'a> Codegen<'a> {
         method: &str,
         name_off: usize,
     ) -> Frag {
+        // (`Trait$method`, when another trait has a method of that name too.)
+        let key = self.types.method_keys.get(&self.range_of(m.syntax())).cloned();
+        let method = key.as_deref().unwrap_or(method);
         let args = self.emit_args(m.arg_list(), &[]);
         // `w.write_str(s)` with `W: fmt::Write`: `w` may be a `String` or a `Formatter`, so the
         // call goes through its cell.
