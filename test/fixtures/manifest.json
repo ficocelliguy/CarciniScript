@@ -48,6 +48,12 @@
     "panic": null
   },
   {
+    "file": "as_ref_bounds.rs",
+    "stdout": "2 3 4\n7 65 2\n3 3 2\n1 ABCD\n[121, 111]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "assert_msg.rs",
     "stdout": "tri(10) = 55\n",
     "exitCode": 101,
@@ -86,6 +92,12 @@
   {
     "file": "bits64.rs",
     "stdout": "1099511627776 35184372088831 1099511627783 1099511627781\n34084860461055 4 255\n141845589917698 4 4\n-20000000000 -2500000000 19999999999 14336\n7 3000000000\n[\"\", \"a\", \"b\", \"ab\", \"c\", \"ac\", \"bc\", \"abc\"]\nOk(1099511627775) Ok(-1295) Err(ParseIntError { kind: PosOverflow })\n[104, 195, 169] Ok(\"hi\")\n144 16 -64\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "blanket_from_into.rs",
+    "stdout": "Equals(\"a\") Equals(\"b\")\nBig(8) Big(14)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -552,6 +564,12 @@
     "panic": null
   },
   {
+    "file": "dyn_from_type_param.rs",
+    "stdout": "S1\nu8 3\nf64 2.5\nstr a\nS2 S3\nS4\nS5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "dyn_number_impls.rs",
     "stdout": "f64 1\ni32 2\nf32 3.5\nf64 4\nf64 1.5 / 1.5 / 1.5\ni32 3 / 3 / 3\nf32 7 / 7 / 7.0\nf64 4.5 / 4.5 / 4.5\nf64 2\ni32 7 / 7 / 7\nf64 8 / 8 / 8.0\nf64 2\nf64 10 i32 10\n6.0\n",
     "exitCode": 0,
@@ -882,6 +900,12 @@
     "panic": null
   },
   {
+    "file": "impl_bound_default.rs",
+    "stdout": "5 0\n7 0\n\"x\" Cell { v: \"\" }\nCell { v: [] }\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "impl_into_box_error.rs",
     "stdout": "My number is Number { value: 5 }\nFahrenheit(212.0)\nFahrenheit(-40.0)\nThe first doubled is 84\nError: invalid first item to double\nError: invalid digit found in string\nThe first doubled is 7\nError: invalid first item to double\nError: invalid digit found in string\nboxed: invalid first item to double\n",
     "exitCode": 0,
@@ -1110,6 +1134,12 @@
     "panic": null
   },
   {
+    "file": "literal_ext_methods.rs",
+    "stdout": "5000 3000000000000\ni32 7 i32 -2\n1.5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "local_aliases.rs",
     "stdout": "inner\n(1, 2) 2 10\n",
     "exitCode": 0,
@@ -1262,6 +1292,12 @@
   {
     "file": "mut_prim_refs.rs",
     "stdout": "[1, 2, 3]\n2 101 [6, 7, 3, 9] ab\n30 102 [16, 7, 4, 8] 2 7\nSome(5.0) [0, 7, 4, 8] Some(42) 32\ntrue false\nSome(53) Some(12) 3 [0, 8, 4, 8]\nSome(158) Some(\"x!\") true 103\n1 11 (2, 3)\n12 W { n: 12, tag: 1 }\n33 12\n13 38 [2.5] 15\n[11, 12] {\"a\": 11} [\"p!\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "mut_ref_unwrapped_bindings.rs",
+    "stdout": "[Some(L { next: 1 }), None] [1, 2, 0, 0] L { next: 5 } L { next: 9 } [L { next: 2 }]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1526,6 +1562,12 @@
   {
     "file": "rand_seeded_sequence.rs",
     "stdout": "572990626\n52\n2\n0.8684266101435584\nfalse\n[8, 2, 7, 9, 6, 10, 3, 4, 1, 5]\nSome(10)\n0.39064927489182444\n2022281974\n86 38 21579 -8802\n-1494933913 true 695494\n0.28212714 294394815046791598121671006870532705556\n-138661904443471983592246935130340669203 0.2350362287242932\n-4 193 42741 756 913601 4 -3 2.3941755 -0.41060555731508497 1972131167\n1 206 46891 208 -612923 4 33 2.218264 0.36974644319389305 1605561281\n-1 195 20564 915 -651414 6 32 1.5511227 0.5869589019137238 -1696622090\n0 103 5396 357 -49042 1 169 2.443627 -0.2150726404896448 -2015155452\n-3 44 29047 600 -177069 6 206 2.3158045 0.8350105286324068 -1315671596\n48 true\n[251, 193, 32, 78, 1, 215, 213]\n[1480260405, 1375212023, 3161703230] 2850961603\n0 []\n3 [66, 91, 28]\n11 [93, 48, 22, 80, 85, 71]\n12 [24, 16, 74, 89, 71, 53]\n30 [77, 46, 93, 44, 96, 58]\n60 [31, 50, 75, 41, 56, 9]\n99 [18, 15, 74, 3, 12, 41]\n100 [2, 10, 23, 53, 13, 98]\n120 [38, 78, 59, 54, 21, 27]\n[182, 22, 1113, 1004, 12]\n[240, 109, 1685, 1030, 256]\nSome(49)\nSome(66)\nSome('é')\nSome(168)\n[70, 50, 43, 17]\n[76, 59, 96]\n[\"c\", \"f\", \"b\", \"e\", \"a\", \"d\"] Some(\"d\")\nNone\n4\n1521642723 168 0.9088859452419126\n[2, 8, 3, 17, 4, 18, 9, 12, 19, 0, 1, 11, 13, 5, 7, 6, 14, 16, 10, 15]\n[218, 17, 119, 14, 208, 96, 83, 103, 29, 245, 162, 176, 213]\n32\n62 15025\n8 8 9 6 5 3 1 4 6 6 1 2 4 5 8 8 9 5 3 1 4 8 9 1 6 6 5 9 4 2 8 2 3 1 1 6 8 0 3 6 \n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "range_into_from.rs",
+    "stdout": "ValueRange { lo: 1, hi: 3 } ValueRange { lo: 2, hi: 5 } ValueRange { lo: 0, hi: 1 }\n5\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1838,6 +1880,12 @@
   {
     "file": "trait_default_consts.rs",
     "stdout": "4 3 6\n8 6 100\nshape square has 4 sides (x1)\nshape triangle has 3 sides (x0.5)\npolygon hexagon has 6 sides (x1) 2\n8 6 100\n12 9 106\nshape 2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "trait_generic_static.rs",
+    "stdout": "13 13\na b\n",
     "exitCode": 0,
     "panic": null
   },

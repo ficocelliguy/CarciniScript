@@ -120,8 +120,8 @@ fn items_ref_hint(e: &ast::Expr) -> Option<ArgRef> {
     }
 }
 
-fn into_bound_target(m: &ast::MethodCallExpr) -> Option<ast::Type> {
-    use ra_ap_syntax::ast::{HasGenericArgs, HasGenericParams, HasName, HasTypeBounds};
+fn into_bound_target(m: &ast::MethodCallExpr, tr: &str) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::{HasGenericParams, HasName};
     let ast::Expr::PathExpr(p) = crate::typeck::strip_parens(&m.receiver()?) else {
         return None;
     };
@@ -131,48 +131,65 @@ fn into_bound_target(m: &ast::MethodCallExpr) -> Option<ast::Type> {
         let named = matches!(p.pat(), Some(ast::Pat::IdentPat(ip)) if ip.name().is_some_and(|n| n.text() == name.text()));
         if named { p.ty() } else { None }
     })?;
-    // `Into<X>` among a bound list: `X`.
-    let target = |l: ast::TypeBoundList| {
-        l.bounds().find_map(|b| {
-            let ast::Type::PathType(pt) = b.ty()? else {
-                return None;
-            };
-            let seg = pt.path()?.segment()?;
-            if seg.name_ref()?.text() != "Into" {
-                return None;
-            }
-            match seg.generic_arg_list()?.generic_args().next()? {
-                ast::GenericArg::TypeArg(a) => a.ty(),
-                _ => None,
-            }
-        })
-    };
     match ty {
-        ast::Type::ImplTraitType(i) => target(i.type_bound_list()?),
+        ast::Type::ImplTraitType(i) => into_target(i.type_bound_list()?, tr),
         ast::Type::PathType(pt) => {
             let t = pt.path()?.as_single_name_ref()?.text().to_string();
-            let inline = f
-                .generic_param_list()
-                .into_iter()
-                .flat_map(|l| l.type_or_const_params())
-                .filter_map(|p| match p {
-                    ast::TypeOrConstParam::Type(tp) => Some(tp),
-                    _ => None,
-                })
-                .find(|tp| tp.name().is_some_and(|n| n.text() == t))
-                .and_then(|tp| tp.type_bound_list())
-                .and_then(target);
-            inline.or_else(|| {
-                f.where_clause()?.predicates().find_map(|pred| {
-                    if pred.ty()?.syntax().text() != t.as_str() {
-                        return None;
-                    }
-                    target(pred.type_bound_list()?)
-                })
+            // (The function's own parameters, then its `impl`'s: `impl<S: Into<X>> From<S> for Y`.)
+            param_into_target(&t, tr, f.generic_param_list(), f.where_clause()).or_else(|| {
+                let imp = f.syntax().parent()?.parent().and_then(ast::Impl::cast)?;
+                param_into_target(&t, tr, imp.generic_param_list(), imp.where_clause())
             })
         }
         _ => None,
     }
+}
+
+/// `Into<X>` (or `tr<X>`, `AsRef<X>`) among a bound list: `X`.
+fn into_target(l: ast::TypeBoundList, tr: &str) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    l.bounds().find_map(|b| {
+        let ast::Type::PathType(pt) = b.ty()? else {
+            return None;
+        };
+        let seg = pt.path()?.segment()?;
+        if seg.name_ref()?.text() != tr {
+            return None;
+        }
+        match seg.generic_arg_list()?.generic_args().next()? {
+            ast::GenericArg::TypeArg(a) => a.ty(),
+            _ => None,
+        }
+    })
+}
+
+/// The `X` of a `t: Into<X>` (`tr<X>`) bound among generic parameters (inline or in the `where`
+/// clause).
+pub(super) fn param_into_target(
+    t: &str,
+    tr: &str,
+    gl: Option<ast::GenericParamList>,
+    wc: Option<ast::WhereClause>,
+) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::{HasName, HasTypeBounds};
+    let inline = gl
+        .into_iter()
+        .flat_map(|l| l.type_or_const_params())
+        .filter_map(|p| match p {
+            ast::TypeOrConstParam::Type(tp) => Some(tp),
+            _ => None,
+        })
+        .find(|tp| tp.name().is_some_and(|n| n.text() == t))
+        .and_then(|tp| tp.type_bound_list())
+        .and_then(|l| into_target(l, tr));
+    inline.or_else(|| {
+        wc?.predicates().find_map(|pred| {
+            if pred.ty()?.syntax().text() != t {
+                return None;
+            }
+            into_target(pred.type_bound_list()?, tr)
+        })
+    })
 }
 
 /// The `std::ops` trait of an operator: `Add` for `+`, ..
@@ -223,6 +240,7 @@ impl Checker<'_> {
                     (Ty::Int(x), Ty::Int(y)) => x == y,
                     (Ty::Float { f32: x }, Ty::Float { f32: y }) => x == y,
                     (Ty::Dyn(x), Ty::Dyn(y)) | (Ty::Extern(x), Ty::Extern(y)) => x == y,
+                    (Ty::Range(x, k1), Ty::Range(y, k2)) => k1 == k2 && self.could_be(x, y),
                     _ => {
                         ia.len() == ib.len() && ia.iter().zip(&ib).all(|(p, q)| self.could_be(p, q))
                     }
@@ -237,6 +255,16 @@ impl Checker<'_> {
             }
             _ => false,
         }
+    }
+
+    /// Whether a `src` number converts into the number type `x` with `.into()` (for an
+    /// `impl<N: Into<i64>> From<N>`: a narrower integer, a `bool`).
+    fn number_into(&self, src: &Ty, x: &Ty) -> bool {
+        let num = |t: &Ty| {
+            matches!(t, Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool)
+                || self.var_kind(t).is_some_and(|k| k != VarKind::General)
+        };
+        num(&self.shallow(src)) && matches!(self.shallow(x), Ty::Int(_) | Ty::Float { .. })
     }
 
     /// The `impl From<X> for adt` that converts a `src`, if exactly one can; unifies `X` with it.
@@ -267,7 +295,7 @@ impl Checker<'_> {
         }
         let fits: Vec<&FromImpl> = impls
             .iter()
-            .filter(|i| self.could_be(&i.src, src))
+            .filter(|i| self.could_be(&i.src, src) || (i.via_into && self.number_into(src, &i.src)))
             .collect();
         // (An integer literal several impls take is an `i32`, as rustc falls back to.)
         let int_lit = matches!(self.zonk(src), Ty::IntLit)
@@ -289,7 +317,9 @@ impl Checker<'_> {
             _ => fits,
         };
         let [one] = fits.as_slice() else { return None };
-        self.unify(&one.src, src);
+        if self.could_be(&one.src, src) {
+            self.unify(&one.src, src);
+        }
         Some((one.key.clone(), rets.remove(&one.key)))
     }
 
@@ -555,12 +585,32 @@ impl Checker<'_> {
         Ty::Adt(adt.to_string(), targs)
     }
 
+    /// `b.as_ref()` with `b: B` where `B: AsRef<X>` (also `impl AsRef<X>`, `as_mut`, `borrow`,
+    /// `borrow_mut`): the parameter is an `X` here already, so the call is the value itself
+    /// (not, say, the path prelude's `as_ref` on a string).
+    pub(super) fn conv_as_ref_call(&mut self, m: &ast::MethodCallExpr, method: &str) -> Option<Ty> {
+        let tr = match method {
+            "as_ref" => "AsRef",
+            "as_mut" => "AsMut",
+            "borrow" => "Borrow",
+            "borrow_mut" => "BorrowMut",
+            _ => return None,
+        };
+        if m.arg_list().is_some_and(|l| l.args().next().is_some()) {
+            return None;
+        }
+        let x = into_bound_target(m, tr)?;
+        let t = self.lower_type(&x);
+        self.record_conv(m.syntax(), Conv::Identity);
+        Some(t)
+    }
+
     /// `x.into()`: the target type usually comes from the context, so it is settled at the end
     /// of the function.
     pub(super) fn conv_into_call(&mut self, m: &ast::MethodCallExpr, recv: Ty) -> Ty {
         // `h.into()` with `h: impl Into<Host>` / `h: H` where `H: Into<Host>`: the parameter is a
         // `Host` here already, and the bound says that's what it converts to.
-        if let Some(x) = into_bound_target(m) {
+        if let Some(x) = into_bound_target(m, "Into") {
             let t = self.lower_type(&x);
             // (`P: Into<i64>` stays a parameter, so it may be any narrower number or a `bool`.)
             self.record_conv(m.syntax(), into_number_conv(&t));
@@ -689,9 +739,14 @@ impl Checker<'_> {
             && matches!(crate::typeck::strip_parens(a), ast::Expr::Literal(l)
                 if matches!(l.kind(), ast::LiteralKind::IntNumber(n) if n.suffix().is_some())
                     || matches!(l.kind(), ast::LiteralKind::FloatNumber(n) if n.suffix().is_some()));
+        // (A string literal for an `impl AsRef<[u8]>` converts to its bytes.)
+        let str_bytes = matches!(target, Ty::Vec(_))
+            && matches!(crate::typeck::strip_parens(a), ast::Expr::Literal(l)
+                if matches!(l.kind(), ast::LiteralKind::String(_)));
         // (Literals, closures and the like take the parameter's type as written.)
         if !from_target
             && !suffixed
+            && !str_bytes
             && !matches!(
                 crate::typeck::strip_parens(a),
                 ast::Expr::PathExpr(_)
@@ -835,6 +890,12 @@ impl Checker<'_> {
                         self.unify(&s, &Ty::Int(IntKind::I32));
                     }
                     Some(Conv::Identity)
+                }
+                // `s.into()` as a `Vec<u8>` (also a string for an `impl AsRef<[u8]>`): its UTF-8
+                // bytes.
+                (Ty::Str, Ty::Vec(e)) if self.could_be(e, &Ty::Int(IntKind::U8)) => {
+                    self.unify(e, &Ty::Int(IntKind::U8));
+                    Some(Conv::Wrap { js: "κσ.$utf8".into() })
                 }
                 // `vec.into()` as a `VecDeque` (or another collection made from a `Vec`), and
                 // back.

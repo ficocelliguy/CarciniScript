@@ -1461,6 +1461,15 @@ impl<'a> Checker<'a> {
                 let tr = tr.clone();
                 self.implements_user_trait(&adt, &tr)
             }
+            // A type parameter bounded by the trait (`Box::new(val)` as a `Box<dyn Tr>` with `T:
+            // Tr`): its values carry their impls as a struct's do.
+            (Ty::Dyn(tr), Ty::Param(p)) | (Ty::Param(p), Ty::Dyn(tr))
+                if tr.split('+').all(|b| {
+                    matches!(b.trim(), "Send" | "Sync" | "'static") || self.param_has(p, b.trim())
+                }) =>
+            {
+                true
+            }
             // A built-in type with your impl of the trait (`Box<dyn io::Write>` holding a
             // `Vec<u8>`, `Box<dyn Money>` an `f64`).
             (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr))
@@ -3012,6 +3021,8 @@ impl<'a> Checker<'a> {
             {
                 Some(true)
             }
+            // `let links = v[i].as_mut().unwrap();`: the `&mut` it holds.
+            Some(e) if self.unwrapped_mut_ref_call(&e) => Some(true),
             // `let g = net.get_mut(0);` / `let s = find(&mut v, "a").unwrap();` with your own
             // `fn get_mut(&mut self, ..) -> &mut Srv` / `-> Option<&mut Srv>`.
             Some(e) if self.user_mut_ref_call(&e) => Some(true),
@@ -3148,6 +3159,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.mark_tuple_mut_refs(l.initializer().as_ref(), &pat);
         // `let (left, right) = v.split_at_mut(mid);`: both are `&mut` views.
         if let Some(ast::Expr::MethodCallExpr(m)) = l.initializer().as_ref().map(strip_parens)
             && m.name_ref().is_some_and(|n| n.text() == "split_at_mut")
@@ -3282,24 +3294,7 @@ impl<'a> Checker<'a> {
     /// binding of it holds a `&mut`, as `iter_mut()`'s items do, and is written through without
     /// `mut`.
     fn user_mut_ref_call(&self, e: &ast::Expr) -> bool {
-        let mut e = strip_parens(e);
-        loop {
-            match &e {
-                ast::Expr::TryExpr(t) => match t.expr() {
-                    Some(inner) => e = strip_parens(&inner),
-                    None => return false,
-                },
-                ast::Expr::MethodCallExpr(m)
-                    if m.name_ref().is_some_and(|n| matches!(n.text(), "unwrap" | "expect")) =>
-                {
-                    match m.receiver() {
-                        Some(r) => e = strip_parens(&r),
-                        None => return false,
-                    }
-                }
-                _ => break,
-            }
-        }
+        let e = strip_unwraps(e).0;
         match &e {
             ast::Expr::CallExpr(c) => {
                 let Some(ast::Expr::PathExpr(p)) = c.expr() else {
@@ -3437,6 +3432,57 @@ impl<'a> Checker<'a> {
         through_place
     }
 
+    /// `v[i].as_mut().unwrap()` / `map.get_mut(&k).expect("..")` / `v.last_mut()?`: a std call
+    /// giving a `&mut`, unwrapped.
+    fn unwrapped_mut_ref_call(&self, e: &ast::Expr) -> bool {
+        let (e, unwrapped) = strip_unwraps(e);
+        unwrapped && matches!(e, ast::Expr::MethodCallExpr(_)) && self.mut_ref_call(&e)
+    }
+
+    /// The bindings of a tuple pattern matched against a tuple literal whose element is a `&mut`
+    /// (`(Some(dst), Some(src))` against `(v.get_mut(a..b), w.get(c..d))`, `(Some(a), b)` against
+    /// `(Some(&mut x), 2)`): written through without `mut`.
+    fn mark_tuple_mut_refs(&mut self, e: Option<&ast::Expr>, pat: &ast::Pat) {
+        let (Some(ast::Expr::TupleExpr(t)), ast::Pat::TuplePat(tp)) = (e.map(strip_parens), pat)
+        else {
+            return;
+        };
+        let (es, ps): (Vec<_>, Vec<_>) = (t.fields().collect(), tp.fields().collect());
+        if es.len() != ps.len() {
+            return;
+        }
+        for (e, p) in es.iter().zip(&ps) {
+            if matches!(p, ast::Pat::TuplePat(_)) {
+                self.mark_tuple_mut_refs(Some(e), p);
+                continue;
+            }
+            // (`Some(&mut x)`: what it holds.)
+            let inner = match strip_parens(e) {
+                ast::Expr::CallExpr(c)
+                    if matches!(c.expr(), Some(ast::Expr::PathExpr(p)) if p.syntax().text() == "Some") =>
+                {
+                    c.arg_list().and_then(|l| l.args().next()).unwrap_or(e.clone())
+                }
+                other => other,
+            };
+            if !(self.mut_ref_call(&inner) || self.unwrapped_mut_ref_call(&inner)) {
+                continue;
+            }
+            // (Not a number, string, bool or `Option`: that `&mut` needs a slot, which a tuple
+            // element doesn't get yet.)
+            for ip in p.syntax().descendants().filter_map(ast::IdentPat::cast) {
+                let Some(n) = ip.name() else { continue };
+                let Some(ty) = self.lookup(n.text()).map(|l| l.ty.clone()) else { continue };
+                if self.cellable(&ty) {
+                    continue;
+                }
+                if let Some(local) = self.scopes.last_mut().and_then(|s| s.get_mut(n.text())) {
+                    local.reference = Some(true);
+                }
+            }
+        }
+    }
+
     /// Bindings from a pattern matched against `map.get_mut(..)`, `v.last_mut()`, `&mut x` and
     /// the like hold `&mut` references, so they can be mutated through without `mut`.
     fn mark_mut_ref_bindings(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) {
@@ -3471,6 +3517,7 @@ impl<'a> Checker<'a> {
         }
         // `Some(x)` against `it.next()` of an `iter_mut()` over numbers: `x` is a slot.
         self.bind_slot_option(scrutinee, pat);
+        self.mark_tuple_mut_refs(scrutinee, pat);
     }
 
     fn let_condition(&mut self, le: &ast::LetExpr) {
@@ -4685,6 +4732,11 @@ impl<'a> Checker<'a> {
                     Some(t) if !matches!(self.shallow(t), Ty::Var(_) | Ty::Unknown) => {
                         let ok = match self.shallow(t) {
                             Ty::Adt(..) => self.implements(t, "Default"),
+                            // (`T: Default` on the function or the `impl`: as `T::default()`.)
+                            Ty::Param(p) if self.param_has(&p, "Default") => {
+                                self.note_dict(&p, c.syntax());
+                                true
+                            }
                             Ty::Extern(n) => self.iface_has_default(&n),
                             other => other.has_default(),
                         };
@@ -4842,7 +4894,7 @@ impl<'a> Checker<'a> {
                                 && l.initializer().is_some_and(|i| i.syntax() == r.syntax())
                                 && matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
                         });
-                if wanted || bound || self.range_ext_value(r, kind) {
+                if wanted || bound || self.range_ext_value(r, kind) || range_conv_value(r) {
                     if kind == RangeKind::Full {
                         return Ty::Range(Box::new(Ty::Unit), kind);
                     }
@@ -6854,6 +6906,38 @@ impl<'a> Checker<'a> {
             return Ty::Bool;
         }
         let mut rt = self.infer(&recv, None);
+        // `b.as_ref()` with `B: AsRef<[u8]>`: what the bound says.
+        if let Some(t) = self.conv_as_ref_call(m, &method) {
+            return t;
+        }
+        // `5.seconds()` with your trait implemented for `i64` only: the literal is an `i64`, as in
+        // rustc (several impls: the fallback `i32` / `f64` when it's one of them).
+        if let Some(kind @ (VarKind::Int | VarKind::Float)) = self.var_kind(&rt) {
+            let fallback = if kind == VarKind::Int { "i32" } else { "f64" };
+            let mut fits: Vec<&str> = if kind == VarKind::Int {
+                vec![
+                    "i8", "i16", "i32", "i64", "isize", "i128", "u8", "u16", "u32", "u64", "usize",
+                    "u128",
+                ]
+            } else {
+                vec!["f32", "f64"]
+            };
+            let std = crate::service::std_methods(&Ty::Int(IntKind::I32));
+            fits.retain(|k| {
+                self.adts.ext_types.contains(*k)
+                    && self.adts.method(k, &method).is_some_and(|s| s.receiver.is_some())
+            });
+            let pick = match fits.as_slice() {
+                [one] => Some(*one),
+                [_, ..] if fits.contains(&fallback) => Some(fallback),
+                _ => None,
+            };
+            if let Some(k) = pick
+                && !std.contains(&method.as_str())
+            {
+                self.unify(&rt, &Ty::from_name(k));
+            }
+        }
         // `stream.extend(tokens)` in a proc-macro crate: a token stream or any iterable of tokens.
         if method == "extend"
             && let Some(t) = self.token_extend(m, &recv, &rt, &args)
@@ -9973,7 +10057,28 @@ impl Checker<'_> {
                 .find(|m| m.name == f && m.sig.receiver.is_none())?;
             Some(tm.sig.clone())
         })?;
-        let sub: HashMap<String, Ty> = [("Self".to_string(), pty)].into();
+        let mut sub: HashMap<String, Ty> = [("Self".to_string(), pty)].into();
+        // The method's own type parameters (`fn select<R: Copy>(r: R) -> R`): the turbofish's
+        // (`O::select::<u8>(x)`), or fresh.
+        let turbofish: Vec<Ty> = match c.expr() {
+            Some(ast::Expr::PathExpr(p)) => p
+                .path()
+                .and_then(|p| p.segment())
+                .and_then(|s| s.generic_arg_list())
+                .map(|l| l.generic_args().collect::<Vec<_>>())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|g| self.generic_arg_ty(g))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (i, p) in sig.type_params.iter().enumerate() {
+            let t = match turbofish.get(i) {
+                Some(t) => t.clone(),
+                None => self.fresh(VarKind::General),
+            };
+            sub.insert(p.clone(), t);
+        }
         let sig = traits::subst_method(&sig, &sub);
         self.arg_count(c.syntax(), "function", sig.params.len(), args.len());
         for (a, p) in args.iter().zip(sig.params.iter()) {
@@ -10778,5 +10883,55 @@ pub(crate) fn class_param(t: &Ty) -> Option<&str> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// A range literal converted with `.into()` / `.try_into()` or passed to `X::from(..)` /
+/// `X::try_from(..)` (`(1..=3).into()` with `impl From<RangeInclusive<usize>> for X`): a value,
+/// not an iterator.
+fn range_conv_value(r: &ast::RangeExpr) -> bool {
+    let mut node = r.syntax().clone();
+    while let Some(p) = node
+        .parent()
+        .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+    {
+        node = p;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if let Some(m) = ast::MethodCallExpr::cast(parent.clone()) {
+        return m.receiver().is_some_and(|x| x.syntax() == &node)
+            && m.name_ref().is_some_and(|n| matches!(n.text().to_string().as_str(), "into" | "try_into"));
+    }
+    let Some(c) = parent.parent().and_then(ast::CallExpr::cast) else {
+        return false;
+    };
+    let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+        return false;
+    };
+    let last = p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref());
+    last.is_some_and(|n| matches!(n.text().to_string().as_str(), "from" | "try_from"))
+        && p.path().and_then(|p| p.qualifier()).is_some()
+        && c.arg_list().is_some_and(|l| l.args().count() == 1)
+}
+
+/// `e` without the `?`, `.unwrap()` and `.expect(..)` around it, and whether there were any.
+fn strip_unwraps(e: &ast::Expr) -> (ast::Expr, bool) {
+    let mut e = strip_parens(e);
+    let mut stripped = false;
+    loop {
+        let inner = match &e {
+            ast::Expr::TryExpr(t) => t.expr(),
+            ast::Expr::MethodCallExpr(m)
+                if m.name_ref().is_some_and(|n| matches!(n.text(), "unwrap" | "expect")) =>
+            {
+                m.receiver()
+            }
+            _ => None,
+        };
+        let Some(inner) = inner else { return (e, stripped) };
+        e = strip_parens(&inner);
+        stripped = true;
     }
 }

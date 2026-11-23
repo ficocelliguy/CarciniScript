@@ -607,6 +607,8 @@ pub struct FromImpl {
     pub key: String,
     /// Absolute offset of the `from` function's name.
     pub at: usize,
+    /// `impl<S: Into<X>> From<S>`: `src` is `X`, and anything that converts into one fits.
+    pub via_into: bool,
 }
 
 /// What a `Y::from(x)`, `x.into()` or `?` converts with.

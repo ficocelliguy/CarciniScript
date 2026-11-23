@@ -235,14 +235,20 @@ see the Bitburner player gaps below).
   accepts (edition 2021, `--crate-type lib`) that this compiler rejects, counts in files of the
   corpus where it shows:
   - Bounds and generics:
-    - [ ] Bounds written on the `impl` aren't used inside its methods for an argument whose
+    - [x] Bounds written on the `impl` aren't used inside its methods for an argument whose
       type is the bound's target: `impl<T: Default> Cell<T> { fn take(&mut self) -> T {
       self.swap(Default::default()) } }` ("`T: Default` is not satisfied", 10 files) and
       `impl<S: Into<OsS>> From<S> for Pred { fn from(o: S) -> Self { Pred::Equals(o.into()) } }`
       ("`OsS: From<S>` is not satisfied", part of 37). `T::default()`, and the same bound on a
-      free function, work.
-    - [ ] A blanket `impl<S: Into<X>> From<S> for Y` isn't found by `let y: Y = "a".into()` or
-      `Y::from("a")` (clap's `ArgPredicate`, `ValueParser`; part of the 37 `From` hits).
+      free function, work. `Default::default()` expected as a `T: Default` (on the function or
+      the `impl`) failed on free functions too; now it is `$T.default()`, as `T::default()` is
+      (`fixtures/impl_bound_default.rs`). `o.into()` reads an `Into<X>` bound off the `impl`
+      when the method has none (`typeck_conv.rs` `param_into_target`).
+    - [x] A blanket `impl<S: Into<X>> From<S> for Y` isn't found by `let y: Y = "a".into()` or
+      `Y::from("a")` (clap's `ArgPredicate`, `ValueParser`; part of the 37 `From` hits). Now
+      such an impl is collected as `From<X>` (`FromImpl::via_into`), and a narrower number fits
+      an `X` that is a number (`impl<N: Into<i64>> From<N> for Big`, `Big::from(7u8)`)
+      (`fixtures/blanket_from_into.rs`).
     - [ ] Bounds declared on associated types: `trait Fac { type P: Parser; fn make() ->
       Self::P; }` then `T::make().map(..)` ("no method `map` for type parameter `Fac::P`"),
       `where <T as Fac>::P: Parser`, `I: Tr<Error = X>` then methods of `I::Iter`, and `type P =
@@ -251,27 +257,39 @@ see the Bitburner player gaps below).
       clause: `impl<Key, F> Meta<Key, F> { fn filter<I>(&mut self, item: I) -> F::Container
       where F: KeyMethod<Key, I> { self.key_method.make(item) } }` (both the projection and
       the method are missing; 7 files with the trait in the same file).
-    - [ ] A trait's own generic method called through a type parameter: `trait Order { fn
+    - [x] A trait's own generic method called through a type parameter: `trait Order { fn
       select<R: Copy>(r: R) -> R; }` then `O::select(x)` / `O::select::<u8>(x)` with
-      `O: Order`: `R` is never instantiated ("expected `u8`, found `R`"; 5 files).
+      `O: Order`: `R` is never instantiated ("expected `u8`, found `R`"; 5 files). Now its
+      type parameters take the turbofish's arguments or fresh ones (`typeck.rs`
+      `param_static_call`; `fixtures/trait_generic_static.rs`). Their own bounds aren't
+      checked there, and one that needs a class (`R: Default`) gets none.
     - [x] `Ord` / `Eq` bounds don't imply `PartialOrd` / `PartialEq` when the bound is on a
       *trait's* method (`trait It2 { fn pick<B: Ord>(self, a: B, b: B) -> B { if a > b .. } }`,
       also with a `where` clause; itertools, fallible-iterator). Free functions and inherent
       impls are fine. (7 + 9 files, most of the comparison ones.) A default method's body never
       entered its own generics; now it does (`typeck_trait.rs` `check_trait_defaults`;
       `fixtures/trait_method_ord_bounds.rs`).
-    - [ ] `.as_ref()` on a type parameter bounded `AsRef<[u8]>` / `AsRef<str>` / `AsRef<Path>`
+    - [x] `.as_ref()` on a type parameter bounded `AsRef<[u8]>` / `AsRef<str>` / `AsRef<Path>`
       resolves to the wrong type (`Vec<u8>` → `String`, `str` → `PathBuf`), so the result
-      doesn't fit a `&[u8]` / `&str` parameter (aho-corasick haystacks, cc flags).
-    - [ ] Unsized coercion of a *type parameter*: `Box::new(val)` as `Box<dyn Tr>`, `val` as
+      doesn't fit a `&[u8]` / `&str` parameter (aho-corasick haystacks, cc flags). The path
+      prelude's `as_ref` on strings won, and a string passed for an `AsRef<[u8]>` was rejected.
+      Now `as_ref` / `as_mut` / `borrow` / `borrow_mut` on a parameter with that bound is the
+      value as the bound says (`conv_as_ref_call`), and a string converts to its UTF-8 bytes
+      there, as `s.into()` to a `Vec<u8>` does now (`fixtures/as_ref_bounds.rs`).
+    - [x] Unsized coercion of a *type parameter*: `Box::new(val)` as `Box<dyn Tr>`, `val` as
       `&dyn Tr`, `Some(Box::new(val))` as `Option<Box<dyn Tr>>`, with `T: Tr` ("expected `dyn
-      Tr`, found `T`", 16 files); concrete types coerce. Also `match` arms returning `Some(e)`
-      for different error types as `Option<&(dyn Error + 'static)>` (`Error::source`, 5).
+      Tr`, found `T`", 16 files); concrete types coerce. Now a type parameter unifies with a
+      `dyn` of traits its bounds have (`Send` / `Sync` aside); dispatch is by the value at run
+      time, numbers included (`fixtures/dyn_from_type_param.rs`).
+    - [ ] `match` arms returning `Some(e)` for different error types as `Option<&(dyn Error +
+      'static)>` (`Error::source`, 5 files): "`match` arms have incompatible types: expected
+      `Option<A>`, found `Option<B>`"; the expected return type doesn't reach the arms.
     - [ ] Inference of a struct's type argument from the one impl of a bound (`Auto::always(
       Vec::new())` with `impl RawStream for Vec<u8>` the only impl): "type annotations needed".
-    - [ ] An extension-trait method on an unsuffixed integer literal, `5.seconds()` with the
+    - [x] An extension-trait method on an unsuffixed integer literal, `5.seconds()` with the
       trait implemented for `i64` only; rustc picks the literal's type from the sole impl (time's
-      macros, 7 files).
+      macros, 7 files). Now so does the checker, and among several impls the fallback `i32` /
+      `f64` when it has one, as rustc (`typeck.rs` `method`; `fixtures/literal_ext_methods.rs`).
   - Names and items:
     - [ ] Items declared inside function bodies share the file's namespace: two functions each
       declaring `enum State` / `struct Acc` collide ("defined multiple times"), and the first
@@ -308,8 +326,11 @@ see the Bitburner player gaps below).
       allocators: 27 files, the whole "derive on an `Option` field" bucket). Now a field
       written as one is `Copy`, `Clone`, `Debug`, `PartialEq` and `Eq` (`Checker::fn_ptr_fields`),
       and `{:?}` prints a made-up address as `{:p}` does (`fixtures/fn_ptr_derives.rs`).
-    - [ ] A range literal matched against `From<Range<usize>>` / `From<RangeInclusive<usize>>`
-      impls is typed as `slice::Iter` (`(a..=b).into()`, clap's `ValueRange`).
+    - [x] A range literal matched against `From<Range<usize>>` / `From<RangeInclusive<usize>>`
+      impls is typed as `slice::Iter` (`(a..=b).into()`, clap's `ValueRange`). Now a range
+      that is `.into()`'s receiver or `X::from(..)`'s argument is a range value
+      (`range_conv_value`), and the impl is picked by its kind (`could_be` compared only the
+      element) (`fixtures/range_into_from.rs`).
     - [x] `Type::from` as a function value (`.map(Id::from)`) isn't found; `Into::into` and
       `.map(|s| s.into())` work. Now a closure (see `PathBuf::from` in the Comprehensive Rust
       survey below).
@@ -323,11 +344,16 @@ see the Bitburner player gaps below).
     - [ ] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
       &'a mut u8 { self.table.items.push(..) }` with `table: &'a mut Table`, and `Entry::Occupied(
       entry) => &mut entry.v.values[i]` (hashbrown, clap).
-    - [ ] A `&mut` binding produced by `Option` combinators or a tuple pattern: `let links =
+    - [x] A `&mut` binding produced by `Option` combinators or a tuple pattern: `let links =
       v[i].as_mut().unwrap(); links.next = 1;`, `if let (Some(dst), Some(src)) = (v.get_mut(a..b),
       w.get(c..d)) { dst.copy_from_slice(src) }`, `let (Some(a), b) = (..) else { .. }; *a += b`.
       (`let Some((a, b)) = x.as_mut() else`, `for v in s.iter_mut()`, destructuring `self` and
-      calling `&mut self` trait methods through a `&mut W` parameter all work.)
+      calling `&mut self` trait methods through a `&mut W` parameter all work.) Now a std `&mut`
+      call under `unwrap` / `expect` / `?` binds a `&mut`, and so does a tuple pattern's
+      element matched against one (`unwrapped_mut_ref_call`, `mark_tuple_mut_refs`;
+      `fixtures/mut_ref_unwrapped_bindings.rs`). Still E0596: such a binding of a number,
+      string or `Option` (`let (Some(a), b) = (Some(&mut x), 2)` with `x: i32`, also `let
+      Some(p) = Some(&mut x) else`), which needs a slot.
   - Patterns:
     - [x] Irrefutable array patterns on a `[T; N]`, `for (j, ([first, rest @ ..], fast)) in ..`
       and `let ([x, ..], y) = ..`, are rejected as refutable (icu; 9 files with the other
@@ -367,10 +393,11 @@ see the Bitburner player gaps below).
     - [ ] Macro-generated inline modules and their items (deranged's `impl_ranged!`: "this block
       kind is not supported yet", 3 files but 1,165 errors).
   - std surface found through these messages (for the std column, not language work):
-    `From<T> for OnceCell<T>` / `OnceCell::from`, `Vec<u8>: From<String>`, `Cow<[u8]>:
-    From<Vec<u8>>`, `OsString::push(&Path)` / `push(&str)` (`OsString` is a `String` here and
-    `push` takes a `char`), `Debug` for `slice::Iter` in a derive, `write_fmt` overridden in an
-    `io::Write` / `fmt::Write` impl ("not a member of trait"), `&a | &b` on `HashSet`.
+    `From<T> for OnceCell<T>` / `OnceCell::from`, `Cow<[u8]>: From<Vec<u8>>`,
+    `OsString::push(&Path)` / `push(&str)` (`OsString` is a `String` here and `push` takes a
+    `char`), `Debug` for `slice::Iter` in a derive, `write_fmt` overridden in an `io::Write` /
+    `fmt::Write` impl ("not a member of trait"), `&a | &b` on `HashSet`. (`Vec<u8>:
+    From<String>` works now, with the `AsRef<[u8]>` item above.)
   - Still mixed, to triage next: the "mismatched types" buckets (two named types that don't
     match, about 90 files outside macros). Samples are std modeling (`Cow<'a, str>` seen as
     `Cow<String>`, `OsStr::to_owned()` as `String`), clap's derive attributes on variants

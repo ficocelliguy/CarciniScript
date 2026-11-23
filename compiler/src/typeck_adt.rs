@@ -1331,7 +1331,20 @@ impl Checker<'_> {
                     }),
                 _ => None,
             };
-            arg.map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown)
+            // (`impl<S: Into<X>> From<S> for Y`: what it takes is what converts into an `X`, and
+            // `o.into()` in its body hands that on.)
+            let via = arg.as_ref().and_then(|t| match t {
+                ast::Type::PathType(p) => super::conv::param_into_target(
+                    &p.path()?.as_single_name_ref()?.text().to_string(),
+                    "Into",
+                    imp.generic_param_list(),
+                    imp.where_clause(),
+                ),
+                _ => None,
+            });
+            let via_into = via.is_some();
+            let ty = via.or(arg).map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+            (ty, via_into)
         });
         // `impl Add<R> for T`: the right operand's type (`Self` by default), and the impl's
         // `type Output = ..;`, which `-> Self::Output` names.
@@ -1483,7 +1496,7 @@ impl Checker<'_> {
                     .insert("fmt$dbg".into(), method);
                 continue;
             }
-            if let Some(src) = &from_src
+            if let Some((src, via_into)) = &from_src
                 && name.text() == "from"
             {
                 let at = self.range(name.syntax()).0;
@@ -1493,6 +1506,7 @@ impl Checker<'_> {
                     src: src.clone(),
                     key: key.clone(),
                     at,
+                    via_into: *via_into,
                 });
                 self.adts
                     .methods

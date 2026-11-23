@@ -3619,6 +3619,10 @@ impl<'a> Codegen<'a> {
                 // (A generic struct: with the classes its values carry, `κσ.$cv(History, [..]).default()`.)
                 let adt_default = match &ty {
                     Ty::Adt(..) => Some(format!("{}.default()", self.dict_of(&ty))),
+                    // (`T: Default`: `$T.default()`, as `T::default()`.)
+                    Ty::Param(_) if self.dict_of(&ty) != "undefined" => {
+                        Some(format!("{}.default()", self.dict_of(&ty)))
+                    }
                     _ => None,
                 };
                 let js = self
@@ -6499,6 +6503,14 @@ impl<'a> Codegen<'a> {
             let f = self.by_value(&recv, f, &from);
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
             return (self.convert(conv, f).at(self.off(m.syntax())), ty);
+        }
+        // `b.as_ref()` with `b: B` where `B: AsRef<[u8]>`: the parameter is a `Vec` already.
+        if matches!(method.as_str(), "as_ref" | "as_mut" | "borrow" | "borrow_mut")
+            && let Some(crate::adt::Conv::Identity) = self.conv_of(m.syntax())
+        {
+            let (f, _) = self.emit_expr(&recv, None);
+            let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            return (f.at(self.off(m.syntax())), ty);
         }
         if method == "into"
             && let Some(conv) = self.conv_of(m.syntax())
