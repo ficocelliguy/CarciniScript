@@ -208,7 +208,11 @@ pub(crate) fn with_prelude(
     {
         out.push(IO);
     }
-    if crate::mbe::uses_log(text) && !text.contains("// (log prelude)") && !declares("LogLevel") {
+    // (`log::Level` alone is `LogLevel` by now.)
+    if (crate::mbe::uses_log(text) || text.contains("LogLevel") || text.contains("__log_"))
+        && !text.contains("// (log prelude)")
+        && !declares("LogLevel")
+    {
         out.push(LOG);
     }
     // (After the rewrite: `num::Integer` is `NumInteger`, `num::integer::gcd` `__num_gcd`, ..)

@@ -2,7 +2,7 @@
 //! a `Vec<T>`: `let [a, b] = arr;` is irrefutable when `arr` is known to hold two elements (its
 //! annotation, an array literal, or `<[T; 2]>::try_from(..)`). A child module of `typeck`.
 
-use ra_ap_syntax::{AstNode, ast};
+use ra_ap_syntax::{AstNode, ast, ast::HasArgList};
 
 use super::Checker;
 use crate::ty::Ty;
@@ -378,6 +378,84 @@ impl Checker<'_> {
         self.missing_steps.set(0);
         self.missing(&rows, &[self.with_dims(ty, dims)]).is_none()
     }
+
+    /// What a `let` binds, as far as array lengths go: a tuple's fields from its annotation or
+    /// a tuple expression, else the array's dimensions (`let_dims`).
+    pub(super) fn let_shape(&self, l: &ast::LetStmt) -> PatShape {
+        if let Some(t @ ast::Type::TupleType(_)) = l.ty() {
+            return type_shape(&t);
+        }
+        if let Some(e @ ast::Expr::TupleExpr(_)) = l.initializer().map(|e| super::strip_parens(&e)) {
+            return expr_shape(&e);
+        }
+        dims_shape(self.let_dims(l))
+    }
+
+    /// The items a `for` loop takes from `iterable`: `enumerate()` and `zip(..)` pair them up,
+    /// else the array's dimensions less the outermost (`item_dims`).
+    pub(super) fn item_shape(&self, iterable: &ast::Expr) -> PatShape {
+        if let ast::Expr::MethodCallExpr(m) = super::strip_parens(iterable)
+            && let Some(recv) = m.receiver()
+        {
+            let arg = m.arg_list().and_then(|l| l.args().next());
+            match m.name_ref().map(|n| n.text().to_string()).as_deref() {
+                Some("enumerate") => {
+                    return PatShape::Tuple(vec![PatShape::Unknown, self.item_shape(&recv)]);
+                }
+                Some("zip") => {
+                    if let Some(a) = arg {
+                        return PatShape::Tuple(vec![self.item_shape(&recv), self.item_shape(&a)]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        dims_shape(self.item_dims(iterable))
+    }
+
+    /// Whether `pat` matches every value of `shape`: `let ([x, ..], y) = ([7, 8], 9);`,
+    /// `for (i, [first, rest @ ..]) in rows.iter().enumerate()` over `[[u8; 3]; 2]`.
+    pub(super) fn pat_fits(&self, pat: &ast::Pat, shape: &PatShape) -> bool {
+        let pat = super::strip_pat(pat);
+        let is_rest = |p: &ast::Pat| match p {
+            ast::Pat::RestPat(_) => true,
+            ast::Pat::IdentPat(ip) => matches!(ip.pat(), Some(ast::Pat::RestPat(_))),
+            _ => false,
+        };
+        match (&pat, shape) {
+            (ast::Pat::TuplePat(tp), PatShape::Tuple(fields)) => {
+                let pats: Vec<ast::Pat> = tp.fields().collect();
+                let rest = pats.iter().position(|p| matches!(p, ast::Pat::RestPat(_)));
+                pats.iter().enumerate().all(|(i, p)| {
+                    let at = match rest {
+                        Some(r) if i == r => return true,
+                        Some(r) if i > r => (fields.len() + i).checked_sub(pats.len()),
+                        _ => Some(i),
+                    };
+                    let field = at.and_then(|k| fields.get(k)).unwrap_or(&PatShape::Unknown);
+                    self.pat_fits(p, field)
+                })
+            }
+            (ast::Pat::SlicePat(sp), PatShape::Array(dims)) => {
+                let Some((&len, inner)) = dims.split_first() else {
+                    return false;
+                };
+                let pats: Vec<ast::Pat> = sp.pats().collect();
+                let fixed: Vec<&ast::Pat> = pats.iter().filter(|p| !is_rest(p)).collect();
+                let count_ok = if fixed.len() < pats.len() {
+                    fixed.len() <= len
+                } else {
+                    fixed.len() == len
+                };
+                let inner = dims_shape(inner.to_vec());
+                count_ok && fixed.iter().all(|p| self.pat_fits(p, &inner))
+            }
+            (ast::Pat::IdentPat(ip), _) if ip.pat().is_some() && !is_rest(&pat) => {
+                ip.pat().is_some_and(|sub| self.pat_fits(&sub, shape))
+            }
+            _ => self.irrefutable_pat(&pat),
+        }
+    }
 }
 
 /// `array_expr_len`, also through what the file declares: a local's `let`, a parameter's type,
@@ -609,4 +687,35 @@ fn fn_ret_dims(root: &ra_ap_syntax::SyntaxNode, name: &str) -> Vec<usize> {
         })
         .collect();
     agreed(all)
+}
+
+/// What's known of a value's array lengths, for a pattern over it (`Checker::pat_fits`).
+pub enum PatShape {
+    /// An array's nested lengths (`[[u8; 3]; 2]` → `[2, 3]`).
+    Array(Vec<usize>),
+    Tuple(Vec<PatShape>),
+    Unknown,
+}
+
+fn dims_shape(dims: Vec<usize>) -> PatShape {
+    if dims.is_empty() {
+        PatShape::Unknown
+    } else {
+        PatShape::Array(dims)
+    }
+}
+
+fn type_shape(t: &ast::Type) -> PatShape {
+    match t {
+        ast::Type::TupleType(tt) => PatShape::Tuple(tt.fields().map(|f| type_shape(&f)).collect()),
+        ast::Type::ParenType(p) => p.ty().map(|t| type_shape(&t)).unwrap_or(PatShape::Unknown),
+        t => dims_shape(array_type_dims(t)),
+    }
+}
+
+fn expr_shape(e: &ast::Expr) -> PatShape {
+    match super::strip_parens(e) {
+        ast::Expr::TupleExpr(te) => PatShape::Tuple(te.fields().map(|f| expr_shape(&f)).collect()),
+        e => dims_shape(array_dims_in_file(&e, 0)),
+    }
 }

@@ -2261,6 +2261,18 @@ impl Codegen<'_> {
             return true;
         }
         let Some(Resolved::Ctor(adt, v)) = self.resolve(&segs) else {
+            // `Range { start, end }`: the runtime range's bounds.
+            if let ast::Pat::RecordPat(rp) = p
+                && crate::typeck::range_struct_pat(&segs).is_some()
+            {
+                for f in rp.record_pat_field_list().into_iter().flat_map(|l| l.fields()) {
+                    if let (Some(fname), Some(sub)) = (f.field_name(), f.pat()) {
+                        let at = format!("κσ.$rangeOf({subject}).{}", fname.text());
+                        self.lower_pat(&sub, &at, out);
+                    }
+                }
+                return true;
+            }
             return false;
         };
         let def = self.types.adts.defs[&adt].clone();

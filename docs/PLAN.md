@@ -276,9 +276,10 @@ see the Bitburner player gaps below).
     - [ ] Items declared inside function bodies share the file's namespace: two functions each
       declaring `enum State` / `struct Acc` collide ("defined multiple times"), and the first
       function then resolves `State::X` and `Acc(..)` against the second's items (19 files).
-    - [ ] An inherent method with the same name as a trait method on the same type (`impl Prog
+    - [x] An inherent method with the same name as a trait method on the same type (`impl Prog
       { fn header(&self) }` next to `impl LineProgram for Prog { fn header(&self) }`): "duplicate
-      definitions" (gimli; rustc prefers the inherent one).
+      definitions" (gimli; rustc prefers the inherent one). Works now (rechecked 2026-11-23:
+      `p.header()` takes the inherent one, `LineProgram::header(&p)` the trait's).
     - [ ] Inherent impls on reference instantiations collide: `impl<L, R> Either<&L, &R> { fn
       cloned }` and `impl<L, R> Either<&mut L, &mut R> { fn cloned }`. Impls per type argument
       (`impl W<u8>` / `impl W<u16>`) and per const argument work, but their associated consts
@@ -297,8 +298,11 @@ see the Bitburner player gaps below).
       its methods are registered as inherent ones (an inherent method of the name wins, without
       "duplicate definitions"), its `type X = ..;` and consts skipped (`typeck_adt.rs`
       `collect_impl`, `Adts::unknown_trait_methods`).
-    - [ ] Field access through `Deref`: `wrap.sign` with `impl Deref for Wrap { type Target =
-      Span; }` is "no field `sign` on type `Wrap`"; methods through `Deref` work (jiff).
+    - [x] Field access through `Deref`: `wrap.sign` with `impl Deref for Wrap { type Target =
+      Span; }` is "no field `sign` on type `Wrap`"; methods through `Deref` work (jiff). Now a
+      field the type lacks and its target has is `(w).deref().sign`, written through `DerefMut`
+      (`typeck_adt.rs` `adt_field`; `fixtures/deref_fields.rs`). One level only: a `Deref` to
+      another `Deref` type doesn't chain.
     - [x] Function pointer types (`fn(u8) -> u8`, `Option<fn(..)>`) are typed as `impl Fn`, so a
       `#[derive(Clone, Copy, Debug)]` struct holding one fails (windows-sys callbacks, brotli
       allocators: 27 files, the whole "derive on an `Option` field" bucket). Now a field
@@ -312,7 +316,10 @@ see the Bitburner player gaps below).
   - Borrow checker, E0596 "not declared as mutable" where rustc accepts (about 50 files; the
     other E0596 hits are `*val = ..` on a loop variable whose iterator type is unknown, and raw
     pointers):
-    - [ ] The typed receiver `fn init(self: &mut Self, ..)` (brotli).
+    - [x] The typed receiver `fn init(self: &mut Self, ..)` (brotli). Now `self: &mut Self`,
+      `self: &'a Self` and `mut self: Self` are written as their shorthand, padded with spaces
+      to the same length, before anything parses the file (`lineindex.rs` `typed_self_params`;
+      `fixtures/typed_self_params.rs`). `self: Box<Self>` and the like stay as they are.
     - [ ] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
       &'a mut u8 { self.table.items.push(..) }` with `table: &'a mut Table`, and `Entry::Occupied(
       entry) => &mut entry.v.values[i]` (hashbrown, clap).
@@ -322,22 +329,34 @@ see the Bitburner player gaps below).
       (`let Some((a, b)) = x.as_mut() else`, `for v in s.iter_mut()`, destructuring `self` and
       calling `&mut self` trait methods through a `&mut W` parameter all work.)
   - Patterns:
-    - [ ] Irrefutable array patterns on a `[T; N]`, `for (j, ([first, rest @ ..], fast)) in ..`
+    - [x] Irrefutable array patterns on a `[T; N]`, `for (j, ([first, rest @ ..], fast)) in ..`
       and `let ([x, ..], y) = ..`, are rejected as refutable (icu; 9 files with the other
-      refutable-pattern hits, one of which is `let Ok(p): Result<_, Infallible> = ..`).
-    - [ ] Struct patterns on std structs: `let Range { start, end } = r;` ("cannot find tuple
-      struct, struct or variant `Range`").
+      refutable-pattern hits, one of which is `let Ok(p): Result<_, Infallible> = ..`). Now an
+      array pattern inside a tuple pattern fits by the lengths known there: a tuple literal's or
+      annotation's fields, and the items of `enumerate()` / `zip(..)` over arrays
+      (`typeck_arrays.rs` `pat_fits`, `PatShape`; `fixtures/tuple_array_patterns.rs`). Still
+      refutable: a tuple local declared elsewhere (`let ([a, b], c) = t;`), and the
+      `Infallible` one.
+    - [x] Struct patterns on std structs: `let Range { start, end } = r;` ("cannot find tuple
+      struct, struct or variant `Range`"). Now `Range`, `RangeFrom`, `RangeTo` and
+      `RangeToInclusive` (bare or under `std::ops::`) take their public fields, irrefutably,
+      in `let`, parameters and `match` (`typeck::range_struct_pat`;
+      `fixtures/range_struct_patterns.rs`).
     - [ ] Tuple-struct and unit patterns of std enums, `Bound::Included(&i)`, `Bound::Unbounded`
       (10 files): `Bound` itself is an unmodeled std type, so this is the std column, listed
       here because the pattern message isn't shaped like a std one.
-    - [ ] The bundled `log` crate's `Level` by its full path: `log::Level` as a type ("cannot
+    - [x] The bundled `log` crate's `Level` by its full path: `log::Level` as a type ("cannot
       find type `LogLevel`") and `log::Level::Error` as a pattern or value (env_logger's
       examples). The other crate-name patterns (`anstyle::Color::Ansi(c)`, `syn::Meta::..`) are
-      crates that aren't bundled.
+      crates that aren't bundled. The path was already renamed `LogLevel`, which hid the `log::`
+      that pulls in the prelude; now the renamed names pull it in too (`stdtime.rs`;
+      `fixtures/log_level_paths.rs`).
   - Places:
-    - [ ] Index assignment on a call result: `b.slice_mut()[0] = 1;`, `b.inner()[1] = 2;`
+    - [x] Index assignment on a call result: `b.slice_mut()[0] = 1;`, `b.inner()[1] = 2;`
       ("assignment to this place is not supported yet", 4 files); `*b.n_mut() = 5` and `let v =
-      b.inner(); v[2] = 9` work.
+      b.inner(); v[2] = 9` work. Now a call giving a `Vec` or slice goes in a temp first, so it
+      runs once, as a nested row already did (`codegen.rs` `emit_assign_place`, `call_base`;
+      `fixtures/index_assign_call.rs`).
   - Macros:
     - [x] BUG: a struct-literal field shorthand inside `macro_rules!` is hygiene-renamed with the
       local it names: `let ids = ..; $name { ids }` becomes "struct has no field named `ids__h1`"
@@ -556,13 +575,19 @@ below has a minimal repro that rustc accepts; the slide or crate it comes from i
   `Target`", whichever of the two impls comes first. In the `Deref` impl itself, and written out as
   `&mut String`, it works. Now `Deref` impls are collected first and `Self::Target` falls back to
   the type's `Deref` target (`fixtures/deref_mut_self_target.rs`).
-- [ ] BUG (found with the item above): a `String` method that mutates, called through a
+- [x] BUG (found with the item above): a `String` method that mutates, called through a
   `DerefMut<Target = String>` (`n.push('c')` with `struct Name(String)`), emits `(n).deref_mut()
   += "c"`, a JS syntax error. A `Vec` target works; a string needs a slot over the field.
-- [ ] `vec![]` / `Vec::new()` typed only by a `&mut Vec<Self::Leaf>` argument in a trait default
+  `DerefMut` bodies were never checked, so `&mut self.0` never became a slot. Now they are, a
+  `deref_mut` declared `-> &mut String` (or a number) returns `κσ.$placeSlot`, and the call is
+  read and written through `[1]` (`Types::deref_slots`; `fixtures/deref_mut_string.rs`).
+- [x] `vec![]` / `Vec::new()` typed only by a `&mut Vec<Self::Leaf>` argument in a trait default
   method (`idiomatic/polymorphism/generics/default-impls`: `let mut buf = vec![];
   self.collect_leaves_buffered(&mut buf); buf`): "type annotations needed for `Vec<_>`". Through
-  a free function with concrete types, or with `let mut buf: Vec<Self::Leaf>`, it works.
+  a free function with concrete types, or with `let mut buf: Vec<Self::Leaf>`, it works. The
+  trait's own `Self::Leaf` unified with anything without binding. Now, in that trait's default
+  methods, an inference variable takes it (`typeck.rs` `unify`;
+  `fixtures/trait_default_assoc_vec.rs`).
 - [x] `fmt::Error` written in a return type, `-> Result<(), fmt::Error>` (Programming Rust
   `libgit2-rs-safe`): "cannot find type `Error`", or, when the file has its own `Error` type,
   "expected `Result<(), Error>`, found `Result<(), fmt::Error>`". `-> fmt::Result` works. Now

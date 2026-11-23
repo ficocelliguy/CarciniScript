@@ -14,7 +14,7 @@ use crate::adt::{
     AdtDef, Field, KNOWN_DERIVES, Method, Receiver, Resolved, Shape, Variant, derives_of,
     impl_parts,
 };
-use crate::ty::Ty;
+use crate::ty::{RangeKind, Ty};
 
 impl Checker<'_> {
     // ------------------------------------------------------------ items
@@ -1798,6 +1798,7 @@ impl Checker<'_> {
                             | "Hash"
                             | "Sum"
                             | "Product"
+                            | "DerefMut"
                     ) && crate::adt::op_method(t).is_none()
                         && !self.adts.traits.contains_key(t)
                 })
@@ -2439,6 +2440,19 @@ impl Checker<'_> {
                 .map(|(_, f)| f.ty.clone())
                 .unwrap_or(Ty::Unknown);
         }
+        // `w.sign` through `impl Deref for Wrap { type Target = Span; }`: `(w).deref().sign`.
+        if let Some(recv) = f.expr()
+            && let Some((n, target)) = self.deref_target(&Ty::Adt(adt.to_string(), targs.to_vec()))
+            && let Ty::Adt(ta, ta_args) = self.shallow(&target)
+            && self
+                .adts
+                .defs
+                .get(&ta)
+                .is_some_and(|d| !d.is_enum && d.variants[0].field(&key).is_some())
+        {
+            self.auto_deref(&recv, &n, &target);
+            return self.adt_field(f, &ta, &ta_args);
+        }
         let msg = if self.adts.method(adt, &key).is_some() {
             format!(
                 "attempted to take value of method `{key}` on type `{adt}` (call it: `{key}(..)`)"
@@ -2606,6 +2620,12 @@ impl Checker<'_> {
             _ => return false,
         };
         let Some(Resolved::Ctor(adt, v)) = self.resolve(&segs) else {
+            if let ast::Pat::RecordPat(rp) = p
+                && let Some(k) = super::range_struct_pat(&segs)
+            {
+                self.range_record_pat(rp, k, expected);
+                return true;
+            }
             let names_adt = segs.len() > 1 && self.resolve(&segs[..1]).is_some()
                 || segs.first().is_some_and(|s| s == "Self");
             if names_adt || matches!(p, ast::Pat::RecordPat(_)) {
@@ -2807,6 +2827,55 @@ impl Checker<'_> {
         }
     }
 
+    /// `let Range { start, end } = r;`: a std range's public fields (`RangeFrom`'s `start`,
+    /// `RangeTo` / `RangeToInclusive`'s `end`).
+    fn range_record_pat(&mut self, rp: &ast::RecordPat, k: RangeKind, expected: &Ty) {
+        let name = path_segs(rp.path()).join("::");
+        let elem = self.fresh(super::VarKind::General);
+        let range = Ty::Range(Box::new(elem.clone()), k);
+        if !self.unify(expected, &range) {
+            let msg = format!(
+                "mismatched types: expected `{}`, found `{name}`",
+                self.describe(expected)
+            );
+            self.error(rp.syntax(), msg);
+        }
+        let fields: &[&str] = match k {
+            RangeKind::Range => &["start", "end"],
+            RangeKind::From => &["start"],
+            _ => &["end"],
+        };
+        let Some(list) = rp.record_pat_field_list() else { return };
+        let mut seen = Vec::new();
+        for f in list.fields() {
+            let Some(fname) = f.field_name() else { continue };
+            let key = fname.text().to_string();
+            if !fields.contains(&key.as_str()) {
+                self.error(
+                    fname.syntax(),
+                    format!("`{name}` does not have a field named `{key}`"),
+                );
+                continue;
+            }
+            seen.push(key);
+            if let Some(sub) = f.pat() {
+                self.pat(&sub, &elem);
+            }
+        }
+        let missing: Vec<String> = fields
+            .iter()
+            .filter(|f| !seen.iter().any(|s| s == *f))
+            .map(|f| format!("`{f}`"))
+            .collect();
+        if list.rest_pat().is_none() && !missing.is_empty() {
+            let s = if missing.len() == 1 { "" } else { "s" };
+            self.error(
+                rp.syntax(),
+                format!("pattern does not mention field{s} {} (add `..` to ignore the rest)", join_and(&missing)),
+            );
+        }
+    }
+
     /// Patterns that match every value: also struct patterns (but not enum variants) whose
     /// fields are irrefutable, and unit structs.
     pub(super) fn irrefutable_pat(&self, p: &ast::Pat) -> bool {
@@ -2824,7 +2893,14 @@ impl Checker<'_> {
             other => return super::irrefutable(other),
         };
         let Some(Resolved::Ctor(adt, _)) = self.resolve(&segs) else {
-            return false;
+            // (`Range { start, end }`)
+            return matches!(&p, ast::Pat::RecordPat(rp)
+                if super::range_struct_pat(&segs).is_some()
+                    && rp
+                        .record_pat_field_list()
+                        .into_iter()
+                        .flat_map(|l| l.fields())
+                        .all(|f| f.pat().is_none_or(|sub| self.irrefutable_pat(&sub))));
         };
         if self.adts.defs[&adt].variants.len() != 1 {
             return false;
@@ -2850,6 +2926,12 @@ impl Checker<'_> {
             ast::Pat::IdentPat(ip) => vec![self.unit_struct_pat(ip)?],
             _ => return None,
         };
+        if self.resolve(&segs).is_none()
+            && super::range_struct_pat(&segs).is_some()
+            && self.irrefutable_pat(p)
+        {
+            return Some(vec![Ap::Wild]);
+        }
         let Resolved::Ctor(adt, v) = self.resolve(&segs)? else {
             return Some(vec![Ap::Other]);
         };

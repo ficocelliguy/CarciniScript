@@ -147,6 +147,9 @@ pub struct Types {
     /// `let r = &mut v[i];` / `&mut s.count` of a number, string, bool or `Option`: a slot over
     /// that element or field (`κσ.$placeSlot`), by the `&mut`; `r` is a slot binding.
     pub place_slots: std::collections::HashSet<(usize, usize)>,
+    /// Auto-derefs (`derefs`) whose `deref_mut` returns a slot over a number or string: read
+    /// and written through its `[1]`.
+    pub deref_slots: std::collections::HashSet<(usize, usize)>,
     /// Expressions whose JS value is a slot over a place (`[1]` reads and writes it): a call of
     /// one of the file's functions declared `-> &mut i32`, a `&mut i32` field, `o.unwrap()` of
     /// an `Option<&mut i32>` value. Codegen reads `[1]` unless the slot itself is kept.
@@ -385,6 +388,7 @@ impl<'a> Checker<'a> {
             index_places: Default::default(),
             slice_views: Default::default(),
             place_slots: Default::default(),
+            deref_slots: Default::default(),
             slot_values: Default::default(),
             slot_reads: Default::default(),
             slot_read_captures: Default::default(),
@@ -730,6 +734,7 @@ pub fn check(
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
     let place_slots = std::mem::take(&mut c.place_slots);
+    let deref_slots = std::mem::take(&mut c.deref_slots);
     let slot_values = std::mem::take(&mut c.slot_values);
     let slot_reads = std::mem::take(&mut c.slot_reads);
     let slot_read_captures = std::mem::take(&mut c.slot_read_captures);
@@ -782,6 +787,7 @@ pub fn check(
             index_places,
             slice_views,
             place_slots,
+            deref_slots,
             slot_values,
             slot_reads,
             slot_read_captures,
@@ -930,6 +936,7 @@ struct Checker<'a> {
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
     place_slots: std::collections::HashSet<(usize, usize)>,
+    deref_slots: std::collections::HashSet<(usize, usize)>,
     slot_values: std::collections::HashSet<(usize, usize)>,
     slot_reads: HashMap<(usize, usize), String>,
     slot_read_captures: HashMap<(usize, String), String>,
@@ -1352,6 +1359,19 @@ impl<'a> Checker<'a> {
         let (a, b) = (self.normalize_proj(a), self.normalize_proj(b));
         match (&a, &b) {
             (Ty::Never, _) | (_, Ty::Never) | (Ty::Unknown, _) | (_, Ty::Unknown) => true,
+            // In the trait's own default methods, its associated type is a type of its own, which
+            // an inference variable takes (`let mut buf = vec![]; self.fill(&mut buf); buf` with
+            // `fn fill(&self, buf: &mut Vec<Self::Leaf>)`).
+            (Ty::Var(v), Ty::Param(p)) | (Ty::Param(p), Ty::Var(v))
+                if self.is_template(p)
+                    && matches!(self.var_kind(&Ty::Var(*v)), Some(VarKind::General))
+                    && p.split_once("::").is_some_and(|(t, _)| {
+                        self.param_bounds.get("Self").is_some_and(|b| b.iter().any(|x| x == t))
+                    }) =>
+            {
+                self.vars[*v as usize] = VarState::Bound(Ty::Param(p.clone()));
+                true
+            }
             // A trait's own associated type or type parameter (`Shape::Unit`, in its declared
             // signatures): whatever the impl says, so it matches any type.
             (Ty::Param(p), _) | (_, Ty::Param(p)) if self.is_template(p) => true,
@@ -3090,6 +3110,7 @@ impl<'a> Checker<'a> {
             && !self.or_pat_covers(&pat, &ty)
             && !self.array_pat_fits(l, &pat)
             && !self.array_pat_covers(&pat, &ty, &self.let_dims(l))
+            && !self.pat_fits(&pat, &self.let_shape(l))
         {
             self.error(
                 pat.syntax(),
@@ -4438,6 +4459,15 @@ impl<'a> Checker<'a> {
     fn auto_deref(&mut self, e: &ast::Expr, adt: &str, target: &Ty) {
         let r = self.range(e.syntax());
         let mutable = self.adts.deref_mut.contains(adt);
+        // (A `deref_mut` declared `-> &mut String` returns a slot over the field.)
+        if mutable
+            && self
+                .adts
+                .method(adt, "deref_mut")
+                .is_some_and(|m| m.ret_slot == Some(false))
+        {
+            self.deref_slots.insert(r);
+        }
         self.derefs.insert(r, (mutable, target.clone()));
     }
 
@@ -8053,7 +8083,10 @@ impl<'a> Checker<'a> {
         self.scopes.push(HashMap::new());
         if let Some(pat) = f.pat() {
             let dims = f.iterable().map(|i| self.item_dims(&i)).unwrap_or_default();
-            if !self.irrefutable_pat(&pat) && !self.array_pat_covers(&pat, &elem, &dims) {
+            if !self.irrefutable_pat(&pat)
+                && !self.array_pat_covers(&pat, &elem, &dims)
+                && !f.iterable().is_some_and(|i| self.pat_fits(&pat, &self.item_shape(&i)))
+            {
                 self.error(pat.syntax(), "refutable pattern in `for` loop binding");
             }
             self.pat(&pat, &elem);
@@ -9076,6 +9109,23 @@ pub fn is_default_call(c: &ast::CallExpr) -> bool {
         text.as_str(),
         "Default::default" | "std::default::Default::default" | "core::default::Default::default"
     )
+}
+
+/// A struct pattern naming a std range type with public fields (`Range { start, end }`,
+/// `RangeFrom`, `RangeTo`, `RangeToInclusive`; bare or under `ops::` / `std::ops::`): its kind.
+/// Only where the name isn't one of the file's own types.
+pub fn range_struct_pat(segs: &[String]) -> Option<RangeKind> {
+    let (last, prefix) = segs.split_last()?;
+    let std_path = match prefix {
+        [] => true,
+        [o] => o == "ops",
+        [s, o] => (s == "std" || s == "core") && o == "ops",
+        _ => false,
+    };
+    match RangeKind::from_name(last)? {
+        RangeKind::Inclusive | RangeKind::Full => None,
+        k => std_path.then_some(k),
+    }
 }
 
 /// Patterns that match every value: `_`, `x`, `x @ <irrefutable>`.

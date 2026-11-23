@@ -673,9 +673,9 @@ pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> Co
 }
 
 fn compile_uncached(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
-    let src = &crate::lineindex::crlf_continuations(src);
+    let src = &crate::lineindex::source_fixups(src);
     let resolve =
-        |p: &str| resolver(p).map(|t| crate::lineindex::crlf_continuations(&t).into_owned());
+        |p: &str| resolver(p).map(|t| crate::lineindex::source_fixups(&t).into_owned());
     let resolver: typeck::Resolver = &resolve;
     // (A proc-macro crate compiled for this compile keeps its own list.)
     let outer = crate::procmacro::take_dependencies();
@@ -3374,8 +3374,15 @@ impl<'a> Codegen<'a> {
         // Auto-deref through `impl Deref`: `(stack).deref()`.
         if let Some((mutable, target)) = self.types.derefs.get(&self.range_of(e.syntax())).cloned()
         {
-            let m = if mutable { "deref_mut" } else { "deref" };
-            return (frag.wrap("(", &format!(").{m}()")).at(start), target);
+            // (`deref_mut` to a string or number returns a slot over it: read and written
+            // through `[1]`, so `n.push('c')` is `(n).deref_mut()[1] += "c"`.)
+            let cell = self.types.deref_slots.contains(&r);
+            let m = match (mutable, cell) {
+                (true, true) => "deref_mut()[1]",
+                (true, false) => "deref_mut()",
+                _ => "deref()",
+            };
+            return (frag.wrap("(", &format!(").{m}")).at(start), target);
         }
         // A number into a `dyn Trait` with impls on two number types: tagged with its own.
         if let Some(k) = self.types.dyn_nums.get(&r) {
@@ -4284,6 +4291,7 @@ impl<'a> Codegen<'a> {
                     ast::Expr::IndexExpr(ix) => ix.base().is_some_and(|b| {
                         is_pure(&b)
                             || self.same_vec_call(&b).is_some()
+                            || self.call_base(&b)
                             || self
                                 .types
                                 .slice_views
@@ -4960,13 +4968,24 @@ impl<'a> Codegen<'a> {
         None
     }
 
+    /// `b.slice_mut()` / `b.inner()` indexed and assigned to: a call giving a `Vec` or slice,
+    /// put in a temp first (`emit_assign_place`).
+    fn call_base(&self, base: &ast::Expr) -> bool {
+        matches!(
+            strip_parens_expr(base),
+            ast::Expr::MethodCallExpr(_) | ast::Expr::CallExpr(_)
+        ) && self.same_vec_call(base).is_none()
+            && matches!(self.ty_of(base.syntax()), Some(Ty::Vec(_)))
+    }
+
     /// The place of an assignment. `grid[i][j] = ..` / `+= ..`: the row goes in a temp first,
-    /// where the inline bounds checks would read it several times.
+    /// where the inline bounds checks would read it several times. So does a call's `Vec` or
+    /// slice (`b.slice_mut()[0] = 1`), which mustn't run twice.
     fn emit_assign_place(&mut self, lhs: &ast::Expr) -> (Frag, Ty) {
         if let ast::Expr::IndexExpr(ix) = strip_parens_expr(lhs)
             && let Some(base) = ix.base()
-            && matches!(strip_parens_expr(&base), ast::Expr::IndexExpr(_))
-            && is_pure(&base)
+            && (matches!(strip_parens_expr(&base), ast::Expr::IndexExpr(_)) && is_pure(&base)
+                || self.call_base(&base))
             && !self
                 .types
                 .slice_views
@@ -8435,6 +8454,12 @@ impl<'a> Codegen<'a> {
             .contains(&self.range_of(strip_parens_expr(&base).syntax()));
         // A read of `grid[i][j]`: the row once (`κσ.$get`), where the inline check would read
         // it three times. (A hoisted row, `recv_override`, is a plain name.)
+        // (A call hoisted into a temp by `emit_assign_place` reads as a plain name.)
+        let pure = is_pure(&base)
+            || self
+                .recv_override
+                .as_ref()
+                .is_some_and(|(r, ..)| *r == self.range_of(base.syntax()));
         let nested_read = matches!(strip_parens_expr(&base), ast::Expr::IndexExpr(_))
             && !index_is_place(ix)
             && !self
@@ -8445,7 +8470,7 @@ impl<'a> Codegen<'a> {
             let mut f = Frag::text("κσ.$get(");
             f.append(bf).push(", ").append(xf).push(format!(", {loc})"));
             f
-        } else if is_pure(&base) && !view && cheap_index(&index) {
+        } else if pure && !view && cheap_index(&index) {
             // The bounds check inline (about twice as fast as calling `κσ.$ix`):
             // `v[(i >= 0 && i < v.length ? i : κσ.$oob(v, i, loc))]`.
             let x = if matches!(
@@ -8471,7 +8496,7 @@ impl<'a> Codegen<'a> {
                 .append(x)
                 .push(format!(", {loc}))]"));
             f
-        } else if is_pure(&base) || view {
+        } else if pure || view {
             let mut f = bf.clone();
             f.push("[κσ.$ix(")
                 .append(bf)

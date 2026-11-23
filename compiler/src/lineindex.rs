@@ -102,3 +102,69 @@ pub fn crlf_continuations(src: &str) -> std::borrow::Cow<'_, str> {
     // (Only ASCII bytes were swapped.)
     String::from_utf8(out).unwrap().into()
 }
+
+/// `src` with each typed `self` parameter written as its shorthand, padded with spaces to the
+/// same length: `self: &mut Self` is `&mut self      `, `self: &'a Self` is `&'a self      `,
+/// `mut self: Self` is `mut self      `. (`self: Box<Self>` and the like stay.)
+pub fn typed_self_params(src: &str) -> std::borrow::Cow<'_, str> {
+    use ra_ap_syntax::SyntaxKind as K;
+    if !src.contains("self:") && !src.contains("self :") {
+        return src.into();
+    }
+    let lexed = ra_ap_parser::LexedStr::new(crate::macros::EDITION, src);
+    let toks: Vec<usize> = (0..lexed.len())
+        .filter(|&i| !matches!(lexed.kind(i), K::WHITESPACE | K::COMMENT))
+        .collect();
+    let mut out = src.as_bytes().to_vec();
+    let mut changed = false;
+    for (n, &i) in toks.iter().enumerate() {
+        if lexed.kind(i) != K::SELF_KW || toks.get(n + 1).map(|&j| lexed.kind(j)) != Some(K::COLON) {
+            continue;
+        }
+        // `&` [lifetime] [`mut`] `Self`, then `,` or `)`.
+        let mut k = n + 2;
+        let mut short = String::new();
+        if toks.get(k).map(|&j| lexed.kind(j)) == Some(K::AMP) {
+            short.push('&');
+            k += 1;
+            if let Some(&j) = toks.get(k).filter(|&&j| lexed.kind(j) == K::LIFETIME_IDENT) {
+                short.push_str(lexed.text(j));
+                short.push(' ');
+                k += 1;
+            }
+            if toks.get(k).map(|&j| lexed.kind(j)) == Some(K::MUT_KW) {
+                short.push_str("mut ");
+                k += 1;
+            }
+        }
+        let Some(&end) = toks.get(k).filter(|&&j| lexed.kind(j) == K::SELF_TYPE_KW) else {
+            continue;
+        };
+        if !matches!(toks.get(k + 1).map(|&j| lexed.kind(j)), Some(K::COMMA | K::R_PAREN)) {
+            continue;
+        }
+        short.push_str("self");
+        let (a, b) = (lexed.text_range(i).start, lexed.text_range(end).end);
+        if src[a..b].contains('\n') || short.len() > b - a {
+            continue;
+        }
+        let mut padded = short.into_bytes();
+        padded.resize(b - a, b' ');
+        out[a..b].copy_from_slice(&padded);
+        changed = true;
+    }
+    if !changed {
+        return src.into();
+    }
+    // (Whole tokens were replaced, with text and spaces.)
+    String::from_utf8(out).unwrap().into()
+}
+
+/// The same-length rewrites made before anything parses a file (`crlf_continuations`,
+/// `typed_self_params`).
+pub fn source_fixups(src: &str) -> std::borrow::Cow<'_, str> {
+    match typed_self_params(src) {
+        std::borrow::Cow::Borrowed(s) => crlf_continuations(s),
+        std::borrow::Cow::Owned(s) => crlf_continuations(&s).into_owned().into(),
+    }
+}
