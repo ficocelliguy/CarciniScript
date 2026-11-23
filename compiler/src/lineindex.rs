@@ -65,3 +65,40 @@ mod tests {
         assert_eq!(idx.line_col(9), (2, 0));
     }
 }
+
+/// `src` with each string continuation before a CR LF (`"a \` CR LF `   b"`, as git checks a
+/// file out on Windows) written `\` LF CR, the same length: the escaper takes a `\` before a LF
+/// only, and skips the CR with the next line's indent, as rustc skips both.
+pub fn crlf_continuations(src: &str) -> std::borrow::Cow<'_, str> {
+    use ra_ap_syntax::SyntaxKind;
+    if !src.contains("\\\r\n") {
+        return src.into();
+    }
+    let lexed = ra_ap_parser::LexedStr::new(crate::macros::EDITION, src);
+    let mut out = src.as_bytes().to_vec();
+    for i in 0..lexed.len() {
+        let raw = lexed.text(i).trim_start_matches(['b', 'c']).starts_with('r');
+        let string = matches!(
+            lexed.kind(i),
+            SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING
+        );
+        if !string || raw {
+            continue;
+        }
+        let r = lexed.text_range(i);
+        let mut j = r.start;
+        while j + 2 < r.end {
+            match &src.as_bytes()[j..j + 3] {
+                [b'\\', b'\r', b'\n'] => {
+                    out[j + 1] = b'\n';
+                    out[j + 2] = b'\r';
+                    j += 3;
+                }
+                [b'\\', ..] => j += 2,
+                _ => j += 1,
+            }
+        }
+    }
+    // (Only ASCII bytes were swapped.)
+    String::from_utf8(out).unwrap().into()
+}

@@ -206,6 +206,20 @@ impl Duration {
         Duration::from_secs_f64(secs as f64)
     }
 
+    pub fn try_from_secs_f64(secs: f64) -> Result<Duration, TryFromFloatSecsError> {
+        if secs < 0.0 {
+            return Err(TryFromFloatSecsError { __negative: true });
+        }
+        if !(secs < 18446744073709551616.0) {
+            return Err(TryFromFloatSecsError { __negative: false });
+        }
+        Ok(Duration::from_secs_f64(secs))
+    }
+
+    pub fn try_from_secs_f32(secs: f32) -> Result<Duration, TryFromFloatSecsError> {
+        Duration::try_from_secs_f64(secs as f64)
+    }
+
     pub fn mul_f64(self, rhs: f64) -> Duration {
         Duration::from_secs_f64(rhs * self.as_secs_f64())
     }
@@ -590,3 +604,27 @@ impl std::fmt::Display for SystemTimeError {
 }
 
 impl std::error::Error for SystemTimeError {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TryFromFloatSecsError {
+    __negative: bool,
+}
+
+impl std::fmt::Debug for TryFromFloatSecsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = if self.__negative { "Negative" } else { "OverflowOrNan" };
+        write!(f, "TryFromFloatSecsError {{ kind: {kind} }}")
+    }
+}
+
+impl std::fmt::Display for TryFromFloatSecsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.__negative {
+            write!(f, "cannot convert float seconds to Duration: value is negative")
+        } else {
+            write!(f, "cannot convert float seconds to Duration: value is either too big or NaN")
+        }
+    }
+}
+
+impl std::error::Error for TryFromFloatSecsError {}

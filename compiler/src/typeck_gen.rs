@@ -6,14 +6,14 @@ use std::collections::HashMap;
 
 use ra_ap_syntax::{
     AstNode, SyntaxNode,
-    ast::{self, HasGenericParams, HasName, HasTypeBounds},
+    ast::{self, HasGenericArgs, HasGenericParams, HasName, HasTypeBounds},
 };
 
 use super::{Checker, VarKind};
 use crate::ty::Ty;
 
 /// The trait bounds a type parameter may have.
-const KNOWN_BOUNDS: &[&str] = &[
+pub(super) const KNOWN_BOUNDS: &[&str] = &[
     "Copy",
     "Clone",
     "Debug",
@@ -70,6 +70,100 @@ const KNOWN_BOUNDS: &[&str] = &[
 
 /// A type parameter with the names of its bounds (`T: PartialOrd + Copy` → `["PartialOrd", "Copy"]`).
 pub type TypeParam = (String, Vec<String>);
+
+/// The std traits an `impl ..` / `dyn ..` of std's may name here (`x: impl Display`, `-> impl
+/// Debug`, `&dyn Display`), with marker traits beside them.
+const STD_IMPL_BOUNDS: &[&str] = &[
+    "Display",
+    "Debug",
+    "ToString",
+    "PartialEq",
+    "Eq",
+    "PartialOrd",
+    "Ord",
+    "Hash",
+    "Clone",
+    "Copy",
+    "Default",
+    "Send",
+    "Sync",
+    "Unpin",
+];
+
+/// The bounds of an `impl Display` / `dyn Ord + Debug` when they're all std formatting,
+/// comparison and marker traits (or lifetimes), without the markers: `["Ord", "Debug"]`.
+pub(super) fn std_impl_bounds(t: &ast::Type) -> Option<Vec<String>> {
+    let list = match t {
+        ast::Type::ImplTraitType(i) => i.type_bound_list()?,
+        ast::Type::DynTraitType(d) => d.type_bound_list()?,
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    for b in list.bounds() {
+        if b.lifetime().is_some() {
+            continue;
+        }
+        let ast::Type::PathType(p) = b.ty()? else {
+            return None;
+        };
+        let seg = p.path()?.segment()?;
+        let n = seg.name_ref()?.text().to_string();
+        if !STD_IMPL_BOUNDS.contains(&n.as_str()) || seg.generic_arg_list().is_some() {
+            return None;
+        }
+        if !matches!(n.as_str(), "Send" | "Sync" | "Unpin") {
+            out.push(n);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Whether a `Ty::Dyn` names std traits (`Display`, `Ord+Debug`: see `std_impl_bounds`).
+pub(super) fn is_std_dyn(tr: &str) -> bool {
+    tr.split('+').all(|b| STD_IMPL_BOUNDS.contains(&b))
+}
+
+/// The std traits one implies: `Ord` gives `PartialOrd`, `Eq` and `PartialEq`, `Display` gives
+/// `ToString` ..
+pub(super) fn std_implies(have: &str, want: &str) -> bool {
+    matches!(
+        (have, want),
+        ("Ord", "PartialOrd" | "Eq" | "PartialEq")
+            | ("Eq", "PartialEq")
+            | ("PartialOrd", "PartialEq")
+            | ("Copy", "Clone")
+            | ("Display", "ToString")
+    )
+}
+
+/// The `generics` key of an argument-position `impl Display` (see `impl_arg_params`).
+pub(super) fn impl_arg_key(t: &ast::Type) -> String {
+    format!("impl@{}", u32::from(t.syntax().text_range().start()))
+}
+
+/// `x: impl Display` / `t: &impl Ord + Debug` in `f`'s parameters: an anonymous type parameter,
+/// as rustc has it, named by its bounds (`impl_Display`, then `impl_Display_2` ..), with them
+/// and its `generics` key.
+pub(super) fn impl_arg_params(f: &ast::Fn) -> Vec<(String, Vec<String>, String)> {
+    let mut out: Vec<(String, Vec<String>, String)> = Vec::new();
+    for p in f.param_list().into_iter().flat_map(|l| l.params()) {
+        let Some(ty) = p.ty() else { continue };
+        for t in ty.syntax().descendants().filter_map(ast::Type::cast) {
+            if !matches!(t, ast::Type::ImplTraitType(_)) {
+                continue;
+            }
+            let Some(bounds) = std_impl_bounds(&t) else {
+                continue;
+            };
+            // (A JS name: the generated code passes a parameter's formatters as `$dbg$<name>`.)
+            let base = format!("impl_{}", bounds.join("_"));
+            let same = out.iter().filter(|(_, b, _)| *b == bounds).count();
+            let name = if same == 0 { base } else { format!("{base}_{}", same + 1) };
+            out.push((name, bounds, impl_arg_key(&t)));
+        }
+    }
+    out
+}
 
 /// Every type parameter of `f` with its bound lists (inline and from `where`).
 fn type_params(f: &ast::Fn) -> Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)> {
@@ -153,7 +247,7 @@ pub(super) fn mention_depths(
 
 /// The last path segment of each trait bound (`std::fmt::Display` → `Display`); `?Sized` and
 /// lifetimes are skipped.
-fn bound_names(lists: &[ast::TypeBoundList]) -> Vec<(String, SyntaxNode)> {
+pub(super) fn bound_names(lists: &[ast::TypeBoundList]) -> Vec<(String, SyntaxNode)> {
     let mut out = Vec::new();
     for l in lists {
         for b in l.bounds() {
@@ -213,6 +307,16 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
 }
 
 impl Checker<'_> {
+    /// A function's written return type. `-> impl Debug` (std's formatting and comparison
+    /// traits) is the body's own type, as in rustc, so `{:?}` prints a tuple as one: a type
+    /// variable the body binds.
+    pub(super) fn lower_ret_type(&mut self, t: &ast::Type) -> Ty {
+        if matches!(t, ast::Type::ImplTraitType(_)) && std_impl_bounds(t).is_some() {
+            return self.fresh(VarKind::General);
+        }
+        self.lower_type(t)
+    }
+
     /// The type parameters of `f`: `Fn`-bounded ones as closure types, the rest as `Ty::Param`.
     /// Sets `self.generics` and `self.param_bounds` for lowering the signature or checking the
     /// body. Unsupported bounds are reported when `report` is set (once per function).
@@ -363,6 +467,14 @@ impl Checker<'_> {
                 }
                 ast::GenericParam::LifetimeParam(_) => {}
             }
+        }
+        // `x: impl Display`: after the written ones (no turbofish names it).
+        for (name, bounds, key) in impl_arg_params(f) {
+            self.generics.insert(key, Ty::Param(name.clone()));
+            self.generics.insert(name.clone(), Ty::Param(name.clone()));
+            self.param_bounds.insert(name.clone(), bounds.clone());
+            order.push(name.clone());
+            params.push((name, bounds));
         }
         params.sort_by_key(|(n, _)| order.iter().position(|x| x == n));
         // The bounds' arguments (`C: Convert<String>`, `S: Shape<Unit = f64>`), once every

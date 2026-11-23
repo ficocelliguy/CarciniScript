@@ -254,10 +254,12 @@ see the Bitburner player gaps below).
     - [ ] A trait's own generic method called through a type parameter: `trait Order { fn
       select<R: Copy>(r: R) -> R; }` then `O::select(x)` / `O::select::<u8>(x)` with
       `O: Order`: `R` is never instantiated ("expected `u8`, found `R`"; 5 files).
-    - [ ] `Ord` / `Eq` bounds don't imply `PartialOrd` / `PartialEq` when the bound is on a
+    - [x] `Ord` / `Eq` bounds don't imply `PartialOrd` / `PartialEq` when the bound is on a
       *trait's* method (`trait It2 { fn pick<B: Ord>(self, a: B, b: B) -> B { if a > b .. } }`,
       also with a `where` clause; itertools, fallible-iterator). Free functions and inherent
-      impls are fine. (7 + 9 files, most of the comparison ones.)
+      impls are fine. (7 + 9 files, most of the comparison ones.) A default method's body never
+      entered its own generics; now it does (`typeck_trait.rs` `check_trait_defaults`;
+      `fixtures/trait_method_ord_bounds.rs`).
     - [ ] `.as_ref()` on a type parameter bounded `AsRef<[u8]>` / `AsRef<str>` / `AsRef<Path>`
       resolves to the wrong type (`Vec<u8>` → `String`, `str` → `PathBuf`), so the result
       doesn't fit a `&[u8]` / `&str` parameter (aho-corasick haystacks, cc flags).
@@ -288,19 +290,25 @@ see the Bitburner player gaps below).
       fields unknown (23 files, several of them the crates these names come from).
     - [ ] `impl Tr for std::io::Stdout {}` next to `impl Tr for std::io::StdoutLock<'_> {}` (same
       for `Stderr`): one JS type here, so "conflicting implementations" (anstream).
-    - [ ] Methods of an `impl Trait for Local { .. }` block are dropped when `Trait` can't be
+    - [x] Methods of an `impl Trait for Local { .. }` block are dropped when `Trait` can't be
       resolved, so `self.is_match(..)` is "no method named" (39 files). Corpus-only in effect
       (a script has all its files), but registering them regardless would be cheap and would
-      take the biggest remaining "no method" bucket with it.
+      take the biggest remaining "no method" bucket with it. Now the impl's error stands alone:
+      its methods are registered as inherent ones (an inherent method of the name wins, without
+      "duplicate definitions"), its `type X = ..;` and consts skipped (`typeck_adt.rs`
+      `collect_impl`, `Adts::unknown_trait_methods`).
     - [ ] Field access through `Deref`: `wrap.sign` with `impl Deref for Wrap { type Target =
       Span; }` is "no field `sign` on type `Wrap`"; methods through `Deref` work (jiff).
-    - [ ] Function pointer types (`fn(u8) -> u8`, `Option<fn(..)>`) are typed as `impl Fn`, so a
+    - [x] Function pointer types (`fn(u8) -> u8`, `Option<fn(..)>`) are typed as `impl Fn`, so a
       `#[derive(Clone, Copy, Debug)]` struct holding one fails (windows-sys callbacks, brotli
-      allocators: 27 files, the whole "derive on an `Option` field" bucket).
+      allocators: 27 files, the whole "derive on an `Option` field" bucket). Now a field
+      written as one is `Copy`, `Clone`, `Debug`, `PartialEq` and `Eq` (`Checker::fn_ptr_fields`),
+      and `{:?}` prints a made-up address as `{:p}` does (`fixtures/fn_ptr_derives.rs`).
     - [ ] A range literal matched against `From<Range<usize>>` / `From<RangeInclusive<usize>>`
       impls is typed as `slice::Iter` (`(a..=b).into()`, clap's `ValueRange`).
-    - [ ] `Type::from` as a function value (`.map(Id::from)`) isn't found; `Into::into` and
-      `.map(|s| s.into())` work.
+    - [x] `Type::from` as a function value (`.map(Id::from)`) isn't found; `Into::into` and
+      `.map(|s| s.into())` work. Now a closure (see `PathBuf::from` in the Comprehensive Rust
+      survey below).
   - Borrow checker, E0596 "not declared as mutable" where rustc accepts (about 50 files; the
     other E0596 hits are `*val = ..` on a loop variable whose iterator type is unknown, and raw
     pointers):
@@ -331,9 +339,12 @@ see the Bitburner player gaps below).
       ("assignment to this place is not supported yet", 4 files); `*b.n_mut() = 5` and `let v =
       b.inner(); v[2] = 9` work.
   - Macros:
-    - [ ] BUG: a struct-literal field shorthand inside `macro_rules!` is hygiene-renamed with the
+    - [x] BUG: a struct-literal field shorthand inside `macro_rules!` is hygiene-renamed with the
       local it names: `let ids = ..; $name { ids }` becomes "struct has no field named `ids__h1`"
       plus "missing field `ids`" (aho-corasick, bitvec; 7 + 9 files). `$name { ids: ids }` too.
+      Now a shorthand field in braces after `$name`, `Self` or a capitalized name (not one being
+      compared, `if n == MAX { x }`) is written `ids: ids__h1` (`mbe.rs` `hygienic`). `ids: ids`
+      already worked; the `let` before it was the trouble (`fixtures/macro_field_shorthand.rs`).
     - [ ] Macro-generated inline modules and their items (deranged's `impl_ranged!`: "this block
       kind is not supported yet", 3 files but 1,165 errors).
   - std surface found through these messages (for the std column, not language work):
@@ -507,79 +518,126 @@ below has a minimal repro that rustc accepts; the slide or crate it comes from i
 
 **Open, compiler:**
 
-- [ ] `for x in v` over a `&mut [T]`, `&mut [T; N]` or `&mut Vec<T>` *parameter*
+- [x] `for x in v` over a `&mut [T]`, `&mut [T; N]` or `&mut Vec<T>` *parameter*
   (`references/exercise`: `fn normalize(vector: &mut [f64; 3]) { for item in vector { *item /=
   mag; } }`): "cannot borrow `item` as mutable, as it is not declared as mutable". Over a local
-  (`for x in &mut v`), a reborrow (`&mut *v`) or `v.iter_mut()` it works.
-- [ ] A `where` clause on an inherent method bounding the impl's type parameter
+  (`for x in &mut v`), a reborrow (`&mut *v`) or `v.iter_mut()` it works. Now a loop over a
+  local holding a `&mut` (a parameter or `let r = &mut v`) binds `&mut` items and is recorded
+  (`Types::mut_ref_loops`), so the code generator loops by index as for `&mut v`
+  (`fixtures/for_mut_ref_params.rs`).
+- [x] A `where` clause on an inherent method bounding the impl's type parameter
   (`idiomatic/polymorphism/generics/conditional-methods`: `impl<T> Value<T> { fn log_error(&self)
   where T: Error { eprintln!("{}", self.0) } }`): "`T` doesn't implement `Display`", or "no
   method named `s` found for type parameter `T`" for your own trait. The bound on the impl
-  header (`impl<T: Display> Value<T>`, or its `where`) works.
+  header (`impl<T: Display> Value<T>`, or its `where`) works. Now the method's predicates on the
+  impl's parameters add to their bounds while its signature and body are checked, and are put
+  back after (`typeck_adt.rs` `enter_method_generics` / `leave_method_where`;
+  `fixtures/method_where_impl_param.rs`).
 - [ ] `L::Output` of a std operator-trait bound (Programming Rust `complex`: `impl<L, R>
   Add<Complex<R>> for Complex<L> where L: Add<R> { type Output = Complex<L::Output>; .. }`; also
   `fn add<L: Add<R>, R>(a: L, b: R) -> L::Output { a + b }`): "cannot find type `Output`", then
   "expected `L`, found `R`". `T: Add<Output = T>` works.
-- [ ] `impl` / `dyn` of std's formatting and comparison traits in parameter and return types:
+- [x] `impl` / `dyn` of std's formatting and comparison traits in parameter and return types:
   `val: impl Display`, `t: &impl Display`, `t: &dyn Display`, `Vec<Box<dyn Display>>`, `-> impl
   Debug`, `impl ToString`, `impl Ord + Debug` (`generics/impl-trait`,
   `idiomatic/polymorphism/dyn/dyn-vs-generics`, `dyn/heterogeneous`, `polymorphism/python`):
   "`impl Display` types are not supported yet". `T: Display`, `impl Into<T>`, `impl AsRef<str>`,
-  `&dyn Error` and your own traits work.
-- [ ] `&123` / `&1.5` passed as `&dyn Any` (`idiomatic/polymorphism/dyn/any-trait`): "mismatched
-  types: expected `dyn Any`, found `{integer}`". Structs, `String` and `&str` coerce.
-- [ ] `Self::Target` in a `DerefMut` impl (`idiomatic/leveraging-the-type-system/newtype-pattern/
+  `&dyn Error` and your own traits work. Now, as in rustc, a parameter's `impl Display` is an
+  anonymous type parameter (`impl_Display`, after the written ones; free functions and methods,
+  `generic::impl_arg_params`), a return type's is the body's own type (a type variable,
+  `lower_ret_type`), and a `dyn` of them is `Ty::Dyn("Ord+Debug")`, which any type with those
+  traits unifies with (`fixtures/impl_std_trait_types.rs`).
+- [x] `&123` / `&1.5` passed as `&dyn Any` (`idiomatic/polymorphism/dyn/any-trait`): "mismatched
+  types: expected `dyn Any`, found `{integer}`". Structs, `String` and `&str` coerce. Now an
+  unsuffixed literal takes rustc's fallback type into `dyn Any` as into any other `dyn`
+  (`fixtures/literal_dyn_any.rs`).
+- [x] `Self::Target` in a `DerefMut` impl (`idiomatic/leveraging-the-type-system/newtype-pattern/
   is-it-encapsulated`: `fn deref_mut(&mut self) -> &mut Self::Target`): "cannot find type
   `Target`", whichever of the two impls comes first. In the `Deref` impl itself, and written out as
-  `&mut String`, it works.
+  `&mut String`, it works. Now `Deref` impls are collected first and `Self::Target` falls back to
+  the type's `Deref` target (`fixtures/deref_mut_self_target.rs`).
+- [ ] BUG (found with the item above): a `String` method that mutates, called through a
+  `DerefMut<Target = String>` (`n.push('c')` with `struct Name(String)`), emits `(n).deref_mut()
+  += "c"`, a JS syntax error. A `Vec` target works; a string needs a slot over the field.
 - [ ] `vec![]` / `Vec::new()` typed only by a `&mut Vec<Self::Leaf>` argument in a trait default
   method (`idiomatic/polymorphism/generics/default-impls`: `let mut buf = vec![];
   self.collect_leaves_buffered(&mut buf); buf`): "type annotations needed for `Vec<_>`". Through
   a free function with concrete types, or with `let mut buf: Vec<Self::Leaf>`, it works.
-- [ ] `fmt::Error` written in a return type, `-> Result<(), fmt::Error>` (Programming Rust
+- [x] `fmt::Error` written in a return type, `-> Result<(), fmt::Error>` (Programming Rust
   `libgit2-rs-safe`): "cannot find type `Error`", or, when the file has its own `Error` type,
-  "expected `Result<(), Error>`, found `Result<(), fmt::Error>`". `-> fmt::Result` works.
-- [ ] `Err(format!(..))?` / `Err("usage")?` in a `-> Result<_, Box<dyn Error>>` (Programming Rust
+  "expected `Result<(), Error>`, found `Result<(), fmt::Error>`". `-> fmt::Result` works. Now
+  `fmt::Error` / `std::fmt::Error` as a type is what `fmt::Result` holds (`typeck.rs`
+  `lower_type`; `fixtures/fmt_error_type.rs`).
+- [x] `Err(format!(..))?` / `Err("usage")?` in a `-> Result<_, Box<dyn Error>>` (Programming Rust
   `grep`, `http-get`; also `Box<dyn Error + Send + Sync>`): "`?` couldn't convert the error to
   `dyn Error`". `Err("bad".into())` and `let e: Box<dyn Error> = s.into()` work, so only the `?`
-  path misses `From<String>` / `From<&str>` for the box.
-- [ ] `concat!(..)` as a format string: `println!(concat!("{}:{}: ", $msg), file!(), line!(),
+  path misses `From<String>` / `From<&str>` for the box. Now `?` takes a string into the box
+  as `.into()` does, the string itself (`typeck_conv.rs` `try_convert`;
+  `fixtures/err_str_question.rs`).
+- [x] `concat!(..)` as a format string: `println!(concat!("{}:{}: ", $msg), file!(), line!(),
   $($params),*)` (`macros/macro_rules/techniques/optional-params`, `internal-rules`), also
   `format!(concat!("{}", "-{}"), 1, 2)` outside a macro: "format argument must be a string
-  literal".
-- [ ] A comment inside `#[derive(..)]`: `#[derive(Debug, Clone /* ... */)]`
+  literal". Now a `concat!` of literals (strings, chars, unsuffixed numbers, bools) is written
+  as the one string literal it makes, after `macro_rules!` expansion (`stdgaps.rs`
+  `concat_literals`; `fixtures/concat_format_strings.rs`). `file!()` / `line!()` inside it are
+  not literals yet.
+- [x] A comment inside `#[derive(..)]`: `#[derive(Debug, Clone /* ... */)]`
   (`idiomatic/foundations/api-design/predictable-api/common-traits`): "`#[derive(Clone/*...*/)]`
-  is not supported".
-- [ ] A string continuation (`\` at the end of a line) before a CR LF line ending (Programming
+  is not supported". Now the derive list and attribute arguments are read without their
+  comments (`adt.rs` `attr_text`, also for `thiserror` / `clap`'s derive lists;
+  `fixtures/derive_comments.rs`).
+- [x] A string continuation (`\` at the end of a line) before a CR LF line ending (Programming
   Rust `spawn-blocking/tests.rs` and `actix-gcd`, as git checks them out on Windows): "unknown
   character escape" / "Invalid escape"; before a LF it works. rustc skips the `\r\n` and the next
-  line's leading whitespace alike.
+  line's leading whitespace alike. Now the `\` CR LF of a (non-raw) string is written `\` LF CR
+  before anything parses it, the same length so positions hold (the escaper skips a CR with
+  the indent; `lineindex.rs` `crlf_continuations`, also for `mod` files and the language
+  service). Tested in `test/run.mjs` ("string continuation before CR LF"), not as a fixture,
+  since git may rewrite a fixture's line endings.
+- [ ] **runtime** A CR LF inside a raw or multi-line string literal (`r"a` CR LF `b"`) stays in
+  the value; rustc reads the file with CR LF as LF, so `r.len()` is one less there. Found with
+  the item above.
 - [ ] **runtime** An out-of-bounds index into an array (`[T; N]`; a `Vec` matches) panics one
   column to the right of rustc's, at the `[` rather than the start of the indexed expression
   (`tuples-and-arrays/arrays`: `a[get_index()] = 0`, rustc 10:5, JS 10:6).
 
 **Open, std:**
 
-- [ ] `dbg!` (45 of the course's slides: `dbg!(x * 2)`, `dbg!(a, b)`, `dbg!()`): "macro `dbg!`
+- [x] `dbg!` (45 of the course's slides: `dbg!(x * 2)`, `dbg!(a, b)`, `dbg!()`): "macro `dbg!`
   (`macro_rules!`) is not supported yet". Prints `[file:line:col] expr = {:#?}` to stderr and
-  hands the value back. By far the most-hit item.
-- [ ] **runtime** `i16::from(true)` / `u8::from(false)` compile and give `true` / `false`
+  hands the value back. By far the most-hit item. Now an arrow function called in place, `((t) =>
+  (κσ.$eprintln(..), t))(x)`, so it works anywhere a value does; the arguments are moved
+  (`moves.rs`) and must be `Debug`. A fixture with `// test: stderr` has its stderr diffed too
+  (`fixtures/dbg_macro.rs`, byte-identical to rustc's).
+- [x] **runtime** `i16::from(true)` / `u8::from(false)` compile and give `true` / `false`
   (`std-traits/from-and-into`, which prints `true` where rustc prints `1`), while `let one: i16 =
   true.into()` is "the trait bound `i16: From<bool>` is not satisfied" (the slide's second block).
-  Should be 1 / 0 for every integer type.
-- [ ] `Vec::from_iter`, `String::from_iter`, `HashSet::from_iter`, `BTreeSet::from_iter`,
+  Should be 1 / 0 for every integer type. Now `Number(b)` (`BigInt(b)` for `i128` / `u128`), also
+  `f32` / `f64` as rustc 1.68+ (`fixtures/bool_into_numbers.rs`).
+- [x] `Vec::from_iter`, `String::from_iter`, `HashSet::from_iter`, `BTreeSet::from_iter`,
   `HashMap::from_iter` called as functions
   (`idiomatic/foundations/api-design/predictable-api/common-traits/clone`): "no function or
-  associated item named `from_iter`" (`collect()` works).
-- [ ] `PathBuf::from` as a function value, `args.map(PathBuf::from)` (Programming Rust `grep`):
+  associated item named `from_iter`" (`collect()` works). Now the path pre-pass writes
+  `X::from_iter(it)` as `(it).into_iter().collect::<X<_>>()` for the std collections, with a
+  turbofish's arguments (`HashMap::<u8, Vec<u8>>::from_iter`, `<Vec<i32>>::from_iter`) and a
+  `std::collections::` prefix; `FromIterator::from_iter(it)` collects by the expected type
+  (`ufcs.rs` `from_iter_path`; `fixtures/from_iter_calls.rs`). Not as a function value.
+- [x] `PathBuf::from` as a function value, `args.map(PathBuf::from)` (Programming Rust `grep`):
   "no function or associated item named `from` found for struct `PathBuf`"; called directly it
-  works, so this is the path pre-pass's (`ufcs.rs`) list.
-- [ ] Small std surface: `String::capacity` (`std-types/string`; `Vec`'s exists),
+  works, so this is the path pre-pass's (`ufcs.rs`) list. Now any `Type::from` (capitalized or
+  a primitive, with a path prefix) passed as an argument is `(|x| Type::from(x))`, which also
+  closes the corpus item "`Type::from` as a function value" above (`ufcs.rs`
+  `from_value_path`; `fixtures/from_fn_values.rs`).
+- [x] Small std surface: `String::capacity` (`std-types/string`; `Vec`'s exists),
   `Duration::try_from_secs_f32` (`pattern-matching/let-control-flow/if-let`),
   `String::from_utf8_unchecked` (Programming Rust `ascii`; the same decode as `from_utf8`),
   `mem::forget` (`idiomatic/leveraging-the-type-system/raii/drop_bomb_forget`: skip the value's
   `Drop`), `panic::catch_unwind` (`error-handling/panics`: a `try` around the closure giving
-  `Err(Box<dyn Any>)`; the classifier sorts it as unsafe/memory today).
+  `Err(Box<dyn Any>)`; the classifier sorts it as unsafe/memory today). All five now
+  (`String::capacity` is its byte length; `try_from_secs_f32` / `_f64` and
+  `TryFromFloatSecsError` in the time prelude; `κσ.$forget` marks the value dropped;
+  `κσ.$catchUnwind` reports the panic to stderr and returns `Err` of its message;
+  `fixtures/std_small_surface.rs`).
 - Missing too, but of little use in a script: `io::stdin().lock()` as a `BufRead` ("the trait
   bound `IoStdin: IoBufRead` is not satisfied"; Programming Rust `grep`), `env::args_os`,
   `PathBuf::read_dir` / `read_link` / `metadata` and `OsStr::from_bytes` (Programming Rust

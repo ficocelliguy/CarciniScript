@@ -125,6 +125,7 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
         || [
             "format_args",
             "env!",
+            "concat!",
             "include!",
             "fmt::format",
             "write_fmt",
@@ -326,6 +327,18 @@ pub(crate) fn expand(
                     }
                 },
             }
+            i = close + 1;
+            continue;
+        }
+        // ---- `concat!("{}: ", "x", 1)` of literals: one string literal, so it can be a format
+        // string (`println!(concat!("[{}] ", $msg), ..)`).
+        if !after_path
+            && name == "concat"
+            && txt(i + 1) == "!"
+            && let Some(close) = closing(&toks, i + 2)
+            && let Some(v) = concat_literals(&toks[i + 3..close])
+        {
+            edits.push((start, toks[close].end, format!("{v:?}")));
             i = close + 1;
             continue;
         }
@@ -849,6 +862,50 @@ fn cargo_env(name: &str) -> Option<&'static str> {
         | "CARGO_PKG_RUST_VERSION" => "",
         _ => return None,
     })
+}
+
+/// The text `concat!` makes of its arguments when they're all literals (strings, chars, unsuffixed
+/// numbers, bools), separated by commas.
+fn concat_literals(args: &[Tok]) -> Option<String> {
+    let mut out = String::new();
+    for (k, t) in args.iter().enumerate() {
+        if k % 2 == 1 {
+            if t.text != "," {
+                return None;
+            }
+            continue;
+        }
+        match t.kind {
+            SyntaxKind::STRING => out.push_str(t.string.as_deref()?),
+            SyntaxKind::CHAR => out.push(char_value(&t.text)?),
+            SyntaxKind::INT_NUMBER | SyntaxKind::FLOAT_NUMBER
+                if t.text.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+            {
+                out.push_str(&t.text)
+            }
+            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => out.push_str(&t.text),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A char literal's value: one character or a simple escape.
+fn char_value(lit: &str) -> Option<char> {
+    let inner = lit.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut cs = inner.chars();
+    match (cs.next()?, cs.next(), cs.next()) {
+        (c, None, _) if c != '\\' => Some(c),
+        ('\\', Some(e), None) => Some(match e {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '0' => '\0',
+            '\\' | '\'' | '"' => e,
+            _ => return None,
+        }),
+        _ => None,
+    }
 }
 
 fn closing(toks: &[Tok], open: usize) -> Option<usize> {

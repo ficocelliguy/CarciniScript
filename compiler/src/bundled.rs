@@ -356,7 +356,7 @@ pub(crate) fn attr_name(a: &ast::Attr) -> Option<String> {
 
 /// What's inside an attribute's parentheses (`#[error("x {0}")]` → `"x {0}"`).
 pub(crate) fn attr_args(a: &ast::Attr) -> Option<String> {
-    let t = a.syntax().text().to_string();
+    let t = crate::adt::attr_text(a);
     let open = t.find('(')?;
     let close = t.rfind(')')?;
     (close > open).then(|| t[open + 1..close].to_string())

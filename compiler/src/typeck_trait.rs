@@ -545,6 +545,8 @@ impl Checker<'_> {
                 let Some(tm) = def.methods.iter().find(|m| m.name == fname.text()) else {
                     continue;
                 };
+                // The method's own type parameters and bounds (`fn pick<B: Ord>`).
+                self.enter_generics(&f, false);
                 let saved = self.self_ty.replace(Ty::Param("Self".into()));
                 self.param_bounds.insert("Self".into(), vec![tr.clone()]);
                 // (`trait Stats: Iterator`: `self` is an iterator, of items unchecked here.)
@@ -587,6 +589,7 @@ impl Checker<'_> {
                     tm.sig.is_async,
                     self_local,
                 );
+                self.leave_generics();
                 self.const_tys.clear();
                 self.param_bounds.clear();
                 self.self_ty = saved;
@@ -637,9 +640,12 @@ impl Checker<'_> {
     /// Whether trait `tr` is `want` or has it as a (transitive) supertrait.
     pub(super) fn trait_includes(&self, tr: &str, want: &str) -> bool {
         let mut seen = Vec::new();
-        let mut todo = vec![tr.to_string()];
+        // (`Ord+Debug`: a `dyn` of several std traits.)
+        let mut todo: Vec<String> = tr.split('+').map(String::from).collect();
         while let Some(t) = todo.pop() {
-            if t == want {
+            if t == want
+                || super::generic::std_implies(&t, want) && !self.adts.traits.contains_key(&t)
+            {
                 return true;
             }
             if seen.contains(&t) {

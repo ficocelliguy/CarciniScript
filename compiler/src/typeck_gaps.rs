@@ -196,6 +196,11 @@ impl Checker<'_> {
                 count(self, 0);
                 USIZE
             }
+            // (Its length in bytes: JS strings have no spare room to report.)
+            (Ty::Str, "capacity") => {
+                count(self, 0);
+                USIZE
+            }
             (Ty::Vec(_), "reserve" | "reserve_exact" | "shrink_to") => {
                 self.check_mutable(recv, Mutation::Borrow);
                 count(self, 1);

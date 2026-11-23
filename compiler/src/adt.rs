@@ -252,6 +252,9 @@ pub struct Adts {
     /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
     /// arguments, not by a trait.
     pub inherent_alts: std::collections::HashSet<String>,
+    /// The `"Type::method"`s of an `impl Tr for Type` whose trait isn't known (from another
+    /// file or crate): registered so calls still type, and an inherent method of the name wins.
+    pub unknown_trait_methods: std::collections::HashSet<String>,
     /// For `TryFrom` / `Extend` / `FromIterator` impls, what their argument (or item) type is
     /// as written, by `"Type::key"`: `TryFrom<&str>` and `TryFrom<String>` take the same JS
     /// value, so a call picks between them by how its argument is written (`.as_str()`,
@@ -754,12 +757,7 @@ pub enum Resolved {
 pub fn derives_of(item: &impl HasAttrs) -> Vec<String> {
     let mut out = Vec::new();
     for attr in item.attrs() {
-        let text: String = attr
-            .syntax()
-            .text()
-            .to_string()
-            .split_whitespace()
-            .collect();
+        let text: String = attr_text(&attr).split_whitespace().collect();
         let Some(inner) = text
             .strip_prefix("#[derive(")
             .and_then(|t| t.strip_suffix(")]"))
@@ -1380,4 +1378,14 @@ pub fn generic_arg_names(g: &ast::GenericArg, n: &str) -> bool {
         ast::GenericArg::ConstArg(c) => c.expr().is_some_and(|e| names_const(&e, n)),
         _ => false,
     }
+}
+
+/// An attribute's text without its comments (`#[derive(Debug, Clone /* , Copy */)]`).
+pub fn attr_text(a: &ast::Attr) -> String {
+    a.syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != SyntaxKind::COMMENT)
+        .map(|t| t.text().to_string())
+        .collect()
 }

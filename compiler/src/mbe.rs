@@ -1275,11 +1275,42 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
             i += 1;
         }
     }
-    fn rename(t: &[Tpl], names: &[String], n: usize, braces: bool) -> Vec<Tpl> {
+    // Whether a `{ .. }` group after `t[..i]` is a struct literal's: after `$name`, `Self` or a
+    // capitalized name that isn't compared (`if n == MAX { x }`).
+    fn struct_literal(t: &[Tpl], i: usize) -> bool {
+        let Some(j) = i.checked_sub(1) else {
+            return false;
+        };
+        let ty = match &t[j] {
+            Tpl::Var(..) => true,
+            Tpl::Tok(s, _) => s.starts_with(|c: char| c.is_ascii_uppercase()),
+            _ => false,
+        };
+        // (Punctuation is one token per character: `==` is `=` `=`.)
+        let before = |k: usize| j.checked_sub(k).and_then(|k| text(&t[k]));
+        let compared = match before(1) {
+            Some("=") => matches!(before(2), Some("=" | "!" | "<" | ">")),
+            b => matches!(b, Some("<" | ">" | "&" | "|" | "in" | "if" | "while" | "match")),
+        };
+        ty && !compared
+    }
+    fn rename(t: &[Tpl], names: &[String], n: usize, braces: bool, fields: bool) -> Vec<Tpl> {
         let mut out = Vec::with_capacity(t.len());
         for (i, x) in t.iter().enumerate() {
             let prev = i.checked_sub(1).and_then(|j| text(&t[j]));
             let next = t.get(i + 1).and_then(text);
+            // A struct literal's shorthand field, `$name { ids }`: `ids: ids__h1`.
+            if let Tpl::Tok(s, sp) = x
+                && fields
+                && names.contains(s)
+                && matches!(prev, None | Some(","))
+                && matches!(next, None | Some(","))
+            {
+                out.push(x.clone());
+                out.push(Tpl::Tok(":".into(), false));
+                out.push(Tpl::Tok(format!("{s}__h{n}"), *sp));
+                continue;
+            }
             out.push(match x {
                 // (Not a field: `.x`, `Point { x: 1 }`, `a::x`; nor a rule's marker:
                 // `closures!(@closure ..)`.)
@@ -1292,10 +1323,11 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
                     Tpl::Tok(format!("{s}__h{n}"), *sp)
                 }
                 Tpl::Group(o, c, inner, sp) => {
-                    Tpl::Group(o.clone(), c.clone(), rename(inner, names, n, o == "{"), *sp)
+                    let fields = o == "{" && struct_literal(t, i);
+                    Tpl::Group(o.clone(), c.clone(), rename(inner, names, n, o == "{", fields), *sp)
                 }
                 Tpl::Rep(inner, sep, op) => {
-                    Tpl::Rep(rename(inner, names, n, braces), sep.clone(), *op)
+                    Tpl::Rep(rename(inner, names, n, braces, fields), sep.clone(), *op)
                 }
                 other => other.clone(),
             });
@@ -1307,7 +1339,7 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
     if names.is_empty() {
         return t.to_vec();
     }
-    rename(t, &names, n, false)
+    rename(t, &names, n, false, false)
 }
 
 fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {

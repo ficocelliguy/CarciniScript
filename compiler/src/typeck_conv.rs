@@ -868,6 +868,11 @@ impl Checker<'_> {
                         js: "Array.from".into(),
                     })
                 }
+                // `let one: i16 = true.into()`: 1 or 0.
+                (Ty::Bool, Ty::Int(k)) => Some(Conv::Wrap {
+                    js: if k.is_big() { "BigInt" } else { "Number" }.into(),
+                }),
+                (Ty::Bool, Ty::Float { .. }) => Some(Conv::Wrap { js: "Number".into() }),
                 _ if self.lossless(&s, &t) => Some(Conv::Identity),
                 _ if self.could_be(&s, &t) => {
                     self.unify(&s, &t);
@@ -1329,6 +1334,14 @@ impl Checker<'_> {
         }
         // Into `Box<dyn Error>`: std errors and your `impl Error` types, unchanged.
         if self.shallow(re) == Ty::Dyn("Error".into()) && self.boxes_as_dyn_error(e) {
+            return true;
+        }
+        // `Err("usage")?` / `Err(format!(..))?` into `Box<dyn Error>`: the string itself, as
+        // `"x".into()`.
+        if self.shallow(re) == Ty::Dyn("Error".into())
+            && self.shallow(e) == Ty::Str
+            && !self.adts.traits.contains_key("Error")
+        {
             return true;
         }
         // (`impl From<MyErr> for String`: a std type's `From` impl.)

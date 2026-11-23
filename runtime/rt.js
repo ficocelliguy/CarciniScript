@@ -5181,6 +5181,21 @@
       for (const k of Object.keys(v)) if (k !== "$tag" && !gone?.has(k)) rt.$drop(v[k]);
     }
   };
+  // `mem::forget(v)`: never dropped (nor what it holds).
+  rt.$forget = (v) => {
+    if ((v !== null && typeof v === "object") || typeof v === "function") dropped.add(v);
+  };
+  // `panic::catch_unwind(f)`: `Ok(f())`, or `Err` of the panic's message once the panic is
+  // reported (to stderr, as Rust's hook does before unwinding).
+  rt.$catchUnwind = (f) => {
+    try {
+      return rt.Ok(f());
+    } catch (e) {
+      if (!(e instanceof CarciniPanic)) throw e;
+      rt.$eprintln(`thread 'main' panicked at ${e.location}:\n${e.panicMessage}`);
+      return rt.Err(e.panicMessage);
+    }
+  };
   // A closure that owns captured values with a `Drop` impl: they drop when it does.
   rt.$own = (f, caps) => {
     f.$caps = caps;

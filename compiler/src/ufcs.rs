@@ -307,8 +307,11 @@ pub fn has_prim_paths(text: &str) -> bool {
         .iter()
         .chain(OTHERS)
         .any(|p| text.contains(&format!("{p}::")))
-        // (`Result::Ok(1)`, see `expand`.)
+        // (`Result::Ok(1)`, `HashMap::from_iter(..)`, see `expand`.)
         || text.contains("Result::")
+        || text.contains("from_iter")
+        || text.contains("::from)")
+        || text.contains("::from,")
         || OP_TRAITS.iter().any(|(t, ..)| {
             text.contains(&format!("{t}::"))
                 || text.contains(&format!("as {t}"))
@@ -451,6 +454,41 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                 i = m + 1;
                 continue;
             }
+        }
+        // `Vec::from_iter(it)`, `HashMap::<K, V>::from_iter(it)`, `FromIterator::from_iter(it)`:
+        // `(it).into_iter().collect::<Vec<_>>()`.
+        if let Some((first, open, ty)) = from_iter_path(&toks, i)
+            && !skip(&toks[i])
+        {
+            let mut j = open + 1;
+            let mut depth = 0;
+            while j < toks.len() {
+                match at(j).as_str() {
+                    "(" | "[" | "{" => depth += 1,
+                    ")" if depth == 0 => break,
+                    ")" | "]" | "}" => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j < toks.len() && j > open + 1 {
+                // (`Vec::from_iter(it,)`: not a tuple.)
+                let close = if at(j - 1) == "," { start(j - 1) } else { start(j) };
+                let fish = ty.map(|t| format!("::<{t}>")).unwrap_or_default();
+                edits.push((start(first), end(open), "(".to_string()));
+                edits.push((close, end(j), format!(").into_iter().collect{fish}()")));
+                i = open + 1;
+                continue;
+            }
+        }
+        // `.map(PathBuf::from)`, `.map(Id::from)`, `.map(f64::from)`: a closure calling it.
+        if let Some((first, m)) = from_value_path(&toks, i)
+            && !skip(&toks[i])
+        {
+            edits.push((start(first), start(first), "(|__ufcs0| ".to_string()));
+            edits.push((end(m), end(m), "(__ufcs0))".to_string()));
+            i = m + 1;
+            continue;
         }
         let prim = at(i);
         // `u64` `:` `:` `pow` (a `::` is one token in paths but two in token trees)
@@ -866,4 +904,147 @@ fn variant_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Option<
         return None;
     }
     Some((first, k, generics))
+}
+
+/// The std collections `X::from_iter(..)` builds, with how many type parameters each has.
+const FROM_ITER_TYPES: &[(&str, usize)] = &[
+    ("Vec", 1),
+    ("VecDeque", 1),
+    ("LinkedList", 1),
+    ("BinaryHeap", 1),
+    ("HashSet", 1),
+    ("BTreeSet", 1),
+    ("HashMap", 2),
+    ("BTreeMap", 2),
+    ("String", 0),
+    ("FromIterator", 0),
+];
+
+/// `Vec::from_iter(`, `std::collections::HashMap::<K, V>::from_iter(` or
+/// `FromIterator::from_iter(` at `toks[i]`: the index of the path's first token and of the `(`,
+/// and the type to collect into (`Vec<_>`, `HashMap<K, V>`; none for `FromIterator`). Not a
+/// type of the file's own (`toks` has its `struct` / `enum` names).
+fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Option<String>)> {
+    let at = |k: usize| toks.get(k).map(|t| t.text().to_string()).unwrap_or_default();
+    // A `::` at `toks[k]` (one token in a path, two `:` in a macro's tokens): its length.
+    let sep = |k: usize| {
+        if at(k) == "::" {
+            Some(1)
+        } else if at(k) == ":" && at(k + 1) == ":" {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let name = at(i);
+    let &(_, n_params) = FROM_ITER_TYPES.iter().find(|(t, _)| *t == name)?;
+    if toks.iter().zip(toks.iter().skip(1)).any(|(kw, n)| {
+        matches!(kw.kind(), SyntaxKind::STRUCT_KW | SyntaxKind::ENUM_KW | SyntaxKind::TRAIT_KW)
+            && n.text() == name
+    }) {
+        return None;
+    }
+    // `std::collections::` / `std::iter::` before it.
+    let mut first = i;
+    loop {
+        let back = if first >= 2 && at(first - 1) == "::" {
+            2
+        } else if first >= 3 && at(first - 1) == ":" && at(first - 2) == ":" {
+            3
+        } else {
+            break;
+        };
+        let seg = at(first - back);
+        let std_seg = matches!(
+            seg.as_str(),
+            "std" | "core" | "alloc" | "collections" | "vec" | "string" | "iter" | "hash_map"
+                | "hash_set" | "btree_map" | "btree_set" | "vec_deque" | "linked_list"
+                | "binary_heap"
+        );
+        if !std_seg {
+            break;
+        }
+        first -= back;
+    }
+    if first > 0 && matches!(at(first - 1).as_str(), "::" | ":" | "." | "<" | "as") {
+        return None;
+    }
+    let mut k = i + 1 + sep(i + 1)?;
+    // A turbofish: `Vec::<u8>::from_iter`.
+    let mut ty = (name != "FromIterator").then(|| match n_params {
+        0 => name.clone(),
+        n => format!("{name}<{}>", vec!["_"; n].join(", ")),
+    });
+    if at(k) == "<" {
+        let open = k;
+        let mut angle = 0;
+        while k < toks.len() {
+            match at(k).as_str() {
+                "<" => angle += 1,
+                ">" => angle -= 1,
+                ">>" => angle -= 2,
+                _ => {}
+            }
+            k += 1;
+            if angle <= 0 {
+                break;
+            }
+        }
+        if angle != 0 {
+            return None;
+        }
+        let inner: Vec<String> = (open + 1..k - 1).map(at).collect();
+        // (`Vec::<Vec<u8>>::from_iter`: the `>>` closes both.)
+        let mut inner = inner.join(" ");
+        if at(k - 1) == ">>" {
+            inner.push('>');
+        }
+        ty = Some(format!("{name}<{inner}>"));
+        k += sep(k)?;
+    }
+    (at(k) == "from_iter" && at(k + 1) == "(").then_some((first, k + 1, ty))
+}
+
+/// `Type::from` named as a value at `toks[i]` (an argument: `.map(PathBuf::from)`,
+/// `std::path::PathBuf::from`, `f64::from`): the index of the path's first token and of `from`.
+/// `From::from` and `String::from` are taken elsewhere.
+fn from_value_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize)> {
+    let at = |k: usize| toks.get(k).map(|t| t.text().to_string()).unwrap_or_default();
+    let sep = |k: usize| {
+        if at(k) == "::" {
+            Some(1)
+        } else if at(k) == ":" && at(k + 1) == ":" {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let name = at(i);
+    let type_like = name.starts_with(|c: char| c.is_ascii_uppercase())
+        || PRIMS.contains(&name.as_str());
+    let taken = matches!(name.as_str(), "From" | "String");
+    if toks[i].kind() != SyntaxKind::IDENT || !type_like || taken {
+        return None;
+    }
+    let m = i + 1 + sep(i + 1)?;
+    if at(m) != "from" || !matches!(at(m + 1).as_str(), ")" | ",") {
+        return None;
+    }
+    // `std::path::` before it.
+    let mut first = i;
+    loop {
+        let back = if first >= 2 && at(first - 1) == "::" {
+            2
+        } else if first >= 3 && at(first - 1) == ":" && at(first - 2) == ":" {
+            3
+        } else {
+            break;
+        };
+        if toks[first - back].kind() != SyntaxKind::IDENT {
+            break;
+        }
+        first -= back;
+    }
+    // An argument: after `(` or `,`.
+    (first > 0 && matches!(at(first - 1).as_str(), "(" | ",")).then_some((first, m))
 }

@@ -228,7 +228,12 @@ There is one JS thread, and scripts share it with the game.
   function's return value is an error (a pointer to a struct can go anywhere).
 - **`{:p}` prints a made-up address** (`0x10000` and up): the same for one object each time,
   but a number or string gets a new one each time it's formatted, and two references to one
-  number variable don't print the same address.
+  number variable don't print the same address. A function pointer's `{:?}` (a derived `Debug`
+  with an `fn(..)` field) is one of these too.
+- **`panic::catch_unwind` gives `Err` of the panic's message**, a string, where rustc's payload is
+  a `Box<dyn Any>` holding a `&str` or `String` (`downcast_ref::<&str>()` finds it either way
+  here). The panic is reported to stderr first, as rustc's hook does, without the
+  `RUST_BACKTRACE` note. `String::capacity` is the string's length in bytes.
 - **`c"..."` is a `CStr` value, and `CString` an owned one.** There's no C to pass them to:
   `as_ptr()` isn't there.
 
@@ -701,7 +706,8 @@ There is one JS thread, and scripts share it with the game.
   closure parameters) are renamed per expansion, so they don't clash with the caller's; other
   names (functions, types, a `static` the body names) resolve at the call site, as in a textual
   expansion. Rule markers aren't renamed: `@closure` in `m!(@closure ..)` stays put even when
-  the expansion also binds `let closure`.
+  the expansion also binds `let closure`. A struct literal's shorthand field naming such a local
+  (`$name { ids }`) keeps the field's name: `ids: ids__h1`.
 - **Fragments are parsed like rustc's**: `expr`, `ty`, `pat`, `pat_param`, `path`, `stmt`,
   `item` and `meta` captures go through rust-analyzer's parser (the prefix parse rustc's matcher
   does), so `$($n:expr)*` takes `0 1 2` as three and `2 * 4 -1` as one, and a qualified path's

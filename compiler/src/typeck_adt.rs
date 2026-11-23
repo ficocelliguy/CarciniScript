@@ -278,11 +278,21 @@ impl Checker<'_> {
             }
         }
         self.collect_traits(file);
-        // `impl` signatures.
-        for item in crate::adt::all_items(file) {
-            if let ast::Item::Impl(imp) = &item {
-                self.collect_impl(imp);
-            }
+        // `impl` signatures. (`Deref` ones first: a `DerefMut` impl's `-> &mut Self::Target` is
+        // their `type Target`, whichever is written first.)
+        let mut impls: Vec<ast::Impl> = crate::adt::all_items(file)
+            .into_iter()
+            .filter_map(|item| match item {
+                ast::Item::Impl(imp) => Some(imp),
+                _ => None,
+            })
+            .collect();
+        impls.sort_by_key(|imp| {
+            !imp.trait_()
+                .is_some_and(|t| t.syntax().text().to_string().ends_with("Deref"))
+        });
+        for imp in &impls {
+            self.collect_impl(imp);
         }
         // Derives need the field types' traits, hand-written impls included.
         for item in crate::adt::all_items(file) {
@@ -654,7 +664,54 @@ impl Checker<'_> {
                 .collect();
             own.sort_by_key(|n| order.iter().position(|x| x == n));
         }
+        // `fn log(&self) where T: Display` on `impl<T> Value<T>`: the impl's `T`, bounded
+        // further in this method.
+        for pred in f.where_clause().into_iter().flat_map(|w| w.predicates()) {
+            let Some(ast::Type::PathType(pt)) = pred.ty() else {
+                continue;
+            };
+            let Some(n) = pt.path().and_then(|p| p.as_single_name_ref()) else {
+                continue;
+            };
+            let n = n.text().to_string();
+            if own.contains(&n) || !self.param_bounds.contains_key(&n) {
+                continue;
+            }
+            let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+            let extra: Vec<String> = super::generic::bound_names(&lists)
+                .into_iter()
+                .map(|(b, _)| b)
+                .filter(|b| {
+                    super::generic::KNOWN_BOUNDS.contains(&b.as_str())
+                        || self.adts.traits.contains_key(b)
+                })
+                .collect();
+            if extra.is_empty() {
+                continue;
+            }
+            let before = self.param_bounds[&n].clone();
+            if !self.method_where.iter().any(|(x, _)| *x == n) {
+                self.method_where.push((n.clone(), before));
+            }
+            self.param_bounds.get_mut(&n).unwrap().extend(extra);
+            self.record_bound_args(&n, &lists);
+        }
+        // `x: impl Display`: an anonymous parameter of the method's, after the written ones.
+        for (name, bounds, key) in super::generic::impl_arg_params(f) {
+            self.generics.insert(key, Ty::Param(name.clone()));
+            self.generics.insert(name.clone(), Ty::Param(name.clone()));
+            self.param_bounds.insert(name.clone(), bounds);
+            own.push(name);
+        }
         own
+    }
+
+    /// The impl's parameters as they were before a method's `where` clause (see
+    /// `enter_method_generics`).
+    fn leave_method_where(&mut self) {
+        for (n, bounds) in std::mem::take(&mut self.method_where) {
+            self.param_bounds.insert(n, bounds);
+        }
     }
 
     /// The `impl`'s type parameters (with bounds) for lowering and checking its methods; returns
@@ -808,6 +865,10 @@ impl Checker<'_> {
                             self.shared_ref_fields
                                 .insert((variant_name.to_string(), name.clone()));
                         }
+                        if f.ty().as_ref().is_some_and(fn_ptr_type) {
+                            self.fn_ptr_fields
+                                .insert((variant_name.to_string(), name.clone()));
+                        }
                         // `n: &'a mut i32`: the field holds a slot over the borrowed place.
                         if f.ty().as_ref().is_some_and(super::written_mut_ref_type)
                             && self.cellable(&ty)
@@ -850,6 +911,10 @@ impl Checker<'_> {
                         }
                         if f.ty().as_ref().is_some_and(shared_ref_type) {
                             self.shared_ref_fields
+                                .insert((variant_name.to_string(), i.to_string()));
+                        }
+                        if f.ty().as_ref().is_some_and(fn_ptr_type) {
+                            self.fn_ptr_fields
                                 .insert((variant_name.to_string(), i.to_string()));
                         }
                         if f.ty().as_ref().is_some_and(super::written_mut_ref_type)
@@ -924,7 +989,16 @@ impl Checker<'_> {
                         && self
                             .shared_ref_fields
                             .contains(&(v.name.clone(), f.name.clone()));
-                    if !copy_array && !shared_ref && !self.implements(&subst(&f.ty, &unknowns), d) {
+                    let fn_ptr =
+                        matches!(d.as_str(), "Copy" | "Clone" | "Debug" | "PartialEq" | "Eq")
+                        && self
+                            .fn_ptr_fields
+                            .contains(&(v.name.clone(), f.name.clone()));
+                    if !copy_array
+                        && !shared_ref
+                        && !fn_ptr
+                        && !self.implements(&subst(&f.ty, &unknowns), d)
+                    {
                         self.error(
                             node,
                             format!("the trait `{d}` is not implemented for `{}` (field `{}` of `{name}`)", f.ty.describe(), f.name),
@@ -1132,6 +1206,7 @@ impl Checker<'_> {
             self.error(&node, format!("cannot find type `{type_name}` in this scope (impls are for structs and enums in this file)"));
             return;
         }
+        let mut unknown_trait = false;
         match trait_name.as_deref() {
             None => {}
             Some("Default") => {
@@ -1208,9 +1283,11 @@ impl Checker<'_> {
                 self.register_trait_impl(imp, t, &type_name);
             }
             Some(t) => {
-                let node = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node);
-                self.error(&node, unknown_impl_trait(t));
-                return;
+                let at = imp.trait_().map(|t| t.syntax().clone()).unwrap_or(node.clone());
+                self.error(&at, unknown_impl_trait(t));
+                // (Its methods are still registered, as inherent ones: the trait is what's
+                // missing, and `self.is_match(..)` elsewhere shouldn't fail for it too.)
+                unknown_trait = true;
             }
         }
         let self_ty = self.enter_impl(imp, &type_name);
@@ -1342,6 +1419,10 @@ impl Checker<'_> {
                 let user_trait = trait_name
                     .as_deref()
                     .is_some_and(|t| self.adts.traits.contains_key(t));
+                // (An unknown trait's `type X = ..;` and consts: the trait's error says it.)
+                if unknown_trait {
+                    continue;
+                }
                 if (op.is_some() || is_iter || is_future || is_deref || from_str || user_trait)
                     && matches!(item, ast::AssocItem::TypeAlias(_))
                 {
@@ -1546,8 +1627,21 @@ impl Checker<'_> {
                     continue;
                 }
             }
+            let key = format!("{type_name}::{}", name.text());
+            if unknown_trait {
+                let methods = self.adts.methods.entry(type_name.clone()).or_default();
+                if !methods.contains_key(name.text()) {
+                    methods.insert(name.text().to_string(), method);
+                    self.adts.unknown_trait_methods.insert(key);
+                }
+                continue;
+            }
+            let guessed = self.adts.unknown_trait_methods.remove(&key);
             let methods = self.adts.methods.entry(type_name.clone()).or_default();
-            if trait_name.is_none() && methods.contains_key(name.text().to_string().as_str()) {
+            if trait_name.is_none()
+                && methods.contains_key(name.text().to_string().as_str())
+                && !guessed
+            {
                 self.error(
                     name.syntax(),
                     format!("duplicate definitions with name `{}`", name.text()),
@@ -1616,7 +1710,7 @@ impl Checker<'_> {
         let ret = f
             .ret_type()
             .and_then(|r| r.ty())
-            .map(|t| self.lower_type(&t))
+            .map(|t| self.lower_ret_type(&t))
             .unwrap_or(Ty::Unit);
         let ref_params = f
             .param_list()
@@ -1655,6 +1749,7 @@ impl Checker<'_> {
             self.param_bounds.remove(p);
             self.const_tys.remove(p);
         }
+        self.leave_method_where();
         method
     }
 
@@ -1823,6 +1918,7 @@ impl Checker<'_> {
                     self.param_bounds.remove(&p);
                     self.const_tys.remove(&p);
                 }
+                self.leave_method_where();
             }
             self.self_ty = saved;
             self.generics.clear();
@@ -2895,6 +2991,26 @@ fn shared_ref_type(t: &ast::Type) -> bool {
             .and_then(|l| l.generic_args().next())
             .is_some_and(|a| match a {
                 ast::GenericArg::TypeArg(ta) => ta.ty().is_some_and(|t| shared_ref_type(&t)),
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
+/// `fn(u8) -> u8` or `Option<fn(..)>`: `Copy`, `Clone`, `Debug` and `PartialEq` whatever its
+/// signature (a closure type isn't).
+fn fn_ptr_type(t: &ast::Type) -> bool {
+    match t {
+        ast::Type::FnPtrType(_) => true,
+        ast::Type::ParenType(p) => p.ty().is_some_and(|t| fn_ptr_type(&t)),
+        ast::Type::PathType(p) => p
+            .path()
+            .and_then(|p| p.segment())
+            .filter(|s| s.name_ref().is_some_and(|n| n.text() == "Option"))
+            .and_then(|s| s.generic_arg_list())
+            .and_then(|l| l.generic_args().next())
+            .is_some_and(|a| match a {
+                ast::GenericArg::TypeArg(ta) => ta.ty().is_some_and(|t| fn_ptr_type(&t)),
                 _ => false,
             }),
         _ => false,

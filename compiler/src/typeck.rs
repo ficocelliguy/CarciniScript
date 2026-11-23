@@ -132,6 +132,9 @@ pub struct Types {
     pub slot_calls: std::collections::HashSet<(usize, usize)>,
     /// Bindings of such a slot (`Some(x)` in `if let`/`match`): `x` reads and writes `x[1]`.
     pub slot_bindings: std::collections::HashSet<(usize, usize)>,
+    /// `for x in v` iterables naming a `&mut` collection (`v: &mut [T]`): looped by index like
+    /// `for x in &mut v`, so `*x = ..` writes the element.
+    pub mut_ref_loops: std::collections::HashSet<(usize, usize)>,
     /// Reads of a fixed-size array of `Copy` values (a local or a struct field), which copy in
     /// by-value positions like rustc's `[T; N]: Copy`.
     pub array_reads: std::collections::HashSet<(usize, usize)>,
@@ -348,6 +351,7 @@ impl<'a> Checker<'a> {
             const_vals: HashMap::new(),
             root_file: None,
             param_bounds: HashMap::new(),
+            method_where: Vec::new(),
             into_targets: HashMap::new(),
             nested_ok: Default::default(),
             slot_locals: HashMap::new(),
@@ -363,6 +367,7 @@ impl<'a> Checker<'a> {
             into_args: Default::default(),
             slot_calls: Default::default(),
             slot_bindings: Default::default(),
+            mut_ref_loops: Default::default(),
             copy_arrays: Default::default(),
             move_sites: Default::default(),
             io_writes: Default::default(),
@@ -374,6 +379,7 @@ impl<'a> Checker<'a> {
             fmt_writes: Default::default(),
             array_fields: Default::default(),
             shared_ref_fields: Default::default(),
+            fn_ptr_fields: Default::default(),
             array_reads: Default::default(),
             cell_returns: Default::default(),
             index_places: Default::default(),
@@ -505,7 +511,7 @@ impl<'a> Checker<'a> {
                 let ret = f
                     .ret_type()
                     .and_then(|r| r.ty())
-                    .map(|t| self.lower_type(&t))
+                    .map(|t| self.lower_ret_type(&t))
                     .unwrap_or(Ty::Unit);
                 if let Some(t) = f.ret_type().and_then(|r| r.ty())
                     && is_ptr_type(&t)
@@ -718,6 +724,7 @@ pub fn check(
     let into_args = std::mem::take(&mut c.into_args);
     let slot_calls = std::mem::take(&mut c.slot_calls);
     let slot_bindings = std::mem::take(&mut c.slot_bindings);
+    let mut_ref_loops = std::mem::take(&mut c.mut_ref_loops);
     let array_reads = std::mem::take(&mut c.array_reads);
     let cell_returns = std::mem::take(&mut c.cell_returns);
     let index_places = std::mem::take(&mut c.index_places);
@@ -769,6 +776,7 @@ pub fn check(
             into_args,
             slot_calls,
             slot_bindings,
+            mut_ref_loops,
             array_reads,
             cell_returns,
             index_places,
@@ -859,6 +867,9 @@ struct Checker<'a> {
     root_file: Option<ast::SourceFile>,
     /// Bounds of the current function's type parameters.
     param_bounds: HashMap<String, Vec<String>>,
+    /// The impl's parameters a method's `where` clause bounds further (`fn log(&self) where T:
+    /// Display`), with their bounds before it, put back after the method.
+    method_where: Vec<(String, Vec<String>)>,
     /// `T: Into<f64>`: what `.into()` on a `T` makes (a number type; `T` stays generic).
     into_targets: HashMap<String, Ty>,
     /// Expressions of type `Option<Option<T>>` that only feed a `.flatten()`.
@@ -888,6 +899,7 @@ struct Checker<'a> {
     into_args: std::collections::HashSet<(usize, usize)>,
     slot_calls: std::collections::HashSet<(usize, usize)>,
     slot_bindings: std::collections::HashSet<(usize, usize)>,
+    mut_ref_loops: std::collections::HashSet<(usize, usize)>,
     /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
     copy_arrays: std::collections::HashSet<(usize, usize)>,
     /// Uses that move a binding (filled by the move checker).
@@ -910,6 +922,9 @@ struct Checker<'a> {
     /// Fields declared as shared references (`&'a [u8]`, `Option<&T>`): `Copy` and `Clone`
     /// whatever they point at. (struct or variant, field)
     pub(super) shared_ref_fields: std::collections::HashSet<(String, String)>,
+    /// Fields declared as function pointers (`fn(u8) -> u8`, `Option<fn()>`): typed as closures,
+    /// but `Copy`, `Clone`, `Debug` and `PartialEq`. (struct or variant, field)
+    pub(super) fn_ptr_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
@@ -1354,9 +1369,9 @@ impl<'a> Checker<'a> {
             // (Never a cyclic type, `?0 = Regex<?0>`: a struct used without its type arguments
             // then overflowed the stack.)
             (Ty::Var(v), t) | (t, Ty::Var(v)) if self.occurs(*v, t) => true,
-            // An unsuffixed literal into a `dyn Trait` (`Box::new(10.0)`): rustc's fallback
-            // type, `f64` or `i32`.
-            (Ty::Var(v), Ty::Dyn(tr)) | (Ty::Dyn(tr), Ty::Var(v)) if tr != "Any" => {
+            // An unsuffixed literal into a `dyn Trait` (`Box::new(10.0)`, `&123` as `&dyn Any`):
+            // rustc's fallback type, `f64` or `i32`.
+            (Ty::Var(v), Ty::Dyn(tr)) | (Ty::Dyn(tr), Ty::Var(v)) => {
                 let lit = match self.var_kind(&Ty::Var(*v)) {
                     Some(VarKind::Int) => Ty::Int(IntKind::I32),
                     Some(VarKind::Float) => Ty::Float { f32: false },
@@ -1409,6 +1424,13 @@ impl<'a> Checker<'a> {
             }
             // Anything is a `dyn Any`.
             (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr)) if tr == "Any" && !matches!(t, Ty::Dyn(_)) => true,
+            // Any type with std's `Display` (..) is a `dyn Display` / `impl Debug`.
+            (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr))
+                if generic::is_std_dyn(tr) && !matches!(t, Ty::Dyn(_)) =>
+            {
+                let (tr, t) = (tr.clone(), t.clone());
+                tr.split('+').all(|b| self.implements(&t, b))
+            }
             // A struct or enum coerces to a `dyn Trait` it implements.
             (Ty::Dyn(tr), Ty::Adt(..)) | (Ty::Adt(..), Ty::Dyn(tr)) => {
                 let adt = if matches!(a, Ty::Adt(..)) {
@@ -1686,6 +1708,19 @@ impl<'a> Checker<'a> {
             {
                 Ty::Dyn(self.user_trait_type(t).unwrap())
             }
+            // `x: impl Display` (an anonymous type parameter: see `generic::impl_arg_params`).
+            ast::Type::ImplTraitType(_)
+                if self.generics.contains_key(&generic::impl_arg_key(t)) =>
+            {
+                self.generics[&generic::impl_arg_key(t)].clone()
+            }
+            // `&dyn Display`, `Box<dyn Debug>`, `-> impl Ord + Debug`: any value with those std
+            // traits (`Dyn("Ord+Debug")`).
+            ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_)
+                if generic::std_impl_bounds(t).is_some() =>
+            {
+                Ty::Dyn(generic::std_impl_bounds(t).unwrap().join("+"))
+            }
             // `dyn Any` (`&dyn Any`, `Box<dyn Any + Send>`): any value, tested by `is::<T>()`.
             ast::Type::DynTraitType(d)
                 if d.type_bound_list().is_some_and(|l| {
@@ -1809,6 +1844,17 @@ impl<'a> Checker<'a> {
                 // `std::cmp::Ordering` (in `fn cmp(&self, o: &Self) -> Ordering`)
                 if name == "Ordering" && !self.adts.defs.contains_key("Ordering") {
                     return Ty::Ordering;
+                }
+                // `fmt::Error` (`-> Result<(), fmt::Error>`), what `fmt::Result` holds.
+                if name == "Error"
+                    && p.path().and_then(|p| p.qualifier()).is_some_and(|q| {
+                        matches!(
+                            q.syntax().text().to_string().as_str(),
+                            "fmt" | "std::fmt" | "core::fmt" | "::std::fmt" | "::core::fmt"
+                        )
+                    })
+                {
+                    return Ty::Extern("fmt::Error".into());
                 }
                 // `anyhow::Error`, and `anyhow::Result<T>` (its error by default).
                 if (name == "Error" || name == "Result")
@@ -2003,6 +2049,16 @@ impl<'a> Checker<'a> {
                     .and_then(|p| p.qualifier())
                     .is_some_and(|q| q.syntax().text() == "Self")
                     && let Some(t) = self.impl_assoc.get(&name)
+                {
+                    return t.clone();
+                }
+                // `Self::Target` in a `DerefMut` impl: its `Deref` impl's.
+                if name == "Target"
+                    && p.path()
+                        .and_then(|p| p.qualifier())
+                        .is_some_and(|q| q.syntax().text() == "Self")
+                    && let Some(Ty::Adt(n, _)) = &self.self_ty
+                    && let Some(t) = self.adts.deref_targets.get(n)
                 {
                     return t.clone();
                 }
@@ -7952,6 +8008,16 @@ impl<'a> Checker<'a> {
                 let t = self.infer(other, None);
                 let by_ref = match other {
                     ast::Expr::RefExpr(r) => Some(r.mut_token().is_some()),
+                    // `for x in v` with `v: &mut [T]`: as `for x in &mut *v`.
+                    ast::Expr::PathExpr(p)
+                        if p.path().and_then(|p| p.as_single_name_ref()).is_some_and(|n| {
+                            self.lookup(n.text()).is_some_and(|l| l.reference == Some(true))
+                        }) =>
+                    {
+                        let r = self.range(other.syntax());
+                        self.mut_ref_loops.insert(r);
+                        Some(true)
+                    }
                     _ => None,
                 };
                 let t = match self.shallow(&t) {
@@ -8124,6 +8190,28 @@ impl<'a> Checker<'a> {
                     self.format_args(&args);
                 }
                 Ty::Adt("Ident".into(), vec![])
+            }
+            // `dbg!(x)` is `x` (printed to stderr with `{:#?}`); `dbg!(a, b)` the tuple.
+            "dbg" => {
+                let expected = match (args.len(), expected.map(|t| self.shallow(t))) {
+                    (1, Some(t)) => vec![Some(t)],
+                    (n, Some(Ty::Tuple(ts))) if ts.len() == n => ts.into_iter().map(Some).collect(),
+                    (n, _) => vec![None; n],
+                };
+                let tys: Vec<Ty> = args
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, e)| {
+                        let t = self.macro_arg(a, e.as_ref());
+                        self.check_debug_value(mc.syntax(), &t);
+                        t
+                    })
+                    .collect();
+                match <[Ty; 1]>::try_from(tys) {
+                    Ok([t]) => t,
+                    Err(tys) if tys.is_empty() => Ty::Unit,
+                    Err(tys) => Ty::Tuple(tys),
+                }
             }
             "println" | "print" | "eprintln" | "eprint" | "format" | "panic" | "unreachable"
             | "todo" | "unimplemented" => {

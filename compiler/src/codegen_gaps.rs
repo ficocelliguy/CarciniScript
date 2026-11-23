@@ -167,6 +167,7 @@ impl Codegen<'_> {
                 f.push(".length");
                 f
             }
+            (Ty::Str, "capacity") => helper("utf8len", vec![]),
             (Ty::Vec(_), "reserve" | "reserve_exact" | "shrink_to") => {
                 let a = self.gap_arg(a0);
                 let mut f = Frag::text("void (");

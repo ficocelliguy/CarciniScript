@@ -561,6 +561,14 @@ impl Checker<'_> {
                 }
                 Ty::Str
             }
+            // (Valid UTF-8 is the caller's promise; invalid bytes decode as `from_utf8_lossy`.)
+            ["str" | "String", "from_utf8_unchecked"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
+                }
+                Ty::Str
+            }
             ["String", "with_capacity"] => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -706,6 +714,24 @@ impl Checker<'_> {
                     Some(a) => self.infer(a, None),
                     None => Ty::Unknown,
                 }
+            }
+            // `mem::forget(x)`: `x` is moved and never dropped.
+            ["mem", "forget"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.infer(a, None);
+                }
+                Ty::Unit
+            }
+            // `panic::catch_unwind(|| ..)`: `Ok` of the closure's value, or `Err` of the panic's
+            // payload.
+            ["panic", "catch_unwind"] => {
+                count(self, 1);
+                let t = match a0.map(|a| self.infer(a, None)).map(|t| self.zonk(&t)) {
+                    Some(Ty::Closure { ret, .. }) => *ret,
+                    _ => Ty::Unknown,
+                };
+                Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into())))
             }
             // `drop(x)`: `x` is dropped now.
             ["drop"] | ["mem", "drop"] => {

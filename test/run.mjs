@@ -83,7 +83,8 @@ async function runJs(jsPath, args = []) {
   }
   κσ.$flush();
   const stdout = lines.filter((l) => !l.startsWith("[stderr] ")).join("\n");
-  return { stdout: stdout ? stdout + "\n" : "", code, panic };
+  const stderr = lines.filter((l) => l.startsWith("[stderr] ")).map((l) => `${l.slice(9)}\n`).join("");
+  return { stdout: stdout ? stdout + "\n" : "", stderr, code, panic };
 }
 
 function runNative(file) {
@@ -92,6 +93,8 @@ function runNative(file) {
   const r = spawnSync(exe, { encoding: "utf8" });
   return {
     stdout: r.stdout.replace(/\r\n/g, "\n"),
+    // (`dbg!`'s `[C:\..\fixtures\x.rs:3:5]` as the JS has it, `[x.rs:3:5]`.)
+    stderr: r.stderr.replace(/\r\n/g, "\n").replace(/^\[[^\n]*[\\/]([^\\/\n]+:\d+:\d+\])/gm, "[$1"),
     code: r.status,
     panic: r.status === 101 ? nativePanic(r.stderr) : null,
   };
@@ -102,10 +105,13 @@ for (const f of fs.readdirSync(path.join(here, "fixtures")).filter((f) => f.ends
   const file = path.join(here, "fixtures", f);
   const name = `diff ${f}`;
   try {
-    const { jsPath } = compileFixture(file);
+    const { src, jsPath } = compileFixture(file);
     const js = await runJs(jsPath);
     const native = runNative(file);
-    if (js.stdout !== native.stdout || js.code !== native.code || js.panic !== native.panic) {
+    // (`// test: stderr` in a fixture: its stderr must match too, as `dbg!`'s output.)
+    if (src.includes("// test: stderr") && js.stderr !== native.stderr) {
+      fail(name, `stderr differs\n--- rustc\n${native.stderr}--- js\n${js.stderr}`);
+    } else if (js.stdout !== native.stdout || js.code !== native.code || js.panic !== native.panic) {
       const a = native.stdout.split("\n");
       const b = js.stdout.split("\n");
       const diff = [];
@@ -597,6 +603,32 @@ function decodeMappings(mappings) {
   const close = maps.filter((m) => m.genLine === 2).map((m) => m.srcLine);
   if (header[0] !== 3 || close[0] !== 5) fail(name, `header -> ${header}, closing brace -> ${close}`);
   else pass(name);
+}
+
+// --- a string continuation before a CR LF line ending (a file git checked out on Windows; not
+// a fixture, since git may change its line endings): rustc skips the CR with the indent.
+{
+  const name = "string continuation before CR LF";
+  const src = [
+    "fn main() {",
+    '    let s = "a \\',
+    '        b";',
+    '    println!("{} {} {:?}", s, "x\\',
+    '  y", b"p\\',
+    '    q");',
+    "}",
+    "",
+  ].join("\r\n");
+  const out = compile(src, "crlf.rs");
+  if (out.code === null) fail(name, out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+  else {
+    const jsPath = path.join(outDir, "crlf.mjs");
+    fs.writeFileSync(jsPath, out.code);
+    const { stdout } = await runJs(jsPath);
+    const want = "a b xy [112, 113]\n";
+    if (stdout !== want) fail(name, `stdout ${JSON.stringify(stdout)}, want ${JSON.stringify(want)}`);
+    else pass(name);
+  }
 }
 
 // --- diagnostics: programs rustc rejects, and the error each must produce (line:col prefix).

@@ -955,12 +955,14 @@ impl Walker<'_> {
                 }
                 let mode = if name == "vec" {
                     Mode::Move("into a `vec!`")
+                } else if name == "dbg" {
+                    Mode::Move("into a `dbg!`")
                 } else {
                     Mode::Use
                 };
                 let args = macros::split_args(self.src, self.base, &mc);
                 // `{name}` in a format string reads `name`.
-                if name != "vec"
+                if !matches!(name.as_str(), "vec" | "dbg")
                     && let Some(fs) = args.iter().find_map(macros::format_string)
                     && let Ok(pieces) = crate::fmt::parse(&fs)
                 {

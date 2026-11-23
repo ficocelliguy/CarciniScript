@@ -673,6 +673,10 @@ pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> Co
 }
 
 fn compile_uncached(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
+    let src = &crate::lineindex::crlf_continuations(src);
+    let resolve =
+        |p: &str| resolver(p).map(|t| crate::lineindex::crlf_continuations(&t).into_owned());
+    let resolver: typeck::Resolver = &resolve;
     // (A proc-macro crate compiled for this compile keeps its own list.)
     let outer = crate::procmacro::take_dependencies();
     let mut out = compile_files(src, filename, resolver);
@@ -3179,7 +3183,10 @@ impl<'a> Codegen<'a> {
                 let mutable = matches!(e, ast::Expr::MethodCallExpr(m) if m.name_ref().is_some_and(|n| n.text() == "iter_mut"));
                 (receiver(e), mutable)
             }
-            other => (Some(other.clone()), false),
+            other => (
+                Some(other.clone()),
+                self.types.mut_ref_loops.contains(&self.range_of(other.syntax())),
+            ),
         };
         let Some(source) = source else { return };
         // Iterators (and enumerating anything but a Vec) loop over the whole expression.
@@ -8726,6 +8733,54 @@ impl<'a> Codegen<'a> {
                     Ty::Adt("Ident".into(), vec![]),
                 )
             }
+            // `dbg!(a, b)`: `((t1, t2) => (κσ.$eprintln(`[file:1:2] a = ${..}`), .., [t1, t2]))(a, b)`.
+            "dbg" => {
+                let head = format!("[{}]", self.location(mc.syntax()));
+                if args.is_empty() {
+                    let mut f = Frag::mapped(start, format!("{}(", rt("eprintln")));
+                    f.push(js_string(&head)).push(")");
+                    return (f, Ty::Unit);
+                }
+                let pretty = Spec {
+                    debug: true,
+                    alt: true,
+                    ..Spec::default()
+                };
+                let mut temps = Vec::new();
+                let mut values = Vec::new();
+                let mut tys = Vec::new();
+                let mut prints = Vec::new();
+                for a in &args {
+                    let (expr, _) = macros::parse_arg(a);
+                    let (f, t) = self.emit_macro_arg(a, None);
+                    let f = match expr {
+                        Some(e) => self.by_value(&e, f, &t),
+                        None => f,
+                    };
+                    let t = t.default_lit();
+                    let tmp = self.temp();
+                    let shown = template_escape(&format!("{head} {} = ", a.text.trim()));
+                    let mut p = Frag::text(format!("{}(`{shown}${{", rt("eprintln")));
+                    p.append(format_value(Frag::text(tmp.clone()), &t, &pretty, None, None))
+                        .push("}`)");
+                    prints.push(p);
+                    temps.push(tmp);
+                    values.push(f);
+                    tys.push(t);
+                }
+                let result = if temps.len() == 1 {
+                    temps[0].clone()
+                } else {
+                    format!("[{}]", temps.join(", "))
+                };
+                let mut f = Frag::mapped(start, format!("(({}) => (", temps.join(", ")));
+                f.append(Frag::join(prints, ", "))
+                    .push(format!(", {result}))("))
+                    .append(Frag::join(values, ", "))
+                    .push(")");
+                let ty = if tys.len() == 1 { tys.pop().unwrap() } else { Ty::Tuple(tys) };
+                (f, ty)
+            }
             "println" | "print" | "eprintln" | "eprint" | "format" => {
                 let tpl = if args.is_empty() {
                     Frag::text("\"\"")
@@ -9361,6 +9416,8 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
         // (A `Box<dyn Error>` may hold a string, whose `{:?}` is quoted.)
         Ty::Dyn(_) => Some("κσ.$dbgAny".into()),
         Ty::Ordering => Some("κσ.$dbgOrdering".into()),
+        // (A `fn(..)` pointer field: an address, as rustc prints it; see `{:p}`.)
+        Ty::Closure { .. } => Some("((f) => κσ.$fmtPtr(f))".into()),
         // (Only a range value is `Debug`: `0..5`.)
         Ty::Iter { elem, .. } | Ty::Range(elem, _) => {
             let inner = debug_fn(elem).unwrap_or_else(|| "String".into());

@@ -592,6 +592,10 @@ impl Codegen<'_> {
                 let b = emit(self, 0);
                 call("fromUtf8Lossy", vec![b])
             }
+            ["str" | "String", "from_utf8_unchecked"] => {
+                let b = emit(self, 0);
+                call("fromUtf8Lossy", vec![b])
+            }
             // `u128::from(x)`: a BigInt from a smaller kind.
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(k) if k.is_big()) => {
                 let k = Ty::from_name(t).int_kind().unwrap_or(IntKind::I128);
@@ -602,7 +606,10 @@ impl Codegen<'_> {
                 f
             }
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(_) | Ty::Float { .. }) => {
-                emit(self, 0)
+                let bool_arg = args.first().is_some_and(|a| self.ty_of(a.syntax()) == Some(Ty::Bool));
+                let x = emit(self, 0);
+                // `i16::from(true)`: 1.
+                if bool_arg { x.wrap("Number(", ")") } else { x }
             }
             ["hint", "black_box"] => emit(self, 0),
             ["Rc" | "Arc", "downgrade"] => self.emit_expr(args.first()?, None).0,
@@ -696,6 +703,8 @@ impl Codegen<'_> {
                 }
             }
             ["drop"] | ["mem", "drop"] => call("drop", vec![emit(self, 0)]),
+            ["mem", "forget"] => call("forget", vec![emit(self, 0)]),
+            ["panic", "catch_unwind"] => call("catchUnwind", vec![emit(self, 0)]),
             // `size_of::<u32>()` / `size_of_val(&x)`: the width rustc gives the type (a JS value has
             // none of its own).
             ["mem", "size_of" | "align_of" | "size_of_val" | "align_of_val"]
