@@ -2454,18 +2454,33 @@ impl Checker<'_> {
                 .map(|(_, f)| f.ty.clone())
                 .unwrap_or(Ty::Unknown);
         }
-        // `w.sign` through `impl Deref for Wrap { type Target = Span; }`: `(w).deref().sign`.
-        if let Some(recv) = f.expr()
-            && let Some((n, target)) = self.deref_target(&Ty::Adt(adt.to_string(), targs.to_vec()))
-            && let Ty::Adt(ta, ta_args) = self.shallow(&target)
-            && self
-                .adts
-                .defs
-                .get(&ta)
-                .is_some_and(|d| !d.is_enum && d.variants[0].field(&key).is_some())
-        {
-            self.auto_deref(&recv, &n, &target);
-            return self.adt_field(f, &ta, &ta_args);
+        // `w.sign` through `impl Deref for Wrap { type Target = Span; }`: `(w).deref().sign`,
+        // through as many `Deref`s as it takes (`(w).deref().deref().sign`).
+        if let Some(recv) = f.expr() {
+            let mut steps = Vec::new();
+            let mut cur = Ty::Adt(adt.to_string(), targs.to_vec());
+            while steps.len() < 8
+                && let Some((n, target)) = self.deref_target(&cur)
+            {
+                if let Ty::Adt(ta, ta_args) = self.shallow(&target)
+                    && self
+                        .adts
+                        .defs
+                        .get(&ta)
+                        .is_some_and(|d| !d.is_enum && d.variants[0].field(&key).is_some())
+                {
+                    let r = self.range(recv.syntax());
+                    if steps.is_empty() {
+                        self.deref_steps.remove(&r);
+                    } else {
+                        self.deref_steps.insert(r, steps);
+                    }
+                    self.auto_deref(&recv, &n, &target);
+                    return self.adt_field(f, &ta, &ta_args);
+                }
+                steps.push(self.adts.deref_mut.contains(&n));
+                cur = target;
+            }
         }
         let msg = if self.adts.method(adt, &key).is_some() {
             format!(

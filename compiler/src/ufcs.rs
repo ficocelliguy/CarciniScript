@@ -457,9 +457,22 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         }
         // `Vec::from_iter(it)`, `HashMap::<K, V>::from_iter(it)`, `FromIterator::from_iter(it)`:
         // `(it).into_iter().collect::<Vec<_>>()`.
-        if let Some((first, open, ty)) = from_iter_path(&toks, i)
+        // As a value (`.map(Vec::from_iter)`): a closure doing that.
+        if let Some((first, name, ty)) = from_iter_path(&toks, i)
             && !skip(&toks[i])
+            && matches!(at(name + 1).as_str(), "," | ")")
         {
+            let fish = ty.map(|t| format!("::<{t}>")).unwrap_or_default();
+            let closure = format!("(|__ufcs0| (__ufcs0).into_iter().collect{fish}())");
+            edits.push((start(first), end(name), closure));
+            i = name + 1;
+            continue;
+        }
+        if let Some((first, name, ty)) = from_iter_path(&toks, i)
+            && !skip(&toks[i])
+            && at(name + 1) == "("
+        {
+            let open = name + 1;
             let mut j = open + 1;
             let mut depth = 0;
             while j < toks.len() {
@@ -920,8 +933,8 @@ const FROM_ITER_TYPES: &[(&str, usize)] = &[
     ("FromIterator", 0),
 ];
 
-/// `Vec::from_iter(`, `std::collections::HashMap::<K, V>::from_iter(` or
-/// `FromIterator::from_iter(` at `toks[i]`: the index of the path's first token and of the `(`,
+/// `Vec::from_iter`, `std::collections::HashMap::<K, V>::from_iter` or
+/// `FromIterator::from_iter` at `toks[i]`: the index of the path's first token and of `from_iter`,
 /// and the type to collect into (`Vec<_>`, `HashMap<K, V>`; none for `FromIterator`). Not a
 /// type of the file's own (`toks` has its `struct` / `enum` names).
 fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Option<String>)> {
@@ -1002,7 +1015,7 @@ fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Optio
         ty = Some(format!("{name}<{inner}>"));
         k += sep(k)?;
     }
-    (at(k) == "from_iter" && at(k + 1) == "(").then_some((first, k + 1, ty))
+    (at(k) == "from_iter").then_some((first, k, ty))
 }
 
 /// `Type::from` named as a value at `toks[i]` (an argument: `.map(PathBuf::from)`,

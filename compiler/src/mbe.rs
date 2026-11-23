@@ -2583,7 +2583,12 @@ pub fn preprocess_with(
     }
     // `std::path` / `OsStr` / `fmt::Arguments` names, `format_args!`, `env!`, `include!`.
     if crate::stdgaps::has_rewrites(&text) {
-        changed |= crate::stdgaps::expand(&mut text, &mut map, procs.map(|p| p.1))?;
+        changed |= crate::stdgaps::expand(
+            &mut text,
+            &mut map,
+            procs.map(|p| p.1),
+            procs.map(|p| (src, p.0)),
+        )?;
     }
     Ok(changed.then_some(Preprocessed { text, map, names }))
 }

@@ -218,7 +218,7 @@ files, std 3,004) last ran on 2026-11-17 with 0 panics.
 proc-macro API outside a proc-macro crate, `asm!`, `is_x86_feature_detected!`. JS values have no
 memory layout. Also not planned: `super::` at the top of a module file (each file compiles on its
 own, and a `#[path]` file can have several parents; `#[path]` covers the shared-folder layout,
-see the Bitburner player gaps below).
+see FEATURES.md).
 
 **Open:**
 
@@ -235,20 +235,6 @@ see the Bitburner player gaps below).
   accepts (edition 2021, `--crate-type lib`) that this compiler rejects, counts in files of the
   corpus where it shows:
   - Bounds and generics:
-    - [x] Bounds written on the `impl` aren't used inside its methods for an argument whose
-      type is the bound's target: `impl<T: Default> Cell<T> { fn take(&mut self) -> T {
-      self.swap(Default::default()) } }` ("`T: Default` is not satisfied", 10 files) and
-      `impl<S: Into<OsS>> From<S> for Pred { fn from(o: S) -> Self { Pred::Equals(o.into()) } }`
-      ("`OsS: From<S>` is not satisfied", part of 37). `T::default()`, and the same bound on a
-      free function, work. `Default::default()` expected as a `T: Default` (on the function or
-      the `impl`) failed on free functions too; now it is `$T.default()`, as `T::default()` is
-      (`fixtures/impl_bound_default.rs`). `o.into()` reads an `Into<X>` bound off the `impl`
-      when the method has none (`typeck_conv.rs` `param_into_target`).
-    - [x] A blanket `impl<S: Into<X>> From<S> for Y` isn't found by `let y: Y = "a".into()` or
-      `Y::from("a")` (clap's `ArgPredicate`, `ValueParser`; part of the 37 `From` hits). Now
-      such an impl is collected as `From<X>` (`FromImpl::via_into`), and a narrower number fits
-      an `X` that is a number (`impl<N: Into<i64>> From<N> for Big`, `Big::from(7u8)`)
-      (`fixtures/blanket_from_into.rs`).
     - [ ] Bounds declared on associated types: `trait Fac { type P: Parser; fn make() ->
       Self::P; }` then `T::make().map(..)` ("no method `map` for type parameter `Fac::P`"),
       `where <T as Fac>::P: Parser`, `I: Tr<Error = X>` then methods of `I::Iter`, and `type P =
@@ -257,47 +243,21 @@ see the Bitburner player gaps below).
       clause: `impl<Key, F> Meta<Key, F> { fn filter<I>(&mut self, item: I) -> F::Container
       where F: KeyMethod<Key, I> { self.key_method.make(item) } }` (both the projection and
       the method are missing; 7 files with the trait in the same file).
-    - [x] A trait's own generic method called through a type parameter: `trait Order { fn
-      select<R: Copy>(r: R) -> R; }` then `O::select(x)` / `O::select::<u8>(x)` with
-      `O: Order`: `R` is never instantiated ("expected `u8`, found `R`"; 5 files). Now its
-      type parameters take the turbofish's arguments or fresh ones (`typeck.rs`
-      `param_static_call`; `fixtures/trait_generic_static.rs`). Their own bounds aren't
-      checked there, and one that needs a class (`R: Default`) gets none.
-    - [x] `Ord` / `Eq` bounds don't imply `PartialOrd` / `PartialEq` when the bound is on a
-      *trait's* method (`trait It2 { fn pick<B: Ord>(self, a: B, b: B) -> B { if a > b .. } }`,
-      also with a `where` clause; itertools, fallible-iterator). Free functions and inherent
-      impls are fine. (7 + 9 files, most of the comparison ones.) A default method's body never
-      entered its own generics; now it does (`typeck_trait.rs` `check_trait_defaults`;
-      `fixtures/trait_method_ord_bounds.rs`).
-    - [x] `.as_ref()` on a type parameter bounded `AsRef<[u8]>` / `AsRef<str>` / `AsRef<Path>`
-      resolves to the wrong type (`Vec<u8>` → `String`, `str` → `PathBuf`), so the result
-      doesn't fit a `&[u8]` / `&str` parameter (aho-corasick haystacks, cc flags). The path
-      prelude's `as_ref` on strings won, and a string passed for an `AsRef<[u8]>` was rejected.
-      Now `as_ref` / `as_mut` / `borrow` / `borrow_mut` on a parameter with that bound is the
-      value as the bound says (`conv_as_ref_call`), and a string converts to its UTF-8 bytes
-      there, as `s.into()` to a `Vec<u8>` does now (`fixtures/as_ref_bounds.rs`).
-    - [x] Unsized coercion of a *type parameter*: `Box::new(val)` as `Box<dyn Tr>`, `val` as
-      `&dyn Tr`, `Some(Box::new(val))` as `Option<Box<dyn Tr>>`, with `T: Tr` ("expected `dyn
-      Tr`, found `T`", 16 files); concrete types coerce. Now a type parameter unifies with a
-      `dyn` of traits its bounds have (`Send` / `Sync` aside); dispatch is by the value at run
-      time, numbers included (`fixtures/dyn_from_type_param.rs`).
-    - [ ] `match` arms returning `Some(e)` for different error types as `Option<&(dyn Error +
+    - [ ] A trait's own generic method called through a type parameter (`O::select::<u8>(x)`
+      with `O: Order`) instantiates the method's type parameters, but doesn't check their own
+      bounds, and one that needs a class (`R: Default`) gets none (`typeck.rs`
+      `param_static_call`).
+    - [x] `match` arms returning `Some(e)` for different error types as `Option<&(dyn Error +
       'static)>` (`Error::source`, 5 files): "`match` arms have incompatible types: expected
       `Option<A>`, found `Option<B>`"; the expected return type doesn't reach the arms.
+      Now an expected type with a `dyn` in it checks each arm against itself, not against the
+      first arm's type (`typeck.rs` `match_expr`; `fixtures/dyn_match_arms.rs`).
     - [ ] Inference of a struct's type argument from the one impl of a bound (`Auto::always(
       Vec::new())` with `impl RawStream for Vec<u8>` the only impl): "type annotations needed".
-    - [x] An extension-trait method on an unsuffixed integer literal, `5.seconds()` with the
-      trait implemented for `i64` only; rustc picks the literal's type from the sole impl (time's
-      macros, 7 files). Now so does the checker, and among several impls the fallback `i32` /
-      `f64` when it has one, as rustc (`typeck.rs` `method`; `fixtures/literal_ext_methods.rs`).
   - Names and items:
     - [ ] Items declared inside function bodies share the file's namespace: two functions each
       declaring `enum State` / `struct Acc` collide ("defined multiple times"), and the first
       function then resolves `State::X` and `Acc(..)` against the second's items (19 files).
-    - [x] An inherent method with the same name as a trait method on the same type (`impl Prog
-      { fn header(&self) }` next to `impl LineProgram for Prog { fn header(&self) }`): "duplicate
-      definitions" (gimli; rustc prefers the inherent one). Works now (rechecked 2026-11-23:
-      `p.header()` takes the inherent one, `LineProgram::header(&p)` the trait's).
     - [ ] Inherent impls on reference instantiations collide: `impl<L, R> Either<&L, &R> { fn
       cloned }` and `impl<L, R> Either<&mut L, &mut R> { fn cloned }`. Impls per type argument
       (`impl W<u8>` / `impl W<u16>`) and per const argument work, but their associated consts
@@ -309,142 +269,50 @@ see the Bitburner player gaps below).
       fields unknown (23 files, several of them the crates these names come from).
     - [ ] `impl Tr for std::io::Stdout {}` next to `impl Tr for std::io::StdoutLock<'_> {}` (same
       for `Stderr`): one JS type here, so "conflicting implementations" (anstream).
-    - [x] Methods of an `impl Trait for Local { .. }` block are dropped when `Trait` can't be
-      resolved, so `self.is_match(..)` is "no method named" (39 files). Corpus-only in effect
-      (a script has all its files), but registering them regardless would be cheap and would
-      take the biggest remaining "no method" bucket with it. Now the impl's error stands alone:
-      its methods are registered as inherent ones (an inherent method of the name wins, without
-      "duplicate definitions"), its `type X = ..;` and consts skipped (`typeck_adt.rs`
-      `collect_impl`, `Adts::unknown_trait_methods`).
-    - [x] Field access through `Deref`: `wrap.sign` with `impl Deref for Wrap { type Target =
-      Span; }` is "no field `sign` on type `Wrap`"; methods through `Deref` work (jiff). Now a
-      field the type lacks and its target has is `(w).deref().sign`, written through `DerefMut`
-      (`typeck_adt.rs` `adt_field`; `fixtures/deref_fields.rs`). One level only: a `Deref` to
-      another `Deref` type doesn't chain.
-    - [x] Function pointer types (`fn(u8) -> u8`, `Option<fn(..)>`) are typed as `impl Fn`, so a
-      `#[derive(Clone, Copy, Debug)]` struct holding one fails (windows-sys callbacks, brotli
-      allocators: 27 files, the whole "derive on an `Option` field" bucket). Now a field
-      written as one is `Copy`, `Clone`, `Debug`, `PartialEq` and `Eq` (`Checker::fn_ptr_fields`),
-      and `{:?}` prints a made-up address as `{:p}` does (`fixtures/fn_ptr_derives.rs`).
-    - [x] A range literal matched against `From<Range<usize>>` / `From<RangeInclusive<usize>>`
-      impls is typed as `slice::Iter` (`(a..=b).into()`, clap's `ValueRange`). Now a range
-      that is `.into()`'s receiver or `X::from(..)`'s argument is a range value
-      (`range_conv_value`), and the impl is picked by its kind (`could_be` compared only the
-      element) (`fixtures/range_into_from.rs`).
-    - [x] `Type::from` as a function value (`.map(Id::from)`) isn't found; `Into::into` and
-      `.map(|s| s.into())` work. Now a closure (see `PathBuf::from` in the Comprehensive Rust
-      survey below).
+    - [x] Field access through `Deref` (`wrap.sign` as `(w).deref().sign`, `typeck_adt.rs`
+      `adt_field`) is one level only: a `Deref` to another `Deref` type doesn't chain.
+      Now it follows the targets until one has the field, the steps before the last in
+      `deref_steps` (`fixtures/deref_chain_fields.rs`).
   - Borrow checker, E0596 "not declared as mutable" where rustc accepts (about 50 files; the
     other E0596 hits are `*val = ..` on a loop variable whose iterator type is unknown, and raw
     pointers):
-    - [x] The typed receiver `fn init(self: &mut Self, ..)` (brotli). Now `self: &mut Self`,
-      `self: &'a Self` and `mut self: Self` are written as their shorthand, padded with spaces
-      to the same length, before anything parses the file (`lineindex.rs` `typed_self_params`;
-      `fixtures/typed_self_params.rs`). `self: Box<Self>` and the like stay as they are.
     - [ ] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
       &'a mut u8 { self.table.items.push(..) }` with `table: &'a mut Table`, and `Entry::Occupied(
       entry) => &mut entry.v.values[i]` (hashbrown, clap).
-    - [x] A `&mut` binding produced by `Option` combinators or a tuple pattern: `let links =
-      v[i].as_mut().unwrap(); links.next = 1;`, `if let (Some(dst), Some(src)) = (v.get_mut(a..b),
-      w.get(c..d)) { dst.copy_from_slice(src) }`, `let (Some(a), b) = (..) else { .. }; *a += b`.
-      (`let Some((a, b)) = x.as_mut() else`, `for v in s.iter_mut()`, destructuring `self` and
-      calling `&mut self` trait methods through a `&mut W` parameter all work.) Now a std `&mut`
-      call under `unwrap` / `expect` / `?` binds a `&mut`, and so does a tuple pattern's
-      element matched against one (`unwrapped_mut_ref_call`, `mark_tuple_mut_refs`;
-      `fixtures/mut_ref_unwrapped_bindings.rs`). Still E0596: such a binding of a number,
-      string or `Option` (`let (Some(a), b) = (Some(&mut x), 2)` with `x: i32`, also `let
-      Some(p) = Some(&mut x) else`), which needs a slot.
+    - [x] A `&mut` binding of a number, string or `Option` from a tuple pattern or `let`-`else`
+      (`let (Some(a), b) = (Some(&mut x), 2)` with `x: i32`, also `let Some(p) = Some(&mut x)
+      else`), which needs a slot. The same for a `Vec` element or struct works
+      (`unwrapped_mut_ref_call`, `mark_tuple_mut_refs`).
+      Now `Some(&mut x)` as the scrutinee, or a tuple element of it, binds the slot, as a local
+      holding one did (`bind_slot_option`; `fixtures/mut_ref_some_bindings.rs`).
   - Patterns:
-    - [x] Irrefutable array patterns on a `[T; N]`, `for (j, ([first, rest @ ..], fast)) in ..`
-      and `let ([x, ..], y) = ..`, are rejected as refutable (icu; 9 files with the other
-      refutable-pattern hits, one of which is `let Ok(p): Result<_, Infallible> = ..`). Now an
-      array pattern inside a tuple pattern fits by the lengths known there: a tuple literal's or
-      annotation's fields, and the items of `enumerate()` / `zip(..)` over arrays
-      (`typeck_arrays.rs` `pat_fits`, `PatShape`; `fixtures/tuple_array_patterns.rs`). Still
-      refutable: a tuple local declared elsewhere (`let ([a, b], c) = t;`), and the
-      `Infallible` one.
-    - [x] Struct patterns on std structs: `let Range { start, end } = r;` ("cannot find tuple
-      struct, struct or variant `Range`"). Now `Range`, `RangeFrom`, `RangeTo` and
-      `RangeToInclusive` (bare or under `std::ops::`) take their public fields, irrefutably,
-      in `let`, parameters and `match` (`typeck::range_struct_pat`;
-      `fixtures/range_struct_patterns.rs`).
     - [ ] Tuple-struct and unit patterns of std enums, `Bound::Included(&i)`, `Bound::Unbounded`
       (10 files): `Bound` itself is an unmodeled std type, so this is the std column, listed
       here because the pattern message isn't shaped like a std one.
-    - [x] The bundled `log` crate's `Level` by its full path: `log::Level` as a type ("cannot
-      find type `LogLevel`") and `log::Level::Error` as a pattern or value (env_logger's
-      examples). The other crate-name patterns (`anstyle::Color::Ansi(c)`, `syn::Meta::..`) are
-      crates that aren't bundled. The path was already renamed `LogLevel`, which hid the `log::`
-      that pulls in the prelude; now the renamed names pull it in too (`stdtime.rs`;
-      `fixtures/log_level_paths.rs`).
-  - Places:
-    - [x] Index assignment on a call result: `b.slice_mut()[0] = 1;`, `b.inner()[1] = 2;`
-      ("assignment to this place is not supported yet", 4 files); `*b.n_mut() = 5` and `let v =
-      b.inner(); v[2] = 9` work. Now a call giving a `Vec` or slice goes in a temp first, so it
-      runs once, as a nested row already did (`codegen.rs` `emit_assign_place`, `call_base`;
-      `fixtures/index_assign_call.rs`).
+    - [x] Still refutable: an array pattern in a tuple pattern over a tuple local declared
+      elsewhere (`let ([a, b], c) = t;`; the lengths are only known from a tuple literal,
+      annotation, `enumerate()` or `zip(..)`, `typeck_arrays.rs` `pat_fits`), and `let Ok(p):
+      Result<_, Infallible> = ..`. Now a
+      tuple local's shape comes from its own `let` or parameter type (`let_shape`), and
+      exhaustiveness skips a variant whose payload is uninhabited (`!`, an empty enum such as
+      `Infallible`), in `let` and `match` both (`fixtures/irrefutable_uninhabited.rs`).
   - Macros:
-    - [x] BUG: a struct-literal field shorthand inside `macro_rules!` is hygiene-renamed with the
-      local it names: `let ids = ..; $name { ids }` becomes "struct has no field named `ids__h1`"
-      plus "missing field `ids`" (aho-corasick, bitvec; 7 + 9 files). `$name { ids: ids }` too.
-      Now a shorthand field in braces after `$name`, `Self` or a capitalized name (not one being
-      compared, `if n == MAX { x }`) is written `ids: ids__h1` (`mbe.rs` `hygienic`). `ids: ids`
-      already worked; the `let` before it was the trouble (`fixtures/macro_field_shorthand.rs`).
     - [ ] Macro-generated inline modules and their items (deranged's `impl_ranged!`: "this block
       kind is not supported yet", 3 files but 1,165 errors).
   - std surface found through these messages (for the std column, not language work):
     `From<T> for OnceCell<T>` / `OnceCell::from`, `Cow<[u8]>: From<Vec<u8>>`,
     `OsString::push(&Path)` / `push(&str)` (`OsString` is a `String` here and `push` takes a
     `char`), `Debug` for `slice::Iter` in a derive, `write_fmt` overridden in an `io::Write` /
-    `fmt::Write` impl ("not a member of trait"), `&a | &b` on `HashSet`. (`Vec<u8>:
-    From<String>` works now, with the `AsRef<[u8]>` item above.)
+    `fmt::Write` impl ("not a member of trait"), `&a | &b` on `HashSet`.
   - Still mixed, to triage next: the "mismatched types" buckets (two named types that don't
     match, about 90 files outside macros). Samples are std modeling (`Cow<'a, str>` seen as
     `Cow<String>`, `OsStr::to_owned()` as `String`), clap's derive attributes on variants
     (`#[command(..)]` giving "expected `ClapCommand`, found `bool`"), and types from other
     files; nothing there has a confirmed probe yet.
-- Left over from closed gaps, after the 2026-11-20 pass (see RUST_GAPS.md "Traits on
-  built-in types" and FEATURES.md):
-  - [x] A generic `-> Option<&mut T>` of a `T` that may be a number (`fn first_mut<T>(v: &mut
-    [T])`): the caller reads a copy, since the function can't tell at run time whether to hand
-    out a slot.
-  - [x] Items that are tuples holding a `&mut` in a *returned* iterator (`-> impl
-    Iterator<Item = (usize, &mut u8)>`, rejected as mismatched types).
-  - [x] Your traits on `RangeFrom` / `RangeTo` / `RangeFull` (a `3..` is an iterator here).
-    `Ty::Range` has a `RangeKind` for each of std's six range types, and a range without a start
-    is marked (`RangeIt.open`), so `$dcall` finds the impl for its kind and `{:?}` prints `..7`
-    (`fixtures/range_kind_impls.rs`).
-  - [x] One trait for both a tuple and a `Vec` (borsh). A call through a generic `T: Tr` goes by
-    `T`'s class: a tuple's is `κσ.$tupT([..])` with its elements' classes, a `Vec`'s is marked
-    (`$prims.vec`), and `$dcallT` / `$dcallMutT` take the array impl for it (`$arrayImpl`). A
-    tuple or `Vec` impl's methods get the elements' classes the way an `Option` impl's do
-    (`typeck::elem_class`, `$callElem`), so `(vec![1], 2)` reaches both impls
-    (`fixtures/tuple_vec_impls.rs`).
+- Left over from closed gaps (see RUST_GAPS.md "Traits on built-in types" and FEATURES.md):
   - [ ] One trait for two tuples of one length (`(u8, u8)` and `(String, String)`). Both impls
     are keyed `Tuple2` (one `$ext$Tuple2` class, methods by name), so this needs a key per
     element types before the class can pick between them.
-  - [x] `dyn Trait` on a float picking the impl by the value. A number coerced to a `dyn Trait`
-    whose trait has impls on two number types is tagged with its type there (`dyn_nums`,
-    `κσ.$dynNum`), and `$dcall` takes that type's impl; `Box::new(10.0)` into a `Box<dyn Tr>` is
-    an `f64`, as in rustc (`fixtures/dyn_number_impls.rs`).
-  - [x] `impl<T> S<Vec<T>>` carrying no class for `T`. A `Vec<T>`'s (and `Option<T>`'s) class
-    carries `T`'s (`κσ.$withElem`), the struct stores it, and the methods read `this.$T?.elem`
-    (`typeck::class_param`; `fixtures/impl_vec_param_class.rs`).
-  - [x] A nested `Option<Option<_>>` through a generic `T: Tr` reaching the inner type's impl
-    for `Some(Some(4))`. A trait with an `Option` impl next to others dispatches by `T`'s class,
-    and `$dcallT` hands an `Option` class's element class to the `Option` impl's methods
-    (`elem_methods`, `κσ.$callElem` / `$takeElem`), as does a direct call
-    (`fixtures/nested_option_impls.rs`).
-
-  Closed in that pass: full std paths and `Option::Some` / `Result::<A, B>::Ok`, E0433 for a std
-  type without its `use`, renamed `Error`s and a `use` in a block, re-exports through an inline
-  module, associated type bounds in return position and GATs, a struct literal's closure typed
-  by the struct's bound, `&mut dyn Write` fields, `partition` over `iter_mut()`, const
-  parameters in associated consts and trait defaults, `const` struct methods in const
-  arguments, your traits on `fn()` types, `Cell`, iterator types, `PartialOrd<T> for str`,
-  `LinkedList`, `ControlFlow`, `CString`, `#[cfg]` on macro arguments, E0527 / E0528 for array
-  patterns, a `Vec<&mut i32>` built by hand (also in a tuple or an enum payload), `as_mut()` of
-  an `Option<number>` passed on or mapped.
 
 ### Crates for Bitburner scripts
 
@@ -467,78 +335,12 @@ The `rust` code blocks of [Rust by Example](https://github.com/rust-lang/rust-by
 after dropping `compile_fail`), with rustdoc's hidden `# ` lines shown and fragments wrapped in
 `fn main`, run through the corpus survey above (`corpus-classify.mjs <root>`, then `corpus_ast`
 and `corpus-report.mjs` on its output). The 40 blocks rustc rejects (deliberate error demos, x86
-`asm!`, multi-file `mod` layouts) are left out. Of the other 244, 219 compile as-is and 233
-(95.5%) have no language gap. The report calls an unresolved name "another crate or file", which
-can't be true of a single-file example, so those are listed below as std gaps. Each gap has a
-minimal repro that rustc accepts. Not yet checked: whether the 219 that compile print what
-rustc's builds print (`tools/diff-one.mjs`).
+`asm!`, multi-file `mod` layouts) are left out. Of the other 244, 219 compiled as-is and 233
+(95.5%) had no language gap at the time; every compiler and std gap it found has since been
+fixed.
 
-**Open, compiler:**
-
-- [x] Two traits with the same method name on one type (`impl A for F { fn get(&self) ->
-  String }`, `impl B for F { fn get(&self) -> u8 }`, called as `<F as A>::get(&f)` /
-  `B::get(&f)`): "mismatched types: expected `u8`, found `String`" (`trait/disambiguating`).
-- [x] A blanket impl of a generic trait (`impl<T, U> DoubleDrop<T> for U`, then
-  `empty.double_drop(null)`): "mismatched types: expected `T`, found `Null`"
-  (`generics/gen_trait`).
-- [x] Inside an inline `mod`, `let ln = ln(x)?;` sees the new binding in its own initializer:
-  "cannot find function `ln`". The same at the top level works (`std/result/question_mark`).
-  The flattener (`modflat.rs` `is_local`) took any binding of the name anywhere in the function
-  as a local; now only one in scope there (`fixtures/mod_local_shadowing.rs`).
-- [x] Inside an inline `mod`, enum patterns in a `match` that's an argument of `panic!`:
-  "constant and enum patterns is not supported yet". The same at the top level works (also
-  `std/result/question_mark`). In macro tokens `=>` is `=` `>`, so `E::A =>` was taken for a
-  format argument name and not rewritten to the module's mangled name.
-- [x] A trait of the file's own named like an operator trait (`trait Add { fn add(&self, n: i32)
-  -> i32; }`, `impl Add for C`), called through the type: `C::add(&c, 2)` is "no function or
-  associated item named `add` found for struct `C`". The checker takes any trait named `Add` for
-  `std::ops::Add` (`adt::op_method`), so the impl's method is stored as `add$0`. `Add::add(&c, 2)`
-  works, as does the same trait under another name. Found while doing the operator-traits item
-  below; not from a Rust by Example file. Now a declared trait of that name wins in
-  `collect_impl` and in bound checks (`typeck_gen.rs` `satisfies`)
-  (`fixtures/user_op_named_trait.rs`).
-
-**Open, std:**
-
-- [x] Methods as function values: `Result::is_ok`, `Result::unwrap`, `Result::unwrap_err`,
-  `Result::ok` passed to `filter` / `map` (`error/iter_result`, `std_misc/file/read_lines`),
-  `From::from` (`error/multiple_error_types/boxing_errors`), and `u64::from_str` with `FromStr`
-  imported (`flow_control/let_else`). Written as closures by the path pre-pass (`ufcs.rs`), as
-  `Option::is_some` already was; `From::from` is `.into()`, `u64::from_str(s)` is
-  `s.parse::<u64>()` (`fixtures/method_value_paths.rs`). `map_err(From::from)` to a
-  `Box<dyn Error>` works since the `Box<dyn Error>: From<E>` item below.
-- [x] Operator traits called by path: `Add::add(a, b)`, also from a macro
-  (`$trait::$method(..)`, `macros/dry`). The same pre-pass writes `Add::add(a, b)`,
-  `<V as Add>::add`, `i32::add` and `V::add` (when `V` has no inherent `add`) as `((a) + (b))`, and
-  as a value `(|a, b| a + b)`; also `Neg` / `Not` and `PartialEq` / `PartialOrd`'s methods, not a
-  trait of the file's own named like one (`fixtures/op_trait_paths.rs`).
-- [x] `impl Into<T> for X` (`conversion/from_into`), and `E.into()` to `Box<dyn Error>` ("the
-  trait bound `dyn Error: From<E>` is not satisfied"). The std-gaps pre-pass (`stdgaps.rs`
-  `into_impls`) writes the impl as `impl From<X> for T` (`self` as a `self__: X` parameter, `Self`
-  as `X`); an `impl Error` type `.into()` a `Box<dyn Error>` is the identity, as for `?`
-  (`typeck_conv.rs` `boxes_as_dyn_error`). `map_err(From::from)` to a `Box<dyn Error>` works now
-  (`fixtures/impl_into_box_error.rs`).
-- [x] Iterator adapter types written out: `iter::Cycle<iter::Chain<IntoIter<i32>,
-  IntoIter<i32>>>` as a return type (`trait/impl_trait`). `Chain` and `Zip` are known now, and
-  `IntoIter` / `Iter` / .. unqualified after a `use std::..` of them (`typeck.rs` `std_iter_type`;
-  `fixtures/iter_adapter_types.rs`).
-- [x] A char slice or array as a pattern: `s.trim_matches(&[' ', ','])`, or a `&[char]` local
-  (`std/str`). Taken by every pattern method (`split` too, which now also takes a closure) and
-  emitted as a predicate (`κσ.$charPat`), which the runtime's pattern helpers already took
-  (`fixtures/char_slice_patterns.rs`).
-- [x] `.eq()` called as a method on a `String` or `Rc<String>` (`std/rc`). Also `ne` / `lt` /
-  `le` / `gt` / `ge` on any non-ADT type (`κσ.$eq`, `$partialCmp`), as derived types had.
-- [x] `BufReader::lines()` yields `String` here, not `io::Result<String>`, so
-  `.lines().flatten()` / `.map_while(Result::ok)` don't type (`std_misc/file/read_lines`).
-  `lines()` already yielded `io::Result<String>`; the type `io::Lines<B>` (a type argument, unlike
-  `str::Lines<'a>`) was the one taken for `String`s, and `flatten` didn't take `Result` items
-  (`fixtures/io_lines_results.rs`).
-- [x] `mem::size_of_val` (`primitives/array`, `std/box`); `DirEntry::path()` (`std_misc/fs`);
-  `Child`'s `stdin` / `stdout` fields (`std_misc/process/pipe`). `size_of_val` / `size_of` lay
-  out tuples, references, boxes, `Vec`s, arrays and the file's structs as rustc does, from the
-  written types where boxes and array lengths are erased (`codegen_std.rs` `type_layout`); a
-  slice's size is its length's worth (`fixtures/size_of_val.rs`). The os prelude has
-  `DirEntry::path()` and `Child`'s pipes (`fixtures/os_pipes_dir_entries.rs`).
+- [ ] Check whether the programs that compile print what rustc's builds print
+  (`tools/diff-one.mjs`).
 
 **Expected:** `thread::spawn` and `mpsc` (4 files), `Rc::strong_count` (no reference counts in
 JS), and the not-planned unsafe features (raw pointers, `slice::from_raw_parts`, `union`, FFI).
@@ -552,144 +354,46 @@ files and the `rust` code blocks of its `src/*.md` slides (319 after dropping `i
 `compile_fail`, with `{{#include file:anchor}}` resolved and hidden `# ` lines shown; 316 that
 rustc accepts as they are or wrapped in `fn main`; the 3 others use unix-only std). The bare-metal
 and Android chapters are left out. Run through the corpus survey above (`corpus-classify.mjs`,
-`corpus_ast`, `corpus-report.mjs`), as Rust by Example was. Of the 384 files, 247 compile as-is
-and 325 (84.6%) have no language gap; the language gaps the report finds are the not-planned
-unsafe, FFI, `union` and proc-macro ones (30 files) plus `concat!` format strings and the CR LF
-continuation below. The 157 compiled programs with a `main` were also run against rustc's builds
-(`tools/diff-one.mjs`): 142 print the same; the rest differ in `{:p}`, filesystem errors,
-`process::exit` running `Drop`s and `Vec::capacity` (all in RUST_GAPS.md) and in the two items
-marked **runtime** below. (In five more, `diff-one` reports the JS location of a `todo!()` as
-`undefined` because the message follows the location on one line; the locations agree.) Each gap
-below has a minimal repro that rustc accepts; the slide or crate it comes from is in parentheses.
+`corpus_ast`, `corpus-report.mjs`), as Rust by Example was. Of the 384 files, 247 compiled as-is
+and 325 (84.6%) had no language gap; the language gaps the report found are the not-planned
+unsafe, FFI, `union` and proc-macro ones (30 files) plus two since fixed (`concat!` format
+strings, a string continuation before CR LF). The 157 compiled programs with a `main` were also
+run against rustc's builds (`tools/diff-one.mjs`): 142 printed the same; the rest differ in
+`{:p}`, filesystem errors, `process::exit` running `Drop`s and `Vec::capacity` (all in
+RUST_GAPS.md) and in the items marked **runtime** below. (In five more, `diff-one` reports the JS
+location of a `todo!()` as `undefined` because the message follows the location on one line; the
+locations agree.) Each gap below has a minimal repro that rustc accepts; the slide or crate it
+comes from is in parentheses.
 
 **Open, compiler:**
 
-- [x] `for x in v` over a `&mut [T]`, `&mut [T; N]` or `&mut Vec<T>` *parameter*
-  (`references/exercise`: `fn normalize(vector: &mut [f64; 3]) { for item in vector { *item /=
-  mag; } }`): "cannot borrow `item` as mutable, as it is not declared as mutable". Over a local
-  (`for x in &mut v`), a reborrow (`&mut *v`) or `v.iter_mut()` it works. Now a loop over a
-  local holding a `&mut` (a parameter or `let r = &mut v`) binds `&mut` items and is recorded
-  (`Types::mut_ref_loops`), so the code generator loops by index as for `&mut v`
-  (`fixtures/for_mut_ref_params.rs`).
-- [x] A `where` clause on an inherent method bounding the impl's type parameter
-  (`idiomatic/polymorphism/generics/conditional-methods`: `impl<T> Value<T> { fn log_error(&self)
-  where T: Error { eprintln!("{}", self.0) } }`): "`T` doesn't implement `Display`", or "no
-  method named `s` found for type parameter `T`" for your own trait. The bound on the impl
-  header (`impl<T: Display> Value<T>`, or its `where`) works. Now the method's predicates on the
-  impl's parameters add to their bounds while its signature and body are checked, and are put
-  back after (`typeck_adt.rs` `enter_method_generics` / `leave_method_where`;
-  `fixtures/method_where_impl_param.rs`).
 - [ ] `L::Output` of a std operator-trait bound (Programming Rust `complex`: `impl<L, R>
   Add<Complex<R>> for Complex<L> where L: Add<R> { type Output = Complex<L::Output>; .. }`; also
   `fn add<L: Add<R>, R>(a: L, b: R) -> L::Output { a + b }`): "cannot find type `Output`", then
   "expected `L`, found `R`". `T: Add<Output = T>` works.
-- [x] `impl` / `dyn` of std's formatting and comparison traits in parameter and return types:
-  `val: impl Display`, `t: &impl Display`, `t: &dyn Display`, `Vec<Box<dyn Display>>`, `-> impl
-  Debug`, `impl ToString`, `impl Ord + Debug` (`generics/impl-trait`,
-  `idiomatic/polymorphism/dyn/dyn-vs-generics`, `dyn/heterogeneous`, `polymorphism/python`):
-  "`impl Display` types are not supported yet". `T: Display`, `impl Into<T>`, `impl AsRef<str>`,
-  `&dyn Error` and your own traits work. Now, as in rustc, a parameter's `impl Display` is an
-  anonymous type parameter (`impl_Display`, after the written ones; free functions and methods,
-  `generic::impl_arg_params`), a return type's is the body's own type (a type variable,
-  `lower_ret_type`), and a `dyn` of them is `Ty::Dyn("Ord+Debug")`, which any type with those
-  traits unifies with (`fixtures/impl_std_trait_types.rs`).
-- [x] `&123` / `&1.5` passed as `&dyn Any` (`idiomatic/polymorphism/dyn/any-trait`): "mismatched
-  types: expected `dyn Any`, found `{integer}`". Structs, `String` and `&str` coerce. Now an
-  unsuffixed literal takes rustc's fallback type into `dyn Any` as into any other `dyn`
-  (`fixtures/literal_dyn_any.rs`).
-- [x] `Self::Target` in a `DerefMut` impl (`idiomatic/leveraging-the-type-system/newtype-pattern/
-  is-it-encapsulated`: `fn deref_mut(&mut self) -> &mut Self::Target`): "cannot find type
-  `Target`", whichever of the two impls comes first. In the `Deref` impl itself, and written out as
-  `&mut String`, it works. Now `Deref` impls are collected first and `Self::Target` falls back to
-  the type's `Deref` target (`fixtures/deref_mut_self_target.rs`).
-- [x] BUG (found with the item above): a `String` method that mutates, called through a
-  `DerefMut<Target = String>` (`n.push('c')` with `struct Name(String)`), emits `(n).deref_mut()
-  += "c"`, a JS syntax error. A `Vec` target works; a string needs a slot over the field.
-  `DerefMut` bodies were never checked, so `&mut self.0` never became a slot. Now they are, a
-  `deref_mut` declared `-> &mut String` (or a number) returns `κσ.$placeSlot`, and the call is
-  read and written through `[1]` (`Types::deref_slots`; `fixtures/deref_mut_string.rs`).
-- [x] `vec![]` / `Vec::new()` typed only by a `&mut Vec<Self::Leaf>` argument in a trait default
-  method (`idiomatic/polymorphism/generics/default-impls`: `let mut buf = vec![];
-  self.collect_leaves_buffered(&mut buf); buf`): "type annotations needed for `Vec<_>`". Through
-  a free function with concrete types, or with `let mut buf: Vec<Self::Leaf>`, it works. The
-  trait's own `Self::Leaf` unified with anything without binding. Now, in that trait's default
-  methods, an inference variable takes it (`typeck.rs` `unify`;
-  `fixtures/trait_default_assoc_vec.rs`).
-- [x] `fmt::Error` written in a return type, `-> Result<(), fmt::Error>` (Programming Rust
-  `libgit2-rs-safe`): "cannot find type `Error`", or, when the file has its own `Error` type,
-  "expected `Result<(), Error>`, found `Result<(), fmt::Error>`". `-> fmt::Result` works. Now
-  `fmt::Error` / `std::fmt::Error` as a type is what `fmt::Result` holds (`typeck.rs`
-  `lower_type`; `fixtures/fmt_error_type.rs`).
-- [x] `Err(format!(..))?` / `Err("usage")?` in a `-> Result<_, Box<dyn Error>>` (Programming Rust
-  `grep`, `http-get`; also `Box<dyn Error + Send + Sync>`): "`?` couldn't convert the error to
-  `dyn Error`". `Err("bad".into())` and `let e: Box<dyn Error> = s.into()` work, so only the `?`
-  path misses `From<String>` / `From<&str>` for the box. Now `?` takes a string into the box
-  as `.into()` does, the string itself (`typeck_conv.rs` `try_convert`;
-  `fixtures/err_str_question.rs`).
-- [x] `concat!(..)` as a format string: `println!(concat!("{}:{}: ", $msg), file!(), line!(),
-  $($params),*)` (`macros/macro_rules/techniques/optional-params`, `internal-rules`), also
-  `format!(concat!("{}", "-{}"), 1, 2)` outside a macro: "format argument must be a string
-  literal". Now a `concat!` of literals (strings, chars, unsuffixed numbers, bools) is written
-  as the one string literal it makes, after `macro_rules!` expansion (`stdgaps.rs`
-  `concat_literals`; `fixtures/concat_format_strings.rs`). `file!()` / `line!()` inside it are
-  not literals yet.
-- [x] A comment inside `#[derive(..)]`: `#[derive(Debug, Clone /* ... */)]`
-  (`idiomatic/foundations/api-design/predictable-api/common-traits`): "`#[derive(Clone/*...*/)]`
-  is not supported". Now the derive list and attribute arguments are read without their
-  comments (`adt.rs` `attr_text`, also for `thiserror` / `clap`'s derive lists;
-  `fixtures/derive_comments.rs`).
-- [x] A string continuation (`\` at the end of a line) before a CR LF line ending (Programming
-  Rust `spawn-blocking/tests.rs` and `actix-gcd`, as git checks them out on Windows): "unknown
-  character escape" / "Invalid escape"; before a LF it works. rustc skips the `\r\n` and the next
-  line's leading whitespace alike. Now the `\` CR LF of a (non-raw) string is written `\` LF CR
-  before anything parses it, the same length so positions hold (the escaper skips a CR with
-  the indent; `lineindex.rs` `crlf_continuations`, also for `mod` files and the language
-  service). Tested in `test/run.mjs` ("string continuation before CR LF"), not as a fixture,
-  since git may rewrite a fixture's line endings.
-- [ ] **runtime** A CR LF inside a raw or multi-line string literal (`r"a` CR LF `b"`) stays in
-  the value; rustc reads the file with CR LF as LF, so `r.len()` is one less there. Found with
-  the item above.
-- [ ] **runtime** An out-of-bounds index into an array (`[T; N]`; a `Vec` matches) panics one
+- [x] `file!()` / `line!()` inside a `concat!` format string (`println!(concat!("{}:{}: ",
+  $msg), file!(), line!())` works; `concat!(file!(), ": {}")` doesn't): `concat!` is only
+  folded when all its parts are literals (`stdgaps.rs` `concat_literals`).
+  `file!()`, `line!()` and `column!()` weren't supported anywhere, so the working case didn't
+  either. Now they are literals (`stdgaps.rs` `location_macro`), also inside `concat!`, whose
+  arguments may come wrapped in parens from a `$x:expr` (`fixtures/location_macros.rs`).
+- [x] **runtime** A CR LF inside a raw or multi-line string literal (`r"a` CR LF `b"`) stays in
+  the value; rustc reads the file with CR LF as LF, so `r.len()` is one less there. It
+  was a compile error in a plain string ("Character must be escaped"). Now string values read
+  CR LF as LF (`lineindex.rs` `string_value`), and the parser's bare-CR error is dropped when
+  every CR starts a CR LF (`test/run.mjs`, not a fixture, since git may change line endings).
+- [x] **runtime** An out-of-bounds index into an array (`[T; N]`; a `Vec` matches) panics one
   column to the right of rustc's, at the `[` rather than the start of the indexed expression
-  (`tuples-and-arrays/arrays`: `a[get_index()] = 0`, rustc 10:5, JS 10:6).
+  (`tuples-and-arrays/arrays`: `a[get_index()] = 0`, rustc 10:5, JS 10:6). Now an
+  array or slice the file declares (a row of one too, a `&[T]` local or parameter) panics at
+  the expression's start (`codegen_std.rs` `builtin_index_base`; `fixtures/panic_array_index.rs`).
 
 **Open, std:**
 
-- [x] `dbg!` (45 of the course's slides: `dbg!(x * 2)`, `dbg!(a, b)`, `dbg!()`): "macro `dbg!`
-  (`macro_rules!`) is not supported yet". Prints `[file:line:col] expr = {:#?}` to stderr and
-  hands the value back. By far the most-hit item. Now an arrow function called in place, `((t) =>
-  (κσ.$eprintln(..), t))(x)`, so it works anywhere a value does; the arguments are moved
-  (`moves.rs`) and must be `Debug`. A fixture with `// test: stderr` has its stderr diffed too
-  (`fixtures/dbg_macro.rs`, byte-identical to rustc's).
-- [x] **runtime** `i16::from(true)` / `u8::from(false)` compile and give `true` / `false`
-  (`std-traits/from-and-into`, which prints `true` where rustc prints `1`), while `let one: i16 =
-  true.into()` is "the trait bound `i16: From<bool>` is not satisfied" (the slide's second block).
-  Should be 1 / 0 for every integer type. Now `Number(b)` (`BigInt(b)` for `i128` / `u128`), also
-  `f32` / `f64` as rustc 1.68+ (`fixtures/bool_into_numbers.rs`).
-- [x] `Vec::from_iter`, `String::from_iter`, `HashSet::from_iter`, `BTreeSet::from_iter`,
-  `HashMap::from_iter` called as functions
-  (`idiomatic/foundations/api-design/predictable-api/common-traits/clone`): "no function or
-  associated item named `from_iter`" (`collect()` works). Now the path pre-pass writes
-  `X::from_iter(it)` as `(it).into_iter().collect::<X<_>>()` for the std collections, with a
-  turbofish's arguments (`HashMap::<u8, Vec<u8>>::from_iter`, `<Vec<i32>>::from_iter`) and a
-  `std::collections::` prefix; `FromIterator::from_iter(it)` collects by the expected type
-  (`ufcs.rs` `from_iter_path`; `fixtures/from_iter_calls.rs`). Not as a function value.
-- [x] `PathBuf::from` as a function value, `args.map(PathBuf::from)` (Programming Rust `grep`):
-  "no function or associated item named `from` found for struct `PathBuf`"; called directly it
-  works, so this is the path pre-pass's (`ufcs.rs`) list. Now any `Type::from` (capitalized or
-  a primitive, with a path prefix) passed as an argument is `(|x| Type::from(x))`, which also
-  closes the corpus item "`Type::from` as a function value" above (`ufcs.rs`
-  `from_value_path`; `fixtures/from_fn_values.rs`).
-- [x] Small std surface: `String::capacity` (`std-types/string`; `Vec`'s exists),
-  `Duration::try_from_secs_f32` (`pattern-matching/let-control-flow/if-let`),
-  `String::from_utf8_unchecked` (Programming Rust `ascii`; the same decode as `from_utf8`),
-  `mem::forget` (`idiomatic/leveraging-the-type-system/raii/drop_bomb_forget`: skip the value's
-  `Drop`), `panic::catch_unwind` (`error-handling/panics`: a `try` around the closure giving
-  `Err(Box<dyn Any>)`; the classifier sorts it as unsafe/memory today). All five now
-  (`String::capacity` is its byte length; `try_from_secs_f32` / `_f64` and
-  `TryFromFloatSecsError` in the time prelude; `κσ.$forget` marks the value dropped;
-  `κσ.$catchUnwind` reports the panic to stderr and returns `Err` of its message;
-  `fixtures/std_small_surface.rs`).
+- [x] `Vec::from_iter` and the other std collections' `from_iter` as a function value
+  (`.map(Vec::from_iter)`); called directly it works (`ufcs.rs` `from_iter_path`). Now
+  in an argument it is a closure collecting into the type (`fixtures/from_iter_values.rs`);
+  `let f = Vec::from_iter;` still isn't (the closure's parameter would have no type).
 - Missing too, but of little use in a script: `io::stdin().lock()` as a `BufRead` ("the trait
   bound `IoStdin: IoBufRead` is not satisfied"; Programming Rust `grep`), `env::args_os`,
   `PathBuf::read_dir` / `read_link` / `metadata` and `OsStr::from_bytes` (Programming Rust
@@ -706,85 +410,18 @@ bundled); `fern_sim`'s multi-file module tree (compiled file by file); `{:p}`.
 
 What a Bitburner player still misses, now that every item in `corpus/bitburner/GAPS.md` is
 fixed. Ranked by how often real scripts hit it times how badly: a silent wrong result or a false
-compile error on an everyday pattern outranks a missing feature with a workaround. Each entry was
-checked against the working tree with a probe program (50 probes over `RUST_GAPS.md`'s open
-items and the idioms of the corpus scripts); **undocumented** means in neither gaps document.
+compile error on an everyday pattern outranks a missing feature with a workaround. The other
+items of the original list (cross-folder modules via `#[path]`, serde tagging and `flatten`,
+`i32` NS results, `std::sync` / tokio sync shims, typed `ns.flags`, `u64` as a number) are done;
+see FEATURES.md.
 
-- [x] **1. Cross-folder modules** (2026-11-19). `mod x;` found only a sibling `x.rs` or
-  `x/mod.rs`, so a `/lib/` shared by scripts in `/hack/` and `/corp/`, the usual Bitburner layout
-  (`import .. from "/lib/util.js"`), couldn't be expressed. Now `#[path = "../lib/util.rs"]`
-  (relative to the file's directory, as rustc) and `#[path = "/lib/util.rs"]` (from the server
-  root; emitted as the absolute import Bitburner already resolves) load the file through the
-  resolver (`typeck_mod.rs` `module_candidates`), everywhere a `mod` file is looked up (`use`
-  paths through modules, macros, `jsx!` components, go to definition). The loaded file's own
-  `mod`s and `include_str!`s are next to it; `include_str!` / `include!` now read next to the
-  file they're in (also `/lib/..`), falling back to the path as written. `super::` from a module
-  file stays not planned (above).
-- [x] **2. `#[serde(tag = "..")]`, `#[serde(content = "..")]` and `#[serde(flatten)]`** (done
-  2026-11-20): were silently ignored, so an internally tagged enum was written externally tagged
-  and failed to read its own output. Now the schema carries the tagging and the flattened fields
-  (`json.rs`, `codegen_json.rs`), the runtime writes an object's pairs through one function
-  (`jsonPairs`: a struct's fields, a map's entries, a tagged enum's tag and content, a flattened
-  field's pairs in place) and reads a tagged enum from its tag field (or the tag-first sequence
-  form) and a flattened field from the keys no named field took, with serde_json's messages and
-  positions (an internally tagged enum's content errors have none, serde reads it from a buffer).
-  What serde rejects is a compile error (`typeck_adt.rs` `check_serde`): tuple variants and
-  non-struct newtype payloads in an internally tagged enum, `flatten` on anything but a struct,
-  map or `Option` of one, `content` without `tag`, and `with` / `serialize_with` /
-  `deserialize_with`. Diff-tested in `test/fixtures/serde_tagged.rs`.
-- [x] **3. Integer-valued NS results are all `f64`** (done 2026-11-20): ports required, pids,
-  thread counts, `hacknet.numNodes()`, levels, Go coordinates and the rest are `i32` now
-  (`isWholeNumber` in `tools/dts2rs.mjs`, see "NS bindings"), so `pid == 0`,
-  `for i in 0..ns.hacknet.num_nodes()` and `v[n as usize]` type-check as written. The same JS
-  number; `|0` wrapping is harmless there. A whole-number argument of any JS-number integer type
-  is accepted for an `i32` enum payload (`ns.exec(.., threads)` with a `usize`), as for `f64`.
-  Left as `f64` on purpose: shares (past 2^31), hashes (fractional), favor and HP (unsure they
-  stay whole), contract `data` (one is up to 2^57).
-- [x] **4. `std::sync` and tokio's sync primitives as single-threaded shims** (done 2026-11-21).
-  `Mutex`, `RwLock`, the atomics, `thread_local!`, `std::sync::mpsc`, `tokio::sync::{Mutex,
-  RwLock, mpsc}`, `tokio::select!` and `tokio::time::timeout` all errored, leaving `static mut`
-  plus `unsafe` as the only mutable module-level state. Now a lock prelude
-  (`lock_prelude.rs`): a lock is a `RefCell` and `m.lock().unwrap()` / `m.lock().await` is its
-  value in place (`codegen.rs` `lock_place`), an atomic a `Cell`, `thread_local!` a `static`
-  `LocalKey` (`bundled.rs`), `atomic::Ordering` renamed `AtomicOrdering` (`std::cmp::Ordering`
-  keeps its name), `MutexGuard<'_, T>` the `T` (`stdgaps.rs`, as `RefMut`). std `mpsc` is a
-  shared queue whose empty `recv` is an error; tokio's is a hand-written future woken by
-  `send`, closing when its last sender drops, so `select!` (rewritten to a `poll_fn` over the
-  branches, `bundled.rs` `tokio_select`) loses nothing to a losing `recv()`. Along the way: an
-  `async move` block now owns and drops its `Drop` captures (a sender moved into a spawned task
-  closes the channel when the task ends); an expression-bodied closure whose body hoists a
-  statement (`|m| *m.entry(k).or_insert(0) += 1`) keeps it inside; a `static mut` read in a
-  macro's arguments inside `unsafe` is accepted; the runtime's waker for a polled promise
-  (`wake_by_ref`) is never pruned. Diff-tested in `sync_locks.rs` and `sync_mpsc.rs`, tokio
-  in `test/ns/tokio_sync.rs`. Left: see RUST_GAPS.md "`std::sync` is single-threaded".
-- [x] **5. `ns.flags` ergonomics** (done 2026-11-21). The schema was `&[JsValue]` built with
-  `JsValue::from(("target", "home"))` and the result a `JsValue`. Now `dts2rs.mjs` emits
-  `flags(&self, schema: &[(&str, FlagValue)]) -> Flags` (`FlagValue`: string, number, boolean or
-  string list), so `ns.flags(&[("target", "home"), ("threads", 1), ("exclude", vec![])])` type-checks
-  (an NS argument's array and tuple literals take a variant's payload, `typeck.rs`
-  `enum_payloads`) and `Flags` reads by name (`get_str` / `get_f64` / `get_bool` / `get_list`,
-  `#[runtime]` bindings methods over `κσ.$jsv.$flagStr` ..) with `rest` for `_`. Its hover docs
-  and the README point to clap for typed fields and `--help`. A default built ahead of time is
-  `"home".into()` or `FlagValue::from(..)` (any bindings enum, from a variant's payload), and
-  `{:?}` of `Flags` shows each flag (`#[debug_keys]`). Tested in `test/ns/flags.rs` (wrong-type
-  defaults in `test/run.mjs`'s NS rejects), an example in the web REPL.
-- [ ] **6. An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
+- [ ] **An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
   are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
   Compile the tests to a `main` that runs each and prints libtest's summary.
-- [x] **7. `u64` is BigInt** (done 2026-11-20): players reach for `u64` for money and thread
-  math, and a 2M-iteration loop was 37 ms as `u64`, 3 ms as `usize`, 2 ms as `f64`. `i64` /
-  `u64` are JS numbers now, like `usize` (see "Lowering decisions"); only `i128` / `u128` are
-  BigInt. The cost is exactness past 2^53 (`RUST_GAPS.md`); `int128_methods.rs` keeps the
-  BigInt paths diff-tested and `int64_numbers.rs` the number ones.
 
 Not caught at all (probed 2026-11-18), so no message to improve: `let r = &v[0]` over a
 `Vec<i32>` then `v.push` (the index copies), `"a" + "b"`, an un-awaited `ns.hack(..)`, and a
 partial move out of a struct (`let a = p.a; let q = p;`).
-
-- [x] Stale in `RUST_GAPS.md` (works now, each confirmed by a probe): `HashMap::get_mut` on number
-  values writes through (`if let Some(v) = m.get_mut("a") { *v += 2.0 }`, `*m.get_mut("a").unwrap() += 1.0`);
-  string byte-range slicing (`&s[0..5]`, `&s[6..]`); `BTreeMap::range`; and two renamed `Error`
-  types from inline modules (`use a::Error as AError; use b::Error as BError;`).
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 
@@ -809,26 +446,17 @@ Measured on node 24 (`--cpu-prof` keeps the wasm's function names), 2026-11-16 t
 `corpus/bitburner/darknet.rs` (784 lines) 78 ms cold and 0.7 ms for the same text again
 (`memo::cached`, keyed by text, file name, bindings generation, settings and every resolved
 file); hover, completions and signature help on an unchanged file 0.3 ms, and after an edit one
-analysis serves all three. Run time: the common Bitburner shapes (BFS over a `VecDeque` ring
-buffer, `BTreeSet` queues, byte scans over strings, `&mut` to a place, slice views, composite map
-keys, inline 64-bit wrapping) are within a small factor of a hand-written JS loop; plain
-map/filter/sum chains are about 1.3x one. `for i in 0..n` and reversed ranges are plain `for`
-loops, `?` and panics are returns and throws (try/finally only for `Drop` types), `push_str` is
-`+=`.
+analysis serves all three. Bundled-crate preludes are parsed once per thread and trimmed to the
+items the program reaches (`prune.rs`): `use chrono` with `NaiveDate` and `println!` is 25 ms.
+Run time: the common Bitburner shapes (BFS over a `VecDeque` ring buffer, `BTreeSet` queues, byte
+scans over strings, `&mut` to a place, slice views, composite map keys, inline 64-bit wrapping)
+are within a small factor of a hand-written JS loop; plain map/filter/sum chains are about 1.3x
+one. `for i in 0..n` and reversed ranges are plain `for` loops, `?` and panics are returns and
+throws (try/finally only for `Drop` types), `push_str` is `+=`.
 
-- [x] A prelude's output depends on the program it's compiled with (renamed locals, impls joining
-  the program's `$ext$i32` class, generic bodies checked against the program's impls), so it was
-  parsed, checked and emitted in full each compile: `use chrono` alone was 68 ms (110 ms on
-  2026-11-19's machine state). Done (2026-11-19): `prune.rs` trims each prelude to the items the
-  program reaches, by name closure over identifiers (a type's impls when its header's types are
-  reached, an inherent impl's methods by name, trait impls whole; the names the compiler emits
-  itself are `IMPLICIT`). The prelude is parsed once per thread; a compile scans the program.
-  `use chrono` with `NaiveDate` and `println!` is 25 ms (the first compile after load parses the
-  prelude: 135 ms); a program using most of chrono 127 → 105 ms, `num` 34 → 26, `regex` 24 →
-  19, `std::time` 17 → 13. The analysis behind hover and completions keeps every method of a
-  reached type. Left: merging the read-only pre-pass rewrites into one walk, and the remaining
-  cost in chrono's formatter (`__chrono_format` handles every specifier, so `{}` on a date
-  reaches `NaiveTime`, `TimeDelta` and `Weekday`).
+- [ ] Merging the read-only pre-pass rewrites into one walk; the remaining cost in chrono's
+  formatter (`__chrono_format` handles every specifier, so `{}` on a date reaches `NaiveTime`,
+  `TimeDelta` and `Weekday`).
 - [ ] `match` as a `switch` on `$tag` (the `else if` chain is cheap once the subject is a name,
   so not pressing); skipping a `Copy` struct's clone at its last use; unit-variant singletons
   (blocked: `*r = Dir::E` through a `&mut` is `κσ.$replace`, which rewrites the object in place,

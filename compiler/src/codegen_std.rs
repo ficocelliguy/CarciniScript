@@ -799,6 +799,34 @@ impl Codegen<'_> {
         Some((f, ty))
     }
 
+    /// Whether indexing `base` is the built-in indexing of an array or slice, as far as the file
+    /// says (an array local, field or result, a row of one, a `&[T]` local or parameter), not
+    /// `Vec`'s `Index` impl: rustc reports its panic at the start of the indexing expression.
+    pub(super) fn builtin_index_base(&self, base: &ast::Expr) -> bool {
+        use typeck::Decl;
+        let Some(root) = self.file_root.clone() else {
+            return false;
+        };
+        // (`aa[0][i]`: the rows of `aa` must be arrays too.)
+        let mut place = super::strip_parens_expr(base);
+        let mut depth = 1;
+        while let ast::Expr::IndexExpr(ix) = &place {
+            let Some(b) = ix.base() else { return false };
+            place = super::strip_parens_expr(&b);
+            depth += 1;
+        }
+        let at = ra_ap_syntax::TextSize::from(self.off(place.syntax()) as u32);
+        let dims = match typeck::decl_at(&root, &place, at) {
+            Some(Decl::Let(Some(t), _) | Decl::Param(Some(t))) => match &t {
+                ast::Type::RefType(r) if matches!(r.ty(), Some(ast::Type::SliceType(_))) => 1,
+                t => typeck::array_type_dims(t).len(),
+            },
+            Some(Decl::Let(None, Some(init))) => typeck::array_dims_in_file(&init, 0).len(),
+            _ => typeck::array_dims_in_file(&place, 0).len(),
+        };
+        dims >= depth
+    }
+
     /// What `size_of_val(arg)` measures: what `arg` points to. The checker erases boxes,
     /// references and array lengths, so a local's declared type (or a `Box::new` / `vec!`
     /// initializer, or the array's length as the file gives it) says first.

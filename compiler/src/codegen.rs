@@ -823,6 +823,9 @@ fn compile_text(
         const_bodies: HashMap::new(),
     };
     for e in parse.errors() {
+        if crate::lineindex::crlf_only_error(&e.to_string(), src) {
+            continue;
+        }
         let r = e.range();
         cg.diag_range(
             usize::from(r.start()),
@@ -3382,7 +3385,16 @@ impl<'a> Codegen<'a> {
                 (true, false) => "deref_mut()",
                 _ => "deref()",
             };
-            return (frag.wrap("(", &format!(").{m}")).at(start), target);
+            // (Chained `Deref`s: the steps before this one.)
+            let steps: String = self
+                .types
+                .deref_steps
+                .get(&r)
+                .into_iter()
+                .flatten()
+                .map(|&m| if m { ".deref_mut()" } else { ".deref()" })
+                .collect();
+            return (frag.wrap("(", &format!("){steps}.{m}")).at(start), target);
         }
         // A number into a `dyn Trait` with impls on two number types: tagged with its own.
         if let Some(k) = self.types.dyn_nums.get(&r) {
@@ -3830,9 +3842,9 @@ impl<'a> Codegen<'a> {
                 (frag, Ty::Float { f32 })
             }
             LiteralKind::Bool(b) => (Frag::text(b.to_string()), Ty::Bool),
-            LiteralKind::String(s) => match s.value() {
-                Ok(v) => (Frag::text(js_string(&v)), Ty::Str),
-                Err(_) => {
+            LiteralKind::String(s) => match crate::lineindex::string_value(&s) {
+                Some(v) => (Frag::text(js_string(&v)), Ty::Str),
+                None => {
                     self.error(l.syntax(), "invalid string literal");
                     (Frag::text("\"\""), Ty::Str)
                 }
@@ -8394,9 +8406,11 @@ impl<'a> Codegen<'a> {
             let ty = self.ty_of(ix.syntax()).unwrap_or(bt);
             return (f, ty);
         }
-        // rustc reports index panics at the `[`.
+        // rustc reports index panics at the `[`, or for an array or slice at the expression.
+        let builtin = ix.base().is_some_and(|b| self.builtin_index_base(&b));
         let bracket = ix
             .l_brack_token()
+            .filter(|_| !builtin)
             .map(|t| self.base + usize::from(t.text_range().start()));
         let loc = js_string(
             &bracket
@@ -9035,7 +9049,7 @@ impl<'a> Codegen<'a> {
             .single_token
             .as_ref()
             .and_then(|t| ast::String::cast(t.clone()))
-            .and_then(|s| s.value().ok().map(|v| v.into_owned()));
+            .and_then(|s| crate::lineindex::string_value(&s));
         let Some(fmt_str) = fmt_str else {
             self.diag_range(
                 fmt_arg.start,

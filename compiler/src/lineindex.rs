@@ -168,3 +168,28 @@ pub fn source_fixups(src: &str) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(s) => crlf_continuations(&s).into_owned().into(),
     }
 }
+
+/// A string literal's value, with each CR LF in it read as LF, as rustc reads the file (a raw or
+/// multi-line string in a file checked out with CR LF line ends).
+pub fn string_value(s: &ra_ap_syntax::ast::String) -> Option<String> {
+    use ra_ap_syntax::{AstToken, ast};
+    match s.value() {
+        Ok(v) if !s.text().contains('\r') => Some(v.into_owned()),
+        _ => {
+            let fixed = s.text().replace("\r\n", "\n");
+            let parse = ast::Expr::parse(&fixed, crate::macros::EDITION);
+            let ast::Expr::Literal(l) = parse.tree() else { return None };
+            match l.kind() {
+                ast::LiteralKind::String(s) => s.value().ok().map(|v| v.into_owned()),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Whether a parse error is the lexer's bare-CR one in a file whose every CR starts a CR LF:
+/// rustc reads those as LF, and `string_value` does.
+pub fn crlf_only_error(message: &str, src: &str) -> bool {
+    message == "Character must be escaped: `\r`"
+        && src.match_indices('\r').all(|(k, _)| src[k + 1..].starts_with('\n'))
+}

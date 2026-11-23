@@ -388,6 +388,20 @@ impl Checker<'_> {
         if let Some(e @ ast::Expr::TupleExpr(_)) = l.initializer().map(|e| super::strip_parens(&e)) {
             return expr_shape(&e);
         }
+        // `let ([a, b], c) = t;`: the tuple local's own `let` or parameter type.
+        let mut init = l.initializer().map(|e| super::strip_parens(&e));
+        for _ in 0..4 {
+            let Some(e @ ast::Expr::PathExpr(_)) = &init else { break };
+            match decl_of(e) {
+                Some(Decl::Let(Some(t @ ast::Type::TupleType(_)), _))
+                | Some(Decl::Param(Some(t @ ast::Type::TupleType(_)))) => return type_shape(&t),
+                Some(Decl::Let(None, Some(i))) => match super::strip_parens(&i) {
+                    e @ ast::Expr::TupleExpr(_) => return expr_shape(&e),
+                    e => init = Some(e),
+                },
+                _ => break,
+            }
+        }
         dims_shape(self.let_dims(l))
     }
 
@@ -719,3 +733,4 @@ fn expr_shape(e: &ast::Expr) -> PatShape {
         e => dims_shape(array_dims_in_file(&e, 0)),
     }
 }
+

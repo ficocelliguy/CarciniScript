@@ -16,7 +16,7 @@ use std::rc::Rc;
 mod adt_check;
 #[path = "typeck_arrays.rs"]
 mod arrays;
-pub(crate) use arrays::{Decl, array_dims_in_file, array_type_len, decl_at};
+pub(crate) use arrays::{Decl, array_dims_in_file, array_type_dims, array_type_len, decl_at};
 #[path = "typeck_coll.rs"]
 mod coll;
 pub(crate) use coll::index_method as coll_index_method;
@@ -198,6 +198,9 @@ pub struct Types {
     /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
     /// the `bool`), with the target type.
     pub derefs: HashMap<(usize, usize), (bool, Ty)>,
+    /// The `deref()` steps before a `derefs` one, where `impl Deref` targets chain (`w.sign` with
+    /// `Outer: Deref<Target = Mid>`, `Mid: Deref<Target = Inner>`): whether each is `deref_mut`.
+    pub deref_steps: HashMap<(usize, usize), Vec<bool>>,
     /// `Trait::m(&x)` / `<T as Trait>::m(..)` calls, by the call's range.
     pub qualified_calls: HashMap<(usize, usize), QualifiedCall>,
     /// Generic functions that call `T::f()` / read `T::CONST` (directly or through another such
@@ -411,6 +414,7 @@ impl<'a> Checker<'a> {
             pending_cell_args: Vec::new(),
             method_keys: Default::default(),
             derefs: Default::default(),
+            deref_steps: Default::default(),
             qualified_calls: Default::default(),
             pending_qualified: Vec::new(),
             cur_fn: None,
@@ -749,6 +753,7 @@ pub fn check(
     let elem_methods = std::mem::take(&mut c.elem_methods);
     let method_keys = std::mem::take(&mut c.method_keys);
     let derefs = std::mem::take(&mut c.derefs);
+    let deref_steps = std::mem::take(&mut c.deref_steps);
     let qualified_calls = std::mem::take(&mut c.qualified_calls);
     let modules = std::mem::take(&mut c.modules);
     let imported = std::mem::take(&mut c.imported);
@@ -803,6 +808,7 @@ pub fn check(
             dyn_nums,
             method_keys,
             derefs,
+            deref_steps,
             qualified_calls,
             dict_params,
             dict_args,
@@ -969,6 +975,7 @@ struct Checker<'a> {
     pending_cell_args: Vec<ast::Expr>,
     method_keys: HashMap<(usize, usize), String>,
     derefs: HashMap<(usize, usize), (bool, Ty)>,
+    deref_steps: HashMap<(usize, usize), Vec<bool>>,
     qualified_calls: HashMap<(usize, usize), QualifiedCall>,
     ptrs: Ptrs,
     quote_vars: HashMap<(usize, usize), QuoteTok>,
@@ -3118,7 +3125,7 @@ impl<'a> Checker<'a> {
         } else if let Some(msg) = self.array_pat_len_error(l, &pat) {
             self.error(pat.syntax(), msg);
         } else if !self.irrefutable_pat(&pat)
-            && !self.or_pat_covers(&pat, &ty)
+            && !self.pat_covers(&pat, &ty)
             && !self.array_pat_fits(l, &pat)
             && !self.array_pat_covers(&pat, &ty, &self.let_dims(l))
             && !self.pat_fits(&pat, &self.let_shape(l))
@@ -3468,8 +3475,9 @@ impl<'a> Checker<'a> {
             if !(self.mut_ref_call(&inner) || self.unwrapped_mut_ref_call(&inner)) {
                 continue;
             }
-            // (Not a number, string, bool or `Option`: that `&mut` needs a slot, which a tuple
-            // element doesn't get yet.)
+            // (A number, string, bool or `Option` gets a slot: `(Some(a), b)` against
+            // `(Some(&mut x), 2)`.)
+            self.bind_slot_option(Some(e), p);
             for ip in p.syntax().descendants().filter_map(ast::IdentPat::cast) {
                 let Some(n) = ip.name() else { continue };
                 let Some(ty) = self.lookup(n.text()).map(|l| l.ty.clone()) else { continue };
@@ -3845,6 +3853,13 @@ impl<'a> Checker<'a> {
             .map(|l| l.arms().collect())
             .unwrap_or_default();
         let mut result: Option<Ty> = None;
+        // Arms coerced to an expected `dyn` (`Some(e)` of two error types as an `Option<&dyn
+        // Error>`): each is checked against it, rather than against the first arm's type.
+        let to_dyn = expected.filter(|t| {
+            let mut dyn_ = false;
+            self.zonk(t).walk(&mut |t| dyn_ |= matches!(t, Ty::Dyn(_)));
+            dyn_
+        });
         for arm in &arms {
             self.scopes.push(HashMap::new());
             if let Some(p) = arm.pat() {
@@ -3854,7 +3869,12 @@ impl<'a> Checker<'a> {
             if let Some(g) = arm.guard().and_then(|g| g.condition()) {
                 self.check(&g, &Ty::Bool);
             }
-            if let Some(body) = arm.expr() {
+            if let Some(to) = to_dyn
+                && let Some(body) = arm.expr()
+            {
+                self.check(&body, to);
+                result = Some(to.clone());
+            } else if let Some(body) = arm.expr() {
                 let hint = result.clone().or_else(|| expected.cloned());
                 let t = self.infer(&body, hint.as_ref());
                 if self.shallow(&t) != Ty::Never {
@@ -3908,12 +3928,14 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Whether a pattern with `|` alternatives covers every value (`let (Ok(n) | Err(n)) = r;`).
-    fn or_pat_covers(&self, p: &ast::Pat, ty: &Ty) -> bool {
-        if !p
-            .syntax()
-            .descendants()
-            .any(|n| ast::OrPat::can_cast(n.kind()))
+    /// Whether a pattern with `|` alternatives or enum variants covers every value (`let (Ok(n) |
+    /// Err(n)) = r;`, `let Ok(n) = r;` with `r: Result<u8, Infallible>`).
+    fn pat_covers(&self, p: &ast::Pat, ty: &Ty) -> bool {
+        if !p.syntax().descendants().any(|n| {
+            ast::OrPat::can_cast(n.kind())
+                || ast::TupleStructPat::can_cast(n.kind())
+                || ast::RecordPat::can_cast(n.kind())
+        })
         {
             return false;
         }
@@ -4125,6 +4147,19 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether no value has type `t`: `!`, or an enum without variants (`Infallible`).
+    fn uninhabited(&self, t: &Ty) -> bool {
+        match self.zonk(t) {
+            Ty::Never => true,
+            Ty::Adt(n, _) => self
+                .adts
+                .defs
+                .get(&n)
+                .is_some_and(|d| d.is_enum && d.variants.is_empty()),
+            _ => false,
+        }
+    }
+
     /// A value not matched by any row (one rendered pattern per column), or None if every value
     /// is matched.
     fn missing(&self, rows: &[Vec<Ap>], tys: &[Ty]) -> Option<Vec<String>> {
@@ -4279,7 +4314,9 @@ impl<'a> Checker<'a> {
                     return Some([vec![head], w].concat());
                 }
                 variants.iter().enumerate().find_map(|(v, variant)| {
-                    if self.adts.cfg_variants.contains(&(n.clone(), v)) {
+                    if self.adts.cfg_variants.contains(&(n.clone(), v))
+                        || variant.fields.iter().any(|f| self.uninhabited(&f.ty))
+                    {
                         return None;
                     }
                     let k = variant.fields.len();
@@ -4332,6 +4369,8 @@ impl<'a> Checker<'a> {
             Family::Result(t, e) => {
                 [(0usize, t, "Ok"), (1, e, "Err")]
                     .into_iter()
+                    // (`Result<T, Infallible>` is always `Ok`.)
+                    .filter(|(_, ty, _)| !self.uninhabited(ty))
                     .find_map(|(v, ty, name)| {
                         let w = self.missing(
                             &specialize(&Ap::Ctor(v, vec![]), 1),

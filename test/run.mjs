@@ -631,6 +631,35 @@ function decodeMappings(mappings) {
   }
 }
 
+// --- a CR LF inside a raw, multi-line or format string: rustc reads it as LF.
+{
+  const name = "CR LF inside string literals";
+  const src = [
+    "fn main() {",
+    '    let r = r"a',
+    'b";',
+    '    let m = "c',
+    'd";',
+    '    let b = r#"x',
+    '  "y""#;',
+    '    println!("{} {} {} {:?}", r.len(), m.len(), b.len(), "e\\r\\nf");',
+    '    println!("p',
+    'q {}", 1);',
+    "}",
+    "",
+  ].join("\r\n");
+  const out = compile(src, "crlf2.rs");
+  if (out.code === null) fail(name, out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+  else {
+    const jsPath = path.join(outDir, "crlf2.mjs");
+    fs.writeFileSync(jsPath, out.code);
+    const { stdout } = await runJs(jsPath);
+    const want = '3 3 7 "e\\r\\nf"\np\nq 1\n';
+    if (stdout !== want) fail(name, `stdout ${JSON.stringify(stdout)}, want ${JSON.stringify(want)}`);
+    else pass(name);
+  }
+}
+
 // --- diagnostics: programs rustc rejects, and the error each must produce (line:col prefix).
 // The `fn main` wrapper is added; bodies start on line 2.
 const rejected = [

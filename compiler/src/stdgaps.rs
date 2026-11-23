@@ -126,6 +126,9 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
             "format_args",
             "env!",
             "concat!",
+            "file!",
+            "line!",
+            "column!",
             "include!",
             "fmt::format",
             "write_fmt",
@@ -228,6 +231,7 @@ pub(crate) fn expand(
     text: &mut String,
     map: &mut OffsetMap,
     resolver: Option<crate::typeck::Resolver>,
+    site: Option<(&str, &str)>,
 ) -> Result<bool, Vec<(usize, usize, String)>> {
     let file = crate::macros::parse_tree(text);
     let imports = std_imports(&file);
@@ -330,13 +334,23 @@ pub(crate) fn expand(
             i = close + 1;
             continue;
         }
+        // ---- `file!()`, `line!()`, `column!()`: where the call is in the source (the outermost
+        // macro call's place inside a `macro_rules!` expansion, as rustc has it).
+        if !after_path
+            && txt(i + 1) == "!"
+            && let Some(v) = location_macro(&toks, i, map, site)
+        {
+            edits.push((start, toks[i + 3].end, v));
+            i += 4;
+            continue;
+        }
         // ---- `concat!("{}: ", "x", 1)` of literals: one string literal, so it can be a format
         // string (`println!(concat!("[{}] ", $msg), ..)`).
         if !after_path
             && name == "concat"
             && txt(i + 1) == "!"
             && let Some(close) = closing(&toks, i + 2)
-            && let Some(v) = concat_literals(&toks[i + 3..close])
+            && let Some(v) = concat_literals(&toks[i + 3..close], map, site)
         {
             edits.push((start, toks[close].end, format!("{v:?}")));
             i = close + 1;
@@ -639,7 +653,7 @@ fn tokens(file: &SourceFile, uses: &[TextRange]) -> Vec<Tok> {
             continue;
         }
         let string =
-            ast::String::cast(t.clone()).and_then(|s| s.value().ok().map(|v| v.to_string()));
+            ast::String::cast(t.clone()).and_then(|s| crate::lineindex::string_value(&s));
         out.push(Tok {
             text: t.text().to_string(),
             kind: t.kind(),
@@ -865,16 +879,31 @@ fn cargo_env(name: &str) -> Option<&'static str> {
 }
 
 /// The text `concat!` makes of its arguments when they're all literals (strings, chars, unsuffixed
-/// numbers, bools), separated by commas.
-fn concat_literals(args: &[Tok]) -> Option<String> {
+/// numbers, bools) or `file!()` / `line!()` / `column!()`, separated by commas.
+fn concat_literals(
+    args: &[Tok],
+    map: &OffsetMap,
+    site: Option<(&str, &str)>,
+) -> Option<String> {
     let mut out = String::new();
-    for (k, t) in args.iter().enumerate() {
-        if k % 2 == 1 {
-            if t.text != "," {
-                return None;
-            }
+    let mut k = 0;
+    while k < args.len() {
+        // (An argument ends at the next `,`; a macro's `$x:expr` comes wrapped in parens.)
+        let mut arg = &args[k..];
+        if let Some(n) = arg.iter().position(|t| t.text == ",") {
+            arg = &arg[..n];
+        }
+        k += arg.len() + 1;
+        while arg.len() > 2 && arg[0].text == "(" && arg[arg.len() - 1].text == ")" {
+            arg = &arg[1..arg.len() - 1];
+        }
+        if arg.len() == 4
+            && let Some((v, _)) = location_value(arg, 0, map, site)
+        {
+            out.push_str(&v);
             continue;
         }
+        let [t] = arg else { return None };
         match t.kind {
             SyntaxKind::STRING => out.push_str(t.string.as_deref()?),
             SyntaxKind::CHAR => out.push(char_value(&t.text)?),
@@ -888,6 +917,40 @@ fn concat_literals(args: &[Tok]) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// `file!()` / `line!()` / `column!()` at `i`, as a literal: the file's name, or the 1-based line or
+/// column (in chars) of the call's place in `src`.
+fn location_macro(
+    toks: &[Tok],
+    i: usize,
+    map: &OffsetMap,
+    site: Option<(&str, &str)>,
+) -> Option<String> {
+    let (v, is_file) = location_value(toks, i, map, site)?;
+    Some(if is_file { format!("{v:?}") } else { format!("{v}u32") })
+}
+
+/// The value of `location_macro`, and whether it is `file!()`'s.
+fn location_value(
+    toks: &[Tok],
+    i: usize,
+    map: &OffsetMap,
+    site: Option<(&str, &str)>,
+) -> Option<(String, bool)> {
+    let (src, filename) = site?;
+    let txt = txt_at(toks, i);
+    if txt(1) != "!" || txt(2) != "(" || txt(3) != ")" {
+        return None;
+    }
+    let at = map.orig(toks[i].start, false).min(src.len());
+    let line_start = src[..at].rfind('\n').map_or(0, |n| n + 1);
+    Some(match txt(0) {
+        "file" => (filename.to_string(), true),
+        "line" => ((src[..at].matches('\n').count() + 1).to_string(), false),
+        "column" => ((src[line_start..at].chars().count() + 1).to_string(), false),
+        _ => return None,
+    })
 }
 
 /// A char literal's value: one character or a simple escape.

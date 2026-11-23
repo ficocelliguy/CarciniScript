@@ -235,7 +235,7 @@ pub fn parse_arg(arg: &MacroArg) -> (Option<ast::Expr>, Vec<(usize, usize, Strin
 /// The value of a format-string argument, if it is a plain string literal.
 pub fn format_string(arg: &MacroArg) -> Option<String> {
     let token = ast::String::cast(arg.single_token.clone()?)?;
-    token.value().ok().map(|v| v.into_owned())
+    crate::lineindex::string_value(&token)
 }
 
 /// A piece of a `quote! { .. }` template.

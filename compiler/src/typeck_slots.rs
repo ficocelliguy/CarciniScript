@@ -1309,6 +1309,15 @@ impl Checker<'_> {
         // (Also `Ok(p)` against a local holding `m.get_mut(k).ok_or(e)`.)
         let (shape, variant) = match scrutinee.and_then(|s| self.option_slot_shape(s)) {
             Some(s) => (s, "Some"),
+            // `Some(&mut x)` itself, of a number, string or `Option` (`let Some(p) = Some(&mut x)
+            // else { .. }`).
+            None if let Some(s) = scrutinee
+                && let ast::Expr::CallExpr(c) = strip_parens(s)
+                && c.expr().is_some_and(|f| f.syntax().text() == "Some")
+                && self.keep_opt_slot(s) =>
+            {
+                (SlotShape::Slot, "Some")
+            }
             None => match scrutinee.and_then(|s| self.result_slot_local(s)) {
                 Some(s) => (s, "Ok"),
                 None => return,
