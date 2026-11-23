@@ -2577,9 +2577,9 @@ pub fn preprocess_with(
     if crate::ufcs::has_prim_paths(&text) {
         changed |= crate::ufcs::expand(&mut text, &mut map);
     }
-    // Nested `fn`s named like another function.
-    if crate::nested::has_duplicate_fns(&text) {
-        changed |= crate::nested::expand(&mut text, &mut map);
+    // Nested items named like another item.
+    if crate::nested::has_duplicate_items(&text) {
+        changed |= crate::nested::expand(&mut text, &mut map, &mut names);
     }
     // `std::path` / `OsStr` / `fmt::Arguments` names, `format_args!`, `env!`, `include!`.
     if crate::stdgaps::has_rewrites(&text) {

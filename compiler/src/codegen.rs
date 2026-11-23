@@ -708,8 +708,8 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
         || src.contains("::")
         // (A module file may use macros of the file that declares it.)
         || (src.contains('!') && !matches!(filename.rsplit('/').next(), Some("main.rs" | "lib.rs")))
-        // (Nested `fn`s that share a name, renamed by `nested.rs`.)
-        || crate::nested::has_duplicate_fns(src)
+        // (Nested items that share a name, renamed by `nested.rs`.)
+        || crate::nested::has_duplicate_items(src)
     {
         let macros = crate::mbe::imported_macros(src, filename, resolver);
         match crate::mbe::preprocess_with(src, &macros, Some((filename, resolver))) {
@@ -3432,6 +3432,15 @@ impl<'a> Codegen<'a> {
             ast::Expr::PathExpr(p) if self.types.slot_args.contains(&self.range_of(p.syntax())) => {
                 let (pf, t) = self.emit_path(p);
                 let mut f = Frag::text("κσ.$cell(() => ");
+                // (`fmt::write(self, args)`: `this` can't be assigned, so a write replaces the
+                // object's contents.)
+                if p.path().is_some_and(|p| p.syntax().text() == "self") {
+                    f.append(pf.clone())
+                        .push(", ($v) => κσ.$replace(")
+                        .append(pf)
+                        .push(", $v))");
+                    return (f, t);
+                }
                 f.append(pf.clone())
                     .push(", ($v) => { ")
                     .append(pf)
@@ -4248,6 +4257,22 @@ impl<'a> Codegen<'a> {
                 f = f.wrap("κσ.$pord(", &format!(", \"{o}\")"));
             }
             return (f.at(self.off(b.syntax())), ty);
+        }
+        // `&a | &b` (`&`, `-`, `^`) on two sets: `κσ.$setOp("|", a, b)`, a new set.
+        if let BinaryOp::ArithOp(
+            o @ (ast::ArithOp::BitOr
+            | ast::ArithOp::BitAnd
+            | ast::ArithOp::Sub
+            | ast::ArithOp::BitXor),
+        ) = op
+            && let Some(lt) = self.raw_ty_of(lhs.syntax())
+            && crate::typeck::is_set(&lt)
+        {
+            let (lf, _) = self.emit_expr(&lhs, None);
+            let (rf, _) = self.emit_expr(&rhs, None);
+            let mut f = Frag::text(format!("κσ.$setOp(\"{o}\", "));
+            f.append(lf).push(", ").append(rf).push(")");
+            return (f.at(self.off(b.syntax())), lt);
         }
         match op {
             // `p = &mut y as *mut i32;` with `p` holding a cell: point it at y's.
@@ -5594,7 +5619,7 @@ impl<'a> Codegen<'a> {
                 .and_then(|s| s.name_ref())
         {
             let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
-            let args = self.emit_args(c.arg_list(), &[]);
+            let mut args = self.emit_args(c.arg_list(), &[]);
             // `T::from(x)` with `T: From<X>`: the class's conversion from `X`.
             // (`T::try_from(x)` with `T: TryFrom<X>`: its `try_from`, or `from` as `Ok`.)
             if let Some(src) = self.types.param_froms.get(&self.range_of(c.syntax())) {
@@ -5607,6 +5632,18 @@ impl<'a> Codegen<'a> {
                 out.append(Frag::join(args, ", ")).push(")");
                 return (out.at(self.off(c.syntax())), ty);
             }
+            // (`T::select::<u8>(x)`: the classes and formatters its impls' bodies need.)
+            if let Some(tys) = self
+                .types
+                .dict_args
+                .get(&self.range_of(c.syntax()))
+                .cloned()
+            {
+                for t in &tys {
+                    args.push(Frag::text(self.dict_of(t)));
+                }
+            }
+            args.extend(self.dbg_arg_frags(c.syntax()));
             let mut out = Frag::text(class);
             out.push(member(f.text()))
                 .push("(")

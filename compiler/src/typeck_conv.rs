@@ -1064,6 +1064,30 @@ impl Checker<'_> {
                 if let Some(sig) = self.adts.method(adt, &i.key).cloned()
                     && sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
                 {
+                    // (`impl<L, R> Add<Complex<R>> for Complex<L>`: `R`, which only the right
+                    // operand names, is a fresh variable.)
+                    let mut own = std::collections::HashMap::new();
+                    for t in sig.params.iter().take(1).chain([&sig.ret]) {
+                        t.walk(&mut |x| {
+                            if let Ty::Param(p) = x
+                                && !sig.impl_args.iter().any(|a| a.mentions_param(p))
+                            {
+                                own.entry(p.clone()).or_insert(Ty::Unknown);
+                            }
+                        });
+                    }
+                    let mut sig = sig;
+                    if !own.is_empty() {
+                        for v in own.values_mut() {
+                            *v = self.fresh(super::VarKind::General);
+                        }
+                        sig.params = sig
+                            .params
+                            .iter()
+                            .map(|p| super::generic::subst(p, &own))
+                            .collect();
+                        sig.ret = super::generic::subst(&sig.ret, &own);
+                    }
                     let sig = self.method_inst(&sig, Some(&targs));
                     self.last_type_args.clear();
                     if let Some(p) = sig.params.first() {

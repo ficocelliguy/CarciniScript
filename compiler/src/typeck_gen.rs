@@ -324,6 +324,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.op_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -481,6 +482,7 @@ impl Checker<'_> {
         // parameter is in scope.
         for (name, lists, _) in type_params(f) {
             self.record_from_bound(&name, &lists);
+            self.record_op_bounds(&name, &lists);
             if self.param_bounds.contains_key(&name) {
                 self.record_bound_args(&name, &lists);
             }
@@ -578,6 +580,62 @@ impl Checker<'_> {
         }
     }
 
+    /// `L: Add<R>` / `L: Add<Output = X>`: the right-hand side `a + b` takes (`R`), and
+    /// `L::Output` (`X`, or else `L` itself: what arithmetic on a `L` yields here, and right for
+    /// numbers and for an `impl Add for V` whose output is `V`).
+    pub(super) fn record_op_bounds(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        if !matches!(self.generics.get(name), Some(Ty::Param(_))) {
+            return;
+        }
+        for b in lists.iter().flat_map(|l| l.bounds()) {
+            let Some(ast::Type::PathType(pt)) = b.ty() else {
+                continue;
+            };
+            let Some(seg) = pt.path().and_then(|p| p.segment()) else {
+                continue;
+            };
+            let Some(tr) = seg.name_ref().map(|n| n.text().to_string()) else {
+                continue;
+            };
+            if crate::adt::op_method(&tr).is_none() || self.adts.traits.contains_key(&tr) {
+                continue;
+            }
+            let mut out = None;
+            for g in seg
+                .generic_arg_list()
+                .into_iter()
+                .flat_map(|l| l.generic_args())
+            {
+                match g {
+                    ast::GenericArg::TypeArg(ta) => {
+                        if let Some(t) = ta.ty() {
+                            let t = self.lower_type(&t);
+                            self.op_args.insert((name.to_string(), tr.clone()), t);
+                        }
+                    }
+                    ast::GenericArg::AssocTypeArg(a)
+                        if a.name_ref().is_some_and(|n| n.text() == "Output") =>
+                    {
+                        out = a.ty().map(|t| self.lower_type(&t));
+                    }
+                    _ => {}
+                }
+            }
+            let key = format!("{name}::Output");
+            match out {
+                Some(t) => {
+                    self.generics.insert(key, t);
+                }
+                None => {
+                    self.generics
+                        .entry(key)
+                        .or_insert_with(|| Ty::Param(name.to_string()));
+                }
+            }
+        }
+    }
+
     /// Record `name`'s user-trait bounds with their arguments.
     pub(super) fn record_bound_args(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
         use ra_ap_syntax::ast::HasGenericArgs;
@@ -629,6 +687,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.op_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -964,20 +1023,6 @@ impl Checker<'_> {
         assign: bool,
     ) -> Ty {
         let shift = matches!(op, ast::ArithOp::Shl | ast::ArithOp::Shr);
-        if shift {
-            // (`T: Shl<u32>`: the amount is any integer, or a `T`.)
-            let rt = self.infer(rhs, None);
-            if !self.is_integer(&rt) && !matches!(self.shallow(&rt), Ty::Param(_)) {
-                let msg = format!(
-                    "no implementation for `{} {op} {}`",
-                    self.describe(lt),
-                    self.describe(&rt)
-                );
-                self.error(rhs.syntax(), msg);
-            }
-        } else {
-            self.check(rhs, lt);
-        }
         let bound = match op {
             ast::ArithOp::Add => "Add",
             ast::ArithOp::Sub => "Sub",
@@ -995,6 +1040,27 @@ impl Checker<'_> {
         } else {
             bound.to_string()
         };
+        // `L: Add<R>`: the right-hand side is an `R`.
+        if let Some(want) = self
+            .op_args
+            .get(&(name.to_string(), bound.clone()))
+            .cloned()
+        {
+            self.check(rhs, &want);
+        } else if shift {
+            // (`T: Shl<u32>`: the amount is any integer, or a `T`.)
+            let rt = self.infer(rhs, None);
+            if !self.is_integer(&rt) && !matches!(self.shallow(&rt), Ty::Param(_)) {
+                let msg = format!(
+                    "no implementation for `{} {op} {}`",
+                    self.describe(lt),
+                    self.describe(&rt)
+                );
+                self.error(rhs.syntax(), msg);
+            }
+        } else {
+            self.check(rhs, lt);
+        }
         let sym = if assign {
             format!("`{op}=`")
         } else {
@@ -1004,7 +1070,10 @@ impl Checker<'_> {
         // Division and shifts depend on the number kind (integer division, the width).
         let needs_kind = shift || matches!(op, ast::ArithOp::Div | ast::ArithOp::Rem);
         self.param_class(name, b.syntax(), needs_kind.then_some(sym.as_str()));
-        lt.clone()
+        match self.generics.get(&format!("{name}::Output")) {
+            Some(out) if !assign => out.clone(),
+            _ => lt.clone(),
+        }
     }
 
     /// Methods on a value of type parameter `T`.

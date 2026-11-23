@@ -1388,8 +1388,9 @@ impl Codegen<'_> {
             );
         }
         // `impl Add for V` (with `V` on the right) and friends as `$op$add`: what generic
-        // arithmetic on a `T` calls (`κσ.$gop`). A shift also takes an integer amount
-        // (`impl Shl<u32> for Bits`, for `T: Shl<u32>`): with both, the amount's JS type picks.
+        // arithmetic on a `T` calls (`κσ.$gop`). One with a number on the right (`impl Shl<u32> for
+        // Bits`, `impl Mul<f64> for V2`, for `T: Mul<f64>`) serves too: with both, the right
+        // operand's JS type picks. So does the only impl of its trait (`Add<Complex<R>>`).
         let ops: Vec<(String, String, bool)> = self
             .types
             .adts
@@ -1400,9 +1401,9 @@ impl Codegen<'_> {
                     .filter_map(|i| {
                         let own = matches!(&i.rhs, Ty::Adt(n, _) if *n == def.name)
                             || matches!(i.trait_name.as_str(), "Neg" | "Not");
-                        let int = matches!(i.rhs, Ty::Int(_))
-                            && i.trait_name.starts_with("Sh");
-                        if !(own || int) {
+                        let int = matches!(i.rhs, Ty::Int(_) | Ty::Float { .. });
+                        let sole = v.iter().filter(|j| j.trait_name == i.trait_name).count() == 1;
+                        if !(own || int || sole) {
                             return None;
                         }
                         Some((

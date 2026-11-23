@@ -510,6 +510,10 @@ There is one JS thread, and scripts share it with the game.
   rustc; through an `impl<S: Shape>`'s parameter in a method, or `dyn Shape`, it matches any
   type. An associated type a `where` clause constrains (`where S::Unit: PartialEq<T>`), or one
   of a trait with a blanket impl, is unchecked rather than given those bounds.
+- **An operator bound's `Output` is the parameter itself.** With `L: Add<R>` (or a plain
+  `T: Add`) and no `Output = X`, `L::Output` and `a + b` are an `L`, so `let x: L = a + b;`
+  compiles where rustc wants `L::Output`. The values are right whenever the impl's output is its
+  own type, as for numbers.
 
 ## Traits on built-in types
 

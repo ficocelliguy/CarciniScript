@@ -703,7 +703,9 @@ impl<'a> Env<'a> {
                 Some(l) => self.named_region(body, tenv, l),
             }
         };
-        match name.as_str() {
+        // (The file's own types and type parameters first: an `enum Entry<'a>` isn't std's.)
+        let own = self.adt_syn.contains_key(&name) || tenv.params.contains_key(&name);
+        match if own { "" } else { name.as_str() } {
             "String" => RTy::String,
             "str" => RTy::Str,
             "Vec" | "VecDeque" | "BinaryHeap" | "LinkedList" | "SmallVec" => {

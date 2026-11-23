@@ -514,6 +514,35 @@ impl Checker<'_> {
             let assoc = recv_args.is_none() && m.receiver.is_none();
             self.bind_impl_arg(ia, arg.as_ref(), &mut map, assoc);
         }
+        // `-> F::Container` with `where F: KeyMethod<Key, I>` on the method: settled once `F` is
+        // known, from its impl of the one trait that declares `Container`.
+        let mut projs: Vec<String> = Vec::new();
+        for t in m.params.iter().chain([&m.ret]) {
+            t.walk(&mut |x| {
+                if let Ty::Param(p) = x
+                    && let Some((s, _)) = p.split_once("::")
+                    && map.contains_key(s)
+                    && !projs.contains(p)
+                {
+                    projs.push(p.clone());
+                }
+            });
+        }
+        for p in projs {
+            let (s, a) = p.split_once("::").unwrap_or_default();
+            let declaring: Vec<&String> = self
+                .adts
+                .traits
+                .iter()
+                .filter(|(_, d)| d.assoc_types.iter().any(|x| x == a))
+                .map(|(n, _)| n)
+                .collect();
+            let [tr] = declaring.as_slice() else { continue };
+            let (tr, a, sv) = ((*tr).clone(), a.to_string(), map[s].clone());
+            let x = self.fresh(VarKind::General);
+            self.pending_projections.push((sv, tr, a, x.clone()));
+            map.insert(p, x);
+        }
         if map.is_empty() {
             return m.clone();
         }
@@ -720,6 +749,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.op_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -819,6 +849,7 @@ impl Checker<'_> {
                     lists.push(l);
                 }
             }
+            self.record_op_bounds(&n, &lists);
             self.record_bound_args(&n, &lists);
             // `impl<F, T> Memo<F, T> where F: Fn(u64) -> T`: `F` is a closure type (once every
             // parameter it names is declared).
@@ -869,6 +900,10 @@ impl Checker<'_> {
                             self.fn_ptr_fields
                                 .insert((variant_name.to_string(), name.clone()));
                         }
+                        if f.ty().as_ref().is_some_and(super::written_mut_ref_type) {
+                            self.mut_borrow_fields
+                                .insert((variant_name.to_string(), name.clone()));
+                        }
                         // `n: &'a mut i32`: the field holds a slot over the borrowed place.
                         if f.ty().as_ref().is_some_and(super::written_mut_ref_type)
                             && self.cellable(&ty)
@@ -915,6 +950,10 @@ impl Checker<'_> {
                         }
                         if f.ty().as_ref().is_some_and(fn_ptr_type) {
                             self.fn_ptr_fields
+                                .insert((variant_name.to_string(), i.to_string()));
+                        }
+                        if f.ty().as_ref().is_some_and(super::written_mut_ref_type) {
+                            self.mut_borrow_fields
                                 .insert((variant_name.to_string(), i.to_string()));
                         }
                         if f.ty().as_ref().is_some_and(super::written_mut_ref_type)
@@ -1640,6 +1679,21 @@ impl Checker<'_> {
                         .insert(key, method);
                     continue;
                 }
+                // `impl<L, R> Either<&L, &R> { fn cloned }` next to `Either<&mut L, &mut R>`:
+                // references are erased, so the two are one instantiation here and the first
+                // serves.
+                let written_ref = imp.self_ty().is_some_and(|t| {
+                    t.syntax()
+                        .descendants()
+                        .any(|d| ast::RefType::can_cast(d.kind()))
+                });
+                if written_ref
+                    && keys
+                        .iter()
+                        .any(|k| existing.get(k).is_some_and(|m| m.impl_args == impl_args))
+                {
+                    continue;
+                }
             }
             let key = format!("{type_name}::{}", name.text());
             if unknown_trait {
@@ -1671,6 +1725,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.op_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -1939,6 +1994,7 @@ impl Checker<'_> {
             self.generics.clear();
             self.param_bounds.clear();
             self.param_trait_args.clear();
+            self.op_args.clear();
             self.lenient_projs.clear();
             self.const_tys.clear();
             self.from_args.clear();

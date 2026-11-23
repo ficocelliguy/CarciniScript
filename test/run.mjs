@@ -1765,6 +1765,20 @@ for (const [label, body, want, wantHelp] of rejectedNs) {
   else pass(name);
 }
 
+// A write through a `&mut` field needs no `mut` on the binding; borrowing the field itself, or
+// a field that isn't a reference, does (each confirmed with rustc).
+{
+  const name = "rejects: `&mut` of a field, not a write through a `&mut` field";
+  const src =
+    "struct T { items: Vec<u8> }\nstruct S<'a> { table: &'a mut T }\nfn f(s: S) {\n    s.table.items.push(1);\n}\n" +
+    "fn g(s: S) {\n    let r = &mut s.table;\n    r.items.clear();\n}\nfn h(t: T) {\n    t.items.push(1);\n}\n";
+  const out = compile(src, "bad.rs");
+  const msgs = out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`);
+  const want = ["7:18 cannot borrow `s` as mutable", "11:5 cannot borrow `t` as mutable"];
+  if (msgs.length !== 2 || want.some((w, i) => !msgs[i].startsWith(w))) fail(name, `want: ${want.join(", ")}\ngot:\n${msgs.join("\n")}`);
+  else pass(name);
+}
+
 // --- results kept across calls: the same text compiled (or analyzed) again after a `mod` file,
 // the bindings or a setting changed must see the change.
 {

@@ -239,14 +239,18 @@ see FEATURES.md).
       Self::P; }` then `T::make().map(..)` ("no method `map` for type parameter `Fac::P`"),
       `where <T as Fac>::P: Parser`, `I: Tr<Error = X>` then methods of `I::Iter`, and `type P =
       T::P;` in an impl ("cannot find type `P`") (13 files).
-    - [ ] A generic trait bound on the impl's type parameter given in a method's `where`
+    - [x] A generic trait bound on the impl's type parameter given in a method's `where`
       clause: `impl<Key, F> Meta<Key, F> { fn filter<I>(&mut self, item: I) -> F::Container
       where F: KeyMethod<Key, I> { self.key_method.make(item) } }` (both the projection and
-      the method are missing; 7 files with the trait in the same file).
+      the method are missing; 7 files with the trait in the same file). Now a call's
+      `F::Container` is settled from the receiver's `F` and its impl of the one trait declaring
+      `Container` (`typeck_adt.rs` `method_inst`; `fixtures/method_where_projection.rs`).
     - [ ] A trait's own generic method called through a type parameter (`O::select::<u8>(x)`
       with `O: Order`) instantiates the method's type parameters, but doesn't check their own
-      bounds, and one that needs a class (`R: Default`) gets none (`typeck.rs`
-      `param_static_call`).
+      bounds (`typeck.rs` `param_static_call`).
+    - [x] The same call passing a class to an impl that needs one (`R: Default`). Now it is a
+      generic call of `Order::select`, which takes the classes and formatters any impl's
+      `select` takes (`finish_needs`; `fixtures/trait_static_generic_dicts.rs`).
     - [x] `match` arms returning `Some(e)` for different error types as `Option<&(dyn Error +
       'static)>` (`Error::source`, 5 files): "`match` arms have incompatible types: expected
       `Option<A>`, found `Option<B>`"; the expected return type doesn't reach the arms.
@@ -255,13 +259,18 @@ see FEATURES.md).
     - [ ] Inference of a struct's type argument from the one impl of a bound (`Auto::always(
       Vec::new())` with `impl RawStream for Vec<u8>` the only impl): "type annotations needed".
   - Names and items:
-    - [ ] Items declared inside function bodies share the file's namespace: two functions each
+    - [x] Items declared inside function bodies share the file's namespace: two functions each
       declaring `enum State` / `struct Acc` collide ("defined multiple times"), and the first
       function then resolves `State::X` and `Acc(..)` against the second's items (19 files).
-    - [ ] Inherent impls on reference instantiations collide: `impl<L, R> Either<&L, &R> { fn
-      cloned }` and `impl<L, R> Either<&mut L, &mut R> { fn cloned }`. Impls per type argument
-      (`impl W<u8>` / `impl W<u16>`) and per const argument work, but their associated consts
-      collide (`impl Cell<u8> { const MIN: u8 }` + `impl Cell<i32> { const MIN: i32 }`, generated
+      Now `nested.rs` renames any nested item whose name is taken (`State__2`), as it did
+      nested `fn`s, with `{:?}` keeping the written name (`fixtures/nested_item_names.rs`).
+    - [x] Inherent impls on reference instantiations collide: `impl<L, R> Either<&L, &R> { fn
+      cloned }` and `impl<L, R> Either<&mut L, &mut R> { fn cloned }`. Now the second is
+      dropped when its methods match the first's (references are erased, so they are one
+      instantiation; `fixtures/ref_instantiation_impls.rs`).
+    - [ ] Impls per type argument (`impl W<u8>` / `impl W<u16>`) and per const argument work,
+      but their associated consts collide (`impl Cell<u8> { const MIN: u8 }` + `impl Cell<i32>
+      { const MIN: i32 }`, generated
       by macros in bitvec, crossbeam, jiff; 28 files + 5 macro-only).
     - [ ] `pub use self::m::{f, T};` re-exporting a *function* of an inline module ("cannot find
       function `f`"), and a re-exported type whose name std or a bundled crate also has
@@ -276,9 +285,13 @@ see FEATURES.md).
   - Borrow checker, E0596 "not declared as mutable" where rustc accepts (about 50 files; the
     other E0596 hits are `*val = ..` on a loop variable whose iterator type is unknown, and raw
     pointers):
-    - [ ] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
+    - [x] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
       &'a mut u8 { self.table.items.push(..) }` with `table: &'a mut Table`, and `Entry::Occupied(
-      entry) => &mut entry.v.values[i]` (hashbrown, clap).
+      entry) => &mut entry.v.values[i]` (hashbrown, clap). Now a place through a field
+      written `&mut T` needs no `mut` (`typeck.rs` `through_mut_field`), and the borrow checker
+      takes the file's own `Entry` (or `Iter`, `Ref`, ..) for itself, not std's
+      (`nll_rty.rs` `path_rty`; `fixtures/mut_field_writes.rs`). Still not caught:
+      `s.table = t` on a binding that isn't `mut` (rustc's E0594).
     - [x] A `&mut` binding of a number, string or `Option` from a tuple pattern or `let`-`else`
       (`let (Some(a), b) = (Some(&mut x), 2)` with `x: i32`, also `let Some(p) = Some(&mut x)
       else`), which needs a slot. The same for a `Vec` element or struct works
@@ -302,8 +315,12 @@ see FEATURES.md).
   - std surface found through these messages (for the std column, not language work):
     `From<T> for OnceCell<T>` / `OnceCell::from`, `Cow<[u8]>: From<Vec<u8>>`,
     `OsString::push(&Path)` / `push(&str)` (`OsString` is a `String` here and `push` takes a
-    `char`), `Debug` for `slice::Iter` in a derive, `write_fmt` overridden in an `io::Write` /
-    `fmt::Write` impl ("not a member of trait"), `&a | &b` on `HashSet`.
+    `char`), `Debug` for `slice::Iter` in a derive.
+    - [x] `write_fmt` overridden in an `io::Write` / `fmt::Write` impl ("not a member of
+      trait"), and `fmt::write(self, args)` inside it. Now both prelude traits have a
+      `write_fmt` that `write!` goes through (`io_prelude.rs`; `fixtures/write_fmt_overrides.rs`).
+    - [x] `&a | &b` (also `&`, `-`, `^`) on `HashSet` / `BTreeSet`. Now a new set of clones
+      (`κσ.$setOp`; `fixtures/set_operators.rs`).
   - Still mixed, to triage next: the "mismatched types" buckets (two named types that don't
     match, about 90 files outside macros). Samples are std modeling (`Cow<'a, str>` seen as
     `Cow<String>`, `OsStr::to_owned()` as `String`), clap's derive attributes on variants
@@ -367,10 +384,15 @@ comes from is in parentheses.
 
 **Open, compiler:**
 
-- [ ] `L::Output` of a std operator-trait bound (Programming Rust `complex`: `impl<L, R>
+- [x] `L::Output` of a std operator-trait bound (Programming Rust `complex`: `impl<L, R>
   Add<Complex<R>> for Complex<L> where L: Add<R> { type Output = Complex<L::Output>; .. }`; also
   `fn add<L: Add<R>, R>(a: L, b: R) -> L::Output { a + b }`): "cannot find type `Output`", then
-  "expected `L`, found `R`". `T: Add<Output = T>` works.
+  "expected `L`, found `R`". `T: Add<Output = T>` works. Now `L: Add<R>` makes the right
+  operand an `R` and `L::Output` an `L` (or the bound's `Output = X`): right for numbers and
+  for an impl whose output is its own type, lenient where rustc's differs (`typeck_gen.rs`
+  `record_op_bounds`); an impl's parameter only the right operand names is fresh per use, and
+  generic arithmetic reaches `impl Mul<f64> for V2` and a type's only impl of an operator
+  (`fixtures/op_bound_output.rs`).
 - [x] `file!()` / `line!()` inside a `concat!` format string (`println!(concat!("{}:{}: ",
   $msg), file!(), line!())` works; `concat!(file!(), ": {}")` doesn't): `concat!` is only
   folded when all its parts are literals (`stdgaps.rs` `concat_literals`).

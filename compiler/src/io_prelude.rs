@@ -126,9 +126,13 @@ pub trait IoWrite {
         }
         Ok(())
     }
-    // What `write!` / `writeln!` call.
+    // (`fmt::Arguments` is a `String` here.)
+    fn write_fmt(&mut self, args: String) -> Result<(), IoError> {
+        self.write_all(args.as_bytes())
+    }
+    // What `write!` / `writeln!` call: `write_fmt`, which an impl may override.
     fn __write_str(&mut self, s: &str) -> Result<(), IoError> {
-        self.write_all(s.as_bytes())
+        self.write_fmt(s.to_string())
     }
     // (Every buffer is written, as `Vec<u8>` and `Stdout` do.)
     fn write_vectored(&mut self, bufs: &[IoIoSlice]) -> Result<usize, IoError> {
@@ -184,10 +188,20 @@ pub trait FmtWrite {
     fn write_char(&mut self, c: char) -> std::fmt::Result {
         self.write_str(&c.to_string())
     }
-    // What `write!` / `writeln!` call.
-    fn __write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.write_str(s)
+    // (`fmt::Arguments` is a `String` here.)
+    fn write_fmt(&mut self, args: String) -> std::fmt::Result {
+        self.write_str(&args)
     }
+    // What `write!` / `writeln!` call: `write_fmt`, which an impl may override.
+    fn __write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write_fmt(s.to_string())
+    }
+}
+
+/// `fmt::write(w, args)`: the text, through `w`'s `write_str` (not its `write_fmt`, which an
+/// override calls this from).
+pub fn __fmt_write<W: FmtWrite>(w: &mut W, args: String) -> std::fmt::Result {
+    w.write_str(&args)
 }
 
 /// `std::io::Stdout` (and its lock): what's written is printed.

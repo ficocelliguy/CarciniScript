@@ -131,6 +131,7 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
             "column!",
             "include!",
             "fmt::format",
+            "fmt::write(",
             "write_fmt",
             "NonZero",
             "dyn FmtWrite",
@@ -354,6 +355,20 @@ pub(crate) fn expand(
         {
             edits.push((start, toks[close].end, format!("{v:?}")));
             i = close + 1;
+            continue;
+        }
+        // ---- `fmt::write(w, args)`: the prelude's `__fmt_write`, its `write_str` of the text.
+        if name == "write"
+            && i >= 2
+            && txt(i - 1) == "::"
+            && txt(i - 2) == "fmt"
+            && txt(i + 1) == "("
+        {
+            let q = qualifier_start(&toks, i);
+            if q.1 {
+                edits.push((toks[q.0].start, end, "__fmt_write".into()));
+            }
+            i += 1;
             continue;
         }
         // ---- `fmt::format(args)`: the string itself.

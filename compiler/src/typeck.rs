@@ -407,6 +407,7 @@ impl<'a> Checker<'a> {
             slot_cell_args: Default::default(),
             fn_cell_args: Default::default(),
             mut_ref_fields: Default::default(),
+            mut_borrow_fields: Default::default(),
             class_dispatch: Default::default(),
             elem_methods: Default::default(),
             dyn_num_coercions: Vec::new(),
@@ -460,6 +461,7 @@ impl<'a> Checker<'a> {
             assoc_output: None,
             impl_assoc: HashMap::new(),
             param_trait_args: HashMap::new(),
+            op_args: HashMap::new(),
             lenient_projs: Default::default(),
             pending_projections: Vec::new(),
             pending_trait_args: Vec::new(),
@@ -962,6 +964,9 @@ struct Checker<'a> {
     slot_cell_args: std::collections::HashSet<(usize, usize)>,
     fn_cell_args: std::collections::HashSet<(usize, usize)>,
     pub(super) mut_ref_fields: std::collections::HashSet<(String, String)>,
+    /// Every field written `&mut T` (`table: &'a mut Table`), by (struct, field): a write
+    /// through one needs no `mut` on the binding that holds the struct.
+    pub(super) mut_borrow_fields: std::collections::HashSet<(String, String)>,
     pub(super) class_dispatch: std::collections::HashSet<(usize, usize)>,
     pub(super) elem_methods: std::collections::HashSet<String>,
     /// Number-typed expressions checked against a `dyn Trait`, with that trait (see `dyn_nums`).
@@ -1071,6 +1076,9 @@ struct Checker<'a> {
     pub(super) impl_assoc: HashMap<String, Ty>,
     /// Each type parameter's user-trait bounds with their arguments: (positional, `Unit = X`).
     pub(super) param_trait_args: HashMap<String, BoundArgs>,
+    /// The right-hand sides of std operator bounds, by (parameter, trait): `L: Add<R>` is
+    /// (`L`, `Add`) → `R`.
+    pub(super) op_args: HashMap<(String, String), Ty>,
     /// Projections a `where` clause constrains (`where I::Item: PartialEq<T>`): unchecked.
     pub(super) lenient_projs: std::collections::HashSet<String>,
     /// Generic calls' projections waiting for their type argument: (`S`'s variable, trait,
@@ -4587,10 +4595,11 @@ impl<'a> Checker<'a> {
                 let Some(inner) = r.expr() else {
                     return Ty::Unknown;
                 };
+                let t = self.infer(&inner, expected);
+                // (After the place is typed: `through_mut_field` reads its fields' owners.)
                 if r.mut_token().is_some() {
                     self.check_mutable(&inner, Mutation::Borrow);
                 }
-                let t = self.infer(&inner, expected);
                 // `&mut v[a..b]`: a view of that part of `v`.
                 if r.mut_token().is_some()
                     && let ast::Expr::IndexExpr(ix) = strip_parens(&inner)
@@ -5490,6 +5499,53 @@ impl<'a> Checker<'a> {
         matches!(self.shallow(&t), Ty::Map(..))
     }
 
+    /// Whether the place `e` is reached through a field written `&mut T` (`self.table.items`
+    /// with `table: &'a mut Table`): a write there goes through the reference, so the binding
+    /// needn't be `mut`. (Assigning the field itself, `self.table = t`, still needs it.)
+    fn through_mut_field(&self, e: &ast::Expr, how: Mutation) -> bool {
+        // (`&mut s.table` borrows the field itself, which does need it.)
+        let explicit = e
+            .syntax()
+            .parent()
+            .and_then(ast::RefExpr::cast)
+            .is_some_and(|r| r.mut_token().is_some());
+        let mut cur = strip_parens(e);
+        let mut outermost = true;
+        loop {
+            cur = match &cur {
+                ast::Expr::FieldExpr(f) => {
+                    let Some(base) = f.expr() else { return false };
+                    let base = strip_parens(&base);
+                    let field = f
+                        .name_ref()
+                        .map(|n| n.text().to_string())
+                        .or_else(|| f.index_token().map(|t| t.text().to_string()));
+                    if let (Some(field), Some(Ty::Adt(adt, _))) = (
+                        field,
+                        self.raw
+                            .get(&self.range(base.syntax()))
+                            .map(|t| self.zonk(t)),
+                    ) && self.mut_borrow_fields.contains(&(adt, field))
+                        && !(outermost && (how == Mutation::Assign || explicit))
+                    {
+                        return true;
+                    }
+                    base
+                }
+                ast::Expr::IndexExpr(ix) => match ix.base() {
+                    Some(b) => strip_parens(&b),
+                    None => return false,
+                },
+                ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => match p.expr() {
+                    Some(b) => strip_parens(&b),
+                    None => return false,
+                },
+                _ => return false,
+            };
+            outermost = false;
+        }
+    }
+
     /// rustc's mutability rules for assigning to or mutably borrowing a place.
     fn check_mutable(&mut self, e: &ast::Expr, how: Mutation) {
         // A write through `v[a..b]` would only change a copy, except for the in-place slice
@@ -5534,6 +5590,9 @@ impl<'a> Checker<'a> {
         // `t.1.push('b')` with `t.1: &mut String`: borrowed through the reference.
         if how != Mutation::Assign && self.slot_values.contains(&self.range(strip_parens(e).syntax()))
         {
+            return;
+        }
+        if self.through_mut_field(e, how) {
             return;
         }
         let Some((name, through)) = Self::place_root(e) else {
@@ -5750,6 +5809,16 @@ impl<'a> Checker<'a> {
                 let lt = self.infer(&lhs, expected);
                 if let Ty::Param(n) = self.shallow(&lt) {
                     return self.param_arith(b, op, &n, &lt, &rhs, false);
+                }
+                // `&a | &b` (`&`, `-`, `^`) on two sets: a new set.
+                if is_set(&self.shallow(&lt))
+                    && matches!(
+                        op,
+                        ArithOp::BitOr | ArithOp::BitAnd | ArithOp::Sub | ArithOp::BitXor
+                    )
+                {
+                    self.check(&rhs, &lt);
+                    return lt;
                 }
                 self.arith_operands(b, op, &lt, &rhs)
             }
@@ -10088,13 +10157,13 @@ impl Checker<'_> {
             self.note_dict(param, c.syntax());
             return Some(pty);
         }
-        let sig = bounds.iter().find_map(|b| {
+        let (tr, sig) = bounds.iter().find_map(|b| {
             let d = self.adts.traits.get(b)?;
             let tm = d
                 .methods
                 .iter()
                 .find(|m| m.name == f && m.sig.receiver.is_none())?;
-            Some(tm.sig.clone())
+            Some((b.clone(), tm.sig.clone()))
         })?;
         let mut sub: HashMap<String, Ty> = [("Self".to_string(), pty)].into();
         // The method's own type parameters (`fn select<R: Copy>(r: R) -> R`): the turbofish's
@@ -10117,6 +10186,16 @@ impl Checker<'_> {
                 None => self.fresh(VarKind::General),
             };
             sub.insert(p.clone(), t);
+        }
+        // (Its own parameters' classes, which an impl's body may need (`R::default()`), go with
+        // the call as `Tr::f`'s: see `finish_needs`.)
+        if !sig.type_params.is_empty()
+            && let Some(caller) = self.cur_fn.clone()
+        {
+            let r = self.range(c.syntax());
+            let targs = sig.type_params.iter().map(|p| sub[p].clone()).collect();
+            self.generic_calls
+                .push((r, caller, format!("{tr}::{f}"), targs));
         }
         let sig = traits::subst_method(&sig, &sub);
         self.arg_count(c.syntax(), "function", sig.params.len(), args.len());
@@ -10206,6 +10285,17 @@ impl Checker<'_> {
                 .adts
                 .method(ty, m)
                 .map(|s| s.dict_names())
+                // (Or a trait's, called through a type parameter: `T::select::<u8>(x)`.)
+                .or_else(|| {
+                    let tm = self
+                        .adts
+                        .traits
+                        .get(ty)?
+                        .methods
+                        .iter()
+                        .find(|t| t.name == m)?;
+                    Some(tm.sig.dict_names())
+                })
                 .unwrap_or_default(),
             // A function: its type parameters, then their projections (`S::Unit`), in the
             // order `instantiate` gives them variables.
@@ -10487,6 +10577,25 @@ impl Checker<'_> {
         loop {
             let mut grew = false;
             let mut uses: Vec<(String, String)> = Vec::new();
+            // A trait's function called through a type parameter takes the classes any impl's
+            // takes.
+            for (_, _, callee, _) in &self.generic_calls {
+                let Some((tr, m)) = callee.split_once("::") else {
+                    continue;
+                };
+                if !self.adts.traits.contains_key(tr) || self.adts.method(tr, m).is_some() {
+                    continue;
+                }
+                for n in param_names(self, callee) {
+                    let any = self.adts.trait_impls.iter().any(|(ty, trs)| {
+                        trs.iter().any(|t| t == tr)
+                            && needs.contains(&(format!("{ty}::{m}"), n.clone()))
+                    });
+                    if any {
+                        uses.push((callee.clone(), n));
+                    }
+                }
+            }
             for (_, caller, callee, targs) in &self.generic_calls {
                 let names = param_names(self, callee);
                 for (i, n) in names.iter().enumerate() {
@@ -10973,4 +11082,9 @@ fn strip_unwraps(e: &ast::Expr) -> (ast::Expr, bool) {
         e = strip_parens(&inner);
         stripped = true;
     }
+}
+
+/// A `HashSet` or `BTreeSet` (the operands of `&a | &b`).
+pub fn is_set(t: &Ty) -> bool {
+    matches!(t, Ty::Set(_) | Ty::Coll(crate::ty::Coll::BTreeSet, _))
 }

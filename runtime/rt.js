@@ -4957,6 +4957,14 @@
       }
       return t;
     },
+    // `&a | &b` (and `&`, `-`, `^`) on two sets: a new set of the same kind, of clones.
+    $setOp(op, a, b) {
+      const m =
+        op === "|" ? "$union" : op === "&" ? "$intersection" : op === "-" ? "$difference" : "$symmetricDifference";
+      const s = new a.constructor();
+      for (const x of a[m](b)) s.$insert(clone(x));
+      return s;
+    },
     // `a + b` (and `-`, `*`, `/`, `%`) where `a: T`: a struct's own operator, else arithmetic
     // as `T`'s kind does it (integer division truncates and panics on zero, results wrap).
     $gop(op, a, b, T, loc) {
