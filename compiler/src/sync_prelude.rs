@@ -127,6 +127,14 @@ impl<T> OnceCell<T> {
     }
 }
 
+impl<T> From<T> for OnceLock<T> {
+    fn from(value: T) -> OnceLock<T> {
+        OnceLock {
+            __v: std::cell::RefCell::new(Some(value)),
+        }
+    }
+}
+
 impl<T> Default for OnceLock<T> {
     fn default() -> OnceLock<T> {
         OnceLock::new()
@@ -146,6 +154,14 @@ impl<T: std::fmt::Debug> std::fmt::Debug for OnceLock<T> {
         match self.get() {
             Some(v) => write!(f, "OnceLock({:?})", v),
             None => write!(f, "OnceLock(<uninit>)"),
+        }
+    }
+}
+
+impl<T> From<T> for OnceCell<T> {
+    fn from(value: T) -> OnceCell<T> {
+        OnceCell {
+            __v: std::cell::RefCell::new(Some(value)),
         }
     }
 }

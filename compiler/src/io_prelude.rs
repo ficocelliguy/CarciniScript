@@ -204,13 +204,31 @@ pub fn __fmt_write<W: FmtWrite>(w: &mut W, args: String) -> std::fmt::Result {
     w.write_str(&args)
 }
 
-/// `std::io::Stdout` (and its lock): what's written is printed.
+/// `std::io::Stdout`: what's written is printed.
 #[derive(Clone)]
 pub struct IoStdout {}
 
 impl IoStdout {
-    pub fn lock(&self) -> IoStdout {
-        IoStdout {}
+    pub fn lock(&self) -> IoStdoutLock {
+        IoStdoutLock {}
+    }
+}
+
+/// `std::io::StdoutLock`: its own type, for an impl on both.
+#[derive(Clone)]
+pub struct IoStdoutLock {}
+
+impl IoWrite for IoStdoutLock {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        print!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+    fn __write_str(&mut self, s: &str) -> Result<(), IoError> {
+        print!("{}", s);
+        Ok(())
     }
 }
 
@@ -228,13 +246,31 @@ impl IoWrite for IoStdout {
     }
 }
 
-/// `std::io::Stderr` (and its lock).
+/// `std::io::Stderr`.
 #[derive(Clone)]
 pub struct IoStderr {}
 
 impl IoStderr {
-    pub fn lock(&self) -> IoStderr {
-        IoStderr {}
+    pub fn lock(&self) -> IoStderrLock {
+        IoStderrLock {}
+    }
+}
+
+/// `std::io::StderrLock`: its own type, for an impl on both.
+#[derive(Clone)]
+pub struct IoStderrLock {}
+
+impl IoWrite for IoStderrLock {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        eprint!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+    fn __write_str(&mut self, s: &str) -> Result<(), IoError> {
+        eprint!("{}", s);
+        Ok(())
     }
 }
 
@@ -284,13 +320,30 @@ impl<W: IoWrite> IoWrite for IoBufWriter<W> {
     }
 }
 
-/// `std::io::Stdin` (and its lock): at its end, as a script has no input.
+/// `std::io::Stdin`: at its end, as a script has no input.
 #[derive(Clone)]
 pub struct IoStdin {}
 
+/// `std::io::StdinLock`: its own type (a `BufRead`), for an impl on both.
+#[derive(Clone)]
+pub struct IoStdinLock {}
+
+impl IoRead for IoStdinLock {
+    fn read(&mut self, _buf: &mut [u8]) -> Result<usize, IoError> {
+        Ok(0)
+    }
+}
+
+impl IoBufRead for IoStdinLock {
+    fn fill_buf(&mut self) -> Result<Vec<u8>, IoError> {
+        Ok(Vec::new())
+    }
+    fn consume(&mut self, _amt: usize) {}
+}
+
 impl IoStdin {
-    pub fn lock(&self) -> IoStdin {
-        IoStdin {}
+    pub fn lock(&self) -> IoStdinLock {
+        IoStdinLock {}
     }
     /// Reads nothing: `Ok(0)` is the end of the input.
     pub fn read_line(&self, _buf: &mut String) -> Result<usize, IoError> {

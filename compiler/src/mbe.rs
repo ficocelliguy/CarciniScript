@@ -2577,6 +2577,10 @@ pub fn preprocess_with(
     if crate::ufcs::has_prim_paths(&text) {
         changed |= crate::ufcs::expand(&mut text, &mut map);
     }
+    // Associated consts per instantiation (`impl Cell<u8>` / `impl Cell<i32>`, each with `MIN`).
+    if crate::inst_consts::has_instantiation_consts(&text) {
+        changed |= crate::inst_consts::expand(&mut text, &mut map);
+    }
     // Nested items named like another item.
     if crate::nested::has_duplicate_items(&text) {
         changed |= crate::nested::expand(&mut text, &mut map, &mut names);

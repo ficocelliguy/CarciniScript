@@ -1170,10 +1170,15 @@
     $skipWhile(p) {
       return new Iter(new SkipWhileIt(this.it, p));
     }
-    // A range value: `{:?}` (`0..5`, `1..=3`) and `==`.
+    // A range value: `{:?}` (`0..5`, `1..=3`) and `==`. Another iterator shows what's left, as
+    // `slice::Iter` does (`Iter([1, 2])`); like `$clone`, it reads the source once.
     $dbg(f = rt.$dbg) {
       const r = this.it;
-      if (!(r instanceof RangeIt)) return "Iter { .. }";
+      if (!(r instanceof RangeIt)) {
+        const all = Array.from(iterable(r));
+        this.it = all[Symbol.iterator]();
+        return `Iter([${all.map((x) => f(x)).join(", ")}])`;
+      }
       return `${r.open ? "" : f(r.i)}${r.incl ? "..=" : ".."}${r.hi === null ? "" : f(r.hi)}`;
     }
     $eq(o) {

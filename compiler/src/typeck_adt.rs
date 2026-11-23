@@ -1159,6 +1159,8 @@ impl Checker<'_> {
             }
             // (An iterator clones what's left: `κσ.Iter.$clone`.)
             Ty::Iter { mutable: false, .. } if t == "Clone" => true,
+            // (`{:?}` shows what's left, as `slice::Iter` does: `Iter([1, 2])`.)
+            Ty::Iter { mutable: false, elem } if t == "Debug" => self.implements(elem, t),
             Ty::Closure { .. } | Ty::Iter { .. } | Ty::Future(_) | Ty::Entry(..) => false,
             Ty::Param(n) => self.param_has(n, t),
             // (`std::error::Error`'s supertraits: `Box<dyn Error>` fields derive `Debug`.)

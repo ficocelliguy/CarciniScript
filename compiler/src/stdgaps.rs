@@ -7,7 +7,7 @@
 
 use ra_ap_syntax::{
     AstNode, AstToken, SourceFile, SyntaxKind, TextRange,
-    ast::{self, HasArgList},
+    ast::{self, HasArgList, HasName},
 };
 
 use crate::mbe::OffsetMap;
@@ -18,6 +18,7 @@ const WRAPPING: &str = include_str!("wrapping_prelude.rs");
 const CSTR: &str = include_str!("cstr_prelude.rs");
 const LINKED_LIST: &str = include_str!("linked_list_prelude.rs");
 const CONTROL_FLOW: &str = include_str!("control_flow_prelude.rs");
+const BOUND: &str = include_str!("bound_prelude.rs");
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
 fn declares(text: &str, name: &str) -> bool {
@@ -30,7 +31,10 @@ fn declares(text: &str, name: &str) -> bool {
 /// prelude it gets names `PathBuf`.
 pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     let mut out = Vec::new();
-    let path = (paths || text.contains("PathBuf") || text.contains("__AsPath"))
+    let path = (paths
+        || text.contains("PathBuf")
+        || text.contains("__AsPath")
+        || text.contains("__os_push"))
         && !text.contains("// (path prelude)")
         && !declares(text, "PathBuf");
     // (The path prelude's `FromStr` names `Infallible`.)
@@ -71,6 +75,12 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
         && !declares(text, "ControlFlow")
     {
         out.push(CONTROL_FLOW);
+    }
+    if crate::stdtime::has_word(text, "Bound")
+        && !text.contains("// (bound prelude)")
+        && !declares(text, "Bound")
+    {
+        out.push(BOUND);
     }
     out
 }
@@ -260,6 +270,7 @@ pub(crate) fn expand(
     edits.extend(writer_params(&file));
     edits.extend(c_string_literals(&file));
     edits.extend(into_impls(&file, text));
+    edits.extend(os_string_pushes(&file, &imports));
     let txt = |i: usize| toks.get(i).map(|t| t.text.clone()).unwrap_or_default();
     let mut errors = Vec::new();
     let mut i = 0;
@@ -866,6 +877,56 @@ fn write_fmt_calls(file: &SourceFile) -> Vec<(usize, usize, String)> {
             usize::from(a.start()),
             ", \"{}\", ".into(),
         ));
+    }
+    out
+}
+
+/// `s.push(x)` on an `OsString` (`x` a string or a path) is `s.__os_push(x)` (the path prelude's):
+/// `OsString` is a `String` here, whose `push` takes a `char`. The bindings are the ones written
+/// `OsString` or made by `OsString::..` / `to_os_string()` / `into_os_string()`, by name.
+fn os_string_pushes(file: &SourceFile, imports: &[String]) -> Vec<(usize, usize, String)> {
+    let os = |t: &str| {
+        (imports.iter().any(|i| i == "OsString") && crate::stdtime::has_word(t, "OsString"))
+            || t.contains("ffi::OsString")
+    };
+    let mut names = std::collections::HashSet::new();
+    for n in file.syntax().descendants() {
+        let (pat, ty, init) = if let Some(l) = ast::LetStmt::cast(n.clone()) {
+            (l.pat(), l.ty(), l.initializer())
+        } else if let Some(p) = ast::Param::cast(n) {
+            (p.pat(), p.ty(), None)
+        } else {
+            continue;
+        };
+        let Some(ast::Pat::IdentPat(ip)) = pat else { continue };
+        let init = init.map(|e| e.syntax().text().to_string()).unwrap_or_default();
+        if ty.is_some_and(|t| os(&t.syntax().text().to_string()))
+            || (os(&init) && init.contains("OsString::"))
+            || init.ends_with(".to_os_string()")
+            || init.ends_with(".into_os_string()")
+        {
+            if let Some(n) = ip.name() {
+                names.insert(n.text().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for m in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::MethodCallExpr::cast)
+    {
+        let (Some(name), Some(ast::Expr::PathExpr(p))) = (m.name_ref(), m.receiver()) else {
+            continue;
+        };
+        if name.text() == "push"
+            && p.path()
+                .and_then(|p| p.as_single_name_ref())
+                .is_some_and(|n| names.contains(&n.text().to_string()))
+        {
+            let r = name.syntax().text_range();
+            out.push((usize::from(r.start()), usize::from(r.end()), "__os_push".into()));
+        }
     }
     out
 }

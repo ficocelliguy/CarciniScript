@@ -322,3 +322,15 @@ impl PathBuf {
         }
     }
 }
+
+/// `OsString::push(s)`, `s` a string or a path (a pre-pass renames the call, as `OsString` is a
+/// `String` here).
+pub trait __OsPush {
+    fn __os_push<P: __AsPath>(&mut self, p: P);
+}
+
+impl __OsPush for String {
+    fn __os_push<P: __AsPath>(&mut self, p: P) {
+        self.push_str(&p.__path_str());
+    }
+}

@@ -37,7 +37,7 @@ pub fn has_variant_imports(text: &str) -> bool {
     }
     let file = crate::macros::parse_tree(text);
     let enums = enums(&file);
-    (!enums.is_empty() || CRATE_ENUMS.iter().any(|(k, _, _)| text.contains(k)))
+    (!enums.is_empty() || CRATE_ENUMS.iter().any(|(_, e, _)| text.contains(e)))
         && file
             .syntax()
             .descendants()
@@ -52,13 +52,30 @@ const CRATE_ENUMS: &[(&str, &str, &[&str])] = &[
     ("either", "Either", &["Left", "Right"]),
     ("itertools", "MinMaxResult", &["NoElements", "OneElement", "MinMax"]),
     ("itertools", "FoldWhile", &["Continue", "Done"]),
+    // (std's, whose preludes are compiled in by name: see `std_enum_path`.)
+    ("std::ops", "Bound", &["Included", "Excluded", "Unbounded"]),
+    ("std::ops", "ControlFlow", &["Continue", "Break"]),
 ];
+
+/// `std::ops::Bound` (also `core::`, `collections::Bound`, `ops::Bound`) as `CRATE_ENUMS`' `std::ops`.
+fn std_enum_path(mut segs: Vec<String>) -> Vec<String> {
+    let s: Vec<&str> = segs.iter().map(|s| s.trim_start_matches("::")).collect();
+    let n = match s.as_slice() {
+        ["std" | "core", "ops", ..] | ["std" | "core", "collections", "Bound", ..] => 2,
+        ["ops", "Bound" | "ControlFlow", ..] => 1,
+        _ => return segs,
+    };
+    segs.drain(..n);
+    segs.insert(0, "std::ops".into());
+    segs
+}
 
 /// What `u` imports, when every leaf is a variant (or all variants) of an enum of this file:
 /// local name → `Enum::Variant`.
 fn imports(u: &ast::Use, enums: &HashMap<String, Vec<String>>) -> Option<HashMap<String, String>> {
     let mut out = HashMap::new();
     for (mut segs, rename, star) in crate::typeck::use_leaves(u) {
+        segs = std_enum_path(segs);
         if matches!(segs.first().map(String::as_str), Some("crate" | "self")) {
             segs.remove(0);
         }
@@ -102,6 +119,7 @@ fn imports(u: &ast::Use, enums: &HashMap<String, Vec<String>>) -> Option<HashMap
 fn kept_enum_imports(u: &ast::Use) -> String {
     let mut out = String::new();
     for (segs, _, star) in crate::typeck::use_leaves(u) {
+        let segs = std_enum_path(segs);
         let segs: Vec<&str> = segs.iter().map(|s| s.trim_start_matches("::")).collect();
         if let [k, e, rest @ ..] = segs.as_slice()
             && !star

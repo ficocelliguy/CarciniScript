@@ -126,6 +126,12 @@
     "panic": null
   },
   {
+    "file": "bound_values.rs",
+    "stdout": "3 4 0\n[1 (2 * [9 \n[Included(1), Excluded(2), Unbounded, Included(9)] Included(4)\ntrue\nIncluded(6)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "box_dyn_error.rs",
     "stdout": "Ok(7) Err(\"empty input\")\nhack failed: boom\nFailed { step: \"hack\", cause: \"boom\" }\nowned \"negative: -3\"\n",
     "exitCode": 0,
@@ -984,6 +990,12 @@
     "panic": null
   },
   {
+    "file": "instantiation_consts.rs",
+    "stdout": "1 -5\n1 -10 -4\nu8 1 8 3\ni32 -5 32 7\n32 2 4\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "int128.rs",
     "stdout": "340282366920938463463374607431768211455 -170141183460469231731687303715884105728\n48611766702991209066196372490252601636 -56713727820156410577229101238628035242\n65536 0\n265252859812191058636308480000000 440732388\n12246913469124691346913 12444444333344444433333 37037036703703703670369 19\n12056327051986882705 9816 98765432109876543209\n98765432109876543210 1267650600228229401496703205376 12345678901234567890123\nffffffffffffffffffffffffffffffff 0xff                  12345678901234567890123|\nOk(123456789012345678901234567890) true\n6 true true\n203 450461974 -1\n",
     "exitCode": 0,
@@ -1046,6 +1058,12 @@
   {
     "file": "iter_clone.rs",
     "stdout": "[2, 3] [2, 3]\nSome((1, 'é')) Some((3, 'l'))\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_debug.rs",
+    "stdout": "Iter([1, 2, 3])\nIter([2, 3])\nSome(2)\nW { it: Iter([1, 2, 3]), n: 3 }\nW {\n    it: Iter(\n        [\n            1,\n            2,\n            3,\n        ],\n    ),\n    n: 3,\n}\nIter([\"a\", \"b\"])\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1422,6 +1440,12 @@
     "panic": null
   },
   {
+    "file": "once_cell_cow_from.rs",
+    "stdout": "Some(4) Some(\"five\") Some(6)\nErr(9)\n[1, 2] [3] 3\n[1, 2]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "once_lock_traits.rs",
     "stdout": "Env { cached: OnceLock(<uninit>) }\nEnv { cached: OnceLock(\"x\") } OnceLock(<uninit>)\n",
     "exitCode": 0,
@@ -1496,6 +1520,12 @@
   {
     "file": "os_pipes_dir_entries.rs",
     "stdout": "! NotFound\ncouldn't run wc\nno child\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "os_string_push.rs",
+    "stdout": "\"abc/def\" \"gabc/def\" h\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1580,6 +1610,12 @@
   {
     "file": "param_patterns.rs",
     "stdout": "7\n13\n14 14\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "partial_field_moves.rs",
+    "stdout": "x y [1, 2] 2\nz y [3]\nleft 4\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1826,6 +1862,12 @@
   {
     "file": "std_imports.rs",
     "stdout": "10 0 4\npear\n[9] [] [2, 3] [1]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_lock_impls.rs",
+    "stdout": "stdout\nstdout lock\nthrough the lock\nstderr / stderr lock\n0 lines\n",
     "exitCode": 0,
     "panic": null
   },

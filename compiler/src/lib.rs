@@ -29,6 +29,7 @@ mod memo;
 mod modflat;
 mod moves;
 mod nav;
+mod inst_consts;
 mod nested;
 mod procmacro;
 mod prune;

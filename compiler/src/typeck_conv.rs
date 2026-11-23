@@ -279,11 +279,12 @@ impl Checker<'_> {
         let mut rets: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
         for i in &mut impls {
             if let Some(sig) = self.adts.method(adt, &i.key).cloned()
-                && sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
-                && sig
-                    .impl_args
-                    .iter()
-                    .any(|a| matches!(a, Ty::Param(p) if i.src.mentions_param(p)))
+                && sig.impl_args.iter().any(|a| {
+                    // (`impl<T> From<Vec<T>> for Cow<'_, [T]>`: the parameter may be nested.)
+                    let mut ps = Vec::new();
+                    a.collect_params(&mut ps);
+                    ps.iter().any(|p| i.src.mentions_param(p))
+                })
             {
                 let sig = self.method_inst(&sig, None);
                 self.last_type_args.clear();

@@ -118,6 +118,8 @@ struct Walker<'a> {
     /// parameters are declared `&T`. An argument there is borrowed, not moved (typeck reports
     /// an owned one as rustc's E0308 where it's certain; here the move isn't recorded).
     ref_params: HashMap<(Option<String>, String), (Option<bool>, Vec<bool>)>,
+    /// Struct fields declared `String` or `Box<..>`, by struct and field name (or tuple index).
+    owned_fields: HashSet<(String, String)>,
 }
 
 /// Where `break`/`continue` go: the states they leave with.
@@ -174,6 +176,37 @@ pub fn check(
             })
             .or_insert((self_ref, refs));
     }
+    let owned_ty = |t: Option<ast::Type>| {
+        t.is_some_and(|t| {
+            let t = t.syntax().text().to_string();
+            t == "String" || t.starts_with("Box<")
+        })
+    };
+    let mut owned_fields = HashSet::new();
+    for s in file.syntax().descendants().filter_map(ast::Struct::cast) {
+        let Some(sn) = s.name().map(|n| n.text().to_string()) else {
+            continue;
+        };
+        match s.field_list() {
+            Some(ast::FieldList::RecordFieldList(l)) => {
+                for f in l.fields() {
+                    if let Some(n) = f.name()
+                        && owned_ty(f.ty())
+                    {
+                        owned_fields.insert((sn.clone(), n.text().to_string()));
+                    }
+                }
+            }
+            Some(ast::FieldList::TupleFieldList(l)) => {
+                for (i, f) in l.fields().enumerate() {
+                    if owned_ty(f.ty()) {
+                        owned_fields.insert((sn.clone(), i.to_string()));
+                    }
+                }
+            }
+            None => {}
+        }
+    }
     let mut w = Walker {
         src,
         types,
@@ -192,6 +225,7 @@ pub fn check(
         targets: Vec::new(),
         move_sites: HashSet::new(),
         ref_params,
+        owned_fields,
     };
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         if !crate::adt::test_only(f.syntax()) {
@@ -212,6 +246,37 @@ impl Walker<'_> {
 
     fn ty(&self, n: &SyntaxNode) -> Option<&Ty> {
         self.types.get(&self.range(n))
+    }
+
+    /// `p.field` on a binding: the binding and the field's name (or tuple index).
+    fn field_base(&self, f: &ast::FieldExpr) -> Option<(Decl, String)> {
+        let ast::Expr::PathExpr(p) = strip(&f.expr()?) else {
+            return None;
+        };
+        let d = self.lookup(p.path()?.as_single_name_ref()?.text().to_string().as_str())?;
+        Some((d, f.name_ref()?.text().to_string()))
+    }
+
+    /// Whether reading the field `f` by value moves it: its type moves, or the struct declares it
+    /// `String` / `Box<..>` (which types alone don't tell from `&str` / `&T`).
+    fn field_moves(&self, f: &ast::FieldExpr) -> bool {
+        if self.ty(f.syntax()).is_some_and(|t| self.moves(t)) {
+            return true;
+        }
+        let Some(Ty::Adt(n, _)) = f.expr().and_then(|x| self.ty(x.syntax()).cloned()) else {
+            return false;
+        };
+        let Some(field) = f.name_ref().map(|n| n.text().to_string()) else {
+            return false;
+        };
+        let declared = self
+            .adts
+            .defs
+            .get(&n)
+            .filter(|d| !d.is_enum)
+            .and_then(|d| d.variants.first()?.field(&field))
+            .is_some_and(|(_, fd)| self.moves(&fd.ty));
+        declared || self.owned_fields.contains(&(n, field))
     }
 
     /// Whether values of `t` are moved (not copied) by assignment.
@@ -794,6 +859,20 @@ impl Walker<'_> {
                                     st.moved.remove(&d);
                                 }
                             }
+                            // `p.a = ..` after `p.a` moved gives the field a value again.
+                            Some(ast::Expr::FieldExpr(f))
+                                if self.field_base(&f).is_some_and(|(d, field)| {
+                                    st.partial.get(&d).is_some_and(|m| m.contains(&field))
+                                }) =>
+                            {
+                                let (d, field) = self.field_base(&f).unwrap();
+                                let moved = st.partial.get_mut(&d).unwrap();
+                                moved.remove(&field);
+                                if moved.is_empty() {
+                                    st.partial.remove(&d);
+                                    st.moved.remove(&d);
+                                }
+                            }
                             Some(other) => self.expr(&other, st, Mode::Use),
                             None => {}
                         }
@@ -865,26 +944,25 @@ impl Walker<'_> {
             }
             ast::Expr::FieldExpr(f) => {
                 // A field that stayed behind in a partly moved struct can still be read.
-                let kept = |me: &Self, x: &ast::Expr| {
-                    let ast::Expr::PathExpr(p) = strip(x) else {
-                        return false;
-                    };
-                    let Some(d) = p
-                        .path()
-                        .and_then(|p| p.as_single_name_ref())
-                        .and_then(|n| me.lookup(n.text().to_string().as_str()))
-                    else {
-                        return false;
-                    };
-                    let field = f.name_ref().map(|n| n.text().to_string());
-                    st.partial
-                        .get(&d)
-                        .is_some_and(|moved| field.is_some_and(|n| !moved.contains(&n)))
-                };
+                let base = self.field_base(f);
+                let kept = base.as_ref().is_some_and(|(d, field)| {
+                    st.partial.get(d).is_some_and(|moved| !moved.contains(field))
+                });
                 if let Some(x) = f.expr()
-                    && !kept(self, &x)
+                    && !kept
                 {
                     self.expr(&x, st, Mode::Use);
+                }
+                // `let a = p.a;` moves only that field: `p` is partly moved.
+                if let Mode::Move(how) = mode
+                    && !st.unreachable
+                    && let Some((d, field)) = base
+                    && self.tracked.contains(&d)
+                    && (!st.moved.contains_key(&d) || st.partial.contains_key(&d))
+                    && self.field_moves(f)
+                {
+                    st.moved.entry(d).or_insert((self.range(f.syntax()).0, how));
+                    st.partial.entry(d).or_default().insert(field);
                 }
                 // A field moved out of its struct (`let x = s.inner;`): the struct no longer
                 // drops it (codegen marks it, when its type has something to drop).

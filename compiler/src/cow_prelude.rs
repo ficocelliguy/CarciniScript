@@ -79,3 +79,10 @@ impl<'a> From<&'a str> for Cow<'a, str> {
         Cow::Borrowed(s)
     }
 }
+
+// (`&[T]` and `Vec<T>` are one type here: this serves `Cow::from(&v[..])` too, as `Owned`.)
+impl<'a, T: Clone> From<Vec<T>> for Cow<'a, [T]> {
+    fn from(v: Vec<T>) -> Cow<'a, [T]> {
+        Cow::Owned(v)
+    }
+}

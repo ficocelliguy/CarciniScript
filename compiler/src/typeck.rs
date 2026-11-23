@@ -2224,7 +2224,7 @@ impl<'a> Checker<'a> {
             "Wrapping" => "num",
             "Cow" => "borrow",
             "Path" | "PathBuf" => "path",
-            "ControlFlow" => "ops",
+            "ControlFlow" | "Bound" => "ops",
             _ => return,
         };
         if self.glob_imports
@@ -5845,6 +5845,22 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
+    /// Whether `e` is certainly a `&str` (not a `String`): a string literal, `&x`, or a local
+    /// declared `&str`.
+    fn borrowed_str(&self, e: &ast::Expr) -> bool {
+        match e {
+            ast::Expr::ParenExpr(p) => p.expr().is_some_and(|x| self.borrowed_str(&x)),
+            ast::Expr::Literal(l) => matches!(l.kind(), ast::LiteralKind::String(_)),
+            ast::Expr::RefExpr(_) => true,
+            ast::Expr::PathExpr(p) => p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .and_then(|n| self.lookup(n.text().as_ref()))
+                .is_some_and(|l| l.reference == Some(false)),
+            _ => false,
+        }
+    }
+
     fn is_integer(&self, t: &Ty) -> bool {
         matches!(self.shallow(t), Ty::Int(_) | Ty::Unknown | Ty::Never)
             || self.var_kind(t) == Some(VarKind::Int)
@@ -5857,6 +5873,19 @@ impl<'a> Checker<'a> {
             return self.op_overload(b.syntax(), op, assign, &n, lt, rhs, None);
         }
         if self.shallow(lt) == Ty::Str && op == ArithOp::Add {
+            // `"a" + "b"` / `&s + ".rs"` / `name + "!"` with `name: &str`: `+` takes a `String`
+            // on the left (rustc's E0369).
+            if let Some(l) = b.lhs()
+                && !matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }))
+                && self.borrowed_str(&l)
+            {
+                let msg = "cannot add to a `&str`: `+` needs a `String` on the left";
+                let help = format!(
+                    "create an owned `String` from the string reference: `{}.to_owned() + ..`, or use `format!`",
+                    l.syntax().text()
+                );
+                self.error_help(b.syntax(), msg.to_string(), &help);
+            }
             self.check(rhs, &Ty::Str);
             return Ty::Str;
         }
@@ -8795,6 +8824,8 @@ impl Checker<'_> {
             },
             // `{}` of `c.to_uppercase()`: its chars.
             Ty::Iter { elem, .. } if !debug && self.shallow(elem) == Ty::Char => false,
+            // `{:?}` of a slice iterator: what's left (`Iter([1, 2])`).
+            Ty::Iter { mutable: false, elem } if debug => self.lacks_fmt(&self.shallow(elem), true),
             Ty::Iter { .. } | Ty::Future(_) | Ty::Fn => true,
             Ty::Range(..) => !debug,
             Ty::Extern(_) => !debug,

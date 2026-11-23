@@ -263,7 +263,9 @@ There is one JS thread, and scripts share it with the game.
   `exists()`, `is_file()` and `is_dir()` are always `false`. Comparing and hashing paths goes by
   their text, not their components (`a//b` != `a/b`).
 - **`OsStr` / `OsString` are `String`**, so string methods work on them too and `into_string()`
-  never fails.
+  never fails. `OsString::push` of a string or a path works on a binding written or made as an
+  `OsString` (`let s: OsString`, `OsString::from(..)`, `x.to_os_string()`, a parameter); on a
+  field or an element, `push` is `String`'s, which takes a `char`.
 - **`env!` is an error and `option_env!` `None`**, except for Cargo's own variables, which get
   placeholders (`CARGO_PKG_NAME` `"script"`, `CARGO_PKG_VERSION` `"0.1.0"`, `CARGO_MANIFEST_DIR`
   `"."`, the rest empty): a script isn't built by cargo.
@@ -404,6 +406,9 @@ There is one JS thread, and scripts share it with the game.
 - **`peek` works on any iterator**, not only one from `peekable()`: the lookahead is added on the
   first `peek` / `next_if`. Cloning an iterator collects what's left (so the two go on
   independently, as in Rust).
+- **`{:?}` of any shared iterator is `slice::Iter`'s** (`Iter([2, 3])`, what's left): Rust
+  writes each iterator its own way (`IntoIter([..])`, `Chars(['a'])`, `Map { iter: Iter([..]) }`).
+  Like cloning, it collects what's left, so an endless iterator never finishes printing.
 - **`size_hint()` on std's iterators is exact** (what's left is counted, through a copy): Rust
   gives `(0, Some(n))` after a `filter`. A custom iterator's comes from its own `size_hint`, or
   `(0, None)`; its `len()` (with `impl ExactSizeIterator`) is that hint's lower bound, where Rust
