@@ -735,7 +735,7 @@ impl Checker<'_> {
         matches!(self.zonk(t), Ty::Vec(e) if matches!(self.zonk(&e), Ty::Int(crate::ty::IntKind::U8)))
     }
 
-    fn satisfies(&self, t: &Ty, b: &str) -> bool {
+    pub(super) fn satisfies(&self, t: &Ty, b: &str) -> bool {
         if let Some(ok) = self.react_bound(t, b) {
             return ok;
         }
@@ -788,6 +788,7 @@ impl Checker<'_> {
             "Shl" | "Shr" | "ShlAssign" | "ShrAssign" => match t {
                 Ty::Int(_) | Ty::IntLit => true,
                 Ty::Param(n) => self.param_has(n, b),
+                Ty::Adt(n, _) => self.has_op_impl(n, b),
                 _ => false,
             },
             "Neg" => match t {

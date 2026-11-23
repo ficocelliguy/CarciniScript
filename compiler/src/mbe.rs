@@ -1472,6 +1472,9 @@ fn bundled_macros(src: &str) -> String {
     if src.contains("tokio::") || src.contains("use tokio") {
         out.push_str(&own_macros_left_out(TOKIO_MACROS, src));
     }
+    if src.contains("izip!") || src.contains("iproduct!") {
+        out.push_str(&own_macros_left_out(ITERTOOLS_MACROS, src));
+    }
     // `std::pin::pin!(fut)` / `futures::pin_mut!(fut)`: pinning is nothing in JS.
     if src.contains("pin!") || src.contains("pin_mut!") {
         out.push_str(&own_macros_left_out(PIN_MACROS, src));
@@ -1508,6 +1511,52 @@ fn own_macros_left_out(macros: &str, src: &str) -> String {
     }
     out
 }
+
+/// itertools' `izip!(a, b, ..)` (items zipped into flat tuples) and `iproduct!(a, b, ..)` (the
+/// cartesian product, as flat tuples; one argument gives 1-tuples, none `once(())`), up to six
+/// iterables.
+const ITERTOOLS_MACROS: &str = r#"
+macro_rules! izip {
+    ($a:expr $(,)?) => { ($a).into_iter() };
+    ($a:expr, $b:expr $(,)?) => { ($a).into_iter().zip($b) };
+    ($a:expr, $b:expr, $c:expr $(,)?) => {
+        ($a).into_iter().zip($b).zip($c).map(|((a, b), c)| (a, b, c))
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
+        ($a).into_iter().zip($b).zip($c).zip($d).map(|(((a, b), c), d)| (a, b, c, d))
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {
+        ($a).into_iter().zip($b).zip($c).zip($d).zip($e)
+            .map(|((((a, b), c), d), e)| (a, b, c, d, e))
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr $(,)?) => {
+        ($a).into_iter().zip($b).zip($c).zip($d).zip($e).zip($f)
+            .map(|(((((a, b), c), d), e), f)| (a, b, c, d, e, f))
+    };
+}
+macro_rules! iproduct {
+    () => { std::iter::once(()) };
+    ($a:expr $(,)?) => { ($a).into_iter().map(|a| (a,)) };
+    ($a:expr, $b:expr $(,)?) => { ($a).into_iter().cartesian_product($b) };
+    ($a:expr, $b:expr, $c:expr $(,)?) => {
+        ($a).into_iter().cartesian_product($b).cartesian_product($c).map(|((a, b), c)| (a, b, c))
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
+        ($a).into_iter().cartesian_product($b).cartesian_product($c).cartesian_product($d)
+            .map(|(((a, b), c), d)| (a, b, c, d))
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {
+        ($a).into_iter().cartesian_product($b).cartesian_product($c).cartesian_product($d)
+            .cartesian_product($e)
+            .map(|((((a, b), c), d), e)| (a, b, c, d, e))
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr $(,)?) => {
+        ($a).into_iter().cartesian_product($b).cartesian_product($c).cartesian_product($d)
+            .cartesian_product($e).cartesian_product($f)
+            .map(|(((((a, b), c), d), e), f)| (a, b, c, d, e, f))
+    };
+}
+"#;
 
 /// Whether `src` uses the bundled `log` (or sets up a logger).
 pub(crate) fn uses_log(src: &str) -> bool {
@@ -1611,11 +1660,11 @@ fn foreign_path(segs: &[String]) -> bool {
 /// would otherwise expand itself forever). The bundled definitions are left out then.
 fn bundled_crate_path(segs: &[String], def: &ast::MacroRules) -> bool {
     let [first, _, ..] = segs else { return false };
-    if !matches!(first.as_str(), "log" | "anyhow" | "tokio" | "futures") {
+    if !matches!(first.as_str(), "log" | "anyhow" | "tokio" | "futures" | "itertools") {
         return false;
     }
     let d = def.syntax().text().to_string();
-    ![PIN_MACROS, LOG_MACROS, ANYHOW_MACROS, TOKIO_MACROS]
+    ![PIN_MACROS, LOG_MACROS, ANYHOW_MACROS, TOKIO_MACROS, ITERTOOLS_MACROS]
         .iter()
         .any(|m| m.contains(d.as_str()))
 }

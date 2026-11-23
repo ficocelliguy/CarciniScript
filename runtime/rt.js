@@ -1199,6 +1199,19 @@
     $peek() {
       return this.$peekable().it.peek();
     }
+    // `peek_mut()` of numbers, strings or bools: `null`, or a slot over the buffered item.
+    $peekMut() {
+      const p = this.$peekable().it;
+      if (p.peek() === null) return null;
+      return {
+        get 1() {
+          return p.v;
+        },
+        set 1(x) {
+          p.v = x;
+        },
+      };
+    }
     $nextIf(p) {
       const x = this.$peek();
       if (x === null || !p(unsome(x))) return null;
@@ -3387,6 +3400,14 @@
           return eq(a[j], o[1]);
         },
       };
+    },
+    // `{:?}` of a `Vec<&mut i32>` / `Vec<(usize, &mut i32)>` of slots or an item of one: a copy
+    // with each slot read. `shape` is `1` for a slot, a tuple's fields (`0`: no slot) or `{e}`
+    // for a Vec's items.
+    $readSlots(x, shape) {
+      if (shape === 1) return x[1];
+      if (Array.isArray(shape)) return x.map((f, i) => (shape[i] ? rt.$readSlots(f, shape[i]) : f));
+      return Array.from(x, (e) => rt.$readSlots(e, shape.e));
     },
     // `v.iter_mut()` of numbers, strings or bools outside a loop by index: each item is a slot
     // whose `[1]` reads and writes the element.
@@ -5872,6 +5893,113 @@
       }
       return null;
     },
+    // `minmax()` and friends, as itertools' `minmax_impl` (two items at a time; the first
+    // minimum and the last maximum), into the prelude's `MinMaxResult` class `M`.
+    minmaxImpl(it, key, lt, M) {
+      const i = it[Symbol.iterator]();
+      const a = i.next();
+      if (a.done) return M.NoElements;
+      const b = i.next();
+      if (b.done) return M.OneElement(a.value);
+      const [x, y] = [a.value, b.value];
+      const [xk, yk] = [key(x), key(y)];
+      let [min, max, mink, maxk] = !lt(y, x, yk, xk) ? [x, y, xk, yk] : [y, x, yk, xk];
+      for (;;) {
+        const f = i.next();
+        if (f.done) break;
+        const first = f.value;
+        const fk = key(first);
+        const s = i.next();
+        if (s.done) {
+          if (lt(first, min, fk, mink)) min = first;
+          else if (!lt(first, max, fk, maxk)) max = first;
+          break;
+        }
+        const second = s.value;
+        const sk = key(second);
+        const [lo, lok, hi, hik] = !lt(second, first, sk, fk)
+          ? [first, fk, second, sk]
+          : [second, sk, first, fk];
+        if (lt(lo, min, lok, mink)) [min, mink] = [lo, lok];
+        if (!lt(hi, max, hik, maxk)) [max, maxk] = [hi, hik];
+      }
+      return M.MinMax(min, max);
+    },
+    minmax(it, M) {
+      return itertools.minmaxImpl(it, () => undefined, (x, y) => cmp(x, y) < 0, M);
+    },
+    minmaxBy(it, f, M) {
+      return itertools.minmaxImpl(it, () => undefined, (x, y) => f(x, y) < 0, M);
+    },
+    minmaxByKey(it, f, M) {
+      return itertools.minmaxImpl(it, f, (x, y, xk, yk) => cmp(xk, yk) < 0, M);
+    },
+    // `exactly_one()`: `Ok` of the one item, else `Err` of the prelude's `ExactlyOneError`
+    // (`E`) holding what was taken (everything, past two).
+    exactlyOne(it, E) {
+      const i = it[Symbol.iterator]();
+      const a = i.next();
+      if (a.done) return rt.Err(new E([], false));
+      const b = i.next();
+      if (b.done) return rt.Ok(a.value);
+      const rest = [a.value, b.value];
+      for (let n = i.next(); !n.done; n = i.next()) rest.push(n.value);
+      return rt.Err(new E(rest, true));
+    },
+    // `fold_while(init, f)`: stops at the first `Done` (the prelude's `FoldWhile`, `W`), leaving
+    // the rest of the items in the iterator.
+    foldWhile(it, init, f, W) {
+      const i = it[Symbol.iterator]();
+      let acc = init;
+      for (let n = i.next(); !n.done; n = i.next()) {
+        const r = f(acc, n.value);
+        if (r.$tag === 1) return r;
+        acc = r[0];
+      }
+      return W.Continue(acc);
+    },
+    // `kmerge()` / `kmerge_by(less)`: itertools' heap of (head, rest) pairs, so equal items come
+    // out in the same order.
+    kmerge(it) {
+      return itertools.kmergeBy(it, (a, b) => cmp(a, b) < 0);
+    },
+    kmergeBy(it, less) {
+      const heap = [];
+      for (const src of it) {
+        const tail = items(src)[Symbol.iterator]();
+        const h = tail.next();
+        if (!h.done) heap.push({ head: h.value, tail });
+      }
+      const lt = (a, b) => less(heap[a].head, heap[b].head);
+      const swap = (a, b) => ([heap[a], heap[b]] = [heap[b], heap[a]]);
+      const sift = (index) => {
+        let pos = index;
+        let child = 2 * pos + 1;
+        while (child + 1 < heap.length) {
+          if (lt(child + 1, child)) child++;
+          if (!lt(child, pos)) return;
+          swap(pos, child);
+          pos = child;
+          child = 2 * pos + 1;
+        }
+        if (child + 1 === heap.length && lt(child, pos)) swap(pos, child);
+      };
+      for (let i = (heap.length >> 1) - 1; i >= 0; i--) sift(i);
+      return lazy(function* () {
+        while (heap.length) {
+          const top = heap[0];
+          const result = top.head;
+          const n = top.tail.next();
+          if (!n.done) top.head = n.value;
+          else {
+            const last = heap.pop();
+            if (heap.length) heap[0] = last;
+          }
+          sift(0);
+          yield result;
+        }
+      });
+    },
     kSmallest(it, k) {
       return rt.$iter(Array.from(it).sort(cmp).slice(0, k));
     },
@@ -6748,8 +6876,28 @@
     isEof: (e) => e.kind === "eof",
     isSyntax: (e) => e.kind === "syntax",
     isData: (e) => e.kind === "data",
-    isIo: () => false,
+    isIo: (e) => e.kind === "io",
     toString: (e) => e.toString(),
+  };
+  // `serde_json::to_writer`: the writer's `io::Result<()>`, its error as a `serde_json::Error`.
+  const sjIoError = (e) =>
+    new SerdeJsonError(typeof e?.fmt === "function" ? rt.$display(e) : String(e), 0, 0, "io");
+  rt.$sjIo = (r) => (r.$tag === 0 ? r : rt.Err(sjIoError(r[0])));
+  // `from_slice(&bytes)`: the bytes as UTF-8 text.
+  rt.$sjFromBytes = (bytes, schema) => {
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes));
+    } catch {
+      return rt.Err(new SerdeJsonError("invalid unicode code point", 0, 0, "syntax"));
+    }
+    return rt.$jsonParse(text, schema, "pos");
+  };
+  // `from_reader(r)`: everything `read(b)` (its `read_to_end`) appends to `b`.
+  rt.$sjFromReader = (read, schema) => {
+    const b = [];
+    const r = read(b);
+    return r.$tag === 0 ? rt.$sjFromBytes(b, schema) : rt.Err(sjIoError(r[0]));
   };
 
   // ---- the bundled `regex`: Rust's syntax as a JS `RegExp` (the `u` flag; `\d` and `\w` as

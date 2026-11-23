@@ -978,6 +978,38 @@ struct Codegen<'a> {
 }
 
 impl<'a> Codegen<'a> {
+    /// `*map.get_mut(k).unwrap()` of a `HashMap` / `BTreeMap`: the map and the key, for a cell
+    /// over that entry (`index_mut`'s `&mut *m.get_mut(k).unwrap()`).
+    fn map_entry_place(&self, e: &ast::Expr) -> Option<(ast::Expr, ast::Expr)> {
+        let ast::Expr::PrefixExpr(pe) = strip_parens_expr(e) else {
+            return None;
+        };
+        if pe.op_kind() != Some(UnaryOp::Deref) {
+            return None;
+        }
+        let ast::Expr::MethodCallExpr(unwrap) = strip_parens_expr(&pe.expr()?) else {
+            return None;
+        };
+        if unwrap.name_ref()?.text() != "unwrap" {
+            return None;
+        }
+        let ast::Expr::MethodCallExpr(get) = strip_parens_expr(&unwrap.receiver()?) else {
+            return None;
+        };
+        if get.name_ref()?.text() != "get_mut" {
+            return None;
+        }
+        let map = get.receiver()?;
+        let mut args = get.arg_list()?.args();
+        let (key, None) = (args.next()?, args.next()) else {
+            return None;
+        };
+        match self.raw_ty_of(map.syntax())? {
+            Ty::Map(..) | Ty::Coll(crate::ty::Coll::BTreeMap, _) => Some((map, key)),
+            _ => None,
+        }
+    }
+
     // ---------------------------------------------------------------- diagnostics & positions
 
     fn off(&self, n: &SyntaxNode) -> usize {
@@ -3304,6 +3336,11 @@ impl<'a> Codegen<'a> {
         if self.types.slot_cell_args.contains(&r) {
             return (frag.wrap("κσ.$slotCell(", ")").at(start), ty);
         }
+        // `{:?}` of a Vec of slots or an item of one: a copy with the slots read.
+        if let Some(shape) = self.types.slot_reads.get(&r) {
+            let f = frag.wrap("κσ.$readSlots(", &format!(", {shape})"));
+            return (f.at(start), ty);
+        }
         // A slot-valued expression (`s.at(0)` of your `-> &mut i32`, `w.n` of `n: &mut i32`,
         // `o.unwrap()` of an `Option<&mut i32>`) read as its value, unless the slot is kept.
         if self.types.slot_values.contains(&r) && !self.types.slot_keeps.contains(&r) {
@@ -3412,6 +3449,19 @@ impl<'a> Codegen<'a> {
                 };
                 let (pf, t) = self.emit_expr(&inner, expected);
                 let mut f = Frag::text("κσ.$cell(() => ");
+                // `&mut *map.get_mut(k).unwrap()`: the entry, written with `insert`.
+                if let Some((map, key)) = self.map_entry_place(&inner) {
+                    let (mf, _) = self.emit_expr(&map, None);
+                    let (kf, kt) = self.emit_expr(&key, None);
+                    let kf = self.by_value(&key, kf, &kt);
+                    f.append(pf)
+                        .push(", ($v) => { ")
+                        .append(mf)
+                        .push(".$insert(")
+                        .append(kf)
+                        .push(", $v); })");
+                    return (f, t);
+                }
                 f.append(pf.clone())
                     .push(", ($v) => { ")
                     .append(pf)
@@ -3978,6 +4028,11 @@ impl<'a> Codegen<'a> {
                 .as_slice(),
             [.., "String", "from"] | [.., "ToString", "to_string"]
         ) {
+            // `.map_err(String::from)` through your `impl From<A> for String`.
+            if let Some(conv @ crate::adt::Conv::From { .. }) = self.conv_of(p.syntax()) {
+                let f = self.convert(conv, Frag::text("x"));
+                return (f.wrap("((x) => ", ")"), Ty::Unknown);
+            }
             return (Frag::text("String"), Ty::Unknown);
         }
         if segs.len() >= 2 && segs[segs.len() - 2] == "char" && segs[segs.len() - 1] == "from" {
@@ -7613,6 +7668,12 @@ impl<'a> Codegen<'a> {
             };
             return (f.wrap("", "[1]"), inner.clone());
         }
+        // `*m.get_mut(k).unwrap_or(&mut 0) += 1`: the slot, or the default's.
+        if slot && method == "unwrap_or" && !into_let && !kept {
+            let mut f = rf.clone().wrap("(", " ?? ");
+            f.append(a(0)).push(")[1]");
+            return (f, inner.clone());
+        }
         let nested = nullable_payload(inner);
         match method {
             "is_some" => (rf.clone().wrap("(", " != null)"), Ty::Bool),
@@ -7708,6 +7769,24 @@ impl<'a> Codegen<'a> {
     /// Whether a method can assign to its receiver `recv`: a place expression, or one standing
     /// in for a place (`recv_override`).
     pub(super) fn place_receiver(&self, recv: &ast::Expr) -> bool {
+        // (`m.get_mut(k).unwrap()` of a slot: its `[1]`, a place.)
+        if let ast::Expr::MethodCallExpr(u) = strip_parens_expr(recv)
+            && u.name_ref().is_some_and(|n| {
+                matches!(n.text().to_string().as_str(), "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else")
+            })
+            && let Some(x) = u.receiver()
+            && self
+                .types
+                .slot_calls
+                .contains(&self.range_of(strip_parens_expr(&x).syntax()))
+        {
+            return true;
+        }
+        // (A slot read through, `r.unwrap()` of a kept `ok_or`: `(..)[1]`.)
+        let r = self.range_of(strip_parens_expr(recv).syntax());
+        if self.types.slot_values.contains(&r) && !self.types.slot_keeps.contains(&r) {
+            return true;
+        }
         is_pure(&strip_refs(recv))
             || self
                 .recv_override
@@ -8959,7 +9038,18 @@ impl<'a> Codegen<'a> {
                             continue;
                         }
                         (None, Some(name)) => match self.lookup(&name) {
-                            Some(l) => (Frag::text(l.js.clone()), l.ty.clone().default_lit()),
+                            // `{refs:?}` of a Vec of slots: a copy with the slots read.
+                            Some(l) => match self
+                                .types
+                                .slot_read_captures
+                                .get(&(fmt_arg.start, name.clone()))
+                            {
+                                Some(shape) => (
+                                    Frag::text(format!("κσ.$readSlots({}, {shape})", l.js)),
+                                    l.ty.clone().default_lit(),
+                                ),
+                                None => (Frag::text(l.js.clone()), l.ty.clone().default_lit()),
+                            },
                             // `{CYAN}`: a `const` item.
                             None if self.consts.contains_key(&name) => {
                                 match self.captured_const(&name) {

@@ -186,7 +186,8 @@ fn op_trait(op: ArithOp) -> &'static str {
         ArithOp::BitAnd => "BitAnd",
         ArithOp::BitOr => "BitOr",
         ArithOp::BitXor => "BitXor",
-        _ => "",
+        ArithOp::Shl => "Shl",
+        ArithOp::Shr => "Shr",
     }
 }
 
@@ -239,7 +240,7 @@ impl Checker<'_> {
     }
 
     /// The `impl From<X> for adt` that converts a `src`, if exactly one can; unifies `X` with it.
-    fn pick_from(&mut self, adt: &str, src: &Ty) -> Option<String> {
+    pub(super) fn pick_from(&mut self, adt: &str, src: &Ty) -> Option<String> {
         self.pick_from_inst(adt, src).map(|(key, _)| key)
     }
 
@@ -1136,13 +1137,19 @@ impl Checker<'_> {
             },
             None => Ty::Unknown,
         };
-        let assigned = ix
-            .syntax()
+        // (Also `v["a"]["b"] = x`: Rust takes every index of an assigned place with `IndexMut`.)
+        let mut place = ix.syntax().clone();
+        while let Some(outer) = place.parent().and_then(ast::IndexExpr::cast)
+            && outer.base().is_some_and(|b| b.syntax() == &place)
+        {
+            place = outer.syntax().clone();
+        }
+        let assigned = place
             .parent()
             .and_then(ast::BinExpr::cast)
             .is_some_and(|b| {
                 matches!(b.op_kind(), Some(ast::BinaryOp::Assignment { .. }))
-                    && b.lhs().is_some_and(|l| l.syntax() == ix.syntax())
+                    && b.lhs().is_some_and(|l| l.syntax() == &place)
             });
         // `names[i].push('!')`: a string element is a JS value, so a method on it needs the place.
         let elem_is_str = self.shallow(&ret) == Ty::Str;
@@ -1312,8 +1319,13 @@ impl Checker<'_> {
         if self.shallow(re) == Ty::Dyn("Error".into()) && self.boxes_as_dyn_error(e) {
             return true;
         }
-        let Ty::Adt(adt, _) = self.shallow(re) else {
-            return false;
+        // (`impl From<MyErr> for String`: a std type's `From` impl.)
+        let adt = match self.shallow(re) {
+            Ty::Adt(adt, _) => adt,
+            t => match crate::adt::ext_key_of(&t) {
+                Some(k) => k.to_string(),
+                None => return false,
+            },
         };
         if self.could_be(e, re) || !self.adts.from_impls.contains_key(&adt) {
             return false;

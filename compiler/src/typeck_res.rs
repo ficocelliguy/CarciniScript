@@ -3,10 +3,10 @@
 
 use ra_ap_syntax::{
     AstNode,
-    ast::{self, HasArgList, HasGenericArgs},
+    ast::{self, HasArgList, HasGenericArgs, HasName},
 };
 
-use super::{Checker, VarKind};
+use super::{Checker, VarKind, strip_parens};
 use crate::ty::{IntKind, Ty};
 
 /// `Ok(..)` / `Err(..)` (also `Result::Ok`): 0 for `Ok`, 1 for `Err`.
@@ -158,10 +158,17 @@ impl Checker<'_> {
             }
             "unwrap" => {
                 count(self, 0);
+                // (`r.unwrap()` of a local holding `m.get_mut(k).ok_or(e)`: the slot.)
+                if m.receiver().is_some_and(|r| self.result_slot_local(&r).is_some()) {
+                    self.mark_slot_yield(&ast::Expr::MethodCallExpr(m.clone()));
+                }
                 t
             }
             "expect" => {
                 count(self, 1);
+                if m.receiver().is_some_and(|r| self.result_slot_local(&r).is_some()) {
+                    self.mark_slot_yield(&ast::Expr::MethodCallExpr(m.clone()));
+                }
                 if let Some(a) = a0 {
                     self.check(a, &Ty::Str);
                 }
@@ -305,7 +312,38 @@ impl Checker<'_> {
             }
             _ => return None,
         };
+        // `let r = m.get_mut(k).ok_or(e)?;` / `*m.get_mut(k).ok_or(e)? += 1` of a number, string or
+        // bool: the `?` (or `unwrap`) yields the slot.
+        if let Some(ast::Expr::MethodCallExpr(x)) = m.receiver().map(|r| strip_parens(&r))
+            && self.slot_calls.contains(&self.range(x.syntax()))
+            && let Some(outer) = super::ok_or_slot(&x)
+        {
+            self.mark_slot_yield(&outer);
+        }
         Some(Ty::Result(Box::new(inner), Box::new(e)))
+    }
+
+    /// `outer` (a `?` or an `unwrap()`) yields a slot: read through it, or keep it in a `let`.
+    pub(super) fn mark_slot_yield(&mut self, outer: &ast::Expr) {
+        let r = self.range(outer.syntax());
+        match outer
+            .syntax()
+            .parent()
+            .and_then(ast::LetStmt::cast)
+            .and_then(|l| l.pat())
+        {
+            Some(ast::Pat::IdentPat(ip)) if ip.pat().is_none() => {
+                if let Some(n) = ip.name() {
+                    let nr = self.range(n.syntax());
+                    self.slot_bindings.insert(nr);
+                }
+                self.slot_values.insert(r);
+                self.slot_keeps.insert(r);
+            }
+            _ => {
+                self.slot_values.insert(r);
+            }
+        }
     }
 
     /// `s.parse::<T>()`: integers, floats, `bool` and `char`.

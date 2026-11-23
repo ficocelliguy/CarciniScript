@@ -145,6 +145,13 @@ pub struct Types {
     /// one of the file's functions declared `-> &mut i32`, a `&mut i32` field, `o.unwrap()` of
     /// an `Option<&mut i32>` value. Codegen reads `[1]` unless the slot itself is kept.
     pub slot_values: std::collections::HashSet<(usize, usize)>,
+    /// Whole values read where they hold slots: a `Vec<&mut i32>` or `Vec<(usize, &mut i32)>` of
+    /// slots, one of its tuple items, given to `{:?}`; codegen copies them out with
+    /// `κσ.$readSlots(v, shape)` (`shape`: the JS form of a `SlotShape`, under `{e: ..}` for a
+    /// Vec).
+    pub slot_reads: HashMap<(usize, usize), String>,
+    /// The same for a captured local (`{refs:?}`), by the format string's start and the name.
+    pub slot_read_captures: HashMap<(usize, String), String>,
     /// Calls of a generic `-> &mut T` (`false`) / `-> Option<&mut T>` (`true`) whose `T` is a
     /// struct or collection there: the function returns a slot, read as the value it holds.
     pub slot_unwraps: HashMap<(usize, usize), bool>,
@@ -340,6 +347,7 @@ impl<'a> Checker<'a> {
             slot_locals: HashMap::new(),
             closure_slots: Vec::new(),
             slot_options: HashMap::new(),
+            slot_results: HashMap::new(),
             pending_bounds: Vec::new(),
             loops: Vec::new(),
             boxed: Default::default(),
@@ -364,6 +372,10 @@ impl<'a> Checker<'a> {
             slice_views: Default::default(),
             place_slots: Default::default(),
             slot_values: Default::default(),
+            slot_reads: Default::default(),
+            slot_read_captures: Default::default(),
+            slot_items: HashMap::new(),
+            whole_slot_items: Default::default(),
             slot_unwraps: Default::default(),
             slot_wraps: Default::default(),
             ret_item_slots: Default::default(),
@@ -406,6 +418,7 @@ impl<'a> Checker<'a> {
             quote_reps: Default::default(),
             pending_json: Vec::new(),
             pending_tries: Vec::new(),
+            pending_string_froms: Vec::new(),
             js_calls: HashMap::new(),
             js_imports: HashMap::new(),
             opaque_index_mut: Default::default(),
@@ -694,6 +707,8 @@ pub fn check(
     let slice_views = std::mem::take(&mut c.slice_views);
     let place_slots = std::mem::take(&mut c.place_slots);
     let slot_values = std::mem::take(&mut c.slot_values);
+    let slot_reads = std::mem::take(&mut c.slot_reads);
+    let slot_read_captures = std::mem::take(&mut c.slot_read_captures);
     let slot_unwraps = std::mem::take(&mut c.slot_unwraps);
     let slot_wraps = std::mem::take(&mut c.slot_wraps);
     let slot_keeps = std::mem::take(&mut c.slot_keeps);
@@ -742,6 +757,8 @@ pub fn check(
             slice_views,
             place_slots,
             slot_values,
+            slot_reads,
+            slot_read_captures,
             slot_unwraps,
             slot_wraps,
             slot_keeps,
@@ -836,6 +853,14 @@ struct Checker<'a> {
     closure_slots: Vec<(usize, slots::SlotShape)>,
     /// Locals holding an `Option` of slot items (`let big = v.iter_mut().find(..)`).
     slot_options: HashMap<String, slots::SlotShape>,
+    /// Locals holding a `Result` of a slot (`let r = m.get_mut(k).ok_or(e);`).
+    slot_results: HashMap<String, slots::SlotShape>,
+    /// Locals holding one tuple item with slots in it (`for t in &tagged`, `let t = &mut
+    /// tagged[1];` of a `Vec<(usize, &mut i32)>`): `t.1` is a slot.
+    slot_items: HashMap<String, slots::SlotShape>,
+    /// Whole items of a `Vec<(_, &mut T)>` of slots used where that's supported (`let t = &rs[1]`,
+    /// `{:?}` of `rs[1]`).
+    whole_slot_items: std::collections::HashSet<(usize, usize)>,
     /// Bounds to check once a generic call's type arguments are known.
     pending_bounds: Vec<(Ty, String, SyntaxNode, usize)>,
     boxed: std::collections::HashSet<(usize, usize)>,
@@ -869,6 +894,8 @@ struct Checker<'a> {
     slice_views: std::collections::HashSet<(usize, usize)>,
     place_slots: std::collections::HashSet<(usize, usize)>,
     slot_values: std::collections::HashSet<(usize, usize)>,
+    slot_reads: HashMap<(usize, usize), String>,
+    slot_read_captures: HashMap<(usize, String), String>,
     slot_unwraps: HashMap<(usize, usize), bool>,
     slot_wraps: HashMap<(usize, usize), bool>,
     /// Functions (by name) and methods (`Adt::name`) declared `-> impl Iterator<Item = (usize,
@@ -907,6 +934,8 @@ struct Checker<'a> {
     pending_json: Vec<(Ty, SyntaxNode, bool)>,
     /// `?`s whose error type wasn't known yet: (the `?`, its error, the function's).
     pending_tries: Vec<(ast::TryExpr, Ty, Ty)>,
+    /// `String::from` as a value with your `impl From<A> for String`: (the path, its argument).
+    pending_string_froms: Vec<(SyntaxNode, Ty)>,
     js_calls: HashMap<(usize, usize), (Option<String>, String)>,
     /// `use js::set_timeout as later;`: local name → the `js` crate's function.
     js_imports: HashMap<String, String>,
@@ -1143,6 +1172,38 @@ impl<'a> Checker<'a> {
                 })
             }
             s => s.inner_types().iter().any(|i| self.has_unbound(i)),
+        }
+    }
+
+    /// Of `impl PartialEq<R> for T` (or `PartialOrd`) impls, by `T`'s key: the method key and `R`
+    /// of the one `rhs` fits; an untyped literal prefers `i32` / `f64`, as rustc's fallback does.
+    fn pick_cmp_impl(&self, k: &str, m: &str, rhs: &Ty) -> Option<(String, Ty)> {
+        let keys = self
+            .adts
+            .method_alts
+            .get(&format!("{k}::{m}"))
+            .cloned()
+            .unwrap_or_else(|| vec![m.to_string()]);
+        let fits: Vec<(String, Ty)> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let p = self.adts.method(k, &key)?.params.first()?.clone();
+                self.could_be(&p, rhs).then_some((key, p))
+            })
+            .collect();
+        let rt = self.shallow(rhs);
+        let preferred = match (&rt, self.var_kind(&rt)) {
+            (Ty::IntLit, _) | (_, Some(VarKind::Int)) => Some(Ty::Int(IntKind::I32)),
+            (_, Some(VarKind::Float)) => Some(Ty::Float { f32: false }),
+            _ => None,
+        };
+        let exact = fits.iter().position(|(_, p)| {
+            *p == rt || preferred.as_ref().is_some_and(|w| p == w)
+        });
+        let mut fits = fits;
+        match exact {
+            Some(i) => Some(fits.swap_remove(i)),
+            None => fits.into_iter().next(),
         }
     }
 
@@ -1494,6 +1555,7 @@ impl<'a> Checker<'a> {
 
     fn declare(&mut self, name: &ast::Name, mut local: Local) {
         local.decl = Some(self.range(name.syntax()));
+        self.slot_items.remove(name.text().to_string().as_str());
         let ty = local.ty.clone();
         self.record(name.syntax(), ty);
         self.scopes
@@ -2349,6 +2411,8 @@ impl<'a> Checker<'a> {
         self.scopes = vec![HashMap::new()];
         self.slot_locals.clear();
         self.slot_options.clear();
+        self.slot_results.clear();
+        self.slot_items.clear();
         // `-> &mut i32` / `-> Option<&mut i32>`: what's returned is kept as a slot (`keep_slot`).
         self.ret_slot = self.ret_slot_kind(f, &ret);
         self.ret_slot_param = self.ret_slot.is_some_and(|opt| {
@@ -2457,6 +2521,7 @@ impl<'a> Checker<'a> {
         self.resolve_parses();
         self.resolve_defaults();
         self.resolve_tries();
+        self.resolve_string_froms();
         self.resolve_json();
         self.resolve_projections(true);
         self.resolve_bounds();
@@ -2763,6 +2828,16 @@ impl<'a> Checker<'a> {
     fn let_stmt(&mut self, l: &ast::LetStmt) {
         let declared = l.ty().map(|t| self.lower_type(&t));
         let declared_ref = l.ty().as_ref().and_then(Self::ref_kind);
+        // `let t = &mut tagged[1];` / `let (i, r) = &mut tagged[1];` of a `Vec<(usize, &mut
+        // i32)>` of slots: `t.1` / `r` are the item's slots.
+        let slot_item = l
+            .initializer()
+            .and_then(|i| self.slot_tuple_item(&i))
+            .map(|(ix, s)| {
+                let r = self.range(ix.syntax());
+                self.whole_slot_items.insert(r);
+                s
+            });
         let init_ty = l.initializer().map(|init| {
             let t = self.infer(&init, declared.as_ref());
             if let Some(d) = &declared {
@@ -2882,6 +2957,9 @@ impl<'a> Checker<'a> {
                 self.let_types.push((r, ty.clone()));
             }
             self.declare(&name, local);
+            if let Some(s) = slot_item {
+                self.slot_items.insert(name.text().to_string(), s);
+            }
             if self.copy_array(l.ty().as_ref(), l.initializer().as_ref(), &ty) {
                 let r = self.range(name.syntax());
                 self.copy_arrays.insert(r);
@@ -2924,6 +3002,9 @@ impl<'a> Checker<'a> {
         }
         self.pat(&pat, &ty);
         self.note_slot_tuple_let(&pat, l.initializer().as_ref());
+        if let Some(s) = &slot_item {
+            self.bind_slot_shape(&pat, s);
+        }
         // `let Some(c) = s.maybe(true) else { return };` of your `-> Option<&mut i32>` (or an
         // `Option<&mut i32>` local or parameter): `c` binds the slot.
         // `let Some(ref mut n) = self.timer else { .. };` / `let (ref mut a, ref mut b) = pair;`
@@ -3039,6 +3120,7 @@ impl<'a> Checker<'a> {
                             | "iter_mut"
                             | "split_at_mut"
                             | "downcast_mut"
+                            | "peek_mut"
                     )
                 }) || mut_element(&ast::Expr::MethodCallExpr(m.clone()), &|e| {
                     self.typed_mut_iter(e)
@@ -4245,7 +4327,10 @@ impl<'a> Checker<'a> {
     fn infer_inner(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> Ty {
         match e {
             ast::Expr::Literal(l) => self.literal(l),
-            ast::Expr::PathExpr(p) => self.path(p),
+            ast::Expr::PathExpr(p) => {
+                self.check_slot_result_use(p);
+                self.path(p)
+            }
             ast::Expr::ParenExpr(p) => p
                 .expr()
                 .map(|i| self.infer(&i, expected))
@@ -4508,6 +4593,26 @@ impl<'a> Checker<'a> {
                     }
                     Ty::Tuple(es) if f.name_ref().is_some_and(|n| n.as_tuple_field().is_some()) => {
                         let i = f.name_ref().and_then(|n| n.as_tuple_field()).unwrap_or(0);
+                        // `tagged[1].1` of a `Vec<(usize, &mut i32)>`, or `t.1` of an item of
+                        // one in a local: the slot in the item.
+                        let item = match strip_parens(&recv) {
+                            ast::Expr::IndexExpr(ix) => {
+                                ix.base().and_then(|b| self.vec_slot_shape(&b))
+                            }
+                            ast::Expr::PathExpr(p) => p
+                                .path()
+                                .and_then(|p| p.as_single_name_ref())
+                                .and_then(|n| {
+                                    self.slot_items.get(n.text().to_string().as_str()).cloned()
+                                }),
+                            _ => None,
+                        };
+                        if let Some(slots::SlotShape::Tuple(fields)) = item
+                            && fields.get(i) == Some(&Some(slots::SlotShape::Slot))
+                        {
+                            let r = self.range(f.syntax());
+                            self.slot_values.insert(r);
+                        }
                         match es.get(i) {
                             Some(t) => t.clone(),
                             None => {
@@ -4924,6 +5029,18 @@ impl<'a> Checker<'a> {
         if let Some(t) = self.adt_path(p, &segs) {
             return t;
         }
+        // `.map_err(String::from)` with your `impl From<A> for String`: which impl is known once
+        // the argument's type is.
+        if let [.., "String", "from"] = segs.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+            && self.adts.from_impls.contains_key("String")
+        {
+            let a = self.fresh(VarKind::General);
+            self.pending_string_froms.push((p.syntax().clone(), a.clone()));
+            return Ty::Closure {
+                params: vec![a],
+                ret: Box::new(Ty::Str),
+            };
+        }
         // `String::from` / `ToString::to_string` as function values.
         if matches!(
             segs.iter()
@@ -5272,8 +5389,13 @@ impl<'a> Checker<'a> {
                         };
                         self.param_arith(b, op, &n, &lt, &rhs, true);
                     }
-                    Some(ArithOp::Shl | ArithOp::Shr) => {
-                        self.infer(&rhs, None);
+                    Some(op @ (ArithOp::Shl | ArithOp::Shr)) => {
+                        // `b <<= 2` with your `impl ShlAssign<u32> for Bits`.
+                        if let Ty::Adt(n, _) = self.shallow(&lt) {
+                            self.op_overload(b.syntax(), op, true, &n, &lt, &rhs, None);
+                        } else {
+                            self.infer(&rhs, None);
+                        }
                     }
                     Some(op) => {
                         self.arith_operands(b, op, &lt, &rhs);
@@ -5304,23 +5426,15 @@ impl<'a> Checker<'a> {
                     && !self.could_be(&lt, &rt)
                     && let Some(k) = match self.shallow(&lt) {
                         Ty::Adt(n, _) => Some(n),
-                        t => crate::adt::ext_key_of(&t)
+                        t => crate::adt::ext_key_of(&self.zonk(&t))
                             .filter(|k| self.adts.ext_types.contains(*k))
                             .map(str::to_string),
                     }
-                    && let Some(sig) = self.adts.method(&k, "partial_cmp").cloned()
-                    && sig.params.first().is_some_and(|p| self.could_be(p, &rt))
+                    && let Some((key, p)) = self.pick_cmp_impl(&k, "partial_cmp", &rt)
                 {
-                    if let Some(p) = sig.params.first() {
-                        self.unify(p, &rt);
-                    }
+                    self.unify(&p, &rt);
                     let r = self.range(b.syntax());
-                    self.conversions.insert(
-                        r,
-                        crate::adt::Conv::Method {
-                            key: "partial_cmp".into(),
-                        },
-                    );
+                    self.conversions.insert(r, crate::adt::Conv::Method { key });
                     return Ty::Bool;
                 }
                 // `"home" == host` / `id == 3` with `impl PartialEq<Host> for &str` /
@@ -5329,19 +5443,15 @@ impl<'a> Checker<'a> {
                     && !self.could_be(&lt, &rt)
                     && let Some(k) = match self.shallow(&lt) {
                         Ty::Adt(n, _) => Some(n),
-                        t => crate::adt::ext_key_of(&t)
+                        t => crate::adt::ext_key_of(&self.zonk(&t))
                             .filter(|k| self.adts.ext_types.contains(*k))
                             .map(str::to_string),
                     }
-                    && let Some(sig) = self.adts.method(&k, "eq").cloned()
-                    && sig.params.first().is_some_and(|p| self.could_be(p, &rt))
+                    && let Some((key, p)) = self.pick_cmp_impl(&k, "eq", &rt)
                 {
-                    if let Some(p) = sig.params.first() {
-                        self.unify(p, &rt);
-                    }
+                    self.unify(&p, &rt);
                     let r = self.range(b.syntax());
-                    self.conversions
-                        .insert(r, crate::adt::Conv::Method { key: "eq".into() });
+                    self.conversions.insert(r, crate::adt::Conv::Method { key });
                     return Ty::Bool;
                 }
                 if !self.unify(&lt, &rt) {
@@ -5370,6 +5480,10 @@ impl<'a> Checker<'a> {
                 let lt = self.infer(&lhs, expected);
                 if let Ty::Param(n) = self.shallow(&lt) {
                     return self.param_arith(b, op, &n, &lt, &rhs, false);
+                }
+                // `b << 2` with your `impl Shl<u32> for Bits`.
+                if let Ty::Adt(n, _) = self.shallow(&lt) {
+                    return self.op_overload(b.syntax(), op, false, &n, &lt, &rhs, None);
                 }
                 let rt = self.infer(&rhs, None);
                 for (t, side) in [(&lt, &lhs), (&rt, &rhs)] {
@@ -6038,6 +6152,32 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `String::from` values: your `From` impl for their argument, or the string itself.
+    fn resolve_string_froms(&mut self) {
+        for (n, a) in std::mem::take(&mut self.pending_string_froms) {
+            if self.could_be(&a, &Ty::Str) {
+                self.unify(&a, &Ty::Str);
+                continue;
+            }
+            match self.pick_from("String", &a) {
+                Some(key) => self.record_conv(
+                    &n,
+                    crate::adt::Conv::From {
+                        adt: "String".into(),
+                        key,
+                    },
+                ),
+                None => {
+                    let msg = format!(
+                        "the trait bound `String: From<{}>` is not satisfied",
+                        self.describe(&a)
+                    );
+                    self.error(&n, msg);
+                }
+            }
+        }
+    }
+
     /// The `?`s whose error wasn't known when they were checked.
     fn resolve_tries(&mut self) {
         for (t, e, re) in std::mem::take(&mut self.pending_tries) {
@@ -6054,6 +6194,10 @@ impl<'a> Checker<'a> {
             return Ty::Unknown;
         };
         let it = self.infer(&inner, None);
+        // `*r? += 1` of a local holding `m.get_mut(k).ok_or(e)`: the slot.
+        if self.result_slot_local(&inner).is_some() {
+            self.mark_slot_yield(&ast::Expr::TryExpr(t.clone()));
+        }
         let ret = self.ret_ty.clone();
         // A closure without a return type (`|acc, c| Some(acc + c.to_digit(10)? as f64)`): `?`
         // makes it return what its operand is, as rustc infers from the body.
@@ -7172,7 +7316,21 @@ impl<'a> Checker<'a> {
                         let params: &[Ty] = if m2 == "unwrap" { &[] } else { &[Ty::Str] };
                         sig(self, params, inner)
                     }
-                    "unwrap_or" => sig(self, &[inner.clone()], inner),
+                    "unwrap_or" => {
+                        let t = sig(self, &[inner.clone()], inner);
+                        // `*m.get_mut(k).unwrap_or(&mut 0) += 1`: the default is a slot too (over
+                        // a local, or holding the value).
+                        if let Some(ast::Expr::MethodCallExpr(x)) =
+                            m.receiver().map(|r| strip_parens(&r))
+                            && self.slot_calls.contains(&self.range(x.syntax()))
+                            && let Some(a) = m.arg_list().and_then(|l| l.args().next())
+                            && !self.keep_slot(&a)
+                        {
+                            let r = self.range(a.syntax());
+                            self.slot_wraps.insert(r, false);
+                        }
+                        t
+                    }
                     "unwrap_or_default" => {
                         let resolved = self.zonk(&inner);
                         if !resolved.has_default() {
@@ -7488,12 +7646,49 @@ impl<'a> Checker<'a> {
             return Ty::Unknown;
         };
         let mut bt = self.infer(&base, None);
-        // (Its items are slots, which only `for` loops over it read and write.)
-        if self.vec_slot_shape(&base).is_some() {
-            self.error(
-                ix.syntax(),
-                "indexing a `Vec<&mut T>` collected from `iter_mut()` over numbers, strings or bools isn't supported yet; loop over it with `for`",
-            );
+        // `*refs[1] = 9` with `refs: Vec<&mut i32>`: its items are slots over the elements.
+        match self.vec_slot_shape(&base) {
+            Some(slots::SlotShape::Slot) => {
+                let r = self.range(ix.syntax());
+                self.slot_values.insert(r);
+            }
+            // `*tagged[1].1 = 9` with `tagged: Vec<(usize, &mut i32)>`: a field of the item is
+            // read (the field access marks a slot); the whole item isn't.
+            Some(slots::SlotShape::Tuple(fields)) => {
+                let field = ix
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .find(|p| p.kind() != ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+                    .and_then(ast::FieldExpr::cast)
+                    .and_then(|f| f.name_ref()?.as_tuple_field());
+                let r = self.range(ix.syntax());
+                let mut ok = self.whole_slot_items.contains(&r)
+                    || field.is_some_and(|i| {
+                        matches!(fields.get(i), Some(None | Some(slots::SlotShape::Slot)))
+                    });
+                // `f(&tagged[1])` / `Some(&tagged[1])`: nothing can be written through a
+                // `&(usize, &mut i32)`, so a copy with the slots read is the same.
+                if !ok
+                    && let Some(re) = ix
+                        .syntax()
+                        .ancestors()
+                        .skip(1)
+                        .find(|p| p.kind() != ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+                        .and_then(ast::RefExpr::cast)
+                    && re.mut_token().is_none()
+                {
+                    self.note_slot_read(&ast::Expr::RefExpr(re));
+                    ok = true;
+                }
+                if !ok {
+                    self.error(
+                        ix.syntax(),
+                        "using a whole item of a `Vec<(_, &mut T)>` collected from `iter_mut()` over numbers, strings or bools by value or as `&mut` isn't supported yet; bind it (`let (i, r) = &mut v[1];`), write through its fields (`*v[1].1 = ..`) or pass `&v[1]` to read it",
+                    );
+                }
+            }
+            None => {}
         }
         // `stack[i]` through `impl Deref` (when the type has no `Index` of its own).
         if let Some((n, target)) = self.deref_target(&bt)
@@ -7983,7 +8178,13 @@ impl<'a> Checker<'a> {
                 Some(i) => tys.get(i).cloned(),
                 // `{name}` with no `name = ...` argument captures a local (or a `const`).
                 None => match self.lookup(n) {
-                    Some(l) => Some(l.ty.clone()),
+                    Some(l) => {
+                        let t = l.ty.clone();
+                        if let Some(js) = self.local_slot_read(n) {
+                            self.slot_read_captures.insert((args[0].start, n.clone()), js);
+                        }
+                        Some(t)
+                    }
                     None if self.consts.contains_key(n.as_str()) => {
                         self.consts.get(n.as_str()).cloned()
                     }
@@ -8006,6 +8207,14 @@ impl<'a> Checker<'a> {
 
     /// Type the arguments of a format macro and check each placeholder can format its value.
     fn format_args(&mut self, args: &[MacroArg]) {
+        // `{:?}` of a Vec of slots or an item of one: copied out (`slot_reads`).
+        for a in &args[1..] {
+            if let (Some(e), _) = macros::parse_arg(a) {
+                let saved = std::mem::replace(&mut self.base, a.start);
+                self.note_slot_read(&e);
+                self.base = saved;
+            }
+        }
         let tys: Vec<Ty> = args[1..].iter().map(|a| self.macro_arg(a, None)).collect();
         let Some(fmt_str) = macros::format_string(&args[0]) else {
             return;
@@ -8903,7 +9112,7 @@ fn slot_let_binding(m: &ast::MethodCallExpr) -> Option<ast::Name> {
     let u = ast::MethodCallExpr::cast(m.syntax().parent()?)?;
     if !u
         .name_ref()
-        .is_some_and(|n| matches!(n.text(), "unwrap" | "expect"))
+        .is_some_and(|n| matches!(n.text(), "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else"))
     {
         return None;
     }
@@ -8945,7 +9154,86 @@ fn slot_position(m: &ast::MethodCallExpr) -> bool {
     if let Some(me) = ast::MatchExpr::cast(p.clone()) {
         return me.expr().is_some_and(|e| e.syntax() == &n);
     }
-    unwrapped_position(m) || slots::keep_position(m.syntax())
+    // `m.get_mut(k).map(|v| *v += 1)`: the closure's parameter binds the slot.
+    if let Some(u) = ast::MethodCallExpr::cast(p.clone())
+        && u.receiver().is_some_and(|r| r.syntax() == &n)
+        && u.name_ref().is_some_and(|x| {
+            matches!(
+                x.text(),
+                "map" | "and_then" | "is_some_and" | "is_none_or" | "inspect" | "map_or"
+                    | "map_or_else"
+            )
+        })
+    {
+        return true;
+    }
+    unwrapped_position(m) || slots::keep_position(m.syntax()) || ok_or_slot(m).is_some()
+        || ok_or_kept(m)
+}
+
+/// `let r = m.get_mut(k).ok_or(e);`: the `Result` kept in a local, which holds the slot.
+fn ok_or_kept(m: &ast::MethodCallExpr) -> bool {
+    let up = |n: SyntaxNode| {
+        let mut n = n;
+        while let Some(p) = n
+            .parent()
+            .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+        {
+            n = p;
+        }
+        n
+    };
+    let n = up(m.syntax().clone());
+    let Some(o) = n.parent().and_then(ast::MethodCallExpr::cast) else {
+        return false;
+    };
+    if !o.receiver().is_some_and(|r| r.syntax() == &n)
+        || !o
+            .name_ref()
+            .is_some_and(|x| matches!(x.text(), "ok_or" | "ok_or_else"))
+    {
+        return false;
+    }
+    let n = up(o.syntax().clone());
+    n.parent()
+        .and_then(ast::LetStmt::cast)
+        .is_some_and(|l| {
+            l.initializer().is_some_and(|i| i.syntax() == &n)
+                && matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
+        })
+}
+
+/// `m.get_mut(k).ok_or(e)?` / `.ok_or_else(..).unwrap()`: the expression that yields the
+/// `&mut`, where a slot stands in for it.
+pub(super) fn ok_or_slot(m: &ast::MethodCallExpr) -> Option<ast::Expr> {
+    let up = |n: SyntaxNode| {
+        let mut n = n;
+        while let Some(p) = n
+            .parent()
+            .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+        {
+            n = p;
+        }
+        n
+    };
+    let n = up(m.syntax().clone());
+    let o = ast::MethodCallExpr::cast(n.parent()?)?;
+    if !o.receiver().is_some_and(|r| r.syntax() == &n)
+        || !o
+            .name_ref()
+            .is_some_and(|x| matches!(x.text(), "ok_or" | "ok_or_else"))
+    {
+        return None;
+    }
+    let n = up(o.syntax().clone());
+    let p = n.parent()?;
+    if let Some(t) = ast::TryExpr::cast(p.clone()) {
+        return Some(ast::Expr::TryExpr(t));
+    }
+    let u = ast::MethodCallExpr::cast(p)?;
+    (u.receiver().is_some_and(|r| r.syntax() == &n)
+        && u.name_ref().is_some_and(|x| matches!(x.text(), "unwrap" | "expect")))
+    .then_some(ast::Expr::MethodCallExpr(u))
 }
 
 /// Whether a call's result is unwrapped (`.unwrap()` / `.expect(..)`) right into a deref
@@ -8962,11 +9250,14 @@ pub(super) fn unwrapped_position(m: &ast::MethodCallExpr) -> bool {
     if let Some(u) = ast::MethodCallExpr::cast(p)
         && u.receiver().is_some_and(|r| r.syntax() == &n)
         && u.name_ref()
-            .is_some_and(|x| matches!(x.text(), "unwrap" | "expect"))
+            .is_some_and(|x| matches!(x.text(), "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else"))
         && let Some(q) = u.syntax().parent()
     {
-        return ast::PrefixExpr::cast(q)
+        // (`m.get_mut(k).unwrap().push(..)`: a method on the value, which may change it.)
+        return ast::PrefixExpr::cast(q.clone())
             .is_some_and(|pe| pe.op_kind() == Some(ast::UnaryOp::Deref))
+            || ast::MethodCallExpr::cast(q)
+                .is_some_and(|mc| mc.receiver().is_some_and(|r| r.syntax() == u.syntax()))
             || slots::keep_position(u.syntax());
     }
     false
@@ -8974,12 +9265,28 @@ pub(super) fn unwrapped_position(m: &ast::MethodCallExpr) -> bool {
 
 /// `v.get_mut(i).is_some()` and the like: the result is only looked at, so a copy is fine.
 fn only_tested(m: &ast::MethodCallExpr) -> bool {
-    m.syntax()
+    let mut n = m.syntax().clone();
+    while let Some(p) = n
         .parent()
-        .and_then(ast::MethodCallExpr::cast)
-        .filter(|u| u.receiver().is_some_and(|r| r.syntax() == m.syntax()))
+        .filter(|p| p.kind() == ra_ap_syntax::SyntaxKind::PAREN_EXPR)
+    {
+        n = p;
+    }
+    let Some(p) = n.parent() else { return false };
+    // `m.get_mut(k) == None`
+    if let Some(b) = ast::BinExpr::cast(p.clone()) {
+        return matches!(
+            b.op_kind(),
+            Some(ast::BinaryOp::CmpOp(ast::CmpOp::Eq { .. }))
+        ) && [b.lhs(), b.rhs()]
+            .into_iter()
+            .flatten()
+            .any(|s| s.syntax().text() == "None");
+    }
+    ast::MethodCallExpr::cast(p)
+        .filter(|u| u.receiver().is_some_and(|r| r.syntax() == &n))
         .and_then(|u| u.name_ref())
-        .is_some_and(|n| matches!(n.text(), "is_some" | "is_none"))
+        .is_some_and(|n| matches!(n.text(), "is_some" | "is_none" | "copied" | "cloned"))
 }
 
 impl Checker<'_> {
@@ -9014,6 +9321,52 @@ impl Checker<'_> {
                 .collect();
             if let Some(t) = body.stmt_list().and_then(|l| l.tail_expr()) {
                 results.push(t);
+            }
+            // (Through the arms of a `match` / `if` and the tails of blocks; a `panic!` hands
+            // out nothing.)
+            let mut i = 0;
+            while i < results.len() {
+                let e = strip_parens(&results[i]);
+                let inner: Option<Vec<ast::Expr>> = match &e {
+                    ast::Expr::MatchExpr(m) => Some(
+                        m.match_arm_list()
+                            .into_iter()
+                            .flat_map(|l| l.arms())
+                            .filter_map(|a| a.expr())
+                            .collect(),
+                    ),
+                    ast::Expr::IfExpr(ie) => Some(
+                        [ie.then_branch().map(ast::Expr::BlockExpr), ie.else_branch().map(|b| match b {
+                            ast::ElseBranch::Block(b) => ast::Expr::BlockExpr(b),
+                            ast::ElseBranch::IfExpr(x) => ast::Expr::IfExpr(x),
+                        })]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                    ),
+                    ast::Expr::BlockExpr(b) => {
+                        Some(b.stmt_list().and_then(|l| l.tail_expr()).into_iter().collect())
+                    }
+                    ast::Expr::MacroExpr(m)
+                        if m.macro_call()
+                            .and_then(|m| macros::macro_name(&m))
+                            .is_some_and(|m| {
+                                matches!(m.as_str(), "panic" | "unreachable" | "todo" | "unimplemented")
+                            }) =>
+                    {
+                        Some(Vec::new())
+                    }
+                    // (Its value is among the `return`s already.)
+                    ast::Expr::ReturnExpr(_) => Some(Vec::new()),
+                    _ => None,
+                };
+                match inner {
+                    Some(es) => {
+                        results.remove(i);
+                        results.extend(es);
+                    }
+                    None => i += 1,
+                }
             }
             for e in results {
                 match strip_parens(&e) {

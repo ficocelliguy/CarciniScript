@@ -429,7 +429,7 @@ Not caught at all (probed 2026-11-18), so no message to improve: `let r = &v[0]`
 `Vec<i32>` then `v.push` (the index copies), `"a" + "b"`, an un-awaited `ns.hack(..)`, and a
 partial move out of a struct (`let a = p.a; let q = p;`).
 
-- [ ] Stale in `RUST_GAPS.md` (works now, each confirmed by a probe): `HashMap::get_mut` on number
+- [x] Stale in `RUST_GAPS.md` (works now, each confirmed by a probe): `HashMap::get_mut` on number
   values writes through (`if let Some(v) = m.get_mut("a") { *v += 2.0 }`, `*m.get_mut("a").unwrap() += 1.0`);
   string byte-range slicing (`&s[0..5]`, `&s[6..]`); `BTreeMap::range`; and two renamed `Error`
   types from inline modules (`use a::Error as AError; use b::Error as BError;`).
@@ -500,5 +500,5 @@ loops, `?` and panics are returns and throws (try/finally only for `Drop` types)
   Every one goes in `RUST_GAPS.md`.
 - **The borrow checker sees through erased types only as far as its overlay reaches:** what it
   can't follow is silent, so some programs rustc rejects still run (what it does see is an
-  error, as in rustc). Documented in RUST_GAPS "Checking".
+  error, as in rustc). Documented in RUST_GAPS "Type checking".
 - **ra_ap_syntax churn:** pinned version; upgrades are deliberate.

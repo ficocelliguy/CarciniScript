@@ -2843,6 +2843,19 @@ const ORDERED_FLOAT_RENAMES: Renames = Renames {
     result_err: None,
 };
 
+/// The types `itertools` methods return, as the itertools prelude's (`itertools::MinMaxResult`,
+/// `use itertools::FoldWhile::{Continue, Done};`).
+const ITERTOOLS_RENAMES: Renames = Renames {
+    roots: &["itertools", "::itertools"],
+    names: &[
+        ("MinMaxResult", "MinMaxResult"),
+        ("FoldWhile", "FoldWhile"),
+        ("ExactlyOneError", "ExactlyOneError"),
+    ],
+    star: &["MinMaxResult", "FoldWhile", "ExactlyOneError"],
+    result_err: None,
+};
+
 /// `petgraph`'s types as the petgraph prelude's (its functions are `petgraph_edits`').
 const PETGRAPH_RENAMES: Renames = Renames {
     roots: &[
@@ -2972,6 +2985,7 @@ const ALL_RENAMES: &[&Renames] = &[
         &REACT_RENAMES,
         &ORDERED_FLOAT_RENAMES,
         &PETGRAPH_RENAMES,
+        &ITERTOOLS_RENAMES,
 ];
 
 /// The crate's own name for a prelude's internal one (`PgGraph` is petgraph's `Graph`), as the

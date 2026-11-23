@@ -1,8 +1,8 @@
-//! `use Enum::*` and `use Enum::{A, B as Bee}` for enums of this file, as a pre-pass over the
-//! source text: each imported variant name, in expressions, patterns and macro arguments, is
-//! written out as `Enum::A`, and the `use` goes away. A `use` inside a function covers that
-//! function; one at the top covers the file. An `OffsetMap` keeps positions pointing at the
-//! original text.
+//! `use Enum::*` and `use Enum::{A, B as Bee}` for enums of this file (and the bundled crates',
+//! `CRATE_ENUMS`), as a pre-pass over the source text: each imported variant name, in expressions,
+//! patterns and macro arguments, is written out as `Enum::A`, and the `use` goes away. A `use`
+//! inside a function covers that function; one at the top covers the file. An `OffsetMap` keeps
+//! positions pointing at the original text.
 
 use std::collections::HashMap;
 
@@ -37,13 +37,22 @@ pub fn has_variant_imports(text: &str) -> bool {
     }
     let file = crate::macros::parse_tree(text);
     let enums = enums(&file);
-    !enums.is_empty()
+    (!enums.is_empty() || CRATE_ENUMS.iter().any(|(k, _, _)| text.contains(k)))
         && file
             .syntax()
             .descendants()
             .filter_map(ast::Use::cast)
             .any(|u| imports(&u, &enums).is_some())
 }
+
+/// The bundled crates' enums whose variants a `use` brings in the same way (`use
+/// itertools::FoldWhile::{Continue, Done};`, `use either::Either::{self, Left, Right};`): the
+/// preludes declare them under these names.
+const CRATE_ENUMS: &[(&str, &str, &[&str])] = &[
+    ("either", "Either", &["Left", "Right"]),
+    ("itertools", "MinMaxResult", &["NoElements", "OneElement", "MinMax"]),
+    ("itertools", "FoldWhile", &["Continue", "Done"]),
+];
 
 /// What `u` imports, when every leaf is a variant (or all variants) of an enum of this file:
 /// local name → `Enum::Variant`.
@@ -53,7 +62,22 @@ fn imports(u: &ast::Use, enums: &HashMap<String, Vec<String>>) -> Option<HashMap
         if matches!(segs.first().map(String::as_str), Some("crate" | "self")) {
             segs.remove(0);
         }
-        let variants = enums.get(segs.first()?)?;
+        // (`either::Either::{self, ..}`: the enum, a name the prelude declares.)
+        let krate = CRATE_ENUMS.iter().find(|(k, e, _)| {
+            segs.len() >= 2 && segs[0].trim_start_matches("::") == *k && segs[1] == *e
+        });
+        let owned: Vec<String>;
+        let variants = match krate {
+            Some((_, _, vs)) => {
+                segs.remove(0);
+                if !star && (segs.len() == 1 || segs.len() == 2 && segs[1] == "self") {
+                    continue;
+                }
+                owned = vs.iter().map(|v| v.to_string()).collect();
+                &owned
+            }
+            None => enums.get(segs.first()?)?,
+        };
         let e = &segs[0];
         match (segs.len(), star) {
             (1, true) => {
@@ -71,6 +95,23 @@ fn imports(u: &ast::Use, enums: &HashMap<String, Vec<String>>) -> Option<HashMap
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// What stays of a `use` of a bundled crate's variants: the enum itself, when it imports that too
+/// (`use either::Either::{self, Left};` keeps `use either::Either;`, which brings in the prelude).
+fn kept_enum_imports(u: &ast::Use) -> String {
+    let mut out = String::new();
+    for (segs, _, star) in crate::typeck::use_leaves(u) {
+        let segs: Vec<&str> = segs.iter().map(|s| s.trim_start_matches("::")).collect();
+        if let [k, e, rest @ ..] = segs.as_slice()
+            && !star
+            && matches!(rest, [] | ["self"])
+            && CRATE_ENUMS.iter().any(|(ck, ce, _)| ck == k && ce == e)
+        {
+            out.push_str(&format!("use {k}::{e};"));
+        }
+    }
+    out
 }
 
 /// Rewrite the imported variants in `text`, recording the edits in `map`.
@@ -92,7 +133,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) {
             .text_range();
         scopes.push((scope, names));
         let r = u.syntax().text_range();
-        edits.push((r.start().into(), r.end().into(), String::new()));
+        edits.push((r.start().into(), r.end().into(), kept_enum_imports(&u)));
     }
     if scopes.is_empty() {
         return;

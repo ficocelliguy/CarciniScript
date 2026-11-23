@@ -76,6 +76,13 @@ pub(super) const ITERTOOLS_METHODS: &[&str] = &[
     "group_by",
     "into_group_map",
     "into_group_map_by",
+    "minmax",
+    "minmax_by",
+    "minmax_by_key",
+    "exactly_one",
+    "fold_while",
+    "kmerge",
+    "kmerge_by",
 ];
 
 const RAND_METHODS: &str = "`gen`, `gen_range`, `gen_bool`, `gen_ratio` (or their rand 0.9 names `random`, `random_range`, ..), `fill`, `next_u32` and `next_u64`";
@@ -847,6 +854,81 @@ impl Checker<'_> {
                 (
                     "intoGroupMapBy",
                     Ty::Map(Box::new(k), Box::new(Ty::Vec(Box::new(e)))),
+                )
+            }
+            // The prelude's `MinMaxResult` / `FoldWhile` / `ExactlyOneError`, whose classes the
+            // helpers are passed to build them.
+            "minmax" | "minmax_by" | "minmax_by_key" => {
+                let js = match method {
+                    "minmax" => {
+                        self.crate_args(m, args, &[]);
+                        "minmax"
+                    }
+                    "minmax_by" => {
+                        let f = Ty::Closure {
+                            params: vec![e.clone(), e.clone()],
+                            ret: Box::new(Ty::Ordering),
+                        };
+                        self.crate_args(m, args, &[f]);
+                        "minmaxBy"
+                    }
+                    _ => {
+                        let k = self.fresh(VarKind::General);
+                        let f = Ty::Closure {
+                            params: vec![e.clone()],
+                            ret: Box::new(k),
+                        };
+                        self.crate_args(m, args, &[f]);
+                        "minmaxByKey"
+                    }
+                };
+                let class = Ty::Adt("MinMaxResult".into(), vec![]);
+                self.note_crate(m.syntax(), &format!("itertools.{js}"), vec![class]);
+                return Some(Ty::Adt("MinMaxResult".into(), vec![e]));
+            }
+            "exactly_one" => {
+                self.crate_args(m, args, &[]);
+                let class = Ty::Adt("ExactlyOneError".into(), vec![]);
+                self.note_crate(m.syntax(), "itertools.exactlyOne", vec![class]);
+                let err = Ty::Adt("ExactlyOneError".into(), vec![e.clone()]);
+                return Some(Ty::Result(Box::new(e), Box::new(err)));
+            }
+            "fold_while" => {
+                self.arg_count(m.syntax(), "method", 2, args.len());
+                let b = match args.first() {
+                    Some(a) => self.infer(a, None),
+                    None => Ty::Unknown,
+                };
+                let fw = Ty::Adt("FoldWhile".into(), vec![b.clone()]);
+                if let Some(a) = args.get(1) {
+                    let f = Ty::Closure {
+                        params: vec![b, e],
+                        ret: Box::new(fw.clone()),
+                    };
+                    self.check(a, &f);
+                }
+                let class = Ty::Adt("FoldWhile".into(), vec![]);
+                self.note_crate(m.syntax(), "itertools.foldWhile", vec![class]);
+                return Some(fw);
+            }
+            "kmerge" | "kmerge_by" => {
+                let u = self.iter_elem(&e).unwrap_or(Ty::Unknown);
+                if method == "kmerge" {
+                    self.crate_args(m, args, &[]);
+                } else {
+                    let f = Ty::Closure {
+                        params: vec![u.clone(), u.clone()],
+                        ret: Box::new(Ty::Bool),
+                    };
+                    self.crate_args(m, args, &[f]);
+                }
+                (
+                    if method == "kmerge" {
+                        "kmerge"
+                    } else {
+                        "kmergeBy"
+                    },
+                    iter(u),
                 )
             }
             _ => return None,

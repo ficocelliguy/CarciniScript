@@ -1388,22 +1388,27 @@ impl Codegen<'_> {
             );
         }
         // `impl Add for V` (with `V` on the right) and friends as `$op$add`: what generic
-        // arithmetic on a `T` calls (`κσ.$gop`).
-        let ops: Vec<(String, String)> = self
+        // arithmetic on a `T` calls (`κσ.$gop`). A shift also takes an integer amount
+        // (`impl Shl<u32> for Bits`, for `T: Shl<u32>`): with both, the amount's JS type picks.
+        let ops: Vec<(String, String, bool)> = self
             .types
             .adts
             .op_impls
             .get(&def.name)
             .map(|v| {
                 v.iter()
-                    .filter(|i| {
-                        matches!(&i.rhs, Ty::Adt(n, _) if *n == def.name)
-                            || matches!(i.trait_name.as_str(), "Neg" | "Not")
-                    })
                     .filter_map(|i| {
+                        let own = matches!(&i.rhs, Ty::Adt(n, _) if *n == def.name)
+                            || matches!(i.trait_name.as_str(), "Neg" | "Not");
+                        let int = matches!(i.rhs, Ty::Int(_))
+                            && i.trait_name.starts_with("Sh");
+                        if !(own || int) {
+                            return None;
+                        }
                         Some((
                             crate::adt::op_method(&i.trait_name)?.to_string(),
                             i.key.clone(),
+                            int,
                         ))
                     })
                     .collect()
@@ -1457,13 +1462,18 @@ impl Codegen<'_> {
             );
         }
         let mut seen: Vec<String> = Vec::new();
-        for (m, key) in ops {
-            if seen.contains(&m) {
+        for (m, key, int) in &ops {
+            if seen.contains(m) {
                 continue;
             }
-            let js = format!("this{}", super::member(&prop(&key)));
-            lines(self, vec![format!("$op${m}(o) {{ return {js}(o); }}")]);
-            seen.push(m);
+            let call = |k: &String| format!("this{}(o)", super::member(&prop(k)));
+            let mut body = call(key);
+            if let Some((_, other, _)) = ops.iter().find(|(m2, _, i2)| m2 == m && i2 != int) {
+                let (num, obj) = if *int { (key, other) } else { (other, key) };
+                body = format!("typeof o === \"object\" ? {} : {}", call(obj), call(num));
+            }
+            lines(self, vec![format!("$op${m}(o) {{ return {body}; }}")]);
+            seen.push(m.clone());
         }
         // `impl fmt::Debug`: `{:?}` writes through its `fmt` (emitted as `fmt$dbg`).
         if manual("Debug") {

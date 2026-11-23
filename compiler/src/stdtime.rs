@@ -10,6 +10,7 @@ const TIME: &str = include_str!("time_prelude.rs");
 const SYNC: &str = include_str!("sync_prelude.rs");
 const LOCK: &str = include_str!("lock_prelude.rs");
 const EITHER: &str = include_str!("either_prelude.rs");
+const ITERTOOLS: &str = include_str!("itertools_prelude.rs");
 const SERDE_JSON: &str = include_str!("serde_json_prelude.rs");
 const REGEX: &str = include_str!("regex_prelude.rs");
 const COW: &str = include_str!("cow_prelude.rs");
@@ -146,6 +147,15 @@ pub(crate) fn with_prelude(
     {
         out.push(EITHER);
     }
+    if text.contains("itertools")
+        && ["minmax", "fold_while", "exactly_one", "MinMaxResult", "FoldWhile", "ExactlyOneError"]
+            .iter()
+            .any(|n| text.contains(n))
+        && !text.contains("// (itertools prelude)")
+        && !declares("MinMaxResult")
+    {
+        out.push(ITERTOOLS);
+    }
     if text.contains("serde_json")
         && !text.contains("// (serde_json prelude)")
         && !declares("Value")
@@ -190,7 +200,9 @@ pub(crate) fn with_prelude(
     if (os
         || io_names.iter().any(|n| text.contains(n))
         || text.contains("io::Write")
-        || text.contains("io::prelude"))
+        || text.contains("io::prelude")
+        // (serde_json's `to_writer` / `from_reader` take an `io::Write` / `io::Read`.)
+        || (text.contains("serde_json") && (text.contains("to_writer") || text.contains("from_reader"))))
         && !text.contains("// (io prelude)")
         && !declares("IoError")
     {

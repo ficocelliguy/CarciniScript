@@ -669,6 +669,23 @@ impl Codegen<'_> {
                     "inspect" => "optInspect",
                     _ => unreachable!(),
                 };
+                // `*m.get_mut(k).unwrap_or_else(|| &mut d) += 1`: the slot (or the default's)
+                // read through, unless a `let` or a call keeps it.
+                let slot = m2 == "unwrap_or_else"
+                    && self.types.slot_calls.contains(&self.range_of(
+                        super::strip_parens_expr(&m.receiver()?).syntax(),
+                    ))
+                    && !m
+                        .syntax()
+                        .parent()
+                        .is_some_and(|p| ast::LetStmt::can_cast(p.kind()))
+                    && !self.types.slot_keeps.contains(&self.range_of(m.syntax()));
+                if slot {
+                    return Some((
+                        helper(js, [vec![first], rest].concat()).wrap("(", ")[1]"),
+                        self.ty_of(m.syntax()).unwrap_or(Ty::Unknown),
+                    ));
+                }
                 out(helper(js, [vec![first], rest].concat()))
             }
 
@@ -865,6 +882,14 @@ impl Codegen<'_> {
             }
         };
         let f = match method {
+            // A slot over the buffered item (numbers, strings, bools), else the item itself.
+            "peek_mut" => {
+                if self.types.slot_calls.contains(&self.range_of(m.syntax())) {
+                    call("peekMut", vec![])
+                } else {
+                    call("peek", vec![])
+                }
+            }
             "cloned" | "copied" => {
                 if elem.is_js_primitive() {
                     rf.clone()

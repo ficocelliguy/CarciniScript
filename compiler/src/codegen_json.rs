@@ -59,7 +59,8 @@ impl Codegen<'_> {
         // (`use serde_json::from_str;` then `from_str(..)`.)
         let imported;
         let tail = match tail {
-            [f @ ("to_string" | "to_string_pretty" | "to_value" | "from_str" | "from_value")]
+            [f @ ("to_string" | "to_string_pretty" | "to_value" | "from_str" | "from_value" | "to_vec"
+                | "to_vec_pretty" | "to_writer" | "to_writer_pretty" | "from_slice" | "from_reader")]
                 if self
                     .crate_imports
                     .get_or_init(|| crate::typeck::crates::crate_imports(self.src))
@@ -139,6 +140,73 @@ impl Codegen<'_> {
                     out
                 } else {
                     text.wrap("κσ.Ok(", ")")
+                }
+            }
+            ["serde_json", f @ ("to_vec" | "to_vec_pretty")] => {
+                let a = args.first()?;
+                let t = self.raw_ty_of(a.syntax()).unwrap_or(Ty::Unknown);
+                let (v, _) = self.emit_expr(a, None);
+                let schema = self.json_schema_expr(&t);
+                let mut out = Frag::mapped(start, "κσ.Ok(κσ.$utf8(κσ.$jsonStringify(");
+                out.append(v)
+                    .push(format!(", {schema}, {})))", *f == "to_vec_pretty"));
+                out
+            }
+            // `to_writer(w, &x)`: the writer's `__write_str` of the text (as `write!` calls it),
+            // its `io::Error` as a `serde_json::Error`.
+            ["serde_json", f @ ("to_writer" | "to_writer_pretty")] => {
+                let (w, a) = (args.first()?, args.get(1)?);
+                let wt = self.raw_ty_of(w.syntax()).unwrap_or(Ty::Unknown);
+                let (wf, _) = self.emit_expr(w, None);
+                let t = self.raw_ty_of(a.syntax()).unwrap_or(Ty::Unknown);
+                let (v, _) = self.emit_expr(a, None);
+                let schema = self.json_schema_expr(&t);
+                let mut text = Frag::text("κσ.$jsonStringify(");
+                text.append(v)
+                    .push(format!(", {schema}, {})", *f == "to_writer_pretty"));
+                let write = js_string(&super::adt_gen::prop("__write_str"));
+                let mut out = Frag::mapped(start, "κσ.$sjIo(");
+                if crate::adt::ext_key_of(&wt).is_some() || matches!(wt, Ty::Param(_) | Ty::Dyn(_)) {
+                    out.push("κσ.$dcall($extRegs, ")
+                        .append(wf)
+                        .push(format!(", {write}, "))
+                        .append(text);
+                } else {
+                    out.append(wf)
+                        .push(format!(".{}(", super::adt_gen::prop("__write_str")))
+                        .append(text);
+                }
+                out.push("))");
+                out
+            }
+            // `from_slice(&bytes)` (UTF-8), `from_reader(r)` (all of an `io::Read`, through its
+            // `read_to_end`; bytes as they are).
+            ["serde_json", f @ ("from_slice" | "from_reader")] => {
+                let a = args.first()?;
+                let target = match &ty {
+                    Ty::Result(t, _) => (**t).clone(),
+                    _ => Ty::Unknown,
+                };
+                let schema = self.json_schema_expr(&target);
+                let rt = self.raw_ty_of(a.syntax()).unwrap_or(Ty::Unknown);
+                let (r, _) = self.emit_expr(a, None);
+                let bytes = *f == "from_slice" || matches!(&rt, Ty::Vec(e) if matches!(**e, Ty::Int(IntKind::U8)));
+                if bytes {
+                    let mut out = Frag::mapped(start, "κσ.$sjFromBytes(");
+                    out.append(r).push(format!(", {schema})"));
+                    out
+                } else {
+                    let read = super::adt_gen::prop("read_to_end");
+                    let mut out = Frag::mapped(start, "κσ.$sjFromReader((b) => ");
+                    if crate::adt::ext_key_of(&rt).is_some() || matches!(rt, Ty::Param(_) | Ty::Dyn(_)) {
+                        out.push("κσ.$dcall($extRegs, ")
+                            .append(r)
+                            .push(format!(", {}, b)", js_string(&read)));
+                    } else {
+                        out.append(r).push(format!(".{read}(b)"));
+                    }
+                    out.push(format!(", {schema})"));
+                    out
                 }
             }
             ["serde_json", f @ ("from_str" | "from_value")] => {

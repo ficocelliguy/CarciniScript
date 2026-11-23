@@ -674,7 +674,25 @@ impl Checker<'_> {
                     }
                     "unwrap_or_else" => {
                         count(self, 1);
-                        self.closure_arg(a0, vec![], t)
+                        let r = self.closure_arg(a0, vec![], t);
+                        // `*m.get_mut(k).unwrap_or_else(|| &mut spare) += 1`: the closure's
+                        // default is a slot too (over a local, or holding the value).
+                        if slot_recv
+                            && let Some(ast::Expr::ClosureExpr(cl)) = a0.map(super::strip_parens)
+                            && let Some(body) = cl.body()
+                        {
+                            let tail = match super::strip_parens(&body) {
+                                ast::Expr::BlockExpr(b) => b.stmt_list().and_then(|l| l.tail_expr()),
+                                other => Some(other),
+                            };
+                            if let Some(tail) = tail
+                                && !self.keep_slot(&tail)
+                            {
+                                let tr = self.range(tail.syntax());
+                                self.slot_wraps.insert(tr, false);
+                            }
+                        }
+                        r
                     }
                     "map_or" => {
                         count(self, 2);
@@ -688,6 +706,9 @@ impl Checker<'_> {
                         count(self, 2);
                         let r = fresh(self);
                         self.closure_arg(a0, vec![], r.clone());
+                        if slot_recv {
+                            self.closure_slots = vec![(0, super::slots::SlotShape::Slot)];
+                        }
                         self.closure_arg(a1, vec![t], r)
                     }
                     "is_some_and" | "is_none_or" => {
@@ -825,7 +846,8 @@ impl Checker<'_> {
                 // (These advance the iterator, or may: `let mut it`.)
                 if matches!(
                     m2,
-                    "peek" | "next_if" | "next_if_eq" | "next_back" | "nth_back" | "by_ref"
+                    "peek" | "peek_mut" | "next_if" | "next_if_eq" | "next_back" | "nth_back"
+                        | "by_ref"
                 ) {
                     self.check_mutable(recv, super::Mutation::Borrow);
                 }
@@ -1061,6 +1083,27 @@ impl Checker<'_> {
             }
             "peek" | "next_back" => {
                 count(self, 0);
+                opt(e)
+            }
+            // A slot over the buffered item for numbers, strings and bools, where one can stand
+            // in (`if let Some(p) = it.peek_mut()`, `*it.peek_mut().unwrap() += 1`).
+            "peek_mut" => {
+                count(self, 0);
+                let resolved = self.zonk(&e);
+                if resolved.is_js_primitive() && super::slot_position(m) {
+                    let r = self.range(m.syntax());
+                    self.slot_calls.insert(r);
+                    if let Some(n) = super::slot_let_binding(m) {
+                        let r = self.range(n.syntax());
+                        self.slot_bindings.insert(r);
+                    }
+                } else if resolved.is_js_primitive() && !super::only_tested(m) {
+                    let msg = format!(
+                        "`Peekable::peek_mut` over `{}` items isn't supported here (the item would be copied, so changes wouldn't stick); use it in `if let Some(x) = ..` / `match`, or as `*it.peek_mut().unwrap()`",
+                        self.describe(&e)
+                    );
+                    self.error(m.syntax(), msg);
+                }
                 opt(e)
             }
             "nth_back" => {

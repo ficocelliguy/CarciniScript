@@ -129,6 +129,54 @@ impl std::ops::Index<usize> for Value {
     }
 }
 
+/// What serde_json's panics call a value's type.
+fn __sj_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+// `v["k"] = ..` inserts the key (`Null` becomes an empty object first); `v[i] = ..` needs the
+// element.
+impl std::ops::IndexMut<&str> for Value {
+    fn index_mut(&mut self, key: &str) -> &mut Value {
+        if let Value::Null = self {
+            *self = Value::Object(std::collections::BTreeMap::new());
+        }
+        let ty = __sj_type(self);
+        match self {
+            Value::Object(m) => {
+                if !m.contains_key(key) {
+                    m.insert(key.to_string(), Value::Null);
+                }
+                &mut *m.get_mut(key).unwrap()
+            }
+            _ => panic!("cannot access key {:?} in JSON {}", key, ty),
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for Value {
+    fn index_mut(&mut self, i: usize) -> &mut Value {
+        let ty = __sj_type(self);
+        match self {
+            Value::Array(a) => {
+                let len = a.len();
+                if i >= len {
+                    panic!("cannot access index {} of JSON array of length {}", i, len);
+                }
+                &mut a[i]
+            }
+            _ => panic!("cannot access index {} of JSON {}", i, ty),
+        }
+    }
+}
+
 impl Value {
     pub fn get<I: __SjIndex>(&self, index: I) -> Option<&Value> {
         index.__sj_get(self)
@@ -296,6 +344,199 @@ impl std::fmt::Debug for Value {
                 }
             }
         }
+    }
+}
+
+// `v["n"] == 1`, `"x" == v["s"]`: serde_json's comparisons with numbers, strings and bools.
+impl PartialEq<str> for Value {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for Value {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == Some(*other)
+    }
+}
+
+impl PartialEq<String> for Value {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == Some(other.as_str())
+    }
+}
+
+impl PartialEq<Value> for str {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_str() == Some(self)
+    }
+}
+
+impl PartialEq<Value> for &str {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_str() == Some(*self)
+    }
+}
+
+impl PartialEq<Value> for String {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_str() == Some(self.as_str())
+    }
+}
+
+impl PartialEq<bool> for Value {
+    fn eq(&self, other: &bool) -> bool {
+        self.as_bool() == Some(*other)
+    }
+}
+
+impl PartialEq<Value> for bool {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_bool() == Some(*self)
+    }
+}
+
+impl PartialEq<i8> for Value {
+    fn eq(&self, other: &i8) -> bool {
+        self.as_i64().map_or(false, |i| i == *other as i64)
+    }
+}
+
+impl PartialEq<Value> for i8 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_i64().map_or(false, |i| i == *self as i64)
+    }
+}
+
+impl PartialEq<i16> for Value {
+    fn eq(&self, other: &i16) -> bool {
+        self.as_i64().map_or(false, |i| i == *other as i64)
+    }
+}
+
+impl PartialEq<Value> for i16 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_i64().map_or(false, |i| i == *self as i64)
+    }
+}
+
+impl PartialEq<i32> for Value {
+    fn eq(&self, other: &i32) -> bool {
+        self.as_i64().map_or(false, |i| i == *other as i64)
+    }
+}
+
+impl PartialEq<Value> for i32 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_i64().map_or(false, |i| i == *self as i64)
+    }
+}
+
+impl PartialEq<i64> for Value {
+    fn eq(&self, other: &i64) -> bool {
+        self.as_i64().map_or(false, |i| i == *other as i64)
+    }
+}
+
+impl PartialEq<Value> for i64 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_i64().map_or(false, |i| i == *self as i64)
+    }
+}
+
+impl PartialEq<isize> for Value {
+    fn eq(&self, other: &isize) -> bool {
+        self.as_i64().map_or(false, |i| i == *other as i64)
+    }
+}
+
+impl PartialEq<Value> for isize {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_i64().map_or(false, |i| i == *self as i64)
+    }
+}
+
+impl PartialEq<u8> for Value {
+    fn eq(&self, other: &u8) -> bool {
+        self.as_u64().map_or(false, |i| i == *other as u64)
+    }
+}
+
+impl PartialEq<Value> for u8 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_u64().map_or(false, |i| i == *self as u64)
+    }
+}
+
+impl PartialEq<u16> for Value {
+    fn eq(&self, other: &u16) -> bool {
+        self.as_u64().map_or(false, |i| i == *other as u64)
+    }
+}
+
+impl PartialEq<Value> for u16 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_u64().map_or(false, |i| i == *self as u64)
+    }
+}
+
+impl PartialEq<u32> for Value {
+    fn eq(&self, other: &u32) -> bool {
+        self.as_u64().map_or(false, |i| i == *other as u64)
+    }
+}
+
+impl PartialEq<Value> for u32 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_u64().map_or(false, |i| i == *self as u64)
+    }
+}
+
+impl PartialEq<u64> for Value {
+    fn eq(&self, other: &u64) -> bool {
+        self.as_u64().map_or(false, |i| i == *other as u64)
+    }
+}
+
+impl PartialEq<Value> for u64 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_u64().map_or(false, |i| i == *self as u64)
+    }
+}
+
+impl PartialEq<usize> for Value {
+    fn eq(&self, other: &usize) -> bool {
+        self.as_u64().map_or(false, |i| i == *other as u64)
+    }
+}
+
+impl PartialEq<Value> for usize {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_u64().map_or(false, |i| i == *self as u64)
+    }
+}
+
+impl PartialEq<f32> for Value {
+    fn eq(&self, other: &f32) -> bool {
+        self.as_f64().map_or(false, |i| i == *other as f64)
+    }
+}
+
+impl PartialEq<Value> for f32 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_f64().map_or(false, |i| i == *self as f64)
+    }
+}
+
+impl PartialEq<f64> for Value {
+    fn eq(&self, other: &f64) -> bool {
+        self.as_f64().map_or(false, |i| i == *other as f64)
+    }
+}
+
+impl PartialEq<Value> for f64 {
+    fn eq(&self, other: &Value) -> bool {
+        other.as_f64().map_or(false, |i| i == *self as f64)
     }
 }
 

@@ -144,22 +144,80 @@ impl Checker<'_> {
                     Box::new(super::crates::serde_json_error()),
                 )
             }
-            ["serde_json", f @ ("from_str" | "from_value")] => {
+            // `to_vec(&x)`: the text's UTF-8 bytes.
+            ["serde_json", "to_vec" | "to_vec_pretty"] => {
                 count(self, 1, 1);
                 if let Some(a) = args.first() {
-                    let want = if *f == "from_str" {
-                        Ty::Str
-                    } else {
-                        super::crates::json_value()
-                    };
-                    self.check(a, &want);
+                    let t = self.infer(a, None);
+                    self.pending_json.push((t, a.syntax().clone(), false));
+                }
+                Ty::Result(
+                    Box::new(Ty::Vec(Box::new(Ty::Int(crate::ty::IntKind::U8)))),
+                    Box::new(super::crates::serde_json_error()),
+                )
+            }
+            // `to_writer(&mut w, &x)`: the text into an `io::Write` (a `Vec<u8>`, `stdout()`, ..).
+            ["serde_json", "to_writer" | "to_writer_pretty"] => {
+                count(self, 2, 2);
+                if let Some(w) = args.first() {
+                    let wt = self.infer(w, None);
+                    // (`let mut buf = Vec::new();`: a `Vec<u8>`.)
+                    if let Ty::Vec(e) = self.shallow(&wt)
+                        && matches!(self.shallow(&e), Ty::Var(_))
+                    {
+                        self.unify(&e, &Ty::Int(crate::ty::IntKind::U8));
+                    }
+                    if !self.satisfies(&self.zonk(&wt), "IoWrite") {
+                        let msg = format!(
+                            "the trait bound `{}: std::io::Write` is not satisfied",
+                            self.describe(&wt)
+                        );
+                        self.error(w.syntax(), msg);
+                    }
+                }
+                if let Some(a) = args.get(1) {
+                    let t = self.infer(a, None);
+                    self.pending_json.push((t, a.syntax().clone(), false));
+                }
+                Ty::Result(
+                    Box::new(Ty::Unit),
+                    Box::new(super::crates::serde_json_error()),
+                )
+            }
+            [
+                "serde_json",
+                f @ ("from_str" | "from_value" | "from_slice" | "from_reader"),
+            ] => {
+                count(self, 1, 1);
+                if let Some(a) = args.first() {
+                    match *f {
+                        "from_str" => {
+                            self.check(a, &Ty::Str);
+                        }
+                        "from_value" => {
+                            self.check(a, &super::crates::json_value());
+                        }
+                        "from_slice" => {
+                            self.check(a, &Ty::Vec(Box::new(Ty::Int(crate::ty::IntKind::U8))));
+                        }
+                        _ => {
+                            let rt = self.infer(a, None);
+                            if !self.satisfies(&self.zonk(&rt), "IoRead") {
+                                let msg = format!(
+                                    "the trait bound `{}: std::io::Read` is not satisfied",
+                                    self.describe(&rt)
+                                );
+                                self.error(a.syntax(), msg);
+                            }
+                        }
+                    }
                 }
                 let turbofish = match c.expr() {
                     Some(ast::Expr::PathExpr(p)) => p
                         .path()
                         .and_then(|p| p.segment())
                         .and_then(|s| s.generic_arg_list())
-                        .and_then(|l| l.generic_args().next())
+                        .and_then(|l| l.generic_args().nth(usize::from(*f == "from_reader")))
                         .and_then(|g| match g {
                             ast::GenericArg::TypeArg(ta) => ta.ty(),
                             _ => None,

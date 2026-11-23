@@ -140,6 +140,23 @@ pub(super) enum SlotShape {
     Tuple(Vec<Option<SlotShape>>),
 }
 
+impl SlotShape {
+    /// The JS form `κσ.$readSlots` takes: `1` for a slot, an array (`0` where there is none) for
+    /// a tuple.
+    pub(super) fn js(&self) -> String {
+        match self {
+            SlotShape::Slot => "1".into(),
+            SlotShape::Tuple(fields) => {
+                let fs: Vec<String> = fields
+                    .iter()
+                    .map(|f| f.as_ref().map_or_else(|| "0".into(), SlotShape::js))
+                    .collect();
+                format!("[{}]", fs.join(", "))
+            }
+        }
+    }
+}
+
 /// Whether the `iter_mut()` call `m` is consumed where the code generator loops by index
 /// (`for x in v.iter_mut()`, `.for_each(..)`, `.enumerate()` into either, `for .. in
 /// v.iter_mut().zip(..)`), so its items needn't be slots.
@@ -347,6 +364,12 @@ impl Checker<'_> {
                 }
                 let Some(inner) = r.expr() else { return false };
                 let inner = strip_parens(&inner);
+                // `&mut refs[i]` of a `Vec<&mut i32>`: the item's slot, passed on.
+                let ir = self.range(inner.syntax());
+                if matches!(inner, ast::Expr::IndexExpr(_)) && self.slot_values.contains(&ir) {
+                    self.slot_keeps.insert(ir);
+                    return true;
+                }
                 let Some(t) = self.raw.get(&self.range(inner.syntax())).cloned() else {
                     return false;
                 };
@@ -388,8 +411,12 @@ impl Checker<'_> {
                 }
             }
             // A call returning a slot, `o.unwrap()` of an `Option<&mut i32>` value, a `&mut i32`
-            // field: kept as is (not read through `[1]`).
-            ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_) | ast::Expr::FieldExpr(_) => {
+            // field, an item of a `Vec<&mut i32>`: kept as is (not read through `[1]`).
+            ast::Expr::CallExpr(_)
+            | ast::Expr::MethodCallExpr(_)
+            | ast::Expr::FieldExpr(_)
+            | ast::Expr::IndexExpr(_)
+            | ast::Expr::TryExpr(_) => {
                 let r = self.range(e.syntax());
                 let slot = self.slot_values.contains(&r)
                     || self.value_slot_shape(&e) == Some(SlotShape::Slot)
@@ -812,6 +839,98 @@ impl Checker<'_> {
         }
     }
 
+    /// `tagged[i]` / `&tagged[i]` / `&mut tagged[i]` of a `Vec<(usize, &mut i32)>` of slots: the
+    /// index expression and the item's shape.
+    pub(super) fn slot_tuple_item(&self, e: &ast::Expr) -> Option<(ast::IndexExpr, SlotShape)> {
+        match strip_parens(e) {
+            ast::Expr::RefExpr(r) => self.slot_tuple_item(&r.expr()?),
+            ast::Expr::IndexExpr(ix) => match self.vec_slot_shape(&ix.base()?)? {
+                s @ SlotShape::Tuple(_) => Some((ix, s)),
+                SlotShape::Slot => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `{:?}` of a whole value holding slots: a Vec of them (`refs`, `&tagged`), an item of one
+    /// (`tagged[1]`) or a local holding an item (`t` of `for t in &tagged`). Marks it to be
+    /// copied out (`slot_reads`).
+    pub(super) fn note_slot_read(&mut self, e: &ast::Expr) {
+        let js = if let Some((ix, s)) = self.slot_tuple_item(e) {
+            let r = self.range(ix.syntax());
+            self.whole_slot_items.insert(r);
+            s.js()
+        } else if let Some(s) = self.vec_slot_shape(e) {
+            format!("{{e: {}}}", s.js())
+        } else if let ast::Expr::PathExpr(p) = strip_parens(e)
+            && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+            && let Some(js) = self.local_slot_read(n.text().to_string().as_str())
+        {
+            js
+        } else {
+            return;
+        };
+        let r = self.range(e.syntax());
+        self.slot_reads.insert(r, js);
+    }
+
+    /// The `κσ.$readSlots` shape of a local holding a Vec of slots or an item of one.
+    pub(super) fn local_slot_read(&self, name: &str) -> Option<String> {
+        match self.slot_locals.get(name) {
+            Some((true, s)) => Some(format!("{{e: {}}}", s.js())),
+            _ => self.slot_items.get(name).map(SlotShape::js),
+        }
+    }
+
+    /// A use of a local holding `m.get_mut(k).ok_or(e)`: `r?`, `r.unwrap()` / `expect`,
+    /// `r.is_ok()` / `is_err()`, or matched (`match r` / `if let Ok(v) = r`); anything else would
+    /// see the slot, so it's an error.
+    pub(super) fn check_slot_result_use(&mut self, p: &ast::PathExpr) {
+        let Some(name) = p.path().and_then(|p| p.as_single_name_ref()) else {
+            return;
+        };
+        if !self
+            .slot_results
+            .contains_key(name.text().to_string().as_str())
+        {
+            return;
+        }
+        let mut n = p.syntax().clone();
+        while let Some(up) = n.parent().filter(|x| x.kind() == SyntaxKind::PAREN_EXPR) {
+            n = up;
+        }
+        // (A macro argument, `println!("{:?}", r)`, has no parent: not one of those.)
+        let ok = n.parent().is_some_and(|parent| match parent.kind() {
+            SyntaxKind::TRY_EXPR | SyntaxKind::MATCH_EXPR | SyntaxKind::LET_EXPR => true,
+            SyntaxKind::LET_STMT => {
+                ast::LetStmt::cast(parent.clone()).is_some_and(|l| l.let_else().is_some())
+            }
+            SyntaxKind::METHOD_CALL_EXPR => ast::MethodCallExpr::cast(parent).is_some_and(|m| {
+                m.receiver().is_some_and(|r| r.syntax() == &n)
+                    && m.name_ref().is_some_and(|x| {
+                        matches!(x.text().to_string().as_str(), "unwrap" | "expect" | "is_ok" | "is_err")
+                    })
+            }),
+            _ => false,
+        });
+        if !ok {
+            let msg = format!(
+                "a `Result` of `get_mut` over numbers, strings or bools kept in a local is only matched (`if let Ok(v) = {n}`), `?`-ed or unwrapped here",
+                n = name.text()
+            );
+            self.error(p.syntax(), msg);
+        }
+    }
+
+    /// A local holding `Ok(slot)` or an error (`let r = m.get_mut(k).ok_or(e);`): the slot's shape.
+    pub(super) fn result_slot_local(&self, e: &ast::Expr) -> Option<SlotShape> {
+        let ast::Expr::PathExpr(p) = strip_parens(e) else {
+            return None;
+        };
+        let n = p.path()?.as_single_name_ref()?.text().to_string();
+        self.slot_results.get(&n).cloned()
+    }
+
     /// The shape of what an `Option` of an item holds: `it.next()`, `.nth(n)`, `.last()`, ..
     pub(super) fn option_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
         // A local that holds one (`let big = it.find(..);`).
@@ -854,7 +973,7 @@ impl Checker<'_> {
             return None;
         };
         match m.name_ref()?.text().to_string().as_str() {
-            "unwrap" | "expect" => self.option_slot_shape(&m.receiver()?),
+            "unwrap" | "expect" | "unwrap_or" => self.option_slot_shape(&m.receiver()?),
             _ => None,
         }
     }
@@ -865,7 +984,19 @@ impl Checker<'_> {
         let n = name.text().to_string();
         self.slot_locals.remove(&n);
         self.slot_options.remove(&n);
+        self.slot_results.remove(&n);
+        self.slot_items.remove(&n);
         let Some(init) = init else { return };
+        // `let r = m.get_mut(k).ok_or(e);`: `r` holds `Ok(slot)` or the error.
+        if let ast::Expr::MethodCallExpr(m) = strip_parens(init)
+            && m.name_ref()
+                .is_some_and(|x| matches!(x.text(), "ok_or" | "ok_or_else"))
+            && let Some(ast::Expr::MethodCallExpr(x)) = m.receiver().map(|r| strip_parens(&r))
+            && self.slot_calls.contains(&self.range(x.syntax()))
+        {
+            self.slot_results.insert(n, SlotShape::Slot);
+            return;
+        }
         // `let o = self.timer.as_mut();` / `let o = Some(&mut x);` / `let o = s.find("a");`:
         // `o` holds `null` or a slot.
         if self.keep_opt_slot(init) {
@@ -1035,6 +1166,12 @@ impl Checker<'_> {
                     local.reference = Some(true);
                 }
             }
+            // `for t in &tagged`: `t.1` is a slot.
+            (ast::Pat::IdentPat(ip), SlotShape::Tuple(_)) if ip.pat().is_none() => {
+                if let Some(n) = ip.name() {
+                    self.slot_items.insert(n.text().to_string(), shape.clone());
+                }
+            }
             (ast::Pat::TuplePat(t), SlotShape::Tuple(fields)) => {
                 for (p, s) in t.fields().zip(fields) {
                     if let Some(s) = s {
@@ -1053,14 +1190,19 @@ impl Checker<'_> {
 
     /// `Some(p)` matched against an `Option` of slot items.
     pub(super) fn bind_slot_option(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) {
-        let Some(shape) = scrutinee.and_then(|s| self.option_slot_shape(s)) else {
-            return;
+        // (Also `Ok(p)` against a local holding `m.get_mut(k).ok_or(e)`.)
+        let (shape, variant) = match scrutinee.and_then(|s| self.option_slot_shape(s)) {
+            Some(s) => (s, "Some"),
+            None => match scrutinee.and_then(|s| self.result_slot_local(s)) {
+                Some(s) => (s, "Ok"),
+                None => return,
+            },
         };
         if let ast::Pat::TupleStructPat(tp) = pat
             && tp
                 .path()
                 .and_then(|p| p.segment())
-                .is_some_and(|s| s.syntax().text() == "Some")
+                .is_some_and(|s| s.syntax().text() == variant)
             && let Some(inner) = tp.fields().next()
         {
             self.bind_slot_shape(&inner, &shape);

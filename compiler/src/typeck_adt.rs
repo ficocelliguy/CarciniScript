@@ -1146,6 +1146,8 @@ impl Checker<'_> {
             }
             Some("From") => {}
             // Hand-written comparisons and clones: codegen bridges `$cmp` / `$eq` / `$clone` to them.
+            // (`impl PartialEq<u32> for Id` compares with something else, not two `Id`s.)
+            Some("PartialOrd" | "PartialEq") if foreign_rhs(imp, &type_name) => {}
             Some(t @ ("Ord" | "PartialOrd" | "PartialEq" | "Eq" | "Clone" | "Debug" | "Error")) => {
                 if let Some(d) = self.adts.defs.get_mut(&type_name) {
                     d.manual.push(t.to_string());
@@ -1440,6 +1442,7 @@ impl Checker<'_> {
             // its methods under keys of their own.
             if let Some(tr) = trait_name.as_deref()
                 && (matches!(tr, "TryFrom" | "FromIterator" | "Extend")
+                    || (matches!(tr, "PartialEq" | "PartialOrd") && foreign_rhs(imp, &type_name))
                     || self
                         .adts
                         .traits
@@ -2988,6 +2991,32 @@ fn const_eval(file: &ast::SourceFile, e: &ast::Expr, _depth: u32) -> Option<i128
         crate::consteval::CVal::Int(n) => Some(n),
         crate::consteval::CVal::Bool(_) | crate::consteval::CVal::U128(_) => None,
     }
+}
+
+/// Whether an `impl PartialEq<R> for T` (or `PartialOrd<R>`) compares `T` with another type:
+/// `R` is written and is neither `Self` nor `T`.
+fn foreign_rhs(imp: &ast::Impl, type_name: &str) -> bool {
+    let Some(ast::Type::PathType(p)) = imp.trait_() else {
+        return false;
+    };
+    let Some(rhs) = p
+        .path()
+        .and_then(|p| p.segment())
+        .and_then(|s| s.generic_arg_list())
+        .and_then(|l| l.generic_args().next())
+    else {
+        return false;
+    };
+    let text = rhs.syntax().text().to_string();
+    let base = text.split('<').next().unwrap_or("").trim();
+    let base = base.rsplit("::").next().unwrap_or(base);
+    let own = imp
+        .self_ty()
+        .map(|t| t.syntax().text().to_string())
+        .unwrap_or_default();
+    let own = own.split('<').next().unwrap_or("").trim().to_string();
+    let own = own.rsplit("::").next().unwrap_or(&own);
+    base != "Self" && base != own && base != type_name
 }
 
 /// The std traits `collect_impl` knows, by name (the `std::ops` operators too).

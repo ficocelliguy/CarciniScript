@@ -522,6 +522,12 @@
     "panic": null
   },
   {
+    "file": "either_variant_imports.rs",
+    "stdout": "number 13\ntext AB\nRight(\"x\") true\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "entry_default_struct.rs",
     "stdout": "joes: Stats { hits: 1, money: 2.0, hosts: [\"joes-1\"] }\nn00dles: Stats { hits: 2, money: 4.5, hosts: [\"n00dles-1\", \"n00dles-2\"] }\n{1: Limit(15), 2: Limit(10)}\nBusy Idle 2\n",
     "exitCode": 0,
@@ -620,6 +626,12 @@
   {
     "file": "format_specs.rs",
     "stdout": "ff FF 10 101\n0xff 0xFF 0o10 0b101\n00000101 0x000000ff     ff| 0xa   |\nff ffffffff 1111111111111110 ffffffffffffffff\n1.2345e3 1.2E-4 6.02e23 1.5e3 0e0\n[ab      ] [     6] [3.14] [2.718] [   1.414]\n[   mid   ]\n0 2 2 0.2 1.00 -0.3\nServer {\n    name: \"n00dles\",\n    ports: [\n        22,\n        80,\n    ],\n    root: Some(\n        true,\n    ),\n    tag: (\n        'x',\n        -1,\n    ),\n}\n[\n    Hack {\n        target: \"a, b\",\n        threads: 3,\n    },\n    Idle,\n    Wait(\n        1.5,\n    ),\n]\n{\n    \"e\": [],\n    \"k\": [\n        (\n            1,\n            \"one\",\n        ),\n    ],\n}\n(\n    1,\n) true []\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "from_for_string.rs",
+    "stdout": "Ok(15)\nErr(\"A-3\")\nErr(\"bx\")\nErr(\"by:one\")\nErr(\"nine\")\nOk(4) Err(-200)\nOk(4) Err(\"A-5\")\nby:z\n[\"a\", \"b\"] [\"A1\", \"A2\"]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -728,6 +740,24 @@
   {
     "file": "get_mut.rs",
     "stdout": "no c\n[(\"a\", 10), (\"b\", 7)]\n[-1, 20, 103] true\n[\"X!\"] {1: true}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "get_mut_combinators.rs",
+    "stdout": "Some(1)\ntrue\ntrue\nSome(11)\nSome(11)\ntrue\nNone\n{\"a\": 12}\nSome(4.0)\n[1.0, 1.5] true\n{1: \"xy\"} 2\nSome('y') {1: \"x\"}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "get_mut_kept_results.rs",
+    "stdout": "{\"a\": 101} 8 101\ndefault\n{\"a\": 100} 5\nmissing\n{\"a\": 2201}\nOk(22020)\nErr(\"no nope\")\n{\"a\": 22020}\n{1: \"n00dles!-home\"} \"?\"\n[-1.0, 5.0] 1\n[11, 2] 0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "get_mut_or_combinators.rs",
+    "stdout": "6 {\"a\": 6}\n-1 5 {\"a\": 5}\n{\"a\": 105} 8 105\nOk(1060)\nErr(\"no q\")\n{\"a\": 1060}\n3 [3.0, 3.5]\n11 [11, 2]\nSome(4) None\n{\"a\": \"x?\"} \"!\"\n{1: true}\n",
     "exitCode": 0,
     "panic": null
   },
@@ -912,6 +942,30 @@
     "panic": null
   },
   {
+    "file": "iter_mut_vec_index.rs",
+    "stdout": "3\n10\n[6, 9, 3]\n[3.0, 2.5]\nax 1\n[\"ax\", \"z\"]\n[true, false]\n2\ntrue\n213\n[104, 7, 102]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_mut_vec_tuple_index.rs",
+    "stdout": "2 3\n18\n[106, 9, 103]\n1 b!\n[\"a\", \"b!\"]\n[5, 26]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_mut_vec_tuple_pass.rs",
+    "stdout": "#1 = 25\nSome(10)\n40\n#2 = 7\n2\n[10, 25, 7]\n8\n5\n[\"home!\", \"n00dles\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "iter_mut_vec_tuple_whole.rs",
+    "stdout": "[(0, 1), (1, 2), (2, 3)]\n0 1 (0, 1)\n1 3 (1, 3)\n2 5 (2, 5)\n(1, 104) (2, 106)\n1 144\n2 113\n103 (0, 102)\n2\n[102, 144, 113]\n[\"a\", \"b\"]\n[(0, 1.5), (1, 2.0)]\n[(0, 1.5), (1, 2.0)]\n(0, 1.5)\n(1, 2.0)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "iterator_idioms.rs",
     "stdout": "[5, 3, 8, 1, 9, 2] [9, 8, 5, 3, 2, 1]\n[80, 20] [3, 1, 2] [5, 8, 9]\n[-2, 5, -7, 8, -7] [[5, 3, 8, 1], [9, 2]]\n[5, 8, 16, 17, 26, 28] 28\n6 2160\n(4, 9) [2, 9]\n[1, 2, 3] true\n[1, 2, 3, 1]\n3.75\na-b-c [(1, 'x'), (2, 'y'), (3, 'z')] [4, 3, 2, 1]\n4\n[11, 12, 13]\n",
     "exitCode": 0,
@@ -920,6 +974,12 @@
   {
     "file": "iterators.rs",
     "stdout": "[6, 2, 8, 2, 10, 18, 4, 12]\nevens 3\n31 6480\nSome(9) Some(1)\nSome(4)\nSome(5) None\ntrue true\n31415926\nSome(9)\n[4, 5, 2]\n[3, 1, 4, 1]\n[5, 9, 2, 6]\nSome(6) Some(1)\n[6, 2, 9]\n[3, 6] [1, 2, 3, 4, 5, 6]\n-0.0 7.5\n165\n0h 2l 4o \nabcde\nfedcba\ndesserts\nSHOUT\n[\"the\", \"quick\", \"brown\", \"fox\"]\n[\"a\", \"b\", \"\", \"c\"]\n[\"line one\", \"line two\", \"\", \"last\"]\n[8, 8, 0, 4]\n[3, 5, 7, 9]\n[1, 2] [3, 4] [5] \n[(1, 'a'), (2, 'b'), (3, 'c')]\n[1, 2, 3, 4, 5, 10, 20]\n[1, 2, 3]\n[1, 2, 2, 3, 3, 3]\nSome(300)\n[1, 3]\n[0, 1, 2]\n[('a', 0), ('b', 1), ('c', 2)]\nSome(\"banana\") Some(\"fig\")\n10\n12 23 34 45 \n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "itertools_more.rs",
+    "stdout": "1 x 1.5\n2 y 2.5\n3 z 3.5\n[4, 4, 4]\n[(1, 3, 5, 7), (2, 4, 6, 8)]\n[(0, 'a'), (0, 'b'), (1, 'a'), (1, 'b')]\n3\n[(7,), (8,)]\n1 2 2 4 \n1 9\nNoElements\nOneElement(5)\nSome((1, 9))\nfig banana\nMinMax(\"banana\", \"plum\")\nSome((-1.0, 7.25))\nOk(42)\ntrue\ngot at least 2 elements when exactly one was expected\n[4, 9, 9]\ngot zero elements when exactly one was expected\nSome(3)\n5\nfalse 6\nDone(Some(9)) Some(1)\n[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\n[(1, 'a'), (1, 'b'), (1, 'c'), (2, 'b'), (3, 'a')]\n[9, 8, 5, 2, 1]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1290,6 +1350,12 @@
     "panic": null
   },
   {
+    "file": "peek_mut.rs",
+    "stdout": "Some(10)\nSome(9)\n[8, 3]\ntrue\n[\"a!?\", \"b\"]\ntrue\nSome([1, 9, 8])\naBc\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "perf_fastpath_edges.rs",
     "stdout": "844424930169000\n1407374883540934\n562949953396618\n18 1125899906842619\n1970324836974585\nLess true\nfalse\n32 true true\n[7] 5 true\nP { x: 9, y: 2 } [P { x: 9, y: 50 }, P { x: 3, y: 4 }] false\ntrue\n[[0, 2, 4], [6, 8, 10], [12, 14, 16]] 22 [[P { x: 0, y: 0 }, P { x: 0, y: 0 }], [P { x: 4, y: 3 }, P { x: 4, y: 0 }]]\n7 10 [1, 4, 3]\n[1, 3, 3]\n60 wörl false\n111 hello true\nSome(7) Some(6)\n195 169\n[[1, 7], [1, 1]]\n",
     "exitCode": 0,
@@ -1368,6 +1434,12 @@
     "panic": null
   },
   {
+    "file": "serde_json_mut.rs",
+    "stdout": "{\"name\":\"n00dles\",\"nested\":{\"deep\":true},\"ram\":8,\"tags\":[\"easy\"]}\n{\"a\":1}\n16\ntrue true false\ntrue false\ntrue true\ntrue false\ntrue\n66 bytes\ntrue\n[1, 2, 3]\n[1,2,3]\n{\n  \"a\": [\n    1\n  ]\n}\n[4, 5]\n17\ntrue\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "serde_tagged.rs",
     "stdout": "{\"type\":\"Ping\"} -> Ping true\n{\"type\":\"Hack\",\"target\":\"n00dles\",\"threads\":12} -> Hack { target: \"n00dles\", threads: 12 } true\n{\"type\":\"grow\",\"host\":\"joesguns\",\"threads\":3} -> Grow(Target { host: \"joesguns\", threads: 3 }) true\n{\"type\":\"Report\",\"totalMoney\":1500000.0,\"servers\":[\"a\",\"b\"]} -> Report { total_money: 1500000.0, servers: [\"a\", \"b\"] } true\n[\n  {\n    \"type\": \"Ping\"\n  },\n  {\n    \"type\": \"Hack\",\n    \"target\": \"n00dles\",\n    \"threads\": 12\n  },\n  {\n    \"type\": \"grow\",\n    \"host\": \"joesguns\",\n    \"threads\": 3\n  },\n  {\n    \"type\": \"Report\",\n    \"totalMoney\": 1500000.0,\n    \"servers\": [\n      \"a\",\n      \"b\"\n    ]\n  }\n]\n{\"kind\":\"started\"} -> Started true\n{\"kind\":\"scanned\",\"data\":[\"home\",\"n00dles\"]} -> Scanned([\"home\", \"n00dles\"]) true\n{\"kind\":\"money\",\"data\":[10.0,2.5]} -> Money(10.0, 2.5) true\n{\"kind\":\"done\",\"data\":{\"ok\":true}} -> Done { ok: true } true\n[\n  {\n    \"kind\": \"started\"\n  },\n  {\n    \"kind\": \"scanned\",\n    \"data\": [\n      \"home\",\n      \"n00dles\"\n    ]\n  },\n  {\n    \"kind\": \"money\",\n    \"data\": [\n      10.0,\n      2.5\n    ]\n  },\n  {\n    \"kind\": \"done\",\n    \"data\": {\n      \"ok\": true\n    }\n  }\n]\n{\"type\":\"Config\",\"name\":\"x\",\"retries\":3} -> Config { name: \"x\", retries: 3 } true\n{\"id\":7,\"host\":\"home\",\"threads\":1,\"delay\":250,\"port\":1} -> Envelope { id: 7, target: Target { host: \"home\", threads: 1 }, extra: {\"delay\": 250, \"port\": 1} } true\n{\"seq\":1,\"type\":\"Ping\"} -> Tagged { seq: 1, message: Ping, retry: None } true\n{\"seq\":2,\"type\":\"Hack\",\"target\":\"n00dles\",\"threads\":2,\"after\":500,\"max\":9} -> Tagged { seq: 2, message: Hack { target: \"n00dles\", threads: 2 }, retry: Some(Retry { after: 500, max: 9 }) } true\n{\n  \"seq\": 3,\n  \"type\": \"grow\",\n  \"host\": \"j\",\n  \"threads\": 1\n}\nOk(Hack { target: \"foodnstuff\", threads: 4 })\nOk(Ping)\nErr(\"invalid type: string \\\"2\\\", expected u32\")\nErr(\"missing field `threads`\")\nErr(\"missing field `threads`\")\nErr(\"missing field `type` at line 1 column 13\")\nErr(\"unknown variant `Nuke`, expected one of `Ping`, `Hack`, `grow`, `Report` at line 1 column 14\")\nErr(\"invalid type: integer `5`, expected variant identifier at line 1 column 9\")\nErr(\"invalid type: string \\\"Ping\\\", expected internally tagged enum Message at line 1 column 6\")\nErr(\"invalid type: integer `1`, expected variant identifier at line 1 column 2\")\nOk(Scanned([\"a\"]))\nOk(Started)\nOk(Started)\nErr(\"invalid type: integer `1`, expected unit variant Event::Started at line 1 column 26\")\nErr(\"missing field `data` at line 1 column 15\")\nErr(\"invalid length 1, expected tuple variant Event::Money with 2 elements at line 1 column 28\")\nOk(Done { ok: false })\nErr(\"missing field `kind` at line 1 column 21\")\nErr(\"unknown variant `finished`, expected one of `started`, `scanned`, `money`, `done` at line 1 column 18\")\nErr(\"invalid type: integer `7`, expected adjacently tagged enum Event at line 1 column 1\")\nOk(Envelope { id: 1, target: Target { host: \"h\", threads: 2 }, extra: {\"a\": 1, \"b\": 2} })\nErr(\"missing field `threads` at line 1 column 25\")\nErr(\"missing field `id` at line 1 column 24\")\nOk(Tagged { seq: 1, message: Ping, retry: None })\nOk(Tagged { seq: 1, message: Hack { target: \"t\", threads: 1 }, retry: Some(Retry { after: 5, max: 1 }) })\nOk(Tagged { seq: 1, message: Hack { target: \"t\", threads: 1 }, retry: None })\nOk(Tagged { seq: 1, message: Ping, retry: None })\nErr(\"missing field `type` at line 1 column 9\")\nErr(\"missing field `target` at line 1 column 23\")\nOk(Config { name: \"n\", retries: 1 })\nOk(Config { name: \"n\", retries: 1 })\nOk(Config { name: \"n\", retries: 1 })\nErr(\"invalid length 1, expected tuple variant Plain::Money with 2 elements at line 1 column 14\")\nErr(\"invalid type: integer `1`, expected unit at line 1 column 9\")\nErr(\"invalid type: string \\\"x\\\", expected u8 at line 1 column 17\")\nErr(\"missing field `a` at line 1 column 11\")\nErr(\"trailing characters at line 1 column 19\")\nOk(Unit)\n{\"target\":\"t\",\"threads\":1,\"type\":\"Hack\"} Hack { target: \"t\", threads: 1 }\n",
     "exitCode": 0,
@@ -1388,6 +1460,12 @@
   {
     "file": "shared.rs",
     "stdout": "[1, 2, 3, 4] 4\n20\n120 [\"+25\", \"+-5\"] 2\n120 [\"+25\", \"+-5\"] Account { balance: RefCell { value: 0 }, log: RefCell { value: [] }, visits: Cell { value: 2 } }\n14\nroot [\"leaf\", \"leaf\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "shift_op_impls.rs",
+    "stdout": "Bits(12)\nBits(6)\n9\nBits(10)\nBits(24)\nBits(16)\n[Bits(1), Bits(16)]\nMask(48) Mask(3)\n[Mask(4), Mask(3)]\n",
     "exitCode": 0,
     "panic": null
   },

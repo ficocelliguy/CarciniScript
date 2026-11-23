@@ -43,6 +43,9 @@ use ra_ap_syntax::{
 /// context a hand-written future is polled with and the
 /// waker it wakes when a polled promise settles).
 const IMPLICIT: &[&str] = &[
+    "MinMaxResult",
+    "FoldWhile",
+    "ExactlyOneError",
     "__std_map_entry",
     "__m",
     "__k",

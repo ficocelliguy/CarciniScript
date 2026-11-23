@@ -940,9 +940,19 @@ const rejected = [
     "6:5 `set_from` assigns through the items: call it on `iter_mut()`",
   ],
   [
-    "indexing a `Vec<&mut i32>` collected from `iter_mut()`",
-    "let mut w = vec![1, 2];\n    let mut rs: Vec<&mut i32> = w.iter_mut().collect();\n    *rs[1] = 9;",
-    "4:6 indexing a `Vec<&mut T>` collected from `iter_mut()` over numbers, strings or bools isn't supported yet",
+    "a whole `&mut` item of a `Vec<(usize, &mut i32)>` collected from `iter_mut()`, passed on",
+    "let mut w = vec![1, 2];\n    let mut rs: Vec<(usize, &mut i32)> = w.iter_mut().enumerate().collect();\n    let o = Some(&mut rs[1]);",
+    "4:23 using a whole item of a `Vec<(_, &mut T)>` collected from `iter_mut()` over numbers, strings or bools by value or as `&mut` isn't supported yet",
+  ],
+  [
+    "a kept `ok_or` of `get_mut` over numbers, used other than matched or unwrapped",
+    "let mut m: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();\n    let r = m.get_mut(\"a\").ok_or(0);\n    let n = r.map(|v| *v);",
+    "4:13 a `Result` of `get_mut` over numbers, strings or bools kept in a local is only matched",
+  ],
+  [
+    "`peek_mut` of numbers, not matched",
+    "let mut it = vec![1, 2].into_iter().peekable();\n    let r = it.peek_mut().or(None);",
+    "3:13 `Peekable::peek_mut` over `{integer}` items isn't supported here",
   ],
   ["`get_index_mut` on an `IndexMap` of numbers, not matched", "let mut m: indexmap::IndexMap<&str, i32> = indexmap::IndexMap::new();\n    m.insert(\"a\", 1);\n    *m.get_index_mut(0).unwrap().1 += 1;", "4:6 `IndexMap::get_index_mut` on a map of `i32` isn't supported here"],
   // Help lines for players who don't know Rust (`diag_help.rs`): the rule under the message.
