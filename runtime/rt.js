@@ -3249,6 +3249,20 @@
         },
       };
     },
+    // `m.lock()` (or `read` / `write` / `try_*`) of the lock prelude's `Mutex` / `RwLock`, not
+    // unwrapped: an `Ok` whose `[0]` reads and writes the lock's value, so a guard bound by a
+    // pattern (`if let Ok(mut g) = m.lock()`) writes through.
+    $lockRes(l) {
+      const r = new Res(0, undefined);
+      Object.defineProperty(r, 0, {
+        get: () => l.__c.v,
+        set: (v) => {
+          l.__c.v = v;
+        },
+        enumerable: true,
+      });
+      return r;
+    },
     // A box (`[v]`: a local whose `&mut` is taken, a `&mut i32` parameter's cell) kept where a
     // slot is (`let r = &mut x;` of a `&mut i32`-typed `r`, `Some(&mut x)`, a `&mut i32` field):
     // `[1]` reads and writes it too.
@@ -3372,6 +3386,13 @@
         },
       };
     },
+    // `rs.get_mut(i)` / `first_mut` (0) / `last_mut` (-1) of a `Vec<&mut i32>`: the slot stored
+    // there, or null.
+    $vecItem(a, i) {
+      const j = i < 0 ? a.length + i : i;
+      if (j < 0 || j >= a.length) return null;
+      return a instanceof Deque ? a.b[a.$p(j)] : a[j];
+    },
     $vecSlot(a, i) {
       let j = i < 0 ? a.length + i : i;
       if (j < 0 || j >= a.length) return null;
@@ -3403,9 +3424,10 @@
     },
     // `{:?}` of a `Vec<&mut i32>` / `Vec<(usize, &mut i32)>` of slots or an item of one: a copy
     // with each slot read. `shape` is `1` for a slot, a tuple's fields (`0`: no slot) or `{e}`
-    // for a Vec's items.
+    // for a Vec's items, `{o}` for an `Option` of one (`None` kept).
     $readSlots(x, shape) {
       if (shape === 1) return x[1];
+      if (shape.o !== undefined) return x == null ? null : rt.$readSlots(x, shape.o);
       if (Array.isArray(shape)) return x.map((f, i) => (shape[i] ? rt.$readSlots(f, shape[i]) : f));
       return Array.from(x, (e) => rt.$readSlots(e, shape.e));
     },
@@ -5341,12 +5363,43 @@
       return null;
     }
   };
-  // The bundled `rand` crate. An RNG is xoshiro128** (32-bit steps, fast in JS); `thread_rng()`
-  // is one shared generator seeded from `Math.random`, `StdRng::seed_from_u64(n)` a
-  // deterministic one (its numbers differ from rand's ChaCha). Numbers sample uniformly by the
-  // type's class (`κσ.$numT("u8")`), as `rng.gen::<T>()` and `gen_range` need.
+  // The bundled `rand` crate, as rand 0.8 computes it. A seeded generator gives rand's own
+  // numbers: `StdRng` (and `ChaCha12Rng`) is ChaCha12, `ChaCha8Rng` / `ChaCha20Rng` ChaCha with
+  // 8 / 20 rounds, `SmallRng` Xoshiro256++, each seeded by `seed_from_u64` / `from_seed` as rand
+  // does. `thread_rng()` (one shared generator seeded from `Math.random`) and `from_entropy()`
+  // are xoshiro128**, which is fast in JS. Sampling (`gen`, `gen_range`, `gen_bool`, `shuffle`,
+  // `choose`, ..) follows rand's algorithms word for word, by the type's class
+  // (`κσ.$numT("u8")`). A `u64` is a JS number: rand's 64 bits, rounded past 2^53.
   class RandRng {
+    // `next_u64()` as `[lo, hi]` 32-bit halves.
+    u64() {
+      const lo = this.u32();
+      return [lo, this.u32()];
+    }
+    // `fill_bytes`: the words' bytes, little-endian; a partly used word is dropped.
+    bytes(n) {
+      const out = [];
+      while (out.length < n) {
+        const w = this.u32();
+        for (let b = 0; b < 4 && out.length < n; b++) out.push((w >>> (8 * b)) & 255);
+      }
+      return out;
+    }
+    // `gen::<f64>()`: 53 bits of `next_u64()`, in [0, 1).
+    f64() {
+      const [lo, hi] = this.u64();
+      return (hi * 2097152 + (lo >>> 11)) / 9007199254740992;
+    }
+    // `next_u64()` as a BigInt.
+    bigU64() {
+      const [lo, hi] = this.u64();
+      return (BigInt(hi) << 32n) | BigInt(lo);
+    }
+  }
+  // xoshiro128**: `thread_rng()` and `from_entropy()`.
+  class XoshiroRng extends RandRng {
     constructor(seed) {
+      super();
       // splitmix32 spreads the seed over the four words of state.
       let x = seed >>> 0;
       const next = () => {
@@ -5371,52 +5424,389 @@
       s[3] = rotl(s[3], 11);
       return r;
     }
-    // A float in [0, 1) with 53 random bits.
-    f64() {
-      return ((this.u32() >>> 5) * 67108864 + (this.u32() >>> 6)) / 9007199254740992;
+  }
+  // rand_chacha's `ChaChaXRng`: the key is the seed's eight little-endian words, the block
+  // counter is 64 bits from 0 and the stream is 0; the words come out block by block.
+  class ChaChaRng extends RandRng {
+    constructor(key, rounds) {
+      super();
+      this.key = key;
+      this.rounds = rounds;
+      this.ctr = 0;
+      this.buf = new Uint32Array(16);
+      this.i = 16;
     }
-    big(bits) {
-      let r = 0n;
-      for (let b = 0; b < bits; b += 32) r = (r << 32n) | BigInt(this.u32());
+    block() {
+      const k = this.key;
+      const input = [
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+        k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+        this.ctr >>> 0, Math.floor(this.ctr / 4294967296) >>> 0, 0, 0,
+      ];
+      const x = input.slice();
+      const qr = (a, b, c, d) => {
+        x[a] = (x[a] + x[b]) | 0;
+        x[d] = rotl(x[d] ^ x[a], 16);
+        x[c] = (x[c] + x[d]) | 0;
+        x[b] = rotl(x[b] ^ x[c], 12);
+        x[a] = (x[a] + x[b]) | 0;
+        x[d] = rotl(x[d] ^ x[a], 8);
+        x[c] = (x[c] + x[d]) | 0;
+        x[b] = rotl(x[b] ^ x[c], 7);
+      };
+      for (let r = 0; r < this.rounds; r += 2) {
+        qr(0, 4, 8, 12);
+        qr(1, 5, 9, 13);
+        qr(2, 6, 10, 14);
+        qr(3, 7, 11, 15);
+        qr(0, 5, 10, 15);
+        qr(1, 6, 11, 12);
+        qr(2, 7, 8, 13);
+        qr(3, 4, 9, 14);
+      }
+      for (let j = 0; j < 16; j++) this.buf[j] = (x[j] + input[j]) >>> 0;
+      this.ctr++;
+      this.i = 0;
+    }
+    u32() {
+      if (this.i >= 16) this.block();
+      return this.buf[this.i++];
+    }
+  }
+  // rand 0.8's `SmallRng` on a 64-bit target: Xoshiro256++, in 32-bit halves (`[lo, hi]`).
+  class Xoshiro256Rng extends RandRng {
+    constructor(words) {
+      super();
+      // (Four u64s, each as `[lo, hi]`.)
+      this.s = words;
+    }
+    u64() {
+      const [s0, s1, s2, s3] = this.s;
+      const r = add64(rotl64(add64(s0, s3), 23), s0);
+      const t = shl64(s1, 17);
+      xor64(s2, s0);
+      xor64(s3, s1);
+      xor64(s1, s2);
+      xor64(s0, s3);
+      xor64(s2, t);
+      this.s[3] = rotl64(s3, 45);
       return r;
     }
+    // (The upper half: the low bits are weaker.)
+    u32() {
+      return this.u64()[1];
+    }
+    // `fill_bytes`: whole `next_u64()`s, then the rest from one more `next_u64` (5..7 bytes)
+    // or `next_u32` (1..4).
+    bytes(n) {
+      const out = [];
+      const push = (w, k) => {
+        for (let b = 0; b < k; b++) out.push((w >>> (8 * b)) & 255);
+      };
+      while (n - out.length >= 8) {
+        const [lo, hi] = this.u64();
+        push(lo, 4);
+        push(hi, 4);
+      }
+      const left = n - out.length;
+      if (left > 4) {
+        const [lo, hi] = this.u64();
+        push(lo, 4);
+        push(hi, left - 4);
+      } else if (left > 0) {
+        push(this.u32(), left);
+      }
+      return out;
+    }
+  }
+  function add64(a, b) {
+    const lo = (a[0] + b[0]) >>> 0;
+    const carry = lo < a[0] >>> 0 ? 1 : 0;
+    return [lo, (a[1] + b[1] + carry) >>> 0];
+  }
+  function xor64(a, b) {
+    a[0] = (a[0] ^ b[0]) >>> 0;
+    a[1] = (a[1] ^ b[1]) >>> 0;
+  }
+  function shl64(a, k) {
+    return k < 32 ? [(a[0] << k) >>> 0, ((a[1] << k) | (a[0] >>> (32 - k))) >>> 0] : [0, (a[0] << (k - 32)) >>> 0];
+  }
+  function rotl64(a, k) {
+    if (k >= 32) {
+      a = [a[1], a[0]];
+      k -= 32;
+    }
+    if (k === 0) return [a[0], a[1]];
+    return [((a[0] << k) | (a[1] >>> (32 - k))) >>> 0, ((a[1] << k) | (a[0] >>> (32 - k))) >>> 0];
   }
   function rotl(x, k) {
     return (x << k) | (x >>> (32 - k));
   }
+  const M64 = (1n << 64n) - 1n;
+  // A `u64` seed (a number or a BigInt) as a BigInt.
+  function seedU64(n) {
+    return BigInt.asUintN(64, typeof n === "bigint" ? n : BigInt(Math.trunc(n)));
+  }
+  // `SeedableRng::seed_from_u64` for the ChaCha generators: PCG32 fills the 32-byte seed.
+  function pcgSeed(n) {
+    let state = seedU64(n);
+    const words = [];
+    for (let i = 0; i < 8; i++) {
+      state = (state * 6364136223846793005n + 11634580027462260723n) & M64;
+      const xs = Number((((state >> 18n) ^ state) >> 27n) & 0xffffffffn);
+      const rot = Number(state >> 59n);
+      words.push(((xs >>> rot) | (xs << ((32 - rot) & 31))) >>> 0);
+    }
+    return words;
+  }
+  // `Xoshiro256PlusPlus::seed_from_u64`: SplitMix64 fills the seed (for an all-zero `from_seed`).
+  function splitMixSeed(n) {
+    let state = seedU64(n);
+    const words = [];
+    for (let i = 0; i < 4; i++) {
+      state = (state + 0x9e3779b97f4a7c15n) & M64;
+      let z = state;
+      z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & M64;
+      z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & M64;
+      z ^= z >> 31n;
+      words.push([Number(z & 0xffffffffn), Number(z >> 32n)]);
+    }
+    return words;
+  }
+  const leWords = (bytes) => Array.from({ length: bytes.length >> 2 }, (_, i) => (bytes[4 * i] | (bytes[4 * i + 1] << 8) | (bytes[4 * i + 2] << 16) | (bytes[4 * i + 3] << 24)) >>> 0);
+  function makeRng(kind, words) {
+    if (kind === "small") {
+      const s = [0, 1, 2, 3].map((i) => [words[2 * i], words[2 * i + 1]]);
+      // (An all-zero seed is `seed_from_u64(0)`'s.)
+      return new Xoshiro256Rng(words.every((w) => w === 0) ? splitMixSeed(0) : s);
+    }
+    return new ChaChaRng(words, kind === "chacha8" ? 8 : kind === "chacha20" ? 20 : 12);
+  }
   let threadRng = null;
-  function seedOf(n) {
-    if (typeof n === "bigint") return Number(BigInt.asUintN(32, n ^ (n >> 32n)));
-    return (n >>> 0) ^ Math.floor(n / 4294967296);
+  // `(hi, lo)` of the 64-bit product of two `u32`s, exactly.
+  function wmul32(v, r) {
+    const hi = Math.floor(((v >>> 16) * r + Math.floor(((v & 0xffff) * r) / 65536)) / 65536);
+    return [hi, Math.imul(v, r) >>> 0];
+  }
+  // What `rng.gen::<u32 / u64 / u128>()` of an integer type's "large" unsigned kind gives:
+  // rand samples 8- to 32-bit integers through `u32`, 64-bit ones through `u64` (BigInt here)
+  // and 128-bit ones through `u128`.
+  function largeOf(T) {
+    return T.big ? 128 : T.bits === 64 ? 64 : 32;
+  }
+  function genLarge(rng, large) {
+    if (large === 32) return rng.u32();
+    if (large === 64) return rng.bigU64();
+    const x = rng.bigU64();
+    return (rng.bigU64() << 64n) | x;
+  }
+  // `UniformInt::sample_single_inclusive(low, high)`: widening multiply with rejection (the
+  // zone a fast approximation, except for 8- and 16-bit types).
+  function intInclusive(rng, lo, hi, T) {
+    const large = largeOf(T);
+    const bits = T.bits;
+    if (large === 32) {
+      const range = (hi - lo + 1) % 2 ** bits;
+      if (range === 0) return rand.gen(rng, T);
+      const zone = bits <= 16 ? 4294967295 - ((4294967296 - range) % range) : ((range << Math.clz32(range)) >>> 0) - 1;
+      for (;;) {
+        const [h, l] = wmul32(rng.u32(), range);
+        if (l <= zone) return lo + h;
+      }
+    }
+    const L = BigInt(large);
+    const mask = (1n << L) - 1n;
+    const blo = BigInt(lo);
+    const range = (BigInt(hi) - blo + 1n) & ((1n << BigInt(bits)) - 1n);
+    if (range === 0n) return rand.gen(rng, T);
+    const lz = L - BigInt(range.toString(2).length);
+    const zone = ((range << lz) & mask) - 1n;
+    for (;;) {
+      const p = genLarge(rng, large) * range;
+      if ((p & mask) <= zone) {
+        const v = blo + (p >> L);
+        return T.big ? rt.$w128(v, T.signed, T.bits) : Number(v);
+      }
+    }
+  }
+  // `Uniform::new_inclusive(low, high).sample(rng)` of an integer type: the zone kept exactly.
+  function intUniform(rng, lo, hi, T) {
+    const large = largeOf(T);
+    if (large === 32) {
+      const range = (hi - lo + 1) % 2 ** T.bits;
+      if (range === 0) return rand.gen(rng, T);
+      const zone = 4294967295 - ((4294967296 - range) % range);
+      for (;;) {
+        const [h, l] = wmul32(rng.u32(), range);
+        if (l <= zone) return lo + h;
+      }
+    }
+    const L = BigInt(large);
+    const mask = (1n << L) - 1n;
+    const blo = BigInt(lo);
+    const range = (BigInt(hi) - blo + 1n) & ((1n << BigInt(T.bits)) - 1n);
+    if (range === 0n) return rand.gen(rng, T);
+    const zone = mask - (((mask + 1n) - range) % range);
+    for (;;) {
+      const p = genLarge(rng, large) * range;
+      if ((p & mask) <= zone) {
+        const v = blo + (p >> L);
+        return T.big ? rt.$w128(v, T.signed, T.bits) : Number(v);
+      }
+    }
+  }
+  const U32T = { kind: "u32", bits: 32, signed: false, big: false, float: false };
+  // rand's `gen_index`: a `u32` `gen_range(0..n)` (a `usize` one past `u32::MAX`).
+  function genIndex(rng, n) {
+    return n <= 4294967295 ? intInclusive(rng, 0, n - 1, U32T) : intInclusive(rng, 0, n - 1, rt.$numT("usize"));
+  }
+  // A float in [0, 1) from the top 52 (`f64`) / 23 (`f32`) bits of a word: `value1_2 - 1.0`.
+  function unitFloat(rng, f32) {
+    if (f32) return (rng.u32() >>> 9) / 8388608;
+    const [lo, hi] = rng.u64();
+    return (hi * 1048576 + (lo >>> 12)) / 4503599627370496;
+  }
+  // The float one ulp below `x` (rand's `decrease_masked`).
+  function floatDown(x, f32) {
+    const dv = new DataView(new ArrayBuffer(8));
+    if (f32) {
+      dv.setFloat32(0, x);
+      dv.setUint32(0, dv.getUint32(0) - 1);
+      return dv.getFloat32(0);
+    }
+    dv.setFloat64(0, x);
+    dv.setBigUint64(0, dv.getBigUint64(0) - 1n);
+    return dv.getFloat64(0);
+  }
+  // `UniformFloat::sample_single(low, high)` / `new_inclusive(low, high).sample(rng)`.
+  function floatRange(rng, lo, hi, inclusive, f32) {
+    const r = f32 ? Math.fround : (x) => x;
+    if (inclusive) {
+      if (!(lo <= hi)) throw new CarciniPanic("Uniform::new_inclusive called with `low > high`", "<rand>");
+      const maxRand = f32 ? 1 - 2 ** -23 : 1 - 2 ** -52;
+      let scale = r(r(hi - lo) / maxRand);
+      if (!Number.isFinite(scale)) throw new CarciniPanic("Uniform::new_inclusive: range overflow", "<rand>");
+      while (r(r(scale * maxRand) + lo) > hi) scale = floatDown(scale, f32);
+      return r(r(unitFloat(rng, f32) * scale) + lo);
+    }
+    if (!(lo < hi)) throw new CarciniPanic("UniformSampler::sample_single: low >= high", "<rand>");
+    let scale = r(hi - lo);
+    if (!Number.isFinite(scale)) throw new CarciniPanic("UniformSampler::sample_single: range overflow", "<rand>");
+    for (;;) {
+      const res = r(r(unitFloat(rng, f32) * scale) + lo);
+      if (res < hi) return res;
+    }
+  }
+  // `Bernoulli { p_int }.sample(rng)`: `u64::MAX` is always true.
+  function bernoulli(rng, pInt) {
+    return pInt === null || rng.bigU64() < pInt;
+  }
+  const SCALE64 = 2 ** 64;
+  function bernoulliInt(p) {
+    if (p === 1) return null;
+    const x = p * SCALE64;
+    return x >= SCALE64 ? M64 : BigInt(Math.trunc(x));
+  }
+  // `rand::seq::index::sample(rng, length, amount)`: the indices `choose_multiple` picks.
+  function indexSample(rng, length, amount) {
+    if (amount > length) throw new CarciniPanic("`amount` of samples must be less than or equal to `length`", "<rand>");
+    const f = Math.fround;
+    const j = length < 500000 ? 0 : 1;
+    let inplace;
+    if (length > 4294967295) inplace = null;
+    else if (amount < 163) {
+      const C = [
+        [1.6, f(8 / 45)],
+        [10, f(70 / 9)],
+      ];
+      const m4 = f(f(C[0][j]) * amount);
+      inplace = amount > 11 && f(length) < f(f(f(C[1][j]) + m4) * amount);
+      if (!inplace) {
+        // Floyd's algorithm (shuffled by insertion when `amount < 50`).
+        const shuffled = amount < 50;
+        const idx = [];
+        for (let k = length - amount; k < length; k++) {
+          const t = intInclusive(rng, 0, k, U32T);
+          const pos = idx.indexOf(t);
+          if (pos >= 0) {
+            if (shuffled) idx.splice(pos, 0, k);
+            else idx.push(k);
+            continue;
+          }
+          idx.push(t);
+        }
+        if (!shuffled) {
+          for (let i = amount - 1; i > 0; i--) {
+            const k = intInclusive(rng, 0, i, U32T);
+            [idx[i], idx[k]] = [idx[k], idx[i]];
+          }
+        }
+        return idx;
+      }
+    } else {
+      const C = [270, f(330 / 9)];
+      inplace = f(length) < f(f(C[j]) * amount);
+    }
+    if (inplace) {
+      const idx = Array.from({ length }, (_, i) => i);
+      for (let i = 0; i < amount; i++) {
+        const k = intInclusive(rng, i, length - 1, U32T);
+        [idx[i], idx[k]] = [idx[k], idx[i]];
+      }
+      return idx.slice(0, amount);
+    }
+    // Rejection sampling with a set of the indices seen.
+    const T = length > 4294967295 ? rt.$numT("usize") : U32T;
+    const seen = new Set();
+    const idx = [];
+    for (let i = 0; i < amount; i++) {
+      let pos = intUniform(rng, 0, length - 1, T);
+      while (seen.has(pos)) pos = intUniform(rng, 0, length - 1, T);
+      seen.add(pos);
+      idx.push(pos);
+    }
+    return idx;
   }
   const rand = {
     thread() {
-      if (threadRng === null) threadRng = new RandRng(Math.floor(Math.random() * 4294967296));
+      if (threadRng === null) threadRng = new XoshiroRng(Math.floor(Math.random() * 4294967296));
       return threadRng;
     },
-    seeded(n) {
-      return new RandRng(seedOf(n));
+    // `StdRng::seed_from_u64(n)` (`kind`: "std", "chacha8", "chacha20" or "small"): rand_core's
+    // PCG32 fill of the seed for each (`SmallRng` doesn't forward to Xoshiro's own).
+    seeded(n, kind = "std") {
+      return makeRng(kind, pcgSeed(n));
+    },
+    // `StdRng::from_seed(bytes)`.
+    fromSeed(bytes, kind = "std") {
+      return makeRng(kind, leWords(bytes));
     },
     entropy() {
-      return new RandRng(Math.floor(Math.random() * 4294967296));
+      return new XoshiroRng(Math.floor(Math.random() * 4294967296));
     },
+    // The other generators' `seed_from_u64` / `from_seed`.
+    seededSmall: (n) => rand.seeded(n, "small"),
+    fromSeedSmall: (b) => rand.fromSeed(b, "small"),
+    seededChaCha8: (n) => rand.seeded(n, "chacha8"),
+    fromSeedChaCha8: (b) => rand.fromSeed(b, "chacha8"),
+    seededChaCha20: (n) => rand.seeded(n, "chacha20"),
+    fromSeedChaCha20: (b) => rand.fromSeed(b, "chacha20"),
     // `rng.gen::<T>()`: integers over their whole range, floats in [0, 1), bools.
     gen(rng, T) {
-      if (T === rt.$prims.bool) return (rng.u32() & 1) === 1;
+      if (T === rt.$prims.bool) return (rng.u32() | 0) < 0;
       if (T === rt.$prims.char) {
-        for (;;) {
-          const c = rng.u32() % 0x110000;
-          if (c < 0xd800 || c > 0xdfff) return String.fromCodePoint(c);
-        }
+        let n = intUniform(rng, 0x800, 0x10ffff, U32T);
+        if (n <= 0xdfff) n -= 0x800;
+        return String.fromCodePoint(n);
       }
       if (T?.kind === undefined || T.float) {
-        const f = rng.f64();
-        return T?.kind === "f32" ? Math.fround(f) : f;
+        if (T?.kind === "f32") return (rng.u32() >>> 8) / 16777216;
+        return rng.f64();
       }
-      if (T.big) return rt.$w128(rng.big(T.bits), T.signed, T.bits);
+      if (T.big) return rt.$w128(genLarge(rng, 128), T.signed, T.bits);
       if (T.bits === 64) {
-        // (The 64-bit kinds are JS numbers: 53 bits of them.)
-        return (rng.u32() >>> 11) * 4294967296 + rng.u32();
+        const [lo, hi] = rng.u64();
+        return (T.signed ? hi | 0 : hi) * 4294967296 + lo;
       }
       return wrapInt(rng.u32(), T);
     },
@@ -5424,87 +5814,121 @@
     range(rng, lo, hi, inclusive, T) {
       if (inclusive ? !(lo <= hi) : !(lo < hi)) throw new CarciniPanic("cannot sample empty range", "<rand>");
       if (T?.float || (T?.kind === undefined && (!Number.isInteger(lo) || !Number.isInteger(hi)))) {
-        const r = lo + rng.f64() * (hi - lo);
-        const v = !inclusive && r >= hi ? lo : r;
-        return T?.kind === "f32" ? Math.fround(v) : v;
+        return floatRange(rng, lo, hi, inclusive, T?.kind === "f32");
       }
-      if (typeof lo === "bigint") {
-        const span = hi - lo + (inclusive ? 1n : 0n);
-        const bits = span.toString(2).length + 64;
-        return lo + (rng.big(Math.ceil(bits / 32) * 32) % span);
-      }
-      const span = hi - lo + (inclusive ? 1 : 0);
-      if (span <= 4294967296) {
-        // Rejection keeps it exactly uniform.
-        const zone = 4294967296 - (4294967296 % span);
-        for (;;) {
-          const x = rng.u32();
-          if (x < zone) return lo + (x % span);
-        }
-      }
-      return lo + Math.floor(rng.f64() * span);
+      T = T?.kind === undefined ? rt.$numT("i32") : T;
+      return intInclusive(rng, lo, inclusive ? hi : hi - (typeof hi === "bigint" ? 1n : 1), T);
     },
     range2(rng, lo, hi, T) {
       return rand.range(rng, lo, hi, false, T);
     },
-    // `rng.fill(&mut buf)`.
+    // `rng.fill(&mut buf)`: `fill_bytes` over the buffer's bytes, little-endian per element.
     fill(rng, buf, T) {
-      for (let i = 0; i < buf.length; i++) buf[i] = rand.gen(rng, T);
+      if (T?.kind === undefined || T.float || T === rt.$prims.bool) {
+        for (let i = 0; i < buf.length; i++) buf[i] = rand.gen(rng, T);
+        return new Res(0, undefined);
+      }
+      const size = T.big ? 16 : T.bits / 8;
+      const bytes = rng.bytes(buf.length * size);
+      for (let i = 0; i < buf.length; i++) {
+        let v = 0n;
+        for (let b = size - 1; b >= 0; b--) v = (v << 8n) | BigInt(bytes[i * size + b]);
+        buf[i] = T.big ? rt.$w128(v, T.signed, T.bits) : Number(T.signed ? BigInt.asIntN(size * 8, v) : v);
+      }
       return new Res(0, undefined);
     },
     bool(rng, p) {
       if (!(p >= 0 && p <= 1)) throw new CarciniPanic(`p=${rt.$dbgF(p)} is outside range [0.0, 1.0]`, "<rand>");
-      return p === 1 || rng.f64() < p;
+      return bernoulli(rng, bernoulliInt(p));
     },
     ratio(rng, num, den) {
       if (den === 0 || num > den) throw new CarciniPanic(`p=${num}/${den} is outside range [0, 1]`, "<rand>");
-      return rand.range(rng, 0, den, false, null) < num;
+      return bernoulli(rng, num === den ? null : bernoulliInt(num / den));
     },
-    // `v.shuffle(&mut rng)`: Fisher-Yates, in place.
+    // `v.shuffle(&mut rng)`: Fisher-Yates from the end, in place.
     shuffle(v, rng) {
       for (let i = v.length - 1; i > 0; i--) {
-        const j = rand.range(rng, 0, i, true, null);
+        const j = genIndex(rng, i + 1);
         const t = v[i];
         v[i] = v[j];
         v[j] = t;
       }
     },
     choose(v, rng) {
-      return v.length === 0 ? null : v[rand.range(rng, 0, v.length, false, null)];
+      return v.length === 0 ? null : v[genIndex(rng, v.length)];
     },
     // `v.choose_multiple(&mut rng, n)`: `n` distinct elements (all of them if fewer), as an
     // iterator.
     chooseMultiple(v, rng, n) {
-      const idx = v.map((_, i) => i);
-      const k = Math.min(n, v.length);
-      for (let i = 0; i < k; i++) {
-        const j = rand.range(rng, i, idx.length, false, null);
-        const t = idx[i];
-        idx[i] = idx[j];
-        idx[j] = t;
-      }
-      return rt.$iter(idx.slice(0, k).map((i) => v[i]));
+      const idx = indexSample(rng, v.length, Math.min(n, v.length));
+      return rt.$iter(idx.map((i) => v[i]));
     },
-    // `iter.choose(&mut rng)`: reservoir sampling.
-    iterChoose(it, rng) {
-      let pick = null;
-      let seen = 0;
-      for (const x of it) {
-        seen++;
-        if (rand.range(rng, 0, seen, false, null) === 0) pick = x;
+    // `iter.choose(&mut rng)`, following rand's use of the iterator's `size_hint`: `mode` is
+    // "exact" (a Vec's or a range's iterator: one index), "chars" (`s.chars()`: at least a
+    // quarter of the bytes left) or neither (a `filter`ed one: reservoir sampling).
+    iterChoose(it, rng, mode) {
+      const all = Array.from(it);
+      const n = all.length;
+      let pos = 0;
+      let bytesLeft = mode === "chars" ? all.reduce((s, c) => s + utf8Len(c), 0) : 0;
+      const hint = () => {
+        if (mode === "exact") return [n - pos, n - pos];
+        if (mode === "chars") return [Math.floor((bytesLeft + 3) / 4), bytesLeft];
+        return [0, null];
+      };
+      const nth = (k) => {
+        if (pos + k >= n) {
+          pos = n;
+          bytesLeft = 0;
+          return null;
+        }
+        for (let i = 0; i < k; i++) bytesLeft -= mode === "chars" ? utf8Len(all[pos + i]) : 0;
+        const x = all[pos + k];
+        if (mode === "chars") bytesLeft -= utf8Len(x);
+        pos += k + 1;
+        return x;
+      };
+      let [lower, upper] = hint();
+      if (upper === lower) return lower === 0 ? null : all[pos + genIndex(rng, lower)];
+      let consumed = 0;
+      let result = null;
+      for (;;) {
+        if (lower > 1) {
+          const ix = genIndex(rng, lower + consumed);
+          let skip = lower;
+          if (ix < lower) {
+            result = nth(ix);
+            skip = lower - (ix + 1);
+          }
+          if (upper === lower) return result;
+          consumed += lower;
+          if (skip > 0) nth(skip - 1);
+        } else {
+          if (pos >= n) return result;
+          const elem = nth(0);
+          consumed += 1;
+          if (genIndex(rng, consumed) === 0) result = elem;
+        }
+        [lower, upper] = hint();
       }
-      return pick;
+    },
+    iterChooseExact(it, rng) {
+      return rand.iterChoose(it, rng, "exact");
+    },
+    iterChooseChars(it, rng) {
+      return rand.iterChoose(it, rng, "chars");
     },
     iterChooseMultiple(it, rng, n) {
       const out = [];
-      let seen = 0;
+      let i = 0;
       for (const x of it) {
-        if (out.length < n) out.push(x);
-        else {
-          const j = rand.range(rng, 0, seen + 1, false, null);
-          if (j < n) out[j] = x;
+        if (out.length < n) {
+          out.push(x);
+          continue;
         }
-        seen++;
+        const k = genIndex(rng, i + 1 + n);
+        if (k < n) out[k] = x;
+        i++;
       }
       return out;
     },
@@ -5524,9 +5948,10 @@
     randomRatio(num, den) {
       return rand.ratio(rand.thread(), num, den);
     },
-    // (A `u64` is a JS number: 53 random bits, as `gen::<u64>()` gives.)
+    // (A `u64` is a JS number: rand's 64 bits, rounded past 2^53.)
     nextU64(rng) {
-      return (rng.u32() >>> 11) * 4294967296 + rng.u32();
+      const [lo, hi] = rng.u64();
+      return hi * 4294967296 + lo;
     },
     // `rng.sample(d)` / `rng.sample_iter(d)`: the distribution's own `sample`.
     sampleDist(rng, d) {

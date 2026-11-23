@@ -534,6 +534,12 @@
     "panic": null
   },
   {
+    "file": "entry_get_mut_binding.rs",
+    "stdout": "23\n{\"a\": 23} {1: \"hi\"}\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "enum_const_discriminants.rs",
     "stdout": "A = 5\nB = 6\nC = 8\nD = 11\nE = 12\nF = -14\nG = -13\nH = 256\nI = 97\nJ = 90\nK = 240\n10 11\n17 200 117\ntrue\n",
     "exitCode": 0,
@@ -752,6 +758,12 @@
   {
     "file": "get_mut_kept_results.rs",
     "stdout": "{\"a\": 101} 8 101\ndefault\n{\"a\": 100} 5\nmissing\n{\"a\": 2201}\nOk(22020)\nErr(\"no nope\")\n{\"a\": 22020}\n{1: \"n00dles!-home\"} \"?\"\n[-1.0, 5.0] 1\n[11, 2] 0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "get_mut_option_debug.rs",
+    "stdout": "Some(5)\nNone\nSome(2.5)\nSome(\"s\") 1\nSome(7)\nSome(5)\nSome(5)!\nSome(6)\nSome(true)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1146,6 +1158,12 @@
     "panic": null
   },
   {
+    "file": "mutex_guard_patterns.rs",
+    "stdout": "60\nabcd\n[1, 2]\nname\n25 6\ntrue\n6\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "nested_fns.rs",
     "stdout": "2\n1 4 100 170\n",
     "exitCode": 0,
@@ -1392,6 +1410,12 @@
     "panic": null
   },
   {
+    "file": "rand_seeded_sequence.rs",
+    "stdout": "572990626\n52\n2\n0.8684266101435584\nfalse\n[8, 2, 7, 9, 6, 10, 3, 4, 1, 5]\nSome(10)\n0.39064927489182444\n2022281974\n86 38 21579 -8802\n-1494933913 true 695494\n0.28212714 294394815046791598121671006870532705556\n-138661904443471983592246935130340669203 0.2350362287242932\n-4 193 42741 756 913601 4 -3 2.3941755 -0.41060555731508497 1972131167\n1 206 46891 208 -612923 4 33 2.218264 0.36974644319389305 1605561281\n-1 195 20564 915 -651414 6 32 1.5511227 0.5869589019137238 -1696622090\n0 103 5396 357 -49042 1 169 2.443627 -0.2150726404896448 -2015155452\n-3 44 29047 600 -177069 6 206 2.3158045 0.8350105286324068 -1315671596\n48 true\n[251, 193, 32, 78, 1, 215, 213]\n[1480260405, 1375212023, 3161703230] 2850961603\n0 []\n3 [66, 91, 28]\n11 [93, 48, 22, 80, 85, 71]\n12 [24, 16, 74, 89, 71, 53]\n30 [77, 46, 93, 44, 96, 58]\n60 [31, 50, 75, 41, 56, 9]\n99 [18, 15, 74, 3, 12, 41]\n100 [2, 10, 23, 53, 13, 98]\n120 [38, 78, 59, 54, 21, 27]\n[182, 22, 1113, 1004, 12]\n[240, 109, 1685, 1030, 256]\nSome(49)\nSome(66)\nSome('é')\nSome(168)\n[70, 50, 43, 17]\n[76, 59, 96]\n[\"c\", \"f\", \"b\", \"e\", \"a\", \"d\"] Some(\"d\")\nNone\n4\n1521642723 168 0.9088859452419126\n[2, 8, 3, 17, 4, 18, 9, 12, 19, 0, 1, 11, 13, 5, 7, 6, 14, 16, 10, 15]\n[218, 17, 119, 14, 208, 96, 83, 103, 29, 245, 162, 176, 213]\n32\n62 15025\n8 8 9 6 5 3 1 4 6 6 1 2 4 5 8 8 9 5 3 1 4 8 9 1 6 6 5 9 4 2 8 2 3 1 1 6 8 0 3 6 \n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "range_kind_impls.rs",
     "stdout": "from 3\nbelow 7\nup to 7\neverything\n2 to 5\nbelow 7; below 7\nfrom 5\nbelow 2\nup to 2\neverything\n1 to 4\ndyn: from 9\ndyn: below 1\ndyn: everything\ndyn: 0 to 1\n[10, 11, 12]\n15\n..2 1.. .. ..=3\n2 1 3\n[10, 20] [20, 30, 40, 50] [10, 20, 30, 40, 50] [10, 20, 30, 40]\ntrue false\n[40, 50] [10] 4\ntrue\n",
     "exitCode": 0,
@@ -1496,6 +1520,12 @@
   {
     "file": "slice_range_mut.rs",
     "stdout": "[3, 1, 2, 9, 5, 8]\n[1, 3, 2, 9, 5, 8]\n[1, 3, 2, 9, 0, 0]\n[1, 2, 3, 9, 0, 0]\n[3, 1, 2, 0, 0, 9]\n[3, 2, 1, 0, 0, 9]\n[3, 2, 1, 0, 0, 9]\n[0, 0, 1, 7, 7, 9]\nabcdefgh\n[\"pear\", \"fig\", \"kiwi\", \"apple\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "slice_try_into_array.rs",
+    "stdout": "true\nfalse\nOk([1, 2, 3])\nErr([1, 2, 3])\n[1, 2, 3]\n5\nerr could not convert slice to array\ncould not convert slice to array\n67305985\n[6, 7, 8, 9]\nNone\nOk([1, 2, 3]) Err([1])\n4\nNone\n[1, 2, 3]\ntrue\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1716,6 +1746,12 @@
     "panic": null
   },
   {
+    "file": "tuple_mut_refs.rs",
+    "stdout": "2\n106\nab\ntrue\n(5, 16)\n2 16 4\nSome(4) 2\nhi 2\n#1 = 4\nSome(5)\n(1, 4)\n4\n1 5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "tuple_trait_impls.rs",
     "stdout": "(u3,i4)\n<s2:abu9i-2>\n(u1,s1:x)(u1,s1:x)\n((u1,u2),i7)((u1,u2),i7)\n7\n14\n(u1,u2) (u3,u4)\n",
     "exitCode": 0,
@@ -1802,6 +1838,12 @@
   {
     "file": "vec_more.rs",
     "stdout": "Ok(3) Err(2) Err(6)\nOk(0)\nOk(1)\n[1, 3] [5, 7, 9, 11] true true\n[3, 5] [1, 7, 9, 11]\n[1, 7] [9, 11]\n[1, 7, 100, 200] []\n[7, 100, 200, 1]\n[200, 1, 7, 100]\n200 [100, 1, 7]\n[7, 7, 7] [1, 2, 1, 2] true\n50 1 2\n[1, 2] Queue { items: [], name: \"jobs\" }\n[\"y\", \"z\"] [\"x\"]\n3 0 4 true\n32 16\nSome(127) None None\n255 -128 254\n1705032704 3\n[\"a\", \"b\", \"c,d\"]\n[\"d\", \"a,b,c\"]\n[\"c\", \"b\", \"a\"]\n[-1.0, 0.0, 2.5, NaN]\nSome('A') Some('b')\n8\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "vec_mut_refs_get_mut.rs",
+    "stdout": "6 12\n6 12\nxy\ntrue\n[102, 51, 21]\n102 51 21\n",
     "exitCode": 0,
     "panic": null
   },

@@ -120,26 +120,29 @@ Compile errors in code a script could plausibly contain:
 
 ## Silent differences in common code
 
-- **`get_mut` on a `Vec<&mut T>` of numbers, strings or bools** (`**rs.get_mut(1).unwrap() += 1`)
-  writes to a copy; index it (`*rs[1] += 1`).
-- **A kept `hash_map::Entry`'s `get_mut` bound to a name** (`let v = e.get_mut(); *v += 1;`)
-  compiles but throws "Assignment to constant variable" at run time; write `*e.get_mut() += 1`.
-- **A `Mutex` guard bound by a pattern** (`if let Ok(mut g) = m.lock()`, `match m.lock()`)
-  holds a copy when the value is a number or `String`, so writes through it are lost;
-  `lock().unwrap()` in an expression or a `let` writes through.
-- **A kept `Option` from `get_mut` / `peek_mut` over numbers, strings or bools, printed**
-  (`let o = m.get_mut("a"); println!("{:?}", o);`) shows the internal slot (`Some(a,5)`)
-  instead of the value (`Some(5)`); print the unwrapped value (`o.map(|v| *v)`) instead.
-- **A plain tuple holding a `&mut` to a number, string or bool** (`let mut t = (1, &mut x);`)
-  holds a copy, so writes through `t.1` (directly or from a function taking
-  `&mut (usize, &mut i32)`) don't reach `x`; write through `x`'s reference in a separate
-  binding instead.
-- **`v.try_into()` from a slice to an array is always `Ok`**, since array lengths aren't in
-  the types; rustc returns `Err` (or panics at `unwrap`) for the wrong length. Written as
-  `<[T; N]>::try_from(v)` the length is known and checked.
-- **Random numbers differ from rand's.** The generator is xoshiro128**, not ChaCha12, so a
-  seeded `StdRng` repeats its own sequence but not rand's, and `shuffle` / `choose` pick
-  differently for the same seed.
+- **A tuple holding a `&mut` to a number, string or bool holds a slot only where it's built or
+  received in sight**: a `let` of a tuple literal (`let t = (1, &mut x);`) or with a written
+  tuple type, a parameter written `(usize, &mut i32)` / `&mut (usize, &mut i32)`, and what
+  those are bound to or borrowed into (`let (i, r) = t;`, `let u = &t;`). A tuple returned
+  from a function declared `-> (u8, &mut i32)`, or stored in a struct field or a collection,
+  holds a copy, so writes through its `.1` don't reach `x`.
+- **`v.try_into()` from a slice or `Vec` to an array checks the length only where the code
+  around it writes one**: a `let` annotation (`let a: [u8; 4] = ..` / `Result<[u8; 4], _>`),
+  a parameter of one of the file's functions, the function's return type, or
+  `u32::from_le_bytes(..)` and the like, through `?`, `.unwrap()`, `.expect(..)` and `.ok()`,
+  with the length a literal or a `const` of the file. Elsewhere (a struct field's value, an
+  assignment to an existing local) array lengths aren't in the types, and the conversion is
+  `Ok` of a copy whatever the length. `<[T; N]>::try_from(v)` always checks.
+- **Seeded random numbers are rand 0.8's, except where a `u64` is involved.** `StdRng`
+  (ChaCha12) and `SmallRng` (Xoshiro256++) seeded with `seed_from_u64` or `from_seed` give
+  rand's sequence through `gen`, `gen_range`, `gen_bool`, `gen_ratio`, `fill`, `shuffle`,
+  `choose`, `choose_multiple` and an iterator's `choose`. But a 64-bit value is a JS number,
+  so `gen::<u64>()` / `next_u64()` are rand's values rounded past 2^53, and a seed above
+  2^53 (`seed_from_u64(u64::MAX)`) isn't rand's seed. The `rand_distr` distributions and
+  `Uniform` sample their own way (so differ from rand's for a seed), as does `iter.choose`
+  after an adapter whose `size_hint` isn't followed (`chain`, `flat_map`, `skip` of
+  `chars()`: rand's result depends on the hint). `thread_rng()` and `from_entropy()` are
+  unseeded and use a faster generator.
 
 ## Bundled crates
 
@@ -188,8 +191,7 @@ There is one JS thread, and scripts share it with the game.
 - **`std::sync` is single-threaded.** Locks never block, fail or poison (`try_lock` is always
   `Ok`, a second `lock()` while the first guard lives is no deadlock), atomics ignore their
   `Ordering`, and a std `mpsc` `recv()` on an empty channel is `Err(RecvError)` instead of
-  waiting. `LockResult<T>` / `TryLockResult<T>` aren't names here (write the `Result`). (A guard
-  bound by a pattern holds a copy: see [part 1](#silent-differences-in-common-code).)
+  waiting. `LockResult<T>` / `TryLockResult<T>` aren't names here (write the `Result`).
 - **rayon runs on one thread.** Results are what one thread gives, so they match rayon's except
   where rayon's own order isn't fixed (`par_bridge`, `for_each` side effects). There's no
   `ThreadPoolBuilder`, `rayon::scope` or `par_iter().update(..)`, and rayon's method names

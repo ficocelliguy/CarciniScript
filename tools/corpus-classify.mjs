@@ -116,6 +116,7 @@ function classify(m, lineText, file) {
     return ["EXT", "name"];
   }
   if (/^cannot find (type|struct|tuple struct|this struct)/.test(m)) return thr(b) ? ["THREAD", b] : ["EXT", "name"];
+  if (/^failed to resolve: use of undeclared (type|crate or module|crate|module)/.test(m)) return thr(b) ? ["THREAD", b] : ["EXT", "name"];
   if (/^type `[^`]*` is not supported yet/.test(m)) {
     if (thr(b)) return ["THREAD", b];
     if (/^(c_|MaybeUninit|NonNull|ManuallyDrop|UnsafeCell|PhantomPinned|Layout|CStr|CString)/.test(b)) return ["LANG", "unsafe/memory: " + b];
@@ -123,6 +124,23 @@ function classify(m, lineText, file) {
     if (STD.has(b)) return ["STD", "type " + b];
     if (isGenericParam(b)) return ["LANG", "type parameter in this position"];
     return ["EXT", "type"];
+  }
+  // `the standard library type `std::cell::UnsafeCell<i32>`` / `function `core::ascii::escape_default``.
+  if (/^the standard library \w+ `[^`]*` is not supported yet/.test(m)) {
+    if (thr(b)) return ["THREAD", b];
+    if (/::(ptr|alloc|intrinsics)::|::mem::(size_of|align_of|size_of_val|align_of_val|transmute|transmute_copy|zeroed|uninitialized|forget)\b|::hint::unreachable_unchecked|^(c_|MaybeUninit|NonNull|ManuallyDrop|UnsafeCell|PhantomPinned|Layout|CStr|CString)/.test(n)) return ["LANG", "unsafe/memory: " + b];
+    const kind = m.match(/^the standard library (\w+)/)[1];
+    return ["STD", kind + " " + (kind === "type" ? b : n.replace(/^(std|core|alloc)::/, ""))];
+  }
+  if (/^the iterator adapter `\.[^`]*\(\)` is not supported yet/.test(m)) return ["STD", "iterator adapter " + n];
+  if (/^`(size_of|align_of|size_of_val|align_of_val)` of `/.test(m)) return ["LANG", "unsafe/memory: " + b];
+  // `dyn Debug` / `impl Display` of a trait the checker has no model for; `for<'a> ..` bounds.
+  if (/^`(dyn |impl |for<)[^`]*` types are not supported yet/.test(m)) {
+    if (/^`for</.test(m)) return ["LANG", "higher-ranked trait bounds"];
+    const tr = base(n.replace(/^(dyn|impl)\s+/, "").split(/\s*\+\s*|\(/)[0]);
+    if (thr(tr)) return ["THREAD", tr];
+    if (STD.has(tr) || tr === "Error") return ["STD", (n.startsWith("dyn") ? "dyn " : "impl ") + tr];
+    return ["EXT", "dyn/impl external trait"];
   }
   if (/^`impl [^`]* for \.\.` is not supported yet/.test(m)) {
     const t = n.replace(/^impl /, "").replace(/ for \.\.$/, ""); const tb = base(t);

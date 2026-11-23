@@ -933,8 +933,15 @@ fn ext_names(n: &SyntaxNode, scope: &Scope) -> Vec<String> {
         if text.starts_with("self::") || matches!(first.as_str(), "" | "std" | "core" | "alloc") {
             continue;
         }
+        // A capitalized name the file doesn't define, a name a non-std `use` brings in, or a
+        // module path (`anstream::AutoStream`, `fmt::Builder`) whose root is neither a module of
+        // this file nor a std import: all from another crate or file.
+        let module_path = segs.len() > 1
+            && first.starts_with(|c: char| c.is_ascii_lowercase())
+            && !scope.local.contains(first);
         let foreign = scope.foreign.contains(first)
-            || first.starts_with(|c: char| c.is_ascii_uppercase()) && !scope.local.contains(first);
+            || first.starts_with(|c: char| c.is_ascii_uppercase()) && !scope.local.contains(first)
+            || module_path;
         if foreign && !out.contains(first) {
             out.push(first.clone());
         }
@@ -1150,7 +1157,8 @@ fn main() {
                 e["node"] = json!({ "kinds": kinds, "feat": feat, "cfg": cfg, "text": text.split_whitespace().collect::<Vec<_>>().join(" ") });
                 e["ext"] = json!(ext_names(&node, &scope));
                 // Names from elsewhere in the error's context: its statement, the signature of the
-                // function it's in, and the header of the impl that is in (`self`'s type).
+                // function it's in (parameters, return type, generic bounds and `where` clause),
+                // and the header of the impl that is in (`self`'s type, its bounds).
                 let mut ctx: Vec<String> = Vec::new();
                 let stmt = node.ancestors().find(|a| {
                     matches!(a.kind(), EXPR_STMT | LET_STMT)
@@ -1164,6 +1172,10 @@ fn main() {
                     stmt,
                     func.as_ref().and_then(|f| child(f, PARAM_LIST)),
                     func.as_ref().and_then(|f| child(f, RET_TYPE)),
+                    func.as_ref().and_then(|f| child(f, GENERIC_PARAM_LIST)),
+                    func.as_ref().and_then(|f| child(f, WHERE_CLAUSE)),
+                    imp.as_ref().and_then(|i| child(i, GENERIC_PARAM_LIST)),
+                    imp.as_ref().and_then(|i| child(i, WHERE_CLAUSE)),
                 ] {
                     if let Some(p) = part {
                         ctx.extend(ext_names(&p, &scope));

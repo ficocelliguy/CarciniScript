@@ -646,8 +646,20 @@ impl Checker<'_> {
                 }
                 (Ty::Vec(x), Ty::Vec(y)) => {
                     let (x, y) = (x.clone(), y.clone());
-                    self.unify(&err, &Ty::Extern("TryFromSliceError".into()));
-                    self.unify(&x, &y).then_some(Conv::TryVec)
+                    let m = ast::MethodCallExpr::cast(node.clone());
+                    // An owned `Vec` (`v.try_into()` of a `Vec` local, `v.clone()`) is the
+                    // `Err` itself; a slice's is a `TryFromSliceError`.
+                    let owned = m
+                        .as_ref()
+                        .and_then(|m| m.receiver())
+                        .is_some_and(|r| self.certainly_owned(&r));
+                    let len = m.as_ref().and_then(super::arrays::try_into_array_len);
+                    if owned {
+                        self.unify(&err, &Ty::Vec(x.clone()));
+                    } else {
+                        self.unify(&err, &Ty::Extern("TryFromSliceError".into()));
+                    }
+                    self.unify(&x, &y).then_some(Conv::TryVec { len, owned })
                 }
                 _ => None,
             };

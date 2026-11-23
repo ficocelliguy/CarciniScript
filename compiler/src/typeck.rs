@@ -105,6 +105,9 @@ pub struct Types {
     /// `write!` / `writeln!` destinations (by their start) that are `io::Write`rs.
     pub io_writes: std::collections::HashSet<usize>,
     /// `TypeId::of::<T>()`, `type_name::<T>()` and `x.type_id()` calls: their string, by range.
+    /// `get_mut` / `first_mut` / `last_mut` of a `Vec<&mut i32>` of slots: the stored slot itself
+    /// (`κσ.$vecItem`), not a slot over it, so `**r += 1` writes through to the referent.
+    pub slot_item_calls: std::collections::HashSet<(usize, usize)>,
     pub any_strs: HashMap<(usize, usize), String>,
     /// `x.is::<T>()` / `downcast_ref::<T>()` .. on a `dyn Any`: the `T` to test for, by range.
     pub any_checks: HashMap<(usize, usize), Ty>,
@@ -266,6 +269,9 @@ pub struct FnSig {
     pub ret_slot: Option<bool>,
     /// Which parameters are written `Option<&mut T>` with such a `T`: `null` or a slot.
     pub opt_slot_params: Vec<bool>,
+    /// The slot shape of each parameter written as a tuple holding such a `&mut T` (`t: (usize,
+    /// &mut i32)`, `t: &mut (usize, &mut i32)`): a tuple literal argument keeps its slots.
+    tuple_slot_params: Vec<Option<slots::SlotShape>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -360,6 +366,8 @@ impl<'a> Checker<'a> {
             copy_arrays: Default::default(),
             move_sites: Default::default(),
             io_writes: Default::default(),
+            slot_item_calls: Default::default(),
+            lock_results: Default::default(),
             any_strs: Default::default(),
             any_checks: Default::default(),
             crate_name: String::new(),
@@ -529,6 +537,14 @@ impl<'a> Checker<'a> {
                 let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t));
                 let ret_slot = self.ret_slot_kind(f, &ret);
                 let opt_slot_params = self.opt_slot_params(f, &params);
+                let tuple_slot_params = f
+                    .param_list()
+                    .map(|pl| {
+                        pl.params()
+                            .map(|p| p.ty().and_then(|t| self.param_tuple_slot_shape(&t)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 self.note_ret_item_slots(f, name.text().to_string());
                 let sig = FnSig {
                     params,
@@ -544,6 +560,7 @@ impl<'a> Checker<'a> {
                     ret_mut_ref,
                     ret_slot,
                     opt_slot_params,
+                    tuple_slot_params,
                 };
                 if self
                     .fns
@@ -741,6 +758,7 @@ pub fn check(
             mut_bindings,
             move_sites: std::mem::take(&mut c.move_sites),
             io_writes: std::mem::take(&mut c.io_writes),
+            slot_item_calls: std::mem::take(&mut c.slot_item_calls),
             any_strs: std::mem::take(&mut c.any_strs),
             any_checks: std::mem::take(&mut c.any_checks),
             fmt_writes: std::mem::take(&mut c.fmt_writes),
@@ -877,6 +895,10 @@ struct Checker<'a> {
     /// `write!` destinations that are `io::Write`rs (by their start).
     io_writes: std::collections::HashSet<usize>,
     /// See `Types::any_strs` / `any_checks`.
+    slot_item_calls: std::collections::HashSet<(usize, usize)>,
+    /// Locals holding an unwrapped `m.lock()` (`let r = m.lock();`): matched later, the `Ok`
+    /// binding aliases the lock's value, as with the call itself.
+    lock_results: std::collections::HashSet<String>,
     any_strs: HashMap<(usize, usize), String>,
     any_checks: HashMap<(usize, usize), Ty>,
     /// The crate's name (the file's stem), which `type_name` puts before a struct's name.
@@ -2477,6 +2499,10 @@ impl<'a> Checker<'a> {
                         decl: None,
                     };
                     self.declare(&n, local);
+                    // `t: &mut (usize, &mut i32)`: `t.1` is a slot.
+                    if let Some(s) = p.ty().and_then(|t| self.param_tuple_slot_shape(&t)) {
+                        self.slot_items.insert(n.text().to_string(), s);
+                    }
                 } else if let Some(pat) = p.pat() {
                     // `(r, c): (usize, usize)`, `Point { x, y }: Point`, `&(a, b): &(i32, i32)`.
                     self.pat(&pat, &ty);
@@ -2845,6 +2871,15 @@ impl<'a> Checker<'a> {
             }
             t
         });
+        // `let mut t = (1, &mut x);`: `t.1` is a slot over `x`; `let u = &t;` / `let (a, b) = t;`
+        // take its shape on.
+        let slot_item = slot_item
+            .or_else(|| self.tuple_let_slot_shape(l.ty().as_ref(), l.initializer().as_ref()))
+            .or_else(|| {
+                l.initializer()
+                    .filter(|i| matches!(strip_parens(i), ast::Expr::PathExpr(_) | ast::Expr::RefExpr(_)))
+                    .and_then(|i| self.tuple_slot_shape(&i))
+            });
         if let Some(ast::Expr::RefExpr(r)) = l.initializer()
             && r.mut_token().is_some()
             && let Some(inner) = r.expr()
@@ -2915,6 +2950,11 @@ impl<'a> Checker<'a> {
             let Some(name) = ip.name() else { return };
             let deferred = l.initializer().is_none();
             self.note_slot_let(&name, l.initializer().as_ref());
+            if l.initializer().is_some_and(|i| self.lock_call(&i)) {
+                self.lock_results.insert(name.text().to_string());
+            } else {
+                self.lock_results.remove(&*name.text());
+            }
             // `let mut refs: Vec<&mut i32> = Vec::new();` / `let tagged: Vec<(usize, &mut i32)> =
             // vec![(0, &mut c)];`: a Vec of slots, filled by `push` or the literal.
             if let Some(t) = l.ty()
@@ -3102,6 +3142,34 @@ impl<'a> Checker<'a> {
     /// Whether a value matched or bound from `e` is a `&mut` reference: `&mut x`, a std call
     /// such as `map.get_mut(..)` / `v.last_mut()` / `it.next()` of an `iter_mut()`, or one of the
     /// file's own functions returning `&mut T` / `Option<&mut T>`.
+    /// `m.lock()` (or `read` / `write` / `get_mut` / `try_*`) on the lock prelude's `Mutex` /
+    /// `RwLock`, not unwrapped: matched, its `Ok` payload is the lock's value in place.
+    pub(super) fn lock_call(&self, e: &ast::Expr) -> bool {
+        let ast::Expr::MethodCallExpr(m) = strip_parens(e) else {
+            return false;
+        };
+        if !m.name_ref().is_some_and(|n| {
+            matches!(
+                n.text().as_ref(),
+                "lock" | "read" | "write" | "get_mut" | "try_lock" | "try_read" | "try_write"
+            )
+        }) {
+            return false;
+        }
+        let Some(recv) = m.receiver() else { return false };
+        let Some(Ty::Adt(n, _)) = self.raw.get(&self.range(recv.syntax())).map(|t| self.zonk(t))
+        else {
+            return false;
+        };
+        matches!(n.as_str(), "Mutex" | "RwLock")
+            && self
+                .adts
+                .defs
+                .get(&n)
+                .and_then(|d| d.variants.first())
+                .is_some_and(|v| v.field("__c").is_some())
+    }
+
     fn mut_ref_call(&self, e: &ast::Expr) -> bool {
         (match ptr::unsafe_tail(e) {
             ast::Expr::RefExpr(r) => r.mut_token().is_some(),
@@ -3243,11 +3311,18 @@ impl<'a> Checker<'a> {
     fn alias_place_bindings(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) -> bool {
         let through_place = match scrutinee.map(strip_parens) {
             Some(ast::Expr::RefExpr(r)) => r.mut_token().is_some(),
+            // (A local holding `m.lock()`'s result: as the call, below.)
             Some(ast::Expr::PathExpr(p)) => p
                 .path()
                 .and_then(|p| p.as_single_name_ref())
-                .and_then(|n| self.lookup(n.text().to_string().as_str()).cloned())
-                .is_some_and(|l| l.reference == Some(true)),
+                .is_some_and(|n| {
+                    let n = n.text().to_string();
+                    self.lock_results.contains(&n)
+                        || self.lookup(&n).is_some_and(|l| l.reference == Some(true))
+                }),
+            // `if let Ok(mut g) = m.lock()`: codegen matches on a result whose payload is the
+            // lock's value in place (`κσ.$lockRes`), so `g` aliases it.
+            Some(e) if self.lock_call(&e) => true,
             // `if let Some(n) = self.timer.as_mut()`: the `Option` in that place itself (codegen
             // matches on the place), so `n` aliases it as it would through `&mut self.timer`.
             Some(e) => self.as_mut_of_place(&e),
@@ -4329,6 +4404,7 @@ impl<'a> Checker<'a> {
             ast::Expr::Literal(l) => self.literal(l),
             ast::Expr::PathExpr(p) => {
                 self.check_slot_result_use(p);
+                self.note_slot_tuple_ref(p);
                 self.path(p)
             }
             ast::Expr::ParenExpr(p) => p
@@ -4595,18 +4671,7 @@ impl<'a> Checker<'a> {
                         let i = f.name_ref().and_then(|n| n.as_tuple_field()).unwrap_or(0);
                         // `tagged[1].1` of a `Vec<(usize, &mut i32)>`, or `t.1` of an item of
                         // one in a local: the slot in the item.
-                        let item = match strip_parens(&recv) {
-                            ast::Expr::IndexExpr(ix) => {
-                                ix.base().and_then(|b| self.vec_slot_shape(&b))
-                            }
-                            ast::Expr::PathExpr(p) => p
-                                .path()
-                                .and_then(|p| p.as_single_name_ref())
-                                .and_then(|n| {
-                                    self.slot_items.get(n.text().to_string().as_str()).cloned()
-                                }),
-                            _ => None,
-                        };
+                        let item = self.tuple_slot_shape(&recv);
                         if let Some(slots::SlotShape::Tuple(fields)) = item
                             && fields.get(i) == Some(&Some(slots::SlotShape::Slot))
                         {
@@ -5287,6 +5352,11 @@ impl<'a> Checker<'a> {
         }
         // `*w.n += 1` with `n: &mut i32`, `*s.at(i) = 0`: a write through the reference.
         if self.through_slot(e) {
+            return;
+        }
+        // `t.1.push('b')` with `t.1: &mut String`: borrowed through the reference.
+        if how != Mutation::Assign && self.slot_values.contains(&self.range(strip_parens(e).syntax()))
+        {
             return;
         }
         let Some((name, through)) = Self::place_root(e) else {
@@ -6392,6 +6462,21 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // `show((3, &mut x))` with `fn show(t: (usize, &mut i32))`: the tuple holds a slot.
+        let tuple_slot_params = self
+            .fns
+            .get(name)
+            .map(|s| s.tuple_slot_params.clone())
+            .unwrap_or_default();
+        for (a, s) in args.iter().zip(tuple_slot_params) {
+            if let Some(s) = s {
+                let a = match strip_parens(a) {
+                    ast::Expr::RefExpr(r) => r.expr().unwrap_or_else(|| a.clone()),
+                    a => a,
+                };
+                self.keep_slot_shape(&a, &s);
+            }
+        }
         // `*at(&mut v, 0) += 1` with `fn at(..) -> &mut i32`: the call is a slot.
         if let Some(s) = self.fns.get(name) {
             let (kind, declared) = (s.ret_slot, s.ret.clone());
@@ -7274,6 +7359,9 @@ impl<'a> Checker<'a> {
                         {
                             let r = self.range(m.syntax());
                             self.slot_calls.insert(r);
+                            if self.vec_slot_shape(&recv) == Some(slots::SlotShape::Slot) {
+                                self.slot_item_calls.insert(r);
+                            }
                             if let Some(n) = slot_let_binding(m) {
                                 let r = self.range(n.syntax());
                                 self.slot_bindings.insert(r);
@@ -9272,7 +9360,8 @@ fn only_tested(m: &ast::MethodCallExpr) -> bool {
     {
         n = p;
     }
-    let Some(p) = n.parent() else { return false };
+    // A macro argument has no parent: `println!("{:?}", m.get_mut(k))` reads a copy.
+    let Some(p) = n.parent() else { return true };
     // `m.get_mut(k) == None`
     if let Some(b) = ast::BinExpr::cast(p.clone()) {
         return matches!(

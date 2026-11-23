@@ -137,7 +137,7 @@ thread), `log` (`info!`, with `env_logger`), `num` (`Zero`, `gcd`, ..) and `toki
 `WeightedIndex`, ..), `chrono` (dates, times, time zones, `format`) and `clap` (`#[derive(Parser)]`
 and the builder, with clap's help and errors). `extern crate x;` works for
 these. See [FEATURES.md](docs/FEATURES.md) for what each
-covers and [RUST_GAPS.md](docs/RUST_GAPS.md) for what differs (rand's seeded sequences, for one).
+covers and [RUST_GAPS.md](docs/RUST_GAPS.md) for what differs (a seeded RNG's 64-bit values, for one).
 
 ### JS globals
 

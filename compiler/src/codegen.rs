@@ -1264,7 +1264,10 @@ impl<'a> Codegen<'a> {
             crate::adt::Conv::TryFrom { adt, key } => {
                 value.wrap(&format!("{}.{key}(", self.class(&adt)), ")")
             }
-            crate::adt::Conv::TryVec => value.wrap("κσ.Ok(κσ.$clone(", "))"),
+            crate::adt::Conv::TryVec { len: Some(n), owned } => {
+                value.wrap("κσ.$arrayTryFrom(", &format!(", {n}, {})", !owned))
+            }
+            crate::adt::Conv::TryVec { len: None, .. } => value.wrap("κσ.Ok(κσ.$clone(", "))"),
             crate::adt::Conv::TryChar => value.wrap("κσ.$tryChar(", ")"),
             crate::adt::Conv::Wrap { js } => value.wrap(&format!("{js}("), ")"),
         }
@@ -6205,7 +6208,8 @@ impl<'a> Codegen<'a> {
         (Frag::text(out), ret)
     }
 
-    /// `m.lock().unwrap()` (or `read` / `write` / `get_mut` / `try_*`, then `unwrap` / `expect`)
+    /// `m.lock().unwrap()` (or `read` / `write` / `get_mut` / `try_*`, then `unwrap` / `expect`, or
+    /// `unwrap_or_else`, whose closure never runs since nothing is poisoned)
     /// on the lock prelude's `Mutex` / `RwLock`: the lock. Its value is `<lock>.__c.v`, a place,
     /// so `*m.lock().unwrap() += 1` and a guard in a `let` write through.
     fn lock_place(&self, e: &ast::Expr) -> Option<ast::Expr> {
@@ -6234,7 +6238,7 @@ impl<'a> Codegen<'a> {
         };
         if !un
             .name_ref()
-            .is_some_and(|n| matches!(&*n.text(), "unwrap" | "expect"))
+            .is_some_and(|n| matches!(&*n.text(), "unwrap" | "expect" | "unwrap_or_else"))
         {
             return None;
         }
@@ -6272,6 +6276,26 @@ impl<'a> Codegen<'a> {
             f.push(".__c.v");
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
             return (f, ty);
+        }
+        // `m.lock()` not unwrapped (`if let Ok(mut g) = m.lock()`): an `Ok` whose payload is
+        // the lock's value in place, so a guard bound by the pattern writes through.
+        if matches!(
+            &*name.text(),
+            "lock" | "read" | "write" | "get_mut" | "try_lock" | "try_read" | "try_write"
+        ) && m.arg_list().is_none_or(|l| l.args().next().is_none())
+            && let Some(Ty::Adt(n, _)) = self.raw_ty_of(recv.syntax())
+            && matches!(n.as_str(), "Mutex" | "RwLock")
+            && self
+                .types
+                .adts
+                .defs
+                .get(&n)
+                .and_then(|d| d.variants.first())
+                .is_some_and(|v| v.field("__c").is_some())
+        {
+            let (f, _) = self.emit_expr(&recv, None);
+            let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            return (f.wrap("κσ.$lockRes(", ")").at(self.off(name.syntax())), ty);
         }
         let name_off = self.off(name.syntax());
         let method = name.text().to_string();
@@ -6357,26 +6381,8 @@ impl<'a> Codegen<'a> {
             return self.emit_expr(&recv, None);
         }
         // The map entry prelude's `&mut V`: the map's slot for the key, a place.
-        if let Some(Ty::Adt(n, _)) = self.ty_of(recv.syntax())
-            && let Some(mode) = match (n.as_str(), method.as_str()) {
-                ("StdOccupiedEntry", "get_mut" | "into_mut") => Some("get"),
-                ("StdVacantEntry", "insert") | ("StdMapEntry", "or_insert") => Some("insert"),
-                ("StdMapEntry", "or_insert_with") => Some("lazy"),
-                _ => None,
-            }
-        {
-            let (rf, _) = self.emit_expr(&recv, None);
-            let arg = self
-                .emit_args(m.arg_list(), &[])
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| Frag::text("undefined"));
-            let mut f = Frag::mapped(self.off(m.syntax()), "κσ.$entrySlot(");
-            f.append(rf)
-                .push(format!(", \"{mode}\", "))
-                .append(arg)
-                .push(")[1]");
-            return (f, self.ty_of(m.syntax()).unwrap_or(Ty::Unknown));
+        if let Some(f) = self.prelude_entry_slot(m) {
+            return (f.wrap("", "[1]"), self.ty_of(m.syntax()).unwrap_or(Ty::Unknown));
         }
         // `stream.extend(tokens)` on a proc-macro crate's `TokenStream`.
         if method == "extend"
@@ -7830,7 +7836,37 @@ impl<'a> Codegen<'a> {
 
     /// `map.entry(k).or_insert(d)` / `.or_default()` / `.or_insert_with(Vec::new)`: the map's
     /// `[key, value]` storage slot for `k`, inserting the default first if the key is missing.
+    /// The map entry prelude's methods that hand out `&mut V` (`e.get_mut()`, `e.into_mut()`,
+    /// `vacant.insert(v)`, `entry.or_insert(v)` of a kept entry): the map's slot for the key.
+    fn prelude_entry_slot(&mut self, m: &ast::MethodCallExpr) -> Option<Frag> {
+        let recv = m.receiver()?;
+        let Some(Ty::Adt(n, _)) = self.ty_of(recv.syntax()) else {
+            return None;
+        };
+        let mode = match (n.as_str(), &*m.name_ref()?.text()) {
+            ("StdOccupiedEntry", "get_mut" | "into_mut") => "get",
+            ("StdVacantEntry", "insert") | ("StdMapEntry", "or_insert") => "insert",
+            ("StdMapEntry", "or_insert_with") => "lazy",
+            _ => return None,
+        };
+        let (rf, _) = self.emit_expr(&recv, None);
+        let arg = self
+            .emit_args(m.arg_list(), &[])
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Frag::text("undefined"));
+        let mut f = Frag::mapped(self.off(m.syntax()), "κσ.$entrySlot(");
+        f.append(rf)
+            .push(format!(", \"{mode}\", "))
+            .append(arg)
+            .push(")");
+        Some(f)
+    }
+
     fn entry_slot(&mut self, m: &ast::MethodCallExpr) -> Option<Frag> {
+        if let Some(f) = self.prelude_entry_slot(m) {
+            return Some(f);
+        }
         let method = m.name_ref()?.text().to_string();
         if !matches!(
             method.as_str(),
@@ -8481,6 +8517,13 @@ impl<'a> Codegen<'a> {
         if self.types.slot_calls.contains(&self.range_of(m.syntax())) {
             // A slot over the element (`{ get 1(), set 1() }`), or null when there's none.
             let f = match method {
+                // Of a `Vec<&mut i32>`: the stored slot itself.
+                "first_mut" | "last_mut" | "get_mut"
+                    if self.types.slot_item_calls.contains(&self.range_of(m.syntax())) =>
+                {
+                    let i = if method == "get_mut" { a(0) } else { Frag::text(if method == "first_mut" { "0" } else { "-1" }) };
+                    helper("vecItem", vec![i])
+                }
                 // `iter_mut()` outside a loop by index: an iterator of slots.
                 "iter_mut" => helper("iterMutSlots", vec![]),
                 "first_mut" => helper("vecSlot", vec![Frag::text("0")]),

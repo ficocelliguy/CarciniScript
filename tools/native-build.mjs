@@ -55,6 +55,8 @@ export function buildNative(file, exe, { debug = false } = {}) {
     .map(([c, v]) =>
       c === "serde" || c === "clap"
         ? `${c} = { version = "${v}", features = ["derive"] }`
+        : c === "rand"
+        ? `rand = { version = "${v}", features = ["small_rng"] }`
         : `${c === "cfg_if" ? "cfg-if" : c === "chrono_tz" ? "chrono-tz" : c === "num_traits" ? "num-traits" : c === "rustc_hash" ? "rustc-hash" : c === "env_logger" ? "env_logger" : c} = "${v}"`,
     );
   const toml = ["[package]", 'name = "prog"', 'version = "0.1.0"', `edition = "${edition}"`, "", "[dependencies]", ...deps, ""];

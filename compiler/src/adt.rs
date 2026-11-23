@@ -625,8 +625,10 @@ pub enum Conv {
     /// `x.try_into()` through an `impl TryFrom<X> for Y`: `Y.key(x)` (`try_from`, or
     /// `try_from$1`, .. when `Y` has several).
     TryFrom { adt: String, key: String },
-    /// `v.try_into()` from a slice to an array: `Ok` of a copy (lengths aren't in the types).
-    TryVec,
+    /// `v.try_into()` from a slice or `Vec` to an array: with the array's length (when the code
+    /// around the call writes it), `κσ.$arrayTryFrom(v, len, slice)`; else `Ok` of a copy
+    /// (lengths aren't in the types). `owned`: a `Vec`, which is the `Err` on a mismatch.
+    TryVec { len: Option<usize>, owned: bool },
     /// `n.try_into()` to a `char`: `κσ.$tryChar(n)`.
     TryChar,
     /// A runtime function of the value (`?` into an `anyhow::Error`: `κσ.$anyhow.from(e)`).

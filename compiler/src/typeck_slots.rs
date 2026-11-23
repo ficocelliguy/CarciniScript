@@ -874,10 +874,13 @@ impl Checker<'_> {
         self.slot_reads.insert(r, js);
     }
 
-    /// The `κσ.$readSlots` shape of a local holding a Vec of slots or an item of one.
+    /// The `κσ.$readSlots` shape of a local holding a Vec of slots, an item of one or an `Option`
+    /// of a slot.
     pub(super) fn local_slot_read(&self, name: &str) -> Option<String> {
         match self.slot_locals.get(name) {
             Some((true, s)) => Some(format!("{{e: {}}}", s.js())),
+            // A kept `Option` of a slot (`let o = m.get_mut(k);`): `None`, or the value read.
+            _ if let Some(s) = self.slot_options.get(name) => Some(format!("{{o: {}}}", s.js())),
             _ => self.slot_items.get(name).map(SlotShape::js),
         }
     }
@@ -1094,6 +1097,119 @@ impl Checker<'_> {
         self.written_slot_elem(&a.ty()?)
     }
 
+    /// `let t = (1, &mut x);` (or `let t: (usize, &mut i32) = ..`) of a number, string, bool or
+    /// `Option` `x`: the tuple holds a slot over `x` there, so writes through `t.1` reach it.
+    /// Marks the `&mut`s to be kept as slots and returns the tuple's shape. After the
+    /// initializer is checked.
+    pub(super) fn tuple_let_slot_shape(
+        &mut self,
+        written: Option<&ast::Type>,
+        init: Option<&ast::Expr>,
+    ) -> Option<SlotShape> {
+        let shape = match written {
+            Some(t @ ast::Type::TupleType(_)) => self.written_slot_elem(t),
+            Some(_) => None,
+            None => init.and_then(|i| self.literal_slot_shape(i)),
+        }?;
+        if let Some(i) = init {
+            self.keep_slot_shape(i, &shape);
+        }
+        Some(shape)
+    }
+
+    /// `show(&t)` / `Some(&t)` of a local tuple holding slots (`let t = (1, &mut x);`): nothing
+    /// can be written through a `&(usize, &mut i32)`, so it's a copy with the slots read.
+    /// (`let u = &t;` takes the shape on instead.)
+    pub(super) fn note_slot_tuple_ref(&mut self, p: &ast::PathExpr) {
+        let Some(n) = p.path().and_then(|p| p.as_single_name_ref()) else {
+            return;
+        };
+        let Some(s @ SlotShape::Tuple(_)) = self.slot_items.get(n.text().to_string().as_str())
+        else {
+            return;
+        };
+        let js = s.js();
+        let Some(re) = p
+            .syntax()
+            .ancestors()
+            .skip(1)
+            .find(|x| x.kind() != SyntaxKind::PAREN_EXPR)
+            .and_then(ast::RefExpr::cast)
+        else {
+            return;
+        };
+        if re.mut_token().is_some()
+            || re
+                .syntax()
+                .parent()
+                .is_some_and(|x| x.kind() == SyntaxKind::LET_STMT)
+        {
+            return;
+        }
+        let r = self.range(re.syntax());
+        self.slot_reads.insert(r, js);
+    }
+
+    /// The slot shape of a tuple whose fields are read: `tagged[1]` of a `Vec<(usize, &mut
+    /// i32)>`, a local holding one (`t` of `let t = (1, &mut x);`), or a tuple field of either
+    /// (`(w.1).1`).
+    pub(super) fn tuple_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
+        match strip_parens(e) {
+            ast::Expr::RefExpr(r) => self.tuple_slot_shape(&r.expr()?),
+            ast::Expr::IndexExpr(ix) => self.vec_slot_shape(&ix.base()?),
+            ast::Expr::PathExpr(p) => {
+                let n = p.path()?.as_single_name_ref()?;
+                self.slot_items.get(n.text().to_string().as_str()).cloned()
+            }
+            ast::Expr::FieldExpr(f) => {
+                let i = f.name_ref()?.as_tuple_field()?;
+                match self.tuple_slot_shape(&f.expr()?)? {
+                    SlotShape::Tuple(fields) => match fields.into_iter().nth(i)?? {
+                        s @ SlotShape::Tuple(_) => Some(s),
+                        SlotShape::Slot => None,
+                    },
+                    SlotShape::Slot => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The slot shape of a tuple literal's `&mut` fields over numbers, strings, bools and
+    /// `Option`s (`(1, &mut x)`).
+    fn literal_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
+        let ast::Expr::TupleExpr(t) = strip_parens(e) else {
+            return None;
+        };
+        let fields: Vec<Option<SlotShape>> = t
+            .fields()
+            .map(|f| match strip_parens(&f) {
+                ast::Expr::RefExpr(r) if r.mut_token().is_some() => {
+                    let inner = r.expr()?;
+                    let ty = self.raw.get(&self.range(inner.syntax()))?;
+                    self.cellable(ty).then_some(SlotShape::Slot)
+                }
+                f @ ast::Expr::TupleExpr(_) => self.literal_slot_shape(&f),
+                _ => None,
+            })
+            .collect();
+        fields.iter().any(Option::is_some).then_some(SlotShape::Tuple(fields))
+    }
+
+    /// A parameter `t: (usize, &mut i32)` / `t: &mut (usize, &mut i32)`: the slot shape of the
+    /// tuple it receives.
+    pub(super) fn param_tuple_slot_shape(&mut self, t: &ast::Type) -> Option<SlotShape> {
+        match t {
+            // (A `&(usize, &mut i32)` gets a copy with the slots read.)
+            ast::Type::RefType(r) if r.mut_token().is_some() => match r.ty()? {
+                tt @ ast::Type::TupleType(_) => self.written_slot_elem(&tt),
+                _ => None,
+            },
+            ast::Type::TupleType(_) => self.written_slot_elem(t),
+            _ => None,
+        }
+    }
+
     /// `&mut T` → a slot; `(A, &mut T)` → a tuple with slots in those positions.
     fn written_slot_elem(&mut self, t: &ast::Type) -> Option<SlotShape> {
         match t {
@@ -1137,7 +1253,7 @@ impl Checker<'_> {
         }
     }
 
-    fn keep_slot_shape(&mut self, e: &ast::Expr, shape: &SlotShape) {
+    pub(super) fn keep_slot_shape(&mut self, e: &ast::Expr, shape: &SlotShape) {
         match (strip_parens(e), shape) {
             (_, SlotShape::Slot) => {
                 self.keep_slot(e);

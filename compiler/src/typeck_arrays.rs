@@ -20,6 +20,154 @@ pub fn array_try_from_len(path: &ast::Path) -> Option<usize> {
     array_type_len(&anchor.ty()?)
 }
 
+/// The length of the array `x.try_into()` (the call `m`) converts to, where the code around it
+/// writes it: a `let` annotation (`let a: [u8; 4] = s.try_into().unwrap();`, `let r:
+/// Result<[u8; 4], _> = s.try_into();`), one of the file's functions' parameters or its return
+/// type, or `u32::from_le_bytes(..)` and the like, through `?`, `.unwrap()`, `.expect(..)`,
+/// `.unwrap_or(..)` and `.ok()`.
+pub fn try_into_array_len(m: &ast::MethodCallExpr) -> Option<usize> {
+    use ra_ap_syntax::SyntaxKind;
+    let mut n = m.syntax().clone();
+    // Whether the `Result` (or the `Option` of `.ok()`) has been unwrapped.
+    let mut unwrapped = false;
+    loop {
+        let p = n.parent()?;
+        match p.kind() {
+            SyntaxKind::PAREN_EXPR => {}
+            SyntaxKind::TRY_EXPR => unwrapped = true,
+            SyntaxKind::METHOD_CALL_EXPR => {
+                let mc = ast::MethodCallExpr::cast(p.clone())?;
+                if mc.receiver()?.syntax() != &n {
+                    return None;
+                }
+                match &*mc.name_ref()?.text() {
+                    "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else" | "unwrap_or_default" => {
+                        unwrapped = true
+                    }
+                    "ok" if !unwrapped => {}
+                    _ => return None,
+                }
+            }
+            SyntaxKind::LET_STMT => {
+                let l = ast::LetStmt::cast(p)?;
+                if l.initializer()?.syntax() != &n {
+                    return None;
+                }
+                let t = l.ty()?;
+                return if unwrapped {
+                    type_len(&t)
+                } else {
+                    type_len(&first_type_arg(&t)?)
+                };
+            }
+            SyntaxKind::ARG_LIST if unwrapped => {
+                let i = p.children().position(|c| c == n)?;
+                let call = p.parent()?;
+                let (name, i) = if let Some(c) = ast::CallExpr::cast(call.clone()) {
+                    let ast::Expr::PathExpr(f) = c.expr()? else {
+                        return None;
+                    };
+                    let path = f.path()?;
+                    let name = path.segment()?.name_ref()?.text().to_string();
+                    // `u32::from_le_bytes(..)`: the integer's size in bytes.
+                    if matches!(name.as_str(), "from_le_bytes" | "from_be_bytes" | "from_ne_bytes") {
+                        let ty = path.qualifier()?.segment()?.name_ref()?.text().to_string();
+                        return int_bytes(&ty);
+                    }
+                    (name, i)
+                } else {
+                    let mc = ast::MethodCallExpr::cast(call)?;
+                    (mc.name_ref()?.text().to_string(), i + 1)
+                };
+                let f = file_fn(&p, &name)?;
+                let mut params: Vec<Option<ast::Type>> = Vec::new();
+                let pl = f.param_list()?;
+                if pl.self_param().is_some() {
+                    params.push(None);
+                } else if i > 0 && ast::MethodCallExpr::can_cast(p.parent()?.kind()) {
+                    return None;
+                }
+                params.extend(pl.params().map(|p| p.ty()));
+                return type_len(params.get(i)?.as_ref()?);
+            }
+            SyntaxKind::RETURN_EXPR => {
+                let f = p.ancestors().find_map(ast::Fn::cast)?;
+                let t = f.ret_type()?.ty()?;
+                return if unwrapped {
+                    type_len(&t)
+                } else {
+                    type_len(&first_type_arg(&t)?)
+                };
+            }
+            SyntaxKind::STMT_LIST => {
+                let sl = ast::StmtList::cast(p.clone())?;
+                if sl.tail_expr()?.syntax() != &n {
+                    return None;
+                }
+                let block = p.parent()?;
+                if let Some(f) = block.parent().and_then(ast::Fn::cast) {
+                    let t = f.ret_type()?.ty()?;
+                    return if unwrapped {
+                        type_len(&t)
+                    } else {
+                        type_len(&first_type_arg(&t)?)
+                    };
+                }
+                n = block;
+                continue;
+            }
+            _ => return None,
+        }
+        n = p;
+    }
+}
+
+/// The length of an array type (or a reference to one) written with a literal or a `const` of
+/// the file.
+fn type_len(t: &ast::Type) -> Option<usize> {
+    match t {
+        ast::Type::RefType(r) => type_len(&r.ty()?),
+        ast::Type::ParenType(p) => type_len(&p.ty()?),
+        _ => array_type_dims(t).first().copied(),
+    }
+}
+
+/// `Result<T, E>` / `Option<T>`: `T`.
+fn first_type_arg(t: &ast::Type) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let ast::Type::PathType(p) = t else { return None };
+    let seg = p.path()?.segment()?;
+    match seg.generic_arg_list()?.generic_args().next()? {
+        ast::GenericArg::TypeArg(a) => a.ty(),
+        _ => None,
+    }
+}
+
+/// The size in bytes of a number type (`from_le_bytes` takes that many).
+fn int_bytes(ty: &str) -> Option<usize> {
+    Some(match ty {
+        "u8" | "i8" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "f32" => 4,
+        "u64" | "i64" | "f64" => 8,
+        "u128" | "i128" => 16,
+        "usize" | "isize" => 8,
+        _ => return None,
+    })
+}
+
+/// The one function (or method) named `name` in the file that holds `at`.
+fn file_fn(at: &ra_ap_syntax::SyntaxNode, name: &str) -> Option<ast::Fn> {
+    use ra_ap_syntax::ast::HasName;
+    let root = at.ancestors().last()?;
+    let mut fs = root
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .filter(|f| f.name().is_some_and(|n| n.text() == name));
+    let f = fs.next()?;
+    fs.next().is_none().then_some(f)
+}
+
 /// The length of an array type written with a literal (`[f64; 4]`).
 pub fn array_type_len(t: &ast::Type) -> Option<usize> {
     match t {

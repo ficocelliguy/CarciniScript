@@ -178,20 +178,40 @@ results in the OS temp dir). Its three steps:
 - `compiler/examples/corpus_ast.rs` parses each file with rust-analyzer's parser and adds the
   Rust features it uses (about 90 syntactic detectors, so a feature counts even where an
   unresolved name stops the compiler first), the construct each error is on, and the names
-  from other crates or files in that construct, its statement, its function's signature and its
-  `impl`'s header. Each feature has a probe program (all accepted by rustc, 2021 edition); a
-  feature whose probe doesn't compile is missing. `--probes` prints just those results.
+  from other crates or files in that construct, its statement, its function's signature
+  (parameters, return type, generic bounds, `where` clause) and its `impl`'s header (self type
+  and bounds). A name counts as from elsewhere when it is capitalized and the file doesn't
+  define it, when a non-std `use` brings it in, or when it is a module path whose root the
+  file neither declares nor imports from std (`anstream::AutoStream`, `fmt::Builder`). Each
+  feature has a probe program (all accepted by rustc, 2021 edition); a feature whose probe
+  doesn't compile is missing. `--probes` prints just those results.
 - `tools/corpus-report.mjs` reclassifies an uncategorized error as downstream of another crate
   or file when such names are involved, or as a language gap when it's on a missing feature
   or is a `#[cfg]`'d item defined twice, then prints the verdicts, language gaps, every feature
   with its use and probe result, what's still uncategorized by message and construct, and the
   crates that pass in every file, and writes a per-file CSV.
+- `tools/corpus-uncategorized.mjs` (optional, after the report) sorts what the report leaves
+  uncategorized into finer buckets: by message, construct and a look at the source file (is the
+  method, type or trait the error names defined in this file? is the error inside a macro
+  expansion?), so each bucket says whether it is a real gap or downstream of another file. The
+  "Still uncategorized" list below comes from it; re-run it after a survey to refresh the list.
 
-**Latest run** (2026-11-17, after `049fcee`): language features all supported in **81.8%** of
-files (4,272 of 5,220; 67% at the first run on 2026-11-16); counting std gaps, 72.2%; by lines,
-64.9%. 896 files have a language gap (631 of them unsafe/memory, not planned), 505 are std-only,
-44 have only uncategorized errors. 70 crates pass in every file; 153 in 80% or more. The crash
-sweeps (registry 5,922 files, std 3,004) run with 0 panics.
+The classifier keys on the compiler's message wording, so a reworded diagnostic silently moves
+its files into "uncategorized" (the 2026-11-22 run found `the standard library function ..`,
+`the iterator adapter ..` and `failed to resolve ..` that way, 800 files' worth). When the
+uncategorized count jumps, check the report's top messages before reading anything else into
+the numbers.
+
+**Latest run** (2026-11-22, working tree after `d437860`, same registry as before): language
+features all supported in **82.9%** of files (4,327 of 5,220; 81.8% on 2026-11-17, 67% at the
+first run on 2026-11-16); counting std gaps, 70.5%; by lines, 67.0%. 839 files have a language
+gap (650 of them unsafe/memory, 126 `union`, 58 proc-macro API, 67 `extern`: not planned), 647
+are std-only, 48 have only uncategorized errors. 75 crates pass in every file; 156 in 80% or
+more. Every one of the ~90 feature probes compiles. The std-only and language-gap counts are up
+on 2026-11-17 because the classifier was taught the compiler's newer wordings (see above):
+`size_of` / `ptr::*` paths now count as unsafe/memory and `the standard library type ..` as std,
+where the 2026-11-17 run had them as "only external names". The crash sweeps (registry 5,922
+files, std 3,004) last ran on 2026-11-17 with 0 panics.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
 `set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
@@ -202,14 +222,130 @@ see the Bitburner player gaps below).
 
 **Open:**
 
-- [ ] Still uncategorized (1,814 file hits, none involving another file's names that the syntax
-  step can see), by message and construct: "no method named" on a method call (166 files),
-  mismatched types (85 on a name, 37 on a method call, 34 on a `&`), a `#[derive]` whose field
-  type lacks the trait (81, e.g. `Clone` for `Arc<dyn PrefilterI>`), a tuple field of a method's
-  result (`self.0.get_ref().0`, 81), `.into()` needing a target (67), "needs a bound" comparisons
-  and operators on type parameters (41 + 28), a tuple-struct pattern of another crate's enum
-  (`Bound::Included(&i)`, 39). Worth sorting next: several are probably std types the checker
-  doesn't know (`Bound`, `Arc<dyn Tr>: Clone`).
+- Still uncategorized after the 2026-11-22 run: 1,459 file hits by message and construct
+  (1,814 on 2026-11-17). `tools/corpus-uncategorized.mjs` sorts them as: about 200 downstream
+  of another file that the syntax step can't see (a method from a trait bound or a field type
+  defined in another module, a tuple field of a value whose type comes from elsewhere, the
+  methods of an `impl OtherFilesTrait for Local` block); about 90 known limitations already
+  recorded (slice / array / `Vec` / `Box<[T]>` being one type, a generic trait implemented more
+  than once, `impl for &T`, `TypeId` / `type_name` on a type parameter); about 150 std-surface
+  gaps whose message isn't shaped like the std ones; about 200 inside macro expansions (mostly
+  the same gaps as below, hit once per expansion); 27 that aren't gaps at all (`compile_error!`
+  under a `cfg`, `env!` of a cargo variable). The rest, each confirmed with a program rustc
+  accepts (edition 2021, `--crate-type lib`) that this compiler rejects, counts in files of the
+  corpus where it shows:
+  - Bounds and generics:
+    - [ ] Bounds written on the `impl` aren't used inside its methods for an argument whose
+      type is the bound's target: `impl<T: Default> Cell<T> { fn take(&mut self) -> T {
+      self.swap(Default::default()) } }` ("`T: Default` is not satisfied", 10 files) and
+      `impl<S: Into<OsS>> From<S> for Pred { fn from(o: S) -> Self { Pred::Equals(o.into()) } }`
+      ("`OsS: From<S>` is not satisfied", part of 37). `T::default()`, and the same bound on a
+      free function, work.
+    - [ ] A blanket `impl<S: Into<X>> From<S> for Y` isn't found by `let y: Y = "a".into()` or
+      `Y::from("a")` (clap's `ArgPredicate`, `ValueParser`; part of the 37 `From` hits).
+    - [ ] Bounds declared on associated types: `trait Fac { type P: Parser; fn make() ->
+      Self::P; }` then `T::make().map(..)` ("no method `map` for type parameter `Fac::P`"),
+      `where <T as Fac>::P: Parser`, `I: Tr<Error = X>` then methods of `I::Iter`, and `type P =
+      T::P;` in an impl ("cannot find type `P`") (13 files).
+    - [ ] A generic trait bound on the impl's type parameter given in a method's `where`
+      clause: `impl<Key, F> Meta<Key, F> { fn filter<I>(&mut self, item: I) -> F::Container
+      where F: KeyMethod<Key, I> { self.key_method.make(item) } }` (both the projection and
+      the method are missing; 7 files with the trait in the same file).
+    - [ ] A trait's own generic method called through a type parameter: `trait Order { fn
+      select<R: Copy>(r: R) -> R; }` then `O::select(x)` / `O::select::<u8>(x)` with
+      `O: Order`: `R` is never instantiated ("expected `u8`, found `R`"; 5 files).
+    - [ ] `Ord` / `Eq` bounds don't imply `PartialOrd` / `PartialEq` when the bound is on a
+      *trait's* method (`trait It2 { fn pick<B: Ord>(self, a: B, b: B) -> B { if a > b .. } }`,
+      also with a `where` clause; itertools, fallible-iterator). Free functions and inherent
+      impls are fine. (7 + 9 files, most of the comparison ones.)
+    - [ ] `.as_ref()` on a type parameter bounded `AsRef<[u8]>` / `AsRef<str>` / `AsRef<Path>`
+      resolves to the wrong type (`Vec<u8>` → `String`, `str` → `PathBuf`), so the result
+      doesn't fit a `&[u8]` / `&str` parameter (aho-corasick haystacks, cc flags).
+    - [ ] Unsized coercion of a *type parameter*: `Box::new(val)` as `Box<dyn Tr>`, `val` as
+      `&dyn Tr`, `Some(Box::new(val))` as `Option<Box<dyn Tr>>`, with `T: Tr` ("expected `dyn
+      Tr`, found `T`", 16 files); concrete types coerce. Also `match` arms returning `Some(e)`
+      for different error types as `Option<&(dyn Error + 'static)>` (`Error::source`, 5).
+    - [ ] Inference of a struct's type argument from the one impl of a bound (`Auto::always(
+      Vec::new())` with `impl RawStream for Vec<u8>` the only impl): "type annotations needed".
+    - [ ] An extension-trait method on an unsuffixed integer literal, `5.seconds()` with the
+      trait implemented for `i64` only; rustc picks the literal's type from the sole impl (time's
+      macros, 7 files).
+  - Names and items:
+    - [ ] Items declared inside function bodies share the file's namespace: two functions each
+      declaring `enum State` / `struct Acc` collide ("defined multiple times"), and the first
+      function then resolves `State::X` and `Acc(..)` against the second's items (19 files).
+    - [ ] An inherent method with the same name as a trait method on the same type (`impl Prog
+      { fn header(&self) }` next to `impl LineProgram for Prog { fn header(&self) }`): "duplicate
+      definitions" (gimli; rustc prefers the inherent one).
+    - [ ] Inherent impls on reference instantiations collide: `impl<L, R> Either<&L, &R> { fn
+      cloned }` and `impl<L, R> Either<&mut L, &mut R> { fn cloned }`. Impls per type argument
+      (`impl W<u8>` / `impl W<u16>`) and per const argument work, but their associated consts
+      collide (`impl Cell<u8> { const MIN: u8 }` + `impl Cell<i32> { const MIN: i32 }`, generated
+      by macros in bitvec, crossbeam, jiff; 28 files + 5 macro-only).
+    - [ ] `pub use self::m::{f, T};` re-exporting a *function* of an inline module ("cannot find
+      function `f`"), and a re-exported type whose name std or a bundled crate also has
+      (`Duration`, `Lazy`, `Value`, `MinMaxResult`, `Mutex`): "defined multiple times" or its
+      fields unknown (23 files, several of them the crates these names come from).
+    - [ ] `impl Tr for std::io::Stdout {}` next to `impl Tr for std::io::StdoutLock<'_> {}` (same
+      for `Stderr`): one JS type here, so "conflicting implementations" (anstream).
+    - [ ] Methods of an `impl Trait for Local { .. }` block are dropped when `Trait` can't be
+      resolved, so `self.is_match(..)` is "no method named" (39 files). Corpus-only in effect
+      (a script has all its files), but registering them regardless would be cheap and would
+      take the biggest remaining "no method" bucket with it.
+    - [ ] Field access through `Deref`: `wrap.sign` with `impl Deref for Wrap { type Target =
+      Span; }` is "no field `sign` on type `Wrap`"; methods through `Deref` work (jiff).
+    - [ ] Function pointer types (`fn(u8) -> u8`, `Option<fn(..)>`) are typed as `impl Fn`, so a
+      `#[derive(Clone, Copy, Debug)]` struct holding one fails (windows-sys callbacks, brotli
+      allocators: 27 files, the whole "derive on an `Option` field" bucket).
+    - [ ] A range literal matched against `From<Range<usize>>` / `From<RangeInclusive<usize>>`
+      impls is typed as `slice::Iter` (`(a..=b).into()`, clap's `ValueRange`).
+    - [ ] `Type::from` as a function value (`.map(Id::from)`) isn't found; `Into::into` and
+      `.map(|s| s.into())` work.
+  - Borrow checker, E0596 "not declared as mutable" where rustc accepts (about 50 files; the
+    other E0596 hits are `*val = ..` on a loop variable whose iterator type is unknown, and raw
+    pointers):
+    - [ ] The typed receiver `fn init(self: &mut Self, ..)` (brotli).
+    - [ ] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
+      &'a mut u8 { self.table.items.push(..) }` with `table: &'a mut Table`, and `Entry::Occupied(
+      entry) => &mut entry.v.values[i]` (hashbrown, clap).
+    - [ ] A `&mut` binding produced by `Option` combinators or a tuple pattern: `let links =
+      v[i].as_mut().unwrap(); links.next = 1;`, `if let (Some(dst), Some(src)) = (v.get_mut(a..b),
+      w.get(c..d)) { dst.copy_from_slice(src) }`, `let (Some(a), b) = (..) else { .. }; *a += b`.
+      (`let Some((a, b)) = x.as_mut() else`, `for v in s.iter_mut()`, destructuring `self` and
+      calling `&mut self` trait methods through a `&mut W` parameter all work.)
+  - Patterns:
+    - [ ] Irrefutable array patterns on a `[T; N]`, `for (j, ([first, rest @ ..], fast)) in ..`
+      and `let ([x, ..], y) = ..`, are rejected as refutable (icu; 9 files with the other
+      refutable-pattern hits, one of which is `let Ok(p): Result<_, Infallible> = ..`).
+    - [ ] Struct patterns on std structs: `let Range { start, end } = r;` ("cannot find tuple
+      struct, struct or variant `Range`").
+    - [ ] Tuple-struct and unit patterns of std enums, `Bound::Included(&i)`, `Bound::Unbounded`
+      (10 files): `Bound` itself is an unmodeled std type, so this is the std column, listed
+      here because the pattern message isn't shaped like a std one.
+    - [ ] The bundled `log` crate's `Level` by its full path: `log::Level` as a type ("cannot
+      find type `LogLevel`") and `log::Level::Error` as a pattern or value (env_logger's
+      examples). The other crate-name patterns (`anstyle::Color::Ansi(c)`, `syn::Meta::..`) are
+      crates that aren't bundled.
+  - Places:
+    - [ ] Index assignment on a call result: `b.slice_mut()[0] = 1;`, `b.inner()[1] = 2;`
+      ("assignment to this place is not supported yet", 4 files); `*b.n_mut() = 5` and `let v =
+      b.inner(); v[2] = 9` work.
+  - Macros:
+    - [ ] BUG: a struct-literal field shorthand inside `macro_rules!` is hygiene-renamed with the
+      local it names: `let ids = ..; $name { ids }` becomes "struct has no field named `ids__h1`"
+      plus "missing field `ids`" (aho-corasick, bitvec; 7 + 9 files). `$name { ids: ids }` too.
+    - [ ] Macro-generated inline modules and their items (deranged's `impl_ranged!`: "this block
+      kind is not supported yet", 3 files but 1,165 errors).
+  - std surface found through these messages (for the std column, not language work):
+    `From<T> for OnceCell<T>` / `OnceCell::from`, `Vec<u8>: From<String>`, `Cow<[u8]>:
+    From<Vec<u8>>`, `OsString::push(&Path)` / `push(&str)` (`OsString` is a `String` here and
+    `push` takes a `char`), `Debug` for `slice::Iter` in a derive, `write_fmt` overridden in an
+    `io::Write` / `fmt::Write` impl ("not a member of trait"), `&a | &b` on `HashSet`.
+  - Still mixed, to triage next: the "mismatched types" buckets (two named types that don't
+    match, about 90 files outside macros). Samples are std modeling (`Cow<'a, str>` seen as
+    `Cow<String>`, `OsStr::to_owned()` as `String`), clap's derive attributes on variants
+    (`#[command(..)]` giving "expected `ClapCommand`, found `bool`"), and types from other
+    files; nothing there has a confirmed probe yet.
 - Left over from closed gaps, after the 2026-11-20 pass (see RUST_GAPS.md "Traits on
   built-in types" and FEATURES.md):
   - [x] A generic `-> Option<&mut T>` of a `T` that may be a number (`fn first_mut<T>(v: &mut
@@ -349,6 +485,112 @@ rustc's builds print (`tools/diff-one.mjs`).
 
 **Expected:** `thread::spawn` and `mpsc` (4 files), `Rc::strong_count` (no reference counts in
 JS), and the not-planned unsafe features (raw pointers, `slice::from_raw_parts`, `union`, FFI).
+
+## Programming Rust and Comprehensive Rust survey (2026-11-22)
+
+The example crates of [Programming Rust](https://github.com/ProgrammingRust/examples) (24 crates,
+41 files, compiled file by file like the registry) and
+[Comprehensive Rust](https://github.com/google/comprehensive-rust): its 27 standalone exercise
+files and the `rust` code blocks of its `src/*.md` slides (319 after dropping `ignore` and
+`compile_fail`, with `{{#include file:anchor}}` resolved and hidden `# ` lines shown; 316 that
+rustc accepts as they are or wrapped in `fn main`; the 3 others use unix-only std). The bare-metal
+and Android chapters are left out. Run through the corpus survey above (`corpus-classify.mjs`,
+`corpus_ast`, `corpus-report.mjs`), as Rust by Example was. Of the 384 files, 247 compile as-is
+and 325 (84.6%) have no language gap; the language gaps the report finds are the not-planned
+unsafe, FFI, `union` and proc-macro ones (30 files) plus `concat!` format strings and the CR LF
+continuation below. The 157 compiled programs with a `main` were also run against rustc's builds
+(`tools/diff-one.mjs`): 142 print the same; the rest differ in `{:p}`, filesystem errors,
+`process::exit` running `Drop`s and `Vec::capacity` (all in RUST_GAPS.md) and in the two items
+marked **runtime** below. (In five more, `diff-one` reports the JS location of a `todo!()` as
+`undefined` because the message follows the location on one line; the locations agree.) Each gap
+below has a minimal repro that rustc accepts; the slide or crate it comes from is in parentheses.
+
+**Open, compiler:**
+
+- [ ] `for x in v` over a `&mut [T]`, `&mut [T; N]` or `&mut Vec<T>` *parameter*
+  (`references/exercise`: `fn normalize(vector: &mut [f64; 3]) { for item in vector { *item /=
+  mag; } }`): "cannot borrow `item` as mutable, as it is not declared as mutable". Over a local
+  (`for x in &mut v`), a reborrow (`&mut *v`) or `v.iter_mut()` it works.
+- [ ] A `where` clause on an inherent method bounding the impl's type parameter
+  (`idiomatic/polymorphism/generics/conditional-methods`: `impl<T> Value<T> { fn log_error(&self)
+  where T: Error { eprintln!("{}", self.0) } }`): "`T` doesn't implement `Display`", or "no
+  method named `s` found for type parameter `T`" for your own trait. The bound on the impl
+  header (`impl<T: Display> Value<T>`, or its `where`) works.
+- [ ] `L::Output` of a std operator-trait bound (Programming Rust `complex`: `impl<L, R>
+  Add<Complex<R>> for Complex<L> where L: Add<R> { type Output = Complex<L::Output>; .. }`; also
+  `fn add<L: Add<R>, R>(a: L, b: R) -> L::Output { a + b }`): "cannot find type `Output`", then
+  "expected `L`, found `R`". `T: Add<Output = T>` works.
+- [ ] `impl` / `dyn` of std's formatting and comparison traits in parameter and return types:
+  `val: impl Display`, `t: &impl Display`, `t: &dyn Display`, `Vec<Box<dyn Display>>`, `-> impl
+  Debug`, `impl ToString`, `impl Ord + Debug` (`generics/impl-trait`,
+  `idiomatic/polymorphism/dyn/dyn-vs-generics`, `dyn/heterogeneous`, `polymorphism/python`):
+  "`impl Display` types are not supported yet". `T: Display`, `impl Into<T>`, `impl AsRef<str>`,
+  `&dyn Error` and your own traits work.
+- [ ] `&123` / `&1.5` passed as `&dyn Any` (`idiomatic/polymorphism/dyn/any-trait`): "mismatched
+  types: expected `dyn Any`, found `{integer}`". Structs, `String` and `&str` coerce.
+- [ ] `Self::Target` in a `DerefMut` impl (`idiomatic/leveraging-the-type-system/newtype-pattern/
+  is-it-encapsulated`: `fn deref_mut(&mut self) -> &mut Self::Target`): "cannot find type
+  `Target`", whichever of the two impls comes first. In the `Deref` impl itself, and written out as
+  `&mut String`, it works.
+- [ ] `vec![]` / `Vec::new()` typed only by a `&mut Vec<Self::Leaf>` argument in a trait default
+  method (`idiomatic/polymorphism/generics/default-impls`: `let mut buf = vec![];
+  self.collect_leaves_buffered(&mut buf); buf`): "type annotations needed for `Vec<_>`". Through
+  a free function with concrete types, or with `let mut buf: Vec<Self::Leaf>`, it works.
+- [ ] `fmt::Error` written in a return type, `-> Result<(), fmt::Error>` (Programming Rust
+  `libgit2-rs-safe`): "cannot find type `Error`", or, when the file has its own `Error` type,
+  "expected `Result<(), Error>`, found `Result<(), fmt::Error>`". `-> fmt::Result` works.
+- [ ] `Err(format!(..))?` / `Err("usage")?` in a `-> Result<_, Box<dyn Error>>` (Programming Rust
+  `grep`, `http-get`; also `Box<dyn Error + Send + Sync>`): "`?` couldn't convert the error to
+  `dyn Error`". `Err("bad".into())` and `let e: Box<dyn Error> = s.into()` work, so only the `?`
+  path misses `From<String>` / `From<&str>` for the box.
+- [ ] `concat!(..)` as a format string: `println!(concat!("{}:{}: ", $msg), file!(), line!(),
+  $($params),*)` (`macros/macro_rules/techniques/optional-params`, `internal-rules`), also
+  `format!(concat!("{}", "-{}"), 1, 2)` outside a macro: "format argument must be a string
+  literal".
+- [ ] A comment inside `#[derive(..)]`: `#[derive(Debug, Clone /* ... */)]`
+  (`idiomatic/foundations/api-design/predictable-api/common-traits`): "`#[derive(Clone/*...*/)]`
+  is not supported".
+- [ ] A string continuation (`\` at the end of a line) before a CR LF line ending (Programming
+  Rust `spawn-blocking/tests.rs` and `actix-gcd`, as git checks them out on Windows): "unknown
+  character escape" / "Invalid escape"; before a LF it works. rustc skips the `\r\n` and the next
+  line's leading whitespace alike.
+- [ ] **runtime** An out-of-bounds index into an array (`[T; N]`; a `Vec` matches) panics one
+  column to the right of rustc's, at the `[` rather than the start of the indexed expression
+  (`tuples-and-arrays/arrays`: `a[get_index()] = 0`, rustc 10:5, JS 10:6).
+
+**Open, std:**
+
+- [ ] `dbg!` (45 of the course's slides: `dbg!(x * 2)`, `dbg!(a, b)`, `dbg!()`): "macro `dbg!`
+  (`macro_rules!`) is not supported yet". Prints `[file:line:col] expr = {:#?}` to stderr and
+  hands the value back. By far the most-hit item.
+- [ ] **runtime** `i16::from(true)` / `u8::from(false)` compile and give `true` / `false`
+  (`std-traits/from-and-into`, which prints `true` where rustc prints `1`), while `let one: i16 =
+  true.into()` is "the trait bound `i16: From<bool>` is not satisfied" (the slide's second block).
+  Should be 1 / 0 for every integer type.
+- [ ] `Vec::from_iter`, `String::from_iter`, `HashSet::from_iter`, `BTreeSet::from_iter`,
+  `HashMap::from_iter` called as functions
+  (`idiomatic/foundations/api-design/predictable-api/common-traits/clone`): "no function or
+  associated item named `from_iter`" (`collect()` works).
+- [ ] `PathBuf::from` as a function value, `args.map(PathBuf::from)` (Programming Rust `grep`):
+  "no function or associated item named `from` found for struct `PathBuf`"; called directly it
+  works, so this is the path pre-pass's (`ufcs.rs`) list.
+- [ ] Small std surface: `String::capacity` (`std-types/string`; `Vec`'s exists),
+  `Duration::try_from_secs_f32` (`pattern-matching/let-control-flow/if-let`),
+  `String::from_utf8_unchecked` (Programming Rust `ascii`; the same decode as `from_utf8`),
+  `mem::forget` (`idiomatic/leveraging-the-type-system/raii/drop_bomb_forget`: skip the value's
+  `Drop`), `panic::catch_unwind` (`error-handling/panics`: a `try` around the closure giving
+  `Err(Box<dyn Any>)`; the classifier sorts it as unsafe/memory today).
+- Missing too, but of little use in a script: `io::stdin().lock()` as a `BufRead` ("the trait
+  bound `IoStdin: IoBufRead` is not satisfied"; Programming Rust `grep`), `env::args_os`,
+  `PathBuf::read_dir` / `read_link` / `metadata` and `OsStr::from_bytes` (Programming Rust
+  `copy`, the unsafe exercise), `i32::unchecked_add`.
+
+**Expected:** threads, channels, `Arc` / `Mutex` and `thread::sleep` (13 files); raw pointers,
+`MaybeUninit`, `PhantomPinned` and `Pin` projections, `transmute`, `slice::from_raw_parts`,
+`get_unchecked`, `align_of` (the unsafe deep dive, 20 files); `extern` blocks and C types (11);
+`union`; the proc-macro exercise; the async chat exercise and the Programming Rust network and
+`libgit2` crates (`async_std`, `reqwest`, `tokio_websockets`, `actix_web`, `libc` aren't
+bundled); `fern_sim`'s multi-file module tree (compiled file by file); `{:p}`.
 
 ## Bitburner player gaps (2026-11-18)
 

@@ -189,12 +189,25 @@ impl Checker<'_> {
                 self.note_crate(c.syntax(), "rand.thread", vec![]);
                 Ty::Rng
             }
-            [r, "seed_from_u64"] if rngs.contains(r) => {
+            // (Each generator seeds and runs as rand's does.)
+            [r, f @ ("seed_from_u64" | "from_seed")] if rngs.contains(r) => {
                 count(self, 1);
                 if let Some(a) = args.first() {
-                    self.check(a, &Ty::Int(IntKind::U64));
+                    let t = if *f == "from_seed" {
+                        Ty::Vec(Box::new(Ty::Int(IntKind::U8)))
+                    } else {
+                        Ty::Int(IntKind::U64)
+                    };
+                    self.check(a, &t);
                 }
-                self.note_crate(c.syntax(), "rand.seeded", vec![]);
+                let kind = match *r {
+                    "SmallRng" => "Small",
+                    "ChaCha8Rng" => "ChaCha8",
+                    "ChaCha20Rng" => "ChaCha20",
+                    _ => "",
+                };
+                let js = if *f == "from_seed" { "rand.fromSeed" } else { "rand.seeded" };
+                self.note_crate(c.syntax(), &format!("{js}{kind}"), vec![]);
                 Ty::Rng
             }
             [r, "from_entropy" | "from_os_rng"] if rngs.contains(r) => {
@@ -438,7 +451,13 @@ impl Checker<'_> {
                     "choose" => {
                         count(self, 1);
                         rng_arg(self, 0);
-                        self.note_crate(m.syntax(), "rand.iterChoose", vec![]);
+                        // (rand picks by the iterator's `size_hint`.)
+                        let js = match iter_size_hint(recv) {
+                            SizeHint::Exact => "rand.iterChooseExact",
+                            SizeHint::Chars => "rand.iterChooseChars",
+                            SizeHint::Unknown => "rand.iterChoose",
+                        };
+                        self.note_crate(m.syntax(), js, vec![]);
                         Ty::Option(Box::new(e))
                     }
                     "choose_multiple" | "sample" => {
@@ -453,6 +472,55 @@ impl Checker<'_> {
             }
             _ => None,
         }
+    }
+}
+
+/// What an iterator's `size_hint` says, for rand's `iter.choose(..)`, which samples by it.
+enum SizeHint {
+    /// The exact length (a collection's or a range's iterator, through `map`, `enumerate`, ..).
+    Exact,
+    /// `s.chars()`: at least a quarter of the bytes left, at most all of them.
+    Chars,
+    /// A lower bound of 0 (`filter`, ..) or anything not known here: reservoir sampling.
+    Unknown,
+}
+
+/// The `size_hint` kind of the iterator `e` builds, by its syntax.
+fn iter_size_hint(e: &ast::Expr) -> SizeHint {
+    match super::strip_parens(e) {
+        ast::Expr::RangeExpr(r) if r.start().is_some() && r.end().is_some() => SizeHint::Exact,
+        ast::Expr::MethodCallExpr(m) => {
+            let Some(recv) = m.receiver() else {
+                return SizeHint::Unknown;
+            };
+            match m.name_ref().map(|n| n.text().to_string()).as_deref() {
+                Some("chars") => SizeHint::Chars,
+                Some("iter" | "iter_mut" | "into_iter" | "keys" | "values" | "values_mut" | "drain") => {
+                    match super::strip_parens(&recv) {
+                        // (A range's `into_iter()`.)
+                        ast::Expr::RangeExpr(_) | ast::Expr::MethodCallExpr(_) => {
+                            match iter_size_hint(&recv) {
+                                SizeHint::Unknown if !matches!(recv, ast::Expr::RangeExpr(_)) => {
+                                    SizeHint::Exact
+                                }
+                                h => h,
+                            }
+                        }
+                        _ => SizeHint::Exact,
+                    }
+                }
+                Some("map" | "enumerate" | "rev" | "cloned" | "copied" | "inspect") => {
+                    iter_size_hint(&recv)
+                }
+                // (These change a `chars()` bound in ways not followed here.)
+                Some("skip" | "take" | "step_by") => match iter_size_hint(&recv) {
+                    SizeHint::Exact => SizeHint::Exact,
+                    _ => SizeHint::Unknown,
+                },
+                _ => SizeHint::Unknown,
+            }
+        }
+        _ => SizeHint::Unknown,
     }
 }
 
