@@ -1189,20 +1189,6 @@ const rejectedFiles = [
     "1:1 unresolved import `reqwest`",
   ],
   [
-    "two imported types of one name, renamed",
-    {
-      "main.rs": "mod a;\nmod b;\nuse a::Error as AError;\nuse b::Error as BError;\nfn main() {}",
-      "a.rs": "pub struct Error;",
-      "b.rs": "pub struct Error(pub i32);",
-    },
-    "3:5 renaming the imported type `Error` isn't supported when another `Error` is in scope",
-  ],
-  [
-    "a renamed imported type next to the file's own of that name",
-    { "main.rs": "mod a;\nuse a::Error as AError;\nstruct Error;\nfn main() {}", "a.rs": "pub struct Error;" },
-    "2:5 renaming the imported type `Error` isn't supported when another `Error` is in scope",
-  ],
-  [
     "`TypeId::of` a type parameter (erased at run time)",
     { "main.rs": "use std::any::{Any, TypeId};\nfn id<T: 'static>() -> TypeId {\n    TypeId::of::<T>()\n}\nfn main() {}\n" },
     "3:5 the type here is a type parameter",

@@ -2611,6 +2611,10 @@ pub fn preprocess_with(
         crate::variants::expand(&mut text, &mut map);
         changed = true;
     }
+    // `mod bytes;` then `pub struct Shlex(bytes::Shlex)`: the module's `Shlex` is `bytes__Shlex`.
+    if crate::modclash::has_mod_files(&text) {
+        changed |= crate::modclash::expand(&mut text, &mut map, procs);
+    }
     if crate::alias::has_import_renames(&text) {
         changed |= crate::alias::expand_import_renames(&mut text, &mut map, procs);
     }

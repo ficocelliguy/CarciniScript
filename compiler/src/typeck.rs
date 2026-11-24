@@ -7187,6 +7187,10 @@ impl<'a> Checker<'a> {
         if let Some(t) = self.conv_as_ref_call(m, &method) {
             return t;
         }
+        // `self.key.as_ref()` with the impl's `T: AsRef<[u8]>`.
+        if let Some(t) = self.conv_param_as_ref_call(m, &method, &rt) {
+            return t;
+        }
         // `5.seconds()` with your trait implemented for `i64` only: the literal is an `i64`, as in
         // rustc (several impls: the fallback `i32` / `f64` when it's one of them).
         if let Some(kind @ (VarKind::Int | VarKind::Float)) = self.var_kind(&rt) {
@@ -10352,6 +10356,12 @@ impl Checker<'_> {
         let mut bounds = self.bound_traits(param);
         // (In a blanket impl's associated function, `T` implements its trait too.)
         bounds.extend(self.cur_blanket_trait(param));
+        // (And the traits blanket impls give it through its bounds.)
+        for tr in self.param_blanket_traits(param) {
+            if !bounds.contains(&tr) {
+                bounds.push(tr);
+            }
+        }
         // `T::from(x)` with `T: From<X>`.
         if f == "from" && self.param_has(param, "From") {
             self.arg_count(c.syntax(), "function", 1, args.len());

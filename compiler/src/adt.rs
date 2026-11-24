@@ -192,6 +192,10 @@ pub struct TraitDef {
     pub const_params: Vec<String>,
     /// Each associated type's bounds (`type Unit: Debug + Copy;`).
     pub assoc_bounds: HashMap<String, Vec<String>>,
+    /// The item type of each associated type bounded by `Iterator<Item = X>` (`type Iter:
+    /// Iterator<Item = u32>;`, with `Self::Unit` in it as `Tr::Unit`): a projection of it is
+    /// the runtime's iterator.
+    pub assoc_iters: HashMap<String, Ty>,
 }
 
 /// A struct's const generic parameter (`struct Buf<const N: usize>`). Instances keep its value
@@ -286,6 +290,9 @@ pub struct Adts {
     /// `impl Future for T { type Output = X; .. }`: `X`, by `T`. Such a value is awaited (and
     /// passed as an `F: Future`) by polling it (`κσ.$drive`).
     pub future_outputs: HashMap<String, Ty>,
+    /// A `mod` file's types known here by a mangled name (`bytes__Shlex`, see `modclash`): the
+    /// class's name in its module (`Shlex`).
+    pub js_names: HashMap<String, String>,
 }
 
 /// Methods every struct or enum has (derived or from the runtime), which a custom iterator's

@@ -1157,10 +1157,16 @@ impl Checker<'_> {
     ) -> Ty {
         // A method of a user trait in `T`'s bounds.
         // (`p.parse(s)` on a `T::P` whose trait declares `type P: Parser;`: those bounds.)
-        let bounds = match self.param_bounds.get(name) {
+        let mut bounds = match self.param_bounds.get(name) {
             Some(b) => b.clone(),
             None => self.bound_traits(name),
         };
+        // (And a trait a blanket impl gives `T` through those bounds.)
+        for tr in self.param_blanket_traits(name) {
+            if !bounds.contains(&tr) {
+                bounds.push(tr);
+            }
+        }
         if let Some((b, sig)) = bounds
             .iter()
             .find_map(|b| self.trait_method(b, method).map(|s| (b.clone(), s)))

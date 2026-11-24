@@ -369,6 +369,9 @@ fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String
     if crate::modflat::has_inline_modules(&renamed) {
         crate::modflat::flatten(&mut renamed, &mut map);
     }
+    if crate::modclash::has_mod_files(&renamed) {
+        crate::modclash::expand(&mut renamed, &mut map, Some((path, resolver)));
+    }
     if crate::alias::has_import_renames(&renamed) {
         crate::alias::expand_import_renames(&mut renamed, &mut map, Some((path, resolver)));
     }
@@ -674,6 +677,9 @@ impl Checker<'_> {
         resolver: Resolver,
         stack: &mut Vec<String>,
     ) {
+        // Type names taken by this file and earlier modules: a module's type named like one goes
+        // by its mangled name (see `modclash`).
+        let mut taken = crate::modclash::local_type_names(file);
         for item in crate::adt::all_items(file) {
             let ast::Item::Module(m) = &item else {
                 continue;
@@ -723,7 +729,18 @@ impl Checker<'_> {
                 continue;
             }
             stack.push(path.clone());
-            let exports = exports_of(&text, &path, resolver, stack);
+            let mut exports = exports_of(&text, &path, resolver, stack);
+            let clash =
+                crate::modclash::clashing(&crate::modclash::pub_adt_names(&text), &mut taken);
+            if !clash.is_empty() {
+                let renamed = crate::modclash::rename_in_module(&text, &n, &clash);
+                exports = exports_of(&renamed, &path, resolver, stack);
+                for c in &clash {
+                    self.adts
+                        .js_names
+                        .insert(crate::modclash::mangle(&n, c), c.clone());
+                }
+            }
             stack.pop();
             if let Some(msg) = &exports.circular {
                 self.error(m.syntax(), format!("{msg} (through `{path}`)"));

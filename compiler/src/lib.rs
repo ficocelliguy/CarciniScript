@@ -26,6 +26,7 @@ mod lineindex;
 mod macros;
 mod mbe;
 mod memo;
+mod modclash;
 mod modflat;
 mod moves;
 mod nav;

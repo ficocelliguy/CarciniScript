@@ -120,7 +120,10 @@ impl Codegen<'_> {
     /// The JS class for a struct or enum (`module.Name` when imported).
     pub(super) fn class(&self, adt: &str) -> String {
         match self.types.adts.defs.get(adt).and_then(|d| d.module.clone()) {
-            Some(m) => format!("{}.{}", super::module_js(&m), escape_ident(adt)),
+            Some(m) => {
+                let js = self.types.adts.js_names.get(adt).map_or(adt, String::as_str);
+                format!("{}.{}", super::module_js(&m), escape_ident(js))
+            }
             None => escape_ident(adt),
         }
     }

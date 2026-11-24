@@ -76,11 +76,13 @@ The gaps fall into three parts:
   works only inside inline `mod x { .. }` blocks, not at the top of a module file, and `crate::`
   names this file. A module file's generic `pub type` aliases (`pub type Grid<T> = ..`) aren't
   usable from the file that loads it (plain ones are).
-- **Types share one namespace across files.** A renamed import of another file's or a crate's
-  type, trait or constant (`use geo::Point as P;`, `pub use area::Error as AreaError;`) is
-  written back under its own name, so two different `Error`s renamed apart in one file (`use
-  a::Error as AError; use b::Error as BError;`), or a renamed `Error` next to the file's own
-  `Error`, is an error. So is such a rename inside a block. A renamed re-export reaches other
+- **Types share one namespace across files.** A `mod` file's struct or enum named like one of
+  the loading file's, or like one an earlier `mod` file exports, goes by a mangled name there
+  (`bytes::Shlex` is `Shlex__bytes`), which hover and error messages show. Traits, type aliases
+  and constants aren't renamed that way: a `mod` file's trait named like this file's is still
+  "defined multiple times". A renamed import of another file's or a crate's type, trait or
+  constant (`use geo::Point as P;`, `pub use area::Error as AreaError;`) is written back under
+  its own name, so such a rename inside a block is an error. A renamed re-export reaches other
   files through a named `use` (`use geo::AreaError;`), not through `use geo::*`.
 - **Macros from other files come through `mod`**: a file sees the `#[macro_export]` macros of the
   files it loads with `mod x;` (and all of them with `#[macro_use]`), not those of files further

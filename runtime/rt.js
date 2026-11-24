@@ -4321,6 +4321,10 @@
       if (v < BigInt(min)) return err("NegOverflow");
       return new Res(0, big ? v : Number(v));
     },
+    // `t.as_ref()` with an impl's `T: AsRef<[u8]>`: a string's UTF-8 bytes, else the bytes as they are.
+    $asRefBytes(v) {
+      return typeof v === "string" ? rt.$utf8(v) : v;
+    },
     // `s.as_bytes()`: UTF-8.
     $utf8(s) {
       const info = strInfo(s);

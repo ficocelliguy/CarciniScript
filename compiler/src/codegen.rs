@@ -6382,10 +6382,20 @@ impl<'a> Codegen<'a> {
             starts.push(ir.start());
             root = b;
         }
-        if !is_pure(&strip_refs(&root)) {
-            self.unsupported(m.syntax(), "this in-place method on a range (assign the Vec to a variable first)");
-        }
         let mut temps = Vec::new();
+        // A Vec that isn't a place (`self.write_buf()[..n].copy_from_slice(..)`): evaluated once,
+        // first; it is the same array either way, so the write-back goes through it.
+        let stripped = strip_refs(&root);
+        if !is_pure(&stripped) {
+            let (f, _) = self.emit_expr(&stripped, None);
+            let t = self.temp();
+            let mut decl = Frag::mapped(self.off(stripped.syntax()), format!("const {t} = "));
+            decl.append(f).push(";");
+            self.line(decl);
+            let r = self.range_of(stripped.syntax());
+            self.expr_temps.insert(r, t);
+            temps.push(r);
+        }
         for e in starts.iter().flatten().filter(|e| !is_pure(e)) {
             let (f, _) = self.emit_expr(e, None);
             let t = self.temp();
@@ -6700,9 +6710,12 @@ impl<'a> Codegen<'a> {
         }
         // `b.as_ref()` with `b: B` where `B: AsRef<[u8]>`: the parameter is a `Vec` already.
         if matches!(method.as_str(), "as_ref" | "as_mut" | "borrow" | "borrow_mut")
-            && let Some(crate::adt::Conv::Identity) = self.conv_of(m.syntax())
+            && let Some(conv @ (crate::adt::Conv::Identity | crate::adt::Conv::Wrap { .. })) =
+                self.conv_of(m.syntax())
         {
+            // (Or a value of an impl's `T: AsRef<[u8]>`, which may be a string: `κσ.$asRefBytes`.)
             let (f, _) = self.emit_expr(&recv, None);
+            let f = self.convert(conv, f);
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
             return (f.at(self.off(m.syntax())), ty);
         }

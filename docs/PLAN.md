@@ -18,11 +18,7 @@ outranks a missing feature, and a missing feature outranks a corpus count. Detai
 sections below.
 
 1. **In-game `#[test]` runner** (Bitburner player gaps). The most-asked-for item still open.
-2. **A struct or enum named like one in a `mod` file it loads** (`pub struct Shlex(bytes::Shlex)`;
-   names and items). Types from every file of a program share one namespace, so this is "defined
-   multiple times" (shlex, serde_json's `IoRead`, time's `Instant`, ureq). Two files each with
-   their own `Config` is a plausible multi-file script.
-3. **Re-run the corpus, refresh the uncategorized sort, then triage the "mismatched types"
+2. **Re-run the corpus, refresh the uncategorized sort, then triage the "mismatched types"
    buckets** (about 90 files). The 2026-11-23 fixes un-hid serde's `impls.rs` and moved the
    re-export and macro files, and the 2026-11-22 sort is stale; "mismatched types" is the largest
    bucket with no confirmed probe yet.
@@ -218,8 +214,11 @@ its files into "uncategorized" (the 2026-11-22 run found `the standard library f
 uncategorized count jumps, check the report's top messages before reading anything else into
 the numbers.
 
-**Latest run** (2026-11-23, working tree after `26e4143`, same registry as before): language
-features all supported in **83.0%** of files (4,335 of 5,220; 82.8% earlier that day, before
+**Latest run** (2026-11-23, working tree after `0cab7c7` plus the `mod`-file type clash, blanket
+bound, `AsRef<[u8]>` and associated-iterator fixes, same registry as before): language features
+all supported in **83.3%** of files (4,350 of 5,220; 71.1% counting std gaps, 67.0% by lines;
+77 crates pass in every file, 159 in 80% or more). The run before that (after `26e4143`): 83.0%
+(4,335; 82.8% earlier that day, before
 that round's eight fixes; 82.9% on 2026-11-22, 81.8% on 2026-11-17, 67% at the first run on
 2026-11-16); counting std gaps, 70.6%; by lines, 66.6%. 827 files have a language gap (639 of
 them unsafe/memory, 126 `union`, 58 proc-macro API, 67 `extern`: not planned), 650 are std-only,
@@ -260,26 +259,8 @@ The gaps below are each confirmed with a program rustc accepts (edition 2021, `-
 that this compiler rejects or miscompiles; counts are files of the corpus where it shows.
 
 - Bounds and generics:
-  - [ ] Methods of an associated type of a bound with an associated-type binding: `I: Tr<Error =
-    X>` then methods of `I::Iter` (the rest of the 13 files with bounds on associated types are
-    fixed).
-  - [ ] `T::f()` of a blanket impl over `T`'s bound (`impl<T: Bounded> Lower for T`, then
-    `T::lowest()` in `fn g<T: Bounded>`).
-  - [ ] `T: AsRef<[u8]>` (and other non-string targets) on an impl's type parameter; `AsRef<str>`
-    / `Into<String>` work, since a string target can make `T` a string.
   - [ ] A turbofish through a type parameter (`O::select::<u8>(x)`) checks the method's own
     bounds, except those with type arguments (`Into<X>`, `Fn(..)`).
-- Names and items:
-  - [ ] A struct or enum named like one in a `mod` file the file loads (`mod bytes;` then `pub
-    struct Shlex(bytes::Shlex)`): "the name `Shlex` is defined multiple times", since the types
-    of a program's files share one namespace (merged by bare name in `typeck_mod::merge_module`).
-    Needs a per-module key for the loaded file's types (and their methods, impls and signatures)
-    when a name collides. Shows in shlex, serde_json (`IoRead`), time (`Instant`), ureq
-    (`Duration`). Re-exported functions of inline modules, and a module's or the program's own
-    types named like std's (`IoRead`, `Instant`, `ParseIntError`), work since 2026-11-23.
-- References into containers:
-  - [ ] `copy_from_slice` / `clone_from_slice` on a range of a `Vec` that isn't a place
-    (`self.buf.write_buf()[..n].copy_from_slice(..)`).
 - Patterns and ranges:
   - [ ] `(..).start_bound()` where only the expected type says what `T` is (the `RangeFull`
     impl's `T` isn't in its self type).

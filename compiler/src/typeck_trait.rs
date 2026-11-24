@@ -107,6 +107,7 @@ impl Checker<'_> {
                     type_params,
                     const_params,
                     assoc_bounds,
+                    assoc_iters: HashMap::new(),
                 },
             );
         }
@@ -150,6 +151,27 @@ impl Checker<'_> {
             let mut consts = Vec::new();
             let mut const_tys = HashMap::new();
             let mut const_defaults = Vec::new();
+            // `type Iter: Iterator<Item = u32>;`
+            let mut assoc_iters = HashMap::new();
+            for ta in t
+                .assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+                .filter_map(|i| match i {
+                    ast::AssocItem::TypeAlias(ta) => Some(ta),
+                    _ => None,
+                })
+            {
+                if let (Some(an), Some(Some(item))) = (
+                    ta.name(),
+                    ta.type_bound_list()
+                        .as_ref()
+                        .and_then(super::bounds_iterator_item),
+                ) {
+                    let elem = self.lower_type(&item);
+                    assoc_iters.insert(an.text().to_string(), elem);
+                }
+            }
             for it in t
                 .assoc_item_list()
                 .into_iter()
@@ -204,6 +226,7 @@ impl Checker<'_> {
                 def.consts = consts;
                 def.const_tys = const_tys;
                 def.const_defaults = const_defaults;
+                def.assoc_iters = assoc_iters;
             }
         }
     }
@@ -881,6 +904,22 @@ impl Checker<'_> {
         Some(sig.ret)
     }
 
+    /// The traits blanket impls give a type parameter through its bounds
+    /// (`impl<T: Bounded> Lower for T` makes `Lower` a trait of a `T: Bounded`).
+    pub(super) fn param_blanket_traits(&self, param: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .adts
+            .blankets
+            .iter()
+            .filter(|(tr, bounds)| {
+                !bounds.contains(tr) && bounds.iter().all(|b| self.param_has(param, b))
+            })
+            .map(|(tr, _)| tr.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// The blanket impl whose associated function is being checked, when `param` is its `T`
     /// (`Self::make()` / `T::make()` in `impl<T: Default> Make for T`): the trait.
     pub(super) fn cur_blanket_trait(&self, param: &str) -> Option<String> {
@@ -1014,6 +1053,7 @@ impl Checker<'_> {
             for a in &def.assoc_types {
                 let t = given
                     .and_then(|(_, named)| named.get(a).cloned())
+                    .or_else(|| self.assoc_iter_proj(p, &tr, a))
                     .unwrap_or_else(|| Ty::Param(format!("{p}::{a}")));
                 sub.insert(format!("{tr}::{a}"), t);
             }
@@ -1059,7 +1099,27 @@ impl Checker<'_> {
             .get(p)
             .and_then(|m| m.get(&tr))
             .and_then(|(_, named)| named.get(assoc).cloned());
-        Some(given.unwrap_or_else(|| Ty::Param(format!("{p}::{assoc}"))))
+        Some(
+            given
+                .or_else(|| self.assoc_iter_proj(p, &tr, assoc))
+                .unwrap_or_else(|| Ty::Param(format!("{p}::{assoc}"))),
+        )
+    }
+
+    /// `p::Iter` where `p`'s trait `tr` declares `type Iter: Iterator<Item = X>`: the runtime's
+    /// iterator of `X` (its other associated types as `p`'s projections).
+    fn assoc_iter_proj(&self, p: &str, tr: &str, a: &str) -> Option<Ty> {
+        let def = self.adts.traits.get(tr)?;
+        let elem = def.assoc_iters.get(a)?;
+        let sub: HashMap<String, Ty> = def
+            .assoc_types
+            .iter()
+            .map(|o| (format!("{tr}::{o}"), Ty::Param(format!("{p}::{o}"))))
+            .collect();
+        Some(Ty::Iter {
+            elem: Box::new(super::generic::subst(elem, &sub)),
+            mutable: false,
+        })
     }
 
     /// `X::Y` as its bound's binding says (`X: Tr<Y = Z>` makes it `Z`), else itself.

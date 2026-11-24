@@ -606,6 +606,51 @@ impl Checker<'_> {
         Some(t)
     }
 
+    /// `self.key.as_ref()` (also `as_mut`, `borrow`, `borrow_mut`) where `key: T` and the
+    /// impl's `T: AsRef<X>` (or a `where` clause says so). A function's own parameters are `X`
+    /// already (converted where they're passed), but a value of the impl's type is whatever it
+    /// was built from: a string for an `AsRef<[u8]>` converts to its bytes here, at run time.
+    pub(super) fn conv_param_as_ref_call(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        method: &str,
+        recv: &Ty,
+    ) -> Option<Ty> {
+        use ra_ap_syntax::ast::HasGenericParams;
+        let tr = match method {
+            "as_ref" => "AsRef",
+            "as_mut" => "AsMut",
+            "borrow" => "Borrow",
+            "borrow_mut" => "BorrowMut",
+            _ => return None,
+        };
+        if m.arg_list().is_some_and(|l| l.args().next().is_some()) {
+            return None;
+        }
+        let Ty::Param(p) = self.shallow(recv) else {
+            return None;
+        };
+        let f = m.syntax().ancestors().find_map(ast::Fn::cast);
+        let x = f
+            .as_ref()
+            .and_then(|f| param_into_target(&p, tr, f.generic_param_list(), f.where_clause()))
+            .or_else(|| {
+                let imp = m.syntax().ancestors().find_map(ast::Impl::cast)?;
+                param_into_target(&p, tr, imp.generic_param_list(), imp.where_clause())
+            })?;
+        let t = self.lower_type(&x);
+        let bytes = matches!(&t, Ty::Vec(e) if **e == Ty::Int(IntKind::U8));
+        self.record_conv(
+            m.syntax(),
+            if bytes {
+                Conv::Wrap { js: "κσ.$asRefBytes".into() }
+            } else {
+                Conv::Identity
+            },
+        );
+        Some(t)
+    }
+
     /// `x.into()`: the target type usually comes from the context, so it is settled at the end
     /// of the function.
     pub(super) fn conv_into_call(&mut self, m: &ast::MethodCallExpr, recv: Ty) -> Ty {
