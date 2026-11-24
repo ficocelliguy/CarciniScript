@@ -36,3 +36,72 @@ impl<T: Clone> Bound<&T> {
         }
     }
 }
+
+/// `std::ops::RangeBounds<T>`: where a range starts and ends, as `Bound`s.
+pub trait RangeBounds<T> {
+    fn start_bound(&self) -> Bound<&T>;
+    fn end_bound(&self) -> Bound<&T>;
+}
+
+impl<T> RangeBounds<T> for std::ops::Range<T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Included(&self.start)
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Excluded(&self.end)
+    }
+}
+
+impl<T> RangeBounds<T> for std::ops::RangeInclusive<T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Included(self.start())
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Included(self.end())
+    }
+}
+
+impl<T> RangeBounds<T> for std::ops::RangeFrom<T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Included(&self.start)
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+}
+
+impl<T> RangeBounds<T> for std::ops::RangeTo<T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Excluded(&self.end)
+    }
+}
+
+impl<T> RangeBounds<T> for std::ops::RangeToInclusive<T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Included(&self.end)
+    }
+}
+
+impl<T> RangeBounds<T> for std::ops::RangeFull {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+}
+
+impl<T> RangeBounds<T> for (Bound<T>, Bound<T>) {
+    fn start_bound(&self) -> Bound<&T> {
+        self.0.as_ref()
+    }
+    fn end_bound(&self) -> Bound<&T> {
+        self.1.as_ref()
+    }
+}

@@ -192,6 +192,7 @@ impl Checker<'_> {
                     name: fname.text().to_string(),
                     sig,
                     has_default: f.body().is_some(),
+                    own_bounds: super::generic::plain_bounds(&f),
                 });
             }
             self.self_ty = saved;
@@ -377,14 +378,40 @@ impl Checker<'_> {
             .into_iter()
             .flat_map(|l| l.generic_params())
         {
-            let n = match p {
+            let n = match &p {
                 ast::GenericParam::TypeParam(tp) => tp.name(),
                 ast::GenericParam::ConstParam(cp) => cp.name(),
                 ast::GenericParam::LifetimeParam(_) => None,
             };
             if let Some(n) = n {
                 let n = n.text().to_string();
-                self.generics.insert(n.clone(), Ty::Param(n));
+                self.generics.insert(n.clone(), Ty::Param(n.clone()));
+                // (And their bounds' names, for `type P = T::P;` with `T: Fac`.)
+                let wheres = imp
+                    .where_clause()
+                    .into_iter()
+                    .flat_map(|w| w.predicates())
+                    .filter(|pred| {
+                        matches!(pred.ty(), Some(ast::Type::PathType(pt))
+                            if pt.path().and_then(|p| p.as_single_name_ref()).is_some_and(|x| x.text() == n.as_str()))
+                    })
+                    .filter_map(|pred| pred.type_bound_list());
+                let inline = match &p {
+                    ast::GenericParam::TypeParam(tp) => tp.type_bound_list(),
+                    _ => None,
+                };
+                let bounds: Vec<String> = inline
+                    .into_iter()
+                    .chain(wheres)
+                    .flat_map(|l| l.bounds())
+                    .filter_map(|b| match b.ty()? {
+                        ast::Type::PathType(pt) => {
+                            Some(pt.path()?.segment()?.name_ref()?.text().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                self.param_bounds.insert(n, bounds);
             }
         }
         // The impl's associated types (`type Unit = f64;`) and trait arguments

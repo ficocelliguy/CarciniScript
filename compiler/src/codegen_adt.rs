@@ -120,7 +120,7 @@ impl Codegen<'_> {
     /// The JS class for a struct or enum (`module.Name` when imported).
     pub(super) fn class(&self, adt: &str) -> String {
         match self.types.adts.defs.get(adt).and_then(|d| d.module.clone()) {
-            Some(m) => format!("{m}.{}", escape_ident(adt)),
+            Some(m) => format!("{}.{}", super::module_js(&m), escape_ident(adt)),
             None => escape_ident(adt),
         }
     }
@@ -990,7 +990,7 @@ impl Codegen<'_> {
             {
                 continue;
             }
-            let prefix = format!("{m}.{}", escape_ident(tr));
+            let prefix = format!("{}.{}", super::module_js(&m), escape_ident(tr));
             // (A trait with const parameters: its defaults are a factory over this impl's
             // arguments, see `emit_trait_defaults`.)
             let (defaults, statics) = match self.trait_const_args.get(&(key.to_string(), tr.clone())) {
@@ -1207,7 +1207,7 @@ impl Codegen<'_> {
                     .get(&tr)
                     .and_then(|d| d.module.clone())
                 {
-                    Some(m) => format!("{m}.{}", escape_ident(&tr)),
+                    Some(m) => format!("{}.{}", super::module_js(&m), escape_ident(&tr)),
                     None => escape_ident(&tr),
                 };
                 let cls = self.class(&adt);

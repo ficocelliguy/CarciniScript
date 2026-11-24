@@ -457,13 +457,25 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         }
         // `Vec::from_iter(it)`, `HashMap::<K, V>::from_iter(it)`, `FromIterator::from_iter(it)`:
         // `(it).into_iter().collect::<Vec<_>>()`.
-        // As a value (`.map(Vec::from_iter)`): a closure doing that.
+        // As a value (`.map(Vec::from_iter)`, `let f = Vec::from_iter;`): a closure doing that.
         if let Some((first, name, ty)) = from_iter_path(&toks, i)
             && !skip(&toks[i])
-            && matches!(at(name + 1).as_str(), "," | ")")
+            && matches!(at(name + 1).as_str(), "," | ")" | ";")
         {
-            let fish = ty.map(|t| format!("::<{t}>")).unwrap_or_default();
-            let closure = format!("(|__ufcs0| (__ufcs0).into_iter().collect{fish}())");
+            // (`let g = Vec::<i32>::from_iter;`: a generic fn, since a closure's parameter would
+            // have no type there.)
+            let closure = match ty.as_deref().and_then(from_iter_item) {
+                Some(item) if at(name + 1) == ";" => {
+                    let t = ty.unwrap_or_default();
+                    format!(
+                        "{{ fn __from_iter{i}<I: IntoIterator<Item = {item}>>(it: I) -> {t} {{ it.into_iter().collect() }} __from_iter{i} }}"
+                    )
+                }
+                _ => {
+                    let fish = ty.map(|t| format!("::<{t}>")).unwrap_or_default();
+                    format!("(|__ufcs0| (__ufcs0).into_iter().collect{fish}())")
+                }
+            };
             edits.push((start(first), end(name), closure));
             i = name + 1;
             continue;
@@ -1016,6 +1028,36 @@ fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Optio
         k += sep(k)?;
     }
     (at(k) == "from_iter").then_some((first, k, ty))
+}
+
+/// The item type a std collection `ty` (`Vec<i32>`, `HashMap<u8, String>`) is collected from,
+/// when every type argument is written.
+fn from_iter_item(ty: &str) -> Option<String> {
+    let (name, rest) = ty.split_once('<').unwrap_or((ty, ">"));
+    let inner = rest.trim().strip_suffix('>')?;
+    if ty.contains('_') {
+        return None;
+    }
+    let mut args = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (k, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(inner[start..k].trim());
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim());
+    Some(match (name.trim(), args.as_slice()) {
+        ("String", _) => "char".to_string(),
+        ("HashMap" | "BTreeMap", [k, v, ..]) => format!("({k}, {v})"),
+        (_, [e, ..]) if !e.is_empty() => e.to_string(),
+        _ => return None,
+    })
 }
 
 /// `Type::from` named as a value at `toks[i]` (an argument: `.map(PathBuf::from)`,

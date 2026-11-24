@@ -67,7 +67,9 @@ if (native.status !== 0) console.log(`[native stderr] ${native.stderr.trim()}`);
 // The panic message (`attempt to add with overflow`) must match as well.
 const nativePanic = /panicked at [^\r\n]*\r?\n([^\r\n]*)/.exec(native.stderr)?.[1];
 const jsPanicLines = (lines.find((l) => l.startsWith("[panic]")) ?? "").split("\n");
-const jsPanic = jsPanicLines[1] ?? jsPanicLines[0];
+// (`[panic] file.rs:2:29: message`, or the location alone on the first line.)
+const jsOneLine = /^\[panic\] \S*?:(\d+:\d+): (.*)$/.exec(jsPanicLines[0]);
+const jsPanic = jsOneLine?.[2] ?? jsPanicLines[1] ?? jsPanicLines[0];
 if (nativePanic && jsPanic !== nativePanic) {
   console.log(`panic: rustc=${JSON.stringify(nativePanic)} js=${JSON.stringify(jsPanic)}`);
   same = false;
@@ -76,7 +78,7 @@ if (nativePanic && jsPanic !== nativePanic) {
 const nativeFile = /panicked at ([^\r\n]*?):\d+:\d+:\r?\n/.exec(native.stderr)?.[1] ?? "";
 const inStd = !nativeFile.endsWith(path.basename(file));
 const nativeAt = inStd ? undefined : /panicked at [^\r\n]*?(\d+:\d+):\r?\n/.exec(native.stderr)?.[1];
-const jsAt = /(\d+:\d+):?$/.exec(jsPanicLines[0] ?? "")?.[1];
+const jsAt = jsOneLine?.[1] ?? /(\d+:\d+):?$/.exec(jsPanicLines[0] ?? "")?.[1];
 if (nativeAt && jsAt !== nativeAt) {
   console.log(`panic location: rustc=${nativeAt} js=${jsAt}`);
   same = false;

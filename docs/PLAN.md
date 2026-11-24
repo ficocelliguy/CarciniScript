@@ -11,6 +11,22 @@ Finished work is recorded in [FEATURES.md](FEATURES.md) (what compiles) and
 [RUST_GAPS.md](RUST_GAPS.md) (where behavior differs from rustc); this document keeps the design
 decisions and the open work.
 
+## Next up
+
+Ranked by what a player hits times how badly; a wrong result or a crash in code rustc accepts
+outranks a missing feature, and a missing feature outranks a corpus count. Details are in the
+sections below.
+
+1. **In-game `#[test]` runner** (Bitburner player gaps). The most-asked-for item still open.
+2. **A struct or enum named like one in a `mod` file it loads** (`pub struct Shlex(bytes::Shlex)`;
+   names and items). Types from every file of a program share one namespace, so this is "defined
+   multiple times" (shlex, serde_json's `IoRead`, time's `Instant`, ureq). Two files each with
+   their own `Config` is a plausible multi-file script.
+3. **Re-run the corpus, refresh the uncategorized sort, then triage the "mismatched types"
+   buckets** (about 90 files). The 2026-11-23 fixes un-hid serde's `impls.rs` and moved the
+   re-export and macro files, and the 2026-11-22 sort is stale; "mismatched types" is the largest
+   bucket with no confirmed probe yet.
+
 ## Contracts inherited from the RapydScript integration
 
 | Concern | Python (RapydScript-NS) today | CarciniScript |
@@ -202,16 +218,17 @@ its files into "uncategorized" (the 2026-11-22 run found `the standard library f
 uncategorized count jumps, check the report's top messages before reading anything else into
 the numbers.
 
-**Latest run** (2026-11-22, working tree after `d437860`, same registry as before): language
-features all supported in **82.9%** of files (4,327 of 5,220; 81.8% on 2026-11-17, 67% at the
-first run on 2026-11-16); counting std gaps, 70.5%; by lines, 67.0%. 839 files have a language
-gap (650 of them unsafe/memory, 126 `union`, 58 proc-macro API, 67 `extern`: not planned), 647
-are std-only, 48 have only uncategorized errors. 75 crates pass in every file; 156 in 80% or
-more. Every one of the ~90 feature probes compiles. The std-only and language-gap counts are up
-on 2026-11-17 because the classifier was taught the compiler's newer wordings (see above):
-`size_of` / `ptr::*` paths now count as unsafe/memory and `the standard library type ..` as std,
-where the 2026-11-17 run had them as "only external names". The crash sweeps (registry 5,922
-files, std 3,004) last ran on 2026-11-17 with 0 panics.
+**Latest run** (2026-11-23, working tree after `26e4143`, same registry as before): language
+features all supported in **83.0%** of files (4,335 of 5,220; 82.8% earlier that day, before
+that round's eight fixes; 82.9% on 2026-11-22, 81.8% on 2026-11-17, 67% at the first run on
+2026-11-16); counting std gaps, 70.6%; by lines, 66.6%. 827 files have a language gap (639 of
+them unsafe/memory, 126 `union`, 58 proc-macro API, 67 `extern`: not planned), 650 are std-only,
+50 have only uncategorized errors, 8 a parse error (2 more than before: serde's `de/impls.rs`,
+whose `atomic_impl!` failure a `forwarded_impl!` one used to hide; both fixed since). 76 crates
+pass in every file; 156 in 80% or more. Every one of the ~90 feature probes compiles. The crash
+sweeps (registry 5,922 files, std 3,004) last ran on 2026-11-23 with 0 panics (2026-11-17 too).
+The slowest file there is windows-sys's `Windows/mod.rs` at 160 s, nearly all of it its
+thousands of `mod` files.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
 `set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
@@ -222,124 +239,50 @@ see FEATURES.md).
 
 **Open:**
 
-- Still uncategorized after the 2026-11-22 run: 1,459 file hits by message and construct
-  (1,814 on 2026-11-17). `tools/corpus-uncategorized.mjs` sorts them as: about 200 downstream
-  of another file that the syntax step can't see (a method from a trait bound or a field type
-  defined in another module, a tuple field of a value whose type comes from elsewhere, the
-  methods of an `impl OtherFilesTrait for Local` block); about 90 known limitations already
-  recorded (slice / array / `Vec` / `Box<[T]>` being one type, a generic trait implemented more
-  than once, `impl for &T`, `TypeId` / `type_name` on a type parameter); about 150 std-surface
-  gaps whose message isn't shaped like the std ones; about 200 inside macro expansions (mostly
-  the same gaps as below, hit once per expansion); 27 that aren't gaps at all (`compile_error!`
-  under a `cfg`, `env!` of a cargo variable). The rest, each confirmed with a program rustc
-  accepts (edition 2021, `--crate-type lib`) that this compiler rejects, counts in files of the
-  corpus where it shows:
-  - Bounds and generics:
-    - [ ] Bounds declared on associated types: `trait Fac { type P: Parser; fn make() ->
-      Self::P; }` then `T::make().map(..)` ("no method `map` for type parameter `Fac::P`"),
-      `where <T as Fac>::P: Parser`, `I: Tr<Error = X>` then methods of `I::Iter`, and `type P =
-      T::P;` in an impl ("cannot find type `P`") (13 files).
-    - [x] A generic trait bound on the impl's type parameter given in a method's `where`
-      clause: `impl<Key, F> Meta<Key, F> { fn filter<I>(&mut self, item: I) -> F::Container
-      where F: KeyMethod<Key, I> { self.key_method.make(item) } }` (both the projection and
-      the method are missing; 7 files with the trait in the same file). Now a call's
-      `F::Container` is settled from the receiver's `F` and its impl of the one trait declaring
-      `Container` (`typeck_adt.rs` `method_inst`; `fixtures/method_where_projection.rs`).
-    - [ ] A trait's own generic method called through a type parameter (`O::select::<u8>(x)`
-      with `O: Order`) instantiates the method's type parameters, but doesn't check their own
-      bounds (`typeck.rs` `param_static_call`).
-    - [x] The same call passing a class to an impl that needs one (`R: Default`). Now it is a
-      generic call of `Order::select`, which takes the classes and formatters any impl's
-      `select` takes (`finish_needs`; `fixtures/trait_static_generic_dicts.rs`).
-    - [x] `match` arms returning `Some(e)` for different error types as `Option<&(dyn Error +
-      'static)>` (`Error::source`, 5 files): "`match` arms have incompatible types: expected
-      `Option<A>`, found `Option<B>`"; the expected return type doesn't reach the arms.
-      Now an expected type with a `dyn` in it checks each arm against itself, not against the
-      first arm's type (`typeck.rs` `match_expr`; `fixtures/dyn_match_arms.rs`).
-    - [ ] Inference of a struct's type argument from the one impl of a bound (`Auto::always(
-      Vec::new())` with `impl RawStream for Vec<u8>` the only impl): "type annotations needed".
-  - Names and items:
-    - [x] Items declared inside function bodies share the file's namespace: two functions each
-      declaring `enum State` / `struct Acc` collide ("defined multiple times"), and the first
-      function then resolves `State::X` and `Acc(..)` against the second's items (19 files).
-      Now `nested.rs` renames any nested item whose name is taken (`State__2`), as it did
-      nested `fn`s, with `{:?}` keeping the written name (`fixtures/nested_item_names.rs`).
-    - [x] Inherent impls on reference instantiations collide: `impl<L, R> Either<&L, &R> { fn
-      cloned }` and `impl<L, R> Either<&mut L, &mut R> { fn cloned }`. Now the second is
-      dropped when its methods match the first's (references are erased, so they are one
-      instantiation; `fixtures/ref_instantiation_impls.rs`).
-    - [x] Impls per type argument (`impl W<u8>` / `impl W<u16>`) and per const argument work,
-      but their associated consts collide (`impl Cell<u8> { const MIN: u8 }` + `impl Cell<i32>
-      { const MIN: i32 }`, generated by macros in bitvec, crossbeam, jiff; 28 files + 5
-      macro-only). Now a pre-pass renames each later impl's const (`MIN__1`) with `Self::MIN` in
-      that impl and `Cell::<i32>::MIN` (`inst_consts.rs`; `fixtures/instantiation_consts.rs`).
-      Still not: through a type alias (`type C = Cell<i32>; C::MIN`).
-    - [ ] `pub use self::m::{f, T};` re-exporting a *function* of an inline module ("cannot find
-      function `f`"), and a re-exported type whose name std or a bundled crate also has
-      (`Duration`, `Lazy`, `Value`, `MinMaxResult`, `Mutex`): "defined multiple times" or its
-      fields unknown (23 files, several of them the crates these names come from).
-    - [x] `impl Tr for std::io::Stdout {}` next to `impl Tr for std::io::StdoutLock<'_> {}` (same
-      for `Stderr`): one JS type here, so "conflicting implementations" (anstream). Now each
-      lock is its own prelude type; `StdinLock` is a `BufRead` (`io_prelude.rs`;
-      `fixtures/std_lock_impls.rs`).
-    - [x] Field access through `Deref` (`wrap.sign` as `(w).deref().sign`, `typeck_adt.rs`
-      `adt_field`) is one level only: a `Deref` to another `Deref` type doesn't chain.
-      Now it follows the targets until one has the field, the steps before the last in
-      `deref_steps` (`fixtures/deref_chain_fields.rs`).
-  - Borrow checker, E0596 "not declared as mutable" where rustc accepts (about 50 files; the
-    other E0596 hits are `*val = ..` on a loop variable whose iterator type is unknown, and raw
-    pointers):
-    - [x] A `&mut` reached through a `&mut` field of a by-value binding: `fn insert(self) ->
-      &'a mut u8 { self.table.items.push(..) }` with `table: &'a mut Table`, and `Entry::Occupied(
-      entry) => &mut entry.v.values[i]` (hashbrown, clap). Now a place through a field
-      written `&mut T` needs no `mut` (`typeck.rs` `through_mut_field`), and the borrow checker
-      takes the file's own `Entry` (or `Iter`, `Ref`, ..) for itself, not std's
-      (`nll_rty.rs` `path_rty`; `fixtures/mut_field_writes.rs`). Still not caught:
-      `s.table = t` on a binding that isn't `mut` (rustc's E0594).
-    - [x] A `&mut` binding of a number, string or `Option` from a tuple pattern or `let`-`else`
-      (`let (Some(a), b) = (Some(&mut x), 2)` with `x: i32`, also `let Some(p) = Some(&mut x)
-      else`), which needs a slot. The same for a `Vec` element or struct works
-      (`unwrapped_mut_ref_call`, `mark_tuple_mut_refs`).
-      Now `Some(&mut x)` as the scrutinee, or a tuple element of it, binds the slot, as a local
-      holding one did (`bind_slot_option`; `fixtures/mut_ref_some_bindings.rs`).
-  - Patterns:
-    - [x] Tuple-struct and unit patterns of std enums, `Bound::Included(&i)`, `Bound::Unbounded`
-      (10 files): `Bound` itself is an unmodeled std type, so this is the std column, listed
-      here because the pattern message isn't shaped like a std one. Now `Bound` is a prelude
-      enum (`bound_prelude.rs`; `as_ref`, `map`, `cloned`), its variants importable like
-      `ControlFlow`'s (`variants.rs`; `fixtures/bound_values.rs`). `BTreeMap::range` of a
-      `Bound` pair and `RangeBounds::start_bound` are still unsupported.
-    - [x] Still refutable: an array pattern in a tuple pattern over a tuple local declared
-      elsewhere (`let ([a, b], c) = t;`; the lengths are only known from a tuple literal,
-      annotation, `enumerate()` or `zip(..)`, `typeck_arrays.rs` `pat_fits`), and `let Ok(p):
-      Result<_, Infallible> = ..`. Now a
-      tuple local's shape comes from its own `let` or parameter type (`let_shape`), and
-      exhaustiveness skips a variant whose payload is uninhabited (`!`, an empty enum such as
-      `Infallible`), in `let` and `match` both (`fixtures/irrefutable_uninhabited.rs`).
-  - Macros:
-    - [ ] Macro-generated inline modules and their items (deranged's `impl_ranged!`: "this block
-      kind is not supported yet", 3 files but 1,165 errors).
-  - std surface found through these messages (for the std column, not language work):
-    - [x] `From<T> for OnceCell<T>` / `OnceCell::from`, `Cow<[u8]>: From<Vec<u8>>`. Now prelude
-      impls (`OnceLock` too), and a `From` impl's type parameter may be nested in its source
-      type (`typeck_conv.rs` `pick_from_inst`; `fixtures/once_cell_cow_from.rs`).
-    - [x] `OsString::push(&Path)` / `push(&str)` (`OsString` is a `String` here and `push` takes a
-      `char`). Now the pre-pass renames `push` on a binding written or made as an `OsString`
-      to the path prelude's `__os_push` (`stdgaps.rs` `os_string_pushes`;
-      `fixtures/os_string_push.rs`); a field or element `OsString` still isn't.
-    - [x] `Debug` for `slice::Iter` in a derive. Now any shared iterator is `Debug`, printing
-      what's left as `slice::Iter` does (`Iter([1, 2])`; `fixtures/iter_debug.rs`; RUST_GAPS.md
-      for other iterators).
-    - [x] `write_fmt` overridden in an `io::Write` / `fmt::Write` impl ("not a member of
-      trait"), and `fmt::write(self, args)` inside it. Now both prelude traits have a
-      `write_fmt` that `write!` goes through (`io_prelude.rs`; `fixtures/write_fmt_overrides.rs`).
-    - [x] `&a | &b` (also `&`, `-`, `^`) on `HashSet` / `BTreeSet`. Now a new set of clones
-      (`κσ.$setOp`; `fixtures/set_operators.rs`).
-  - Still mixed, to triage next: the "mismatched types" buckets (two named types that don't
-    match, about 90 files outside macros). Samples are std modeling (`Cow<'a, str>` seen as
-    `Cow<String>`, `OsStr::to_owned()` as `String`), clap's derive attributes on variants
-    (`#[command(..)]` giving "expected `ClapCommand`, found `bool`"), and types from other
-    files; nothing there has a confirmed probe yet.
+- [ ] Refresh the uncategorized sort. The 2026-11-23 report has 1,257 uncategorized file hits by
+  message and construct (1,459 on 2026-11-22, 1,814 on 2026-11-17). The last sort
+  (2026-11-22) put them as: about 200 downstream of another file that the
+  syntax step can't see (a method from a trait bound or a field type defined in another module, a
+  tuple field of a value whose type comes from elsewhere, the methods of an `impl
+  OtherFilesTrait for Local` block); about 90 known limitations already recorded (slice / array /
+  `Vec` / `Box<[T]>` being one type, a generic trait implemented more than once, `impl for &T`,
+  `TypeId` / `type_name` on a type parameter); about 150 std-surface gaps whose message isn't
+  shaped like the std ones; about 200 inside macro expansions; 27 that aren't gaps at all
+  (`compile_error!` under a `cfg`, `env!` of a cargo variable). Most of the gaps it confirmed are
+  fixed since (FEATURES.md).
+- [ ] Triage the "mismatched types" buckets (two named types that don't match, about 90 files
+  outside macros). Samples are std modeling (`Cow<'a, str>` seen as `Cow<String>`,
+  `OsStr::to_owned()` as `String`), clap's derive attributes on variants (`#[command(..)]` giving
+  "expected `ClapCommand`, found `bool`"), and types from other files; nothing there has a
+  confirmed probe yet.
+
+The gaps below are each confirmed with a program rustc accepts (edition 2021, `--crate-type lib`)
+that this compiler rejects or miscompiles; counts are files of the corpus where it shows.
+
+- Bounds and generics:
+  - [ ] Methods of an associated type of a bound with an associated-type binding: `I: Tr<Error =
+    X>` then methods of `I::Iter` (the rest of the 13 files with bounds on associated types are
+    fixed).
+  - [ ] `T::f()` of a blanket impl over `T`'s bound (`impl<T: Bounded> Lower for T`, then
+    `T::lowest()` in `fn g<T: Bounded>`).
+  - [ ] `T: AsRef<[u8]>` (and other non-string targets) on an impl's type parameter; `AsRef<str>`
+    / `Into<String>` work, since a string target can make `T` a string.
+  - [ ] A turbofish through a type parameter (`O::select::<u8>(x)`) checks the method's own
+    bounds, except those with type arguments (`Into<X>`, `Fn(..)`).
+- Names and items:
+  - [ ] A struct or enum named like one in a `mod` file the file loads (`mod bytes;` then `pub
+    struct Shlex(bytes::Shlex)`): "the name `Shlex` is defined multiple times", since the types
+    of a program's files share one namespace (merged by bare name in `typeck_mod::merge_module`).
+    Needs a per-module key for the loaded file's types (and their methods, impls and signatures)
+    when a name collides. Shows in shlex, serde_json (`IoRead`), time (`Instant`), ureq
+    (`Duration`). Re-exported functions of inline modules, and a module's or the program's own
+    types named like std's (`IoRead`, `Instant`, `ParseIntError`), work since 2026-11-23.
+- References into containers:
+  - [ ] `copy_from_slice` / `clone_from_slice` on a range of a `Vec` that isn't a place
+    (`self.buf.write_buf()[..n].copy_from_slice(..)`).
+- Patterns and ranges:
+  - [ ] `(..).start_bound()` where only the expected type says what `T` is (the `RangeFull`
+    impl's `T` isn't in its self type).
 - Left over from closed gaps (see RUST_GAPS.md "Traits on built-in types" and FEATURES.md):
   - [ ] One trait for two tuples of one length (`(u8, u8)` and `(String, String)`). Both impls
     are keyed `Tuple2` (one `$ext$Tuple2` class, methods by name), so this needs a key per
@@ -370,8 +313,16 @@ and `corpus-report.mjs` on its output). The 40 blocks rustc rejects (deliberate 
 (95.5%) had no language gap at the time; every compiler and std gap it found has since been
 fixed.
 
-- [ ] Check whether the programs that compile print what rustc's builds print
-  (`tools/diff-one.mjs`).
+The 213 programs with a `main` were run against rustc's builds (`tools/diff-one.mjs`, 2026-11-23):
+190 print the same. Four differences were fixed (`stringify!` of an `expr` passed on through a
+recursive macro kept the parentheses each expansion added; a block's own `use` didn't shadow the
+module's item of that name; `#[cfg(panic = "unwind")]` was false; `Utf8Error` / `FromUtf8Error`
+printed as `Utf8Error { kind: Invalid }`), and `diff-one` now reads a JS panic whose message
+shares the line with its location (nine false differences before). The other 22 are expected:
+threads and channels (4), `Rc::strong_count`, unsafe, FFI and `asm!` (7), the filesystem and
+processes (7), the executable's path, Windows path separators, and the two doc-test blocks
+rustc's build has no `main` for. The last, `std/hash_1`, prints a `HashMap` in iteration order,
+which rustc randomizes per run.
 
 **Expected:** `thread::spawn` and `mpsc` (4 files), `Rc::strong_count` (no reference counts in
 JS), and the not-planned unsafe features (raw pointers, `slice::from_raw_parts`, `union`, FFI).
@@ -387,53 +338,19 @@ rustc accepts as they are or wrapped in `fn main`; the 3 others use unix-only st
 and Android chapters are left out. Run through the corpus survey above (`corpus-classify.mjs`,
 `corpus_ast`, `corpus-report.mjs`), as Rust by Example was. Of the 384 files, 247 compiled as-is
 and 325 (84.6%) had no language gap; the language gaps the report found are the not-planned
-unsafe, FFI, `union` and proc-macro ones (30 files) plus two since fixed (`concat!` format
-strings, a string continuation before CR LF). The 157 compiled programs with a `main` were also
-run against rustc's builds (`tools/diff-one.mjs`): 142 printed the same; the rest differ in
-`{:p}`, filesystem errors, `process::exit` running `Drop`s and `Vec::capacity` (all in
-RUST_GAPS.md) and in the items marked **runtime** below. (In five more, `diff-one` reports the JS
-location of a `todo!()` as `undefined` because the message follows the location on one line; the
-locations agree.) Each gap below has a minimal repro that rustc accepts; the slide or crate it
-comes from is in parentheses.
+unsafe, FFI, `union` and proc-macro ones (30 files) plus two since fixed. The 157 compiled
+programs with a `main` were also run against rustc's builds (`tools/diff-one.mjs`): 142 printed
+the same; the rest differ in `{:p}`, filesystem errors, `process::exit` running `Drop`s and
+`Vec::capacity` (all in RUST_GAPS.md), and in a CR LF inside string literals and array index
+panic columns (both fixed since). (In five more, `diff-one` reported the JS location of a
+`todo!()` as `undefined` because the message follows the location on one line; the locations
+agree; `diff-one` reads that line since 2026-11-23.) Every compiler and std gap it found is fixed
+except:
 
-**Open, compiler:**
-
-- [x] `L::Output` of a std operator-trait bound (Programming Rust `complex`: `impl<L, R>
-  Add<Complex<R>> for Complex<L> where L: Add<R> { type Output = Complex<L::Output>; .. }`; also
-  `fn add<L: Add<R>, R>(a: L, b: R) -> L::Output { a + b }`): "cannot find type `Output`", then
-  "expected `L`, found `R`". `T: Add<Output = T>` works. Now `L: Add<R>` makes the right
-  operand an `R` and `L::Output` an `L` (or the bound's `Output = X`): right for numbers and
-  for an impl whose output is its own type, lenient where rustc's differs (`typeck_gen.rs`
-  `record_op_bounds`); an impl's parameter only the right operand names is fresh per use, and
-  generic arithmetic reaches `impl Mul<f64> for V2` and a type's only impl of an operator
-  (`fixtures/op_bound_output.rs`).
-- [x] `file!()` / `line!()` inside a `concat!` format string (`println!(concat!("{}:{}: ",
-  $msg), file!(), line!())` works; `concat!(file!(), ": {}")` doesn't): `concat!` is only
-  folded when all its parts are literals (`stdgaps.rs` `concat_literals`).
-  `file!()`, `line!()` and `column!()` weren't supported anywhere, so the working case didn't
-  either. Now they are literals (`stdgaps.rs` `location_macro`), also inside `concat!`, whose
-  arguments may come wrapped in parens from a `$x:expr` (`fixtures/location_macros.rs`).
-- [x] **runtime** A CR LF inside a raw or multi-line string literal (`r"a` CR LF `b"`) stays in
-  the value; rustc reads the file with CR LF as LF, so `r.len()` is one less there. It
-  was a compile error in a plain string ("Character must be escaped"). Now string values read
-  CR LF as LF (`lineindex.rs` `string_value`), and the parser's bare-CR error is dropped when
-  every CR starts a CR LF (`test/run.mjs`, not a fixture, since git may change line endings).
-- [x] **runtime** An out-of-bounds index into an array (`[T; N]`; a `Vec` matches) panics one
-  column to the right of rustc's, at the `[` rather than the start of the indexed expression
-  (`tuples-and-arrays/arrays`: `a[get_index()] = 0`, rustc 10:5, JS 10:6). Now an
-  array or slice the file declares (a row of one too, a `&[T]` local or parameter) panics at
-  the expression's start (`codegen_std.rs` `builtin_index_base`; `fixtures/panic_array_index.rs`).
-
-**Open, std:**
-
-- [x] `Vec::from_iter` and the other std collections' `from_iter` as a function value
-  (`.map(Vec::from_iter)`); called directly it works (`ufcs.rs` `from_iter_path`). Now
-  in an argument it is a closure collecting into the type (`fixtures/from_iter_values.rs`);
-  `let f = Vec::from_iter;` still isn't (the closure's parameter would have no type).
-- Missing too, but of little use in a script: `io::stdin().lock()` as a `BufRead` ("the trait
-  bound `IoStdin: IoBufRead` is not satisfied"; Programming Rust `grep`), `env::args_os`,
-  `PathBuf::read_dir` / `read_link` / `metadata` and `OsStr::from_bytes` (Programming Rust
-  `copy`, the unsafe exercise), `i32::unchecked_add`.
+- [ ] `let g = Vec::from_iter;` with no type anywhere (the closure's parameter would have none;
+  with a `let` type or a turbofish it works).
+- Of little use in a script: `PathBuf::read_dir` / `read_link` / `metadata` and
+  `OsStr::from_bytes` (Programming Rust `copy`, the unsafe exercise).
 
 **Expected:** threads, channels, `Arc` / `Mutex` and `thread::sleep` (13 files); raw pointers,
 `MaybeUninit`, `PhantomPinned` and `Pin` projections, `transmute`, `slice::from_raw_parts`,
@@ -445,25 +362,14 @@ bundled); `fern_sim`'s multi-file module tree (compiled file by file); `{:p}`.
 ## Bitburner player gaps (2026-11-18)
 
 What a Bitburner player still misses, now that every item in `corpus/bitburner/GAPS.md` is
-fixed. Ranked by how often real scripts hit it times how badly: a silent wrong result or a false
-compile error on an everyday pattern outranks a missing feature with a workaround. The other
-items of the original list (cross-folder modules via `#[path]`, serde tagging and `flatten`,
-`i32` NS results, `std::sync` / tokio sync shims, typed `ns.flags`, `u64` as a number) are done;
-see FEATURES.md.
+fixed. The other items of the original list and of the 2026-11-18 probe (cross-folder modules
+via `#[path]`, serde tagging and `flatten`, `i32` NS results, `std::sync` / tokio sync shims,
+typed `ns.flags`, `u64` as a number, un-awaited futures, `&str + &str`, partial moves out of a
+struct) are done; see FEATURES.md.
 
 - [ ] **An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
   are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
   Compile the tests to a `main` that runs each and prints libtest's summary.
-
-Not caught at all (probed 2026-11-18), so no message to improve: `let r = &v[0]` over a
-`Vec<i32>` then `v.push` (the index copies) and an un-awaited `ns.hack(..)`.
-
-- [x] `"a" + "b"` (rustc's E0369, "cannot add `&str` to `&str`"). Now an error when the left side
-  is a string literal, a `&x` or a local or parameter declared `&str` (`typeck.rs`
-  `borrowed_str`); a `let s = "a";` local isn't known to be one.
-- [x] A partial move out of a struct (`let a = p.a; let q = p;`). Now a non-`Copy` field moved
-  by value partly moves its binding; assigning the field again restores it (`moves.rs`
-  `field_moves`; `fixtures/partial_field_moves.rs`).
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 

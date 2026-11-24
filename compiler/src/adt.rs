@@ -166,6 +166,9 @@ pub struct TraitMethod {
     /// `Self` appears as `Ty::Param("Self")`.
     pub sig: Method,
     pub has_default: bool,
+    /// The method's own type parameters' trait bounds without type arguments (`R: Default`),
+    /// checked where a call through a type parameter instantiates them.
+    pub own_bounds: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +211,9 @@ pub type ImplHead = (Vec<Ty>, Vec<Ty>);
 #[derive(Default, Clone, Debug)]
 pub struct Adts {
     pub defs: HashMap<String, AdtDef>,
+    /// The trait bounds a struct or enum declares on each type parameter (`struct Auto<S:
+    /// RawStream>`, also its `where` clause), by type: the traits' names.
+    pub param_bounds: HashMap<String, Vec<Vec<String>>>,
     /// Structs' const generic parameters, in order, by struct.
     pub const_params: HashMap<String, Vec<ConstParam>>,
     /// Enum variants under a `#[cfg(..)]` (by enum, then variant index): they may not exist, so

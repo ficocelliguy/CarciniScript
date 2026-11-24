@@ -224,10 +224,12 @@ impl Checker<'_> {
                 rt.clone()
             }
             // ---- integers
+            // (`unchecked_*` overflows into undefined behavior; here it wraps.)
             (Ty::Int(k), m2)
                 if m2.starts_with("checked_")
                     || m2.starts_with("saturating_")
-                    || m2.starts_with("wrapping_") =>
+                    || m2.starts_with("wrapping_")
+                    || matches!(m2, "unchecked_add" | "unchecked_sub" | "unchecked_mul") =>
             {
                 let op = m2.split_once('_').map(|x| x.1).unwrap_or("");
                 match op {
@@ -497,7 +499,7 @@ impl Checker<'_> {
         let a1 = args.get(1);
         Some(match tail {
             // The script's arguments (the host's, `κσ.$setArgs`), its name first.
-            ["env", "args"] => {
+            ["env", "args" | "args_os"] => {
                 count(self, 0);
                 Ty::Iter {
                     elem: Box::new(Ty::Str),

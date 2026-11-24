@@ -642,8 +642,14 @@ impl Matcher<'_> {
                     // them: `$body $i += 1;` with a `{ .. }` body.)
                     let block = end == pos + 1
                         && matches!(&toks[pos], Tok::Group { open, .. } if open == "{");
+                    // (Nor does a string or char literal, which in an attribute's `key = $size`
+                    // mustn't have them.)
+                    let quoted = end == pos + 1
+                        && matches!(&toks[pos], Tok::Leaf { kind, .. } if matches!(kind,
+                            SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING
+                                | SyntaxKind::CHAR | SyntaxKind::BYTE));
                     let frag = match kind.as_str() {
-                        "expr" | "expr_2021" if !block => Frag::Expr,
+                        "expr" | "expr_2021" if !block && !quoted => Frag::Expr,
                         "ty" => Frag::Ty,
                         _ => Frag::Other,
                     };
@@ -1342,6 +1348,37 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
     rename(t, &names, n, false, false)
 }
 
+/// The parentheses around an `expr` capture in an expansion, marked so that a `stringify!` of it in
+/// a further expansion can leave them out (rustc's are invisible).
+const EXPR_OPEN: &str = "(/*expr*/";
+
+/// Whether no `)` in `text` closes a `(` before it (outside string literals), so that
+/// `(` + `text` + `)` is one group.
+fn balanced(text: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(_), '\\') => {
+                chars.next();
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"') => quote = Some('"'),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
     for (i, x) in t.iter().enumerate() {
         match x {
@@ -1362,6 +1399,16 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
                     unreachable!()
                 };
                 if let Some(Bound::One(text, _)) = b.get(n) {
+                    // (Nor the ones an earlier expansion added, passing it on:
+                    // `calculate! { eval $e }`.)
+                    let mut text = text.as_str();
+                    while let Some(t) = text
+                        .strip_prefix(EXPR_OPEN)
+                        .and_then(|t| t.strip_suffix(')'))
+                        .filter(|t| balanced(t))
+                    {
+                        text = t;
+                    }
                     out.push_str(o);
                     out.push_str(text);
                     out.push_str(c);
@@ -1382,7 +1429,11 @@ fn transcribe(t: &[Tpl], b: &Bindings, out: &mut String) -> Result<(), String> {
                 match b.get(n) {
                     Some(Bound::One(text, frag)) => {
                         let angle = matches!(t.get(i + 1), Some(Tpl::Tok(s, _)) if s == "<");
-                        if *frag == Frag::Expr || (*frag == Frag::Ty && angle) {
+                        if *frag == Frag::Expr {
+                            out.push_str(EXPR_OPEN);
+                            out.push_str(text);
+                            out.push(')');
+                        } else if *frag == Frag::Ty && angle {
                             out.push('(');
                             out.push_str(text);
                             out.push(')');

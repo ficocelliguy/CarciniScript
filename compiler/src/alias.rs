@@ -231,6 +231,79 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) {
                 };
                 let r = seg.syntax().text_range();
                 edits.push((r.start().into(), r.end().into(), new));
+            } else if n.kind() == SyntaxKind::TOKEN_TREE
+                && n.ancestors().any(|p| ast::MacroCall::can_cast(p.kind()))
+                && !n.ancestors().any(|p| {
+                    ast::MacroRules::can_cast(p.kind()) || ast::MacroDef::can_cast(p.kind())
+                })
+            {
+                // A macro call's arguments: `println!("{}", Pt::ORIGIN)`, an alias starting a path
+                // (followed by `::`, not after one).
+                let toks: Vec<_> = n
+                    .children_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .filter(|t| !matches!(t.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))
+                    .collect();
+                for (i, t) in toks.iter().enumerate() {
+                    let at = |j: usize| toks.get(j).map(|t| t.text().to_string());
+                    let path_next = at(i + 1).as_deref() == Some("::")
+                        || (at(i + 1).as_deref() == Some(":") && at(i + 2).as_deref() == Some(":"));
+                    let path_before = i > 0
+                        && matches!(at(i - 1).as_deref(), Some("::" | ":" | "$" | "." | "'"));
+                    if t.kind() != SyntaxKind::IDENT || !path_next || path_before {
+                        continue;
+                    }
+                    let Some(a) = find(&table, t.text(), &n) else {
+                        continue;
+                    };
+                    if in_alias(&n) || shadowed(&n, t.text()) {
+                        continue;
+                    }
+                    // A generic alias takes its arguments by turbofish: `C::<i32>::MIN`.
+                    let mut end = t.text_range().end();
+                    let mut args = Vec::new();
+                    if !a.params.is_empty() {
+                        let lt = if at(i + 1).as_deref() == Some("::") { i + 2 } else { i + 3 };
+                        if at(lt).as_deref() != Some("<") {
+                            continue;
+                        }
+                        // (`>>` closes two.)
+                        let (mut depth, mut arg_start, mut close) = (0i32, lt + 1, None);
+                        for (j, x) in toks.iter().enumerate().skip(lt) {
+                            match x.text() {
+                                "<" | "(" | "[" => depth += 1,
+                                ")" | "]" => depth -= 1,
+                                ">" | ">>" => depth -= x.text().len() as i32,
+                                "," if depth == 1 => {
+                                    args.push((arg_start, j));
+                                    arg_start = j + 1;
+                                }
+                                _ => {}
+                            }
+                            if depth <= 0 {
+                                close = (depth == 0).then_some(j);
+                                break;
+                            }
+                        }
+                        let Some(close) = close else { continue };
+                        if arg_start < close {
+                            args.push((arg_start, close));
+                        }
+                        end = toks[close].text_range().end();
+                    }
+                    let text_of = |(s, e): (usize, usize)| {
+                        let r = TextRange::new(
+                            toks[s].text_range().start(),
+                            toks[e - 1].text_range().end(),
+                        ) - n.text_range().start();
+                        n.text().to_string()[r].to_string()
+                    };
+                    let args: Vec<String> = args.into_iter().map(text_of).collect();
+                    let Some(new) = turbofish(&instantiate(a, &args)) else {
+                        continue;
+                    };
+                    edits.push((t.text_range().start().into(), end.into(), new));
+                }
             }
         }
         if edits.is_empty() || round == 15 {

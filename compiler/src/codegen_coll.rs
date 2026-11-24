@@ -198,8 +198,17 @@ impl Codegen<'_> {
         use ra_ap_syntax::ast::RangeItem;
         let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
         let range = m.arg_list().and_then(|l| l.args().next());
-        let Some(ast::Expr::RangeExpr(r)) = range.map(|e| strip_parens_expr(&e)) else {
-            return (Frag::text("undefined"), ty);
+        let r = match range.map(|e| strip_parens_expr(&e)) {
+            Some(ast::Expr::RangeExpr(r)) => r,
+            // A `Bound` pair or a range value: read at run time.
+            Some(other) => {
+                let (af, at) = self.emit_expr(&other, None);
+                let arg = self.by_value(&other, af, &at);
+                let mut f = rf.clone();
+                f.push(".$rangeArg(").append(arg).push(")");
+                return (f.at(self.off(m.syntax())), ty);
+            }
+            None => return (Frag::text("undefined"), ty),
         };
         let mut bound = |b: Option<ast::Expr>| match b {
             Some(b) => {

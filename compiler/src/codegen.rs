@@ -291,6 +291,15 @@ fn escape_ident(name: &str) -> String {
     }
 }
 
+/// A module path in JS (`util`, `geo.shapes`), each segment named as its `import` names it
+/// (`read$` for `mod read;`).
+pub(super) fn module_js(m: &str) -> String {
+    if m == "κσ" {
+        return m.to_string();
+    }
+    m.split('.').map(escape_ident).collect::<Vec<_>>().join(".")
+}
+
 /// `.name`, or `["name"]` when the JS property name isn't a valid identifier.
 fn member(js: &str) -> String {
     let ident = js
@@ -796,6 +805,7 @@ fn compile_text(
         name_log: Vec::new(),
         tmp: 0,
         recv_override: None,
+        expr_temps: HashMap::new(),
         wb_methods: std::collections::HashSet::new(),
         base: 0,
         ret_ty: Ty::Unit,
@@ -925,6 +935,9 @@ struct Codegen<'a> {
     tmp: u32,
     /// While emitting `v[a..b].sort()`: the receiver's range and the temporary holding the copy.
     recv_override: Option<((usize, usize), String, Ty)>,
+    /// Expressions already evaluated into a temporary (a range start in `v[f()..].sort()`), by
+    /// range: emitted as the temporary.
+    expr_temps: HashMap<(usize, usize), String>,
     /// Methods (by type and name) that can't keep a `&mut` argument past the call
     /// (`writeback_safe`): their `&mut place` arguments are write-back temps.
     wb_methods: std::collections::HashSet<(String, String)>,
@@ -1424,7 +1437,7 @@ impl<'a> Codegen<'a> {
             if imp.sig.is_some() && local_fns.contains(&imp.name) {
                 continue;
             }
-            let js = format!("{}.{}", escape_ident(&imp.module), escape_ident(&imp.js));
+            let js = format!("{}.{}", module_js(&imp.module), escape_ident(&imp.js));
             match imp.sig {
                 Some(sig) => {
                     let sig = FnSig {
@@ -3342,6 +3355,10 @@ impl<'a> Codegen<'a> {
     /// Lower `e` to a JS expression. May write hoisted statements first.
     fn emit_expr(&mut self, e: &ast::Expr, expected: Option<&Ty>) -> (Frag, Ty) {
         let start = self.off(e.syntax());
+        if let Some(t) = self.expr_temps.get(&self.range_of(e.syntax())) {
+            let ty = self.ty_of(e.syntax()).unwrap_or(Ty::Unknown);
+            return (Frag::text(t.clone()).at(start), ty);
+        }
         let (frag, ty) = self.emit_expr_inner(e, expected);
         let ty = self.ty_of(e.syntax()).unwrap_or(ty);
         let r = self.range_of(e.syntax());
@@ -5237,12 +5254,19 @@ impl<'a> Codegen<'a> {
     /// The JS class a two-segment path `T::x` starts from: `$T` for a type parameter whose class
     /// the function takes, or `this` / `this.constructor` for `Self` in a trait's default method.
     fn param_class(&self, p: &ast::PathExpr) -> Option<String> {
-        let path = p.path()?;
-        let q = path.qualifier()?;
-        if q.qualifier().is_some() {
-            return None;
-        }
-        let first = q.segment()?.name_ref()?.text().to_string();
+        // (`<T as Tr>::make()` / `Tr::make()` the checker took as `T::make()`.)
+        let call = p.syntax().parent().filter(|c| c.kind() == SyntaxKind::CALL_EXPR);
+        let first = match call.and_then(|c| self.types.param_paths.get(&self.range_of(&c))) {
+            Some(t) => t.clone(),
+            None => {
+                let path = p.path()?;
+                let q = path.qualifier()?;
+                if q.qualifier().is_some() {
+                    return None;
+                }
+                q.segment()?.name_ref()?.text().to_string()
+            }
+        };
         if self.dict_scope.contains(&first) {
             return Some(format!("${first}"));
         }
@@ -5359,6 +5383,63 @@ impl<'a> Codegen<'a> {
         }
     }
 
+    /// A generic type's class passed for a type parameter (`go::<W<A>>()`), with the classes its
+    /// associated functions take for the `impl`'s parameters filled in from `args`
+    /// (`κσ.$sv(W, {mk: [0, [A]]})`): the generic caller's `$T.mk()` doesn't know them. Each
+    /// entry is the function's parameter count and its class arguments in order, `null` for one
+    /// of its own type parameters (which the caller passes).
+    fn static_view(&self, n: &str, args: &[Ty], view: String) -> String {
+        if args.is_empty() {
+            return view;
+        }
+        let prefix = format!("{n}::");
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for (key, list) in &self.types.dict_params {
+            let Some(m) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(sig) = self.types.adts.method(n, m) else {
+                continue;
+            };
+            if sig.receiver.is_some() {
+                continue;
+            }
+            let mut any = false;
+            let ds: Vec<String> = list
+                .iter()
+                .map(|p| {
+                    let pos = sig
+                        .impl_args
+                        .iter()
+                        .position(|a| matches!(a, Ty::Param(x) if x == p))
+                        .filter(|_| !sig.type_params.contains(p));
+                    match pos.and_then(|i| args.get(i)) {
+                        Some(a) => {
+                            any = true;
+                            self.dict_of(a)
+                        }
+                        None => "null".into(),
+                    }
+                })
+                .collect();
+            if any {
+                entries.push((
+                    adt_gen::prop(m),
+                    format!("[{}, [{}]]", sig.params.len(), ds.join(", ")),
+                ));
+            }
+        }
+        if entries.is_empty() {
+            return view;
+        }
+        entries.sort();
+        let body: Vec<String> = entries
+            .into_iter()
+            .map(|(k, v)| format!("{}: {v}", js_string(&k)))
+            .collect();
+        format!("κσ.$sv({view}, {{{}}})", body.join(", "))
+    }
+
     fn dict_of_own(&self, t: &Ty) -> String {
         match t {
             // (A blanket impl's `T` in its associated functions: their `this`.)
@@ -5376,7 +5457,8 @@ impl<'a> Codegen<'a> {
                     .flatten()
                     .filter_map(|&i| Some((i, self.dict_of(args.get(i)?))))
                     .collect();
-                class_view(self.class(n), args, &stored)
+                let view = class_view(self.class(n), args, &stored);
+                self.static_view(n, args, view)
             }
             Ty::Param(p) if self.dict_scope.contains(p) => format!("${p}"),
             // (The number kind: generic `/` truncates for integers, results wrap.)
@@ -5725,6 +5807,40 @@ impl<'a> Codegen<'a> {
                 q.method.clone()
             };
             let args: Vec<ast::Expr> = c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
+            // `T::name(t)` / `<T as Tr>::name(t)` on a type parameter's value, which may be a
+            // number or string your impl is on: as `t.name()` (`κσ.$dcall`).
+            if q.receiver
+                && let Some(recv) = args.first().map(strip_refs)
+                && let Some(Ty::Param(p)) = self.ty_of(recv.syntax())
+                && (self
+                    .types
+                    .adts
+                    .ext_types
+                    .iter()
+                    .any(|k| self.types.adts.method(k, &q.method).is_some())
+                    || self.pub_trait_method(&q.method))
+            {
+                let (rf, _) = self.receiver(&recv);
+                // (By `T`'s class when its impls are on types JS can't tell apart.)
+                let by_class = Some(self.dict_of(&Ty::Param(p)))
+                    .filter(|c| c != "undefined")
+                    .filter(|_| self.types.class_dispatch.contains(&self.range_of(c.syntax())));
+                let mut f = Frag::mapped(
+                    self.off(c.syntax()),
+                    match by_class {
+                        Some(cls) => format!("κσ.$dcallT($extRegs, {cls}, "),
+                        None => "κσ.$dcall($extRegs, ".into(),
+                    },
+                );
+                f.append(rf)
+                    .push(format!(", {}", js_string(&adt_gen::prop(&q.method))));
+                for a in args.iter().skip(1) {
+                    let (af, t) = self.emit_expr(a, None);
+                    f.push(", ").append(self.by_value(a, af, &t));
+                }
+                f.push(")");
+                return (f, ty);
+            }
             let mut rest = Vec::new();
             let mut head = match (&q.adt, q.receiver) {
                 (_, true) => {
@@ -6256,9 +6372,29 @@ impl<'a> Codegen<'a> {
         let (Some(base), Some(ast::Expr::RangeExpr(r))) = (ix.base(), ix.index()) else {
             return (Frag::text("undefined"), Ty::Unknown);
         };
-        let lo_pure = r.start().is_none_or(|e| is_pure(&e));
-        if !is_pure(&strip_refs(&base)) || !lo_pure {
-            self.unsupported(m.syntax(), "this in-place method on a range (assign the Vec and the range start to variables first)");
+        // The ranges' starts, innermost last (`dst[1..][..n]`), over a Vec that's safe to evaluate
+        // twice; a start that isn't (`tmp[8 - buf.len()..]`) is evaluated once, first.
+        let mut starts = vec![r.start()];
+        let mut root = base.clone();
+        while let ast::Expr::IndexExpr(inner) = strip_parens_expr(&root)
+            && let (Some(b), Some(ast::Expr::RangeExpr(ir))) = (inner.base(), inner.index())
+        {
+            starts.push(ir.start());
+            root = b;
+        }
+        if !is_pure(&strip_refs(&root)) {
+            self.unsupported(m.syntax(), "this in-place method on a range (assign the Vec to a variable first)");
+        }
+        let mut temps = Vec::new();
+        for e in starts.iter().flatten().filter(|e| !is_pure(e)) {
+            let (f, _) = self.emit_expr(e, None);
+            let t = self.temp();
+            let mut decl = Frag::mapped(self.off(e.syntax()), format!("const {t} = "));
+            decl.append(f).push(";");
+            self.line(decl);
+            let r = self.range_of(e.syntax());
+            self.expr_temps.insert(r, t);
+            temps.push(r);
         }
         // The copy, with the usual range checks.
         let (copy, ty) = self.emit_index(ix);
@@ -6273,10 +6409,19 @@ impl<'a> Codegen<'a> {
         let mut line = Frag::text(format!("const {out} = "));
         line.append(call).push(";");
         self.line(line);
-        let (bf, _) = self.receiver(&base);
-        let lo = match r.start() {
-            Some(e) => self.emit_expr(&e, None).0,
-            None => Frag::text("0"),
+        let (bf, _) = self.receiver(&root);
+        let los: Vec<Frag> = starts
+            .iter()
+            .flatten()
+            .map(|e| self.operand(e, None).0)
+            .collect();
+        for r in temps {
+            self.expr_temps.remove(&r);
+        }
+        let lo = if los.is_empty() {
+            Frag::text("0")
+        } else {
+            Frag::join(los, " + ")
         };
         let mut back = Frag::text("κσ.$writeBack(");
         back.append(bf)

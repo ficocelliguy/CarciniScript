@@ -121,6 +121,22 @@ fn to_arg(src: &str, base: usize, mut group: Vec<SyntaxElement>) -> Option<Macro
     let end = base + usize::from(group.last()?.text_range().end());
     let single_token = match group.as_slice() {
         [NodeOrToken::Token(t)] => Some(t.clone()),
+        // A string literal from a macro's `$x:expr` comes wrapped in parens (`debug!("{}", x)`
+        // forwarding `$($args:expr),*` to `println!`); rustc takes it as the format string.
+        [NodeOrToken::Node(n)] if n.kind() == SyntaxKind::TOKEN_TREE => {
+            let inner: Vec<_> = n
+                .children_with_tokens()
+                .filter(|el| !el.kind().is_trivia())
+                .collect();
+            match inner.as_slice() {
+                [open, NodeOrToken::Token(t), close]
+                    if open.kind() == T!['('] && close.kind() == T![')'] && t.kind() == SyntaxKind::STRING =>
+                {
+                    Some(t.clone())
+                }
+                _ => None,
+            }
+        }
         _ => None,
     };
     Some(MacroArg {
@@ -516,7 +532,8 @@ fn cfg_pred(toks: &[String], i: &mut usize, debug: bool) -> Result<bool, String>
 
 /// A target cfg of the one target scripts compile for: JS, described as rustc's
 /// `wasm32-unknown-unknown` (not `unix` / `windows`, little-endian, no target features), except
-/// that `usize` is 64 bits here (`usize::MAX` is `u64::MAX`), so `target_pointer_width = "64"`.
+/// that `usize` is 64 bits here (`usize::MAX` is `u64::MAX`), so `target_pointer_width = "64"`, and
+/// that panics unwind (`panic = "unwind"`).
 /// `None` for a name that isn't about the target.
 fn target_cfg(name: &str, value: Option<&str>) -> Option<bool> {
     let v = value.map(|v| v.trim_matches('"'));
@@ -531,6 +548,8 @@ fn target_cfg(name: &str, value: Option<&str>) -> Option<bool> {
         ("target_pointer_width", Some(v)) => v == "64",
         ("target_has_atomic", Some(_)) => true,
         ("target_feature", Some(_)) => false,
+        // (A panic throws, and `Drop`s and `catch_unwind` see it go by.)
+        ("panic", Some(v)) => v == "unwind",
         _ => return None,
     })
 }
@@ -822,6 +841,23 @@ fn loses_to_alternative(
     winner != Some(start)
 }
 
+/// Whether a `macro_rules!` body's matchers (each token tree just before a `=>`) have a `#`.
+fn matchers_take_attrs(body: &ast::TokenTree) -> bool {
+    let elems: Vec<SyntaxElement> = body
+        .syntax()
+        .children_with_tokens()
+        .filter(|e| !e.kind().is_trivia())
+        .collect();
+    elems.windows(3).any(|w| {
+        w[0].kind() == SyntaxKind::TOKEN_TREE
+            && w[1].kind() == T![=]
+            && w[2].kind() == T![>]
+            && w[0].as_node().is_some_and(|n| {
+                n.descendants_with_tokens().any(|t| t.kind() == T![#])
+            })
+    })
+}
+
 /// Blanks out (with spaces, so offsets stay put) every item, statement, field, variant, match
 /// arm or expression under a `#[cfg(..)]` that's off for a script, so `#[cfg(windows)] fn x`
 /// next to `#[cfg(not(windows))] fn x` leaves one `x`. Features count as unknown here (such
@@ -904,9 +940,21 @@ pub fn strip_cfg(text: &mut String) -> bool {
     // `#[cfg(..)]` on a macro's arguments (`vec![#[cfg(unix)] 1, 2]`, `sum!(1, #[cfg(feature =
     // "x")] 2)`): not items, so the attribute is read off the token tree. Off, the argument goes
     // too (through its comma); otherwise just the attribute.
+    // (Not a call of a `macro_rules!` whose matchers take attributes themselves, `#[cfg(w =
+    // $w:literal)]` or `$(#[$m:meta])*`: it gets them as written, and its expansion is stripped.)
+    let attr_macros: Vec<String> = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::MacroRules::cast)
+        .filter(|m| m.token_tree().is_some_and(|tt| matchers_take_attrs(&tt)))
+        .filter_map(|m| ast::HasName::name(&m).map(|n| n.text().to_string()))
+        .collect();
     for mc in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
         let Some(tt) = mc.token_tree() else { continue };
         if mc.syntax().ancestors().skip(1).any(|a| ast::MacroCall::can_cast(a.kind())) {
+            continue;
+        }
+        if macro_name(&mc).is_some_and(|n| attr_macros.contains(&n)) {
             continue;
         }
         // (`cfg_if! { if #[cfg(..)] { .. } }`: the attributes are its syntax.)

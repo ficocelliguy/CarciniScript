@@ -1676,7 +1676,6 @@
     "ParseIntError:InvalidDigit": "invalid digit found in string",
     "ParseIntError:PosOverflow": "number too large to fit in target type",
     "ParseIntError:NegOverflow": "number too small to fit in target type",
-    "Utf8Error:Invalid": "invalid utf-8 sequence",
     "ParseFloatError:Empty": "cannot parse float from empty string",
     "ParseFloatError:Invalid": "invalid float literal",
     "ParseBoolError:": "provided string was not `true` or `false`",
@@ -1703,6 +1702,67 @@
     }
     toString() {
       return PARSE_MESSAGES[`${this.type}:${this.kind}`];
+    }
+  }
+
+  // `str::from_utf8`'s error: where the valid prefix ends, and how long the bad sequence there
+  // is (`null` when the bytes end inside a character), found as std finds them.
+  class Utf8Error {
+    constructor(bytes, owned) {
+      this.type = "Utf8Error";
+      if (owned) this.bytes = bytes;
+      this.valid_up_to = bytes.length;
+      this.error_len = null;
+      const n = bytes.length;
+      let i = 0;
+      scan: while (i < n) {
+        const b = bytes[i];
+        if (b < 0x80) {
+          i++;
+          continue;
+        }
+        let w = 0;
+        let lo = 0x80;
+        let hi = 0xbf;
+        if (b >= 0xc2 && b <= 0xdf) w = 2;
+        else if (b >= 0xe0 && b <= 0xef) {
+          w = 3;
+          if (b === 0xe0) lo = 0xa0;
+          if (b === 0xed) hi = 0x9f;
+        } else if (b >= 0xf0 && b <= 0xf4) {
+          w = 4;
+          if (b === 0xf0) lo = 0x90;
+          if (b === 0xf4) hi = 0x8f;
+        }
+        this.valid_up_to = i;
+        if (!w) {
+          this.error_len = 1;
+          break;
+        }
+        for (let k = 1; k < w; k++) {
+          if (i + k >= n) break scan;
+          const c = bytes[i + k];
+          if (c < (k === 1 ? lo : 0x80) || c > (k === 1 ? hi : 0xbf)) {
+            this.error_len = k;
+            break scan;
+          }
+        }
+        i += w;
+        this.valid_up_to = n;
+      }
+    }
+    $eq(o) {
+      return this.valid_up_to === o.valid_up_to && this.error_len === o.error_len;
+    }
+    $dbg() {
+      const len = this.error_len === null ? "None" : `Some(${this.error_len})`;
+      const e = `Utf8Error { valid_up_to: ${this.valid_up_to}, error_len: ${len} }`;
+      return this.bytes ? `FromUtf8Error { bytes: [${this.bytes.join(", ")}], error: ${e} }` : e;
+    }
+    toString() {
+      return this.error_len === null
+        ? `incomplete utf-8 byte sequence from index ${this.valid_up_to}`
+        : `invalid utf-8 sequence of ${this.error_len} bytes from index ${this.valid_up_to}`;
     }
   }
 
@@ -2035,15 +2095,33 @@
       }
       // `range(lo..hi)` / `range(lo..=hi)` / `range(lo..)` / `range(..hi)`: the entries with
       // keys in it, in order (`undefined` for an open end).
-      $range(lo, hi, inclusive) {
-        if (lo !== undefined && hi !== undefined && cmp(lo, hi) > 0) {
-          throw new CarciniPanic(`range start is greater than range end in ${this.constructor.name}`, "<std>");
+      // (`after`: the start is `Excluded`.)
+      $range(lo, hi, inclusive, after = false) {
+        if (lo !== undefined && hi !== undefined) {
+          const c = cmp(lo, hi);
+          if (c > 0) {
+            throw new CarciniPanic(`range start is greater than range end in ${this.constructor.name}`, "<std>");
+          }
+          if (c === 0 && after && !inclusive) {
+            throw new CarciniPanic(`range start and end are equal and excluded in ${this.constructor.name}`, "<std>");
+          }
         }
         this.$sort();
-        const i = lo === undefined ? this.h : this.$bound(lo, false);
+        const i = lo === undefined ? this.h : this.$bound(lo, after);
         const j = hi === undefined ? this.s.length : this.$bound(hi, inclusive);
         const part = i < j ? this.s.slice(i, j) : [];
         return new Iter(new MapIt(part[Symbol.iterator](), out));
+      }
+      // `range((Bound::Excluded(a), Bound::Included(b)))` (the bound prelude's enum: `$tag` 0
+      // `Included`, 1 `Excluded`, 2 `Unbounded`), or a range value (`let r = a..b; m.range(r)`).
+      $rangeArg(a) {
+        if (Array.isArray(a)) {
+          const [s, e] = a;
+          const at = (b) => (b.$tag === 2 ? undefined : b[0]);
+          return this.$range(at(s), at(e), e.$tag === 0, s.$tag === 1);
+        }
+        const it = a.it;
+        return this.$range(it.open ? undefined : it.i, it.hi ?? undefined, it.incl);
       }
       // Iteration, in key order.
       [Symbol.iterator]() {
@@ -4251,11 +4329,12 @@
       for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
       return a;
     },
-    $fromUtf8(bytes) {
+    // (`owned`: `String::from_utf8`, whose error is a `FromUtf8Error` holding the bytes.)
+    $fromUtf8(bytes, owned) {
       try {
         return new Res(0, new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)));
       } catch {
-        return new Res(1, new ParseError("Utf8Error", "Invalid"));
+        return new Res(1, new Utf8Error(bytes, owned));
       }
     },
     $fromUtf8Lossy(bytes) {
@@ -4805,6 +4884,24 @@
     $cv(cls, args) {
       const view = Object.create(cls);
       view.$cargs = args;
+      return view;
+    },
+    // A generic type's class passed for a type parameter (`go::<W<A>>()`): its associated
+    // functions with the classes they take for the `impl`'s parameters filled in. `fns` maps a
+    // function to its parameter count and its class arguments, `null` for the ones the caller
+    // passes (the function's own type parameters'); the rest of the caller's arguments follow.
+    $sv(cls, fns) {
+      const view = Object.create(cls);
+      for (const k of Object.keys(fns)) {
+        const [n, ds] = fns[k];
+        const f = cls[k];
+        view[k] = function (...a) {
+          const out = a.slice(0, n);
+          let j = n;
+          for (const d of ds) out.push(d === null ? a[j++] : d);
+          return f.apply(this, out.concat(a.slice(j)));
+        };
+      }
       return view;
     },
     // A trait's default methods, added to an implementing class unless it defines its own.

@@ -200,6 +200,30 @@ fn type_params(f: &ast::Fn) -> Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)
     out
 }
 
+/// Each type parameter of `f` with the names of its trait bounds that take no type arguments
+/// (`R: Default + Clone`, not `F: Fn(u8)` or `S: Into<String>`).
+pub(super) fn plain_bounds(f: &ast::Fn) -> Vec<(String, Vec<String>)> {
+    type_params(f)
+        .into_iter()
+        .map(|(n, lists, _)| {
+            let plain = bound_names(&lists)
+                .into_iter()
+                .filter(|(_, b)| {
+                    ast::TypeBound::cast(b.clone())
+                        .and_then(|b| b.ty())
+                        .and_then(|t| match t {
+                            ast::Type::PathType(p) => p.path()?.segment(),
+                            _ => None,
+                        })
+                        .is_some_and(|s| s.generic_arg_list().is_none())
+                })
+                .map(|(b, _)| b)
+                .collect();
+            (n, plain)
+        })
+        .collect()
+}
+
 /// For each type parameter, how many others its bounds wait on: 0 when they name no other
 /// parameter, else one more than the deepest one they name (`F: FnOnce() -> P` waits on `P`,
 /// whatever `P`'s own bounds are). Lowering in this order sees each named parameter first.
@@ -776,8 +800,34 @@ impl Checker<'_> {
         )
     }
 
+    /// `emit(&mut Vec::new())` with `W: io::Write`: the one `Vec` impl of the trait (`impl Write
+    /// for Vec<u8>`) names the element type, as rustc infers it.
+    fn settle_by_impl(&mut self, t: &Ty, b: &str) {
+        // (`shallow`, not `zonk`: an unsettled element type stays a variable.)
+        let s = self.shallow(t);
+        if let Some(key) = crate::adt::ext_key_of(&s)
+            && let Some(tr) = self.adts.traits.get(b)
+            && let Some(impl_args) = tr.methods.iter().find_map(|tm| {
+                self.adts
+                    .method(key, &tm.name)
+                    .map(|s| s.impl_args.clone())
+                    .filter(|a| !a.is_empty())
+            })
+        {
+            for (arg, want) in crate::adt::ext_args(&s).iter().zip(&impl_args) {
+                if matches!(self.shallow(arg), Ty::Var(_)) && !matches!(want, Ty::Param(_)) {
+                    self.unify(arg, want);
+                }
+            }
+        }
+    }
+
     /// Check the bounds of every generic call in the function.
     pub(super) fn resolve_bounds(&mut self) {
+        // A struct's type arguments, by its parameters' bounds: only inferred from, not checked.
+        for (t, b) in std::mem::take(&mut self.adt_bounds) {
+            self.settle_by_impl(&t, &b);
+        }
         let saved = self.base;
         for (t, b, node, base) in std::mem::take(&mut self.pending_bounds) {
             // (Calls inside macro arguments were parsed from the argument's text.)
@@ -786,25 +836,7 @@ impl Checker<'_> {
             if matches!(z, Ty::Var(_) | Ty::Unknown) {
                 continue;
             }
-            // `emit(&mut Vec::new())` with `W: io::Write`: the one `Vec` impl of the trait
-            // (`impl Write for Vec<u8>`) names the element type, as rustc infers it.
-            // (`shallow`, not `zonk`: an unsettled element type stays a variable.)
-            let s = self.shallow(&t);
-            if let Some(key) = crate::adt::ext_key_of(&s)
-                && let Some(tr) = self.adts.traits.get(&b)
-                && let Some(impl_args) = tr.methods.iter().find_map(|tm| {
-                    self.adts
-                        .method(key, &tm.name)
-                        .map(|s| s.impl_args.clone())
-                        .filter(|a| !a.is_empty())
-                })
-            {
-                for (arg, want) in crate::adt::ext_args(&s).iter().zip(&impl_args) {
-                    if matches!(self.shallow(arg), Ty::Var(_)) && !matches!(want, Ty::Param(_)) {
-                        self.unify(arg, want);
-                    }
-                }
-            }
+            self.settle_by_impl(&t, &b);
             let z = self.zonk(&t);
             if !self.satisfies(&z, &b) {
                 // (The react prelude's bounds say what a `jsx!` child or attribute takes.)
@@ -1076,6 +1108,44 @@ impl Checker<'_> {
         }
     }
 
+    /// Whether a call of trait `b`'s method on a value of `T` (`name`) goes by `T`'s class
+    /// (`κσ.$dcallT`), noting the class the function then takes.
+    pub(super) fn by_class_dispatch(&mut self, name: &str, b: &str) -> bool {
+        // `x.money()` with `impl Money for i32` and `impl Money for f64`: JS can't tell a whole
+        // `f64` from an integer.
+        let numeric_impls = self
+            .adts
+            .trait_impls
+            .iter()
+            .filter(|(ty, trs)| {
+                trs.iter().any(|t| t == b)
+                    && matches!(Ty::from_name(ty), Ty::Int(_) | Ty::Float { .. })
+            })
+            .count();
+        // The same with an impl on `Option` next to others: `Some(4)` is `4` at run time, so
+        // only the class tells `Option<i32>`'s impl from `i32`'s.
+        let option_impl = self
+            .adts
+            .trait_impls
+            .get("Option")
+            .is_some_and(|trs| trs.iter().any(|t| t == b))
+            && self
+                .adts
+                .trait_impls
+                .iter()
+                .any(|(ty, trs)| ty != "Option" && trs.iter().any(|t| t == b));
+        // And with impls on a tuple and a `Vec` (slice, array): all of them are JS arrays.
+        let has = |k: &str| {
+            self.adts
+                .trait_impls
+                .get(k)
+                .is_some_and(|trs| trs.iter().any(|t| t == b))
+        };
+        let array_impls = has("Vec") && (1..=12).filter_map(crate::adt::tuple_key).any(has);
+        (numeric_impls >= 2 || option_impl || array_impls)
+            && (self.try_note_dict(name) || array_impls && self.elem_class(name))
+    }
+
     /// Methods on a value of type parameter `T`.
     pub(super) fn param_method(
         &mut self,
@@ -1086,46 +1156,17 @@ impl Checker<'_> {
         args: &[ast::Expr],
     ) -> Ty {
         // A method of a user trait in `T`'s bounds.
-        let bounds = self.param_bounds.get(name).cloned().unwrap_or_default();
+        // (`p.parse(s)` on a `T::P` whose trait declares `type P: Parser;`: those bounds.)
+        let bounds = match self.param_bounds.get(name) {
+            Some(b) => b.clone(),
+            None => self.bound_traits(name),
+        };
         if let Some((b, sig)) = bounds
             .iter()
             .find_map(|b| self.trait_method(b, method).map(|s| (b.clone(), s)))
             && sig.receiver.is_some()
         {
-            // `x.money()` with `impl Money for i32` and `impl Money for f64`: JS can't tell a
-            // whole `f64` from an integer, so the call goes by `T`'s class (`κσ.$dcallT`).
-            let numeric_impls = self
-                .adts
-                .trait_impls
-                .iter()
-                .filter(|(ty, trs)| {
-                    trs.contains(&b) && matches!(Ty::from_name(ty), Ty::Int(_) | Ty::Float { .. })
-                })
-                .count();
-            // The same with an impl on `Option` next to others: `Some(4)` is `4` at run time, so
-            // only the class tells `Option<i32>`'s impl from `i32`'s.
-            let option_impl = self
-                .adts
-                .trait_impls
-                .get("Option")
-                .is_some_and(|trs| trs.contains(&b))
-                && self
-                    .adts
-                    .trait_impls
-                    .iter()
-                    .any(|(ty, trs)| ty != "Option" && trs.contains(&b));
-            // And with impls on a tuple and a `Vec` (slice, array): all of them are JS arrays.
-            let has = |k: &str| {
-                self.adts
-                    .trait_impls
-                    .get(k)
-                    .is_some_and(|trs| trs.contains(&b))
-            };
-            let array_impls =
-                has("Vec") && (1..=12).filter_map(crate::adt::tuple_key).any(has);
-            if (numeric_impls >= 2 || option_impl || array_impls)
-                && (self.try_note_dict(name) || array_impls && self.elem_class(name))
-            {
+            if self.by_class_dispatch(name, &b) {
                 let r = self.range(m.syntax());
                 self.class_dispatch.insert(r);
             }

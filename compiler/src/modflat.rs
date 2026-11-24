@@ -507,11 +507,35 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
     }
     // `use`s inside function bodies (`fn main() { use geo::Point as P; .. }`): the alias is
     // recorded with the module's (its scope is wider than the block, which is close enough).
+    // In that block it also wins over the module's own items (`use deeply::function;` there
+    // shadows the outer `fn function`).
+    let mut block_uses: Vec<(ra_ap_syntax::TextRange, String, String)> = Vec::new();
     for u in file.syntax().descendants().filter_map(ast::Use::cast) {
-        if u.syntax().parent().is_none_or(|p| p.kind() != SyntaxKind::STMT_LIST) {
+        let Some(block) = u
+            .syntax()
+            .parent()
+            .filter(|p| p.kind() == SyntaxKind::STMT_LIST)
+        else {
             continue;
-        }
+        };
         let path = module_path(u.syntax());
+        for (segs, rename, star) in crate::typeck::use_leaves(&u) {
+            if star {
+                continue;
+            }
+            let Some((start, rest, explicit)) = f.start(&path, &segs) else {
+                continue;
+            };
+            let (module, i) = f.walk(start, rest);
+            if (i > 0 || explicit) && i + 1 == rest.len() {
+                let name = &rest[i];
+                let mangled = f
+                    .lookup(&module, name, 0)
+                    .unwrap_or_else(|| mangle(&module, name));
+                let alias = rename.unwrap_or_else(|| name.clone());
+                block_uses.push((block.text_range(), alias, mangled));
+            }
+        }
         removed.extend(f.uses(&[ast::Item::Use(u)], &path, &mut errors));
     }
 
@@ -600,6 +624,22 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
         else {
             continue;
         };
+        // A name a block's own `use` brings in (the innermost block's).
+        if let [name] = names_seg.as_slice()
+            && !is_local(n, n.text_range().start(), name)
+            && let Some((_, _, mangled)) = block_uses
+                .iter()
+                .filter(|(r, alias, _)| alias == name && r.contains_range(n.text_range()))
+                .min_by_key(|(r, _, _)| r.len())
+        {
+            if mangled != name
+                && let Some(nr) = segs[0].name_ref()
+            {
+                let (a, b) = range(nr.syntax());
+                edits.push((a, b, mangled.clone()));
+            }
+            continue;
+        }
         // A single name inside a function may be a local, which wins over items.
         let (skipped, mangled) = match f.resolve(&module_path(n), &names_seg, true, |name| {
             is_local(n, n.text_range().start(), name)

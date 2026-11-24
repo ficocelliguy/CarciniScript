@@ -542,12 +542,26 @@ impl Checker<'_> {
                         }
                         self.record(r.syntax(), Ty::Unknown);
                     }
+                    // A `(Bound<K>, Bound<K>)` pair, a range value or an `R: RangeBounds<K>`
+                    // (`$rangeArg` reads either at run time).
                     Some(other) => {
-                        self.error(
-                            other.syntax(),
-                            "`range` takes a range expression here (`a..b`, `a..=b`, `a..`, `..b`); `Bound` pairs aren't supported yet",
-                        );
-                        self.infer(&other, None);
+                        let bound = Ty::Adt("Bound".into(), vec![key.clone()]);
+                        let t = self.infer(&other, None);
+                        match self.shallow(&t) {
+                            Ty::Tuple(es) if es.len() == 2 => {
+                                for e in &es {
+                                    self.unify(e, &bound);
+                                }
+                            }
+                            Ty::Range(e, _) => {
+                                self.unify(&e, &key);
+                            }
+                            Ty::Param(_) | Ty::Unknown => {}
+                            _ => self.error(
+                                other.syntax(),
+                                "`range` takes a range (`a..b`, `a..=b`, `a..`, `..b`) or a `(Bound<K>, Bound<K>)` pair here",
+                            ),
+                        }
                     }
                     None => {}
                 }

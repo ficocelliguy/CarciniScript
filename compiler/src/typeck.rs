@@ -235,6 +235,9 @@ pub struct Types {
     /// `T::from(x)` with `T: From<X>`: `X`'s name, by the call's range (the class's
     /// `$from$X`, or the number conversion).
     pub param_froms: HashMap<(usize, usize), String>,
+    /// `<T as Tr>::make()` / `Tr::make()` where a `T` is expected, for a type parameter `T`: `T`,
+    /// by the call's range (emitted as `T::make()`).
+    pub param_paths: HashMap<(usize, usize), String>,
     /// Structs whose values carry classes for some of their type parameters (`this.$T`), by
     /// position: what an `impl<T>`'s methods with `self` use for `T` (`a / b`, `s.parse::<T>()`).
     pub stored: HashMap<String, Vec<usize>>,
@@ -319,6 +322,12 @@ struct Local {
     decl: Option<(usize, usize)>,
 }
 
+/// The std bounds a trait method's own type parameters are checked against where a call
+/// through a type parameter names their types (the file's own traits are checked too).
+const CHECKED_OWN_BOUNDS: &[&str] = &[
+    "Default", "Clone", "Copy", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash",
+];
+
 /// What a mutation of a place is doing, for rustc-style error messages.
 #[derive(Clone, Copy, PartialEq)]
 enum Mutation {
@@ -365,6 +374,7 @@ impl<'a> Checker<'a> {
             slot_options: HashMap::new(),
             slot_results: HashMap::new(),
             pending_bounds: Vec::new(),
+            adt_bounds: Vec::new(),
             loops: Vec::new(),
             boxed: Default::default(),
             cell_args: Default::default(),
@@ -375,6 +385,7 @@ impl<'a> Checker<'a> {
             slot_bindings: Default::default(),
             mut_ref_loops: Default::default(),
             copy_arrays: Default::default(),
+            str_locals: Default::default(),
             move_sites: Default::default(),
             io_writes: Default::default(),
             slot_item_calls: Default::default(),
@@ -433,6 +444,7 @@ impl<'a> Checker<'a> {
             crate_items: crates::crate_imports(src),
             stored_uses: Default::default(),
             param_froms: HashMap::new(),
+            param_paths: HashMap::new(),
             unbound_targs: Default::default(),
             generic_calls: Vec::new(),
             last_type_args: Vec::new(),
@@ -766,6 +778,7 @@ pub fn check(
     let quote_reps = std::mem::take(&mut c.quote_reps);
     let js_calls = std::mem::take(&mut c.js_calls);
     let param_froms = std::mem::take(&mut c.param_froms);
+    let param_paths = std::mem::take(&mut c.param_paths);
     let mut crate_calls = std::mem::take(&mut c.crate_calls);
     for cc in crate_calls.values_mut() {
         cc.tys = cc.tys.iter().map(|t| c.zonk(t)).collect();
@@ -825,6 +838,7 @@ pub fn check(
             quote_reps,
             js_calls,
             param_froms,
+            param_paths,
             stored,
             crate_calls,
         },
@@ -906,6 +920,9 @@ struct Checker<'a> {
     whole_slot_items: std::collections::HashSet<(usize, usize)>,
     /// Bounds to check once a generic call's type arguments are known.
     pending_bounds: Vec<(Ty, String, SyntaxNode, usize)>,
+    /// New values' type arguments with the user-trait bounds their struct declares on them
+    /// (`struct Auto<S: RawStream>`), to infer from (`Auto::new(Vec::new())`).
+    adt_bounds: Vec<(Ty, String)>,
     boxed: std::collections::HashSet<(usize, usize)>,
     cell_args: std::collections::HashSet<(usize, usize)>,
     slot_args: std::collections::HashSet<(usize, usize)>,
@@ -916,6 +933,9 @@ struct Checker<'a> {
     mut_ref_loops: std::collections::HashSet<(usize, usize)>,
     /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
     copy_arrays: std::collections::HashSet<(usize, usize)>,
+    /// `let` locals whose initializer is certainly a `&str` (`let s = "a";`, `let t = s;`,
+    /// `let u = x.as_str();`), by declaration: `s + ".."` is rustc's E0369.
+    str_locals: std::collections::HashSet<(usize, usize)>,
     /// Uses that move a binding (filled by the move checker).
     move_sites: std::collections::HashSet<(usize, usize)>,
     /// `write!` destinations that are `io::Write`rs (by their start).
@@ -1016,6 +1036,8 @@ struct Checker<'a> {
     const_derivable: std::collections::HashSet<(String, String)>,
     /// `T::from(x)` calls: `X`'s name by range.
     param_froms: HashMap<(usize, usize), String>,
+    /// `<T as Tr>::make()` calls: `T` by range.
+    param_paths: HashMap<(usize, usize), String>,
     /// Struct literals of structs with const parameters: (range, struct, type arguments).
     const_lits: Vec<((usize, usize), String, Vec<Ty>)>,
     /// Calls of the bundled crates (`rand`), by range.
@@ -1149,6 +1171,27 @@ impl<'a> Checker<'a> {
             message: "this loop never ends and never awaits, so it would freeze Bitburner: add `ns.sleep(..).await` (or another awaited NS call) inside it".into(),
             severity: "warning",
             help: None,
+        });
+    }
+
+    /// `ns.hack("x");` / `work();` with `async fn work()`: a call's future dropped as a
+    /// statement never runs (rustc's `unused_must_use`). In Bitburner the script goes on, and
+    /// its next NS call fails because this one is still pending.
+    fn warn_dropped_future(&mut self, e: &ast::Expr, t: &Ty) {
+        // (Also an `async { .. };` block.)
+        let block = matches!(e, ast::Expr::BlockExpr(b) if b.async_token().is_some());
+        if !(block || matches!(e, ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_)))
+            || !matches!(self.shallow(t), Ty::Future(_))
+        {
+            return;
+        }
+        let (start, end) = self.range(e.syntax());
+        self.diags.push(RawDiag {
+            start,
+            end,
+            message: "unused implementer of `Future` that must be used".into(),
+            severity: "warning",
+            help: Some(format!("futures do nothing unless you `.await` them: write `.await` after the {} (an NS call left pending makes the script's next NS call fail)", if block { "block" } else { "call" })),
         });
     }
 
@@ -2022,7 +2065,12 @@ impl<'a> Checker<'a> {
                         _ => self.fresh(VarKind::General),
                     };
                 }
-                if is_std_error(&name) {
+                // (Unless the program defines its own: `pub struct ParseIntError { .. }`, which a
+                // plain `ParseIntError` names; `num::ParseIntError` is still std's.)
+                if is_std_error(&name)
+                    && (!self.adts.defs.contains_key(&name)
+                        || p.path().is_some_and(|q| q.qualifier().is_some()))
+                {
                     return Ty::Extern(name);
                 }
                 if name == "Option" {
@@ -2224,7 +2272,7 @@ impl<'a> Checker<'a> {
             "Wrapping" => "num",
             "Cow" => "borrow",
             "Path" | "PathBuf" => "path",
-            "ControlFlow" | "Bound" => "ops",
+            "ControlFlow" | "Bound" | "RangeBounds" => "ops",
             _ => return,
         };
         if self.glob_imports
@@ -2897,6 +2945,7 @@ impl<'a> Checker<'a> {
             ast::Stmt::ExprStmt(es) => match es.expr() {
                 Some(e) => {
                     let t = self.infer(&e, None);
+                    self.warn_dropped_future(&e, &t);
                     self.shallow(&t) == Ty::Never
                 }
                 None => false,
@@ -3101,6 +3150,13 @@ impl<'a> Checker<'a> {
             self.declare(&name, local);
             if let Some(s) = slot_item {
                 self.slot_items.insert(name.text().to_string(), s);
+            }
+            if l.ty().is_none()
+                && l.initializer().is_some_and(|i| self.str_init(&i))
+                && self.zonk(&ty) == Ty::Str
+            {
+                let r = self.range(name.syntax());
+                self.str_locals.insert(r);
             }
             if self.copy_array(l.ty().as_ref(), l.initializer().as_ref(), &ty) {
                 let r = self.range(name.syntax());
@@ -4942,7 +4998,12 @@ impl<'a> Checker<'a> {
                                 && l.initializer().is_some_and(|i| i.syntax() == r.syntax())
                                 && matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
                         });
-                if wanted || bound || self.range_ext_value(r, kind) || range_conv_value(r) {
+                if wanted
+                    || bound
+                    || self.range_ext_value(r, kind)
+                    || range_conv_value(r)
+                    || expected.is_some_and(|t| self.range_bound_arg(t, kind))
+                {
                     if kind == RangeKind::Full {
                         return Ty::Range(Box::new(Ty::Unit), kind);
                     }
@@ -5489,6 +5550,34 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether `e` is fields of a local (`p.x`, `s.a.b`), with no index or `*` on the way.
+    fn field_place(e: &ast::Expr) -> bool {
+        match strip_parens(e) {
+            ast::Expr::FieldExpr(f) => f.expr().is_some_and(|b| match strip_parens(&b) {
+                ast::Expr::PathExpr(_) => true,
+                b => Self::field_place(&b),
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether `e` is the left side of an assignment (`e = v`, `e += v`, `(e, f) = t`).
+    fn assigned_place(e: &ast::Expr) -> bool {
+        let mut node = e.syntax().clone();
+        loop {
+            let Some(parent) = node.parent() else { return false };
+            if let Some(b) = ast::BinExpr::cast(parent.clone()) {
+                return matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }))
+                    && b.lhs().is_some_and(|l| l.syntax() == &node);
+            }
+            if ast::TupleExpr::can_cast(parent.kind()) || ast::ParenExpr::can_cast(parent.kind()) {
+                node = parent;
+            } else {
+                return false;
+            }
+        }
+    }
+
     /// Whether `e` is `map[..]` on a `HashMap`, which can be read but not assigned through.
     fn indexes_a_map(&mut self, e: &ast::Expr) -> bool {
         let ast::Expr::IndexExpr(ix) = strip_parens(e) else {
@@ -5503,12 +5592,14 @@ impl<'a> Checker<'a> {
     /// with `table: &'a mut Table`): a write there goes through the reference, so the binding
     /// needn't be `mut`. (Assigning the field itself, `self.table = t`, still needs it.)
     fn through_mut_field(&self, e: &ast::Expr, how: Mutation) -> bool {
-        // (`&mut s.table` borrows the field itself, which does need it.)
+        // (`&mut s.table` borrows the field itself, which does need it; so does `s.table = t`,
+        // which the caller passes as a `Borrow` since it is reached through a field.)
         let explicit = e
             .syntax()
             .parent()
             .and_then(ast::RefExpr::cast)
-            .is_some_and(|r| r.mut_token().is_some());
+            .is_some_and(|r| r.mut_token().is_some())
+            || Self::assigned_place(e);
         let mut cur = strip_parens(e);
         let mut outermost = true;
         loop {
@@ -5630,6 +5721,14 @@ impl<'a> Checker<'a> {
                 e.syntax(),
                 format!("cannot borrow `*{n}` as mutable, as it is behind a `&` reference"),
             ),
+            // `p.x = 5`, `s.table = t`: rustc's E0594 names the field.
+            None if !local.mutable && Self::assigned_place(e) && Self::field_place(e) => {
+                let place = strip_parens(e).syntax().text().to_string();
+                self.error(
+                    e.syntax(),
+                    format!("cannot assign to `{place}`, as `{n}` is not declared as mutable (declare it with `let mut {n}`)"),
+                )
+            }
             None if !local.mutable => self.error(
                 e.syntax(),
                 format!("cannot borrow `{n}` as mutable, as it is not declared as mutable (declare it with `let mut {n}`)"),
@@ -5846,7 +5945,7 @@ impl<'a> Checker<'a> {
     }
 
     /// Whether `e` is certainly a `&str` (not a `String`): a string literal, `&x`, or a local
-    /// declared `&str`.
+    /// declared `&str` or initialized with one (`str_locals`).
     fn borrowed_str(&self, e: &ast::Expr) -> bool {
         match e {
             ast::Expr::ParenExpr(p) => p.expr().is_some_and(|x| self.borrowed_str(&x)),
@@ -5856,8 +5955,26 @@ impl<'a> Checker<'a> {
                 .path()
                 .and_then(|p| p.as_single_name_ref())
                 .and_then(|n| self.lookup(n.text().as_ref()))
-                .is_some_and(|l| l.reference == Some(false)),
+                .is_some_and(|l| l.reference == Some(false) || l.decl.is_some_and(|d| self.str_locals.contains(&d))),
             _ => false,
+        }
+    }
+
+    /// A `let` initializer that is certainly a `&str`: what `borrowed_str` accepts, or a method
+    /// giving one (`x.as_str()`, `x.trim()`).
+    fn str_init(&self, e: &ast::Expr) -> bool {
+        match e {
+            ast::Expr::ParenExpr(p) => p.expr().is_some_and(|x| self.str_init(&x)),
+            ast::Expr::MethodCallExpr(m) => {
+                m.arg_list().is_some_and(|a| a.args().next().is_none())
+                    && m.name_ref().is_some_and(|n| {
+                        matches!(
+                            n.text().to_string().as_str(),
+                            "as_str" | "trim" | "trim_start" | "trim_end"
+                        )
+                    })
+            }
+            _ => self.borrowed_str(e),
         }
     }
 
@@ -5969,7 +6086,7 @@ impl<'a> Checker<'a> {
             }
             return Ty::Unknown;
         };
-        if let Some(t) = self.qualified_call(c, &callee, &args) {
+        if let Some(t) = self.qualified_call(c, &callee, &args, expected) {
             return t;
         }
         let Some(path) = callee.path() else {
@@ -6797,6 +6914,29 @@ impl<'a> Checker<'a> {
             parent.kind(),
             ra_ap_syntax::SyntaxKind::REF_EXPR | ra_ap_syntax::SyntaxKind::ARRAY_EXPR
         )
+    }
+
+    /// Whether a range passed where `t` is expected is a value: `t` is a generic call's type
+    /// argument bound by a trait the range type implements (`take(5..=6)` with `R:
+    /// RangeBounds<i32>`), not an iterator.
+    fn range_bound_arg(&self, t: &Ty, kind: RangeKind) -> bool {
+        let key = kind.name();
+        let implemented = |b: &str| {
+            self.adts.traits.get(b).is_some_and(|tr| {
+                tr.methods
+                    .iter()
+                    .any(|m| self.adts.method(key, &m.name).is_some())
+            })
+        };
+        match self.shallow(t) {
+            // (`r: impl RangeBounds<u8>`.)
+            Ty::Dyn(b) => implemented(&b),
+            t @ Ty::Var(_) => self
+                .pending_bounds
+                .iter()
+                .any(|(v, b, ..)| self.shallow(v) == t && implemented(b)),
+            _ => false,
+        }
     }
 
     /// Values JS can't point at: they need a cell to be shared through `&mut`.
@@ -9875,6 +10015,7 @@ impl Checker<'_> {
         c: &ast::CallExpr,
         callee: &ast::PathExpr,
         args: &[ast::Expr],
+        expected: Option<&Ty>,
     ) -> Option<Ty> {
         let path = callee.path()?;
         let method = path.segment()?.name_ref()?.text().to_string();
@@ -9916,6 +10057,43 @@ impl Checker<'_> {
                 (bound.unwrap_or(n), None)
             }
         };
+        // `<T as Bounded>::min_value()`, or `Bounded::min_value()` where a `T` is expected, with
+        // `T: Bounded`: as `T::min_value()` (by `T`'s class).
+        let param = match &anchor_ty {
+            Some(ast::Type::PathType(p)) => p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .map(|n| n.text().to_string()),
+            Some(_) => None,
+            // (`Self` where the function's return type has it: `fn from(n: i64) -> Option<Self>`.)
+            None => {
+                let ret = self.adts.traits.get(&trait_name).and_then(|d| {
+                    let m = d.methods.iter().find(|m| m.name == method)?;
+                    Some(m.sig.ret.clone())
+                });
+                match (ret, expected) {
+                    (Some(ret), Some(e)) => match self.self_in(&ret, e) {
+                        Some(Ty::Param(p)) => Some(p),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+        };
+        if let Some(p) = param.filter(|p| p != "Self" && self.param_bounds.contains_key(p))
+            && (self.bound_traits(&p).contains(&trait_name)
+                || self.cur_blanket_trait(&p).is_some_and(|t| t == trait_name))
+            && self.adts.traits.get(&trait_name).is_some_and(|d| {
+                d.methods
+                    .iter()
+                    .any(|m| m.name == method && m.sig.receiver.is_none())
+            })
+            && let Some(t) = self.param_static_call(c, &p, &method, args)
+        {
+            let r = self.range(c.syntax());
+            self.param_paths.insert(r, p);
+            return Some(t);
+        }
         let def = self.adts.traits.get(&trait_name).cloned()?;
         let tm = def.methods.iter().find(|m| m.name == method)?.clone();
         // (`self: Arc<Self>` and the like count too: the first parameter is about `Self`.)
@@ -9961,6 +10139,14 @@ impl Checker<'_> {
         }
         let local_trait = def.module.is_none();
         let r = self.range(c.syntax());
+        // `T::money(&x)` on a `T` whose impls JS can't tell apart: by `T`'s class, as `x.money()`.
+        if receiver
+            && let Ty::Param(p) = self.shallow(&self_ty)
+            && self.param_bounds.contains_key(&p)
+            && self.by_class_dispatch(&p, &trait_name)
+        {
+            self.class_dispatch.insert(r);
+        }
         self.qualified_calls.insert(
             r,
             QualifiedCall {
@@ -9980,10 +10166,37 @@ impl Checker<'_> {
 }
 
 impl Checker<'_> {
+    /// What `Self` is in `ret` (a trait function's return type) for a call expected to make
+    /// `expected`: `Self` against `T`, `Option<Self>` against `Option<T>`, and so on.
+    fn self_in(&self, ret: &Ty, expected: &Ty) -> Option<Ty> {
+        let e = self.shallow(expected);
+        match (ret, &e) {
+            (Ty::Param(s), _) if s == "Self" => Some(e),
+            (Ty::Option(r), Ty::Option(x)) | (Ty::Vec(r), Ty::Vec(x)) => self.self_in(r, x),
+            (Ty::Result(r, re), Ty::Result(x, xe)) => {
+                self.self_in(r, x).or_else(|| self.self_in(re, xe))
+            }
+            (Ty::Tuple(rs), Ty::Tuple(xs)) if rs.len() == xs.len() => {
+                rs.iter().zip(xs).find_map(|(r, x)| self.self_in(r, x))
+            }
+            _ => None,
+        }
+    }
+
     /// `T`'s bounds and their supertraits, of this file.
     fn bound_traits(&self, param: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let mut todo: Vec<String> = self.param_bounds.get(param).cloned().unwrap_or_default();
+        let mut todo: Vec<String> = match (self.param_bounds.get(param), param.rsplit_once("::")) {
+            (Some(b), _) => b.clone(),
+            // `T::P` with `T: Fac` and `trait Fac { type P: Parser; }`: what `Fac` declares.
+            (None, Some((p, a))) => self
+                .bound_traits(p)
+                .iter()
+                .filter_map(|t| self.adts.traits.get(t)?.assoc_bounds.get(a).cloned())
+                .flatten()
+                .collect(),
+            (None, None) => Vec::new(),
+        };
         while let Some(t) = todo.pop() {
             if out.contains(&t) {
                 continue;
@@ -10188,18 +10401,20 @@ impl Checker<'_> {
             self.note_dict(param, c.syntax());
             return Some(pty);
         }
-        let (tr, sig) = bounds.iter().find_map(|b| {
+        let (tr, sig, own_bounds) = bounds.iter().find_map(|b| {
             let d = self.adts.traits.get(b)?;
             let tm = d
                 .methods
                 .iter()
                 .find(|m| m.name == f && m.sig.receiver.is_none())?;
-            Some((b.clone(), tm.sig.clone()))
+            Some((b.clone(), tm.sig.clone(), tm.own_bounds.clone()))
         })?;
-        let mut sub: HashMap<String, Ty> = [("Self".to_string(), pty)].into();
+        // (`Fac::P` in `fn make() -> Self::P` is `T::P`, or the bound's `P = X`.)
+        let mut sub = self.bound_subst(param);
+        sub.insert("Self".to_string(), pty);
         // The method's own type parameters (`fn select<R: Copy>(r: R) -> R`): the turbofish's
         // (`O::select::<u8>(x)`), or fresh.
-        let turbofish: Vec<Ty> = match c.expr() {
+        let turbofish: Vec<(Ty, SyntaxNode)> = match c.expr() {
             Some(ast::Expr::PathExpr(p)) => p
                 .path()
                 .and_then(|p| p.segment())
@@ -10207,15 +10422,22 @@ impl Checker<'_> {
                 .map(|l| l.generic_args().collect::<Vec<_>>())
                 .unwrap_or_default()
                 .iter()
-                .filter_map(|g| self.generic_arg_ty(g))
+                .filter_map(|g| Some((self.generic_arg_ty(g)?, g.syntax().clone())))
                 .collect(),
             _ => Vec::new(),
         };
         for (i, p) in sig.type_params.iter().enumerate() {
-            let t = match turbofish.get(i) {
-                Some(t) => t.clone(),
-                None => self.fresh(VarKind::General),
+            let (t, at) = match turbofish.get(i) {
+                Some((t, at)) => (t.clone(), at.clone()),
+                None => (self.fresh(VarKind::General), c.syntax().clone()),
             };
+            // Its bounds, checked once the type is known (`O::select::<NoDef>` with `R: Default`).
+            for b in own_bounds.iter().filter(|(n, _)| n == p).flat_map(|(_, bs)| bs) {
+                if CHECKED_OWN_BOUNDS.contains(&b.as_str()) || self.adts.traits.contains_key(b) {
+                    self.pending_bounds
+                        .push((t.clone(), b.clone(), at.clone(), self.base));
+                }
+            }
             sub.insert(p.clone(), t);
         }
         // (Its own parameters' classes, which an impl's body may need (`R::default()`), go with

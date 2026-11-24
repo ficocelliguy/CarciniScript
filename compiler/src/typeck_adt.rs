@@ -133,6 +133,35 @@ impl Checker<'_> {
                     manual: vec![],
                 },
             );
+            let bounds = type_param_bounds(&item);
+            if bounds.iter().any(|b| !b.is_empty()) {
+                self.adts.param_bounds.insert(name.text().to_string(), bounds);
+            }
+        }
+        // And those an inherent impl declares (`impl<S: RawStream> Auto<S> { fn always(s: S) }`),
+        // which settle a new value's type arguments the same way. (Only inferred from, so one
+        // impl's bound reaching another impl's calls is lenient, not wrong.)
+        for item in crate::adt::all_items(file) {
+            let ast::Item::Impl(imp) = &item else { continue };
+            if imp.trait_().is_some() {
+                continue;
+            }
+            for (adt, pos, bounds) in impl_param_bounds(imp) {
+                let Some(def) = self.adts.defs.get(&adt) else { continue };
+                let n = def.type_params.len();
+                let all = self
+                    .adts
+                    .param_bounds
+                    .entry(adt)
+                    .or_insert_with(|| vec![Vec::new(); n]);
+                if let Some(slot) = all.get_mut(pos) {
+                    for b in bounds {
+                        if !slot.contains(&b) {
+                            slot.push(b);
+                        }
+                    }
+                }
+            }
         }
         // Const parameters (`struct Buf<T, const N: usize = 4>`), then how each is read off
         // the fields (`data: [T; N]`).
@@ -449,7 +478,24 @@ impl Checker<'_> {
             .get(adt)
             .map(|d| d.type_params.len())
             .unwrap_or(0);
-        (0..n).map(|_| self.fresh(VarKind::General)).collect()
+        let args: Vec<Ty> = (0..n).map(|_| self.fresh(VarKind::General)).collect();
+        self.note_adt_bounds(adt, &args);
+        args
+    }
+
+    /// The user-trait bounds `adt` declares on its type parameters, for `args` (see
+    /// `adt_bounds`).
+    fn note_adt_bounds(&mut self, adt: &str, args: &[Ty]) {
+        let Some(bounds) = self.adts.param_bounds.get(adt) else {
+            return;
+        };
+        for (a, bs) in args.iter().zip(bounds) {
+            for b in bs {
+                if self.adts.traits.contains_key(b) {
+                    self.adt_bounds.push((a.clone(), b.clone()));
+                }
+            }
+        }
     }
 
     /// Variant `v` of `adt` with its field types instantiated for `args`.
@@ -868,6 +914,14 @@ impl Checker<'_> {
                     }
                 };
                 self.generics.insert(n, Ty::Future(Box::new(out)));
+            } else if let Some(target) = lists.iter().find_map(super::conversion_target) {
+                // `impl<T: AsRef<str>> Display for K<T>`: a string, as in a function's generics.
+                // Only strings: other targets (`AsRef<[u8]>` of a `&str`) convert where a
+                // function's argument is passed, and a value of the impl's type has no such step.
+                let t = self.lower_type(&target);
+                if t == Ty::Str {
+                    self.generics.insert(n, t);
+                }
             }
         }
         self.note_where_projections(imp.where_clause());
@@ -2319,6 +2373,11 @@ impl Checker<'_> {
                     })
                     .unwrap_or_default();
                 let method = self.method_inst(&method, None);
+                // (`Auto::always(Vec::new())` with `struct Auto<S: RawStream>`.)
+                if method.impl_args.iter().any(|a| matches!(a, Ty::Var(_))) {
+                    let args = method.impl_args.clone();
+                    self.note_adt_bounds(&adt, &args);
+                }
                 if dict_count > 0 {
                     let own = std::mem::take(&mut self.last_type_args);
                     if let Some(ast::Expr::PathExpr(p)) = c.expr() {
@@ -3233,6 +3292,94 @@ fn type_param_names(item: &ast::Item) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The traits a struct or enum bounds each of its type parameters by (`struct Auto<S: RawStream>`,
+/// `where S: RawStream`), by name; const parameters have none.
+fn type_param_bounds(item: &ast::Item) -> Vec<Vec<String>> {
+    let (gp, wc) = match item {
+        ast::Item::Struct(s) => (s.generic_param_list(), s.where_clause()),
+        ast::Item::Enum(e) => (e.generic_param_list(), e.where_clause()),
+        _ => (None, None),
+    };
+    let names = |l: ast::TypeBoundList| {
+        l.bounds()
+            .filter_map(|b| match b.ty() {
+                Some(ast::Type::PathType(p)) => {
+                    p.path()?.segment()?.name_ref().map(|n| n.text().to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    gp.into_iter()
+        .flat_map(|l| l.generic_params())
+        .filter_map(|p| match p {
+            ast::GenericParam::TypeParam(tp) => {
+                let name = tp.name()?.text().to_string();
+                let mut out: Vec<String> = tp.type_bound_list().map(names).unwrap_or_default();
+                for l in where_clause_bounds(wc.clone(), &name) {
+                    out.extend(names(l));
+                }
+                Some(out)
+            }
+            ast::GenericParam::ConstParam(_) => Some(Vec::new()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// For `impl<S: RawStream> Auto<S>`: (`Auto`, the argument's position, `S`'s bounds' names) for
+/// each argument of the self type that is one of the impl's type parameters with bounds.
+fn impl_param_bounds(imp: &ast::Impl) -> Vec<(String, usize, Vec<String>)> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let Some(ast::Type::PathType(pt)) = imp.self_ty() else {
+        return Vec::new();
+    };
+    let Some(seg) = pt.path().and_then(|p| p.segment()) else {
+        return Vec::new();
+    };
+    let Some(adt) = seg.name_ref().map(|n| n.text().to_string()) else {
+        return Vec::new();
+    };
+    let params: Vec<ast::TypeParam> = imp
+        .generic_param_list()
+        .into_iter()
+        .flat_map(|l| l.type_or_const_params())
+        .filter_map(|p| match p {
+            ast::TypeOrConstParam::Type(tp) => Some(tp),
+            _ => None,
+        })
+        .collect();
+    let args = seg
+        .generic_arg_list()
+        .into_iter()
+        .flat_map(|l| l.generic_args())
+        .filter(|a| !matches!(a, ast::GenericArg::LifetimeArg(_)));
+    let mut out = Vec::new();
+    for (pos, a) in args.enumerate() {
+        let ast::GenericArg::TypeArg(ta) = a else { continue };
+        let Some(ast::Type::PathType(at)) = ta.ty() else { continue };
+        let Some(n) = at.path().and_then(|p| p.as_single_name_ref()) else { continue };
+        let Some(tp) = params.iter().find(|tp| tp.name().is_some_and(|x| x.text() == n.text()))
+        else {
+            continue;
+        };
+        let bounds: Vec<String> = tp
+            .type_bound_list()
+            .into_iter()
+            .chain(where_clause_bounds(imp.where_clause(), &n.text()))
+            .flat_map(|l| l.bounds())
+            .filter_map(|b| match b.ty()? {
+                ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        if !bounds.is_empty() {
+            out.push((adt.clone(), pos, bounds));
+        }
+    }
+    out
 }
 
 /// The bound lists a `where` clause gives the type parameter `name` (`where S: Into<String>`).

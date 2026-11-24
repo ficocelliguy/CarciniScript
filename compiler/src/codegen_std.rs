@@ -217,7 +217,10 @@ impl Codegen<'_> {
                         || m2.starts_with("wrapping_")
                         || matches!(
                             m2,
-                            "abs_diff"
+                            "unchecked_add"
+                                | "unchecked_sub"
+                                | "unchecked_mul"
+                                | "abs_diff"
                                 | "count_ones"
                                 | "count_zeros"
                                 | "leading_zeros"
@@ -232,7 +235,7 @@ impl Codegen<'_> {
                         )) =>
             {
                 let mut all = vec![
-                    Frag::text(js_string(m2)),
+                    Frag::text(js_string(&m2.replacen("unchecked_", "wrapping_", 1))),
                     rf.clone(),
                     Frag::text(format!("{}, {}", k.bits(), k.is_signed())),
                 ];
@@ -241,10 +244,12 @@ impl Codegen<'_> {
                 f.append(Frag::join(all, ", ")).push(")");
                 f
             }
+            // (`unchecked_*` wraps, as `wrapping_*`.)
             (Ty::Int(k), m2)
                 if m2.starts_with("checked_")
                     || m2.starts_with("saturating_")
-                    || m2.starts_with("wrapping_") =>
+                    || m2.starts_with("wrapping_")
+                    || matches!(m2, "unchecked_add" | "unchecked_sub" | "unchecked_mul") =>
             {
                 let (kind, op) = m2.split_once('_')?;
                 let (min, max) = k.min_max();
@@ -543,7 +548,7 @@ impl Codegen<'_> {
             f
         };
         let f = match tail {
-            ["env", "args"] => call("envArgs", vec![]),
+            ["env", "args" | "args_os"] => call("envArgs", vec![]),
             ["process", "exit"] => {
                 let code = emit(self, 0);
                 call("exit", vec![code])
@@ -584,9 +589,14 @@ impl Codegen<'_> {
                     vec![s, r, Frag::text(format!("{min}, {max}"))],
                 )
             }
-            ["str" | "String", "from_utf8"] => {
+            ["str", "from_utf8"] => {
                 let b = emit(self, 0);
                 call("fromUtf8", vec![b])
+            }
+            // (Its error is a `FromUtf8Error`, which holds the bytes.)
+            ["String", "from_utf8"] => {
+                let b = emit(self, 0);
+                call("fromUtf8", vec![b, Frag::text("true")])
             }
             ["String", "from_utf8_lossy"] => {
                 let b = emit(self, 0);

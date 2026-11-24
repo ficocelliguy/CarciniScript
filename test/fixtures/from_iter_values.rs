@@ -12,4 +12,11 @@ fn main() {
     println!("{:?}", t);
     let w: Option<Vec<u8>> = Some([4u8, 5]).map(Vec::<u8>::from_iter);
     println!("{:?}", w);
+    // Bound by `let`: with a `fn` type, or with every type argument written.
+    let f: fn(std::ops::Range<i32>) -> Vec<i32> = Vec::from_iter;
+    println!("{:?}", f(0..3));
+    let g = BTreeMap::<u8, char>::from_iter;
+    println!("{:?}", g([(2, 'b'), (1, 'a')]));
+    let h = String::from_iter;
+    println!("{} {}", h(vec!['a', 'b']), Vec::<Vec<u8>>::from_iter([vec![1u8]]).len());
 }

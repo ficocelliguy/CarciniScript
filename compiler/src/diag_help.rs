@@ -52,7 +52,9 @@ pub fn for_message(message: &str, severity: &str) -> Option<String> {
         RETURNED_REF
     } else if has("cannot assign twice to immutable variable") {
         MUTABILITY
-    } else if has("cannot borrow `") && m.contains("as it is not declared as mutable") {
+    } else if (has("cannot borrow `") || has("cannot assign to `"))
+        && m.contains("as it is not declared as mutable")
+    {
         MUTABILITY
     } else if has("cannot borrow `") && m.contains("as it is behind a `&` reference") {
         BEHIND_REF

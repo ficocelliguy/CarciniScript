@@ -722,7 +722,7 @@ const rejected = [
   ],
   ["Display of a tuple", 'println!("{}", (1, 2));', "2:14 `({integer}, {integer})` doesn't implement `std::fmt::Display`"],
   ["tuple pattern arity", "let (a, b, c) = (1, 2);", "2:9 mismatched types: expected a tuple with 2 elements, found one with 3"],
-  ["assigning a field of an immutable tuple", "let t = (1, 2);\n    t.0 = 5;", "3:5 cannot borrow `t` as mutable"],
+  ["assigning a field of an immutable tuple", "let t = (1, 2);\n    t.0 = 5;", "3:5 cannot assign to `t.0`, as `t` is not declared as mutable"],
   ["ordering sets", "let a = std::collections::HashSet::from([1]);\n    let b = a.clone();\n    let x = a < b;", "4:13 `HashSet<{integer}>` can't be compared"],
   ["float HashMap keys", "let mut m = std::collections::HashMap::new();\n    m.insert(0.5, 1);", "the trait bound `f64: Hash` is not satisfied"],
   [
@@ -756,7 +756,9 @@ const rejected = [
   ["== without PartialEq", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let a = N { v: 1.0 };\n    let c = a == N { v: 2.0 };", "10:13 the trait bound `N: PartialEq` is not satisfied"],
   ["Display of a struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    println!(\"{}\", P::new());", "9:14 `P` doesn't implement `std::fmt::Display`"],
   ["Debug without the derive", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    println!(\"{:?}\", N { v: 1.0 });", "9:14 `N` doesn't implement `std::fmt::Debug`"],
-  ["assigning a field of an immutable struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.x = 5;", "10:5 cannot borrow `p` as mutable, as it is not declared as mutable"],
+  ["assigning a field of an immutable struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.x = 5;", "10:5 cannot assign to `p.x`, as `p` is not declared as mutable"],
+  ["reassigning a `&mut` field of an immutable binding (E0594)", "}\nstruct T { n: i32 }\nstruct S<'a> { table: &'a mut T }\nfn f() {\n    let mut a = T { n: 1 };\n    let mut b = T { n: 2 };\n    let s = S { table: &mut a };\n    s.table.n = 3;\n    s.table = &mut b;", "10:5 cannot assign to `s.table`, as `s` is not declared as mutable"],
+  ["a trait generic method's own bound, called through a type parameter", "}\ntrait Order { fn select<R: Default>(x: u8) -> R; }\nstruct NoDef;\nfn go<O: Order>() -> NoDef {\n    O::select::<NoDef>(1)", "6:17 the trait bound `NoDef: Default` is not satisfied"],
   ["unknown variant", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let e = E::D;", "9:13 no variant or associated item named `D` found for enum `E`"],
   ["associated function called as a method", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.new();", "(`new` is an associated function: call `P::new(..)`)"],
   ["HashSet of a struct without Hash", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let mut s = std::collections::HashSet::new();\n    s.insert(N { v: 1.0 });", "the trait bound `N: Hash` is not satisfied"],
@@ -911,6 +913,9 @@ const rejected = [
   ["mixed arithmetic", "let a: i32 = 1;\n    let b: f64 = 2.0;\n    let c = a + b;", "4:13 cannot add `f64` to `i32`"],
   ["`+` on two string literals", "let s = \"a\" + \"b\";", "2:13 cannot add to a `&str`: `+` needs a `String` on the left", "create an owned `String`"],
   ["`+` on a `&str` parameter", "}\nfn shout(name: &str) -> String {\n    name + \"!\"", "4:5 cannot add to a `&str`"],
+  ["`+` on a local holding a literal", "let s = \"a\";\n    let t = s + \"b\";", "3:13 cannot add to a `&str`"],
+  ["`+` on a local copied from a `&str` local", "let a = \"q\";\n    let b = a;\n    let c = b + \"c\";", "4:13 cannot add to a `&str`"],
+  ["`+` on a local from `as_str()`", "let s = String::from(\"a\");\n    let r = s.as_str();\n    let t = r + \"b\";", "4:13 cannot add to a `&str`"],
   ["a type error through a type alias", "}\ntype Score = u64;\nfn f() {\n    let s: Score = \"x\";", "5:20 mismatched types: expected `u64`, found `String`"],
   ["a generic alias given a wrong element", "}\ntype Grid<T> = Vec<Vec<T>>;\nfn f() {\n    let g: Grid<i32> = vec![vec![\"a\"]];", "5:34 mismatched types: expected `i32`, found `String`"],
   ["a variant import misused as a function", "}\nenum K {\n    A,\n    B(u32),\n}\nuse K::*;\nfn f() {\n    let k = A(1);", "9:13 expected function, found unit variant `K::A`"],
@@ -1502,6 +1507,11 @@ for (const [label, files, want] of rejectedFiles) {
 const warned = [
   ["loop that never awaits", "let mut n = 0;\n    loop {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
   ["while true that never awaits", "let mut n = 0;\n    while true {\n        n += 1;\n    }", "3:5 this loop never ends and never awaits"],
+  // rustc's `unused_must_use` on a future dropped as a statement (`pub async fn main` sources are
+  // used whole).
+  ["an `async fn` call that isn't awaited", "}\nasync fn work() -> i32 {\n    1\n}\nasync fn go() {\n    work();", "7:5 unused implementer of `Future` that must be used"],
+  ["an NS call that isn't awaited", "pub async fn main(ns: NS) {\n    ns.hack(\"n00dles\");\n}\n", "2:5 unused implementer of `Future` that must be used"],
+  ["an `async` block dropped as a statement", "pub async fn main(ns: NS) {\n    async { ns.hack(\"n00dles\").await; };\n}\n", "2:5 unused implementer of `Future` that must be used"],
 ];
 // --- borrow conflicts rustc rejects: errors with rustc's message and position, nothing emitted.
 const borrowRejected = [
@@ -1540,7 +1550,7 @@ const borrowRejected = [
 ];
 for (const [label, body, want] of warned) {
   const name = `warns: ${label}`;
-  const out = compile(`fn main() {\n    ${body}\n}\n`, "warn.rs");
+  const out = compile(body.startsWith("pub async fn main") ? body : `fn main() {\n    ${body}\n}\n`, "warn.rs");
   const msgs = out.diagnostics.filter((d) => d.severity === "warning").map((d) => `${d.line}:${d.column} ${d.message}`);
   if (out.code === null || !msgs.some((m) => m.startsWith(want))) {
     fail(name, `want: ${want}\ngot:\n${out.diagnostics.map((d) => `${d.severity} ${d.line}:${d.column} ${d.message}`).join("\n") || "(no diagnostics)"}`);
@@ -1573,6 +1583,9 @@ for (const [label, body, want] of borrowRejected) {
 }
 const quiet = [
   ["loop that awaits", "pub async fn main(ns: NS) {\n    loop {\n        ns.sleep(10.0).await;\n    }\n}\n"],
+  // A future bound with `let` (even `_`) isn't dropped unused; a `String` on the left of `+`.
+  ["NS futures bound with `let`", "pub async fn main(ns: NS) {\n    let _ = ns.hack(\"n00dles\");\n    let _pending = ns.grow(\"n00dles\");\n    ns.weaken(\"n00dles\").await;\n}\n"],
+  ["`+` on `String` locals", "fn main() {\n    let s = String::new();\n    let t = s + \"b\";\n    let u = \"a\";\n    let v = u.to_string() + \"c\";\n    println!(\"{} {}\", t, v);\n}\n"],
   // `&str` values for a `&str` parameter: a `&`, a literal, a slice method, a reference local, a
   // `Vec<&str>` element, an iterated item; a borrowed argument isn't moved.
   ["references for a `&str` parameter", "fn take(s: &str) -> usize { s.len() }\nfn main() {\n    let t = String::from(\"abc\");\n    let r = &t;\n    let names: Vec<&str> = vec![\"a\"];\n    let mut n = take(r) + take(\"lit\") + take(&t) + take(t.as_str()) + take(names[0]);\n    for name in names.iter() { n += take(name); }\n    n += take(&t);\n    println!(\"{} {}\", n, t);\n}\n"],

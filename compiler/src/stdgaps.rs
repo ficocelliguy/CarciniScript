@@ -76,7 +76,7 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     {
         out.push(CONTROL_FLOW);
     }
-    if crate::stdtime::has_word(text, "Bound")
+    if (crate::stdtime::has_word(text, "Bound") || crate::stdtime::has_word(text, "RangeBounds"))
         && !text.contains("// (bound prelude)")
         && !declares(text, "Bound")
     {
@@ -883,7 +883,8 @@ fn write_fmt_calls(file: &SourceFile) -> Vec<(usize, usize, String)> {
 
 /// `s.push(x)` on an `OsString` (`x` a string or a path) is `s.__os_push(x)` (the path prelude's):
 /// `OsString` is a `String` here, whose `push` takes a `char`. The bindings are the ones written
-/// `OsString` or made by `OsString::..` / `to_os_string()` / `into_os_string()`, by name.
+/// `OsString` or made by `OsString::..` / `to_os_string()` / `into_os_string()`, the struct
+/// fields declared `OsString`, by name, and the elements of a `Vec<OsString>`.
 fn os_string_pushes(file: &SourceFile, imports: &[String]) -> Vec<(usize, usize, String)> {
     let os = |t: &str| {
         (imports.iter().any(|i| i == "OsString") && crate::stdtime::has_word(t, "OsString"))
@@ -910,20 +911,128 @@ fn os_string_pushes(file: &SourceFile, imports: &[String]) -> Vec<(usize, usize,
             }
         }
     }
+    // Struct fields declared `OsString` (`p.s.push(..)`, `self.s.push(..)`), by name: only names
+    // no other struct field in the file declares with another type.
+    let mut fields = std::collections::HashSet::new();
+    let mut other_fields = std::collections::HashSet::new();
+    for f in file.syntax().descendants().filter_map(ast::RecordField::cast) {
+        let Some(n) = f.name() else { continue };
+        if f.ty().is_some_and(|t| os(&t.syntax().text().to_string())) {
+            fields.insert(n.text().to_string());
+        } else {
+            other_fields.insert(n.text().to_string());
+        }
+    }
+    fields.retain(|n| !other_fields.contains(n));
+    // `Vec<OsString>` / `[OsString]` bindings and fields: their elements are `OsString`s too
+    // (`v[0].push(..)`, `v.last_mut().unwrap().push(..)`, and the bindings of `for s in
+    // v.iter_mut()` / `&mut v` and `if let Some(s) = v.last_mut()`).
+    let elems = |t: &str| {
+        let t: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        os(&t) && (t.contains("Vec<") || t.contains('['))
+    };
+    let mut vecs = std::collections::HashSet::new();
+    for n in file.syntax().descendants() {
+        let (pat, ty) = if let Some(l) = ast::LetStmt::cast(n.clone()) {
+            (l.pat(), l.ty())
+        } else if let Some(p) = ast::Param::cast(n) {
+            (p.pat(), p.ty())
+        } else {
+            continue;
+        };
+        if let Some(ast::Pat::IdentPat(ip)) = pat
+            && ty.is_some_and(|t| elems(&t.syntax().text().to_string()))
+            && let Some(n) = ip.name()
+        {
+            vecs.insert(n.text().to_string());
+        }
+    }
+    let mut vec_fields = std::collections::HashSet::new();
+    let mut other_vec_fields = std::collections::HashSet::new();
+    for f in file.syntax().descendants().filter_map(ast::RecordField::cast) {
+        let Some(n) = f.name() else { continue };
+        if f.ty().is_some_and(|t| elems(&t.syntax().text().to_string())) {
+            vec_fields.insert(n.text().to_string());
+        } else {
+            other_vec_fields.insert(n.text().to_string());
+        }
+    }
+    vec_fields.retain(|n| !other_vec_fields.contains(n));
+    let named = |e: Option<ast::Expr>| match e {
+        Some(ast::Expr::PathExpr(p)) => p
+            .path()
+            .and_then(|p| p.as_single_name_ref())
+            .is_some_and(|n| vecs.contains(&n.text().to_string())),
+        Some(ast::Expr::FieldExpr(f)) => f
+            .name_ref()
+            .is_some_and(|n| vec_fields.contains(&n.text().to_string())),
+        _ => false,
+    };
+    // (Also `&mut v`.)
+    let is_vec = |e: Option<ast::Expr>| match e {
+        Some(ast::Expr::RefExpr(r)) if r.mut_token().is_some() => named(r.expr()),
+        e => named(e),
+    };
+    // `v.last_mut()` / `first_mut()` / `get_mut(i)` / `iter_mut()` on such a `Vec`.
+    let elem_call = |e: Option<ast::Expr>, ms: &[&str]| match e {
+        Some(ast::Expr::MethodCallExpr(m)) => {
+            m.name_ref().is_some_and(|n| ms.contains(&n.text())) && is_vec(m.receiver())
+        }
+        _ => false,
+    };
+    const ELEM: [&str; 3] = ["last_mut", "first_mut", "get_mut"];
+    for n in file.syntax().descendants() {
+        let pat = if let Some(f) = ast::ForExpr::cast(n.clone()) {
+            let it = f.iterable();
+            if !(elem_call(it.clone(), &["iter_mut"]) || is_vec(it)) {
+                continue;
+            }
+            f.pat()
+        } else if let Some(l) = ast::LetExpr::cast(n) {
+            if !elem_call(l.expr(), &ELEM) {
+                continue;
+            }
+            match l.pat() {
+                Some(ast::Pat::TupleStructPat(t))
+                    if t.path().is_some_and(|p| p.syntax().text() == "Some") =>
+                {
+                    t.fields().next()
+                }
+                _ => None,
+            }
+        } else {
+            continue;
+        };
+        if let Some(ast::Pat::IdentPat(ip)) = pat
+            && let Some(n) = ip.name()
+        {
+            names.insert(n.text().to_string());
+        }
+    }
     let mut out = Vec::new();
     for m in file
         .syntax()
         .descendants()
         .filter_map(ast::MethodCallExpr::cast)
     {
-        let (Some(name), Some(ast::Expr::PathExpr(p))) = (m.name_ref(), m.receiver()) else {
-            continue;
-        };
-        if name.text() == "push"
-            && p.path()
+        let Some(name) = m.name_ref() else { continue };
+        let os_recv = match m.receiver() {
+            Some(ast::Expr::PathExpr(p)) => p
+                .path()
                 .and_then(|p| p.as_single_name_ref())
-                .is_some_and(|n| names.contains(&n.text().to_string()))
-        {
+                .is_some_and(|n| names.contains(&n.text().to_string())),
+            Some(ast::Expr::FieldExpr(f)) => f
+                .name_ref()
+                .is_some_and(|n| fields.contains(&n.text().to_string())),
+            Some(ast::Expr::IndexExpr(i)) => is_vec(i.base()),
+            Some(ast::Expr::MethodCallExpr(u)) => {
+                u.name_ref()
+                    .is_some_and(|n| matches!(n.text(), "unwrap" | "expect"))
+                    && elem_call(u.receiver(), &ELEM)
+            }
+            _ => false,
+        };
+        if name.text() == "push" && os_recv {
             let r = name.syntax().text_range();
             out.push((usize::from(r.start()), usize::from(r.end()), "__os_push".into()));
         }
@@ -977,6 +1086,22 @@ fn concat_literals(
             && let Some((v, _)) = location_value(arg, 0, map, site)
         {
             out.push_str(&v);
+            continue;
+        }
+        // (`stringify!(name)`: its tokens' text, one space where the source has some.)
+        if arg.len() >= 4
+            && arg[0].text == "stringify"
+            && arg[1].text == "!"
+            && arg[2].text == "("
+            && arg[arg.len() - 1].text == ")"
+        {
+            let inner = &arg[3..arg.len() - 1];
+            for (j, t) in inner.iter().enumerate() {
+                if j > 0 && t.start > inner[j - 1].end {
+                    out.push(' ');
+                }
+                out.push_str(&t.text);
+            }
             continue;
         }
         let [t] = arg else { return None };

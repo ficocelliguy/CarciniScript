@@ -32,7 +32,21 @@ impl Lanes<4> {
     const WIDTH: usize = 4;
 }
 
+// Through type aliases of one instantiation, and of a plain type.
+type C8 = Cell<u8>;
+type C32 = Cell<i32>;
+struct Plain;
+impl Plain {
+    const K: i32 = 7;
+}
+type P = Plain;
+// A generic alias, with turbofish (in a macro's arguments too).
+type G<T> = Cell<T>;
+
 fn main() {
+    println!("{} {} {}", C8::MIN, C32::MIN, P::K);
+    let k = C32::BITS + 1;
+    println!("{} {}", k, P::K + C32::MIN);
     println!("{} {}", Cell::<u8>::MIN, Cell::<i32>::MIN);
     let m = Cell::<i32>::MIN + 1;
     println!("{} {} {}", Cell::<u8>::lo(), Cell::<i32>::lo(), m);
@@ -40,4 +54,6 @@ fn main() {
     Cell(7i32).show();
     let a = [0u8; Cell::<i32>::BITS as usize];
     println!("{} {} {}", a.len(), Lanes::<2>::WIDTH, Lanes::<4>::WIDTH);
+    let g = G::<i32>::BITS;
+    println!("{} {} {}", G::<u8>::MIN, G::<i32>::MIN, g);
 }

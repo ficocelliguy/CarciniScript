@@ -59,10 +59,15 @@ pub(crate) fn with_prelude(
     resolver: crate::typeck::Resolver,
     whole_impls: bool,
 ) -> Option<String> {
+    // (The program's own types don't ask for a prelude: `mod read; use read::IoRead;` and
+    // `struct IoRead` are its `IoRead`, not the io prelude's.)
+    let full = text;
+    let masked = mask_own_types(text);
+    let text: &str = &masked;
     let declares = |name: &str| {
         ["struct", "enum", "type", "trait", "union"]
             .iter()
-            .any(|kw| text.contains(&format!("{kw} {name}")))
+            .any(|kw| full.contains(&format!("{kw} {name}")))
     };
     let mut out: Vec<&'static str> = Vec::new();
     // (After the rewrite: `chrono::NaiveDate` is `ChronoNaiveDate`, ..; its `TimeDelta::to_std`
@@ -364,7 +369,132 @@ pub(crate) fn with_prelude(
     if out.is_empty() {
         return None;
     }
-    let modules = crate::prune::module_texts(text, filename, resolver);
-    let trimmed = crate::prune::trimmed(text, &modules, &out, whole_impls);
-    Some(format!("{text}{trimmed}"))
+    let modules = crate::prune::module_texts(full, filename, resolver);
+    let trimmed = crate::prune::trimmed(full, &modules, &out, whole_impls);
+    Some(format!("{full}{trimmed}"))
+}
+
+/// `text` with the program's own type names blanked out, for deciding which preludes it needs:
+/// the types it defines (`struct IoRead`), and every word a `use` brings in from one of its file
+/// modules (`mod read;` then `use read::IoRead;` / `pub use crate::read::{IoRead, Other as O}`)
+/// or a path names there (`read::IoRead::new(..)`).
+fn mask_own_types(text: &str) -> std::borrow::Cow<'_, str> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut names: Vec<String> = Vec::new();
+    // (Not the types of a prelude compiled in already.)
+    let marker = text.lines().find(|l| l.starts_with("// (") && l.ends_with(" prelude)"));
+    let own = marker
+        .and_then(|m| text.find(m))
+        .map_or(text, |i| &text[..i]);
+    for kw in ["struct ", "enum ", "trait ", "type ", "union "] {
+        let mut from = 0;
+        while let Some(i) = own[from..].find(kw) {
+            let at = from + i;
+            from = at + kw.len();
+            if own[..at].chars().next_back().is_some_and(ident) {
+                continue;
+            }
+            let name: String = own[from..].chars().take_while(|c| ident(*c)).collect();
+            if name.starts_with(|c: char| c.is_uppercase()) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    let mut mods: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let l = line.trim_start();
+        let l = l.strip_prefix("pub").map_or(l, |r| {
+            let r = r.trim_start();
+            match r.strip_prefix('(') {
+                Some(r) => r.split_once(')').map_or(r, |x| x.1).trim_start(),
+                None => r,
+            }
+        });
+        if let Some(rest) = l.strip_prefix("mod ")
+            && let Some(name) = rest.trim().strip_suffix(';')
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            mods.push(name.trim_start_matches("r#"));
+        }
+    }
+    let mut from = 0;
+    while let Some(i) = text[from..].find("use ") {
+        let at = from + i;
+        from = at + 4;
+        if text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let Some(end) = text[from..].find(';') else { break };
+        let stmt = &text[from..from + end];
+        let mut path = stmt.trim_start().trim_start_matches("::");
+        for p in ["crate::", "self::"] {
+            path = path.strip_prefix(p).unwrap_or(path);
+        }
+        while let Some(p) = path.strip_prefix("super::") {
+            path = p;
+        }
+        let first = path.split("::").next().unwrap_or("").trim();
+        if !mods.contains(&first) {
+            continue;
+        }
+        // (The names it brings in: each last segment, or the `as` name.)
+        for part in path.split(|c| matches!(c, ',' | '{' | '}')) {
+            let part = part.trim();
+            let name = match part.split_once(" as ") {
+                Some((_, alias)) => alias.trim(),
+                None => part.rsplit("::").next().unwrap_or("").trim(),
+            };
+            if name.starts_with(|c: char| c.is_uppercase())
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    // (And the names it reaches by path: `de::IoRead::new(..)`.)
+    for m in &mods {
+        let pat = format!("{m}::");
+        let mut from = 0;
+        while let Some(i) = text[from..].find(&pat) {
+            let at = from + i;
+            from = at + pat.len();
+            if text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let name: String = text[from..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.starts_with(|c: char| c.is_uppercase()) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if names.is_empty() {
+        return text.into();
+    }
+    let mut out = text.to_string();
+    for n in &names {
+        let blank = "_".repeat(n.len());
+        let mut from = 0;
+        while let Some(i) = out[from..].find(n.as_str()) {
+            let at = from + i;
+            let ident = |c: char| c.is_alphanumeric() || c == '_';
+            let before = out[..at].chars().next_back().is_some_and(ident);
+            let after = out[at + n.len()..].chars().next().is_some_and(ident);
+            if !before && !after {
+                out.replace_range(at..at + n.len(), &blank);
+            }
+            from = at + n.len();
+        }
+    }
+    out.into()
 }
