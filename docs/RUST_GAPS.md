@@ -266,7 +266,8 @@ There is one JS thread, and scripts share it with the game.
   their text, not their components (`a//b` != `a/b`).
 - **`OsStr` / `OsString` are `String`**, so string methods work on them too and `into_string()`
   never fails. `OsString::push` of a string or a path works on a binding written or made as an
-  `OsString` (`let s: OsString`, `OsString::from(..)`, `x.to_os_string()`, a parameter); on a
+  `OsString` (`let s: OsString`, `OsString::from(..)`, `x.to_os_string()`, an `OsStr`'s
+  `to_owned()`, a parameter); on a
   field or an element, `push` is `String`'s, which takes a `char`.
 - **`env!` is an error and `option_env!` `None`**, except for Cargo's own variables, which get
   placeholders (`CARGO_PKG_NAME` `"script"`, `CARGO_PKG_VERSION` `"0.1.0"`, `CARGO_MANIFEST_DIR`

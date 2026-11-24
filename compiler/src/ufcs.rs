@@ -82,13 +82,15 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
             || method.starts_with("wrapping_")
             || method.starts_with("saturating_")
         {
-            let unary = method.ends_with("_neg") || method.ends_with("_abs");
+            let unary = method.ends_with("_neg")
+                || method.ends_with("_abs")
+                || method == "checked_next_power_of_two";
             return Some(if unary { 0 } else { 1 });
         }
         return Some(match method {
             "abs" | "signum" | "to_string" | "count_ones" | "count_zeros" | "leading_zeros"
             | "trailing_zeros" | "is_power_of_two" | "ilog2" | "ilog10" | "isqrt"
-            | "is_positive" | "is_negative" => 0,
+            | "is_positive" | "is_negative" | "next_power_of_two" => 0,
             "pow" | "min" | "max" | "rem_euclid" | "div_euclid" | "abs_diff" | "cmp"
             | "partial_cmp" => 1,
             "clamp" => 2,

@@ -231,6 +231,7 @@ impl Codegen<'_> {
             (Ty::Vec(_), "strip_suffix") => {
                 helper("vecStrip", vec![self.gap_arg(a0), Frag::text("true")])
             }
+            (Ty::Vec(_), "is_ascii") => helper("isAscii", vec![]),
             (Ty::Vec(_), "eq_ignore_ascii_case") => {
                 helper("bytesEqIgnoreCase", vec![self.gap_arg(a0)])
             }

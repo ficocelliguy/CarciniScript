@@ -156,6 +156,7 @@ impl Codegen<'_> {
             (Ty::Str, "to_ascii_lowercase") => helper("asciiLower", vec![]),
             (Ty::Str, "to_owned") => rf.clone(),
             (Ty::Str, "eq_ignore_ascii_case") => helper("eqIgnoreAsciiCase", self.arg_frags(m)),
+            (Ty::Str, "is_ascii") => helper("isAscii", vec![]),
             (Ty::Str, "is_char_boundary") => helper("isCharBoundary", self.arg_frags(m)),
             (Ty::Str, "insert" | "insert_str") => {
                 let a = self.arg_frags(m);

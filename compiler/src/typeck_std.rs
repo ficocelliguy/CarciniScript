@@ -161,6 +161,10 @@ impl Checker<'_> {
                 }
                 Ty::Bool
             }
+            (Ty::Str, "is_ascii") => {
+                count(self, 0);
+                Ty::Bool
+            }
             (Ty::Str, "is_char_boundary") => {
                 count(self, 1);
                 if let Some(a) = a0 {

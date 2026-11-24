@@ -2841,6 +2841,12 @@
       for (let i = 0; i < p.length; i++) if (!eq(v[at + i], p[i])) return null;
       return suffix ? v.slice(0, at) : v.slice(p.length);
     },
+    // `s.is_ascii()` on a string or a byte slice.
+    $isAscii(v) {
+      if (typeof v === "string") return /^[\0-\x7f]*$/.test(v);
+      for (let i = 0; i < v.length; i++) if (v[i] > 127) return false;
+      return true;
+    },
     $bytesEqIgnoreCase(a, b) {
       if (a.length !== b.length) return false;
       const low = (x) => (x >= 65 && x <= 90 ? x + 32 : x);
@@ -4397,6 +4403,11 @@
       const end = hi === null ? n : inclusive ? hi + 1 : hi;
       if (lo > end || end > n) return null;
       return mutable ? this.$sliceMut(v, lo, hi, inclusive, "<std>") : v.slice(lo, end);
+    },
+    // `v.get(r)` with a range value.
+    $getRangeBy(v, r) {
+      const it = r.it;
+      return this.$getRange(v, it.i, it.hi, it.incl, false);
     },
     // `v.split_at_mut(mid)`: views of both halves.
     $splitAtMut(v, mid, location) {

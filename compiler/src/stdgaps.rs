@@ -918,8 +918,9 @@ fn write_fmt_calls(file: &SourceFile) -> Vec<(usize, usize, String)> {
 
 /// `s.push(x)` on an `OsString` (`x` a string or a path) is `s.__os_push(x)` (the path prelude's):
 /// `OsString` is a `String` here, whose `push` takes a `char`. The bindings are the ones written
-/// `OsString` or made by `OsString::..` / `to_os_string()` / `into_os_string()`, the struct
-/// fields declared `OsString`, by name, and the elements of a `Vec<OsString>`.
+/// `OsString` or made by `OsString::..` / `to_os_string()` / `into_os_string()` / an `OsStr`'s
+/// `to_owned()`, the struct fields declared `OsString`, by name, and the elements of a
+/// `Vec<OsString>`.
 fn os_string_pushes(file: &SourceFile, imports: &[String]) -> Vec<(usize, usize, String)> {
     let os = |t: &str| {
         (imports.iter().any(|i| i == "OsString") && crate::stdtime::has_word(t, "OsString"))
@@ -940,6 +941,9 @@ fn os_string_pushes(file: &SourceFile, imports: &[String]) -> Vec<(usize, usize,
             || (os(&init) && init.contains("OsString::"))
             || init.ends_with(".to_os_string()")
             || init.ends_with(".into_os_string()")
+            // (`p.as_os_str().to_owned()`, `OsStr::new(..).to_owned()`: an `OsString`.)
+            || (init.ends_with(".to_owned()")
+                && (init.contains(".as_os_str()") || init.contains("OsStr::")))
         {
             if let Some(n) = ip.name() {
                 names.insert(n.text().to_string());

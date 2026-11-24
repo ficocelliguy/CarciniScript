@@ -435,6 +435,7 @@ impl<'a> Checker<'a> {
             const_tys: HashMap::new(),
             from_args: HashMap::new(),
             try_from_args: HashMap::new(),
+            borrow_args: HashMap::new(),
             const_needs: Default::default(),
             const_derivable: Default::default(),
             const_lits: Vec::new(),
@@ -1028,6 +1029,8 @@ struct Checker<'a> {
     pub(super) from_args: HashMap<String, Ty>,
     /// `T: TryFrom<X>` bounds in scope: each `X` by parameter.
     pub(super) try_from_args: HashMap<String, Vec<Ty>>,
+    /// `K: Borrow<Q>` bounds in scope: `Q` by parameter, the key a map of `K`s is looked up by.
+    pub(super) borrow_args: HashMap<String, Ty>,
     /// The const generic parameters in scope (`const N: usize`), with their types.
     pub(super) const_tys: HashMap<String, Ty>,
     /// (function, const parameter) pairs: each is passed like a class (`$N`)...
@@ -2101,6 +2104,16 @@ impl<'a> Checker<'a> {
                 if let Some(g) = self.generics.get(&name) {
                     return g.clone();
                 }
+                // `std::vec::IntoIter<T>` is std's even when the file has an `IntoIter` of its own
+                // (the io prelude's `lines()` next to a collection's iterator struct).
+                if self.adts.defs.contains_key(&name)
+                    && p.path()
+                        .and_then(|q| q.first_segment())
+                        .is_some_and(|s| matches!(s.syntax().text().to_string().as_str(), "std" | "core" | "alloc"))
+                    && let Some(t) = self.std_iter_type(&name, seg.as_ref())
+                {
+                    return t;
+                }
                 if self.adts.defs.contains_key(&name) {
                     // `Stack<i32>`, `Buf<4>`; missing arguments are inferred (or a const
                     // parameter's default).
@@ -2660,7 +2673,18 @@ impl<'a> Checker<'a> {
         let Some(body) = f.body() else { return };
         self.ret_declared = f.ret_type().is_some();
         self.fn_name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
-        let found = self.block(&body, Some(&ret));
+        let mut found = self.block(&body, Some(&ret));
+        // `fn id(&self) -> &str { &self.key }` with a `Cow<str>` field: deref coercion of the
+        // tail, as `check` does at an argument.
+        if matches!(f.ret_type().and_then(|r| r.ty()), Some(ast::Type::RefType(_)))
+            && let Some(tail) = body.stmt_list().and_then(|l| l.tail_expr())
+            && let Some((n, target)) = self.deref_target(&found)
+            && !matches!(self.shallow(&ret), Ty::Adt(ref m, _) if *m == n)
+            && self.could_be(&target, &ret)
+        {
+            self.auto_deref(&tail, &n, &target);
+            found = target;
+        }
         if !self.unify(&found, &ret) {
             let tail = body.stmt_list().and_then(|l| l.tail_expr());
             let has_tail = tail.is_some();
@@ -4544,12 +4568,13 @@ impl<'a> Checker<'a> {
             return expected.clone();
         }
         // `&stack` where `&Vec<i32>` is expected, with `impl Deref<Target = Vec<i32>> for Stack`.
-        if let Ty::Adt(n, _) = self.shallow(&t)
-            && !matches!(
-                self.shallow(expected),
-                Ty::Adt(..) | Ty::Var(_) | Ty::Unknown
-            )
-            && let Some(target) = self.adts.deref_targets.get(&n).cloned()
+        // (The target through the type arguments: `&cow` as a `&str`, `&LAZY` as a `&Context`.)
+        if let Some((n, target)) = self.deref_target(&t)
+            && match self.shallow(expected) {
+                Ty::Var(_) | Ty::Unknown => false,
+                Ty::Adt(m, _) => m != n && matches!(self.shallow(&target), Ty::Adt(ref k, _) if *k == m),
+                _ => true,
+            }
             && self.could_be(&target, expected)
         {
             self.unify(&target, expected);
@@ -4619,6 +4644,25 @@ impl<'a> Checker<'a> {
             self.deref_slots.insert(r);
         }
         self.derefs.insert(r, (mutable, target.clone()));
+    }
+
+    /// The key a map lookup checks its argument against: `Q` for a `&Q` binding when the map's
+    /// keys are a `K: Borrow<Q>` (`self.map.get(k)`), else `k`.
+    fn lookup_key(&self, k: &Ty, arg: Option<&ast::Expr>) -> Ty {
+        let inner = arg.map(strip_parens).map(|a| match &a {
+            ast::Expr::RefExpr(r) => r.expr().map(|e| strip_parens(&e)).unwrap_or(a),
+            _ => a,
+        });
+        if let Ty::Param(kn) = self.shallow(k)
+            && let Some(q) = self.borrow_args.get(&kn)
+            && let Some(ast::Expr::PathExpr(p)) = inner
+            && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+            && let Some(local) = self.lookup(n.text())
+            && self.shallow(&local.ty) == self.shallow(q)
+        {
+            return q.clone();
+        }
+        k.clone()
     }
 
     /// `x`'s type through `impl Deref`, when `x` is such a struct or enum.
@@ -7799,7 +7843,22 @@ impl<'a> Checker<'a> {
                         Ty::Option(Box::new(Ty::Vec(Box::new(elem))))
                     }
                     "pop" | "first" | "last" => sig(self, &[], Ty::Option(Box::new(elem))),
-                    "get" => sig(self, &[USIZE], Ty::Option(Box::new(elem))),
+                    // (`v.get(r)` with a `Range<usize>` value: the slice, as `&v[r]`.)
+                    "get" => {
+                        self.arg_count(m.syntax(), "method", 1, args.len());
+                        let t = args.first().map(|a| (a, self.infer(a, Some(&USIZE))));
+                        match t.map(|(a, t)| (a, self.shallow(&t), t)) {
+                            Some((_, Ty::Range(e, _), _)) => {
+                                self.unify(&e, &USIZE);
+                                Ty::Option(Box::new(Ty::Vec(Box::new(elem))))
+                            }
+                            Some((a, _, t)) => {
+                                self.expect(a.syntax(), &t, &USIZE);
+                                Ty::Option(Box::new(elem))
+                            }
+                            None => Ty::Option(Box::new(elem)),
+                        }
+                    }
                     // The element itself, which writes go through when it's a JS object (a struct,
                     // tuple, array or collection); numbers, strings and bools would be copies.
                     "get_mut" | "first_mut" | "last_mut" => {
@@ -7992,8 +8051,14 @@ impl<'a> Checker<'a> {
                 };
                 match m2 {
                     "insert" => sig(self, &[k, v.clone()], opt(v)),
-                    "get" | "remove" => sig(self, &[k], opt(v)),
-                    "contains_key" => sig(self, &[k], Ty::Bool),
+                    "get" | "remove" => {
+                        let key = self.lookup_key(&k, args.first());
+                        sig(self, &[key], opt(v))
+                    }
+                    "contains_key" => {
+                        let key = self.lookup_key(&k, args.first());
+                        sig(self, &[key], Ty::Bool)
+                    }
                     "get_mut" => {
                         let resolved = self.zonk(&v);
                         if resolved.is_js_primitive() && slot_position(m) {
@@ -8010,7 +8075,8 @@ impl<'a> Checker<'a> {
                             );
                             self.error(m.syntax(), msg);
                         }
-                        sig(self, &[k], opt(v))
+                        let key = self.lookup_key(&k, args.first());
+                        sig(self, &[key], opt(v))
                     }
                     "len" => sig(self, &[], USIZE),
                     "is_empty" => sig(self, &[], Ty::Bool),

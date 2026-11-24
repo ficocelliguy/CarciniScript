@@ -806,7 +806,13 @@ impl Checker<'_> {
         {
             return self.check(a, p);
         }
-        let t = self.infer(a, None);
+        // (`repeat(0..)` into an `impl Into<Count>` with `impl From<RangeFrom<usize>> for
+        // Count`: the range is a value, not an iterator.)
+        let range_src = matches!(crate::typeck::strip_parens(a), ast::Expr::RangeExpr(_))
+            && matches!(&target, Ty::Adt(tn, _) if self.adts.from_impls.get(tn)
+                .is_some_and(|fs| fs.iter().any(|f| matches!(f.src, Ty::Range(..)))));
+        let hint = range_src.then(|| Ty::Range(Box::new(Ty::Unknown), crate::ty::RangeKind::Full));
+        let t = self.infer(a, hint.as_ref());
         if self.could_be(&t, p) {
             self.unify(&t, p);
             return p.clone();

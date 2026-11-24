@@ -284,6 +284,10 @@ impl Checker<'_> {
                 }
                 opt(Ty::Vec(e))
             }
+            (Ty::Vec(e), "is_ascii") if matches!(self.shallow(&e), Ty::Int(IntKind::U8)) => {
+                count(self, 0);
+                Ty::Bool
+            }
             (Ty::Vec(e), "eq_ignore_ascii_case")
                 if matches!(self.shallow(&e), Ty::Int(IntKind::U8)) =>
             {

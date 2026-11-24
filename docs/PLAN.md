@@ -19,13 +19,12 @@ sections below.
 
 1. **Fix the confirmed "mismatched types" gaps** (triaged 2026-11-24; the list is under
    "Real-world corpus survey", "Std modeling" and "Bounds and generics"). In player order:
-   `&Cow<str>` deref coercion at arguments and returns (12 files), `impl PartialEq<Other>`
-   method resolution and `T: PartialEq<U>` bounds (12), a file's own `IntoIter` breaking the
-   io prelude (10, and the errors land past the end of the file), `.as_ref()` targets on
-   bounded parameters (7), `LazyLock` deref coercion (4), `K: Borrow<Q>` lookups (3),
-   `slice.get(range)` (3), `usize::checked_next_power_of_two` as a function value (3),
-   `OsStr::to_owned()` (3), `A::Item` field types (2), std iterator structs as declared types
-   (4). Also seen on the way: `str::is_ascii` is missing.
+   `impl PartialEq<Other>` method resolution and `T: PartialEq<U>` bounds (12 files),
+   `.as_ref()` targets on bounded parameters (7), `A::Item` field types (2), std iterator
+   structs as declared types (4), and a file's own `Vec` shadowing the preludes' `Vec::new()`
+   (bumpalo; the errors land past the end of the file). Done 2026-11-24: `Cow` and `LazyLock`
+   deref coercion, a file's own `IntoIter`, `K: Borrow<Q>` lookups, `slice.get(range)`,
+   `checked_next_power_of_two` as a function value, `OsStr::to_owned()`, `str::is_ascii`.
 
 ## Contracts inherited from the RapydScript integration
 
@@ -287,40 +286,56 @@ that this compiler rejects or miscompiles; counts are files of the corpus where 
 
 - Std modeling (from the 2026-11-24 "mismatched types" triage; each reads "expected `X`,
   found `Y`" today):
-  - [ ] `&Cow<str>` / `&Cow<[u8]>` where a `&str` / `&[u8]` is expected: `f(&e.message)` with a
+  - [x] `&Cow<str>` / `&Cow<[u8]>` where a `&str` / `&[u8]` is expected: `f(&e.message)` with a
     `Cow` field, `s.push_str(&rep)`, `&self.key` as a `&str` block tail, `f(&cow_returning())`,
     `g(self)` in an `impl Tr for Cow<'a, str>`. Deref coercion of `Cow` at an argument and a
     return. 12 files (cc, multipart, regex, url, rouille, log, form_urlencoded, wasm-bindgen).
+    Now `check` and a function body's tail (under a `-> &..` return type) deref through the
+    type arguments (`typeck.rs` `deref_target`; `fixtures/coercion_gaps.rs`).
   - [ ] A std iterator struct named as a type doesn't unify with the method that makes it:
     `btree_map::Keys` / `Values` / `ValuesMut` / `IntoKeys`, `btree_set::Difference`,
     `vec::Drain`, `slice::Iter` written `Iter<'_, T>` as a field or return type get "found
     `std::slice::Iter`"; the struct holding one has no `next` / `count`; and returning
     `self.inner.keys()` as a `btree_map::Keys` reports `K: Ord` unsatisfied under an
     `impl<K: Ord, V>`. 4 files (wasmparser's collections, slab, clap_builder's `flat_map`).
-  - [ ] A file's own `IntoIter` type breaks the compiler's io prelude: with an `impl io::Write`
+  - [x] A file's own `IntoIter` type breaks the compiler's io prelude: with an `impl io::Write`
     (or `Read`) in the file, `Read::bytes` / `BufRead::lines` / `split` in the prelude resolve
     `IntoIter` to the file's struct, and three errors land one line past the end of the file.
     serde_json's `Error` and `Read` likely do the same (not probed). 10 files (smallvec,
-    thin-vec, bytes, ra_ap_stdx, serde_json, regex-automata).
+    thin-vec, bytes, ra_ap_stdx, serde_json, regex-automata). Now a `std::` / `core::` /
+    `alloc::` path to a std iterator is std's even when the file has a type of that name
+    (`typeck.rs` `lower_type`; `fixtures/coercion_gaps.rs`).
+  - [ ] A file's own `Vec` (bumpalo's `collections/vec.rs`) shadows `Vec::new()` in the
+    preludes: "no function or associated item named `new`" past the end of the file. Such a
+    diagnostic crashed the compiler in `adt::test_code_at` (from the `#[test]` runner) until
+    2026-11-24.
   - [ ] `.as_ref()` on a bounded type parameter takes the wrong target: `S: AsRef<OsStr> +
     ?Sized` gives `PathBuf`, `H: AsRef<[u8]> + ?Sized` gives `Vec<u8>` when a `&[u8]` field
     wants it; `s.as_ref()` on a `&str` passed to a `&[u8]` parameter; and a blanket `impl<H:
     AsRef<[u8]>> From<&H> for Input` isn't found for `Input::from(s)` ("`Input` implements
     `From<H>`"). 7 files (tempfile, ring, smol_str, clap_builder, aho-corasick, http).
-  - [ ] `LazyLock<T>` / `LazyCell<T>` don't deref-coerce: `&CONTEXT` as a `&'static T`,
+  - [x] `LazyLock<T>` / `LazyCell<T>` don't deref-coerce: `&CONTEXT` as a `&'static T`,
     `f(&QUEUE)`, and `LAZY.clone()` is a `LazyLock<T>` rather than `T`. 4 files (indexmap
-    benches, js-sys, uuid, wasm-bindgen).
-  - [ ] `OsStr::to_owned()` is a `String`, so `push(" ")` on it wants a `char` (the
+    benches, js-sys, uuid, wasm-bindgen). Now as `Cow` above (`fixtures/coercion_gaps.rs`).
+  - [x] `OsStr::to_owned()` is a `String`, so `push(" ")` on it wants a `char` (the
     `OsString::push` rule in RUST_GAPS.md doesn't cover a binding made by `to_owned`). 3
-    files (cc, clap_builder).
-  - [ ] `slice.get(range)` with a `Range<usize>` / `RangeFrom<usize>` value ("expected `usize`,
+    files (cc, clap_builder). Now `p.as_os_str().to_owned()` and `OsStr::new(..).to_owned()`
+    bindings are `OsString`s to the pre-pass (`stdgaps.rs` `os_string_pushes`;
+    `fixtures/coercion_gaps.rs`).
+  - [x] `slice.get(range)` with a `Range<usize>` / `RangeFrom<usize>` value ("expected `usize`,
     found `Range<usize>`"; indexing `&v[r]` with the same value works). 3 files (ring, rustls,
     untrusted). Also `repeat(0..)` where the parameter is `impl Into<Local>` and `Local` has
-    `From<RangeFrom<usize>>`: the bare `0..` is typed as a slice `Iter`. 1 file (winnow).
-  - [ ] A method path as a function value when the method takes only `self`:
+    `From<RangeFrom<usize>>`: the bare `0..` is typed as a slice `Iter`. 1 file (winnow). Now
+    `get` takes a range value (`κσ.$getRangeBy`), and a range literal passed to an `impl
+    Into<X>` whose `X` has a `From` of a range is a range value (`typeck_conv.rs`
+    `check_into_arg`; `fixtures/coercion_gaps.rs`).
+  - [x] A method path as a function value when the method takes only `self`:
     `.and_then(usize::checked_next_power_of_two)` is "expected `impl Fn(usize) -> Option<_>`,
     found `impl Fn(usize, _)`" and "takes 0 arguments but 1 were supplied" (`String::len`,
-    `i32::abs`, `str::trim` work). 3 files (smallvec, crossbeam-channel).
+    `i32::abs`, `str::trim` work). 3 files (smallvec, crossbeam-channel). Now
+    `checked_next_power_of_two` and `next_power_of_two` have their arity in `ufcs.rs`
+    (`fixtures/coercion_gaps.rs`).
+  - [x] `str::is_ascii` (and `[u8]::is_ascii`) were missing (`κσ.$isAscii`).
 - Bounds and generics:
   - [ ] A turbofish through a type parameter (`O::select::<u8>(x)`) checks the method's own
     bounds, except those with type arguments (`Into<X>`, `Fn(..)`).
@@ -333,9 +348,11 @@ that this compiler rejects or miscompiles; counts are files of the corpus where 
     tuple `A: PartialEq<C>` (`self.0 == rhs.0`) all report the two parameters as mismatched.
     12 files (tiny_http, http, potential_utf, jiff-core, strsim, hashbrown tests, clap_derive,
     itertools).
-  - [ ] `K: Borrow<Q>` in a `where` clause: `self.map.get(k)` / `get_mut` / `remove` with a
+  - [x] `K: Borrow<Q>` in a `where` clause: `self.map.get(k)` / `get_mut` / `remove` with a
     `&Q` on a `HashMap<K, V>` is "expected `K`, found `Q`". 3 files (indexmap, ra_ap_stdx,
-    rustls).
+    rustls). Now a `Borrow<Q>` bound (also a method's `where` on its impl's parameter) is
+    recorded, and a map lookup by a `&Q` binding checks against `Q` (`typeck.rs` `lookup_key`;
+    `fixtures/coercion_gaps.rs`).
   - [ ] `A::Item` as a struct field type (`v: Vec<A::Item>` under `struct S<A: Array>`, a
     local trait with an associated type) is "cannot find type `Item`", and everything typed
     through the field follows. 2 files (smallvec), but it is the whole `Array`-trait pattern.

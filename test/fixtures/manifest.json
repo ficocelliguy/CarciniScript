@@ -276,6 +276,12 @@
     "panic": null
   },
   {
+    "file": "coercion_gaps.rs",
+    "stdout": "BAD\nxcafeok\nk1 2 195\n4 4\n1\n9\nSome(1) None true\nSome(2) false\nSome([20, 30]) Some([30, 40]) None\n0..None 1..Some(3)\nSome(16) None\n\"/bin/cc -O2 --end\"\ntrue false false\n[105, 104]\n3 3\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "coll_hasher_args.rs",
     "stdout": "{\"a\", \"b\"} 2\n",
     "exitCode": 0,

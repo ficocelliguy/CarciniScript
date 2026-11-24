@@ -353,6 +353,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.borrow_args.clear();
         let mut params = Vec::new();
         // Bounds that name other parameters come after the plain ones: `Fut: Future<Output = T>`,
         // then `F: Fn() -> Fut` / `S: Into<T>`, then `I: IntoIterator<Item = P>`. (Rust takes
@@ -505,7 +506,7 @@ impl Checker<'_> {
         // The bounds' arguments (`C: Convert<String>`, `S: Shape<Unit = f64>`), once every
         // parameter is in scope.
         for (name, lists, _) in type_params(f) {
-            self.record_from_bound(&name, &lists);
+            self.record_from_bound(&name, &lists, false);
             self.record_op_bounds(&name, &lists);
             if self.param_bounds.contains_key(&name) {
                 self.record_bound_args(&name, &lists);
@@ -574,21 +575,30 @@ impl Checker<'_> {
         out
     }
 
-    /// `T: From<X>`: `X`, for `T::from(x)`.
-    pub(super) fn record_from_bound(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
+    /// `T: From<X>`: `X`, for `T::from(x)` (and `T: Borrow<X>`, for a map lookup by `X`; only that
+    /// one with `borrow_only`, for a method's `where` clause on its impl's parameter).
+    pub(super) fn record_from_bound(
+        &mut self,
+        name: &str,
+        lists: &[ast::TypeBoundList],
+        borrow_only: bool,
+    ) {
         use ra_ap_syntax::ast::HasGenericArgs;
         for l in lists {
             for b in l.bounds() {
                 if let Some(ast::Type::PathType(pt)) = b.ty()
                     && let Some(seg) = pt.path().and_then(|p| p.segment())
                     && let Some(tr) = seg.name_ref().map(|n| n.text().to_string())
-                    && matches!(tr.as_str(), "From" | "TryFrom")
+                    && matches!(tr.as_str(), "From" | "TryFrom" | "Borrow")
+                    && (!borrow_only || tr == "Borrow")
                     && let Some(ast::GenericArg::TypeArg(ta)) =
                         seg.generic_arg_list().and_then(|l| l.generic_args().next())
                     && let Some(t) = ta.ty()
                 {
                     let x = self.lower_type(&t);
-                    if tr == "From" {
+                    if tr == "Borrow" {
+                        self.borrow_args.insert(name.to_string(), x);
+                    } else if tr == "From" {
                         self.from_args.insert(name.to_string(), x);
                     } else {
                         // (`T: TryFrom<u64> + TryFrom<i64>`: a call picks by its argument;
@@ -716,6 +726,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.borrow_args.clear();
     }
 
     /// Fresh type variables for a generic function's parameters, with the bounds to check once

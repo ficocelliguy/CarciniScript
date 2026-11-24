@@ -1230,9 +1230,13 @@ pub fn has_test_code(src: &str) -> bool {
 /// Whether the token at `offset` in `file` (parsed as written) is in code only a test build
 /// compiles. False in a test build, where all of it is.
 pub fn test_code_at(file: &ast::SourceFile, offset: usize) -> bool {
+    // (A diagnostic past the end of the file, from a prelude, is in no test item.)
     let Ok(at) = u32::try_from(offset) else {
         return false;
     };
+    if file.syntax().text_range().end() < at.into() {
+        return false;
+    }
     file.syntax()
         .token_at_offset(at.into())
         .left_biased()

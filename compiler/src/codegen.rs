@@ -8939,6 +8939,13 @@ impl<'a> Codegen<'a> {
                 .push(format!(", {incl}, {})", method == "get_mut"));
             return (f, Ty::Option(Box::new(vec_ty)));
         }
+        // `v.get(r)` with a `Range<usize>` value.
+        if method == "get"
+            && let Some(arg) = m.arg_list().and_then(|l| l.args().next())
+            && matches!(self.raw_ty_of(arg.syntax()), Some(Ty::Range(..)))
+        {
+            return (helper("getRangeBy", vec![a(0)]), Ty::Option(Box::new(vec_ty)));
+        }
         match method {
             "len" => (rf.clone().push(".length").clone(), usize),
             "pop" => (helper("pop", vec![]), Ty::Option(Box::new(elem.clone()))),

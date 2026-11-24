@@ -711,7 +711,7 @@ impl Checker<'_> {
                                 self.generics.insert(n.clone(), Ty::Param(n.clone()));
                                 self.param_bounds.insert(n.clone(), bounds);
                                 self.record_bound_args(&n, &lists);
-                                self.record_from_bound(&n, &lists);
+                                self.record_from_bound(&n, &lists, false);
                                 self.note_where_projections(f.where_clause());
                                 own.push(n);
                             }
@@ -753,6 +753,8 @@ impl Checker<'_> {
                 continue;
             }
             let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+            // (`where K: Borrow<Q>`: `self.map.get(k)` with a `&Q`.)
+            self.record_from_bound(&n, &lists, true);
             let extra: Vec<String> = super::generic::bound_names(&lists)
                 .into_iter()
                 .map(|(b, _)| b)
@@ -787,6 +789,8 @@ impl Checker<'_> {
         for (n, bounds) in std::mem::take(&mut self.method_where) {
             self.param_bounds.insert(n, bounds);
         }
+        // (A method's `where K: Borrow<Q>` names the method's own `Q`.)
+        self.borrow_args.clear();
     }
 
     /// The `impl`'s type parameters (with bounds) for lowering and checking its methods; returns
@@ -800,6 +804,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.borrow_args.clear();
         let mut impl_params: Vec<(String, Option<ast::TypeBoundList>)> = Vec::new();
         if let Some(gp) = imp.generic_param_list() {
             for p in gp.generic_params() {
@@ -1786,6 +1791,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.borrow_args.clear();
     }
 
     /// A method's signature (without `self`), with `Self` lowered per `self.self_ty`.
@@ -2055,6 +2061,7 @@ impl Checker<'_> {
             self.const_tys.clear();
             self.from_args.clear();
             self.try_from_args.clear();
+            self.borrow_args.clear();
         }
     }
 
@@ -2221,7 +2228,7 @@ impl Checker<'_> {
     }
 
     fn no_assoc(&mut self, node: &SyntaxNode, adt: &str, m: &str) {
-        let kind = if self.adts.defs[adt].is_enum {
+        let kind = if self.adts.defs.get(adt).is_some_and(|d| d.is_enum) {
             "enum"
         } else {
             "struct"
@@ -2709,7 +2716,7 @@ impl Checker<'_> {
             "partial_cmp" => derived(self, "PartialOrd", 1, Ty::Option(Box::new(Ty::Ordering))),
             "max" | "min" => derived(self, "Ord", 1, t.clone()),
             "lt" | "le" | "gt" | "ge" => derived(self, "PartialOrd", 1, Ty::Bool),
-            "to_string" if self.adts.defs[adt].display => {
+            "to_string" if self.adts.defs.get(adt).is_some_and(|d| d.display) => {
                 self.arg_count(m.syntax(), "method", 0, args.len());
                 Ty::Str
             }
@@ -2717,7 +2724,7 @@ impl Checker<'_> {
                 for a in args {
                     self.infer(a, None);
                 }
-                let kind = if self.adts.defs[adt].is_enum {
+                let kind = if self.adts.defs.get(adt).is_some_and(|d| d.is_enum) {
                     "enum"
                 } else {
                     "struct"
