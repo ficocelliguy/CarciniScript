@@ -1216,6 +1216,30 @@ pub fn with_test_build<T>(on: bool, f: impl FnOnce() -> T) -> T {
     r
 }
 
+/// Whether `filename` is under the top-level `tests/` folder: built as a test build, as Cargo
+/// builds its `tests/*.rs` (`run tests/solver.rs` runs the tests in it).
+pub fn is_tests_path(filename: &str) -> bool {
+    filename.trim_start_matches('/').starts_with("tests/")
+}
+
+/// Whether `src` may have code only a test build compiles.
+pub fn has_test_code(src: &str) -> bool {
+    src.contains("#[test]") || src.contains("cfg(test)")
+}
+
+/// Whether the token at `offset` in `file` (parsed as written) is in code only a test build
+/// compiles. False in a test build, where all of it is.
+pub fn test_code_at(file: &ast::SourceFile, offset: usize) -> bool {
+    let Ok(at) = u32::try_from(offset) else {
+        return false;
+    };
+    file.syntax()
+        .token_at_offset(at.into())
+        .left_biased()
+        .and_then(|t| t.parent())
+        .is_some_and(|n| test_only(&n))
+}
+
 /// Whether `f` is a test: `#[test]`.
 pub fn is_test_fn(f: &ast::Fn) -> bool {
     f.attrs().any(|a| {

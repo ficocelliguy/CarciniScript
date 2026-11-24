@@ -19,6 +19,7 @@ const CSTR: &str = include_str!("cstr_prelude.rs");
 const LINKED_LIST: &str = include_str!("linked_list_prelude.rs");
 const CONTROL_FLOW: &str = include_str!("control_flow_prelude.rs");
 const BOUND: &str = include_str!("bound_prelude.rs");
+const UNWIND: &str = include_str!("unwind_prelude.rs");
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
 fn declares(text: &str, name: &str) -> bool {
@@ -82,6 +83,12 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     {
         out.push(BOUND);
     }
+    if crate::stdtime::has_word(text, "AssertUnwindSafe")
+        && !text.contains("// (unwind prelude)")
+        && !declares(text, "AssertUnwindSafe")
+    {
+        out.push(UNWIND);
+    }
     out
 }
 
@@ -112,7 +119,8 @@ fn c_string_literals(file: &SourceFile) -> Vec<(usize, usize, String)> {
 
 /// Whether the pre-pass has anything to do in `text`.
 pub(crate) fn has_rewrites(text: &str) -> bool {
-    // (The names `std_module` knows, as whole words: `Ref` isn't in `RefCell`.)
+    // (The names `std_module` and `prelude_type_module` know, as whole words: `Ref` isn't in
+    // `RefCell`.)
     [
         "Path",
         "PathBuf",
@@ -128,6 +136,8 @@ pub(crate) fn has_rewrites(text: &str) -> bool {
         "Read",
         "BufRead",
         "Cursor",
+        "Wrapping",
+        "AssertUnwindSafe",
     ]
     .iter()
     .any(|n| crate::stdtime::has_word(text, n))
@@ -165,6 +175,16 @@ fn std_module(name: &str) -> Option<&'static str> {
         "Infallible" => "convert",
         "Read" | "BufRead" | "Cursor" => "io",
         n if nonzero_int(n).is_some() || n == "NonZero" => "num",
+        _ => return None,
+    })
+}
+
+/// The std module of a type a Rust-source prelude defines under its own name, which a written-out
+/// path (`std::num::Wrapping`) drops to.
+fn prelude_type_module(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Wrapping" => "num",
+        "AssertUnwindSafe" => "panic",
         _ => return None,
     })
 }
@@ -392,6 +412,21 @@ pub(crate) fn expand(
             let q = qualifier_start(&toks, i);
             if q.1 {
                 edits.push((toks[q.0].start, end, "String::from".into()));
+            }
+            i += 1;
+            continue;
+        }
+        // `std::panic::AssertUnwindSafe(..)` / `std::num::Wrapping<u8>` written out: the
+        // prelude's type, by its name.
+        if let Some(module) = prelude_type_module(&name)
+            && !declares(text, &name)
+        {
+            let (q, std_path) = qualifier_start(&toks, i);
+            if q < i
+                && std_path
+                && toks[q..i].iter().rev().nth(1).is_some_and(|m| m.text == module)
+            {
+                edits.push((toks[q].start, toks[i].start, String::new()));
             }
             i += 1;
             continue;
@@ -1211,7 +1246,7 @@ fn qualifier_start(toks: &[Tok], i: usize) -> (usize, bool) {
         || (!leading
             && matches!(
                 first.as_str(),
-                "path" | "ffi" | "fmt" | "cell" | "num" | "convert" | "io"
+                "path" | "ffi" | "fmt" | "cell" | "num" | "convert" | "io" | "panic"
             )
             && q + 2 == i);
     (q, std)

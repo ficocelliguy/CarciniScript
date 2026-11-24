@@ -10,7 +10,7 @@ use ra_ap_syntax::{
 use serde::Serialize;
 
 use crate::lineindex::LineIndex;
-use crate::service::{Analysis, analyze, offset_of, type_at};
+use crate::service::{Analysis, analyze, in_build_at, offset_of, type_at};
 use crate::ty::Ty;
 use crate::typeck::Resolver;
 
@@ -471,6 +471,18 @@ pub fn definition(
     column: u32,
     resolver: Resolver,
 ) -> Option<Location> {
+    in_build_at(src, filename, line, column, || {
+        definition_build(src, filename, line, column, resolver)
+    })
+}
+
+fn definition_build(
+    src: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    resolver: Resolver,
+) -> Option<Location> {
     let an = analyze(src, filename, resolver);
     let token = token_at(&an, src, line, column)?;
     let cx = Ctx {
@@ -554,25 +566,43 @@ pub fn references(
     resolver: Resolver,
     others: &[String],
 ) -> Vec<Location> {
-    let an = analyze(src, filename, resolver);
-    let Some(token) = token_at(&an, src, line, column) else {
+    let found = in_build_at(src, filename, line, column, || {
+        let an = analyze(src, filename, resolver);
+        let token = token_at(&an, src, line, column)?;
+        let cx = Ctx {
+            an: &an,
+            filename,
+            resolver,
+        };
+        let def = cx.def(&token)?;
+        Some((token.text().to_string(), norm(&an, src, filename, &def)))
+    });
+    let Some((name, target)) = found else {
         return Vec::new();
     };
-    let cx = Ctx {
-        an: &an,
-        filename,
-        resolver,
-    };
-    let Some(def) = cx.def(&token) else {
-        return Vec::new();
-    };
-    let target = norm(&an, src, filename, &def);
-    let name = token.text().to_string();
-    let mut out = uses_in(src, filename, &name, &target, resolver);
+    let mut out = uses_in_builds(src, filename, &name, &target, resolver);
     for path in others.iter().filter(|p| p.as_str() != filename) {
         if let Some(text) = resolver(path) {
-            out.extend(uses_in(&text, path, &name, &target, resolver));
+            out.extend(uses_in_builds(&text, path, &name, &target, resolver));
         }
+    }
+    out
+}
+
+/// `uses_in` of both builds: a normal build leaves test code out, and a test build has it (a
+/// `tests/` script is only ever a test build).
+fn uses_in_builds(
+    src: &str,
+    filename: &str,
+    name: &str,
+    target: &(String, usize, usize),
+    resolver: Resolver,
+) -> Vec<Location> {
+    let mut out = uses_in(src, filename, name, target, resolver);
+    if crate::adt::has_test_code(src) && !crate::adt::is_tests_path(filename) {
+        let tests = crate::adt::with_test_build(true, || uses_in(src, filename, name, target, resolver));
+        out.extend(tests.into_iter().filter(|l| !out.contains(l)).collect::<Vec<_>>());
+        out.sort_by_key(|l| (l.line, l.column));
     }
     out
 }

@@ -43,4 +43,7 @@ fn main() {
     total += Wrapping(2);
     total -= Wrapping(5);
     println!("{total} {} {}", total < Wrapping(10), Wrapping(7u32).mix(3));
+    // (Written out.)
+    let w: std::num::Wrapping<u8> = std::num::Wrapping(250u8) + std::num::Wrapping(10u8);
+    println!("{w}");
 }

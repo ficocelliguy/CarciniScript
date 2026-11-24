@@ -5301,9 +5301,10 @@
   };
   // `panic::catch_unwind(f)`: `Ok(f())`, or `Err` of the panic's message once the panic is
   // reported (to stderr, as Rust's hook does before unwinding).
+  // (`f` may be an `AssertUnwindSafe` of the closure: a tuple struct, the closure at `[0]`.)
   rt.$catchUnwind = (f) => {
     try {
-      return rt.Ok(f());
+      return rt.Ok(typeof f === "function" ? f() : f[0]());
     } catch (e) {
       if (!(e instanceof CarciniPanic)) throw e;
       rt.$eprintln(`thread '${threadName}' panicked at ${e.location}:\n${e.panicMessage}`);

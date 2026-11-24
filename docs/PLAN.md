@@ -17,11 +17,15 @@ Ranked by what a player hits times how badly; a wrong result or a crash in code 
 outranks a missing feature, and a missing feature outranks a corpus count. Details are in the
 sections below.
 
-1. **Host wiring for test builds** (Bitburner player gaps): the compiler side is done.
-2. **Re-run the corpus, refresh the uncategorized sort, then triage the "mismatched types"
-   buckets** (about 90 files). The 2026-11-23 fixes un-hid serde's `impls.rs` and moved the
-   re-export and macro files, and the 2026-11-22 sort is stale; "mismatched types" is the largest
-   bucket with no confirmed probe yet.
+1. **Fix the confirmed "mismatched types" gaps** (triaged 2026-11-24; the list is under
+   "Real-world corpus survey", "Std modeling" and "Bounds and generics"). In player order:
+   `&Cow<str>` deref coercion at arguments and returns (12 files), `impl PartialEq<Other>`
+   method resolution and `T: PartialEq<U>` bounds (12), a file's own `IntoIter` breaking the
+   io prelude (10, and the errors land past the end of the file), `.as_ref()` targets on
+   bounded parameters (7), `LazyLock` deref coercion (4), `K: Borrow<Q>` lookups (3),
+   `slice.get(range)` (3), `usize::checked_next_power_of_two` as a function value (3),
+   `OsStr::to_owned()` (3), `A::Item` field types (2), std iterator structs as declared types
+   (4). Also seen on the way: `str::is_ascii` is missing.
 
 ## Contracts inherited from the RapydScript integration
 
@@ -214,10 +218,12 @@ its files into "uncategorized" (the 2026-11-22 run found `the standard library f
 uncategorized count jumps, check the report's top messages before reading anything else into
 the numbers.
 
-**Latest run** (2026-11-23, working tree after `0cab7c7` plus the `mod`-file type clash, blanket
-bound, `AsRef<[u8]>` and associated-iterator fixes, same registry as before): language features
-all supported in **83.3%** of files (4,350 of 5,220; 71.1% counting std gaps, 67.0% by lines;
-77 crates pass in every file, 159 in 80% or more). The run before that (after `26e4143`): 83.0%
+**Latest run** (2026-11-24, working tree after `0310884`, same registry as before): language features all
+supported in **83.3%** of files (4,350 of 5,220; 71.1% counting std gaps, 67.0% by lines; 77
+crates pass in every file, 159 in 80% or more). Every per-file verdict is the same as the
+2026-11-23 run (working tree after `0cab7c7` plus the `mod`-file type clash, blanket bound,
+`AsRef<[u8]>` and associated-iterator fixes), so the `#[test]` runner changed nothing here. The
+run before that (after `26e4143`): 83.0%
 (4,335; 82.8% earlier that day, before
 that round's eight fixes; 82.9% on 2026-11-22, 81.8% on 2026-11-17, 67% at the first run on
 2026-11-16); counting std gaps, 70.6%; by lines, 66.6%. 827 files have a language gap (639 of
@@ -225,9 +231,10 @@ them unsafe/memory, 126 `union`, 58 proc-macro API, 67 `extern`: not planned), 6
 50 have only uncategorized errors, 8 a parse error (2 more than before: serde's `de/impls.rs`,
 whose `atomic_impl!` failure a `forwarded_impl!` one used to hide; both fixed since). 76 crates
 pass in every file; 156 in 80% or more. Every one of the ~90 feature probes compiles. The crash
-sweeps (registry 5,922 files, std 3,004) last ran on 2026-11-23 with 0 panics (2026-11-17 too).
-The slowest file there is windows-sys's `Windows/mod.rs` at 160 s, nearly all of it its
-thousands of `mod` files.
+sweeps (registry 5,922 files, std 3,004) last ran on 2026-11-24 with 0 panics (2026-11-23 and
+2026-11-17 too). The slowest files there are windows-sys's `Windows/Win32/mod.rs` at 147 s and
+`Windows/mod.rs` at 121 s, nearly all of it their thousands of `mod` files, and stdarch's
+`core_arch/src/lib.rs` at 108 s.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
 `set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
@@ -238,29 +245,103 @@ see FEATURES.md).
 
 **Open:**
 
-- [ ] Refresh the uncategorized sort. The 2026-11-23 report has 1,257 uncategorized file hits by
-  message and construct (1,459 on 2026-11-22, 1,814 on 2026-11-17). The last sort
-  (2026-11-22) put them as: about 200 downstream of another file that the
-  syntax step can't see (a method from a trait bound or a field type defined in another module, a
-  tuple field of a value whose type comes from elsewhere, the methods of an `impl
-  OtherFilesTrait for Local` block); about 90 known limitations already recorded (slice / array /
-  `Vec` / `Box<[T]>` being one type, a generic trait implemented more than once, `impl for &T`,
-  `TypeId` / `type_name` on a type parameter); about 150 std-surface gaps whose message isn't
-  shaped like the std ones; about 200 inside macro expansions; 27 that aren't gaps at all
-  (`compile_error!` under a `cfg`, `env!` of a cargo variable). Most of the gaps it confirmed are
-  fixed since (FEATURES.md).
-- [ ] Triage the "mismatched types" buckets (two named types that don't match, about 90 files
-  outside macros). Samples are std modeling (`Cow<'a, str>` seen as `Cow<String>`,
-  `OsStr::to_owned()` as `String`), clap's derive attributes on variants (`#[command(..)]` giving
-  "expected `ClapCommand`, found `bool`"), and types from other files; nothing there has a
-  confirmed probe yet.
+- [x] Refresh the uncategorized sort (2026-11-24). The report has 1,186 uncategorized file hits
+  by message and construct (1,257 on 2026-11-23, 1,459 on 2026-11-22, 1,814 on 2026-11-17);
+  the finer sort has 1,375 file hits in 467 buckets. Roughly: 250 inside macro expansions; 300
+  downstream of another file that the syntax step can't see (a method from a trait bound or
+  supertrait defined elsewhere, 51 of them; a tuple field of a value typed elsewhere, 51 plus 16
+  on call results; a `From` impl in another file, 28; a type parameter where a concrete type is
+  expected or the reverse); 215 "mismatched types" outside macros (the open item below); about
+  95 bounds and derives (`PartialEq` / `PartialOrd` on a type parameter without the bound,
+  `Clone` / `Copy` derives whose field type lacks the derive); 65 whose inference target is
+  unknown (`.into()`, `Default::default()`, `.collect()` at an argument, closure body or struct
+  field); 52 mutability (E0596 on `*val`, `tmp[n..]`, 4 of them on a `&mut` parameter and
+  flagged as possible false positives); 47 conflicting or duplicate definitions (`cfg`'d or
+  macro-generated twins); 58 known limitations already recorded (slice / array / `Vec` /
+  `Box<[T]>` being one type, a generic trait implemented more than once, `impl for &T`,
+  `TypeId` / `type_name` on a type parameter); 27 that aren't gaps at all (`compile_error!`
+  under a `cfg`, `env!` of a cargo variable). The 2026-11-22 sort had about 150 std-surface
+  gaps whose message isn't shaped like the std ones; most of those are fixed since
+  (FEATURES.md), and what remains of them sits in the mismatched-types and `.into()` buckets.
+- [x] Triage the "mismatched types" buckets (2026-11-24). Outside macros they are 80 buckets,
+  274 files, 1,131 errors. Every example (not the sort's three per bucket) was read by
+  expected/found pair, and each cluster was reduced to a program rustc accepts (`--crate-type
+  lib`, 2021) and run through the compiler: 11 clusters confirmed, listed under "Std modeling"
+  and "Bounds and generics" below (about 75 files between them). The 20 probe programs
+  (`p_*.rs`) and the driver that runs rustc and then the wasm compiler over each
+  (`probe.mjs`) are in the OS temp dir under `carciniscript-probes-2026-11-24/`; they are the
+  starting fixtures for each fix.
+- Not gaps, from the same triage (the rest of the "mismatched types" files): raw-pointer casts
+  (`s as *const str as *const Self`, `&EMPTY_CHUNK as *const ..`, pointer to integer: bumpalo,
+  icu_provider, icu_collections, indexmap, zerotrie, zerovec, crossbeam-epoch, once_cell,
+  rowan; about 12 files, unsafe/memory, not planned, though the message should say so rather
+  than "mismatched types"); external types (clap's `#[command(..)]` on a variant, syn's `Ident
+  == "str"`, serde-wasm-bindgen's `JsValue`, fastrand's `WyRng`, rayon, rand); closures whose
+  parameter type comes from another file's iterator (regex's `bytes.rs`); and autocfg's
+  pre-2018 `Option<&error::Error>`. Two suspected clusters passed their probes: a local
+  `IntoIterator` impl with its own `IntoIter` (the smallvec hit is the `A::Item` field gap
+  below), and `Some(e)` as `Option<&(dyn Error + 'static)>` from an `io::Error` field.
 
 The gaps below are each confirmed with a program rustc accepts (edition 2021, `--crate-type lib`)
 that this compiler rejects or miscompiles; counts are files of the corpus where it shows.
 
+- Std modeling (from the 2026-11-24 "mismatched types" triage; each reads "expected `X`,
+  found `Y`" today):
+  - [ ] `&Cow<str>` / `&Cow<[u8]>` where a `&str` / `&[u8]` is expected: `f(&e.message)` with a
+    `Cow` field, `s.push_str(&rep)`, `&self.key` as a `&str` block tail, `f(&cow_returning())`,
+    `g(self)` in an `impl Tr for Cow<'a, str>`. Deref coercion of `Cow` at an argument and a
+    return. 12 files (cc, multipart, regex, url, rouille, log, form_urlencoded, wasm-bindgen).
+  - [ ] A std iterator struct named as a type doesn't unify with the method that makes it:
+    `btree_map::Keys` / `Values` / `ValuesMut` / `IntoKeys`, `btree_set::Difference`,
+    `vec::Drain`, `slice::Iter` written `Iter<'_, T>` as a field or return type get "found
+    `std::slice::Iter`"; the struct holding one has no `next` / `count`; and returning
+    `self.inner.keys()` as a `btree_map::Keys` reports `K: Ord` unsatisfied under an
+    `impl<K: Ord, V>`. 4 files (wasmparser's collections, slab, clap_builder's `flat_map`).
+  - [ ] A file's own `IntoIter` type breaks the compiler's io prelude: with an `impl io::Write`
+    (or `Read`) in the file, `Read::bytes` / `BufRead::lines` / `split` in the prelude resolve
+    `IntoIter` to the file's struct, and three errors land one line past the end of the file.
+    serde_json's `Error` and `Read` likely do the same (not probed). 10 files (smallvec,
+    thin-vec, bytes, ra_ap_stdx, serde_json, regex-automata).
+  - [ ] `.as_ref()` on a bounded type parameter takes the wrong target: `S: AsRef<OsStr> +
+    ?Sized` gives `PathBuf`, `H: AsRef<[u8]> + ?Sized` gives `Vec<u8>` when a `&[u8]` field
+    wants it; `s.as_ref()` on a `&str` passed to a `&[u8]` parameter; and a blanket `impl<H:
+    AsRef<[u8]>> From<&H> for Input` isn't found for `Input::from(s)` ("`Input` implements
+    `From<H>`"). 7 files (tempfile, ring, smol_str, clap_builder, aho-corasick, http).
+  - [ ] `LazyLock<T>` / `LazyCell<T>` don't deref-coerce: `&CONTEXT` as a `&'static T`,
+    `f(&QUEUE)`, and `LAZY.clone()` is a `LazyLock<T>` rather than `T`. 4 files (indexmap
+    benches, js-sys, uuid, wasm-bindgen).
+  - [ ] `OsStr::to_owned()` is a `String`, so `push(" ")` on it wants a `char` (the
+    `OsString::push` rule in RUST_GAPS.md doesn't cover a binding made by `to_owned`). 3
+    files (cc, clap_builder).
+  - [ ] `slice.get(range)` with a `Range<usize>` / `RangeFrom<usize>` value ("expected `usize`,
+    found `Range<usize>`"; indexing `&v[r]` with the same value works). 3 files (ring, rustls,
+    untrusted). Also `repeat(0..)` where the parameter is `impl Into<Local>` and `Local` has
+    `From<RangeFrom<usize>>`: the bare `0..` is typed as a slice `Iter`. 1 file (winnow).
+  - [ ] A method path as a function value when the method takes only `self`:
+    `.and_then(usize::checked_next_power_of_two)` is "expected `impl Fn(usize) -> Option<_>`,
+    found `impl Fn(usize, _)`" and "takes 0 arguments but 1 were supplied" (`String::len`,
+    `i32::abs`, `str::trim` work). 3 files (smallvec, crossbeam-channel).
 - Bounds and generics:
   - [ ] A turbofish through a type parameter (`O::select::<u8>(x)`) checks the method's own
     bounds, except those with type arguments (`Into<X>`, `Fn(..)`).
+  - [ ] `impl PartialEq<Other> for T` / `PartialOrd<Other>`: inside the impl, `self.0.partial_cmp(other)`
+    on the `u16` field resolves to the impl's own method (wants a `StatusCode`), and `self.eq(&T)`
+    next to a derived `PartialEq` resolves to the `PartialEq<str>` impl (wants a `String`); a
+    `Sp { .. } == 3u8` call of a generic `impl<T: PartialEq<U>, U> PartialEq<U> for Sp<T>`
+    asks for `#[derive(PartialEq)]`. Generic bounds `Elem1: PartialEq<Elem2>`, `I::Item:
+    PartialEq<J::Item>` (`a.into_iter().eq(b)`), `T: PartialEq<U>` (`self.val == *other`) and
+    tuple `A: PartialEq<C>` (`self.0 == rhs.0`) all report the two parameters as mismatched.
+    12 files (tiny_http, http, potential_utf, jiff-core, strsim, hashbrown tests, clap_derive,
+    itertools).
+  - [ ] `K: Borrow<Q>` in a `where` clause: `self.map.get(k)` / `get_mut` / `remove` with a
+    `&Q` on a `HashMap<K, V>` is "expected `K`, found `Q`". 3 files (indexmap, ra_ap_stdx,
+    rustls).
+  - [ ] `A::Item` as a struct field type (`v: Vec<A::Item>` under `struct S<A: Array>`, a
+    local trait with an associated type) is "cannot find type `Item`", and everything typed
+    through the field follows. 2 files (smallvec), but it is the whole `Array`-trait pattern.
+  - [ ] `Error::custom("..")` as a `Self::Error` in a trait default method (`Self::Error:
+    Error`) is "on a type parameter isn't supported yet" plus "expected `T`, found `String`".
+    4 files (serde, serde_core).
 - Patterns and ranges:
   - [ ] `(..).start_bound()` where only the expected type says what `T` is (the `RangeFull`
     impl's `T` isn't in its self type).
@@ -348,12 +429,13 @@ via `#[path]`, serde tagging and `flatten`, `i32` NS results, `std::sync` / toki
 typed `ns.flags`, `u64` as a number, un-awaited futures, `&str + &str`, partial moves out of a
 struct, test builds with libtest's report) are done; see FEATURES.md.
 
-- [ ] **Run tests in game (bitoxidizer-src).** `compileTests` builds a module whose `main(ns)` runs
-  the `#[test]`s (FEATURES). The host still has to choose it: e.g. `run solver.rs --test` (the
-  arguments after it are libtest's), compiled and cached apart from the normal module, and
-  editor markers from the test build too, so errors inside `mod tests` show.
-- [ ] Hover, completions and navigation inside `#[cfg(test)]` code (the language service sees a
-  normal build, which leaves it out).
+Running tests in game, from this repo only (Bitburner's `run` and its flag parsing stay as they
+are), is done: `compileTests`, the libtest report, `tests/` scripts as test builds, test-code
+errors as warnings, the language service inside test code, the README's "Testing your scripts"
+and the web REPL's Run tests button; see FEATURES.
+
+- Completions and signature help inside a macro invocation's arguments (`assert_eq!(v.le`,
+  `vec![f(1, `) don't answer, in test code or not; most test code is inside `assert!`s.
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 

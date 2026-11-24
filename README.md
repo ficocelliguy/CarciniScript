@@ -67,7 +67,9 @@ npm run build && npm run repl     # then open http://localhost:8765/web-repl/
 
 Monaco editor with live diagnostics, generated JS, and click-to-highlight between Rust and JS via
 the source map. Programs run in a Web Worker (Stop / 10 s watchdog for runaway loops) against a
-mock `ns`; runtime-error stack traces are mapped back to Rust lines.
+mock `ns`; runtime-error stack traces are mapped back to Rust lines. **Run tests**
+(Ctrl+Shift+Enter) compiles the editor's `#[test]` functions as a test build and shows libtest's
+report.
 
 **Self-test** (button in the REPL, or headless via `npm run test:browser`) verifies in the browser:
 fixture output and panic messages match recorded native rustc output
@@ -108,14 +110,77 @@ to the file's directory (`#[path = "../lib/util.rs"] mod util;`) or from the roo
 (`#[path = "/lib/util.rs"]`, imported as `"/lib/util.rs"`, which Bitburner resolves from the
 root), so scripts in `/hack/` and `/corp/` can share one `/lib/`.
 
-### Tests
+### Testing your scripts
+
+Tests are written as in Rust. `#[cfg(test)]` items and `#[test]` functions are test code: a
+normal `compile` leaves them out, as `rustc` does without `--test`, so they cost no RAM and the
+script runs as usual. Errors inside them are still reported, as warnings that say only a test
+build compiles the code. In the editor, hover, completions, signature help and go to definition
+inside test code answer from the test build, and references and rename include the uses in tests.
+
+```rust
+pub fn ways_to_sum(n: usize) -> u64 { /* .. */ }
+
+pub async fn main(ns: &NS) {
+    ns.tprint(&ways_to_sum(5).to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn five() {
+        assert_eq!(ways_to_sum(5), 6);
+    }
+}
+```
 
 `compileTests(source, filename, resolve?)` is `rustc --test`: `#[cfg(test)]` code is compiled, and
 the module's `main(ns)` runs the file's `#[test]` functions and prints libtest's report (`test
-tests::solves ... ok`, then each failure's output and `test result:`) to the terminal with
+tests::five ... ok`, then each failure's output and `test result:`) to the terminal with
 `ns.tprintf`, or to stdout without an `ns`. Its `ns.args` are libtest's: name filters, `--exact`,
-`--ignored`, `--include-ignored`. The script's own `main` isn't run, and a normal `compile` leaves
-the tests out.
+`--ignored`, `--include-ignored`. The script's own `main` isn't run.
+
+A plain `compile` of a script under the top-level `tests/` folder is a test build too, as Cargo
+builds `tests/*.rs`, so in Bitburner `run tests/solver.rs` prints the report. Such a script
+reaches the code under test with `#[path = "/solver.rs"] mod solver;` (its `pub` items, as its
+normal build has them), or runs that file's own unit tests with `include!("/solver.rs");`.
+
+Without either, a script can run its own tests: list them with a macro and run each under
+`catch_unwind`, which turns a failed assertion into an `Err` with the panic message
+(`test/fixtures/assert_unwind_safe.rs` does this):
+
+```rust
+use std::panic::{self, AssertUnwindSafe};
+
+macro_rules! tests {
+    ($($name:ident $body:block)*) => {
+        $(fn $name() $body)*
+        const TESTS: &[(&str, fn())] = &[$((stringify!($name), $name)),*];
+    };
+}
+
+tests! {
+    five { assert_eq!(ways_to_sum(5), 6); }
+    zero { assert_eq!(ways_to_sum(0), 1); }
+}
+
+pub async fn main(ns: &NS) {
+    let mut failed = 0;
+    for (name, test) in TESTS {
+        match panic::catch_unwind(AssertUnwindSafe(test)) {
+            Ok(()) => ns.tprint(&format!("test {name} ... ok")),
+            Err(e) => {
+                failed += 1;
+                let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
+                ns.tprint(&format!("test {name} ... FAILED: {msg}"));
+            }
+        }
+    }
+    ns.tprint(&format!("{} passed; {failed} failed", TESTS.len() - failed));
+}
+```
 
 ### Proc macros
 

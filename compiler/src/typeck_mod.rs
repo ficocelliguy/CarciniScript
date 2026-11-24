@@ -352,8 +352,18 @@ fn reexport(c: &Checker, out: &mut Exports, name: &str, as_name: &str) {
     }
 }
 
-/// The public signatures of the module in `text`.
+/// The public signatures of the module in `text`, as its normal build has them: a test build's
+/// `mod` files are imported as they compile on their own.
 fn exports_of(text: &str, path: &str, resolver: Resolver, stack: &mut Vec<String>) -> Exports {
+    crate::adt::with_test_build(false, || normal_exports_of(text, path, resolver, stack))
+}
+
+fn normal_exports_of(
+    text: &str,
+    path: &str,
+    resolver: Resolver,
+    stack: &mut Vec<String>,
+) -> Exports {
     // Renamed imports and crates, as the file itself compiles them (`pub fn f() -> M` with `use
     // units::Meters as M;`).
     let mut renamed = text.to_string();

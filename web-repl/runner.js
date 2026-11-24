@@ -2,6 +2,9 @@
 // freezing the page. Messages out: { type: "out" | "err" | "ns" | "call" | "panic" | "error" | "done", ... }
 const post = (type, data = {}) => self.postMessage({ type, ...data });
 
+// `ns.tprintf(format, ...args)`: `%s`, `%d`, `%i` and `%f` take the arguments in order.
+const printf = (format, ...args) => String(format).replace(/%[sdif]/g, () => String(args.shift()));
+
 // Generic mock: any `ns.foo.bar(...)` call is logged and returns a plausible value. Methods that
 // are async in Bitburner return Promises.
 function genericNs() {
@@ -39,12 +42,17 @@ function genericNs() {
     new Proxy(function () {}, {
       get(_, prop) {
         if (typeof prop === "symbol" || prop === "then") return undefined;
+        if (prop === "args" && path === "") return [];
         return make(path ? `${path}.${prop}` : prop);
       },
       apply(_, __, args) {
         const name = path.split(".").pop();
         if (name === "tprint" || name === "print") {
           post("ns", { text: args.join("") });
+          return undefined;
+        }
+        if (name === "tprintf" || name === "printf") {
+          post("ns", { text: printf(...args) });
           return undefined;
         }
         post("call", { text: `ns.${path}(${args.map((a) => JSON.stringify(a)).join(", ")})` });

@@ -121,6 +121,16 @@ try {
   );
   await screenshot("repl-playground.png");
 
+  // 1b. Run tests: the playground's `#[cfg(test)]` module as a test build, libtest's report.
+  await evaluate("carcini.runTests()");
+  await waitFor("document.getElementById('output-log').textContent.includes('exited with')");
+  const testOut = await evaluate("document.getElementById('output-log').textContent");
+  report(
+    testOut.includes("test tests::known_chains ... ok") && /test result: ok\. 1 passed; 0 failed/.test(testOut) && testOut.includes("exited with 0"),
+    "playground run tests",
+    testOut.split("\n").filter(Boolean).slice(1, 4).join(" | "),
+  );
+
   // 2. The in-page self-test (differential vs rustc, NS, source maps, robustness).
   const full = process.argv.includes("--full-prefixes");
   const results = await evaluate(`carcini.selfTest({ fullPrefixes: ${full} }).then(r => r.map(x => ({ ok: x.ok, name: x.name, detail: x.detail, pre: x.pre })))`);

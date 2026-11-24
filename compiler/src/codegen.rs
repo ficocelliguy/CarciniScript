@@ -680,6 +680,47 @@ pub(crate) fn int_bounds(k: IntKind) -> (String, String) {
 /// Compile `src`; `resolver` reads the files of its `mod` declarations (paths relative to the
 /// project root, like `lib/util.rs`).
 pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
+    if crate::adt::test_build() {
+        return compile_build(src, filename, resolver);
+    }
+    // A script under `tests/` is a test build, as Cargo builds its `tests/*.rs`.
+    if crate::adt::is_tests_path(filename) {
+        return compile_tests_with(src, filename, resolver);
+    }
+    let mut out = compile_build(src, filename, resolver);
+    // Errors in the test code, which only a test build compiles, as warnings: the script runs,
+    // and the editor still marks them.
+    if crate::adt::has_test_code(src) {
+        let tests = compile_tests_with(src, filename, resolver);
+        let file = crate::macros::parse_tree(src);
+        for d in tests.diagnostics {
+            if d.severity != "error"
+                || !crate::adt::test_code_at(&file, d.start)
+                || out
+                    .diagnostics
+                    .iter()
+                    .any(|e| (e.start, e.end, &e.message) == (d.start, d.end, &d.message))
+            {
+                continue;
+            }
+            let note = "This is test code, which only a test build compiles (a script under \
+                        `tests/`, see `compileTests`): the script still runs.";
+            out.diagnostics.push(Diagnostic {
+                severity: "warning",
+                help: Some(match d.help {
+                    Some(h) => format!("{h} {note}"),
+                    None => note.into(),
+                }),
+                ..d
+            });
+        }
+        out.diagnostics.sort_by_key(|d| (d.start, d.end));
+    }
+    out
+}
+
+/// `compile_with` for the build `test_build` says (a test build, or not).
+fn compile_build(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
     thread_local! {
         static COMPILES: crate::memo::Cache<CompileOutput> = Default::default();
     }

@@ -450,6 +450,126 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
   else pass(name);
 }
 
+// --- scripts under `tests/` are test builds, as Cargo builds `tests/*.rs`: a plain `compile` of
+// one runs its tests. It reaches the code under test with `#[path = "/solver.rs"] mod solver;`,
+// whose file is imported as its normal build (its `cfg(test)` items aren't there), or runs that
+// file's own unit tests with `include!`.
+{
+  const files = {
+    "solver.rs": [
+      "pub fn double(x: i32) -> i32 {",
+      "    x * 2",
+      "}",
+      "",
+      "#[cfg(test)]",
+      "pub fn only_in_tests() -> i32 {",
+      "    1",
+      "}",
+      "",
+      "pub async fn main(ns: &NS) {",
+      '    ns.tprint(&format!("{}", double(2)));',
+      "}",
+      "",
+      "#[cfg(test)]",
+      "mod tests {",
+      "    #[test]",
+      "    fn own() {",
+      "        assert_eq!(super::double(1), 2);",
+      "    }",
+      "}",
+      "",
+    ].join("\n"),
+    "tests/solver.rs": '#[path = "/solver.rs"]\nmod solver;\n\n#[test]\nfn doubles() {\n    assert_eq!(solver::double(4), 8);\n}\n',
+    "tests/own.rs": 'include!("/solver.rs");\n',
+  };
+  const read = (p) => files[p];
+  const outRoot = path.join(outDir, "tests-folder");
+  const report = (lines) => [
+    "",
+    `running ${lines.length} test${lines.length === 1 ? "" : "s"}`,
+    ...lines,
+    "",
+    new RegExp(`^test result: ok\\. ${lines.length} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in \\d+\\.\\d\\ds$`),
+    "",
+  ];
+  const cases = [
+    ["tests/ scripts: a `mod` of the code under test", "tests/solver.rs", report(["test doubles ... ok"])],
+    ["tests/ scripts: `include!` of a file's unit tests", "tests/own.rs", report(["test tests::own ... ok"])],
+  ];
+  for (const [name, entry, want] of cases) {
+    try {
+      for (const f of ["solver.rs", entry]) {
+        const out = compile(read(f), f, read);
+        const errors = out.diagnostics.filter((d) => d.severity === "error");
+        if (errors.length) throw new Error(errors.map((d) => `${f}:${d.line}:${d.column}: ${d.message}`).join("\n"));
+        if (f === "solver.rs" && out.code.includes("only_in_tests")) throw new Error(`solver.rs isn't its normal build:\n${out.code}`);
+        const dest = path.join(outRoot, f.replace(/\.rs$/, ".mjs"));
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        const code = out.code.replace(/from "\/(.*?)\.rs";/g, (_, p) => `from "${path.relative(path.dirname(f), p).replaceAll("\\", "/")}.mjs";`);
+        fs.writeFileSync(dest, code);
+      }
+      const printed = [];
+      const ns = { args: [], tprintf: (fmt, s) => printed.push(fmt === "%s" ? s : `bad format ${fmt}`), tprint: (s) => printed.push(`tprint ${s}`) };
+      await (await import(pathToFileURL(path.join(outRoot, entry.replace(/\.rs$/, ".mjs"))).href)).main(ns);
+      const ok = printed.length === want.length && want.every((w, i) => (typeof w === "string" ? w === printed[i] : w.test(printed[i])));
+      if (!ok) fail(name, printed.join("\n"));
+      else pass(name);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+  // The `mod` file's own test build isn't what the test script sees (as rustc: a library's
+  // `cfg(test)` items aren't there for `tests/*.rs`).
+  {
+    const name = "tests/ scripts: the `mod` file's `cfg(test)` items";
+    const src = '#[path = "/solver.rs"]\nmod solver;\n\n#[test]\nfn uses() {\n    assert_eq!(solver::only_in_tests(), 1);\n}\n';
+    const out = compile(src, "tests/uses.rs", read);
+    const errors = out.diagnostics.filter((d) => d.severity === "error");
+    if (!errors.some((d) => d.line === 6 && /only_in_tests/.test(d.message))) fail(name, errors.map((d) => `${d.line}: ${d.message}`).join("\n") || "no error");
+    else pass(name);
+  }
+  // Elsewhere, a script's tests stay out (only a top-level `tests/` folder).
+  {
+    const name = "tests/ scripts: only the top-level folder";
+    const out = compile(read("tests/solver.rs"), "lib/tests/solver.rs", (p) => (p === "solver.rs" ? files["solver.rs"] : undefined));
+    if (out.code === null || out.code.includes("$runTests")) fail(name, out.code ?? out.diagnostics.map((d) => d.message).join("\n"));
+    else pass(name);
+  }
+}
+
+// --- errors in test code: a normal build leaves the code out, so they're warnings that say only
+// a test build compiles it; the script still compiles. An error the normal build has too isn't
+// repeated.
+{
+  const name = "test code errors as warnings";
+  const src = [
+    "fn main() {",
+    '    let n: i32 = "x";',
+    "}",
+    "",
+    "#[cfg(test)]",
+    "mod tests {",
+    "    #[test]",
+    "    fn t() {",
+    '        let s: String = 5;',
+    "    }",
+    "}",
+    "",
+    "#[test]",
+    "fn top() {",
+    "    missing();",
+    "}",
+    "",
+  ].join("\n");
+  const out = compile(src, "main.rs");
+  const got = out.diagnostics.map((d) => `${d.line} ${d.severity}${/only a test build compiles/.test(d.help ?? "") ? " (test)" : ""}`);
+  const want = ["2 error", "9 warning (test)", "15 warning (test)"];
+  const clean = compile(src.replace('"x"', "1"), "main.rs");
+  if (got.join("\n") !== want.join("\n")) fail(name, out.diagnostics.map((d) => `${d.line} ${d.severity}: ${d.message} | ${d.help}`).join("\n"));
+  else if (clean.code === null) fail(name, `the script doesn't compile:\n${clean.diagnostics.map((d) => `${d.line} ${d.severity}: ${d.message}`).join("\n")}`);
+  else pass(name);
+}
+
 // --- NS scripts against a mock
 function mockNs(log) {
   const state = { security: 10, minSecurity: 1, money: 100, maxMoney: 1000 };
@@ -1567,6 +1687,55 @@ for (const [label, files, want] of rejectedFiles) {
     try {
       const got = run();
       if (got === want) pass(name);
+      else fail(name, `want ${JSON.stringify(want)}\ngot  ${JSON.stringify(got)}`);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+}
+
+// --- language service inside test code: a normal build leaves it out, so the service answers
+// from the test build there (and everywhere in a `tests/` script); references and rename take
+// both builds' uses.
+{
+  const src = [
+    "pub fn double(x: i32) -> i32 {",
+    "    x * 2",
+    "}",
+    "fn main() {",
+    "    let a = double(1);",
+    "}",
+    "#[cfg(test)]",
+    "mod tests {",
+    "    use super::*;",
+    "    fn helper() -> Vec<i32> { let d = double(2); vec![d] }",
+    "    #[test]",
+    "    fn doubles() {",
+    "        let got = helper();",
+    "        let n = got.len();",
+    "        assert_eq!(n, 1);",
+    "    }",
+    "}",
+  ].join("\n");
+  const lines = src.split("\n");
+  const col = (line, needle) => lines[line - 1].indexOf(needle) + 1;
+  const loc = (l) => l && `${l.line}:${l.column}`;
+  const checks = [
+    ["hover in a test", () => hover(src, "t.rs", 13, col(13, "got"))?.contents, "got: Vec<i32>"],
+    ["hover in a `tests/` script", () => hover("#[test]\nfn t() {\n    let n = 3u8;\n}\n", "tests/t.rs", 3, 9)?.contents, "n: u8"],
+    ["completions in a test", () => completions(src.replace("got.len()", "got.le"), "t.rs", 14, col(14, "len") + 2).some((c) => c.label === "len"), true],
+    ["signature help in a test", () => signatureHelp(src.replace("double(2)", "double(2, )"), "t.rs", 10, col(10, "double(2)") + 10)?.label, "fn double(x: i32) -> i32"],
+    ["definition from a test", () => loc(definition(src, "t.rs", 13, col(13, "helper"))), `10:${col(10, "helper")}`],
+    ["definition of a non-test item from a test", () => loc(definition(src, "t.rs", 10, col(10, "double"))), `1:${col(1, "double")}`],
+    ["references take both builds' uses", () => references(src, "t.rs", 1, col(1, "double")).map(loc).join(" "), `1:${col(1, "double")} 5:${col(5, "double")} 10:${col(10, "double")}`],
+    ["references from a test", () => references(src, "t.rs", 10, col(10, "double")).map(loc).join(" "), `1:${col(1, "double")} 5:${col(5, "double")} 10:${col(10, "double")}`],
+    ["rename renames uses in tests", () => rename(src, "t.rs", 1, col(1, "double"), "twice").length, 3],
+  ];
+  for (const [label, run, want] of checks) {
+    const name = `service in test code: ${label}`;
+    try {
+      const got = run();
+      if (got === want || (typeof want === "string" && typeof got === "string" && got.includes(want))) pass(name);
       else fail(name, `want ${JSON.stringify(want)}\ngot  ${JSON.stringify(got)}`);
     } catch (e) {
       fail(name, e.message);

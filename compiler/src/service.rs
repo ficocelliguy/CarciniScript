@@ -80,13 +80,16 @@ impl Analysis {
 }
 
 /// `analyze_uncached`, kept for the next request on the same text (hover, completions and
-/// signature help each ask).
+/// signature help each ask). A `tests/` script is analyzed as the test build it compiles to.
 pub(crate) fn analyze(src: &str, filename: &str, resolver: Resolver) -> std::rc::Rc<Analysis> {
     thread_local! {
         static ANALYSES: crate::memo::Cache<std::rc::Rc<Analysis>> = Default::default();
     }
-    crate::memo::cached(&ANALYSES, src, filename, resolver, |resolver| {
-        std::rc::Rc::new(analyze_uncached(src, filename, resolver))
+    let test = crate::adt::test_build() || crate::adt::is_tests_path(filename);
+    crate::adt::with_test_build(test, || {
+        crate::memo::cached(&ANALYSES, src, filename, resolver, |resolver| {
+            std::rc::Rc::new(analyze_uncached(src, filename, resolver))
+        })
     })
 }
 
@@ -182,8 +185,60 @@ fn code(s: &str) -> String {
     format!("```rust\n{s}\n```")
 }
 
+/// Whether a request at `offset` answers from the test build: in a `tests/` script, or in code
+/// only a test build compiles (a `#[cfg(test)]` module, a `#[test]` function), which a normal
+/// build leaves out.
+pub(crate) fn test_build_at(src: &str, filename: &str, offset: usize) -> bool {
+    crate::adt::test_build()
+        || crate::adt::is_tests_path(filename)
+        || (crate::adt::has_test_code(src)
+            && crate::adt::test_code_at(&crate::macros::parse_tree(src), offset))
+}
+
+/// `f()` in the build `test_build_at` picks for (line, column).
+pub(crate) fn in_build_at<T>(src: &str, filename: &str, line: u32, column: u32, f: impl FnOnce() -> T) -> T {
+    let on = test_build_at(src, filename, offset_of(src, line, column));
+    crate::adt::with_test_build(on, f)
+}
+
 /// What to show for hovering at (line, column).
 pub fn hover(
+    src: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    resolver: Resolver,
+) -> Option<Hover> {
+    in_build_at(src, filename, line, column, || hover_build(src, filename, line, column, resolver))
+}
+
+/// Completions at (line, column): the members of the value before a `.`.
+pub fn completions(
+    src: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    resolver: Resolver,
+) -> Vec<Completion> {
+    in_build_at(src, filename, line, column, || {
+        completions_build(src, filename, line, column, resolver)
+    })
+}
+
+/// The signature of the function or method whose argument list holds the cursor.
+pub fn signature_help(
+    src: &str,
+    filename: &str,
+    line: u32,
+    column: u32,
+    resolver: Resolver,
+) -> Option<SignatureHelp> {
+    in_build_at(src, filename, line, column, || {
+        signature_help_build(src, filename, line, column, resolver)
+    })
+}
+
+fn hover_build(
     src: &str,
     filename: &str,
     line: u32,
@@ -460,8 +515,7 @@ pub fn hover(
     None
 }
 
-/// Completions at (line, column): the members of the value before a `.`.
-pub fn completions(
+fn completions_build(
     src: &str,
     filename: &str,
     line: u32,
@@ -646,8 +700,7 @@ pub struct SignatureHelp {
     pub documentation: String,
 }
 
-/// The signature of the function or method whose argument list holds the cursor.
-pub fn signature_help(
+fn signature_help_build(
     src: &str,
     filename: &str,
     line: u32,

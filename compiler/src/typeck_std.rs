@@ -726,11 +726,15 @@ impl Checker<'_> {
                 Ty::Unit
             }
             // `panic::catch_unwind(|| ..)`: `Ok` of the closure's value, or `Err` of the panic's
-            // payload.
+            // payload. (Also of `AssertUnwindSafe(|| ..)`, the unwind prelude's.)
             ["panic", "catch_unwind"] => {
                 count(self, 1);
                 let t = match a0.map(|a| self.infer(a, None)).map(|t| self.zonk(&t)) {
                     Some(Ty::Closure { ret, .. }) => *ret,
+                    Some(Ty::Adt(n, args)) if n == "AssertUnwindSafe" => match args.first() {
+                        Some(Ty::Closure { ret, .. }) => (**ret).clone(),
+                        _ => Ty::Unknown,
+                    },
                     _ => Ty::Unknown,
                 };
                 Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into())))

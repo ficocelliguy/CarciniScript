@@ -1,11 +1,11 @@
-import { initCarciniScript, compile, setNsBindings, version } from "../index.js";
+import { initCarciniScript, compile, compileTests, setNsBindings, version } from "../index.js";
 
 const $ = (id) => document.getElementById(id);
 const runtimeUrl = new URL("../runtime/rt.js", import.meta.url).href;
 const runnerUrl = new URL("./runner.js", import.meta.url);
 const RUN_TIMEOUT_MS = 10_000;
 
-const PLAYGROUND = `// Edit me. Compiles as you type; Ctrl+Enter runs.
+const PLAYGROUND = `// Edit me. Compiles as you type; Ctrl+Enter runs, Ctrl+Shift+Enter runs the tests.
 // Click a line here to highlight the JS it became (and vice versa).
 fn collatz_len(mut n: u64) -> u32 {
     let mut steps = 0;
@@ -40,16 +40,38 @@ pub async fn main(ns: NS) {
     let x: i32 = i32::MAX;
     println!("{} {:?} {:>8.3}|", x + 1, 0.1 + 0.2, 3.14159);
 }
+
+// Left out of a normal build; Run tests (Ctrl+Shift+Enter) runs them.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_chains() {
+        assert_eq!(collatz_len(1), 0);
+        assert_eq!(collatz_len(6), 8);
+    }
+}
 `;
 
 const UNSUPPORTED = `// Rust outside the supported subset gets compile errors, never a crash.
-use std::sync::Mutex;
+// (Scripts run on one JS thread, and there's no C to link against.)
+use std::thread;
+
+extern "C" {
+    fn abs(x: i32) -> i32;
+}
+
+union Bits {
+    i: u32,
+    f: f32,
+}
 
 fn main() {
-    let total = Mutex::new(0);
-    let later = async { 41 + 1 };
-    let p = &total as *const Mutex<i32>;
-    println!("{:?}", total);
+    let worker = thread::spawn(|| 41 + 1);
+    let b = Bits { i: 1 };
+    let f = unsafe { b.f };
+    println!("{:?} {} {}", worker.join(), f, unsafe { abs(-3) });
 }
 `;
 
@@ -181,6 +203,12 @@ function runOnPage(code, sourceMap, filename, { onEvent = () => {} } = {}) {
           emit({ type: "ns", text: args.join("") });
           return undefined;
         }
+        // (`%s`, `%d`, `%i` and `%f` take the arguments in order.)
+        if (name === "printf" || name === "tprintf") {
+          const [format, ...rest] = args;
+          emit({ type: "ns", text: String(format).replace(/%[sdif]/g, () => String(rest.shift())) });
+          return undefined;
+        }
         emit({ type: "call", text: `ns.${path}(${args.map((a) => JSON.stringify(a)).join(", ")})` });
         // (`ns.flags(schema)` with no arguments to parse: each flag's default.)
         if (name === "flags") return { _: [], ...Object.fromEntries(args[0] ?? []) };
@@ -309,7 +337,7 @@ function recompile() {
   } else {
     current = { ...current, code: "", sourceMap: null, maps: [] };
   }
-  $("run").disabled = out.code === null || running !== null;
+  updateRunButtons();
   setStatus(`compiled ${source.length} chars in ${out.ms.toFixed(1)} ms · v${version()}`);
 }
 
@@ -372,16 +400,45 @@ function mapStack(stack, maps = current.maps, filename = current.filename) {
 
 async function run() {
   if (!current.code || running) return;
+  await runBuild(current, `running ${current.filename}…`);
+}
+
+/** Whether `source` has tests for Run tests to run. */
+const hasTests = (source) => source.includes("#[test]");
+
+/** Compile the editor's text as a test build (`compileTests`) and run it: libtest's report. */
+async function runTests() {
+  if (running || !hasTests(rustEditor.getValue())) return;
+  const out = compileTests(rustEditor.getValue(), current.filename);
+  if (out.code === null) {
+    showTab("output");
+    $("output-log").replaceChildren();
+    log(`the test build of ${current.filename} doesn't compile:`, "line-err");
+    for (const d of out.diagnostics.filter((d) => d.severity === "error")) log(`${d.line}:${d.column} error: ${d.message}`, "line-err");
+    return;
+  }
+  const maps = decodeMappings(JSON.parse(out.sourceMap).mappings);
+  await runBuild({ code: out.code, sourceMap: out.sourceMap, maps }, `running the tests of ${current.filename}…`);
+}
+
+/** Enable Run and Run tests when there's something to run and nothing running. */
+function updateRunButtons() {
+  $("run").disabled = !current.code || running !== null;
+  $("test").disabled = !hasTests(rustEditor.getValue()) || running !== null;
+}
+
+/** Run a compiled build (`{ code, sourceMap, maps }`), logging its output. */
+async function runBuild({ code, sourceMap, maps }, heading) {
   showTab("output");
   $("output-log").replaceChildren();
-  log(`running ${current.filename}…`, "line-meta");
-  $("run").disabled = true;
+  log(heading, "line-meta");
+  $("run").disabled = $("test").disabled = true;
   $("stop").disabled = false;
   const t0 = performance.now();
   // (A program drawing with `jsx!` runs on the page; React elements can't leave a worker.)
-  const runner = usesReact(current.code) ? runOnPage : runInWorker;
+  const runner = usesReact(code) ? runOnPage : runInWorker;
   if (runner === runOnPage) previousRoots?.();
-  running = runner(current.code, current.sourceMap, current.filename, {
+  running = runner(code, sourceMap, current.filename, {
     onEvent: (ev) => {
       if (ev.type === "out") log(ev.text);
       else if (ev.type === "err") log(ev.text, "line-err");
@@ -390,7 +447,7 @@ async function run() {
       else if (ev.type === "panic") log(`thread 'main' panicked at ${ev.location}:\n${ev.message}`, "line-err");
       else if (ev.type === "error") {
         log(`error: ${ev.message}`, "line-err");
-        const mapped = ev.stack ? mapStack(ev.stack) : "";
+        const mapped = ev.stack ? mapStack(ev.stack, maps) : "";
         if (mapped) log(mapped, "line-err");
       }
     },
@@ -404,7 +461,7 @@ async function run() {
   log(`exited with ${exitCode} after ${(performance.now() - t0).toFixed(0)} ms`, "line-meta");
   running = null;
   $("stop").disabled = true;
-  $("run").disabled = !current.code;
+  updateRunButtons();
 }
 
 function stop() {
@@ -631,9 +688,11 @@ async function boot() {
   rustEditor.onDidChangeCursorSelection(highlightFromRust);
   jsEditor.onDidChangeCursorSelection(highlightFromJs);
   rustEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, run);
+  rustEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter, runTests);
 
   document.querySelectorAll(".tabs button").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
   $("run").onclick = run;
+  $("test").onclick = runTests;
   $("stop").onclick = stop;
   $("selftest").onclick = selfTest;
   $("examples").onchange = (e) => loadExample(e.target.value);
@@ -642,7 +701,7 @@ async function boot() {
   await loadExample("playground");
   recompile();
   setStatus(`${$("status").textContent} · wasm init ${initMs.toFixed(0)} ms`);
-  window.carcini = { compile, selfTest, run, editor: rustEditor, js: jsEditor };
+  window.carcini = { compile, selfTest, run, runTests, editor: rustEditor, js: jsEditor };
 }
 
 boot().catch((e) => {
