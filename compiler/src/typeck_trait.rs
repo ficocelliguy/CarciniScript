@@ -532,7 +532,7 @@ impl Checker<'_> {
                     ("Vec<T>", "[T]", "self.as_slice()")
                 };
                 format!(
-                    "`{tr}` is implemented for both `{borrowed}` and `{owned}`, which are one type in JS: the `{owned}` impl's methods must hand each call on to the `{borrowed}` impl's (`{call}.method(args)`)"
+                    "`{tr}` is implemented for both `{borrowed}` and `{owned}` with different behavior (they are one type in JS): the `{owned}` impl's methods must hand each call on to the `{borrowed}` impl's (`{call}.method(args)`)"
                 )
             } else if matches!(type_name, "String" | "Vec") {
                 let same = if type_name == "String" {
@@ -1179,8 +1179,18 @@ impl Checker<'_> {
                     path.segment().and_then(|s| s.name_ref()),
                 )
             {
-                self.lenient_projs
-                    .insert(format!("{}::{}", qn.text(), n.text()));
+                let proj = format!("{}::{}", qn.text(), n.text());
+                // (`where I::Item: PartialEq<J::Item>`: `a.into_iter().eq(b)`, `x == y`.)
+                for b in pred.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
+                    if let Some(ast::Type::PathType(bt)) = b.ty()
+                        && let Some(seg) = bt.path().and_then(|p| p.segment())
+                        && let Some(tr) = seg.name_ref().map(|n| n.text().to_string())
+                        && matches!(tr.as_str(), "PartialEq" | "PartialOrd")
+                    {
+                        self.record_cmp_bound(&proj, &tr, &seg);
+                    }
+                }
+                self.lenient_projs.insert(proj);
             }
         }
     }
@@ -1351,5 +1361,6 @@ pub fn subst_method(m: &Method, sub: &HashMap<String, Ty>) -> Method {
         ret_slot: m.ret_slot,
         opt_slot_params: m.opt_slot_params.clone(),
         cell_self: m.cell_self,
+        trait_params: m.trait_params.clone(),
     }
 }

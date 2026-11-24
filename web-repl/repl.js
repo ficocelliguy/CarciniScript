@@ -295,6 +295,9 @@ function recompile() {
   }
   const errors = out.diagnostics.filter((d) => d.severity === "error");
   const warnings = out.diagnostics.length - errors.length;
+  // rustc's parts on one line each: `error[E0308]: mismatched types`, the label, `help:` lines.
+  const headline = (d) => `${d.severity}${d.code ? `[${d.code}]` : ""}: ${d.message}`;
+  const details = (d) => [d.label, ...(d.helps ?? []).map((h) => `help: ${h}`), ...(d.notes ?? []).map((n) => `note: ${n}`)].filter(Boolean);
   monaco.editor.setModelMarkers(
     rustEditor.getModel(),
     "carciniscript",
@@ -303,7 +306,7 @@ function recompile() {
       startColumn: d.column,
       endLineNumber: d.endLine,
       endColumn: Math.max(d.endColumn, d.column + 1),
-      message: d.help ? `${d.message}\n\n${d.help}` : d.message,
+      message: [headline(d), ...details(d), d.help && `\n${d.help}`].filter(Boolean).join("\n"),
       severity: d.severity === "error" ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
     })),
   );
@@ -312,7 +315,13 @@ function recompile() {
     ...out.diagnostics.map((d) => {
       const li = document.createElement("li");
       li.className = d.severity;
-      li.textContent = `${d.line}:${d.column} ${d.severity}: ${d.message}`;
+      li.textContent = `${d.line}:${d.column} ${headline(d)}${d.label ? `: ${d.label}` : ""}`;
+      for (const h of (d.helps ?? []).map((h) => `help: ${h}`).concat((d.notes ?? []).map((n) => `note: ${n}`))) {
+        const line = document.createElement("div");
+        line.className = "help";
+        line.textContent = h;
+        li.append(line);
+      }
       if (d.help) {
         const help = document.createElement("div");
         help.className = "help";
@@ -414,7 +423,7 @@ async function runTests() {
     showTab("output");
     $("output-log").replaceChildren();
     log(`the test build of ${current.filename} doesn't compile:`, "line-err");
-    for (const d of out.diagnostics.filter((d) => d.severity === "error")) log(`${d.line}:${d.column} error: ${d.message}`, "line-err");
+    log(out.rendered, "line-err");
     return;
   }
   const maps = decodeMappings(JSON.parse(out.sourceMap).mappings);

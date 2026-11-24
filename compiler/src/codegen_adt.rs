@@ -2131,8 +2131,11 @@ impl Codegen<'_> {
             .method_keys
             .get(&self.range_of(m.syntax()))
             .cloned();
-        let method = picked.as_deref().unwrap_or(method);
-        if let Some(sig) = self.types.adts.method(adt, method).cloned()
+        // (`$std`: the derived comparison, past an `impl PartialEq<Other>`'s `eq`.)
+        let std_cmp = picked.as_deref() == Some("$std");
+        let method = picked.as_deref().filter(|_| !std_cmp).unwrap_or(method);
+        if !std_cmp
+            && let Some(sig) = self.types.adts.method(adt, method).cloned()
             && sig.receiver.is_some()
         {
             // `c.bump(&mut self.n)` with a method that can't keep the borrow: the place goes in

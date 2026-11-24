@@ -190,6 +190,7 @@ impl Checker<'_> {
             message: message.into(),
             severity: "error",
             help: None,
+            spans: Vec::new(),
         });
     }
 }

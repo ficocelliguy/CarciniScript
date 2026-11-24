@@ -549,6 +549,32 @@ impl Walker<'_> {
             let idx = LineIndex::new(self.src);
             let (l, c) = idx.line_col(moved_at);
             let n = &self.names[&decl];
+            // rustc's "borrow of moved value" when this use only reads. A field read (`p.x`, not
+            // `p.x.len()`) is a use, of the place `p.x`; of the field itself, when it's the one
+            // that moved.
+            let field = self.src[at.1..]
+                .strip_prefix('.')
+                .map(|r| &r[..r.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(r.len())])
+                .filter(|f| !f.is_empty() && !self.src[at.1 + 1 + f.len()..].trim_start().starts_with(['(', ':']));
+            let field_read = field.is_some_and(|f| !self.src[at.1 + 1 + f.len()..].starts_with('.'));
+            let verb = if matches!(mode, Mode::Use) && !field_read { "borrow" } else { "use" };
+            let moved_field = field.filter(|f| st.partial.get(&decl).is_some_and(|m| m.contains(*f)));
+            let at = match field {
+                Some(f) if field_read || moved_field.is_some() => (at.0, at.1 + 1 + f.len()),
+                _ => at,
+            };
+            // (Where the binding is declared, and why its value moves.)
+            let mut spans = Vec::new();
+            if how != UNINIT
+                && !st.partial.contains_key(&decl)
+                && let Some(t) = self.types.get(&decl)
+            {
+                let why = format!(
+                    "move occurs because `{n}` has type `{}`, which does not implement the `Copy` trait",
+                    t.describe()
+                );
+                spans.push((decl.0, decl.1, why));
+            }
             self.diags.push(RawDiag {
                 start: at.0,
                 end: at.1,
@@ -563,22 +589,29 @@ impl Walker<'_> {
                         l + 1
                     )
                 } else if moved_at == at.0 {
-                    format!("use of moved value: `{n}` (moved here {how} in the loop's previous iteration; `.clone()` it to keep a copy)")
+                    format!("{verb} of moved value: `{n}` (moved here {how} in the loop's previous iteration; `.clone()` it to keep a copy)")
+                } else if let Some(f) = moved_field {
+                    format!(
+                        "use of moved value: `{n}.{f}` (moved on line {}:{} {how}; `.clone()` it there to keep a copy)",
+                        l + 1,
+                        c + 1
+                    )
                 } else if st.partial.contains_key(&decl) {
                     format!(
-                        "use of partially moved value: `{n}` (a field moved on line {}:{} {how}; bind it with `ref` or `.clone()` it there to keep it)",
+                        "{verb} of partially moved value: `{n}` (a field moved on line {}:{} {how}; bind it with `ref` or `.clone()` it there to keep it)",
                         l + 1,
                         c + 1
                     )
                 } else {
                     format!(
-                        "use of moved value: `{n}` (moved on line {}:{} {how}; `.clone()` it there to keep a copy)",
+                        "{verb} of moved value: `{n}` (moved on line {}:{} {how}; `.clone()` it there to keep a copy)",
                         l + 1,
                         c + 1
                     )
                 },
                 severity: "error",
                 help: None,
+                spans,
             });
         }
         if let Mode::Move(how) = mode
@@ -1289,6 +1322,7 @@ impl Walker<'_> {
                 ),
                 severity: "error",
                 help: None,
+                spans: Vec::new(),
             });
         }
         st.assigned.insert(d);

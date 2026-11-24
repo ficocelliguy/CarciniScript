@@ -629,14 +629,14 @@ impl Checker<'_> {
                 match crate::diag_help::js_alias(method, false) {
                     Some(alias) => {
                         let msg = format!(
-                            "no method named `{method}` found for `{}` (`{method}` is {alias} in Rust)",
+                            "no method named `{method}` found for `{}` (you might have meant to use {alias})",
                             self.describe(&this)
                         );
                         self.error_help(m.syntax(), msg, crate::diag_help::JS_NAMES);
                     }
                     None => {
                         let msg = format!(
-                            "no method named `{method}` found for `{}` (the std surface is still small; see docs/FEATURES.md)",
+                            "no method named `{method}` found for `{}`",
                             self.describe(&this)
                         );
                         self.error(m.syntax(), msg);

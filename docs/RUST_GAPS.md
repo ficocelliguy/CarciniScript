@@ -57,7 +57,9 @@ The gaps fall into three parts:
   operations and shifts are exact and do wrap to 64 bits. So a 64-bit hash or random number
   generator (FNV-1a, xorshift, SplitMix, `wrapping_mul` by a large odd constant) doesn't give
   rustc's values as `u64`; write it over `u128` (exact BigInts, wrapping at 128 bits) and mask
-  with `& 0xffff_ffff_ffff_ffff` where the width matters. The trade is speed: a `u64` loop runs
+  with `& 0xffff_ffff_ffff_ffff` where the width matters (the `inexact_64bit` warning points
+  at a `wrapping_*` / `overflowing_*` call, a multiplication by a constant past 2^32 and a
+  literal past 2^53 on a 64-bit integer; `#[allow(inexact_64bit)]` turns it off). The trade is speed: a `u64` loop runs
   at `f64`'s pace instead of 10x slower as a BigInt, and `u64` is what players write for money
   and thread math. `DefaultHasher::finish()` and `rng.next_u64()` give 53-bit values. This is a
   deliberate choice and isn't planned to change.
@@ -348,8 +350,43 @@ There is one JS thread, and scripts share it with the game.
 - **Exhaustiveness is approximate.** Catch-all arms, `true`/`false`, `None`/`Some(_)` and integer
   or char ranges are understood, but checking gives up on very large matches (it assumes
   they're covered).
-- **`RefCell` doesn't track borrows**, so a `borrow_mut` while another borrow is alive doesn't
-  panic.
+- **`RefCell` tracks the borrows `let` holds.** `let g = c.borrow_mut();` holds its borrow until
+  the block ends (or `drop(g)`), and a conflicting `borrow` / `borrow_mut` panics as rustc's does.
+  A guard kept any other way doesn't hold it: in a struct field, returned or passed on, bound
+  by a pattern (`if let Ok(mut g) = c.try_borrow_mut()`), or a temporary that Rust keeps alive
+  to the end of an `if let` / `match` (`if let Some(x) = c.borrow_mut().pop() { c.borrow(); }`
+  panics in Rust 2021, not here). So a program that panics in Rust may run on; one that runs
+  in Rust never panics here. Writes through a `try_borrow_mut()` guard bound by a pattern don't
+  stick when the value is a number, string or bool.
+
+## Diagnostics
+
+- **rustc's rendering, with few of its suggestions for errors.** `rendered` has rustc's layout,
+  codes, labels and secondary spans. The warnings' suggestions are rustc's patches of the source,
+  and so is E0384's `let mut x`, but most errors' (`help: consider changing this to be mutable`
+  with `let mut v` underneath) are a single `= help:` line, and some secondary spans and notes
+  rustc adds aren't there: "borrow later used here", "note: function defined here", the type in
+  E0004's "the matched value is of type `T`", E0061's missing or extra arguments. Codes and
+  labels are given for the common errors; a rarer one is `error: ..` without a code. Diagnostics
+  come in rustc's order by pass (the early lints, type errors, each function's borrow errors and
+  lints, dead code, the late lints); within the type errors, in source order.
+- **Warnings rustc gives that are missing.** The lints lean towards silence, so a warning may be
+  missing but one rustc doesn't give shouldn't appear. Not given: a tuple struct's field never
+  read, a trait's method never used, `unused_macros`, `unused_labels`, `unused_braces`,
+  `unused_doc_comments`, `deprecated`, and the other lints `lints.rs` doesn't list. Dead code
+  goes by name: a function, method or field is used when anything live uses one of that name
+  (a field read through a value of unknown type counts for every struct). A module file's
+  `pub` items are never reported (they may be used by the script's other files), and a test
+  build doesn't report dead code. `unused_assignments` skips a variable
+  a closure captures or that a `&mut` borrows, and `unused_mut` one whose method calls this
+  compiler can't tell are `&self` (it knows std's common ones and the file's own). An
+  unreachable pattern is found when one earlier arm covers it or the earlier arms cover every
+  variant of an `Option`, `Result`, `bool` or the file's enum; overlapping ranges, slices and
+  arms with `..` in a tuple aren't compared. `unused_must_use` knows `Result`, `write!`, the
+  iterator adapters and futures, not `#[must_use]` functions.
+- **Messages rustc never gives.** What this compiler doesn't support is an error with a plain
+  message (`the standard library type `UnsafeCell<i32>` is not supported`); rustc would compile
+  it. The editor's `help` says why.
 
 ## Vec, arrays and slices
 
@@ -525,6 +562,12 @@ There is one JS thread, and scripts share it with the game.
   `T: Add`) and no `Output = X`, `L::Output` and `a + b` are an `L`, so `let x: L = a + b;`
   compiles where rustc wants `L::Output`. The values are right whenever the impl's output is its
   own type, as for numbers.
+- **A `T: PartialEq<R>` bound reaches one impl.** `a == b` / `a < b` with `T: PartialEq<R>` (or
+  `PartialOrd<R>`) calls `a`'s `impl PartialEq<R>` when `b` isn't of `a`'s class. A type with
+  several such impls (`PartialEq<str>` and `PartialEq<&str>`) reaches the first, a number
+  (`impl PartialEq<Code> for u16`) uses std's comparison, and `a.into_iter().eq(b)` under
+  `where I::Item: PartialEq<J::Item>` compares the items with their derived `PartialEq`.
+  Comparing concrete types (`code == 200`, `200 == code`) picks the right impl.
 
 ## Traits on built-in types
 

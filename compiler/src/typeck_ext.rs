@@ -867,6 +867,12 @@ impl Checker<'_> {
     pub(super) fn extend_arg(&mut self, arg: Option<&ast::Expr>, elem: &Ty) {
         let Some(a) = arg else { return };
         let t = self.infer(a, None);
+        self.extend_arg_ty(a, &t, elem);
+    }
+
+    /// `extend_arg` with the argument's type `t` already inferred.
+    fn extend_arg_ty(&mut self, a: &ast::Expr, t: &Ty, elem: &Ty) {
+        let t = t.clone();
         match self.iter_elem(&t) {
             Some(e) => {
                 if !self.unify(&e, elem) {
@@ -1181,7 +1187,22 @@ impl Checker<'_> {
             // Comparing what two iterators yield.
             "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "cmp" | "partial_cmp" => {
                 count(self, 1);
-                self.extend_arg(a0, &e);
+                // (`a.into_iter().eq(b)` with `I::Item: PartialEq<J::Item>`.)
+                let tr = if matches!(method, "eq" | "ne") {
+                    "PartialEq"
+                } else {
+                    "PartialOrd"
+                };
+                if let Some(a) = a0 {
+                    let t = self.infer(a, None);
+                    let bounded = method != "cmp"
+                        && self.iter_elem(&t).is_some_and(|o| {
+                            self.cmp_bound_fits(&e, &o, tr)
+                        });
+                    if !bounded {
+                        self.extend_arg_ty(a, &t, &e);
+                    }
+                }
                 match method {
                     "cmp" => {
                         self.require_ord(m.syntax(), &e, "sort");

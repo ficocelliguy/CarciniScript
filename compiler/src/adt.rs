@@ -139,6 +139,10 @@ pub struct Method {
     /// be a number or a string, so the method takes the receiver's cell as `this` (like a
     /// `&mut self` method of an `impl Tr for i32`), whatever the receiver is.
     pub cell_self: bool,
+    /// The impl's type parameters only its trait's arguments name (`U` of `impl<T: PartialEq<U>,
+    /// U> PartialEq<U> for Sp<T>`, `C` and `D` of `impl<A, B, C, D> Equivalent<(C, D)> for (A,
+    /// B)`): fresh at each call.
+    pub trait_params: Vec<String>,
 }
 
 impl Method {
@@ -274,6 +278,10 @@ pub struct Adts {
     /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
     /// arguments, not by a trait.
     pub inherent_alts: std::collections::HashSet<String>,
+    /// The `"Type::key"`s of methods from an `impl PartialEq<R> for Type` (or `PartialOrd<R>`)
+    /// whose `R` is another type: `a.eq(&b)` with a `b` of `a`'s own type takes the derived or
+    /// std comparison instead.
+    pub foreign_cmp: std::collections::HashSet<String>,
     /// The `"Type::method"`s of an `impl Tr for Type` whose trait isn't known (from another
     /// file or crate): registered so calls still type, and an inherent method of the name wins.
     pub unknown_trait_methods: std::collections::HashSet<String>,

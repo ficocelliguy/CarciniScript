@@ -67,7 +67,7 @@ pub fn check(
         if body.point_count() > MAX_POINTS {
             continue;
         }
-        for (span, msg) in check_body(&env, body) {
+        for (span, msg, spans) in check_body(&env, body) {
             if out
                 .iter()
                 .any(|d| d.start == span.0 && d.end == span.1 && d.message.starts_with(&msg))
@@ -81,6 +81,7 @@ pub fn check(
                 severity: if strict { "error" } else { "warning" },
                 // (The help says it runs anyway when borrow conflicts are warnings.)
                 help: None,
+                spans: spans.into_iter().map(|((s, e), l)| (s, e, l)).collect(),
             });
         }
     }
@@ -132,7 +133,8 @@ struct Analysis<'b, 'e, 'a> {
     values: Vec<BitSet>,
     /// Loans reported as escaping or outliving their place (not reported again).
     reported: Vec<bool>,
-    diags: Vec<(Span, String)>,
+    /// (where, message, rustc's secondary spans: the conflicting loan's)
+    diags: Vec<(Span, String, Vec<(Span, String)>)>,
 }
 
 /// The loans in scope at a point: in scope, and activated (two-phase).
@@ -142,7 +144,7 @@ struct LoanState {
     active: BitSet,
 }
 
-fn check_body(env: &Env, body: &Body) -> Vec<(Span, String)> {
+fn check_body(env: &Env, body: &Body) -> Vec<(Span, String, Vec<(Span, String)>)> {
     let mut block_start = Vec::with_capacity(body.blocks.len());
     let mut n = 0;
     for b in &body.blocks {
@@ -489,7 +491,7 @@ impl Analysis<'_, '_, '_> {
                 .or_else(|| self.body.returns.first().map(|s| s.span));
             if let Some(span) = span {
                 self.diags
-                    .push((span, "lifetime may not live long enough".to_string()));
+                    .push((span, "lifetime may not live long enough".to_string(), Vec::new()));
             }
         }
     }
@@ -520,7 +522,7 @@ impl Analysis<'_, '_, '_> {
                     (_, false) => format!("cannot return value referencing local variable `{}`", local.name),
                 };
                 self.reported[li] = true;
-                self.diags.push((site.span, msg));
+                self.diags.push((site.span, msg, Vec::new()));
             }
         }
     }
@@ -687,8 +689,16 @@ impl Analysis<'_, '_, '_> {
                 hit = Some((li, lm));
             }
         }
-        let Some((_, lm)) = hit else { return };
+        let Some((li, lm)) = hit else { return };
         let p = self.body.describe(place);
+        let loan_label = match (access, lm) {
+            (Access::Read | Access::ShallowRead | Access::Write, _) => format!("`{p}` is borrowed here"),
+            (Access::Borrow, _) => "mutable borrow occurs here".to_string(),
+            (Access::Move, _) => format!("borrow of `{p}` occurs here"),
+            (Access::MutBorrow, true) => "first mutable borrow occurs here".to_string(),
+            (Access::MutBorrow, false) => "immutable borrow occurs here".to_string(),
+        };
+        let loan_span = self.loans[li].span;
         let msg = match (access, lm) {
             (Access::Read | Access::ShallowRead, _) => {
                 format!("cannot use `{p}` because it was mutably borrowed")
@@ -705,13 +715,13 @@ impl Analysis<'_, '_, '_> {
                 format!("cannot borrow `{p}` as mutable because it is also borrowed as immutable")
             }
         };
-        self.diags.push((span, msg));
+        self.diags.push((span, msg, vec![(loan_span, loan_label)]));
     }
 
     /// A two-phase borrow becomes a `&mut` at its call: like taking it there, against every
     /// other loan.
     fn check_activation(&mut self, st: &LoanState, p: usize, place: &Place, this: Option<usize>, span: Span) {
-        let mut hit: Option<bool> = None;
+        let mut hit: Option<(usize, bool)> = None;
         for li in st.scope.iter() {
             if Some(li) == this {
                 continue;
@@ -727,18 +737,18 @@ impl Analysis<'_, '_, '_> {
                 continue;
             }
             let lm = self.loan_mutable(st, li);
-            if hit.is_none() || (lm && hit == Some(false)) {
-                hit = Some(lm);
+            if hit.is_none() || (lm && hit.is_some_and(|h| !h.1)) {
+                hit = Some((li, lm));
             }
         }
-        let Some(lm) = hit else { return };
+        let Some((li, lm)) = hit else { return };
         let p = self.body.describe(place);
-        let msg = if lm {
-            format!("cannot borrow `{p}` as mutable more than once at a time")
+        let (msg, label) = if lm {
+            (format!("cannot borrow `{p}` as mutable more than once at a time"), "first mutable borrow occurs here")
         } else {
-            format!("cannot borrow `{p}` as mutable because it is also borrowed as immutable")
+            (format!("cannot borrow `{p}` as mutable because it is also borrowed as immutable"), "immutable borrow occurs here")
         };
-        self.diags.push((span, msg));
+        self.diags.push((span, msg, vec![(self.loans[li].span, label.to_string())]));
     }
 
     /// The end of a local's storage: a loan of it still in scope outlives it.
@@ -758,7 +768,7 @@ impl Analysis<'_, '_, '_> {
                 _ => (loan.span, format!("`{}` does not live long enough", local.name)),
             };
             self.reported[li] = true;
-            self.diags.push((span, msg));
+            self.diags.push((span, msg, Vec::new()));
         }
     }
 }

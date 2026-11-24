@@ -8,6 +8,7 @@ const {
   definitionJson,
   referencesJson,
   renameJson,
+  formatDiagnosticsJson,
   setNsBindings,
   setOverflowChecks,
   setStrictBorrows,
@@ -34,4 +35,6 @@ exports.rename = (source, filename, line, column, newName, resolve, others = [])
 exports.setNsBindings = (text) => JSON.parse(setNsBindings(text));
 exports.setOverflowChecks = (on) => setOverflowChecks(on);
 exports.setStrictBorrows = (on) => setStrictBorrows(on);
+exports.formatDiagnostics = (source, filename, diagnostics) =>
+  formatDiagnosticsJson(source, filename, JSON.stringify(diagnostics));
 exports.version = version;

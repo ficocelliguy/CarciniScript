@@ -56,6 +56,8 @@ pub fn is_std_error(name: &str) -> bool {
             | "CharTryFromError"
             | "TryFromSliceError"
             | "Utf8Error"
+            | "BorrowError"
+            | "BorrowMutError"
             | "serde_json::Error"
     )
 }
@@ -122,13 +124,13 @@ impl Checker<'_> {
             self.error(p.syntax(), msg);
         }
         let fields: Vec<ast::Pat> = tp.fields().collect();
-        let name = if variant == 0 { "Ok" } else { "Err" };
         if fields.len() != 1 {
             self.error(
                 p.syntax(),
                 format!(
-                    "`{name}` has 1 field, but this pattern has {}",
-                    fields.len()
+                    "this pattern has {} field{}, but the corresponding tuple variant has 1 field",
+                    fields.len(),
+                    if fields.len() == 1 { "" } else { "s" }
                 ),
             );
         }

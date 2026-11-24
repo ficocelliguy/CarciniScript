@@ -425,6 +425,7 @@ impl Checker<'_> {
                     ret_slot: None,
                     opt_slot_params: vec![],
                     cell_self: false,
+                    trait_params: vec![],
                 });
         }
     }
@@ -637,6 +638,15 @@ impl Checker<'_> {
             self.pending_projections.push((sv, tr, a, x.clone()));
             map.insert(p, x);
         }
+        // `impl<A, B, C, D> Equivalent<(C, D)> for (A, B)`, `impl<T: PartialEq<U>, U>
+        // PartialEq<U> for Sp<T>`: impl parameters only the trait's arguments name are fresh per
+        // call (unless the call is in that impl, where they're in scope).
+        for p in &m.trait_params {
+            if !map.contains_key(p) && !self.generics.contains_key(p) {
+                let v = self.fresh(VarKind::General);
+                map.insert(p.clone(), v);
+            }
+        }
         if map.is_empty() {
             return m.clone();
         }
@@ -655,6 +665,7 @@ impl Checker<'_> {
             ret_slot: m.ret_slot,
             opt_slot_params: m.opt_slot_params.clone(),
             cell_self: m.cell_self,
+            trait_params: m.trait_params.clone(),
         }
     }
 
@@ -848,6 +859,7 @@ impl Checker<'_> {
         self.param_bounds.clear();
         self.param_trait_args.clear();
         self.op_args.clear();
+        self.cmp_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -1642,6 +1654,7 @@ impl Checker<'_> {
             // (A `&mut self` method on a string, number, bool, char or `Option` takes a cell as
             // `this`: see `codegen_adt::cell_self`.)
             method.impl_args = impl_args.clone();
+            method.trait_params = trait_only_params(imp);
             if let (Some(op), Some(rhs)) = (op, &op_rhs)
                 && name.text() == op
             {
@@ -1710,6 +1723,8 @@ impl Checker<'_> {
                 _ => None,
             };
             // A generic trait's second impl for this type (`impl IntoS<u16> for Vec<u8>` after
+            let foreign_cmp = matches!(trait_name.as_deref(), Some("PartialEq" | "PartialOrd"))
+                && foreign_rhs(imp, &type_name);
             // `impl IntoS<u8> for Vec<u8>`, `impl TryFrom<Vec<u8>>` after `impl TryFrom<&str>`):
             // its methods under keys of their own.
             if let Some(tr) = trait_name.as_deref()
@@ -1734,6 +1749,9 @@ impl Checker<'_> {
                     .or_insert_with(|| vec![n.clone()]);
                 let key = format!("{n}${}", alts.len());
                 alts.push(key.clone());
+                if foreign_cmp {
+                    self.adts.foreign_cmp.insert(format!("{type_name}::{key}"));
+                }
                 let at = self.range(name.syntax()).0;
                 self.adts.alt_keys_at.insert(at, key.clone());
                 if let Some(w) = written {
@@ -1854,6 +1872,9 @@ impl Checker<'_> {
                 );
                 continue;
             }
+            if foreign_cmp {
+                self.adts.foreign_cmp.insert(key);
+            }
             // Trait methods (`fmt`, `default`) live alongside inherent ones under their own name.
             methods.insert(name.text().to_string(), method);
         }
@@ -1864,6 +1885,7 @@ impl Checker<'_> {
         self.param_bounds.clear();
         self.param_trait_args.clear();
         self.op_args.clear();
+        self.cmp_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -1951,6 +1973,7 @@ impl Checker<'_> {
             ret_slot,
             opt_slot_params,
             cell_self: false,
+            trait_params: vec![],
         };
         for p in &own {
             self.generics.remove(p);
@@ -2134,6 +2157,7 @@ impl Checker<'_> {
             self.param_bounds.clear();
             self.param_trait_args.clear();
             self.op_args.clear();
+            self.cmp_args.clear();
             self.lenient_projs.clear();
             self.const_tys.clear();
             self.from_args.clear();
@@ -2895,14 +2919,26 @@ impl Checker<'_> {
                 let named = fields.len() - usize::from(rest.is_some());
                 if (rest.is_none() && named != n) || named > n {
                     let s = |k: usize| if k == 1 { "" } else { "s" };
-                    self.error(
-                        p.syntax(),
+                    // rustc's caret is on the pattern's fields.
+                    let at = match (fields.first(), fields.last()) {
+                        (Some(a), Some(b)) => (self.range(a.syntax()).0, self.range(b.syntax()).1),
+                        _ => self.range(p.syntax()),
+                    };
+                    let what = if name.contains("::") { "tuple variant" } else { "tuple struct" };
+                    self.error_spans(
+                        at,
                         format!(
-                            "this pattern has {named} field{}, but `{name}` has {n} field{}",
+                            "this pattern has {named} field{}, but the corresponding {what} has {n} field{}",
                             s(named),
                             s(n)
                         ),
+                        None,
+                        Vec::new(),
                     );
+                    // (Its names are still bound, so their uses don't report again.)
+                    for f in &fields {
+                        self.pat(f, &Ty::Unknown);
+                    }
                     return true;
                 }
                 for (i, f) in fields.iter().enumerate() {
@@ -3507,6 +3543,30 @@ fn const_eval(file: &ast::SourceFile, e: &ast::Expr, _depth: u32) -> Option<i128
         crate::consteval::CVal::Int(n) => Some(n),
         crate::consteval::CVal::Bool(_) | crate::consteval::CVal::U128(_) => None,
     }
+}
+
+/// The type parameters of `imp` that its trait's arguments name and its self type doesn't
+/// (`U` of `impl<T: PartialEq<U>, U> PartialEq<U> for Sp<T>`).
+fn trait_only_params(imp: &ast::Impl) -> Vec<String> {
+    let (Some(tr), Some(own)) = (imp.trait_(), imp.self_ty()) else {
+        return Vec::new();
+    };
+    let names = |n: &SyntaxNode| -> Vec<String> {
+        n.descendants()
+            .filter_map(ast::NameRef::cast)
+            .map(|r| r.text().to_string())
+            .collect()
+    };
+    let (in_trait, in_own) = (names(tr.syntax()), names(own.syntax()));
+    imp.generic_param_list()
+        .into_iter()
+        .flat_map(|l| l.type_or_const_params())
+        .filter_map(|p| match p {
+            ast::TypeOrConstParam::Type(tp) => tp.name().map(|n| n.text().to_string()),
+            ast::TypeOrConstParam::Const(_) => None,
+        })
+        .filter(|n| in_trait.contains(n) && !in_own.contains(n))
+        .collect()
 }
 
 /// Whether an `impl PartialEq<R> for T` (or `PartialOrd<R>`) compares `T` with another type:

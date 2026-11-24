@@ -342,6 +342,70 @@ impl Checker<'_> {
         Some((one.key.clone(), rets.remove(&one.key)))
     }
 
+    /// `self.0.partial_cmp(other)` on a `u16` with an `impl PartialOrd<StatusCode> for u16` in the
+    /// file, `self.eq(other)` with an `impl PartialEq<str> for P` next to a derived `PartialEq`:
+    /// when every impl of the method for the receiver's type compares it with another type and
+    /// the argument is of the receiver's own, the call is the derived or std comparison (its key
+    /// `$std`, for codegen).
+    pub(super) fn std_cmp_call(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        rt: &Ty,
+        method: &str,
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        if !matches!(
+            method,
+            "eq" | "ne" | "partial_cmp" | "lt" | "le" | "gt" | "ge"
+        ) {
+            return None;
+        }
+        let [a] = args else { return None };
+        let t = self.shallow(rt);
+        let key = match &t {
+            Ty::Adt(n, _) => n.clone(),
+            t => crate::adt::ext_key_of(t)?.to_string(),
+        };
+        let keys = self
+            .adts
+            .method_alts
+            .get(&format!("{key}::{method}"))
+            .cloned()
+            .unwrap_or_else(|| vec![method.to_string()]);
+        if !keys
+            .iter()
+            .all(|k| self.adts.foreign_cmp.contains(&format!("{key}::{k}")))
+        {
+            return None;
+        }
+        let at = self.infer(a, None);
+        let foreign = keys.iter().any(|k| {
+            self.adts
+                .method(&key, k)
+                .and_then(|s| s.params.first())
+                .is_some_and(|p| self.could_be(p, &at))
+        });
+        if foreign || !self.could_be(&t, &at) {
+            return None;
+        }
+        self.unify(&t, &at);
+        if matches!(t, Ty::Adt(..)) {
+            let tr = if method == "eq" || method == "ne" {
+                "PartialEq"
+            } else {
+                "PartialOrd"
+            };
+            self.require_trait(m.syntax(), &t, tr);
+        }
+        let r = self.range(m.syntax());
+        self.method_keys.insert(r, "$std".into());
+        Some(if method == "partial_cmp" {
+            Ty::Option(Box::new(Ty::Ordering))
+        } else {
+            Ty::Bool
+        })
+    }
+
     /// `v.into_s()` where a generic trait is implemented more than once for `ty`
     /// (`impl IntoS<u8> for Vec<u8>`, `impl IntoS<u16> for Vec<u8>`): the key of the impl whose
     /// signature fits the arguments and the expected type (the first that fits when several do),

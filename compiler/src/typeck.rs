@@ -89,6 +89,8 @@ pub struct RawDiag {
     /// The rule behind the message for a player who doesn't know Rust (`diag_help.rs`);
     /// `None` leaves it to the message's shape.
     pub help: Option<String>,
+    /// Other places the error involves: (start, end, rustc's label for it).
+    pub spans: Vec<(usize, usize, String)>,
 }
 
 /// Resolved types keyed by absolute `(start, end)` byte range: every expression, and the name of
@@ -138,6 +140,9 @@ pub struct Types {
     /// Reads of a fixed-size array of `Copy` values (a local or a struct field), which copy in
     /// by-value positions like rustc's `[T; N]: Copy`.
     pub array_reads: std::collections::HashSet<(usize, usize)>,
+    /// Bindings (by name range) that a mutation needed declared `mut`: an assignment, a `&mut`
+    /// borrow or a `&mut self` method call rooted at them (rustc's `unused_mut` reads it).
+    pub mut_roots: std::collections::HashSet<(usize, usize)>,
     /// `&mut place` results of `index_mut` bodies: a cell over the place (`κσ.$cell`).
     pub cell_returns: std::collections::HashSet<(usize, usize)>,
     /// `grid[i] = v` / `grid[i] += v` through `impl IndexMut`: written as `cell[0]`.
@@ -198,6 +203,9 @@ pub struct Types {
     pub dyn_nums: HashMap<(usize, usize), String>,
     /// Method calls that go to one of several impls of a generic trait: the method's key.
     pub method_keys: HashMap<(usize, usize), String>,
+    /// `a == b` / `a < b` that a `T: PartialEq<R>` / `PartialOrd<R>` bound with `R` another type
+    /// allowed (`κσ.$eqTo` / `$pcmpTo`: `a`'s own impl when `b` isn't of its class).
+    pub bound_cmps: std::collections::HashSet<(usize, usize)>,
     /// Auto-deref through `impl Deref`: these expressions are `x.deref()` (or `x.deref_mut()`,
     /// the `bool`), with the target type.
     pub derefs: HashMap<(usize, usize), (bool, Ty)>,
@@ -402,6 +410,7 @@ impl<'a> Checker<'a> {
             shared_ref_fields: Default::default(),
             fn_ptr_fields: Default::default(),
             array_reads: Default::default(),
+            mut_roots: Default::default(),
             cell_returns: Default::default(),
             index_places: Default::default(),
             slice_views: Default::default(),
@@ -430,6 +439,7 @@ impl<'a> Checker<'a> {
             ret_slot: None,
             pending_cell_args: Vec::new(),
             method_keys: Default::default(),
+            bound_cmps: Default::default(),
             derefs: Default::default(),
             deref_steps: Default::default(),
             qualified_calls: Default::default(),
@@ -480,6 +490,7 @@ impl<'a> Checker<'a> {
             impl_assoc: HashMap::new(),
             param_trait_args: HashMap::new(),
             op_args: HashMap::new(),
+            cmp_args: HashMap::new(),
             lenient_projs: Default::default(),
             pending_projections: Vec::new(),
             pending_trait_args: Vec::new(),
@@ -684,6 +695,7 @@ pub fn check(
             message,
             severity: "error",
             help: None,
+            spans: Vec::new(),
         });
     }
     // (`Option<Option<T>>` and `Option<()>` are representable: `Some(None)` and `Some(())` are
@@ -702,6 +714,7 @@ pub fn check(
             message,
             severity: "error",
             help: None,
+            spans: Vec::new(),
         });
     }
     // Moves are only checked in programs that type-check: they rely on the types.
@@ -726,6 +739,7 @@ pub fn check(
             message,
             severity: "error",
             help: None,
+            spans: Vec::new(),
         });
     }
     // (Before the definitions move out: methods' type parameters are looked up there.)
@@ -773,6 +787,7 @@ pub fn check(
     let self_assoc_dicts = std::mem::take(&mut c.self_assoc_dicts);
     let elem_methods = std::mem::take(&mut c.elem_methods);
     let method_keys = std::mem::take(&mut c.method_keys);
+    let bound_cmps = std::mem::take(&mut c.bound_cmps);
     let derefs = std::mem::take(&mut c.derefs);
     let deref_steps = std::mem::take(&mut c.deref_steps);
     let qualified_calls = std::mem::take(&mut c.qualified_calls);
@@ -810,6 +825,7 @@ pub fn check(
             slot_bindings,
             mut_ref_loops,
             array_reads,
+            mut_roots: std::mem::take(&mut c.mut_roots),
             cell_returns,
             index_places,
             slice_views,
@@ -830,6 +846,7 @@ pub fn check(
             elem_methods,
             dyn_nums,
             method_keys,
+            bound_cmps,
             derefs,
             deref_steps,
             qualified_calls,
@@ -971,6 +988,7 @@ struct Checker<'a> {
     /// but `Copy`, `Clone`, `Debug` and `PartialEq`. (struct or variant, field)
     pub(super) fn_ptr_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
+    mut_roots: std::collections::HashSet<(usize, usize)>,
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
@@ -1011,6 +1029,7 @@ struct Checker<'a> {
     /// after the call's arguments are inferred (a slot-valued call, `o.unwrap()`).
     pending_cell_args: Vec<ast::Expr>,
     method_keys: HashMap<(usize, usize), String>,
+    bound_cmps: std::collections::HashSet<(usize, usize)>,
     derefs: HashMap<(usize, usize), (bool, Ty)>,
     deref_steps: HashMap<(usize, usize), Vec<bool>>,
     qualified_calls: HashMap<(usize, usize), QualifiedCall>,
@@ -1115,6 +1134,9 @@ struct Checker<'a> {
     /// The right-hand sides of std operator bounds, by (parameter, trait): `L: Add<R>` is
     /// (`L`, `Add`) → `R`.
     pub(super) op_args: HashMap<(String, String), Ty>,
+    /// `L: PartialEq<R>` / `PartialOrd<R>` bounds (and `where I::Item: PartialEq<J::Item>`), by
+    /// (parameter or projection, trait): `R` as written, lowered where `a == b` compares.
+    pub(super) cmp_args: HashMap<(String, String), ast::Type>,
     /// Projections a `where` clause constrains (`where I::Item: PartialEq<T>`): unchecked.
     pub(super) lenient_projs: std::collections::HashSet<String>,
     /// Generic calls' projections waiting for their type argument: (`S`'s variable, trait,
@@ -1185,6 +1207,7 @@ impl<'a> Checker<'a> {
             message: "this loop never ends and never awaits, so it would freeze Bitburner: add `ns.sleep(..).await` (or another awaited NS call) inside it".into(),
             severity: "warning",
             help: None,
+            spans: Vec::new(),
         });
     }
 
@@ -1206,6 +1229,7 @@ impl<'a> Checker<'a> {
             message: "unused implementer of `Future` that must be used".into(),
             severity: "warning",
             help: Some(format!("futures do nothing unless you `.await` them: write `.await` after the {} (an NS call left pending makes the script's next NS call fail)", if block { "block" } else { "call" })),
+            spans: Vec::new(),
         });
     }
 
@@ -1217,6 +1241,7 @@ impl<'a> Checker<'a> {
             message: message.into(),
             severity: "error",
             help: None,
+            spans: Vec::new(),
         });
     }
 
@@ -1225,8 +1250,7 @@ impl<'a> Checker<'a> {
     fn missing_ret_msg(&self, found: &str) -> String {
         let suggest = found.replace("{integer}", "i32").replace("{float}", "f64");
         format!(
-            "mismatched types: expected `()`, found `{found}` (`{}` has no return type: add `-> {suggest}` after the parameters, or end the line with `;`)",
-            self.fn_name
+            "mismatched types: expected `()`, found `{found}` (try adding a return type: `-> {suggest}`)"
         )
     }
 
@@ -1239,6 +1263,25 @@ impl<'a> Checker<'a> {
             message: message.into(),
             severity: "error",
             help: Some(help.to_string()),
+            spans: Vec::new(),
+        });
+    }
+
+    /// An error at `start..end` with rustc's secondary spans: (start, end, label).
+    pub(super) fn error_spans(
+        &mut self,
+        (start, end): (usize, usize),
+        message: impl Into<String>,
+        help: Option<&str>,
+        spans: Vec<(usize, usize, String)>,
+    ) {
+        self.diags.push(RawDiag {
+            start,
+            end,
+            message: message.into(),
+            severity: "error",
+            help: help.map(str::to_string),
+            spans,
         });
     }
 
@@ -1304,6 +1347,12 @@ impl<'a> Checker<'a> {
             .into_iter()
             .filter_map(|key| {
                 let p = self.adts.method(k, &key)?.params.first()?.clone();
+                // (`impl<T: PartialEq<U>, U> PartialEq<U> for Sp<T>`: any `U`.)
+                let mut ps = Vec::new();
+                p.collect_params(&mut ps);
+                let any: HashMap<String, Ty> =
+                    ps.into_iter().map(|n| (n, Ty::Unknown)).collect();
+                let p = generic::subst(&p, &any);
                 self.could_be(&p, rhs).then_some((key, p))
             })
             .collect();
@@ -2327,11 +2376,12 @@ impl<'a> Checker<'a> {
         {
             return;
         }
+        let kind = if matches!(name, "Ordering") { "enum" } else { "struct" };
         let msg = if in_type {
-            format!("cannot find type `{name}` in this scope (add `use std::{module}::{name};`)")
+            format!("cannot find type `{name}` in this scope (consider importing this {kind}: `use std::{module}::{name};`)")
         } else {
             format!(
-                "failed to resolve: use of undeclared type `{name}` (add `use std::{module}::{name};`)"
+                "failed to resolve: use of undeclared type `{name}` (consider importing this {kind}: `use std::{module}::{name};`)"
             )
         };
         self.error(node, msg);
@@ -2716,25 +2766,40 @@ impl<'a> Checker<'a> {
                 .map(|t| t.syntax().clone())
                 .unwrap_or_else(|| body.syntax().clone());
             let (expected_s, found_s) = (self.describe(&ret), self.describe(&found));
+            // (rustc's secondary spans: the return type, the function's name.)
+            let ret_ty = f.ret_type().and_then(|r| r.ty()).map(|t| self.range(t.syntax()));
+            let fn_name = f.name().map(|n| self.range(n.syntax()));
             if !self.ret_declared && !matches!(self.shallow(&found), Ty::Unit) {
                 // `fn name() { String::from("x") }`: the `()` comes from the missing `-> T`,
                 // the mistake a JavaScript author makes most.
                 let msg = self.missing_ret_msg(&found_s);
                 self.error_help(&node, msg, diag_help::MISSING_RET);
             } else if self.ret_declared && !has_tail && matches!(self.shallow(&found), Ty::Unit) {
-                // `fn name() -> String { String::from("x"); }`: the stray `;`.
+                // `fn name() -> String { String::from("x"); }`: the stray `;`. rustc points at
+                // the return type, the name, and the `;`.
                 let last = body
                     .stmt_list()
                     .and_then(|l| l.statements().last())
-                    .map(|s| s.syntax().clone())
-                    .unwrap_or(node);
-                let msg = format!(
-                    "mismatched types: expected `{expected_s}`, found `()` (the last line ends with `;`, so the function returns nothing; remove the `;` to return its value)"
-                );
-                self.error_help(&last, msg, diag_help::STRAY_SEMI);
+                    .map(|s| self.range(s.syntax()));
+                let msg = format!("mismatched types: expected `{expected_s}`, found `()`");
+                let mut spans = Vec::new();
+                if let Some((s, e)) = fn_name {
+                    let why = "implicitly returns `()` as its body has no tail or `return` expression";
+                    spans.push((s, e, why.to_string()));
+                }
+                if let Some((_, e)) = last
+                    && self.src.as_bytes().get(e.wrapping_sub(1)) == Some(&b';')
+                {
+                    spans.push((e - 1, e, "help: remove this semicolon to return this value".into()));
+                }
+                let at = ret_ty.or(last).unwrap_or_else(|| self.range(&node));
+                self.error_spans(at, msg, Some(diag_help::STRAY_SEMI), spans);
             } else {
                 let msg = format!("mismatched types: expected `{expected_s}`, found `{found_s}`");
-                self.error(&node, msg);
+                let spans = ret_ty
+                    .map(|(s, e)| vec![(s, e, format!("expected `{expected_s}` because of return type"))])
+                    .unwrap_or_default();
+                self.error_spans(self.range(&node), msg, None, spans);
             }
         }
         self.resolve_intos();
@@ -2784,6 +2849,7 @@ impl<'a> Checker<'a> {
                 message,
                 severity: "error",
                 help: None,
+                spans: Vec::new(),
             });
         }
         for (r, adt, targs) in std::mem::take(&mut self.const_lits) {
@@ -2809,6 +2875,7 @@ impl<'a> Checker<'a> {
                         message: format!("type annotations needed: cannot infer the value of the const parameter `{p}` declared on the {kind} `{adt}`"),
                         severity: "error",
                         help: None,
+                        spans: Vec::new(),
                     });
                 }
             }
@@ -3740,7 +3807,7 @@ impl<'a> Checker<'a> {
                 if fields.len() != 1 {
                     self.error(
                         p.syntax(),
-                        format!("`Some` has 1 field, but this pattern has {}", fields.len()),
+                        format!("this pattern has {} field{}, but the corresponding tuple variant has 1 field", fields.len(), if fields.len() == 1 { "" } else { "s" }),
                     );
                 }
                 if let Some(f) = fields.first() {
@@ -5038,7 +5105,7 @@ impl<'a> Checker<'a> {
                         match diag_help::js_alias(&name, true) {
                             Some(alias) => self.error_help(
                                 f.syntax(),
-                                format!("{msg} (`{name}` is {alias} in Rust)"),
+                                format!("{msg} (you might have meant to use {alias})"),
                                 diag_help::JS_NAMES,
                             ),
                             None => self.error(f.syntax(), msg),
@@ -5735,6 +5802,12 @@ impl<'a> Checker<'a> {
 
     /// rustc's mutability rules for assigning to or mutably borrowing a place.
     fn check_mutable(&mut self, e: &ast::Expr, how: Mutation) {
+        // (Whatever the outcome, the root binding is one a mutation goes through.)
+        if let Some((name, _)) = Self::place_root(e)
+            && let Some(d) = self.lookup(name.text()).and_then(|l| l.decl)
+        {
+            self.mut_roots.insert(d);
+        }
         // A write through `v[a..b]` would only change a copy, except for the in-place slice
         // methods, which codegen writes back.
         if let Some(range) = Self::range_slice_in(e) {
@@ -5955,6 +6028,17 @@ impl<'a> Checker<'a> {
                     self.conversions.insert(r, crate::adt::Conv::Method { key });
                     return Ty::Bool;
                 }
+                let tr = if matches!(cmp, CmpOp::Ord { .. }) {
+                    "PartialOrd"
+                } else {
+                    "PartialEq"
+                };
+                // `x != y` with `Elem1: PartialEq<Elem2>`.
+                if self.cmp_bound_fits(&lt, &rt, tr) {
+                    let r = self.range(b.syntax());
+                    self.bound_cmps.insert(r);
+                    return Ty::Bool;
+                }
                 if !self.unify(&lt, &rt) {
                     let msg = format!(
                         "mismatched types: expected `{}`, found `{}`",
@@ -5963,11 +6047,6 @@ impl<'a> Checker<'a> {
                     );
                     self.error(rhs.syntax(), msg);
                 }
-                let tr = if matches!(cmp, CmpOp::Ord { .. }) {
-                    "PartialOrd"
-                } else {
-                    "PartialEq"
-                };
                 self.require_trait(b.syntax(), &lt, tr);
                 if matches!(cmp, CmpOp::Ord { .. })
                     && matches!(self.shallow(&lt), Ty::Set(_) | Ty::Map(..))
@@ -6092,12 +6171,32 @@ impl<'a> Checker<'a> {
                 && !matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }))
                 && self.borrowed_str(&l)
             {
-                let msg = "cannot add to a `&str`: `+` needs a `String` on the left";
+                // rustc's caret is on the `+`, with each side's type under it.
+                let lhs_s = if matches!(l, ast::Expr::RefExpr(_)) { "&String" } else { "&str" };
+                let rhs_s = if self.borrowed_str(rhs) {
+                    "&str"
+                } else if matches!(rhs, ast::Expr::RefExpr(_)) {
+                    "&String"
+                } else {
+                    "String"
+                };
+                let msg = format!("cannot add `{rhs_s}` to `{lhs_s}`");
                 let help = format!(
                     "create an owned `String` from the string reference: `{}.to_owned() + ..`, or use `format!`",
                     l.syntax().text()
                 );
-                self.error_help(b.syntax(), msg.to_string(), &help);
+                let at = b
+                    .op_token()
+                    .map(|t| {
+                        let r = t.text_range();
+                        (self.base + usize::from(r.start()), self.base + usize::from(r.end()))
+                    })
+                    .unwrap_or_else(|| self.range(b.syntax()));
+                let spans = vec![
+                    (self.range(l.syntax()).0, self.range(l.syntax()).1, lhs_s.to_string()),
+                    (self.range(rhs.syntax()).0, self.range(rhs.syntax()).1, rhs_s.to_string()),
+                ];
+                self.error_spans(at, msg, Some(&help), spans);
             }
             self.check(rhs, &Ty::Str);
             return Ty::Str;
@@ -7364,6 +7463,9 @@ impl<'a> Checker<'a> {
             self.record(recv.syntax(), target.clone());
             rt = target;
         }
+        if let Some(t) = self.std_cmp_call(m, &rt, &method, &args) {
+            return t;
+        }
         // A user trait method on a built-in type (`x.money()` with `impl Money for f64`); std's own
         // methods come first, as inherent methods do in Rust.
         // (A generic trait implemented twice for the type: the impl whose signature fits.)
@@ -7503,7 +7605,7 @@ impl<'a> Checker<'a> {
             // `v.length()`: the JavaScript name.
             if let Some(alias) = diag_help::js_alias(&method, false) {
                 let msg = format!(
-                    "no method named `{method}` found for `{}` (`{method}` is {alias} in Rust)",
+                    "no method named `{method}` found for `{}` (you might have meant to use {alias})",
                     c.describe(ty)
                 );
                 c.error_help(m.syntax(), msg, diag_help::JS_NAMES);
@@ -7512,12 +7614,12 @@ impl<'a> Checker<'a> {
             let hint = if matches!(method.as_str(), "context" | "with_context")
                 && matches!(ty, Ty::Result(..) | Ty::Option(_))
             {
-                "if you meant `anyhow::Context`'s, add `use anyhow::Context;`"
+                " (if you meant `anyhow::Context`'s, add `use anyhow::Context;`)"
             } else {
-                "the std surface is still small; see docs/FEATURES.md"
+                ""
             };
             let msg = format!(
-                "no method named `{method}` found for `{}` ({hint})",
+                "no method named `{method}` found for `{}`{hint}",
                 c.describe(ty)
             );
             c.error(m.syntax(), msg);
@@ -7692,6 +7794,11 @@ impl<'a> Checker<'a> {
                         self.arg_count(m.syntax(), "method", 0, args.len());
                         inner
                     }
+                    "try_borrow" | "try_borrow_mut" => {
+                        self.arg_count(m.syntax(), "method", 0, args.len());
+                        let err = if method == "try_borrow" { "BorrowError" } else { "BorrowMutError" };
+                        Ty::Result(Box::new(inner), Box::new(Ty::Extern(err.into())))
+                    }
                     "clone" => Ty::RefCell(Box::new(inner)),
                     _ => {
                         loose(self);
@@ -7855,7 +7962,7 @@ impl<'a> Checker<'a> {
                         {
                             self.error(
                                 m.syntax(),
-                                format!("the trait bound `{}: Ord` is not satisfied (floats can't be sorted with `sort`; `sort_by` is coming with closures)", self.describe(&elem)),
+                                format!("the trait bound `{}: Ord` is not satisfied (floats aren't totally ordered; sort them with `sort_by(|a, b| a.total_cmp(b))`)", self.describe(&elem)),
                             );
                         }
                         sig(self, &[], Ty::Unit)
@@ -8640,6 +8747,7 @@ impl<'a> Checker<'a> {
                 message,
                 severity: "error",
                 help: None,
+                spans: Vec::new(),
             });
         }
         let Some(expr) = expr else { return Ty::Unknown };
@@ -8833,6 +8941,7 @@ impl<'a> Checker<'a> {
                             message: msg,
                             severity: "error",
                             help: None,
+                            spans: Vec::new(),
                         });
                     }
                 }
@@ -8910,6 +9019,7 @@ impl<'a> Checker<'a> {
                             message,
                             severity: "error",
                             help: None,
+                            spans: Vec::new(),
                         });
                         None
                     }
@@ -8936,10 +9046,14 @@ impl<'a> Checker<'a> {
             return;
         };
         let mut next = 0;
+        // (Which placeholder this is, for rustc's span on it.)
+        let mut placeholder = 0;
         for p in pieces {
             let Piece::Arg { arg, spec } = p else {
                 continue;
             };
+            let this_placeholder = placeholder;
+            placeholder += 1;
             // `{:.*}` takes the precision before the value; `width$` / `prec$` name a `usize`.
             let counts: Vec<ArgRef> = spec
                 .precision_arg
@@ -8962,9 +9076,21 @@ impl<'a> Checker<'a> {
                         message,
                         severity: "error",
                         help: None,
+                        spans: Vec::new(),
                     });
                 }
             }
+            // (The argument the placeholder takes, where rustc points; a captured name is in
+            // the format string.)
+            let taken = match &arg {
+                ArgRef::Next => Some(next),
+                ArgRef::Index(i) => Some(*i),
+                ArgRef::Name(n) => args[1..].iter().position(|a| a.name.as_deref() == Some(n.as_str())),
+            };
+            let (arg_start, arg_end) = match taken.and_then(|i| args.get(i + 1)) {
+                Some(a) => (a.start, a.end()),
+                None => (args[0].start, args[0].end()),
+            };
             let ty = self.format_arg_ty(&arg, &mut next, &tys, args);
             let Some(ty) = ty else { continue };
             let resolved = self.shallow(&ty);
@@ -8995,6 +9121,7 @@ impl<'a> Checker<'a> {
                         message,
                         severity: "error",
                         help: None,
+                        spans: Vec::new(),
                     });
                     continue;
                 }
@@ -9022,7 +9149,7 @@ impl<'a> Checker<'a> {
                         'e' => "LowerExp",
                         _ => "UpperExp",
                     };
-                    let (start, end) = (args[0].start, args[0].end());
+                    let (start, end) = (arg_start, arg_end);
                     let message = format!(
                         "`{}` doesn't implement `std::fmt::{tr}`",
                         self.describe(&ty)
@@ -9033,6 +9160,7 @@ impl<'a> Checker<'a> {
                         message,
                         severity: "error",
                         help: None,
+                        spans: Vec::new(),
                     });
                 }
                 continue;
@@ -9049,13 +9177,16 @@ impl<'a> Checker<'a> {
                     "`{}` doesn't implement `std::fmt::{trait_name}`{hint}",
                     self.describe(&ty)
                 );
-                let (start, end) = (args[0].start, args[0].end());
+                let (start, end) = (arg_start, arg_end);
                 self.diags.push(RawDiag {
                     start,
                     end,
                     message,
                     severity: "error",
                     help: None,
+                    spans: placeholder_at(&args[0], this_placeholder)
+                        .map(|(s, e)| vec![(s, e, "required by this formatting parameter".to_string())])
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -10857,6 +10988,7 @@ impl Checker<'_> {
                     message: format!("type annotations needed: cannot infer the value of the const parameter `{n}` declared on {on} (give it with `::<..>`: array lengths in types don't inform it here)"),
                     severity: "error",
                     help: None,
+                    spans: Vec::new(),
                 });
             }
         }
@@ -11604,4 +11736,30 @@ fn strip_unwraps(e: &ast::Expr) -> (ast::Expr, bool) {
 /// A `HashSet` or `BTreeSet` (the operands of `&a | &b`).
 pub fn is_set(t: &Ty) -> bool {
     matches!(t, Ty::Set(_) | Ty::Coll(crate::ty::Coll::BTreeSet, _))
+}
+
+/// The `n`th placeholder (`{}`, `{:?}`, `{name}`) of a format string literal: its absolute range.
+fn placeholder_at(fmt: &MacroArg, n: usize) -> Option<(usize, usize)> {
+    let t = fmt.text.as_str();
+    if !(t.starts_with('"') || t.starts_with('r')) {
+        return None;
+    }
+    let b = t.as_bytes();
+    let (mut i, mut k) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            b'{' if b.get(i + 1) == Some(&b'{') => i += 2,
+            b'}' if b.get(i + 1) == Some(&b'}') => i += 2,
+            b'{' => {
+                let close = i + t[i..].find('}')?;
+                if k == n {
+                    return Some((fmt.start + i, fmt.start + close + 1));
+                }
+                k += 1;
+                i = close + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }

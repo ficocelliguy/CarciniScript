@@ -95,8 +95,17 @@ import "carciniscript/runtime"; // installs globalThis.κσ
 
 await initCarciniScript(); // once, at startup
 setNsBindings(nsBindingsText); // optional: typed NS (see below)
-const { code, sourceMap, diagnostics } = compile(source, "hack.rs");
+const { code, sourceMap, diagnostics, rendered } = compile(source, "hack.rs");
 ```
+
+`rendered` is the diagnostics as rustc prints them (`error[E0308]: mismatched types`, the `-->`
+line, the source with `^^^` under the span, `error: aborting due to 1 previous error`), for a
+terminal; `diagnostics` has the same parts for an editor (`message`, `code`, `label`, `spans`,
+`helps`, `notes`, `children`, and `help`, the rule in JavaScript terms for players new to Rust).
+rustc's warnings come too (unused variables and `mut`s, dead code, unused imports, ..; `lint`
+names each), with rustc's lint levels (`#[allow(dead_code)]`, `#![deny(warnings)]`); they never
+stop a script from compiling unless denied. A panic that ends a script throws an error whose
+`String(e)` and `e.stack` are rustc's panic report.
 
 ### Modules
 

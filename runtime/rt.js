@@ -7,13 +7,34 @@
   "use strict";
   if (globalThis.κσ) return;
 
+  // A Rust panic. Hosts show an uncaught error as `String(e)` or `e.stack`, so both are rustc's
+  // report (the name is empty); the JS stack stays at `jsStack`. `panicMessage` and `location`
+  // are the parts.
   class CarciniPanic extends Error {
     constructor(message, location) {
-      super(`${location}: ${message}`);
-      this.name = "panic";
+      const report =
+        `thread '${threadName}' panicked at ${location}:\n${message}\n` +
+        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace";
+      super(report);
+      this.name = "";
       this.panicMessage = message;
       this.location = location;
+      asReport(this, report);
     }
+  }
+
+  // `fn main() -> Result<..>` returned `Err(e)`: rustc's `Error: {e:?}`, shown like a panic.
+  class CarciniError extends Error {
+    constructor(report) {
+      super(report);
+      this.name = "";
+      asReport(this, report);
+    }
+  }
+
+  function asReport(e, report) {
+    e.jsStack = e.stack;
+    Object.defineProperty(e, "stack", { value: report, writable: true, configurable: true });
   }
 
   // `std::process::exit(code)`: unwinds to the host, which ends the script with `exitCode`.
@@ -166,6 +187,16 @@
       return true;
     }
     return a === b;
+  }
+
+  // Whether `a` (a struct or enum) has its own method `m` and `b` isn't of its class.
+  function otherClass(a, b, m) {
+    return (
+      a !== null &&
+      typeof a === "object" &&
+      typeof a[m] === "function" &&
+      !(b !== null && typeof b === "object" && b.constructor === a.constructor)
+    );
   }
 
   // Rust's `Ord`: numbers, bools, strings and (lexicographically) Vecs.
@@ -1686,6 +1717,8 @@
     "TryFromSliceError:": "could not convert slice to array",
     "CharTryFromError:": "converted integer out of range for `char`",
     "Error:": "an error occurred when formatting an argument",
+    "BorrowError:": "RefCell already mutably borrowed",
+    "BorrowMutError:": "RefCell already borrowed",
   };
   class ParseError {
     constructor(type, kind) {
@@ -1767,10 +1800,12 @@
   }
 
   // `RefCell<T>` / `Cell<T>`: the value at `.v`. No `$clone`: cloning an `Rc<RefCell<T>>` shares it.
+  // `b` counts the `Ref`s held by `let` bindings, or is -1 while a `RefMut` is (`$refHold`).
   class RefCell {
     constructor(v, kind) {
       this.v = v;
       this.kind = kind;
+      this.b = 0;
     }
     $eq(o) {
       return eq(this.v, o.v);
@@ -2362,6 +2397,7 @@
 
   const rt = {
     CarciniPanic,
+    CarciniError,
     CarciniExit,
     // `std::env::args()`: hosts set the program's arguments (its name first).
     $setArgs(args) {
@@ -2911,11 +2947,7 @@
     },
     // `fn main() -> Result<..>` returned `Err(e)`: fail with rustc's `Error: {e:?}`.
     $mainResult(r, fmt) {
-      if (r != null && r.$tag === 1) {
-        const err = new Error(`Error: ${fmt(r[0])}`);
-        err.name = "CarciniError";
-        throw err;
-      }
+      if (r != null && r.$tag === 1) throw new CarciniError(`Error: ${fmt(r[0])}`);
     },
     // User trait impls for built-in types (`impl Money for f64`), by JS kind, for calls through
     // a type parameter or `dyn Trait` (`$dcall`). Each compiled script has its own registry
@@ -3594,6 +3626,16 @@
     $ordOpt(c) {
       return Number.isNaN(c) ? null : c;
     },
+    // `a == b` / `a < b` through a `T: PartialEq<R>` / `PartialOrd<R>` bound: with `b` not of
+    // `a`'s class, `a`'s `impl PartialEq<R>`'s `eq` (the first such impl) / `partial_cmp`.
+    $eqTo(a, b) {
+      return otherClass(a, b, "eq") ? a.eq(b) : eq(a, b);
+    },
+    $pcmpTo(a, b) {
+      if (otherClass(a, b, "partial_cmp")) return a.partial_cmp(b);
+      const c = cmp(a, b);
+      return Number.isNaN(c) ? null : c;
+    },
     $ordReverse(o) {
       return o === 0 ? 0 : -o;
     },
@@ -4212,6 +4254,29 @@
       return rt.$write(f, s, false);
     },
     RefCell,
+    // `c.borrow()` / `c.borrow_mut()` as a temporary: panics while a held borrow conflicts.
+    $refBorrow(c, mut, location) {
+      if (mut ? c.b !== 0 : c.b < 0) {
+        throw new CarciniPanic(mut ? "RefCell already borrowed" : "RefCell already mutably borrowed", location);
+      }
+      return c;
+    },
+    // `let g = c.borrow_mut();`: the borrow is held until the returned release runs (the end of
+    // the block, or `drop(g)`).
+    $refHold(c, mut, location) {
+      rt.$refBorrow(c, mut, location);
+      c.b = mut ? -1 : c.b + 1;
+      let held = true;
+      return () => {
+        if (held) c.b = mut ? 0 : c.b - 1;
+        held = false;
+      };
+    },
+    // `c.try_borrow()` / `c.try_borrow_mut()`: `Ok` of the value, or the `Err` a held borrow makes.
+    $tryBorrow(c, mut) {
+      if (mut ? c.b !== 0 : c.b < 0) return rt.Err(new ParseError(mut ? "BorrowMutError" : "BorrowError", ""));
+      return rt.Ok(c.v);
+    },
     $cellReplace(c, v) {
       const old = c.v;
       c.v = v;

@@ -50,10 +50,38 @@ use crate::typeck::{self, Types, is_none_binding, path_is};
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
+    /// rustc's headline (`mismatched types`); the label and `help:` lines are apart.
     pub message: String,
     pub severity: &'static str,
+    /// rustc's error code (`E0308`), for the errors rustc gives one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The text rustc puts after the `^^^` under the span (`expected `i32`, found `&str``).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Other places the error involves, each with its label (`value moved here`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<SubSpan>,
+    /// rustc's `help:` and `note:` lines.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub helps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// rustc's sub-diagnostics after the `= help:` / `= note:` lines, in order: a note or help
+    /// with its own snippet (`note: the lint level is defined here`), a plain one, or a
+    /// suggestion (`help: remove these parentheses` and the source as it would read).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Child>,
+    /// The lint a warning is (`unused_variables`), as rustc names it; `#[allow(..)]` takes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lint: Option<String>,
+    /// Where the lint's level was set (`#[deny(unused)]`: the range of `unused` and the name
+    /// written there), for `rustc_diag::finish`'s notes; `None` for the default level.
+    #[serde(skip)]
+    pub lint_attr: Option<(usize, usize, String)>,
     /// The rule behind the message in JavaScript or Python terms, and what to try, for a player
-    /// who doesn't know Rust (`diag_help.rs`). Not every message has one.
+    /// who doesn't know Rust (`diag_help.rs`). Not every message has one; the editor shows it,
+    /// rustc's rendering doesn't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub help: Option<String>,
     /// Byte offsets into the source.
@@ -66,12 +94,95 @@ pub struct Diagnostic {
     pub end_column: u32,
 }
 
+/// A secondary span of a diagnostic: a range of the same file, positioned like the diagnostic.
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubSpan {
+    pub start: usize,
+    pub end: usize,
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub label: String,
+    /// Another primary span (`^^^`) of the diagnostic, as rustc marks each unused import.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub primary: bool,
+}
+
+/// A rustc sub-diagnostic: `kind` is `help` or `note`. With `spans` it is shown with its own
+/// `-->` and snippet; with `edits` (each a range and, as its label, the text replacing it) it
+/// is a suggestion, shown as the source would read after it.
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Child {
+    pub kind: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<SubSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<SubSpan>,
+}
+
+impl Diagnostic {
+    /// A diagnostic at `start..end` of the text `idx` indexes, its other fields empty.
+    pub fn at(
+        idx: &LineIndex,
+        start: usize,
+        end: usize,
+        message: String,
+        severity: &'static str,
+    ) -> Diagnostic {
+        let (l0, c0) = idx.line_col(start);
+        let (l1, c1) = idx.line_col(end);
+        Diagnostic {
+            message,
+            severity,
+            code: None,
+            label: None,
+            spans: Vec::new(),
+            helps: Vec::new(),
+            notes: Vec::new(),
+            children: Vec::new(),
+            lint: None,
+            lint_attr: None,
+            help: None,
+            start,
+            end,
+            line: l0 + 1,
+            column: c0 + 1,
+            end_line: l1 + 1,
+            end_column: c1 + 1,
+        }
+    }
+}
+
+impl SubSpan {
+    pub fn at(idx: &LineIndex, start: usize, end: usize, label: String) -> SubSpan {
+        let (l0, c0) = idx.line_col(start);
+        let (l1, c1) = idx.line_col(end);
+        SubSpan {
+            start,
+            end,
+            line: l0 + 1,
+            column: c0 + 1,
+            end_line: l1 + 1,
+            end_column: c1 + 1,
+            label,
+            primary: false,
+        }
+    }
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CompileOutput {
     pub code: Option<String>,
     pub source_map: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The diagnostics as rustc prints them (`error[E0308]: mismatched types`, the `-->` line,
+    /// the source with `^^^` under the span, `error: aborting due to ..`); empty without any.
+    pub rendered: String,
     /// Files the output depends on besides its `mod` files (which it imports): the proc-macro
     /// crates it used. A host that caches compiled scripts recompiles when one changes.
     pub dependencies: Vec<String>,
@@ -781,27 +892,14 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
                 let idx = LineIndex::new(src);
                 let diagnostics = errs
                     .into_iter()
-                    .map(|(start, end, message)| {
-                        let (l0, c0) = idx.line_col(start);
-                        let (l1, c1) = idx.line_col(end);
-                        Diagnostic {
-                            message,
-                            severity: "error",
-                            help: None,
-                            start,
-                            end,
-                            line: l0 + 1,
-                            column: c0 + 1,
-                            end_line: l1 + 1,
-                            end_column: c1 + 1,
-                        }
-                    })
+                    .map(|(start, end, message)| Diagnostic::at(&idx, start, end, message, "error"))
                     .collect();
                 return CompileOutput {
                     code: None,
                     source_map: None,
                     diagnostics,
                     dependencies: Vec::new(),
+                    rendered: String::new(),
                 };
             }
         }
@@ -832,6 +930,8 @@ fn compile_text(
         drop_flags: HashMap::new(),
         stmt_drops: Vec::new(),
         param_drops: Vec::new(),
+        guards: HashMap::new(),
+        pending_guard: None,
         async_body: false,
         src,
         filename,
@@ -894,7 +994,9 @@ fn compile_text(
             "error",
         );
     }
-    if cg.diags.is_empty() {
+    // (rustc lints a file only once it parses.)
+    let parsed = cg.diags.is_empty();
+    if parsed {
         let file = parse.tree();
         let origin = typeck::Origin {
             map: map.clone(),
@@ -918,7 +1020,7 @@ fn compile_text(
                 .iter()
                 .any(|e| e.start == d.start && e.end == d.end && e.message == d.message)
             {
-                cg.diag_range_help(d.start, d.end, d.message, d.severity, d.help);
+                cg.diag_spans(d.start, d.end, d.message, d.severity, d.help, d.spans);
             }
         }
         cg.diags.sort_by_key(|d| (d.start, d.end));
@@ -942,6 +1044,38 @@ fn compile_text(
             d.end = m.orig(d.end, true).max(d.start);
             let (l1, c1) = idx.line_col(d.end);
             (d.end_line, d.end_column) = (l1 + 1, c1 + 1);
+            for s in &mut d.spans {
+                s.start = m.orig(s.start, false);
+                s.end = m.orig(s.end, true).max(s.start);
+                let (l1, c1) = idx.line_col(s.end);
+                (s.end_line, s.end_column) = (l1 + 1, c1 + 1);
+            }
+        }
+    }
+    if parsed {
+        let mut_roots = cg
+            .types
+            .mut_roots
+            .iter()
+            .map(|&(s, _)| map.as_ref().map_or(s, |m| m.orig(s, false)))
+            .collect();
+        let cx = crate::lints::Cx {
+            types: &cg.types,
+            map: map.as_deref(),
+            mut_roots,
+            resolver,
+        };
+        crate::lints::adopt(original, &mut diagnostics);
+        diagnostics.extend(crate::lints::check(original, &cx));
+        // (A lint `#[deny(..)]` makes an error.)
+        if diagnostics.iter().any(|d| d.severity == "error") {
+            return CompileOutput {
+                code: None,
+                source_map: None,
+                diagnostics,
+                dependencies: Vec::new(),
+                rendered: String::new(),
+            };
         }
     }
     CompileOutput {
@@ -949,6 +1083,7 @@ fn compile_text(
         source_map,
         diagnostics,
         dependencies: Vec::new(),
+        rendered: String::new(),
     }
 }
 
@@ -967,6 +1102,11 @@ struct Codegen<'a> {
     stmt_drops: Vec<(String, String)>,
     /// A function's by-value parameters to drop when its body ends: (JS access, type).
     param_drops: Vec<(String, Ty)>,
+    /// `let g = cell.borrow_mut();` guards: the local's JS name -> the function that releases
+    /// its borrow (at the end of the block, or `drop(g)`). `pending_guard` hands the one a `let`
+    /// just made to the block.
+    guards: HashMap<String, String>,
+    pending_guard: Option<String>,
     /// The next block body is an `async` block's (emitted as a function body).
     async_body: bool,
     filename: &'a str,
@@ -1099,20 +1239,27 @@ impl<'a> Codegen<'a> {
         severity: &'static str,
         help: Option<String>,
     ) {
-        let (l0, c0) = self.idx.line_col(start);
-        let (l1, c1) = self.idx.line_col(end);
+        self.diag_spans(start, end, message, severity, help, Vec::new());
+    }
+
+    /// `diag_range_help` with secondary spans: (start, end, label).
+    fn diag_spans(
+        &mut self,
+        start: usize,
+        end: usize,
+        message: String,
+        severity: &'static str,
+        help: Option<String>,
+        spans: Vec<(usize, usize, String)>,
+    ) {
         let help = help.or_else(|| crate::diag_help::for_message(&message, severity));
-        self.diags.push(Diagnostic {
-            message,
-            severity,
-            help,
-            start,
-            end,
-            line: l0 + 1,
-            column: c0 + 1,
-            end_line: l1 + 1,
-            end_column: c1 + 1,
-        });
+        let mut d = Diagnostic::at(&self.idx, start, end, message, severity);
+        d.help = help;
+        d.spans = spans
+            .into_iter()
+            .map(|(s, e, label)| SubSpan::at(&self.idx, s, e, label))
+            .collect();
+        self.diags.push(d);
     }
 
     fn error(&mut self, n: &SyntaxNode, message: impl Into<String>) {
@@ -2108,7 +2255,9 @@ impl<'a> Codegen<'a> {
         let params = std::mem::take(&mut self.param_drops);
         let drops_here = !params.is_empty()
             || list.statements().any(|s| match s {
-                ast::Stmt::LetStmt(l) => self.let_drops(&l).is_some(),
+                ast::Stmt::LetStmt(l) => {
+                    self.let_drops(&l).is_some() || self.let_guard(&l).is_some()
+                }
                 _ => false,
             });
         let list_js = drops_here.then(|| {
@@ -2125,6 +2274,12 @@ impl<'a> Codegen<'a> {
         for stmt in list.statements() {
             let saved_stmt_drops = std::mem::take(&mut self.stmt_drops);
             diverged |= self.emit_stmt(&stmt);
+            // (A `RefCell` guard's borrow, released when the block ends.)
+            if let Some(rel) = self.pending_guard.take()
+                && let Some(dk) = &list_js
+            {
+                self.line(Frag::text(format!("{dk}.push({rel});")));
+            }
             // (Closures handed to std methods in it: dropped now, as Rust drops the adapters.)
             for (flag, js) in std::mem::replace(&mut self.stmt_drops, saved_stmt_drops) {
                 self.line(Frag::text(format!(
@@ -2388,6 +2543,27 @@ impl<'a> Codegen<'a> {
         self.needs_drop(&t).then_some(name)
     }
 
+    /// `let g = cell.borrow();` / `let mut g = cell.borrow_mut();`: the call, the cell, and
+    /// whether the borrow is mutable.
+    fn let_guard(&self, l: &ast::LetStmt) -> Option<(ast::MethodCallExpr, ast::Expr, bool)> {
+        let Some(ast::Pat::IdentPat(ip)) = l.pat() else {
+            return None;
+        };
+        if ip.pat().is_some() || ip.name().is_none() || l.let_else().is_some() {
+            return None;
+        }
+        let ast::Expr::MethodCallExpr(m) = strip_parens_expr(&l.initializer()?) else {
+            return None;
+        };
+        let mutable = match &*m.name_ref()?.text() {
+            "borrow" => false,
+            "borrow_mut" => true,
+            _ => return None,
+        };
+        let recv = m.receiver()?;
+        matches!(self.ty_of(recv.syntax()), Some(Ty::RefCell(_))).then_some((m, recv, mutable))
+    }
+
     /// A local (by its JS name) that now owns a value to drop: its flag, and the closure.
     fn track_drop(&mut self, list: &str, js: &str) {
         let flag = self.temp();
@@ -2542,12 +2718,9 @@ impl<'a> Codegen<'a> {
             self.declare(name.text(), Some(name.syntax()), local);
             return;
         }
-        // `let b = cell.borrow_mut();`: `b` aliases the cell's value.
-        if let ast::Expr::MethodCallExpr(m) = strip_parens_expr(&init)
-            && m.name_ref().is_some_and(|n| n.text() == "borrow_mut")
-            && let Some(recv) = m.receiver()
-            && matches!(self.ty_of(recv.syntax()), Some(Ty::RefCell(_)))
-        {
+        // `let b = cell.borrow_mut();`: `b` aliases the cell's value, and holds the borrow until
+        // the block ends (or `drop(b)`).
+        if let Some((m, recv, mutable)) = self.let_guard(l) {
             let (rf, _) = self.emit_expr(&recv, None);
             let js = self.fresh(name.text());
             let mut f = Frag::mapped(start, "const ");
@@ -2556,6 +2729,14 @@ impl<'a> Codegen<'a> {
                 .append(rf)
                 .push(";");
             self.line(f);
+            let rel = self.temp();
+            let at = m.name_ref().map_or(start, |n| self.off(n.syntax()));
+            let loc = js_string(&self.location_at(at));
+            self.line(Frag::text(format!(
+                "const {rel} = κσ.$refHold({js}, {mutable}, {loc});"
+            )));
+            self.guards.insert(format!("{js}.v"), rel.clone());
+            self.pending_guard = Some(rel);
             let ty = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
             self.declare(
                 name.text(),
@@ -3978,7 +4159,7 @@ impl<'a> Codegen<'a> {
                 if value > (1u128 << 53) && (value as f64) as u128 != value {
                     self.warn(
                         l.syntax(),
-                        "integer literal exceeds 2^53 and loses precision as a JS number",
+                        "integer literal exceeds 2^53 and loses precision (64-bit integers are exact to 2^53 here)",
                     );
                 }
                 (Frag::text(value.to_string()), ty)
@@ -4405,6 +4586,35 @@ impl<'a> Codegen<'a> {
                 f = f.wrap("κσ.$pord(", &format!(", \"{o}\")"));
             }
             return (f.at(self.off(b.syntax())), ty);
+        }
+        // `x != y` / `a < b` through a `T: PartialEq<R>` / `PartialOrd<R>` bound: `a`'s own impl
+        // when `b` isn't of its class.
+        if let BinaryOp::CmpOp(cmp) = op
+            && self.types.bound_cmps.contains(&self.range_of(b.syntax()))
+        {
+            let (lf, _) = self.emit_expr(&lhs, None);
+            let (rf, _) = self.emit_expr(&rhs, None);
+            let helper = if matches!(cmp, ast::CmpOp::Eq { .. }) {
+                "eqTo"
+            } else {
+                "pcmpTo"
+            };
+            let mut f = Frag::text(format!("κσ.${helper}("));
+            f.append(lf).push(", ").append(rf).push(")");
+            f = match cmp {
+                ast::CmpOp::Eq { negated: true } => f.wrap("!", ""),
+                ast::CmpOp::Eq { negated: false } => f,
+                ast::CmpOp::Ord { ordering, strict } => {
+                    let o = match (ordering, strict) {
+                        (ast::Ordering::Less, true) => "<",
+                        (ast::Ordering::Less, false) => "<=",
+                        (ast::Ordering::Greater, true) => ">",
+                        (ast::Ordering::Greater, false) => ">=",
+                    };
+                    f.wrap("κσ.$pord(", &format!(", \"{o}\")"))
+                }
+            };
+            return (f.at(self.off(b.syntax())), Ty::Bool);
         }
         // `&a | &b` (`&`, `-`, `^`) on two sets: `κσ.$setOp("|", a, b)`, a new set.
         if let BinaryOp::ArithOp(
@@ -5311,6 +5521,14 @@ impl<'a> Codegen<'a> {
     fn emit_fn_call(&mut self, c: &ast::CallExpr, name: &str, callee_off: usize) -> (Frag, Ty) {
         let Some(sig) = self.fns.get(name) else {
             if name == "drop" {
+                // `drop(g)` of a `RefCell` guard: the borrow ends.
+                if let Some(ast::Expr::PathExpr(p)) = c.arg_list().and_then(|a| a.args().next())
+                    && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+                    && let Some(local) = self.lookup(n.text())
+                    && let Some(rel) = self.guards.get(&local.js)
+                {
+                    return (Frag::mapped(callee_off, format!("{rel}()")), Ty::Unit);
+                }
                 let args = self.emit_args(c.arg_list(), &[]);
                 let mut f = Frag::mapped(callee_off, "κσ.$drop(");
                 f.append(Frag::join(args, ", ")).push(")");
@@ -6922,8 +7140,15 @@ impl<'a> Codegen<'a> {
         }
         // A user trait method on a built-in type: `$ext$f64.prototype.money.call(x)`. Inside a
         // default method compiled for a built-in type, `self`'s type decides it.
+        // (Not `self.partial_cmp(&other.0)` in `impl PartialOrd<Code> for u16`: std's, `$std`.)
+        let std_cmp = self
+            .types
+            .method_keys
+            .get(&self.range_of(m.syntax()))
+            .is_some_and(|k| k == "$std");
         let ext = match self.conv_of(m.syntax()) {
             Some(crate::adt::Conv::Ext { key }) => Some(key),
+            _ if std_cmp => None,
             _ => match strip_refs(&recv) {
                 ast::Expr::PathExpr(p)
                     if p.path()
@@ -7132,8 +7357,24 @@ impl<'a> Codegen<'a> {
                 })
                 .unwrap_or_else(|| Frag::text("undefined"));
             let f = match method.as_str() {
-                // The value lives at `.v`, which stays assignable: `*c.borrow_mut() += 1`.
-                "borrow" | "borrow_mut" | "get" | "into_inner" => {
+                // The value lives at `.v`, which stays assignable: `*c.borrow_mut() += 1`. A
+                // borrow checks the cell's flag first, which a `let` guard holds.
+                "borrow" | "borrow_mut" => {
+                    let mut f = Frag::mapped(name_off, "κσ.$refBorrow(");
+                    f.append(rf.clone()).push(format!(
+                        ", {}, {}).v",
+                        method == "borrow_mut",
+                        js_string(&self.location_at(name_off))
+                    ));
+                    f
+                }
+                "try_borrow" | "try_borrow_mut" => {
+                    let mut f = Frag::mapped(name_off, "κσ.$tryBorrow(");
+                    f.append(rf.clone())
+                        .push(format!(", {})", method == "try_borrow_mut"));
+                    f
+                }
+                "get" | "into_inner" => {
                     let mut f = rf.clone();
                     f.push(".").append(Frag::mapped(name_off, "v"));
                     f
@@ -7444,7 +7685,7 @@ impl<'a> Codegen<'a> {
     fn no_method(&mut self, node: &SyntaxNode, method: &str, ty: &Ty) -> (Frag, Ty) {
         self.error(
             node,
-            format!("no method named `{method}` found for `{}` (the spike's std surface is small; see docs/FEATURES.md)", ty.describe()),
+            format!("no method named `{method}` found for `{}`", ty.describe()),
         );
         (Frag::text("undefined"), Ty::Unknown)
     }

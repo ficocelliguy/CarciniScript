@@ -474,6 +474,7 @@ impl Checker<'_> {
         self.param_bounds.clear();
         self.param_trait_args.clear();
         self.op_args.clear();
+        self.cmp_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();
@@ -757,7 +758,14 @@ impl Checker<'_> {
             let Some(tr) = seg.name_ref().map(|n| n.text().to_string()) else {
                 continue;
             };
-            if crate::adt::op_method(&tr).is_none() || self.adts.traits.contains_key(&tr) {
+            if self.adts.traits.contains_key(&tr) {
+                continue;
+            }
+            if matches!(tr.as_str(), "PartialEq" | "PartialOrd") {
+                self.record_cmp_bound(name, &tr, &seg);
+                continue;
+            }
+            if crate::adt::op_method(&tr).is_none() {
                 continue;
             }
             let mut out = None;
@@ -792,6 +800,51 @@ impl Checker<'_> {
                         .or_insert_with(|| Ty::Param(name.to_string()));
                 }
             }
+        }
+    }
+
+    /// `a == b` / `a < b` (`tr` is `PartialEq` / `PartialOrd`) with an `a` of a parameter bounded
+    /// `PartialEq<R>` / `PartialOrd<R>`: whether `b` is that `R` (then unified). A `PartialOrd<R>`
+    /// bound serves `==` too: its supertrait is `PartialEq<R>`. Not when `b` is an `a` already.
+    pub(super) fn cmp_bound_fits(&mut self, lt: &Ty, rt: &Ty, tr: &str) -> bool {
+        let Ty::Param(n) = self.shallow(lt) else {
+            return false;
+        };
+        // (Two type parameters are one type only by name; `could_be` takes any two.)
+        let fits = |c: &Self, x: &Ty| match (c.shallow(x), c.shallow(rt)) {
+            (Ty::Param(a), Ty::Param(b)) => a == b,
+            _ => c.could_be(x, rt),
+        };
+        if fits(self, lt) {
+            return false;
+        }
+        let traits: &[&str] = if tr == "PartialEq" {
+            &["PartialEq", "PartialOrd"]
+        } else {
+            &["PartialOrd"]
+        };
+        for t in traits {
+            if let Some(x) = self.cmp_args.get(&(n.clone(), t.to_string())).cloned() {
+                let x = self.lower_type(&x);
+                if fits(self, &x) {
+                    self.unify(&x, rt);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// `name: PartialEq<R>` (or `PartialOrd<R>`, at `seg`): `R`, for `a == b` with an `a` of
+    /// `name` (`name` may be a projection, `I::Item`).
+    pub(super) fn record_cmp_bound(&mut self, name: &str, tr: &str, seg: &ast::PathSegment) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        if let Some(ast::GenericArg::TypeArg(ta)) =
+            seg.generic_arg_list().and_then(|l| l.generic_args().next())
+            && let Some(t) = ta.ty()
+        {
+            self.cmp_args
+                .insert((name.to_string(), tr.to_string()), t);
         }
     }
 
@@ -847,6 +900,7 @@ impl Checker<'_> {
         self.param_bounds.clear();
         self.param_trait_args.clear();
         self.op_args.clear();
+        self.cmp_args.clear();
         self.lenient_projs.clear();
         self.const_tys.clear();
         self.from_args.clear();

@@ -8,6 +8,7 @@ import init, {
   definitionJson,
   referencesJson,
   renameJson,
+  formatDiagnosticsJson,
   setNsBindings as setNsBindingsJson,
   setOverflowChecks as setOverflowChecksWasm,
   setStrictBorrows as setStrictBorrowsWasm,
@@ -100,6 +101,16 @@ export function rename(source, filename, line, column, newName, resolve, others 
 export function setNsBindings(text) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
   return JSON.parse(setNsBindingsJson(text));
+}
+
+/**
+ * Diagnostics in rustc's human format (`error[E0308]: mismatched types`, the `-->` line, the source
+ * with `^^^` under each span and its label, `help:` and `note:` lines), then rustc's summary
+ * (`error: aborting due to 2 previous errors`). `compile()`'s `rendered` is this for its diagnostics.
+ */
+export function formatDiagnostics(source, filename, diagnostics) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return formatDiagnosticsJson(source, filename, JSON.stringify(diagnostics));
 }
 
 export { version };

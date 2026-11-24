@@ -66,6 +66,12 @@
     "panic": null
   },
   {
+    "file": "asref_targets.rs",
+    "stdout": "6\ncafé\n/a/b\n6 2\nSome(97) Some(195)\n6\nSome(404) None\n4 20 mixed 0\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "assert_msg.rs",
     "stdout": "tri(10) = 55\n",
     "exitCode": 101,
@@ -284,12 +290,6 @@
   {
     "file": "coercion_gaps.rs",
     "stdout": "BAD\nxcafeok\nk1 2 195\n4 4\n1\n9\nSome(1) None true\nSome(2) false\nSome([20, 30]) Some([30, 40]) None\n0..None 1..Some(3)\nSome(16) None\n\"/bin/cc -O2 --end\"\ntrue false false\n[105, 104]\n3 3\n",
-    "exitCode": 0,
-    "panic": null
-  },
-  {
-    "file": "std_iter_struct_types.rs",
-    "stdout": "Some(\"a\")\n[\"a\", \"b\", \"c\"]\n[10, 20, 30]\n3\n[\"a\", \"b\", \"c\"]\n3 [1, 3, 5]\n[10, 20, 30] 0\n[1, 3, 5]\nSome(9)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -1728,6 +1728,12 @@
     "panic": null
   },
   {
+    "file": "partial_eq_other.rs",
+    "stdout": "true true true true\ntrue false\nSome(Less) Some(Greater)\ntrue false\ntrue false true\nSome(Less) true\n3\ntrue false\ntrue true\ntrue false\ntrue false true false\ntrue false\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "partial_field_moves.rs",
     "stdout": "x y [1, 2] 2\nz y [3]\nleft 4\n",
     "exitCode": 0,
@@ -1840,6 +1846,12 @@
     "stdout": "Left(3) Right(\"x\")\nLeft([1, 2, 3]) Right(\"y\") [1, 2]\n",
     "exitCode": 0,
     "panic": null
+  },
+  {
+    "file": "refcell_borrow_flags.rs",
+    "stdout": "[1, 2, 3, 3]\n4 1\ntrue\nRefCell already borrowed | BorrowMutError\ntrue\nRefCell already mutably borrowed | BorrowError\nOk(5)\n13\n[\"a\", \"b\"]\n",
+    "exitCode": 101,
+    "panic": "thread 'main' panicked at refcell_borrow_flags.rs:60:20:\nRefCell already borrowed"
   },
   {
     "file": "results.rs",
@@ -2000,6 +2012,12 @@
   {
     "file": "std_imports.rs",
     "stdout": "10 0 4\npear\n[9] [] [2, 3] [1]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "std_iter_struct_types.rs",
+    "stdout": "Some(\"a\")\n[\"a\", \"b\", \"c\"]\n[10, 20, 30]\n3\n[\"a\", \"b\", \"c\"]\n3 [1, 3, 5]\n[10, 20, 30] 0\n[1, 3, 5]\nSome(9)\n",
     "exitCode": 0,
     "panic": null
   },
@@ -2354,12 +2372,6 @@
   {
     "file": "writes_through_refs.rs",
     "stdout": "[170, 187, 120, 121, 122, 0, 0, 0]\n[1, 4, 3, 2, 5, 6]\n[0, 9, 7, 0, 2, 0]\n[\"d\", \"a\", \"b\", \"c\"] [false, true, true, false, false]\nSome([2, 3]) Some([1, 2]) None\n[1, 3, 20, 0, 0] true\nOk(5) [97, 98, 99, 100, 101, 0, 0, 0]\ntrue\n3 [120, 121, 122, 0, 0, 0]\n[1, 2, 9, 9, 9]\n[7, 7]\n[101, 102, -1]\n1-2-3\n4, 5\n69\n[ab] [42]\ntext <eol> 13\n[Acc { n: 10 }, Acc { n: 14 }] [7, 14, 21]\nababy 3\n",
-    "exitCode": 0,
-    "panic": null
-  },
-  {
-    "file": "asref_targets.rs",
-    "stdout": "6\ncafé\n/a/b\n6 2\nSome(97) Some(195)\n6\nSome(404) None\n4 20 mixed 0\n",
     "exitCode": 0,
     "panic": null
   }
