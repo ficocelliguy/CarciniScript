@@ -38,7 +38,7 @@ export async function main(ns) {
 |---|---|
 | `compiler/` | Rust crate: `ra_ap_syntax` parser → codegen → source map. Builds to wasm (~700 KB). |
 | `runtime/rt.js` | Runtime helpers installed once on `globalThis.κσ`. |
-| `index.js` | JS API: `initCarciniScript()`, then synchronous `compile(source, filename, resolve?)`. |
+| `index.js` | JS API: `initCarciniScript()`, then synchronous `compile(source, filename, resolve?)` (and `compileTests`, a test build). |
 | `test/` | Differential fixtures (native rustc vs transpiled JS), NS mock scripts, source map checks. |
 | `web-repl/` | Browser REPL and self-test. |
 | `tools/build.mjs` | Builds the wasm and bindings into `pkg/`. |
@@ -107,6 +107,15 @@ passes the server's scripts. A module in another folder is loaded with rustc's `
 to the file's directory (`#[path = "../lib/util.rs"] mod util;`) or from the root
 (`#[path = "/lib/util.rs"]`, imported as `"/lib/util.rs"`, which Bitburner resolves from the
 root), so scripts in `/hack/` and `/corp/` can share one `/lib/`.
+
+### Tests
+
+`compileTests(source, filename, resolve?)` is `rustc --test`: `#[cfg(test)]` code is compiled, and
+the module's `main(ns)` runs the file's `#[test]` functions and prints libtest's report (`test
+tests::solves ... ok`, then each failure's output and `test result:`) to the terminal with
+`ns.tprintf`, or to stdout without an `ns`. Its `ns.args` are libtest's: name filters, `--exact`,
+`--ignored`, `--include-ignored`. The script's own `main` isn't run, and a normal `compile` leaves
+the tests out.
 
 ### Proc macros
 

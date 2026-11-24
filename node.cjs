@@ -1,6 +1,7 @@
 // CommonJS entry for Node and jest. The wasm loads synchronously on require, so init is a no-op.
 const {
   compileJson,
+  compileTestsJson,
   hoverJson,
   completionsJson,
   signatureHelpJson,
@@ -16,6 +17,8 @@ const {
 exports.initCarciniScript = async () => {};
 exports.initCarciniScriptSync = () => {};
 exports.compile = (source, filename = "main.rs", resolve) => JSON.parse(compileJson(source, filename, resolve));
+exports.compileTests = (source, filename = "main.rs", resolve) =>
+  JSON.parse(compileTestsJson(source, filename, resolve));
 exports.hover = (source, filename, line, column, resolve) =>
   JSON.parse(hoverJson(source, filename, line, column, resolve));
 exports.completions = (source, filename, line, column, resolve) =>

@@ -1,6 +1,7 @@
 import init, {
   initSync,
   compileJson,
+  compileTestsJson,
   hoverJson,
   completionsJson,
   signatureHelpJson,
@@ -37,6 +38,17 @@ export function initCarciniScriptSync(module) {
 export function compile(source, filename = "main.rs", resolve) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
   return JSON.parse(compileJson(source, filename, resolve));
+}
+
+/**
+ * Compile Rust's tests, like `rustc --test`: `cfg(test)` is on, and the module's `main(ns)` runs the
+ * `#[test]` functions and prints libtest's report (to the terminal with `ns.tprintf`, or to stdout
+ * without an `ns`) instead of running the program's `main`. `ns.args` are libtest's: name filters,
+ * `--exact`, `--ignored`, `--include-ignored`.
+ */
+export function compileTests(source, filename = "main.rs", resolve) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  return JSON.parse(compileTestsJson(source, filename, resolve));
 }
 
 /** Hover at a 1-based line and UTF-16 column: `{ contents (markdown), line, column, endLine, endColumn }` or null. */

@@ -472,8 +472,8 @@ fn tts_text(tt: &ast::TokenTree) -> String {
     out
 }
 
-/// `cfg!(..)`'s predicate: `debug_assertions` (on in debug builds), `test` and `feature = ".."`
-/// (off), the target's (see `target_cfg`), and `not` / `all` / `any` of those. Other names are
+/// `cfg!(..)`'s predicate: `debug_assertions` (on in debug builds), `test` (on in a test
+/// build), `feature = ".."` (off), the target's (see `target_cfg`), and `not` / `all` / `any` of those. Other names are
 /// off, as in rustc.
 pub fn eval_cfg(mc: &ast::MacroCall, debug: bool) -> Result<bool, String> {
     let tt = mc.token_tree().ok_or("`cfg!` needs a predicate")?;
@@ -616,7 +616,8 @@ fn cfg_eval(
             match (name.as_str(), value) {
                 ("debug_assertions", None) => Ok(Some(debug)),
                 ("feature", Some(v)) => Ok(features(&v)),
-                // `test`, and names nothing sets (`loom`, `fuzzing`, ..) are off.
+                ("test", None) => Ok(Some(crate::adt::test_build())),
+                // Names nothing sets (`loom`, `fuzzing`, ..) are off.
                 _ => Ok(Some(false)),
             }
         }

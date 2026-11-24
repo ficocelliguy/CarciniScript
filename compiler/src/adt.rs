@@ -1198,9 +1198,39 @@ fn shadowed_defaults(imp: &ast::Impl, tr: &str, items: &[ast::Item]) -> bool {
         })
 }
 
+thread_local! {
+    /// Compiling a test build (`compile_tests`, like `rustc --test`).
+    static TEST_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this is a test build: `cfg(test)` is on and `#[test]` functions are compiled.
+pub fn test_build() -> bool {
+    TEST_BUILD.with(|t| t.get())
+}
+
+/// `f()` as a test build (`on`) or not.
+pub fn with_test_build<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let was = TEST_BUILD.with(|t| t.replace(on));
+    let r = f();
+    TEST_BUILD.with(|t| t.set(was));
+    r
+}
+
+/// Whether `f` is a test: `#[test]`.
+pub fn is_test_fn(f: &ast::Fn) -> bool {
+    f.attrs().any(|a| {
+        let text: String = a.syntax().text().to_string().split_whitespace().collect();
+        text == "#[test]"
+    })
+}
+
 /// Whether `node` is (inside) an item that only exists in test builds: `#[cfg(test)]` or
-/// `#[test]`. Like `rustc` without `--test`, the compiler leaves those out.
+/// `#[test]`. Like `rustc` without `--test`, the compiler leaves those out, except in a test
+/// build.
 pub fn test_only(node: &ra_ap_syntax::SyntaxNode) -> bool {
+    if test_build() {
+        return false;
+    }
     node.ancestors().filter_map(ast::Item::cast).any(|item| {
         let attrs: Vec<ast::Attr> = match &item {
             ast::Item::Fn(f) => f.attrs().collect(),

@@ -3,13 +3,14 @@
 //    (101 on panic) must match.
 //  - ns/*.rs: async NS scripts run against a mock `ns`; output must match ns/*.expected.
 //  - Source map and diagnostics checks.
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   initCarciniScriptSync,
   compile,
+  compileTests,
   setNsBindings,
   setOverflowChecks,
   setStrictBorrows,
@@ -362,6 +363,91 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
     }
   }
   setOverflowChecks(false);
+}
+
+// --- test builds: test/libtest/*.rs compiled with `compileTests` against `rustc --test` (a debug
+// build, run with `--test-threads=1` and the fixture's `// args:`); libtest's report must match,
+// but for thread ids, source directories and the time taken.
+{
+  setOverflowChecks(true);
+  const normalize = (s) =>
+    s
+      .replace(/\r\n/g, "\n")
+      .replace(/^(thread '[^']*') \(\d+\)/gm, "$1")
+      .replace(/[^\s'"`]*[\\/]([^\\/\s]+\.rs:\d+:\d+)/g, "$1")
+      .replace(/finished in \d+\.\d+s/, "finished in 0.00s");
+  for (const file of fs.readdirSync(path.join(here, "libtest")).filter((f) => f.endsWith(".rs"))) {
+    const name = `libtest ${file}`;
+    try {
+      const src = fs.readFileSync(path.join(here, "libtest", file), "utf8");
+      const args = /^\/\/ args: (.*)$/m.exec(src)?.[1].trim().split(/\s+/) ?? [];
+      const out = compileTests(src, file);
+      if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+      const jsPath = path.join(outDir, `libtest-${file.replace(/\.rs$/, ".mjs")}`);
+      fs.writeFileSync(jsPath, out.code);
+      const js = await runJs(jsPath, [{ args }]);
+      const exe = path.join(outDir, `libtest-${path.basename(file, ".rs")}${process.platform === "win32" ? ".exe" : ""}`);
+      execFileSync("rustc", ["--test", "--edition", "2024", "-A", "warnings", "-o", exe, path.join(here, "libtest", file)], { stdio: "pipe" });
+      const r = spawnSync(exe, ["--test-threads=1", ...args], { encoding: "utf8" });
+      const [want, got] = [normalize(r.stdout), normalize(js.stdout)];
+      if (want !== got) fail(name, `--- rustc --test\n${want}--- js\n${got}`);
+      else pass(name);
+    } catch (e) {
+      fail(name, e.message);
+    }
+  }
+  setOverflowChecks(false);
+}
+
+// A Netscript script's tests: its `main(ns)` is left alone, and the report goes to the terminal
+// (`ns.tprintf`, which doesn't prefix the script's name).
+{
+  const name = "libtest NS script";
+  try {
+    const src = [
+      "pub async fn main(ns: &NS) {",
+      '    ns.tprint(&format!("{}", double(ns.args.len() as i32)));',
+      "}",
+      "",
+      "fn double(x: i32) -> i32 {",
+      "    x * 2",
+      "}",
+      "",
+      "#[cfg(test)]",
+      "mod tests {",
+      "    #[test]",
+      "    fn doubles() {",
+      "        assert_eq!(super::double(4), 8);",
+      "    }",
+      "}",
+      "",
+    ].join("\n");
+    const out = compileTests(src, "solver.rs");
+    if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${d.message}`).join("\n"));
+    const jsPath = path.join(outDir, "libtest-ns.mjs");
+    fs.writeFileSync(jsPath, out.code);
+    const printed = [];
+    const ns = { args: [], tprintf: (fmt, s) => printed.push(fmt === "%s" ? s : `bad format ${fmt}`), tprint: (s) => printed.push(`tprint ${s}`) };
+    await (await import(pathToFileURL(jsPath).href)).main(ns);
+    const want = ["", "running 1 test", "test tests::doubles ... ok", "", /^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in \d+\.\d\ds$/, ""];
+    const ok = printed.length === want.length && want.every((w, i) => (typeof w === "string" ? w === printed[i] : w.test(printed[i])));
+    // (A normal build is unchanged: the script's `main`, no tests.)
+    const normal = compile(src, "solver.rs").code ?? "";
+    if (!ok) fail(name, printed.join("\n"));
+    else if (!/export async function main\(ns\)/.test(normal) || normal.includes("doubles")) fail(name, `normal build:\n${normal}`);
+    else pass(name);
+  } catch (e) {
+    fail(name, e.message);
+  }
+}
+
+// rustc's error for a test that takes arguments.
+{
+  const name = "libtest arguments";
+  const out = compileTests("#[test]\nfn takes(x: i32) {}\n", "main.rs");
+  const errors = out.diagnostics.filter((d) => d.severity === "error").map((d) => `${d.line}: ${d.message}`);
+  if (errors.join("\n") !== "1: functions used as tests can not have any arguments") fail(name, errors.join("\n"));
+  else pass(name);
 }
 
 // --- NS scripts against a mock

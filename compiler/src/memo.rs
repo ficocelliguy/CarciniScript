@@ -10,12 +10,13 @@ use crate::typeck::Resolver;
 const KEEP: usize = 6;
 
 /// What changes a result besides the source and the files read: the NS bindings, overflow checks
-/// and strict borrows.
+/// and strict borrows, and whether it's a test build.
 #[derive(PartialEq, Clone, Copy)]
 struct Settings {
     bindings: u64,
     overflow: bool,
     strict: bool,
+    test: bool,
 }
 
 fn settings() -> Settings {
@@ -23,6 +24,7 @@ fn settings() -> Settings {
         bindings: crate::bindings::generation(),
         overflow: crate::codegen::overflow_checks(),
         strict: crate::nll::strict(),
+        test: crate::adt::test_build(),
     }
 }
 

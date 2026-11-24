@@ -41,6 +41,17 @@ export function compile(
   filename?: string,
   resolve?: (path: string) => string | undefined,
 ): CompileOutput;
+/**
+ * Compile Rust's tests, like `rustc --test`: `cfg(test)` is on, and the module's `main(ns)` runs the
+ * `#[test]` functions and prints libtest's report (to the terminal with `ns.tprintf`, or to stdout
+ * without an `ns`) instead of running the program's `main`. `ns.args` are libtest's: name filters,
+ * `--exact`, `--ignored`, `--include-ignored`.
+ */
+export function compileTests(
+  source: string,
+  filename?: string,
+  resolve?: (path: string) => string | undefined,
+): CompileOutput;
 export interface Hover {
   /** Markdown. */
   contents: string;

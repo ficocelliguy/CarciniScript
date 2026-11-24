@@ -5306,9 +5306,111 @@
       return rt.Ok(f());
     } catch (e) {
       if (!(e instanceof CarciniPanic)) throw e;
-      rt.$eprintln(`thread 'main' panicked at ${e.location}:\n${e.panicMessage}`);
+      rt.$eprintln(`thread '${threadName}' panicked at ${e.location}:\n${e.panicMessage}`);
       return rt.Err(e.panicMessage);
     }
+  };
+  // The thread a panic report names: the test running, in a test build.
+  let threadName = "main";
+  // A test build's `main(ns)`: runs the `#[test]` functions in name order and reports like
+  // libtest (`cargo test -- --test-threads=1`), to the terminal under Bitburner or to stdout.
+  // Each test's output is kept and shown only if it fails. `ns.args` are libtest's: name
+  // filters (substrings; whole names with `--exact`), `--ignored` and `--include-ignored`.
+  // Each test is `{ name, f, at, shouldPanic, ignore, dbg }`: `at` is where the test is
+  // (`file:line:col`), `shouldPanic` is `true` or the expected substring, `ignore` is `true` or
+  // the reason, and `dbg` formats the `Err` of a test that returns a `Result`.
+  rt.$runTests = async (ns, tests) => {
+    const say = typeof ns?.tprintf === "function" ? (s) => ns.tprintf("%s", s) : (s) => rt.$println(s);
+    const args = (ns?.args ?? []).map(String);
+    const filters = args.filter((a) => !a.startsWith("--"));
+    const exact = args.includes("--exact");
+    const onlyIgnored = args.includes("--ignored");
+    const withIgnored = args.includes("--include-ignored");
+    const picked = tests
+      .filter((t) => !filters.length || filters.some((f) => (exact ? t.name === f : t.name.includes(f))))
+      .filter((t) => !onlyIgnored || t.ignore)
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const start = Date.now();
+    let [passed, ignored] = [0, 0];
+    const failures = [];
+    // (Rust's panic hook adds the backtrace note to the first panic only.)
+    let noted = false;
+    say("");
+    say(`running ${picked.length} test${picked.length === 1 ? "" : "s"}`);
+    for (const t of picked) {
+      const head = `test ${t.name}${t.shouldPanic ? " - should panic" : ""} ...`;
+      if (t.ignore && !onlyIgnored && !withIgnored) {
+        ignored++;
+        say(`${head} ignored${t.ignore === true ? "" : `, ${t.ignore}`}`);
+        continue;
+      }
+      // The test's output (stdout and stderr, as libtest captures them).
+      let out = "";
+      const sinks = [outSink, errSink];
+      rt.$flush();
+      outSink = errSink = (line) => {
+        out += line + "\n";
+      };
+      threadName = t.name;
+      let ok;
+      try {
+        try {
+          const r = await t.f();
+          if (r != null && r.$tag === 1 && t.dbg) {
+            rt.$eprintln(`Error: ${t.dbg(r[0])}`);
+            ok = false;
+          } else if (t.shouldPanic) {
+            rt.$print(`note: test did not panic as expected at ${t.at}`);
+            ok = false;
+          } else ok = true;
+        } catch (e) {
+          if (e?.name === "CarciniExit") throw e;
+          const message = e instanceof CarciniPanic ? e.panicMessage : String(e?.stack ?? e);
+          const location = e instanceof CarciniPanic ? e.location : "<js>";
+          rt.$eprintln(`\nthread '${t.name}' panicked at ${location}:\n${message}`);
+          if (!noted) rt.$eprintln("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace");
+          noted = true;
+          if (typeof t.shouldPanic === "string" && !message.includes(t.shouldPanic)) {
+            rt.$print(
+              "note: panic did not contain expected string\n" +
+                `      panic message: ${rt.$dbgStr(message)}\n` +
+                ` expected substring: ${rt.$dbgStr(t.shouldPanic)}`,
+            );
+            ok = false;
+          } else ok = !!t.shouldPanic;
+        }
+      } finally {
+        // (A line the test left unfinished is part of its output.)
+        out += outBuf + errBuf;
+        outBuf = errBuf = "";
+        [outSink, errSink] = sinks;
+        threadName = "main";
+      }
+      say(`${head} ${ok ? "ok" : "FAILED"}`);
+      if (ok) passed++;
+      else failures.push([t.name, out]);
+    }
+    if (failures.length) {
+      say("");
+      say("failures:");
+      const shown = failures.filter(([, out]) => out);
+      if (shown.length) say("");
+      for (const [name, out] of shown) {
+        say(`---- ${name} stdout ----`);
+        for (const line of out.split("\n")) say(line);
+      }
+      say("");
+      say("failures:");
+      for (const [name] of failures) say(`    ${name}`);
+    }
+    const secs = ((Date.now() - start) / 1000).toFixed(2);
+    say("");
+    say(
+      `test result: ${failures.length ? "FAILED" : "ok"}. ${passed} passed; ${failures.length} failed; ` +
+        `${ignored} ignored; 0 measured; ${tests.length - picked.length} filtered out; finished in ${secs}s`,
+    );
+    say("");
+    return !failures.length;
   };
   // A closure that owns captured values with a `Drop` impl: they drop when it does.
   rt.$own = (f, caps) => {

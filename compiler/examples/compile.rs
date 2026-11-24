@@ -1,6 +1,12 @@
-//! `cargo run --example compile -- path/to/file.rs` prints the generated JS, or diagnostics.
+//! `cargo run --example compile -- [--test] path/to/file.rs` prints the generated JS, or
+//! diagnostics.
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: compile <file.rs>");
+    // `--test`: a test build (`rustc --test`).
+    let test = std::env::args().any(|a| a == "--test");
+    let path = std::env::args()
+        .skip(1)
+        .find(|a| a != "--test")
+        .expect("usage: compile [--test] <file.rs>");
     let src = std::fs::read_to_string(&path).expect("read source");
     // `CARCINI_BINDINGS=bindings/ns.rs`: typed NS bindings, as the editor loads them.
     if let Some(b) = std::env::var_os("CARCINI_BINDINGS") {
@@ -18,7 +24,11 @@ fn main() {
         .map(|d| d.to_path_buf())
         .unwrap_or_default();
     let resolve = |p: &str| std::fs::read_to_string(dir.join(p)).ok();
-    let out = carciniscript::compile_with(&src, &name, &resolve);
+    let out = if test {
+        carciniscript::compile_tests_with(&src, &name, &resolve)
+    } else {
+        carciniscript::compile_with(&src, &name, &resolve)
+    };
     for d in &out.diagnostics {
         eprintln!(
             "{}:{}:{}: {}: {}",

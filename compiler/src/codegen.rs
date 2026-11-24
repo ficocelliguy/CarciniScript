@@ -642,6 +642,13 @@ pub fn compile(src: &str, filename: &str) -> CompileOutput {
     compile_with(src, filename, &|_| None)
 }
 
+/// `compile_with` as a test build, like `rustc --test`: `cfg(test)` is on, and `main(ns)` runs
+/// the `#[test]` functions and prints libtest's report (`κσ.$runTests`) instead of running the
+/// program's own `main`.
+pub fn compile_tests_with(src: &str, filename: &str, resolver: typeck::Resolver) -> CompileOutput {
+    crate::adt::with_test_build(true, || compile_with(src, filename, resolver))
+}
+
 static OVERFLOW_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Debug-build overflow checks: integer arithmetic that overflows panics instead of wrapping.
@@ -1387,7 +1394,12 @@ impl<'a> Codegen<'a> {
                     .and_then(|r| r.ty())
                     .map(|t| self.lower_type(&t))
                     .unwrap_or(Ty::Unit);
-                let js = escape_ident(name.text());
+                let mut js = escape_ident(name.text());
+                // A test build's `main` runs the tests (`emit_test_main`); the program's own is
+                // compiled under another name.
+                if js == "main" && crate::adt::test_build() {
+                    js = "main$".into();
+                }
                 self.used_names.insert(js.clone(), 1);
                 let is_async = f.async_token().is_some();
                 let sig = FnSig {
@@ -1679,6 +1691,82 @@ impl<'a> Codegen<'a> {
         }
         self.emit_mixins();
         self.emit_consts(file);
+        if crate::adt::test_build() {
+            self.emit_test_main(file);
+        }
+    }
+
+    /// A test build's `main(ns)`: `κσ.$runTests` over the file's `#[test]` functions (those of
+    /// inline modules are flattened to the top level as `tests__name`, shown `tests::name`).
+    fn emit_test_main(&mut self, file: &ast::SourceFile) {
+        use ra_ap_syntax::ast::{HasAttrs, HasModuleItem};
+        let mut entries = Vec::new();
+        for item in file.items() {
+            let ast::Item::Fn(f) = item else { continue };
+            let Some(name) = f.name() else { continue };
+            if !crate::adt::is_test_fn(&f) {
+                continue;
+            }
+            if f
+                .param_list()
+                .is_some_and(|l| l.params().next().is_some() || l.self_param().is_some())
+            {
+                self.error(f.syntax(), "functions used as tests can not have any arguments");
+                continue;
+            }
+            let Some(sig) = self.fns.get(name.text()) else { continue };
+            let shown = name.text().replace("__", "::");
+            // A test that returns a `Result` fails on `Err` (`Error: {e:?}`), like `main`.
+            let returns_result = f
+                .ret_type()
+                .and_then(|r| r.ty())
+                .is_some_and(|t| t.syntax().text().to_string().contains("Result"));
+            let dbg = match &sig.ret {
+                Ty::Result(_, e) => debug_fn(e).unwrap_or_else(|| "κσ.$dbg".into()),
+                _ if returns_result => "κσ.$dbg".into(),
+                _ => "null".into(),
+            };
+            let attr_value = |want: &str| -> Option<Option<String>> {
+                f.attrs().find_map(|a| {
+                    let path = a.path()?.syntax().text().to_string();
+                    if path != want {
+                        return None;
+                    }
+                    // `#[ignore = "why"]`, `#[should_panic(expected = "text")]`: the string.
+                    let text = a
+                        .syntax()
+                        .descendants_with_tokens()
+                        .filter_map(|e| e.into_token())
+                        .filter_map(ast::String::cast)
+                        .find_map(|s| s.value().ok().map(|v| v.into_owned()));
+                    Some(text)
+                })
+            };
+            let flag = |v: Option<Option<String>>| match v {
+                None => "false".to_string(),
+                Some(None) => "true".to_string(),
+                Some(Some(s)) => js_string(&s),
+            };
+            entries.push(format!(
+                "{{ name: {}, f: {}, at: {}, shouldPanic: {}, ignore: {}, dbg: {dbg} }}",
+                js_string(&shown),
+                sig.js,
+                js_string(&self.location(name.syntax())),
+                flag(attr_value("should_panic")),
+                flag(attr_value("ignore")),
+            ));
+        }
+        self.line(Frag::text("export async function main(ns) {"));
+        self.out.indent += 1;
+        self.line(Frag::text("await κσ.$runTests(ns, ["));
+        self.out.indent += 1;
+        for e in entries {
+            self.line(Frag::text(format!("{e},")));
+        }
+        self.out.indent -= 1;
+        self.line(Frag::text("]);"));
+        self.out.indent -= 1;
+        self.line(Frag::text("}"));
     }
 
     /// `export const NAME = value;` for each `const` / `static`, after everything else (JS `const`s

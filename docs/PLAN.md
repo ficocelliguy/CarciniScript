@@ -17,7 +17,7 @@ Ranked by what a player hits times how badly; a wrong result or a crash in code 
 outranks a missing feature, and a missing feature outranks a corpus count. Details are in the
 sections below.
 
-1. **In-game `#[test]` runner** (Bitburner player gaps). The most-asked-for item still open.
+1. **Host wiring for test builds** (Bitburner player gaps): the compiler side is done.
 2. **Re-run the corpus, refresh the uncategorized sort, then triage the "mismatched types"
    buckets** (about 90 files). The 2026-11-23 fixes un-hid serde's `impls.rs` and moved the
    re-export and macro files, and the 2026-11-22 sort is stale; "mismatched types" is the largest
@@ -346,11 +346,14 @@ What a Bitburner player still misses, now that every item in `corpus/bitburner/G
 fixed. The other items of the original list and of the 2026-11-18 probe (cross-folder modules
 via `#[path]`, serde tagging and `flatten`, `i32` NS results, `std::sync` / tokio sync shims,
 typed `ns.flags`, `u64` as a number, un-awaited futures, `&str + &str`, partial moves out of a
-struct) are done; see FEATURES.md.
+struct, test builds with libtest's report) are done; see FEATURES.md.
 
-- [ ] **An in-game `#[test]` runner.** `#[cfg(test)]` is dropped (FEATURES). Contract solvers
-  are the most test-worthy Bitburner code, and Discord users named Rust's testing as a draw.
-  Compile the tests to a `main` that runs each and prints libtest's summary.
+- [ ] **Run tests in game (bitoxidizer-src).** `compileTests` builds a module whose `main(ns)` runs
+  the `#[test]`s (FEATURES). The host still has to choose it: e.g. `run solver.rs --test` (the
+  arguments after it are libtest's), compiled and cached apart from the normal module, and
+  editor markers from the test build too, so errors inside `mod tests` show.
+- [ ] Hover, completions and navigation inside `#[cfg(test)]` code (the language service sees a
+  normal build, which leaves it out).
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 
