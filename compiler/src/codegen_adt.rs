@@ -411,6 +411,22 @@ impl Codegen<'_> {
                         }
                         self.line(line);
                     }
+                    // `type Error = MyError;` read as a class by a trait's default method
+                    // (`Self::Error::custom(..)`): `this.constructor.$at$Error`.
+                    ast::AssocItem::TypeAlias(ta) => {
+                        let (Some(n), Some(t)) = (ta.name(), ta.ty()) else {
+                            continue;
+                        };
+                        if !self.types.self_assoc_dicts.contains(&n.text().to_string()) {
+                            continue;
+                        }
+                        let ty = self.lower_type(&t);
+                        let d = self.dict_of(&ty);
+                        self.line(Frag::mapped(
+                            self.off(ta.syntax()),
+                            format!("static get $at${}() {{ return {d}; }}", n.text()),
+                        ));
+                    }
                     _ => {}
                 }
             }

@@ -19,12 +19,12 @@ sections below.
 
 1. **Fix the confirmed "mismatched types" gaps** (triaged 2026-11-24; the list is under
    "Real-world corpus survey", "Std modeling" and "Bounds and generics"). In player order:
-   `impl PartialEq<Other>` method resolution and `T: PartialEq<U>` bounds (12 files),
-   `.as_ref()` targets on bounded parameters (7), `A::Item` field types (2), std iterator
-   structs as declared types (4), and a file's own `Vec` shadowing the preludes' `Vec::new()`
-   (bumpalo; the errors land past the end of the file). Done 2026-11-24: `Cow` and `LazyLock`
-   deref coercion, a file's own `IntoIter`, `K: Borrow<Q>` lookups, `slice.get(range)`,
-   `checked_next_power_of_two` as a function value, `OsStr::to_owned()`, `str::is_ascii`.
+   `impl PartialEq<Other>` method resolution and `T: PartialEq<U>` bounds (12 files). Done
+   2026-11-24: `Cow` and `LazyLock` deref coercion, a file's own `IntoIter`, `K: Borrow<Q>`
+   lookups, `slice.get(range)`, `checked_next_power_of_two` as a function value,
+   `OsStr::to_owned()`, `str::is_ascii`; then `.as_ref()` targets on bounded parameters,
+   `A::Item` field types, std iterator structs as declared types, a file's own `Vec`,
+   `Self::Error::custom`, turbofish bounds with type arguments, and raw-pointer cast messages.
 
 ## Contracts inherited from the RapydScript integration
 
@@ -273,8 +273,11 @@ see FEATURES.md).
 - Not gaps, from the same triage (the rest of the "mismatched types" files): raw-pointer casts
   (`s as *const str as *const Self`, `&EMPTY_CHUNK as *const ..`, pointer to integer: bumpalo,
   icu_provider, icu_collections, indexmap, zerotrie, zerovec, crossbeam-epoch, once_cell,
-  rowan; about 12 files, unsafe/memory, not planned, though the message should say so rather
-  than "mismatched types"); external types (clap's `#[command(..)]` on a variant, syn's `Ident
+  rowan; about 12 files, unsafe/memory, not planned; since 2026-11-24 a pointer-to-pointer
+  cast says "isn't supported: values have no memory layout to reinterpret" and an integer to
+  pointer cast gets the existing message, so 132 "mismatched types" lines in those files drop
+  to 31, the rest macro-generated or not casts; `a as *const T == b as *const T` still asks
+  for `PartialEq`); external types (clap's `#[command(..)]` on a variant, syn's `Ident
   == "str"`, serde-wasm-bindgen's `JsValue`, fastrand's `WyRng`, rayon, rand); closures whose
   parameter type comes from another file's iterator (regex's `bytes.rs`); and autocfg's
   pre-2018 `Option<&error::Error>`. Two suspected clusters passed their probes: a local
@@ -292,12 +295,17 @@ that this compiler rejects or miscompiles; counts are files of the corpus where 
     return. 12 files (cc, multipart, regex, url, rouille, log, form_urlencoded, wasm-bindgen).
     Now `check` and a function body's tail (under a `-> &..` return type) deref through the
     type arguments (`typeck.rs` `deref_target`; `fixtures/coercion_gaps.rs`).
-  - [ ] A std iterator struct named as a type doesn't unify with the method that makes it:
+  - [x] A std iterator struct named as a type doesn't unify with the method that makes it:
     `btree_map::Keys` / `Values` / `ValuesMut` / `IntoKeys`, `btree_set::Difference`,
     `vec::Drain`, `slice::Iter` written `Iter<'_, T>` as a field or return type get "found
     `std::slice::Iter`"; the struct holding one has no `next` / `count`; and returning
     `self.inner.keys()` as a `btree_map::Keys` reports `K: Ord` unsatisfied under an
     `impl<K: Ord, V>`. 4 files (wasmparser's collections, slab, clap_builder's `flat_map`).
+    Now a module-qualified std iterator (also `IntoKeys`, `IntoValues`, `Drain`, `Difference`,
+    `Intersection`, `Union`, `SymmetricDifference`) is std's inside a wrapper of the same name
+    (`typeck.rs` `std_qualified`), and the `Ord` check on a generic `BTreeMap` key reads the
+    enclosing fn / impl / trait bounds (`typeck_coll.rs` `param_ord_at`;
+    `fixtures/std_iter_struct_types.rs`).
   - [x] A file's own `IntoIter` type breaks the compiler's io prelude: with an `impl io::Write`
     (or `Read`) in the file, `Read::bytes` / `BufRead::lines` / `split` in the prelude resolve
     `IntoIter` to the file's struct, and three errors land one line past the end of the file.
@@ -305,15 +313,21 @@ that this compiler rejects or miscompiles; counts are files of the corpus where 
     thin-vec, bytes, ra_ap_stdx, serde_json, regex-automata). Now a `std::` / `core::` /
     `alloc::` path to a std iterator is std's even when the file has a type of that name
     (`typeck.rs` `lower_type`; `fixtures/coercion_gaps.rs`).
-  - [ ] A file's own `Vec` (bumpalo's `collections/vec.rs`) shadows `Vec::new()` in the
+  - [x] A file's own `Vec` (bumpalo's `collections/vec.rs`) shadows `Vec::new()` in the
     preludes: "no function or associated item named `new`" past the end of the file. Such a
     diagnostic crashed the compiler in `adt::test_code_at` (from the `#[test]` runner) until
-    2026-11-24.
-  - [ ] `.as_ref()` on a bounded type parameter takes the wrong target: `S: AsRef<OsStr> +
+    2026-11-24. Now a pre-pass renames a file's own top-level `Vec` to `Vec__file` before the
+    preludes are added (`ownstd.rs`; `fixtures/own_vec_shadow.rs`); diagnostics show that name.
+    The rest of bumpalo's `vec.rs` is indexing through `Deref` (`self[i]`) and raw pointers.
+  - [x] `.as_ref()` on a bounded type parameter takes the wrong target: `S: AsRef<OsStr> +
     ?Sized` gives `PathBuf`, `H: AsRef<[u8]> + ?Sized` gives `Vec<u8>` when a `&[u8]` field
     wants it; `s.as_ref()` on a `&str` passed to a `&[u8]` parameter; and a blanket `impl<H:
     AsRef<[u8]>> From<&H> for Input` isn't found for `Input::from(s)` ("`Input` implements
-    `From<H>`"). 7 files (tempfile, ring, smol_str, clap_builder, aho-corasick, http).
+    `From<H>`"). 7 files (tempfile, ring, smol_str, clap_builder, aho-corasick, http). Now the
+    bound is found behind a `&'a S` parameter (`typeck_conv.rs` `into_bound_target`), a
+    `str.as_ref()` takes its target from the expected type (`conv_str_as_ref_call`), a bytes
+    target converts at run time (`κσ.$asRefBytes`), and a blanket `From<&H>` has `H`'s
+    `AsRef` target as its source (`FromImpl::via_as_ref`; `fixtures/asref_targets.rs`).
   - [x] `LazyLock<T>` / `LazyCell<T>` don't deref-coerce: `&CONTEXT` as a `&'static T`,
     `f(&QUEUE)`, and `LAZY.clone()` is a `LazyLock<T>` rather than `T`. 4 files (indexmap
     benches, js-sys, uuid, wasm-bindgen). Now as `Cow` above (`fixtures/coercion_gaps.rs`).
@@ -337,8 +351,13 @@ that this compiler rejects or miscompiles; counts are files of the corpus where 
     (`fixtures/coercion_gaps.rs`).
   - [x] `str::is_ascii` (and `[u8]::is_ascii`) were missing (`κσ.$isAscii`).
 - Bounds and generics:
-  - [ ] A turbofish through a type parameter (`O::select::<u8>(x)`) checks the method's own
-    bounds, except those with type arguments (`Into<X>`, `Fn(..)`).
+  - [x] A turbofish through a type parameter (`O::select::<u8>(x)`) checks the method's own
+    bounds, except those with type arguments (`Into<X>`, `Fn(..)`). Now `Into<X>`, `From<X>`,
+    `PartialEq<X>` and `Fn(..)` bounds are checked too when the type is a number, `bool`,
+    `char`, string or closure (`adt.rs` `ArgBound`, `typeck_gen.rs` `arg_bounds`), and
+    turbofish arguments go in written order even past a parameter lowered to its target
+    (`O::mix::<&str, u16>` gave `&str` to the wrong one). Also fixed: a trait function named
+    like an NS call (`run`) through a type parameter called `$O.run` rather than `run$`.
   - [ ] `impl PartialEq<Other> for T` / `PartialOrd<Other>`: inside the impl, `self.0.partial_cmp(other)`
     on the `u16` field resolves to the impl's own method (wants a `StatusCode`), and `self.eq(&T)`
     next to a derived `PartialEq` resolves to the `PartialEq<str>` impl (wants a `String`); a
@@ -353,12 +372,19 @@ that this compiler rejects or miscompiles; counts are files of the corpus where 
     rustls). Now a `Borrow<Q>` bound (also a method's `where` on its impl's parameter) is
     recorded, and a map lookup by a `&Q` binding checks against `Q` (`typeck.rs` `lookup_key`;
     `fixtures/coercion_gaps.rs`).
-  - [ ] `A::Item` as a struct field type (`v: Vec<A::Item>` under `struct S<A: Array>`, a
+  - [x] `A::Item` as a struct field type (`v: Vec<A::Item>` under `struct S<A: Array>`, a
     local trait with an associated type) is "cannot find type `Item`", and everything typed
     through the field follows. 2 files (smallvec), but it is the whole `Array`-trait pattern.
-  - [ ] `Error::custom("..")` as a `Self::Error` in a trait default method (`Self::Error:
+    Now field types are lowered with their parameters' bounds (`typeck_adt.rs`
+    `enter_param_bounds`), `adt_subst` settles `A::Item` for a known `A`, and a file with its
+    own `SmallVec` skips the bundled crate's rewrite (`fixtures/assoc_type_fields.rs`).
+  - [x] `Error::custom("..")` as a `Self::Error` in a trait default method (`Self::Error:
     Error`) is "on a type parameter isn't supported yet" plus "expected `T`, found `String`".
-    4 files (serde, serde_core).
+    4 files (serde, serde_core). Now `Self::Error::custom`, `<Self::Error as Error>::custom`
+    and `Error::custom` by expected type dispatch through a `$at$Error` getter on each impl
+    class (`typeck.rs` `self_projection`, `codegen_adt.rs`), and a file's own `trait Error`
+    is no longer taken for `std::error::Error` (`fixtures/assoc_type_fields.rs`). Not yet:
+    `T::E::mk(..)` in a generic free function.
 - Patterns and ranges:
   - [ ] `(..).start_bound()` where only the expected type says what `T` is (the `RangeFull`
     impl's `T` isn't in its self type).
@@ -451,8 +477,13 @@ are), is done: `compileTests`, the libtest report, `tests/` scripts as test buil
 errors as warnings, the language service inside test code, the README's "Testing your scripts"
 and the web REPL's Run tests button; see FEATURES.
 
-- Completions and signature help inside a macro invocation's arguments (`assert_eq!(v.le`,
-  `vec![f(1, `) don't answer, in test code or not; most test code is inside `assert!`s.
+- [x] Completions and signature help inside a macro invocation's arguments (`assert_eq!(v.le`,
+  `vec![f(1, `) don't answer, in test code or not; most test code is inside `assert!`s. Now
+  completions, signature help and hover re-parse the argument under the cursor in the std
+  macros (`assert*!`, `debug_assert*!`, `vec!`, `println!` / `format!`, `dbg!`, nested too;
+  `service.rs` `tree_at`), and an unclosed call keeps its last token (`macros.rs`). Not yet:
+  signature help with a stray closer in an unfinished nested call (`vec![add(1, ];`), and
+  hover on a closure parameter inside a macro.
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 

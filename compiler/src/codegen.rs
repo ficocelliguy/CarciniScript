@@ -767,6 +767,8 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
         || (src.contains('!') && !matches!(filename.rsplit('/').next(), Some("main.rs" | "lib.rs")))
         // (Nested items that share a name, renamed by `nested.rs`.)
         || crate::nested::has_duplicate_items(src)
+        // (A struct named like a std type, renamed by `ownstd.rs`.)
+        || crate::ownstd::has_own_std_types(src)
     {
         let macros = crate::mbe::imported_macros(src, filename, resolver);
         match crate::mbe::preprocess_with(src, &macros, Some((filename, resolver))) {
@@ -5419,6 +5421,18 @@ impl<'a> Codegen<'a> {
         if let Some(js) = const_js_of(&first) {
             return Some(js);
         }
+        // (`Self::Error::custom(..)` in a trait's default method: the implementing class's
+        // `type Error`, a getter it has for this.)
+        if let Some(a) = first.strip_prefix("Self::")
+            && self.in_trait_default
+        {
+            let cls = if self.lookup("self").is_some() {
+                "this.constructor"
+            } else {
+                "this"
+            };
+            return Some(format!("{cls}.$at${a}"));
+        }
         if first == "Self" && self.in_trait_default {
             return Some(
                 if self.lookup("self").is_some() {
@@ -5609,9 +5623,15 @@ impl<'a> Codegen<'a> {
             // (With the element's class when it has one, for `impl<T> S<Vec<T>>`.)
             Ty::Vec(e) | Ty::Option(e) => {
                 let prim = if matches!(t, Ty::Vec(_)) { "vec" } else { "option" };
-                match self.dict_of(e) {
+                let d = match self.dict_of(e) {
                     d if d == "undefined" => format!("κσ.$prims.{prim}"),
                     d => format!("κσ.$withElem(κσ.$prims.{prim}, {d})"),
+                };
+                // (With your impls' associated functions, `A::size()` for `impl Array for
+                // [T; 4]`.)
+                match crate::adt::ext_key_of(t).filter(|k| self.types.adts.ext_types.contains(*k)) {
+                    Some(key) => format!("κσ.$withStatics({d}, $ext${key})"),
+                    None => d,
                 }
             }
             // (A tuple's elements', for its impl's methods: see `κσ.$dcallT`.)
@@ -5856,7 +5876,14 @@ impl<'a> Codegen<'a> {
             }
             args.extend(self.dbg_arg_frags(c.syntax()));
             let mut out = Frag::text(class);
-            out.push(member(f.text()))
+            // (Named as the class declares it: `run$` for an NS function's name. The runtime's
+            // classes for built-in types have `default` and the like as they are.)
+            let name = f.text().to_string();
+            out.push(member(&if bindings::is_ram_name(&name) {
+                escape_ident(&name)
+            } else {
+                name
+            }))
                 .push("(")
                 .append(Frag::join(args, ", "))
                 .push(")");

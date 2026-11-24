@@ -4954,6 +4954,15 @@
     $withElem(prim, elem) {
       return { ...prim, elem };
     },
+    // A `Vec<T>`'s or `Option<T>`'s class with the associated functions of your trait impls for
+    // it (`ext`, `impl Array for [T; 4]`), for `A::size()`.
+    $withStatics(d, ext) {
+      const o = { ...d };
+      for (const k of Object.getOwnPropertyNames(ext)) {
+        if (typeof ext[k] === "function" && !["length", "name", "prototype"].includes(k)) o[k] = ext[k].bind(ext);
+      }
+      return o;
+    },
     // A tuple's class: its length, and its elements' classes as `elem` (for a tuple impl's
     // methods, see `$dcallT`).
     $tupT(elem) {

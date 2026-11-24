@@ -200,6 +200,131 @@ fn type_params(f: &ast::Fn) -> Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)
     out
 }
 
+impl Checker<'_> {
+    /// The bounds of `f`'s type parameters that take type arguments and are checked at a
+    /// turbofish: `R: Into<i64>`, `R: From<u8>`, `R: PartialEq<u8>`, `F: Fn(i32) -> i32`. Those
+    /// whose arguments name a type parameter are left out.
+    pub(super) fn arg_bounds(&mut self, f: &ast::Fn) -> Vec<(String, crate::adt::ArgBound)> {
+        use crate::adt::ArgBound;
+        let mut out = Vec::new();
+        let tps = type_params(f);
+        let names: Vec<String> = tps.iter().map(|(n, _, _)| n.clone()).collect();
+        // (`R: Into<T>` with the method's `T`: not lowered here.)
+        let names_param = |s: &SyntaxNode| {
+            s.descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .any(|t| {
+                    t.kind() == ra_ap_syntax::SyntaxKind::IDENT
+                        && names.iter().any(|n| n == t.text())
+                })
+        };
+        for (n, lists, _) in tps.iter().cloned() {
+            for l in &lists {
+                if names_param(l.syntax()) {
+                    continue;
+                }
+                if let Some(c) = self.lower_fn_bounds(l)
+                    && !mentions_param(&c)
+                {
+                    out.push((n.clone(), ArgBound::Fn(c)));
+                }
+                for b in l.bounds() {
+                    let Some(ast::Type::PathType(p)) = b.ty() else {
+                        continue;
+                    };
+                    let Some(seg) = p.path().and_then(|p| p.segment()) else {
+                        continue;
+                    };
+                    let Some(tr) = seg.name_ref().map(|n| n.text().to_string()) else {
+                        continue;
+                    };
+                    if !matches!(tr.as_str(), "Into" | "From" | "PartialEq") {
+                        continue;
+                    }
+                    let Some(ast::GenericArg::TypeArg(ta)) = seg
+                        .generic_arg_list()
+                        .and_then(|l| l.generic_args().next())
+                    else {
+                        continue;
+                    };
+                    let Some(t) = ta.ty() else { continue };
+                    let t = self.lower_type(&t);
+                    if !mentions_param(&t) {
+                        out.push((n.clone(), ArgBound::Conv(tr, t)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a type argument `t` (settled) meets a turbofish's `ArgBound`; `None` when it
+    /// can't tell (only std's numbers, `bool`, `char`, strings and closures are judged).
+    pub(super) fn arg_bound_holds(&self, t: &Ty, b: &crate::adt::ArgBound) -> Option<bool> {
+        use crate::adt::ArgBound;
+        let scalar = |t: &Ty| {
+            matches!(
+                t,
+                Ty::Int(_) | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str
+            )
+        };
+        match b {
+            ArgBound::Fn(c) => match t {
+                Ty::Closure { .. } => Some(self.could_be(t, c)),
+                _ if scalar(t) => Some(false),
+                _ => None,
+            },
+            ArgBound::Conv(tr, x) => {
+                if !scalar(t) || !scalar(x) {
+                    return None;
+                }
+                Some(match tr.as_str() {
+                    "Into" => std_from(x, t),
+                    "From" => std_from(t, x),
+                    _ => t == x,
+                })
+            }
+        }
+    }
+}
+
+fn mentions_param(t: &Ty) -> bool {
+    let mut ps = Vec::new();
+    t.collect_params(&mut ps);
+    !ps.is_empty()
+}
+
+/// Whether std has `impl From<src> for dst` (or they're the same), for numbers, `bool`, `char`
+/// and strings.
+fn std_from(dst: &Ty, src: &Ty) -> bool {
+    use crate::ty::IntKind::*;
+    if dst == src {
+        return true;
+    }
+    match (dst, src) {
+        (Ty::Str, Ty::Char) => true,
+        (Ty::Int(_), Ty::Bool) => true,
+        (Ty::Char, Ty::Int(U8)) => true,
+        (Ty::Int(U32 | U64 | U128), Ty::Char) => true,
+        (Ty::Float { f32: false }, Ty::Float { f32: true }) => true,
+        (Ty::Float { f32 }, Ty::Int(k)) => {
+            let max = if *f32 { 16 } else { 32 };
+            !matches!(k, Isize | Usize) && k.bits() <= max
+        }
+        (Ty::Int(Usize), Ty::Int(k)) => matches!(k, U8 | U16),
+        (Ty::Int(Isize), Ty::Int(k)) => matches!(k, I8 | I16 | U8),
+        (Ty::Int(_), Ty::Int(Isize | Usize)) => false,
+        (Ty::Int(d), Ty::Int(s)) => {
+            if d.is_signed() == s.is_signed() {
+                d.bits() > s.bits()
+            } else {
+                d.is_signed() && d.bits() > s.bits()
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Each type parameter of `f` with the names of its trait bounds that take no type arguments
 /// (`R: Default + Clone`, not `F: Fn(u8)` or `S: Into<String>`).
 pub(super) fn plain_bounds(f: &ast::Fn) -> Vec<(String, Vec<String>)> {
@@ -861,6 +986,33 @@ impl Checker<'_> {
                 );
                 self.error(&node, msg);
             }
+        }
+        for (t, b, node, base) in std::mem::take(&mut self.pending_arg_bounds) {
+            self.base = base;
+            let z = self.zonk(&t);
+            if self.arg_bound_holds(&z, &b) != Some(false) {
+                continue;
+            }
+            let msg = match &b {
+                crate::adt::ArgBound::Fn(c) => format!(
+                    "expected an `{}` closure, found `{}`",
+                    self.describe(c).trim_start_matches("impl "),
+                    self.describe(&z)
+                ),
+                crate::adt::ArgBound::Conv(tr, x) if tr == "Into" => format!(
+                    "the trait bound `{}: From<{}>` is not satisfied (needed for `{}: Into<{}>`)",
+                    self.describe(x),
+                    self.describe(&z),
+                    self.describe(&z),
+                    self.describe(x)
+                ),
+                crate::adt::ArgBound::Conv(tr, x) => format!(
+                    "the trait bound `{}: {tr}<{}>` is not satisfied",
+                    self.describe(&z),
+                    self.describe(x)
+                ),
+            };
+            self.error(&node, msg);
         }
         self.base = saved;
     }

@@ -209,12 +209,14 @@ impl Checker<'_> {
                 };
                 let Some(fname) = f.name() else { continue };
                 let sig = self.lower_method(&f);
+                let arg_bounds = self.arg_bounds(&f);
                 // (A default one without `self` is copied onto each implementing class.)
                 methods.push(TraitMethod {
                     name: fname.text().to_string(),
                     sig,
                     has_default: f.body().is_some(),
                     own_bounds: super::generic::plain_bounds(&f),
+                    arg_bounds,
                 });
             }
             self.self_ty = saved;
@@ -1186,7 +1188,7 @@ impl Checker<'_> {
     /// `t`, written in the impl of `tr` for `key`, with the impl's type parameters replaced by
     /// what the value of type `z` has for them (`T` of `impl<T> Tr for Stack<T>`, for a
     /// `Stack<i32>`). Parameters it can't place stay as they are.
-    fn through_impl_head(&mut self, z: &Ty, key: &str, tr: &str, t: &Ty) -> Ty {
+    pub(super) fn through_impl_head(&self, z: &Ty, key: &str, tr: &str, t: &Ty) -> Ty {
         let Some(heads) = self.adts.impl_heads.get(&(key.to_string(), tr.to_string())) else {
             return t.clone();
         };

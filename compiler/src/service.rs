@@ -146,6 +146,77 @@ pub(crate) fn type_at(types: &Types, n: &SyntaxNode) -> Option<Ty> {
         .filter(|t| !matches!(t, Ty::Unknown | Ty::Var(_)))
 }
 
+/// The tree to find the token at `offset` in. The parser leaves a macro's arguments as a token
+/// tree, so inside a built-in macro (`assert_eq!(v.le`, `vec![f(1, `) the argument there is
+/// re-parsed as the checker splits it (`macros::split_args`): alone in an otherwise blank text,
+/// inside `fn f(){(..)}`, so its nodes keep their offsets and the checker's types for them are
+/// found. Nested macros too.
+fn tree_at(file: &SourceFile, offset: usize) -> SourceFile {
+    let at = TextSize::from(offset as u32);
+    let mut tree = file.clone();
+    let mut text: Option<String> = None;
+    // Whether a token tree has its closing delimiter (`assert_eq!(v.le` as typed hasn't).
+    let closed = |tt: &ast::TokenTree| {
+        let open = tt.syntax().first_token().map(|t| t.kind());
+        let close = tt.syntax().last_token().map(|t| t.kind());
+        tt.syntax().text_range().len() > TextSize::from(1)
+            && matches!(
+                open.zip(close),
+                Some(
+                    (SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
+                        | (SyntaxKind::L_BRACK, SyntaxKind::R_BRACK)
+                        | (SyntaxKind::L_CURLY, SyntaxKind::R_CURLY)
+                )
+            )
+    };
+    loop {
+        // (Past an unclosed token tree, `vec![f(1, |`, the token is the whitespace after it.)
+        let token = tree.syntax().token_at_offset(at).left_biased().map(|t| {
+            if t.kind().is_trivia() {
+                t.prev_token().unwrap_or(t)
+            } else {
+                t
+            }
+        });
+        let Some((mc, tt)) = token
+            .and_then(|t| t.parent_ancestors().find_map(ast::MacroCall::cast))
+            .and_then(|mc| Some((mc.clone(), mc.token_tree()?)))
+            .filter(|(_, tt)| {
+                let r = tt.syntax().text_range();
+                r.start() < at && (at < r.end() || !closed(tt))
+            })
+        else {
+            return tree;
+        };
+        let src = text.get_or_insert_with(|| file.syntax().to_string());
+        let args = match crate::macros::split_repeat(src, 0, &mc) {
+            Some((value, count)) => vec![value, count],
+            None => crate::macros::split_args(src, 0, &mc),
+        };
+        // (Unclosed, the last argument runs to the cursor.)
+        let open_tail = !closed(&tt);
+        let n = args.len();
+        let Some(arg) = args.into_iter().enumerate().find_map(|(i, a)| {
+            (a.start <= offset && (offset <= a.end() || open_tail && i + 1 == n)).then_some(a)
+        }) else {
+            return tree;
+        };
+        const OPEN: &str = "fn f(){(";
+        if arg.start < OPEN.len() {
+            return tree;
+        }
+        let mut padded = " ".repeat(arg.start - OPEN.len());
+        padded.push_str(OPEN);
+        padded.push_str(&arg.text);
+        if padded.len() < offset {
+            padded.push_str(&" ".repeat(offset - padded.len()));
+        }
+        padded.push_str(" )}");
+        tree = SourceFile::parse(&padded, crate::macros::EDITION).tree();
+        text = Some(padded);
+    }
+}
+
 fn signature(name: &str, params: &[(String, Ty)], ret: &Ty, is_async: bool) -> String {
     let ps: Vec<String> = params
         .iter()
@@ -264,7 +335,7 @@ fn hover_build(
     let an = analyze(src, filename, resolver);
     let offset = an.at(offset_of(src, line, column))?;
     let (file, types) = (&an.file, &an.types);
-    let token = file
+    let token = tree_at(file, offset)
         .syntax()
         .token_at_offset(TextSize::from(offset as u32))
         .right_biased()?;
@@ -555,7 +626,7 @@ fn completions_build(
         return vec![];
     };
     let (file, types) = (&an.file, &an.types);
-    let Some(token) = file
+    let Some(token) = tree_at(file, dot)
         .syntax()
         .token_at_offset(TextSize::from(dot as u32))
         .right_biased()
@@ -711,7 +782,7 @@ fn signature_help_build(
     let offset = an.at(offset_of(src, line, column))?;
     let (file, types) = (&an.file, &an.types);
     let at = TextSize::from(offset as u32);
-    let token = file.syntax().token_at_offset(at).left_biased()?;
+    let token = tree_at(file, offset).syntax().token_at_offset(at).left_biased()?;
     let args = token
         .parent_ancestors()
         .filter_map(ast::ArgList::cast)

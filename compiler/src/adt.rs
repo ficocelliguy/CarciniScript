@@ -169,6 +169,18 @@ pub struct TraitMethod {
     /// The method's own type parameters' trait bounds without type arguments (`R: Default`),
     /// checked where a call through a type parameter instantiates them.
     pub own_bounds: Vec<(String, Vec<String>)>,
+    /// Those bounds with type arguments (`R: Into<i64>`, `F: Fn(i32) -> i32`), by parameter.
+    pub arg_bounds: Vec<(String, ArgBound)>,
+}
+
+/// A bound with type arguments on a trait method's own type parameter, checked where a call
+/// through a type parameter names its type with a turbofish (`O::widen::<u8>(x)`).
+#[derive(Clone, Debug)]
+pub enum ArgBound {
+    /// `Into<X>`, `From<X>` or `PartialEq<X>`, with `X`.
+    Conv(String, Ty),
+    /// `Fn(..) -> R` (or `FnMut` / `FnOnce`): the closure type.
+    Fn(Ty),
 }
 
 #[derive(Clone, Debug)]
@@ -622,6 +634,9 @@ pub struct FromImpl {
     pub at: usize,
     /// `impl<S: Into<X>> From<S>`: `src` is `X`, and anything that converts into one fits.
     pub via_into: bool,
+    /// `impl<H: AsRef<X>> From<&H>`: `src` is `X`, and a string fits an `X` of bytes (the impl's
+    /// `as_ref()` converts it).
+    pub via_as_ref: bool,
 }
 
 /// What a `Y::from(x)`, `x.into()` or `?` converts with.
@@ -1339,7 +1354,11 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
                 _ => return None,
             };
             let kind = match &t {
-                ast::Type::PathType(p) if p.syntax().text().to_string().starts_with("Vec") => "seq",
+                ast::Type::PathType(p)
+                    if p.syntax().text().to_string().strip_prefix("Vec").is_some_and(|r| r.is_empty() || r.starts_with('<')) =>
+                {
+                    "seq"
+                }
                 ast::Type::SliceType(_) | ast::Type::ArrayType(_) => "seq",
                 _ => "str",
             };

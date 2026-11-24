@@ -219,6 +219,7 @@ impl Checker<'_> {
                 ast::Item::Struct(s) => {
                     let Some(name) = s.name() else { continue };
                     self.enter_type_params(&type_param_names(&item));
+                    let saved_bounds = self.enter_param_bounds(&item);
                     // `struct Pairs<I: Iterator<Item = T>> { it: I }`: the runtime's iterator.
                     for tp in s
                         .generic_param_list()
@@ -241,6 +242,7 @@ impl Checker<'_> {
                     let variant =
                         self.lower_variant(name.text().to_string().as_str(), s.field_list());
                     self.generics.clear();
+                    self.param_bounds = saved_bounds;
                     if let Some(def) = self.adts.defs.get_mut(name.text().to_string().as_str())
                         && !def.is_enum
                     {
@@ -250,6 +252,7 @@ impl Checker<'_> {
                 ast::Item::Enum(e) => {
                     let Some(name) = e.name() else { continue };
                     self.enter_type_params(&type_param_names(&item));
+                    let saved_bounds = self.enter_param_bounds(&item);
                     let mut variants = Vec::new();
                     let mut default_variant = None;
                     let mut next_discr = 0i64;
@@ -290,6 +293,7 @@ impl Checker<'_> {
                         variants.push(variant);
                     }
                     self.generics.clear();
+                    self.param_bounds = saved_bounds;
                     if let Some(def) = self.adts.defs.get_mut(name.text().to_string().as_str())
                         && def.is_enum
                     {
@@ -451,6 +455,27 @@ impl Checker<'_> {
         lists.iter().find_map(|l| self.lower_fn_bounds(l))
     }
 
+    /// A struct's or enum's parameter bounds while its fields are lowered, so `A::Item` under
+    /// `struct S<A: Array>` is `A`'s projection; returns the bounds to restore.
+    fn enter_param_bounds(&mut self, item: &ast::Item) -> HashMap<String, Vec<String>> {
+        let saved = self.param_bounds.clone();
+        let gp = match item {
+            ast::Item::Struct(s) => s.generic_param_list(),
+            ast::Item::Enum(e) => e.generic_param_list(),
+            _ => None,
+        };
+        let names = gp.into_iter().flat_map(|l| l.type_or_const_params()).filter_map(|p| match p {
+            ast::TypeOrConstParam::Type(tp) => tp.name().map(|n| n.text().to_string()),
+            _ => None,
+        });
+        for (n, b) in names.zip(type_param_bounds(item)) {
+            if !b.is_empty() {
+                self.param_bounds.insert(n, b);
+            }
+        }
+        saved
+    }
+
     fn enter_type_params(&mut self, names: &[String]) {
         self.generics.clear();
         for n in names {
@@ -463,11 +488,34 @@ impl Checker<'_> {
         let Some(def) = self.adts.defs.get(adt) else {
             return HashMap::new();
         };
-        def.type_params
+        let mut map: HashMap<String, Ty> = def
+            .type_params
             .iter()
             .enumerate()
             .map(|(i, p)| (p.clone(), args.get(i).cloned().unwrap_or(Ty::Unknown)))
-            .collect()
+            .collect();
+        // `A::Item` of `struct SmallVec<A: Array>` for a known `A` (`[i32; 4]`): its impl's.
+        if self.adts.param_bounds.contains_key(adt) {
+            for (p, a) in def.type_params.iter().zip(args) {
+                let z = self.zonk(a);
+                let key = match &z {
+                    Ty::Adt(n, _) => Some(n.clone()),
+                    Ty::Var(_) | Ty::Unknown | Ty::Param(_) => None,
+                    other => crate::adt::ext_key_of(other).map(str::to_string),
+                };
+                let Some(key) = key else { continue };
+                for ((k, tr), assoc) in &self.adts.impl_assoc {
+                    if *k != key {
+                        continue;
+                    }
+                    for (name, t) in assoc {
+                        let t = self.through_impl_head(&z, k, tr, t);
+                        map.entry(format!("{p}::{name}")).or_insert(t);
+                    }
+                }
+            }
+        }
+        map
     }
 
     /// Fresh type arguments for a new value of `adt`.
@@ -1323,7 +1371,14 @@ impl Checker<'_> {
             // Hand-written comparisons and clones: codegen bridges `$cmp` / `$eq` / `$clone` to them.
             // (`impl PartialEq<u32> for Id` compares with something else, not two `Id`s.)
             Some("PartialOrd" | "PartialEq") if foreign_rhs(imp, &type_name) => {}
-            Some(t @ ("Ord" | "PartialOrd" | "PartialEq" | "Eq" | "Clone" | "Debug" | "Error")) => {
+            // (Not the file's own `trait Error`, serde's `de::Error`: a user trait.)
+            Some(t @ ("Ord" | "PartialOrd" | "PartialEq" | "Eq" | "Clone" | "Debug" | "Error"))
+                if !(t == "Error"
+                    && self.adts.traits.get("Error").is_some_and(|d| d.module.is_none())
+                    && imp
+                        .trait_()
+                        .is_some_and(|tr| !tr.syntax().text().to_string().contains("error::"))) =>
+            {
                 if let Some(d) = self.adts.defs.get_mut(&type_name) {
                     d.manual.push(t.to_string());
                 }
@@ -1443,8 +1498,29 @@ impl Checker<'_> {
                 _ => None,
             });
             let via_into = via.is_some();
-            let ty = via.or(arg).map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
-            (ty, via_into)
+            // (`impl<'h, H: ?Sized + AsRef<[u8]>> From<&'h H> for Input<'h>`: it takes what is
+            // a `[u8]` here, a string too.)
+            let as_ref = (!via_into)
+                .then(|| match arg.as_ref()? {
+                    ast::Type::RefType(r) => match r.ty()? {
+                        ast::Type::PathType(p) => super::conv::param_into_target(
+                            &p.path()?.as_single_name_ref()?.text().to_string(),
+                            "AsRef",
+                            imp.generic_param_list(),
+                            imp.where_clause(),
+                        ),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .flatten();
+            let via_as_ref = as_ref.is_some();
+            let ty = via
+                .or(as_ref)
+                .or(arg)
+                .map(|t| self.lower_type(&t))
+                .unwrap_or(Ty::Unknown);
+            (ty, via_into, via_as_ref)
         });
         // `impl Add<R> for T`: the right operand's type (`Self` by default), and the impl's
         // `type Output = ..;`, which `-> Self::Output` names.
@@ -1596,7 +1672,7 @@ impl Checker<'_> {
                     .insert("fmt$dbg".into(), method);
                 continue;
             }
-            if let Some((src, via_into)) = &from_src
+            if let Some((src, via_into, via_as_ref)) = &from_src
                 && name.text() == "from"
             {
                 let at = self.range(name.syntax()).0;
@@ -1607,6 +1683,7 @@ impl Checker<'_> {
                     key: key.clone(),
                     at,
                     via_into: *via_into,
+                    via_as_ref: *via_as_ref,
                 });
                 self.adts
                     .methods

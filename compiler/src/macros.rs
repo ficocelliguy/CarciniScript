@@ -96,7 +96,13 @@ fn inner_elements(mc: &ast::MacroCall) -> Vec<SyntaxElement> {
     if elems.len() < 2 {
         return vec![];
     }
-    elems[1..elems.len() - 1]
+    // (An unclosed `assert_eq!(v.le` as it is typed keeps its last token.)
+    let closed = matches!(
+        (elems[0].kind(), elems[elems.len() - 1].kind()),
+        (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}'])
+    );
+    let end = if closed { elems.len() - 1 } else { elems.len() };
+    elems[1..end]
         .iter()
         .filter(|el| !el.kind().is_trivia())
         .cloned()

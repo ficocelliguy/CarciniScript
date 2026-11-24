@@ -78,7 +78,8 @@ The gaps fall into three parts:
   usable from the file that loads it (plain ones are).
 - **Types share one namespace across files.** A `mod` file's struct or enum named like one of
   the loading file's, or like one an earlier `mod` file exports, goes by a mangled name there
-  (`bytes::Shlex` is `Shlex__bytes`), which hover and error messages show. Traits, type aliases
+  (`bytes::Shlex` is `Shlex__bytes`), which hover and error messages show. A file's own
+  top-level `Vec` is `Vec__file` in the same way, so the bundled preludes keep std's. Traits, type aliases
   and constants aren't renamed that way: a `mod` file's trait named like this file's is still
   "defined multiple times". A renamed import of another file's or a crate's type, trait or
   constant (`use geo::Point as P;`, `pub use area::Error as AreaError;`) is written back under
@@ -430,7 +431,9 @@ There is one JS thread, and scripts share it with the game.
   map's `values_mut()` / `iter_mut()`. A slot passed on to a function that takes `&mut i32` is
   a copy of the element. `{:?}` of a collected `Vec<&mut T>` / `Vec<(usize, &mut T)>`, one of
   its items or a loop variable over it prints the elements (also as `{refs:?}`); `{:?}` of a
-  slot anywhere else (`it.next()`) prints the slot object.
+  slot anywhere else (`it.next()`) prints the slot object. A generic wrapper's `values_mut()`
+  (`fn vm(&mut self) -> ValuesMut<'_, K, V>`) doesn't make slots for a caller whose `V` is a
+  number: `*v += 1` through it throws a JS `TypeError`.
 - **`unwrap_or(default)` evaluates `default` lazily** (it lowers to `??`). Rust evaluates it
   eagerly, so the difference shows only if the default expression has side effects.
 - **A range made by `a..b` is an iterator until something asks for a `Range`** (a `let r =

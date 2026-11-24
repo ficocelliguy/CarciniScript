@@ -57,7 +57,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     if text.contains("petgraph") && !text.contains("mod petgraph") {
         petgraph_edits(&file, &mut edits);
     }
-    if text.contains("SmallVec") || text.contains("smallvec!") {
+    // (Not in a file with its own `SmallVec`: smallvec's sources.)
+    if (text.contains("SmallVec") || text.contains("smallvec!"))
+        && !file.syntax().descendants().filter_map(ast::Adt::cast).any(|a| {
+            a.name().is_some_and(|n| n.text() == "SmallVec")
+        })
+    {
         smallvec_edits(&file, &mut edits);
     }
     if text.contains("indexmap!") || text.contains("indexset!") {

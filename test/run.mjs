@@ -965,6 +965,9 @@ const rejected = [
   ["assigning a field of an immutable struct", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.x = 5;", "10:5 cannot assign to `p.x`, as `p` is not declared as mutable"],
   ["reassigning a `&mut` field of an immutable binding (E0594)", "}\nstruct T { n: i32 }\nstruct S<'a> { table: &'a mut T }\nfn f() {\n    let mut a = T { n: 1 };\n    let mut b = T { n: 2 };\n    let s = S { table: &mut a };\n    s.table.n = 3;\n    s.table = &mut b;", "10:5 cannot assign to `s.table`, as `s` is not declared as mutable"],
   ["a trait generic method's own bound, called through a type parameter", "}\ntrait Order { fn select<R: Default>(x: u8) -> R; }\nstruct NoDef;\nfn go<O: Order>() -> NoDef {\n    O::select::<NoDef>(1)", "6:17 the trait bound `NoDef: Default` is not satisfied"],
+  ["a trait generic method's Into bound, through a turbofish", "}\ntrait Order { fn zero<R: Into<i64> + Default>() -> i64; }\nfn go<O: Order>() -> i64 {\n    O::zero::<String>()", "5:15 the trait bound `i64: From<String>` is not satisfied"],
+  ["a trait generic method's From bound, through a turbofish", "}\ntrait Order { fn conv<R: From<u8>>(x: u8) -> R; }\nfn go<O: Order>() -> bool {\n    O::conv::<bool>(7)", "5:15 the trait bound `bool: From<u8>` is not satisfied"],
+  ["a trait generic method's Fn bound, through a turbofish", "}\ntrait Order { fn run<F: Fn(i32) -> i32>(f: F) -> i32; }\nfn go<O: Order>() -> i32 {\n    O::run::<u8>(3)", "5:14 expected an `Fn(i32) -> i32` closure, found `u8`"],
   ["unknown variant", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let e = E::D;", "9:13 no variant or associated item named `D` found for enum `E`"],
   ["associated function called as a method", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let p = P::new();\n    p.new();", "(`new` is an associated function: call `P::new(..)`)"],
   ["HashSet of a struct without Hash", "}\n#[derive(Debug, Clone, Copy, PartialEq)]\nstruct P { x: i32, y: i32 }\nenum E { A, B(i32), C { v: i32 } }\nstruct N { v: f64 }\nimpl P { fn new() -> P { P { x: 0, y: 0 } } }\nfn f() {\n    let mut s = std::collections::HashSet::new();\n    s.insert(N { v: 1.0 });", "the trait bound `N: Hash` is not satisfied"],
@@ -1171,6 +1174,9 @@ const rejected = [
   ["structured_clone of a type without Clone", "}\nstruct P {\n    x: i32,\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = js::structured_clone(&p);", "8:34 the trait bound `P: Clone` is not satisfied (`structured_clone` copies Rust values by their `Clone`)"],
   ["a pointer cast to an integer", "let x = 1;\n    let p = &x as *const i32;\n    let a = p as usize;", "4:13 casting a raw pointer to an integer isn't supported"],
   ["an integer cast to a pointer", "let p = 0x1000 as *const i32;", "2:13 casting an integer to a raw pointer isn't supported"],
+  ["an integer variable cast to a pointer", "let n: usize = 8;\n    let p = n as *const i32;", "3:13 casting an integer to a raw pointer isn't supported"],
+  ["a pointer cast to another pointee type", "let x = 1u32;\n    let p = &x as *const u32 as *const u8;", "3:13 casting a pointer to `u32` to a pointer to `u8` isn't supported: values have no memory layout to reinterpret"],
+  ["a reference cast to a pointer to another struct", "}\nstruct A {\n    n: u32,\n}\nstruct B {\n    n: u32,\n}\nfn g(a: &A) -> &B {\n    unsafe { &*(a as *const A as *const B) }", "10:17 casting a pointer to `A` to a pointer to `B` isn't supported"],
   ["transmute between sizes", "let x: u64 = unsafe { std::mem::transmute(1u32) };", "2:27 cannot transmute between types of different sizes"],
   ["transmute of a Vec", "let x: u64 = unsafe { std::mem::transmute(vec![1u8]) };", "2:27 `transmute` from `Vec<u8>` to `u64` isn't supported"],
   ["a pointer to a number in a struct", "}\nstruct S {\n    p: *mut i32,\n}\nfn g() {", "4:8 a raw pointer to a number, string or bool in a struct isn't supported yet"],
@@ -1555,6 +1561,19 @@ for (const [label, files, want] of rejectedFiles) {
     ["hover after a macro keeps its position", () => { const h = hover(withMacro, "mac.rs", 6, 10); return h && `${h.line}:${h.column}-${h.endColumn} ${h.contents}`; }, "6:9-14 ```rust\ntotal: i32"],
     ["completions after a macro", () => completions(withMacro, "mac.rs", 7, 11).some((c) => c.label === "checked_add"), true],
   );
+  // Inside a built-in macro's arguments (a token tree to the parser): members, names in scope,
+  // signature help and hover, as typed (unclosed) and closed, nested too.
+  const inMacro = (line) => src.replace("    t.", line);
+  checks.push(
+    ["completions in `assert!`", () => completions(inMacro("    assert!(v.);"), "svc.rs", 8, 15).some((c) => c.label === "binary_search"), true],
+    ["completions in an unclosed `assert_eq!`", () => completions(inMacro("    assert_eq!(t.sc"), "svc.rs", 8, 20).map((c) => c.label).join(","), "clone,host,money,score"],
+    ["completions in `println!`", () => completions(inMacro('    println!("{}", t.);'), "svc.rs", 8, 22).map((c) => c.label).join(","), "clone,host,money,score"],
+    ["completions in a nested `vec!`", () => completions(inMacro("    dbg!(vec![t.]);"), "svc.rs", 8, 17).map((c) => c.label).join(","), "clone,host,money,score"],
+    ["names in scope in `vec!`", () => completions(inMacro("    let w = vec![s"), "svc.rs", 8, 19).map((c) => c.label).join(","), "s"],
+    ["signature help in `vec!`", () => { const h = signatureHelp(inMacro("    let w = vec![v.insert(0, )];"), "svc.rs", 8, 29); return h && `${h.label} @${h.active}`; }, "fn insert(&mut self, index: usize, element: i32) @1"],
+    ["signature help in an unclosed `debug_assert!`", () => { const h = signatureHelp(inMacro("    debug_assert!(t.score("), "svc.rs", 8, 27); return h && `${h.label} @${h.active}`; }, "fn score(&self) -> f64 @0"],
+    ["hover in `assert_eq!`", () => hover(inMacro("    assert_eq!(s, 3.0);"), "svc.rs", 8, 16)?.contents, "s: f64"],
+  );
   // `jsx!`: hover on tags and attributes (markup) and in embedded expressions; completions of
   // tags, a component's props and an element's attributes.
   const withJsx = [
@@ -1730,6 +1749,11 @@ for (const [label, files, want] of rejectedFiles) {
     ["references take both builds' uses", () => references(src, "t.rs", 1, col(1, "double")).map(loc).join(" "), `1:${col(1, "double")} 5:${col(5, "double")} 10:${col(10, "double")}`],
     ["references from a test", () => references(src, "t.rs", 10, col(10, "double")).map(loc).join(" "), `1:${col(1, "double")} 5:${col(5, "double")} 10:${col(10, "double")}`],
     ["rename renames uses in tests", () => rename(src, "t.rs", 1, col(1, "double"), "twice").length, 3],
+    // Inside `assert_eq!`'s arguments, as typed (the macro not closed yet) and closed.
+    ["completions in an unclosed `assert_eq!`", () => completions(src.replace("assert_eq!(n, 1);", "assert_eq!(got.le"), "t.rs", 15, col(15, "assert_eq!(") + 11 + 6).some((c) => c.label === "len"), true],
+    ["completions in `assert_eq!`", () => completions(src.replace("assert_eq!(n, 1);", "assert_eq!(got.le, 1);"), "t.rs", 15, col(15, "assert_eq!(") + 11 + 6).some((c) => c.label === "len"), true],
+    ["hover in `assert_eq!`", () => hover(src, "t.rs", 15, col(15, "n,"))?.contents, "n: usize"],
+    ["signature help in `assert_eq!`", () => { const h = signatureHelp(src.replace("assert_eq!(n, 1);", "assert_eq!(double(n, "), "t.rs", 15, col(15, "assert_eq!(") + 11 + 10); return h && `${h.label} @${h.active}`; }, "fn double(x: i32) -> i32 @1"],
   ];
   for (const [label, run, want] of checks) {
     const name = `service in test code: ${label}`;

@@ -131,6 +131,11 @@ fn into_bound_target(m: &ast::MethodCallExpr, tr: &str) -> Option<ast::Type> {
         let named = matches!(p.pat(), Some(ast::Pat::IdentPat(ip)) if ip.name().is_some_and(|n| n.text() == name.text()));
         if named { p.ty() } else { None }
     })?;
+    // (`prefix: &'a S` with `S: AsRef<OsStr> + ?Sized`: the bound is on what it points to.)
+    let ty = match ty {
+        ast::Type::RefType(r) => r.ty()?,
+        t => t,
+    };
     match ty {
         ast::Type::ImplTraitType(i) => into_target(i.type_bound_list()?, tr),
         ast::Type::PathType(pt) => {
@@ -280,10 +285,17 @@ impl Checker<'_> {
         for i in &mut impls {
             if let Some(sig) = self.adts.method(adt, &i.key).cloned()
                 && sig.impl_args.iter().any(|a| {
-                    // (`impl<T> From<Vec<T>> for Cow<'_, [T]>`: the parameter may be nested.)
+                    // (`impl<T> From<Vec<T>> for Cow<'_, [T]>`: the parameter may be nested; and
+                    // `impl<A: Array> From<&[A::Item]> for SmallVec<A>`: through a projection.)
                     let mut ps = Vec::new();
                     a.collect_params(&mut ps);
-                    ps.iter().any(|p| i.src.mentions_param(p))
+                    let mut srcs = Vec::new();
+                    i.src.collect_params(&mut srcs);
+                    ps.iter().any(|p| {
+                        srcs.iter().any(|s| {
+                            s == p || s.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with("::"))
+                        })
+                    })
                 })
             {
                 let sig = self.method_inst(&sig, None);
@@ -296,7 +308,13 @@ impl Checker<'_> {
         }
         let fits: Vec<&FromImpl> = impls
             .iter()
-            .filter(|i| self.could_be(&i.src, src) || (i.via_into && self.number_into(src, &i.src)))
+            .filter(|i| {
+                self.could_be(&i.src, src)
+                    || (i.via_into && self.number_into(src, &i.src))
+                    || (i.via_as_ref
+                        && matches!(&i.src, Ty::Vec(e) if **e == Ty::Int(crate::ty::IntKind::U8))
+                        && matches!(self.shallow(src), Ty::Str))
+            })
             .collect();
         // (An integer literal several impls take is an `i32`, as rustc falls back to.)
         let int_lit = matches!(self.zonk(src), Ty::IntLit)
@@ -602,8 +620,71 @@ impl Checker<'_> {
         }
         let x = into_bound_target(m, tr)?;
         let t = self.lower_type(&x);
-        self.record_conv(m.syntax(), Conv::Identity);
+        // (Bytes: callers convert a string where they pass it, but a value of an impl's
+        // `H: AsRef<[u8]>` handed on as it is may still be one.)
+        let bytes = matches!(&t, Ty::Vec(e) if **e == Ty::Int(IntKind::U8));
+        self.record_conv(
+            m.syntax(),
+            if bytes {
+                Conv::Wrap { js: "κσ.$asRefBytes".into() }
+            } else {
+                Conv::Identity
+            },
+        );
         Some(t)
+    }
+
+    /// Whether the type parameter `p` (of the function or `impl` around `at`) has an `AsRef<X>`,
+    /// `Into<X>` or `Borrow<X>` bound whose `X` could be `target`.
+    pub(super) fn param_converts_to(&mut self, p: &str, at: &SyntaxNode, target: &Ty) -> bool {
+        use ra_ap_syntax::ast::HasGenericParams;
+        let f = at.ancestors().find_map(ast::Fn::cast);
+        let imp = at.ancestors().find_map(ast::Impl::cast);
+        for tr in ["AsRef", "Into", "Borrow"] {
+            let x = f
+                .as_ref()
+                .and_then(|f| param_into_target(p, tr, f.generic_param_list(), f.where_clause()))
+                .or_else(|| {
+                    let imp = imp.as_ref()?;
+                    param_into_target(p, tr, imp.generic_param_list(), imp.where_clause())
+                });
+            if let Some(x) = x {
+                let x = self.lower_type(&x);
+                if self.could_be(&x, target) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// `s.as_ref()` on a string where a `&[u8]`, `&str` or `&OsStr` is expected: its bytes or
+    /// itself (not the path prelude's `AsRef<Path>`, which a `use std::path` brings in).
+    pub(super) fn conv_str_as_ref_call(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        method: &str,
+        recv: &Ty,
+        expected: Option<&Ty>,
+    ) -> Option<Ty> {
+        if method != "as_ref"
+            || m.arg_list().is_some_and(|l| l.args().next().is_some())
+            || !matches!(self.shallow(recv), Ty::Str)
+        {
+            return None;
+        }
+        let e = self.shallow(expected?);
+        match &e {
+            Ty::Str => self.record_conv(m.syntax(), Conv::Identity),
+            Ty::Vec(x) if self.shallow(x) == Ty::Int(IntKind::U8) => self.record_conv(
+                m.syntax(),
+                Conv::Wrap {
+                    js: "κσ.$utf8".into(),
+                },
+            ),
+            _ => return None,
+        }
+        Some(e)
     }
 
     /// `self.key.as_ref()` (also `as_mut`, `borrow`, `borrow_mut`) where `key: T` and the
@@ -815,6 +896,13 @@ impl Checker<'_> {
         let t = self.infer(a, hint.as_ref());
         if self.could_be(&t, p) {
             self.unify(&t, p);
+            return p.clone();
+        }
+        // `Input::new(haystack)` with the impl's `H: AsRef<[u8]>`: an `H` is a `[u8]` already
+        // (its `as_ref()` makes the bytes where they're read).
+        if let Ty::Param(name) = self.shallow(&t)
+            && self.param_converts_to(&name, a.syntax(), p)
+        {
             return p.clone();
         }
         let r = self.range(a.syntax());

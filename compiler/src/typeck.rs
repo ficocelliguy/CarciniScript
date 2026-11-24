@@ -186,6 +186,9 @@ pub struct Types {
     /// and a float type (or two integer types): dispatched by `T`'s class (`κσ.$dcallT`), since
     /// the run-time value can't tell a whole `f64` from an `i32`.
     pub class_dispatch: std::collections::HashSet<(usize, usize)>,
+    /// Associated types a trait's default method uses as a class (`Self::Error::custom(..)`): each
+    /// impl's class has a `$at$Error` getter for them.
+    pub self_assoc_dicts: std::collections::HashSet<String>,
     /// Methods of `impl<T> Tr for Option<T>` (`"Option::depth"`) that use `T`'s class: a caller
     /// that knows the `Option`'s type hands them its element's (`κσ.$callElem`, `$dcallT`).
     pub elem_methods: std::collections::HashSet<String>,
@@ -374,6 +377,7 @@ impl<'a> Checker<'a> {
             slot_options: HashMap::new(),
             slot_results: HashMap::new(),
             pending_bounds: Vec::new(),
+            pending_arg_bounds: Vec::new(),
             adt_bounds: Vec::new(),
             loops: Vec::new(),
             boxed: Default::default(),
@@ -420,6 +424,7 @@ impl<'a> Checker<'a> {
             mut_ref_fields: Default::default(),
             mut_borrow_fields: Default::default(),
             class_dispatch: Default::default(),
+            self_assoc_dicts: Default::default(),
             elem_methods: Default::default(),
             dyn_num_coercions: Vec::new(),
             ret_slot: None,
@@ -709,7 +714,7 @@ pub fn check(
     }
     if let Some((&(start, end), ty)) = map
         .iter()
-        .filter_map(|(k, t)| Some((k, c.unordered_coll(t)?)))
+        .filter_map(|(k, t)| Some((k, c.unordered_coll(t, file, k.0)?)))
         .min_by_key(|(k, _)| **k)
     {
         let message = format!(
@@ -765,6 +770,7 @@ pub fn check(
     let fn_cell_args = std::mem::take(&mut c.fn_cell_args);
     let mut_ref_fields = std::mem::take(&mut c.mut_ref_fields);
     let class_dispatch = std::mem::take(&mut c.class_dispatch);
+    let self_assoc_dicts = std::mem::take(&mut c.self_assoc_dicts);
     let elem_methods = std::mem::take(&mut c.elem_methods);
     let method_keys = std::mem::take(&mut c.method_keys);
     let derefs = std::mem::take(&mut c.derefs);
@@ -820,6 +826,7 @@ pub fn check(
             fn_cell_args,
             mut_ref_fields,
             class_dispatch,
+            self_assoc_dicts,
             elem_methods,
             dyn_nums,
             method_keys,
@@ -921,6 +928,9 @@ struct Checker<'a> {
     whole_slot_items: std::collections::HashSet<(usize, usize)>,
     /// Bounds to check once a generic call's type arguments are known.
     pending_bounds: Vec<(Ty, String, SyntaxNode, usize)>,
+    /// A turbofish's type with a bound that takes type arguments (`O::widen::<u8>` for
+    /// `R: Into<i64>`), checked once it is known.
+    pending_arg_bounds: Vec<(Ty, crate::adt::ArgBound, SyntaxNode, usize)>,
     /// New values' type arguments with the user-trait bounds their struct declares on them
     /// (`struct Auto<S: RawStream>`), to infer from (`Auto::new(Vec::new())`).
     adt_bounds: Vec<(Ty, String)>,
@@ -989,6 +999,7 @@ struct Checker<'a> {
     /// through one needs no `mut` on the binding that holds the struct.
     pub(super) mut_borrow_fields: std::collections::HashSet<(String, String)>,
     pub(super) class_dispatch: std::collections::HashSet<(usize, usize)>,
+    pub(super) self_assoc_dicts: std::collections::HashSet<String>,
     pub(super) elem_methods: std::collections::HashSet<String>,
     /// Number-typed expressions checked against a `dyn Trait`, with that trait (see `dyn_nums`).
     dyn_num_coercions: Vec<((usize, usize), Ty, String)>,
@@ -2105,11 +2116,10 @@ impl<'a> Checker<'a> {
                     return g.clone();
                 }
                 // `std::vec::IntoIter<T>` is std's even when the file has an `IntoIter` of its own
-                // (the io prelude's `lines()` next to a collection's iterator struct).
+                // (the io prelude's `lines()` next to a collection's iterator struct), and so is
+                // `btree_map::Keys<'a, K, V>` in a wrapper struct named `Keys`.
                 if self.adts.defs.contains_key(&name)
-                    && p.path()
-                        .and_then(|q| q.first_segment())
-                        .is_some_and(|s| matches!(s.syntax().text().to_string().as_str(), "std" | "core" | "alloc"))
+                    && p.path().is_some_and(|q| self.std_qualified(&q))
                     && let Some(t) = self.std_iter_type(&name, seg.as_ref())
                 {
                     return t;
@@ -2197,6 +2207,20 @@ impl<'a> Checker<'a> {
                     && let Some(t) = self.projection(qn.text().to_string().as_str(), &name)
                 {
                     return t;
+                }
+                // `A::Item` in a field of `struct S<A: Array>`: fields are lowered before the
+                // file's traits are, so `A`'s projection, as the impls' `A::Item` will be.
+                if let Some(q) = p.path().and_then(|p| p.qualifier())
+                    && let Some(qn) = q.as_single_name_ref()
+                    && let qn = qn.text().to_string()
+                    && self.generics.get(&qn) == Some(&Ty::Param(qn.clone()))
+                    && self.param_bounds.get(&qn).is_some_and(|bs| {
+                        bs.iter().any(|b| {
+                            self.file_trait_names.contains(b) && !self.adts.traits.contains_key(b)
+                        })
+                    })
+                {
+                    return Ty::Param(format!("{qn}::{name}"));
                 }
                 // `T::Error` of a `T: TryFrom<X>` (unchecked).
                 if let Some(q) = p.path().and_then(|p| p.qualifier())
@@ -4773,11 +4797,39 @@ impl<'a> Checker<'a> {
                 let to = c.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
                 if let Some(inner) = c.expr() {
                     let t = self.infer(&inner, None);
-                    if matches!(strip_parens(&inner), ast::Expr::Literal(_)) {
+                    // (`n as *mut T` with `n` an integer; `&x as *const i32` is a reference.)
+                    // (A local's own integer, or an integer going to a pointer to something else;
+                    // a reference to an integer, `&x` or an `r: &i32`, is a pointer to it.)
+                    let local_ref = match strip_parens(&inner) {
+                        ast::Expr::PathExpr(p) => p
+                            .path()
+                            .and_then(|p| p.as_single_name_ref())
+                            .and_then(|n| self.lookup(n.text().as_ref()))
+                            .map(|l| l.reference.is_some()),
+                        _ => None,
+                    };
+                    let int = matches!(self.shallow(&t), Ty::Int(_) | Ty::IntLit)
+                        && !matches!(strip_parens(&inner), ast::Expr::RefExpr(_))
+                        && !self.is_ptr(&inner)
+                        && local_ref != Some(true)
+                        && (local_ref == Some(false)
+                            || !matches!(self.shallow(&to), Ty::Int(_) | Ty::IntLit | Ty::Var(_)));
+                    if matches!(strip_parens(&inner), ast::Expr::Literal(_)) || int {
                         self.error(
                             c.syntax(),
                             "casting an integer to a raw pointer isn't supported: values have no memory addresses",
                         );
+                    } else if (!self.could_be(&t, &to)
+                        || matches!((self.shallow(&t), self.shallow(&to)), (Ty::Param(a), Ty::Param(b)) if a != b))
+                        && !matches!(self.shallow(&to), Ty::Dyn(_))
+                    {
+                        // `s as *const str as *const Name`, `self as *const Self as *const u8`.
+                        let msg = format!(
+                            "casting a pointer to `{}` to a pointer to `{}` isn't supported: values have no memory layout to reinterpret",
+                            self.describe(&t),
+                            self.describe(&to)
+                        );
+                        self.error(c.syntax(), msg);
                     } else {
                         self.expect(inner.syntax(), &t, &to);
                     }
@@ -6220,6 +6272,19 @@ impl<'a> Checker<'a> {
             }
             _ => names,
         };
+        // `Self::Error::custom(..)` in a trait's default method, with `type Error: Error;`: the
+        // implementing type's `Error` (its class's `$at$Error`).
+        if let [s, a, f] = names.as_slice()
+            && s == "Self"
+            && self.self_projection(a)
+        {
+            let p = format!("Self::{a}");
+            if let Some(t) = self.param_static_call(c, &p, f, &args) {
+                let r = self.range(c.syntax());
+                self.param_paths.insert(r, p);
+                return t;
+            }
+        }
         // `i32::make()` / `Vec::<u8>::make()` / `Q::make()`: a blanket impl's associated function.
         if let [t, f] = names.as_slice()
             && let Some(qt) = self.blanket_qualifier(&path, t)
@@ -7233,6 +7298,10 @@ impl<'a> Checker<'a> {
         }
         // `self.key.as_ref()` with the impl's `T: AsRef<[u8]>`.
         if let Some(t) = self.conv_param_as_ref_call(m, &method, &rt) {
+            return t;
+        }
+        // `s.as_ref()` on a string as a `&[u8]` or `&OsStr`.
+        if let Some(t) = self.conv_str_as_ref_call(m, &method, &rt, expected) {
             return t;
         }
         // `5.seconds()` with your trait implemented for `i64` only: the literal is an `i64`, as in
@@ -8787,6 +8856,10 @@ impl<'a> Checker<'a> {
                     let l = self.macro_arg(&args[0], None);
                     let r = self.macro_arg(&args[1], Some(&l));
                     let _ = r;
+                } else if let [a] = args.as_slice() {
+                    // (Codegen reports the missing argument; `assert_eq!(v.le` being typed still
+                    // has types for the language service.)
+                    self.macro_arg(a, None);
                 }
                 if args.len() > 2 {
                     self.format_args(&args[2..]);
@@ -10130,10 +10203,15 @@ impl Checker<'_> {
         // `<T as Bounded>::min_value()`, or `Bounded::min_value()` where a `T` is expected, with
         // `T: Bounded`: as `T::min_value()` (by `T`'s class).
         let param = match &anchor_ty {
-            Some(ast::Type::PathType(p)) => p
-                .path()
-                .and_then(|p| p.as_single_name_ref())
-                .map(|n| n.text().to_string()),
+            Some(ast::Type::PathType(p)) => p.path().and_then(|p| match p.as_single_name_ref() {
+                Some(n) => Some(n.text().to_string()),
+                // (`<Self::Error as Error>::custom(..)`.)
+                None => p
+                    .qualifier()
+                    .is_some_and(|q| q.syntax().text() == "Self")
+                    .then(|| Some(format!("Self::{}", p.segment()?.name_ref()?.text())))
+                    .flatten(),
+            }),
             Some(_) => None,
             // (`Self` where the function's return type has it: `fn from(n: i64) -> Option<Self>`.)
             None => {
@@ -10150,7 +10228,21 @@ impl Checker<'_> {
                 }
             }
         };
-        if let Some(p) = param.filter(|p| p != "Self" && self.param_bounds.contains_key(p))
+        // (A default method's signature names `Self::Error` by its trait, `Visitor::Error`.)
+        let param = param.map(|p| match p.split_once("::") {
+            Some((tr, a))
+                if self.param_bounds.get("Self").is_some_and(|b| b.iter().any(|b| b == tr))
+                    && self.self_projection(a) =>
+            {
+                format!("Self::{a}")
+            }
+            _ => p,
+        });
+        if let Some(p) = param.filter(|p| {
+            p != "Self"
+                && (self.param_bounds.contains_key(p)
+                    || p.strip_prefix("Self::").is_some_and(|a| self.self_projection(a)))
+        })
             && (self.bound_traits(&p).contains(&trait_name)
                 || self.cur_blanket_trait(&p).is_some_and(|t| t == trait_name))
             && self.adts.traits.get(&trait_name).is_some_and(|d| {
@@ -10181,7 +10273,11 @@ impl Checker<'_> {
             }
             _ => self.fresh(VarKind::General),
         };
-        let sub: HashMap<String, Ty> = [("Self".to_string(), self_ty.clone())].into();
+        let mut sub: HashMap<String, Ty> = [("Self".to_string(), self_ty.clone())].into();
+        // (The method's own type parameters, `fn custom<T: Display>(msg: T)`: fresh.)
+        for p in &tm.sig.type_params {
+            sub.insert(p.clone(), self.fresh(VarKind::General));
+        }
         let sig = traits::subst_method(&tm.sig, &sub);
         let rest = if receiver {
             args.get(1..).unwrap_or(&[])
@@ -10381,6 +10477,11 @@ impl Checker<'_> {
         if param == "Self" {
             return;
         }
+        // (`Self::Error` in a trait's default method: the implementing class's getter.)
+        if let Some(a) = param.strip_prefix("Self::") {
+            self.self_assoc_dicts.insert(a.to_string());
+            return;
+        }
         if !self.try_note_dict(param) {
             self.error(
                 node,
@@ -10477,13 +10578,18 @@ impl Checker<'_> {
             self.note_dict(param, c.syntax());
             return Some(pty);
         }
-        let (tr, sig, own_bounds) = bounds.iter().find_map(|b| {
+        let (tr, sig, own_bounds, arg_bounds) = bounds.iter().find_map(|b| {
             let d = self.adts.traits.get(b)?;
             let tm = d
                 .methods
                 .iter()
                 .find(|m| m.name == f && m.sig.receiver.is_none())?;
-            Some((b.clone(), tm.sig.clone(), tm.own_bounds.clone()))
+            Some((
+                b.clone(),
+                tm.sig.clone(),
+                tm.own_bounds.clone(),
+                tm.arg_bounds.clone(),
+            ))
         })?;
         // (`Fac::P` in `fn make() -> Self::P` is `T::P`, or the bound's `P = X`.)
         let mut sub = self.bound_subst(param);
@@ -10502,7 +10608,21 @@ impl Checker<'_> {
                 .collect(),
             _ => Vec::new(),
         };
+        // (Turbofish arguments go by the written order: a parameter lowered to its bound's target
+        // (`S: Into<String>`, `F: Fn(u8)`) isn't among the signature's.)
+        let written: Vec<&String> = own_bounds.iter().map(|(n, _)| n).collect();
+        for (n, b) in &arg_bounds {
+            if let Some((t, at)) = written
+                .iter()
+                .position(|w| *w == n)
+                .and_then(|i| turbofish.get(i))
+            {
+                self.pending_arg_bounds
+                    .push((t.clone(), b.clone(), at.clone(), self.base));
+            }
+        }
         for (i, p) in sig.type_params.iter().enumerate() {
+            let i = written.iter().position(|w| *w == p).unwrap_or(i);
             let (t, at) = match turbofish.get(i) {
                 Some((t, at)) => (t.clone(), at.clone()),
                 None => (self.fresh(VarKind::General), c.syntax().clone()),
@@ -10533,6 +10653,14 @@ impl Checker<'_> {
         }
         self.note_dict(param, c.syntax());
         Some(sig.ret)
+    }
+
+    /// Whether `Self::{assoc}` is a bounded associated type of the trait whose default method is
+    /// being checked (`type Error: Error;`).
+    fn self_projection(&self, assoc: &str) -> bool {
+        self.self_ty == Some(Ty::Param("Self".into()))
+            && self.param_bounds.contains_key("Self")
+            && !self.bound_traits(&format!("Self::{assoc}")).is_empty()
     }
 
     /// `T::SIDES`: an associated const declared by a bound of `T`.
@@ -11064,6 +11192,39 @@ impl Checker<'_> {
 }
 
 impl Checker<'_> {
+    /// Whether a type path's qualifier is std's: rooted at `std` / `core` / `alloc`, or a std
+    /// module the file doesn't declare itself (`btree_map::Keys`, `vec::Drain`, `slice::Iter`).
+    fn std_qualified(&self, path: &ast::Path) -> bool {
+        let Some(q) = path.qualifier() else {
+            return false;
+        };
+        let root = path.first_segment().map(|s| s.syntax().text().to_string());
+        if matches!(root.as_deref(), Some("std" | "core" | "alloc")) {
+            return true;
+        }
+        let Some(last) = q.segment().map(|s| s.syntax().text().to_string()) else {
+            return false;
+        };
+        matches!(
+            last.as_str(),
+            "btree_map"
+                | "btree_set"
+                | "hash_map"
+                | "hash_set"
+                | "vec"
+                | "vec_deque"
+                | "slice"
+                | "binary_heap"
+                | "linked_list"
+                | "str"
+                | "string"
+        ) && !self.src.lines().any(|l| {
+            let l = l.trim_start().trim_start_matches("pub ");
+            l.strip_prefix("mod ")
+                .is_some_and(|r| r.trim_end_matches([';', ' ', '{']) == last)
+        })
+    }
+
     /// Whether a `use std::..` item imports `name` (`use std::vec::IntoIter;`), so an
     /// unqualified `IntoIter<T>` is std's.
     fn std_imported(&self, name: &str) -> bool {
@@ -11102,7 +11263,18 @@ impl Checker<'_> {
             && matches!(
                 name,
                 "Iter" | "IntoIter" | "IterMut" | "Bytes" | "Lines" | "Split"
-            ));
+            ))
+            || (qualified
+                && matches!(
+                    name,
+                    "IntoKeys"
+                        | "IntoValues"
+                        | "Drain"
+                        | "Difference"
+                        | "Intersection"
+                        | "Union"
+                        | "SymmetricDifference"
+                ));
         if !known {
             return None;
         }
@@ -11145,13 +11317,21 @@ impl Checker<'_> {
             "Chars" => iter(Ty::Char, false),
             "CharIndices" => iter(Ty::Tuple(vec![USIZE, Ty::Char]), false),
             // (`hash_map::Keys<K, V>` and friends: the key or value type.)
-            "Keys" | "Values" | "ValuesMut" => match args.as_slice() {
+            "Keys" | "Values" | "ValuesMut" | "IntoKeys" | "IntoValues" => match args.as_slice() {
                 [k, v] => iter(
-                    if name == "Keys" { k.clone() } else { v.clone() },
+                    if matches!(name, "Keys" | "IntoKeys") { k.clone() } else { v.clone() },
                     name == "ValuesMut",
                 ),
                 _ => return None,
             },
+            // (`btree_set::Difference<'a, T>` and friends: the set's items; `vec::Drain<'a, T>`.)
+            "Difference" | "Intersection" | "Union" | "SymmetricDifference" | "Drain" => {
+                match args.as_slice() {
+                    [t] => iter(t.clone(), false),
+                    [k, v] => iter(Ty::Tuple(vec![k.clone(), v.clone()]), false),
+                    _ => return None,
+                }
+            }
             "Bytes" => iter(Ty::Int(IntKind::U8), false),
             // (`io::Lines<BufReader<File>>`, with a type argument: `io::Result<String>`s.)
             "Lines" if !args.is_empty() => iter(
@@ -11299,7 +11479,15 @@ pub(super) fn into_param_flags(f: &ast::Fn) -> Vec<bool> {
     f.param_list()
         .map(|pl| {
             pl.params()
-                .map(|p| match p.ty() {
+                // (`haystack: &'h H` with `H: ?Sized + AsRef<[u8]>`: the bound is on `H`.)
+                .map(|p| match p.ty().map(|t| match &t {
+                    ast::Type::RefType(r)
+                        if matches!(r.ty(), Some(ast::Type::PathType(_))) =>
+                    {
+                        r.ty().unwrap()
+                    }
+                    _ => t,
+                }) {
                     Some(ast::Type::ImplTraitType(i)) => {
                         i.type_bound_list().is_some_and(|l| into_bound(&l))
                     }

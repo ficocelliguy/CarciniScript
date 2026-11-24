@@ -2636,6 +2636,10 @@ pub fn preprocess_with(
     if crate::inst_consts::has_instantiation_consts(&text) {
         changed |= crate::inst_consts::expand(&mut text, &mut map);
     }
+    // The file's own `Vec`, which the preludes after the program don't mean.
+    if crate::ownstd::has_own_std_types(&text) {
+        changed |= crate::ownstd::expand(&mut text, &mut map, &mut names);
+    }
     // Nested items named like another item.
     if crate::nested::has_duplicate_items(&text) {
         changed |= crate::nested::expand(&mut text, &mut map, &mut names);

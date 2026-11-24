@@ -6,6 +6,41 @@
 
 use ra_ap_syntax::{AstNode, ast};
 
+/// Whether the fn, impl or trait around offset `at` bounds type parameter `name` by a trait that
+/// `ord` says includes `Ord` (`K: Ord`, `where K: Ord + Clone`, `T: MyKey` with `MyKey: Ord`).
+fn param_ord_at(file: &ast::SourceFile, at: usize, name: &str, ord: &dyn Fn(&str) -> bool) -> bool {
+    use ast::{HasGenericParams, HasName, HasTypeBounds};
+    let Ok(at) = u32::try_from(at) else {
+        return false;
+    };
+    let Some(tok) = file.syntax().token_at_offset(at.into()).right_biased() else {
+        return false;
+    };
+    let in_list = |l: Option<ast::TypeBoundList>| {
+        l.into_iter().flat_map(|l| l.bounds()).any(|b| {
+            b.ty().is_some_and(|t| {
+                let text = t.syntax().text().to_string();
+                let last = text.split('<').next().unwrap_or("").rsplit("::").next().unwrap_or("");
+                ord(last.trim())
+            })
+        })
+    };
+    tok.parent_ancestors().any(|node| {
+        let Some(g) = ast::AnyHasGenericParams::cast(node) else {
+            return false;
+        };
+        let params = g.generic_param_list().into_iter().flat_map(|l| l.type_or_const_params());
+        params.into_iter().any(|p| match p {
+            ast::TypeOrConstParam::Type(tp) => {
+                tp.name().is_some_and(|n| n.text() == name) && in_list(tp.type_bound_list())
+            }
+            _ => false,
+        }) || g.where_clause().into_iter().flat_map(|w| w.predicates()).any(|w| {
+            w.ty().is_some_and(|t| t.syntax().text() == name) && in_list(w.type_bound_list())
+        })
+    })
+}
+
 use super::{Checker, Mutation, USIZE, VarKind};
 use crate::ty::{Coll, Ty};
 
@@ -99,7 +134,13 @@ pub(crate) fn index_method(method: &str) -> bool {
 
 impl Checker<'_> {
     /// A B-tree or heap whose keys can't be ordered: its element type, described.
-    pub(super) fn unordered_coll(&self, t: &Ty) -> Option<String> {
+    /// (`at` is the expression's offset in `file`, for a type parameter's bounds.)
+    pub(super) fn unordered_coll(
+        &self,
+        t: &Ty,
+        file: &ast::SourceFile,
+        at: usize,
+    ) -> Option<String> {
         let mut found = None;
         t.walk(&mut |x| {
             if found.is_some() {
@@ -116,6 +157,13 @@ impl Checker<'_> {
                 },
                 _ => return,
             };
+            // (A type parameter's bounds are gone by this whole-file pass: they are read from
+            // the items around the expression.)
+            if let Ty::Param(n) = self.zonk(&key)
+                && param_ord_at(file, at, &n, &|t| self.trait_includes(t, "Ord"))
+            {
+                return;
+            }
             if !self.implements(&key, "Ord") {
                 found = Some(key.describe());
             }
