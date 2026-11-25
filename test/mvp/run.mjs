@@ -7,12 +7,12 @@
 // `x.rs` is a script; `x/` is a program of several files, `x/main.rs` its root. A Netscript script
 // (`pub async fn main(ns: NS)`) runs natively against tools/ns-shim.rs and here against a mock
 // of the same network; `// args: ..` gives its `ns.args`. Arguments filter the cases by name.
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { initCarciniScriptSync, compile, compileTests, setNsBindings, setOverflowChecks } from "../../index.js";
 import "../../runtime/rt.js";
+import { cachedNative, dirContents, run } from "../../tools/native-build.mjs";
 import { nativePanic } from "../../tools/native-panic.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -160,30 +160,30 @@ function scriptArgs(src) {
   return { words, js, rs: `vec![${rs.join(", ")}]` };
 }
 
-const filter = process.argv.slice(2);
-for (const entry of fs.readdirSync(here).sort()) {
+// A case: where its files are, and its root file's source.
+function caseOf(entry) {
   const isDir = fs.statSync(path.join(here, entry)).isDirectory();
-  if (!isDir && !entry.endsWith(".rs")) continue;
-  const caseName = entry.replace(/\.rs$/, "");
-  if (filter.length && !filter.some((f) => caseName.includes(f))) continue;
-  const name = `mvp ${entry}`;
-  try {
-    const root = isDir ? path.join(here, entry) : here;
-    const file = isDir ? "main.rs" : entry;
-    const read = (p) => {
-      try {
-        return fs.readFileSync(path.join(root, p), "utf8");
-      } catch {
-        return undefined;
-      }
-    };
-    const src = read(file);
-    const isNs = /pub async fn main\(ns: NS\)/.test(src);
-    const args = scriptArgs(src);
-    const work = path.join(outDir, caseName);
-    fs.mkdirSync(work, { recursive: true });
+  const root = isDir ? path.join(here, entry) : here;
+  const file = isDir ? "main.rs" : entry;
+  const read = (p) => {
+    try {
+      return fs.readFileSync(path.join(root, p), "utf8");
+    } catch {
+      return undefined;
+    }
+  };
+  const src = read(file);
+  const isNs = /pub async fn main\(ns: NS\)/.test(src);
+  return { isDir, root, file, read, src, isNs, args: scriptArgs(src), work: path.join(outDir, entry.replace(/\.rs$/, "")) };
+}
 
-    // rustc, as `cargo build` runs it.
+// rustc's side of a case, cached by its sources and the toolchain (tools/native-build.mjs): the
+// build (rustc, as `cargo build` runs it), the run if it built, and the test build's report.
+function nativeCase(entry) {
+  const { isDir, root, file, src, isNs, args, work } = caseOf(entry);
+  const key = ["mvp", path.join(root, file), isDir ? dirContents(root) : src, isNs ? fs.readFileSync(shimPath, "utf8") : null];
+  return cachedNative(key, async () => {
+    fs.mkdirSync(work, { recursive: true });
     let crateRoot = path.join(root, file);
     if (isNs) {
       crateRoot = path.join(work, "wrapper.rs");
@@ -195,7 +195,31 @@ for (const entry of fs.readdirSync(here).sort()) {
       );
     }
     const exe = path.join(work, `native${exeSuffix}`);
-    const built = spawnSync("rustc", ["--edition", "2024", "--crate-type", "bin", "-o", exe, path.relative(root, crateRoot)], { cwd: root, encoding: "utf8" });
+    const built = await run("rustc", ["--edition", "2024", "--crate-type", "bin", "-o", exe, path.relative(root, crateRoot)], { cwd: root });
+    const ran = built.status === 0 ? await run(exe, isNs ? [] : args.words) : null;
+    let tests = null;
+    if (/#\[test\]/.test(src)) {
+      const testExe = path.join(work, `tests${exeSuffix}`);
+      await run("rustc", ["--test", "--edition", "2024", "-A", "warnings", "-o", testExe, path.join(root, file)]);
+      tests = await run(testExe, ["--test-threads=1"]);
+    }
+    return { built: { status: built.status, stderr: built.stderr }, ran, tests };
+  });
+}
+
+const filter = process.argv.slice(2);
+const entries = fs
+  .readdirSync(here)
+  .sort()
+  .filter((entry) => entry.endsWith(".rs") || fs.statSync(path.join(here, entry)).isDirectory())
+  .filter((entry) => !filter.length || filter.some((f) => entry.replace(/\.rs$/, "").includes(f)));
+const natives = entries.map(nativeCase);
+for (const [i, entry] of entries.entries()) {
+  const name = `mvp ${entry}`;
+  try {
+    const { isDir, root, file, read, src, isNs, args, work } = caseOf(entry);
+    fs.mkdirSync(work, { recursive: true });
+    const { built, ran, tests } = await natives[i];
     const want = normalize(built.stderr);
 
     // Ours: every file of the program, compiled to an ES module each.
@@ -218,7 +242,7 @@ for (const entry of fs.readdirSync(here).sort()) {
     if ((built.status === 0) !== compiled) problems.push(`rustc ${built.status === 0 ? "compiles it" : "rejects it"}, ours ${compiled ? "compiles it" : "rejects it"}`);
 
     if (built.status === 0 && compiled) {
-      const native = spawnSync(exe, isNs ? [] : args.words, { encoding: "utf8" });
+      const native = ran;
       const nativeOut = { stdout: native.stdout.replace(/\r\n/g, "\n"), code: native.status, panic: native.status === 101 ? normalize(nativePanic(native.stderr)) : null };
       const js = await runJs(path.join(work, file.replace(/\.rs$/, ".mjs")), isNs ? [mockNs(args.js)] : []);
       if (js.panic) js.panic = normalize(js.panic);
@@ -241,10 +265,7 @@ for (const entry of fs.readdirSync(here).sort()) {
         const jsPath = path.join(work, "tests.mjs");
         fs.writeFileSync(jsPath, out.code);
         const js = await runJs(jsPath, [{ args: [] }]);
-        const testExe = path.join(work, `tests${exeSuffix}`);
-        spawnSync("rustc", ["--test", "--edition", "2024", "-A", "warnings", "-o", testExe, path.join(root, file)], { encoding: "utf8" });
-        const r = spawnSync(testExe, ["--test-threads=1"], { encoding: "utf8" });
-        const [w, g] = [normalize(r.stdout), normalize(js.stdout)];
+        const [w, g] = [normalize(tests.stdout), normalize(js.stdout)];
         if (w !== g) problems.push(`--- rustc --test\n${w}--- ours\n${g}`);
       }
     }

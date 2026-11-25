@@ -48,6 +48,8 @@ mod quote;
 mod react;
 #[path = "typeck_res.rs"]
 mod res;
+#[path = "typeck_scope.rs"]
+mod scope;
 #[path = "typeck_slots.rs"]
 mod slots;
 #[path = "typeck_std.rs"]
@@ -400,6 +402,7 @@ impl<'a> Checker<'a> {
             str_locals: Default::default(),
             ref_vecs: Default::default(),
             move_sites: Default::default(),
+            trait_calls: Vec::new(),
             io_writes: Default::default(),
             slot_item_calls: Default::default(),
             lock_results: Default::default(),
@@ -631,6 +634,8 @@ impl<'a> Checker<'a> {
 pub struct Origin {
     pub map: Option<std::rc::Rc<crate::mbe::OffsetMap>>,
     pub len: usize,
+    /// The program as written (what `map` maps back to).
+    pub src: std::rc::Rc<str>,
 }
 
 impl Origin {
@@ -668,6 +673,7 @@ pub fn check(
     }
     c.check_impls(file);
     c.check_trait_defaults(file);
+    c.check_trait_scopes(file, origin);
     let map: HashMap<(usize, usize), Ty> = c.raw.iter().map(|(k, t)| (*k, c.zonk(t))).collect();
     let float_set = |t: &Ty| -> bool {
         fn walk(t: &Ty) -> bool {
@@ -970,6 +976,8 @@ struct Checker<'a> {
     ref_vecs: HashMap<(usize, usize), String>,
     /// Uses that move a binding (filled by the move checker).
     move_sites: std::collections::HashSet<(usize, usize)>,
+    /// Method calls a user trait's impl may answer (see `traitscope`).
+    trait_calls: Vec<scope::TraitCall>,
     /// `write!` destinations that are `io::Write`rs (by their start).
     io_writes: std::collections::HashSet<usize>,
     /// See `Types::any_strs` / `any_checks`.
@@ -7696,6 +7704,7 @@ impl<'a> Checker<'a> {
                 self.check(a, p);
             }
             self.record_ext(m.syntax(), key);
+            self.note_trait_call(m, key, &method, &rt);
             return if sig.is_async {
                 Ty::Future(Box::new(sig.ret))
             } else {
@@ -7716,6 +7725,7 @@ impl<'a> Checker<'a> {
                 self.check(a, p);
             }
             self.record_ext(m.syntax(), &key);
+            self.note_trait_call(m, &key, &method, &rt);
             return if sig.is_async {
                 Ty::Future(Box::new(sig.ret))
             } else {

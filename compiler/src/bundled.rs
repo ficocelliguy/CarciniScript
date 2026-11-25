@@ -2347,10 +2347,14 @@ const FS_RENAMES: Renames = Renames {
         ("OpenOptions", "FsOpenOptions"),
         ("Metadata", "FsMetadata"),
         ("DirEntry", "FsDirEntry"),
+        ("FileType", "FsFileType"),
         ("read_to_string", "__fs_read_to_string"),
         ("read", "__fs_read"),
         ("metadata", "__fs_metadata"),
         ("read_dir", "__fs_read_dir"),
+        ("read_link", "__fs_read_link"),
+        ("symlink_metadata", "__fs_symlink_metadata"),
+        ("canonicalize", "__fs_canonicalize"),
         ("exists", "__fs_exists"),
         ("write", "__fs_write"),
         ("create_dir", "__fs_create_dir"),
@@ -2361,7 +2365,7 @@ const FS_RENAMES: Renames = Renames {
         ("copy", "__fs_copy"),
         ("rename", "__fs_rename"),
     ],
-    star: &["File", "OpenOptions", "Metadata", "DirEntry"],
+    star: &["File", "OpenOptions", "Metadata", "DirEntry", "FileType"],
     result_err: None,
 };
 

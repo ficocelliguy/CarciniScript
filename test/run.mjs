@@ -3,7 +3,9 @@
 //    (101 on panic) must match.
 //  - ns/*.rs: async NS scripts run against a mock `ns`; output must match ns/*.expected.
 //  - Source map and diagnostics checks.
-import { execFileSync, spawnSync } from "node:child_process";
+// Arguments filter the tests by name (`node test/run.mjs moves borrow`). Native builds are cached
+// in test/out/native-cache by source, flags and toolchain (`NATIVE_JOBS` builds at once).
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,7 +25,7 @@ import {
   formatDiagnostics,
 } from "../index.js";
 import "../runtime/rt.js";
-import { buildNative } from "../tools/native-build.mjs";
+import { nativeRuns } from "../tools/native-build.mjs";
 import { nativePanic } from "../tools/native-panic.mjs";
 
 // `js::Date`'s local time is UTC in the tests (the native shim has no time zones).
@@ -42,12 +44,17 @@ if (bindingProblems.length) {
 // A diagnostic on one line, as the checkers wrote it before rustc's structure: the headline, its
 // label after a colon, its help lines in parentheses.
 const oneLine = (d) => `${d.message}${d.label ? `: ${d.label}` : ""}${(d.helps ?? []).map((h) => ` (${h})`).join("")}`;
+// The arguments: a test runs when its name contains one of them. (Others are reported by neither
+// `fail` nor `pass`; the slow sections skip them up front.)
+const only = process.argv.slice(2);
+const wanted = (name) => !only.length || only.some((w) => name.includes(w));
 let failures = 0;
 const fail = (name, msg) => {
+  if (!wanted(name)) return;
   failures++;
   console.log(`FAIL ${name}\n${msg}\n`);
 };
-const pass = (name) => console.log(`ok   ${name}`);
+const pass = (name) => wanted(name) && console.log(`ok   ${name}`);
 
 function compileFixture(file) {
   const src = fs.readFileSync(file, "utf8");
@@ -99,10 +106,10 @@ async function runJs(jsPath, args = []) {
   return { stdout: stdout ? stdout + "\n" : "", stderr, code, panic };
 }
 
-function runNative(file) {
-  const exe = path.join(outDir, path.basename(file, ".rs") + (process.platform === "win32" ? ".exe" : ""));
-  buildNative(file, exe);
-  const r = spawnSync(exe, { encoding: "utf8" });
+// A native run from `nativeRuns`, normalized for comparison.
+async function nativeResult(run) {
+  const r = await run;
+  if (r.error) throw new Error(r.error);
   return {
     stdout: r.stdout.replace(/\r\n/g, "\n"),
     // (`dbg!`'s `[C:\..\fixtures\x.rs:3:5]` as the JS has it, `[x.rs:3:5]`.)
@@ -112,14 +119,18 @@ function runNative(file) {
   };
 }
 
-// --- differential fixtures
-for (const f of fs.readdirSync(path.join(here, "fixtures")).filter((f) => f.endsWith(".rs"))) {
-  const file = path.join(here, "fixtures", f);
+// --- differential fixtures (built natively in the background, in order)
+const fixtures = fs
+  .readdirSync(path.join(here, "fixtures"))
+  .filter((f) => f.endsWith(".rs") && wanted(`diff ${f}`))
+  .map((f) => ({ f, file: path.join(here, "fixtures", f) }));
+const fixtureRuns = nativeRuns(fixtures);
+for (const [i, { f, file }] of fixtures.entries()) {
   const name = `diff ${f}`;
   try {
     const { src, jsPath } = compileFixture(file);
     const js = await runJs(jsPath);
-    const native = runNative(file);
+    const native = await nativeResult(fixtureRuns[i]);
     // (`// test: stderr` in a fixture: its stderr must match too, as `dbg!`'s output.)
     if (src.includes("// test: stderr") && js.stderr !== native.stderr) {
       fail(name, `stderr differs\n--- rustc\n${native.stderr}--- js\n${js.stderr}`);
@@ -141,7 +152,9 @@ for (const f of fs.readdirSync(path.join(here, "fixtures")).filter((f) => f.ends
 }
 
 // --- multi-file programs: test/modules/<name>/main.rs plus its `mod` files
-for (const dir of fs.readdirSync(path.join(here, "modules"))) {
+const moduleDirs = fs.readdirSync(path.join(here, "modules")).filter((dir) => wanted(`modules ${dir}`));
+const moduleRuns = nativeRuns(moduleDirs.map((dir) => ({ file: path.join(here, "modules", dir, "main.rs"), dir: path.join(here, "modules", dir) })));
+for (const [i, dir] of moduleDirs.entries()) {
   const root = path.join(here, "modules", dir);
   const name = `modules ${dir}`;
   try {
@@ -169,7 +182,7 @@ for (const dir of fs.readdirSync(path.join(here, "modules"))) {
       fs.writeFileSync(dest, out.code.replace(/\.rs";/g, '.mjs";'));
     }
     const js = await runJs(path.join(outRoot, "main.mjs"));
-    const native = runNative(path.join(root, "main.rs"));
+    const native = await nativeResult(moduleRuns[i]);
     if (js.stdout !== native.stdout || js.code !== native.code) {
       fail(name, `rustc:\n${native.stdout}\njs:\n${js.stdout}`);
     } else pass(name);
@@ -221,6 +234,7 @@ for (const dir of fs.readdirSync(path.join(here, "modules"))) {
 for (const dir of fs.readdirSync(path.join(here, "procmacro"))) {
   const root = path.join(here, "procmacro", dir);
   const name = `procmacro ${dir}`;
+  if (!wanted(name)) continue;
   try {
     const read = (p) => {
       try {
@@ -300,6 +314,7 @@ for (const dir of fs.readdirSync(path.join(here, "procmacro"))) {
   for (const f of programs) fs.copyFileSync(path.join(here, "js", f), path.join(ws, "app", "src", "bin", f));
   for (const f of programs) {
     const name = `js ${f}`;
+    if (!wanted(name)) continue;
     try {
       const out = compile(fs.readFileSync(path.join(here, "js", f), "utf8"), f);
       if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${oneLine(d)}`).join("\n"));
@@ -324,6 +339,7 @@ for (const dir of fs.readdirSync(path.join(here, "procmacro"))) {
 // Node, against the expected output in the matching .out file.
 for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsWith(".rs"))) {
   const name = `js-node ${f}`;
+  if (!wanted(name)) continue;
   try {
     const out = compile(fs.readFileSync(path.join(here, "js-node", f), "utf8"), f);
     if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${oneLine(d)}`).join("\n"));
@@ -342,7 +358,9 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
 // `rustc` without `-O`; stdout, exit code and the panic (message and location) must match.
 {
   setOverflowChecks(true);
-  for (const file of fs.readdirSync(path.join(here, "debug")).filter((f) => f.endsWith(".rs"))) {
+  const files = fs.readdirSync(path.join(here, "debug")).filter((f) => f.endsWith(".rs") && wanted(`debug ${f}`));
+  const runs = nativeRuns(files.map((f) => ({ file: path.join(here, "debug", f), debug: true })));
+  for (const [i, file] of files.entries()) {
     const name = `debug ${file}`;
     try {
       const src = fs.readFileSync(path.join(here, "debug", file), "utf8");
@@ -351,9 +369,8 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
       const jsPath = path.join(outDir, `debug-${file.replace(/\.rs$/, ".mjs")}`);
       fs.writeFileSync(jsPath, out.code);
       const js = await runJs(jsPath);
-      const exe = path.join(outDir, `debug-${path.basename(file, ".rs")}${process.platform === "win32" ? ".exe" : ""}`);
-      buildNative(path.join(here, "debug", file), exe, { debug: true });
-      const r = spawnSync(exe, { encoding: "utf8" });
+      const r = await runs[i];
+      if (r.error) throw new Error(r.error);
       const nativeStdout = r.stdout.replace(/\r\n/g, "\n");
       const at = (s) => {
         if (!s) return undefined;
@@ -387,19 +404,26 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
       .replace(/^(thread '[^']*') \(\d+\)/gm, "$1")
       .replace(/[^\s'"`]*[\\/]([^\\/\s]+\.rs:\d+:\d+)/g, "$1")
       .replace(/finished in \d+\.\d+s/, "finished in 0.00s");
-  for (const file of fs.readdirSync(path.join(here, "libtest")).filter((f) => f.endsWith(".rs"))) {
+  const argsOf = (src) => /^\/\/ args: (.*)$/m.exec(src)?.[1].trim().split(/\s+/) ?? [];
+  const files = fs.readdirSync(path.join(here, "libtest")).filter((f) => f.endsWith(".rs") && wanted(`libtest ${f}`));
+  const runs = nativeRuns(
+    files.map((f) => {
+      const file = path.join(here, "libtest", f);
+      return { file, test: true, args: argsOf(fs.readFileSync(file, "utf8")) };
+    }),
+  );
+  for (const [i, file] of files.entries()) {
     const name = `libtest ${file}`;
     try {
       const src = fs.readFileSync(path.join(here, "libtest", file), "utf8");
-      const args = /^\/\/ args: (.*)$/m.exec(src)?.[1].trim().split(/\s+/) ?? [];
+      const args = argsOf(src);
       const out = compileTests(src, file);
       if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${oneLine(d)}`).join("\n"));
       const jsPath = path.join(outDir, `libtest-${file.replace(/\.rs$/, ".mjs")}`);
       fs.writeFileSync(jsPath, out.code);
       const js = await runJs(jsPath, [{ args }]);
-      const exe = path.join(outDir, `libtest-${path.basename(file, ".rs")}${process.platform === "win32" ? ".exe" : ""}`);
-      execFileSync("rustc", ["--test", "--edition", "2024", "-A", "warnings", "-o", exe, path.join(here, "libtest", file)], { stdio: "pipe" });
-      const r = spawnSync(exe, ["--test-threads=1", ...args], { encoding: "utf8" });
+      const r = await runs[i];
+      if (r.error) throw new Error(r.error);
       const [want, got] = [normalize(r.stdout), normalize(js.stdout)];
       if (want !== got) fail(name, `--- rustc --test\n${want}--- js\n${got}`);
       else pass(name);
@@ -713,6 +737,7 @@ function mockNs(log) {
 }
 for (const f of fs.readdirSync(path.join(here, "ns")).filter((f) => f.endsWith(".rs"))) {
   const name = `ns ${f}`;
+  if (!wanted(name)) continue;
   try {
     const { out, jsPath } = compileFixture(path.join(here, "ns", f));
     const log = [];
@@ -1078,7 +1103,11 @@ const rejected = [
   ["a made value for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f(n: i32) {\n    take(format!(\"{}\", n));", "5:10 mismatched types: expected `&str`, found `String`"],
   ["use after a `for` loop", "let v = vec![1, 2];\n    for x in v { println!(\"{x}\"); }\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move"],
   ["use after `into_iter()`", "let v = vec![1];\n    let it = v.into_iter();\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move"],
-  ["use after a partial move out of a tuple", "let p = (1, vec![1]);\n    let (_, v) = p;\n    println!(\"{:?} {}\", v, p.0);\n    println!(\"{:?}\", p);", "5:22 borrow of partially moved value: `p`: value borrowed here after partial move (consider cloning the value if the performance cost is acceptable)"],
+  ["use after a partial move out of a tuple", "let p = (1, vec![1]);\n    let (_, v) = p;\n    println!(\"{:?} {}\", v, p.0);\n    println!(\"{:?}\", p);", "5:22 borrow of partially moved value: `p`: value borrowed here after partial move"],
+  ["use after `if let` moved a `String` out", "let o = Some(String::from(\"a\"));\n    if let Some(x) = o { println!(\"{}\", x); }\n    println!(\"{:?}\", o);", "4:22 borrow of partially moved value: `o`: value borrowed here after partial move"],
+  ["use after a `match` arm moved a `Vec` out", "let o: Result<Vec<i32>, i32> = Ok(vec![1]);\n    match o { Ok(v) => println!(\"{:?}\", v), Err(_) => {} }\n    let p = o;", "4:13 use of partially moved value: `o`: value used here after partial move"],
+  ["use after a non-`move` closure consumed a capture", "let s = String::from(\"a\");\n    let c = || drop(s);\n    c();\n    println!(\"{}\", s);", "5:20 borrow of moved value: `s`: value borrowed here after move"],
+  ["a `String` field read after `let` destructuring moved it", "}\nstruct P { name: String, n: i32 }\nfn f() {\n    let p = P { name: String::new(), n: 1 };\n    let P { name, n } = p;\n    println!(\"{} {}\", name, p.name);", "7:29 borrow of moved value: `p.name`: value borrowed here after move"],
   ["use after a partial move out of a struct", "}\nstruct P { x: i32, v: Vec<i32> }\nfn f() {\n    let p = P { x: 1, v: vec![1] };\n    let P { v, .. } = p;\n    println!(\"{:?} {}\", v, p.x);\n    let q = p;", "8:13 use of partially moved value: `p`"],
   ["a moved field read after a partial move", "}\nstruct P { x: i32, v: Vec<i32> }\nfn f() {\n    let p = P { x: 1, v: vec![1] };\n    let P { v, .. } = p;\n    let w = p.v;", "7:13 use of moved value: `p.v`: value used here after move"],
   ["a whole use after a field moved out", "}\nstruct P { a: String, b: String }\nfn f() {\n    let p = P { a: String::new(), b: String::new() };\n    let a = p.a;\n    println!(\"{} {}\", a, p.b);\n    let q = p;", "8:13 use of partially moved value: `p`: value used here after partial move (consider cloning the value if the performance cost is acceptable)"],
@@ -1851,6 +1880,7 @@ for (const [label, body, want] of borrowRejected) {
 // output line for line (and `formatDiagnostics` the same).
 for (const f of fs.readdirSync(path.join(here, "rendered")).filter((f) => f.endsWith(".rs"))) {
   const name = `rendered ${f}`;
+  if (!wanted(name)) continue;
   const dir = path.join(here, "rendered");
   const src = fs.readFileSync(path.join(dir, f), "utf8");
   const out = compile(src, f);

@@ -122,7 +122,7 @@ function bucket(f, e) {
   }
   if (/^mismatched types: expected `(.+?)`, found a tuple/.test(m)) return "mismatched types: tuple found" + mac;
   if (/^mismatched types: expected items of type/.test(m)) return "mismatched types: iterator item type" + mac;
-  if (/^this block kind is not supported yet/.test(m)) {
+  if (/^this block kind is not supported(?: yet)?/.test(m)) {
     const k = e.node?.kinds?.[0];
     const mm = t.match(/(\w+)!\s*[({\[]/);
     if (mm) return `item-position macro call not expanded (${hasMacroRules(f, mm[1]) ? "a local macro_rules" : "macro from elsewhere"})`;
@@ -130,7 +130,7 @@ function bucket(f, e) {
   }
   if (/^duplicate definitions with name/.test(m)) return "duplicate definitions (no #[cfg] seen on the node)" + mac;
   if (/^the name `(\w+)` is defined multiple times/.test(m)) return "name defined multiple times" + (t ? "" : " (a use import)") + mac;
-  if (/^fields of this type is not supported yet/.test(m)) {
+  if (/^fields of this type is not supported(?: yet)?/.test(m)) {
     if (/\)\s*\.\d+$/.test(t)) return "tuple field (`.0`) of a call result";
     if (/\.\d+$/.test(t)) return "tuple field of a non-call expression";
     return "tuple field: other" + mac;
@@ -166,7 +166,7 @@ function bucket(f, e) {
     if (STD_TYPES.has(h) || /^(PhantomData|NonNull|MaybeUninit|UnsafeCell|ManuallyDrop|Pin|Arc|Mutex|Atomic\w+)/.test(h)) return `derive \`${tr}\`: field is std \`${h}\``;
     return hasType(f, h) ? `derive \`${tr}\`: field type is local without that derive` : `derive \`${tr}\`: field type from another file`;
   }
-  if (/^(struct|constant) and enum patterns is not supported yet/.test(m)) {
+  if (/^(struct|constant) and enum patterns is not supported(?: yet)?/.test(m)) {
     const kind = m.startsWith("struct") ? "tuple/struct" : "constant/unit";
     const p = t.replace(/\(.*$/s, "").replace(/\s*\{.*$/s, "").trim();
     const segs = p.replace(/^::/, "").split("::");
@@ -200,7 +200,7 @@ function bucket(f, e) {
     if (isParam(head(ty))) return `type parameter doesn't implement ${x[2]} (bound missing or via supertrait)`;
     return hasType(f, head(ty)) ? `local type doesn't implement ${x[2]}` + mac : `type from another file doesn't implement ${x[2]}` + mac;
   }
-  if (/^assignment to this place is not supported yet/.test(m)) return /\)\s*\[[^\]]*\]$/.test(t) ? "assignment target: index of a call result" : /\)\s*\.\w+$/.test(t) ? "assignment target: field of a call result" : "assignment target: other" + mac;
+  if (/^assignment to this place is not supported(?: yet)?/.test(m)) return /\)\s*\[[^\]]*\]$/.test(t) ? "assignment target: index of a call result" : /\)\s*\.\w+$/.test(t) ? "assignment target: field of a call result" : "assignment target: other" + mac;
   if ((x = m.match(/^cannot apply binary operator `(.+?)` to type `(\w+)/))) return `binary operator \`${x[1]}\` on \`${x[2]}\`` + (STD_TYPES.has(x[2]) ? " (std op impl missing)" : hasType(f, x[2]) ? " (local type)" : " (type elsewhere)");
   if ((x = m.match(/arms have incompatible types: expected `(.+?)`, found `(.+?)`/))) return `match arms differ: ${shape(x[1], x[2])}` + mac;
   if (/^attempted to take value of method/.test(m)) return "method used as a field" + mac;

@@ -181,8 +181,11 @@ pub fn shape(d: &mut Diagnostic, src: &str, idx: &LineIndex) {
     }
     let mut s = Shaped::default();
     rules(&msg, &mut s, d, src);
+    if s.code == Some("E0382") {
+        d.spans.retain(|sp| !(sp.start == sp.end && s.notes.contains(&sp.label)));
+    }
     // (rustc leaves the label off a missing method when it suggests another.)
-    if s.code == Some("E0599") && !hints.is_empty() && s.label.as_deref().is_some_and(|l| l.starts_with("method not found")) {
+    if s.code == Some("E0599") && !hints.is_empty() && !s.helps.iter().any(|h| h.starts_with("items from traits")) && s.label.as_deref().is_some_and(|l| l.starts_with("method not found")) {
         s.label = None;
     }
     let headline = s.headline.take().unwrap_or(msg);
@@ -535,6 +538,17 @@ fn word_at(src: &str, at: usize) -> Option<(usize, usize)> {
     (n > 0).then_some((at, at + n))
 }
 
+/// The end of a closure's head (`move |a, b|`), for the closure starting at `at`.
+fn closure_head(src: &str, at: usize) -> Option<usize> {
+    let rest = src.get(at..)?;
+    let open = rest.find('|')?;
+    if !rest[..open].trim().split_whitespace().all(|w| w == "move" || w == "async") {
+        return None;
+    }
+    let close = open + 1 + rest[open + 1..].find('|')?;
+    Some(at + close + 1)
+}
+
 /// A byte offset of a 1-based line and UTF-16 column.
 fn offset_of(src: &str, line: usize, col: usize) -> Option<usize> {
     let start = if line <= 1 {
@@ -670,6 +684,39 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
                 std_def_generics(ty).unwrap_or(ty)
             ));
             s.label = Some(format!("method not found in `{ty}`"));
+            // A trait not in scope: the hint names it, its import, and where that goes.
+            if d.message.contains("items from traits can only be used if the trait is in scope") {
+                s.helps.push("items from traits can only be used if the trait is in scope".into());
+                let tr = d.message.split("trait `").nth(1).and_then(|r| r.split('`').next());
+                let import = d.message.split("add `").nth(1).and_then(|r| r.split('`').next());
+                let site = d.message.split("` on line ").nth(1).and_then(|r| {
+                    let (l, c) = r.split(|c: char| !(c.is_ascii_digit() || c == ':')).next()?.split_once(':')?;
+                    offset_of(src, l.parse().ok()?, c.parse().ok()?)
+                });
+                // (On a number, `bool` or `char`, rustc also points at the trait's method.)
+                if type_kind(ty, src) == "type"
+                    && let Some(tr) = tr
+                    && let Some(t) = src.find(&format!("trait {tr}"))
+                    && let Some(f) = src[t..].find(&format!("fn {m}("))
+                {
+                    let a = t + f + 3;
+                    s.spans.push((a, a + m.len(), format!("the method is available for `{ty}` here")));
+                }
+                if let (Some(tr), Some(import), Some(at)) = (tr, import, site) {
+                    let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+                    let indent = &src[line_start..at];
+                    // (A line of its own, unless the item shares its line: `mod k { fn f() }`.)
+                    let edit = if indent.trim().is_empty() {
+                        (line_start, line_start, format!("{indent}{import}\n"))
+                    } else {
+                        (at, at, format!("{import} "))
+                    };
+                    s.suggestion = Some((
+                        format!("trait `{tr}` which provides `{m}` is implemented but not in scope; perhaps you want to import it"),
+                        vec![edit],
+                    ));
+                }
+            }
         } else if !msg.ends_with("in the current scope") && msg.contains(" found for ") {
             // (An iterator's type is a std struct.)
             let msg = msg.replacen(" found for iterator `", " found for struct `", 1);
@@ -963,7 +1010,65 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
         });
         let moved = moved.or_else(|| d.message.contains("moved here").then_some(start));
         let mut own_help = false;
+        // (A part moved by a pattern binding: the checker's type label is rustc's note.)
+        // (`shape` drops those spans.)
+        for sp in &d.spans {
+            let note = sp.start == sp.end
+                && (sp.label.starts_with("partial move occurs because")
+                    || sp.label.starts_with("move occurs because"));
+            if note {
+                s.notes.push(sp.label.clone());
+            }
+        }
+        // (Into a closure: where the closure used it, `by its use on line 3:21`.)
+        let closure_use = d.message.split("by its use on line ").nth(1).and_then(|r| {
+            let (l, c) = r.split(|c: char| !(c.is_ascii_digit() || c == ':')).next()?.split_once(':')?;
+            offset_of(src, l.parse().ok()?, c.parse().ok()?)
+        });
+        let into_closure = d.message.contains("into a closure") || d.message.contains("into a `move` closure");
         if let Some(at) = moved
+            && into_closure
+            && let Some(u) = closure_use
+            && let Some((ua, ub)) = word_at(src, u)
+            && let Some(head) = closure_head(src, at)
+        {
+            let partial = has("use of partially") || has("borrow of partially");
+            if partial {
+                // (The place the closure took, `j.name`.)
+                let mut ub = ub;
+                while let Some(rest) = src.get(ub..).and_then(|r| r.strip_prefix('.')) {
+                    let len = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+                    if len == 0 || rest[len..].starts_with('(') {
+                        break;
+                    }
+                    ub += 1 + len;
+                }
+                s.spans.push((at, head, "value partially moved into closure here".into()));
+                s.spans.push((ua, ub, "variable partially moved due to use in closure".into()));
+                own_help = true;
+            } else {
+                s.spans.push((at, head, "value moved into closure here".into()));
+                s.spans.push((ua, ub, "variable moved due to use in closure".into()));
+            }
+            if !partial && !d.message.contains("into a `move` closure") {
+                own_help = true;
+                s.suggestion = Some((
+                    "consider cloning the value if the performance cost is acceptable".into(),
+                    vec![(ub, ub, ".clone()".into())],
+                ));
+            }
+        } else if let Some(at) = moved
+            && d.message.contains("by binding it in a pattern")
+            && let Some((a, b)) = word_at(src, at)
+        {
+            let partial = has("use of partially") || has("borrow of partially");
+            s.spans.push((a, b, if partial { "value partially moved here" } else { "value moved here" }.into()));
+            own_help = true;
+            s.suggestion = Some((
+                "borrow this binding in the pattern to avoid moving the value".into(),
+                vec![(a, a, "ref ".into())],
+            ));
+        } else if let Some(at) = moved
             && let Some((a, b)) = word_at(src, at)
         {
             let partial = has("use of partially") || has("borrow of partially");
@@ -2016,6 +2121,20 @@ fn suggestion(out: &mut String, lines: &[&str], edits: &[SubSpan], width: usize)
     let mut new_lines: Vec<String> = Vec::new();
     let mut marks: Vec<Vec<(usize, usize)>> = Vec::new();
     let insert_only = edits.iter().all(|e| (e.line, e.column) == (e.end_line, e.end_column));
+    // Whole lines inserted before a line (`use crate::m::T;`): rustc shows just them, `N + ..`.
+    if insert_only && edits.iter().all(|e| e.column == 1 && e.label.ends_with('\n')) {
+        let mut n = first + 1;
+        for e in edits {
+            for part in e.label.lines() {
+                let row = format!("{:>width$} + {}", n, expand_tabs(part));
+                out.push_str(row.trim_end());
+                out.push('\n');
+                n += 1;
+            }
+        }
+        out.push_str(&format!("{pad} |\n"));
+        return;
+    }
     let adds_lines = edits.iter().any(|e| e.label.contains('\n'));
     // (What each line keeps after its last edit.)
     let mut rests: Vec<String> = Vec::new();

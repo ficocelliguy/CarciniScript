@@ -35,7 +35,8 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     let path = (paths
         || text.contains("PathBuf")
         || text.contains("__AsPath")
-        || text.contains("__os_push"))
+        || text.contains("__os_push")
+        || text.contains("__os_from"))
         && !text.contains("// (path prelude)")
         && !declares(text, "PathBuf");
     // (The path prelude's `FromStr` names `Infallible`.)
@@ -475,6 +476,19 @@ pub(crate) fn expand(
                 b = toks[i + 2].end;
                 next = i + 3;
             }
+        }
+        // `OsStr::from_bytes(..)` / `OsString::from_vec(..)` (`std::os::unix::ffi`): the path
+        // prelude's (lossy, as an `OsStr` is a `String` here).
+        if txt(i + 1) == "::"
+            && let Some(f) = match (name.as_str(), txt(i + 2).as_str()) {
+                ("OsStr", "from_bytes") => Some("__os_from_bytes"),
+                ("OsString", "from_vec") => Some("__os_from_vec"),
+                _ => None,
+            }
+        {
+            to = f.into();
+            b = toks[i + 2].end;
+            next = i + 3;
         }
         // `Arguments<'_>`: a `String` has no lifetime.
         if name == "Arguments"

@@ -248,7 +248,9 @@ In Bitburner, `js::document()` and `js::window()` cost 25 GB like their JS names
 the value before a `.` (or the names in scope for a plain identifier), and `signatureHelp(...)`
 gives parameter hints inside a call. `setOverflowChecks(true)` makes the compiles that follow panic on integer overflow, like a Rust debug
 build (the default wraps, like a release build). Borrow conflicts rustc rejects are errors, as in rustc;
-`setStrictBorrows(false)` makes them warnings (the program still runs).
+`setStrictBorrows(false)` makes them warnings (the program still runs). Errors in test code
+(`#[test]`, `#[cfg(test)]`) come from a second, test build of the file, as warnings;
+`setTestCodeChecks(false)` skips that build.
 
 `definition(...)` finds where the name under the cursor is
 defined (locals by scope; functions, types, methods, fields, variants and aliases; items of

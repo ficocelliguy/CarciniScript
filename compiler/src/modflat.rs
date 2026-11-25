@@ -38,6 +38,12 @@ struct Module {
     /// Names other `use`s bring in (`use std::fmt;`), and whether one is a `*`.
     external: HashSet<String>,
     external_glob: bool,
+    /// Its traits (by name), for `TraitScopes`.
+    traits: HashSet<String>,
+    /// What `use .. as _;` brings in (only traits matter: their methods).
+    anon: Vec<(Vec<String>, String)>,
+    /// Whether a macro call among its items may write more `use`s.
+    item_macros: bool,
     /// Whether some of its names can't be known here (a macro call or `mod x;` among its items,
     /// or a `#[cfg]`'d twin): then missing or private names aren't reported.
     open: bool,
@@ -159,16 +165,21 @@ impl Flattener {
             }
             if let Some(n) = item_name(&item) {
                 module.items.insert(n.text().to_string());
+                if matches!(item, ast::Item::Trait(_)) {
+                    module.traits.insert(n.text().to_string());
+                }
                 if let Some(scope) = visible_from(item.syntax(), &path) {
                     module.private.insert(n.text().to_string(), scope);
                 }
             } else if !matches!(item, ast::Item::Impl(_) | ast::Item::Use(_)) {
                 module.open = true;
+                module.item_macros |= matches!(item, ast::Item::MacroCall(_));
             }
         }
         // Two modules of one name (under different `#[cfg]`s): keep what both have.
         if let Some(old) = self.modules.remove(&path) {
             module.items.extend(old.items);
+            module.traits.extend(old.traits);
             module.children.extend(old.children);
             module.open = true;
         }
@@ -417,6 +428,11 @@ impl Flattener {
                 } else if !star && i + 1 == rest.len() {
                     let name = rest[i].clone();
                     let alias = rename.unwrap_or_else(|| name.clone());
+                    if alias == "_" {
+                        m.anon.push((module, name));
+                        kept.pop();
+                        continue;
+                    }
                     m.uses.insert(alias, Target::Item(module, name));
                 } else if i == rest.len() && !star {
                     let alias = rename.unwrap_or_else(|| segs.last().cloned().unwrap_or_default());
@@ -483,61 +499,12 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
     // In a file that doesn't parse, module errors would only be noise.
     let broken = !parsed.errors().is_empty();
     let file = parsed.tree();
-    let mut f = Flattener {
-        modules: HashMap::new(),
-    };
-    let root_items: Vec<ast::Item> = file.items().collect();
-    f.collect(root_items.iter().cloned(), Vec::new(), false);
-    // `use`s, per module (after every module's items are known).
-    let mut errors = Vec::new();
-    let mut removed: Vec<(ast::Use, String)> = f.uses(&root_items, &[], &mut errors);
-    for m in file
-        .syntax()
-        .descendants()
-        .filter_map(ast::Module::cast)
-        .filter(inline_module)
-    {
-        // (A module's own node is among its ancestors, so this includes its name.)
-        let path = module_path(m.syntax());
-        let items: Vec<ast::Item> = m
-            .item_list()
-            .map(|l| l.items().collect())
-            .unwrap_or_default();
-        removed.extend(f.uses(&items, &path, &mut errors));
-    }
-    // `use`s inside function bodies (`fn main() { use geo::Point as P; .. }`): the alias is
-    // recorded with the module's (its scope is wider than the block, which is close enough).
-    // In that block it also wins over the module's own items (`use deeply::function;` there
-    // shadows the outer `fn function`).
-    let mut block_uses: Vec<(ra_ap_syntax::TextRange, String, String)> = Vec::new();
-    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
-        let Some(block) = u
-            .syntax()
-            .parent()
-            .filter(|p| p.kind() == SyntaxKind::STMT_LIST)
-        else {
-            continue;
-        };
-        let path = module_path(u.syntax());
-        for (segs, rename, star) in crate::typeck::use_leaves(&u) {
-            if star {
-                continue;
-            }
-            let Some((start, rest, explicit)) = f.start(&path, &segs) else {
-                continue;
-            };
-            let (module, i) = f.walk(start, rest);
-            if (i > 0 || explicit) && i + 1 == rest.len() {
-                let name = &rest[i];
-                let mangled = f
-                    .lookup(&module, name, 0)
-                    .unwrap_or_else(|| mangle(&module, name));
-                let alias = rename.unwrap_or_else(|| name.clone());
-                block_uses.push((block.text_range(), alias, mangled));
-            }
-        }
-        removed.extend(f.uses(&[ast::Item::Use(u)], &path, &mut errors));
-    }
+    let Scan {
+        f,
+        mut errors,
+        removed,
+        block_uses,
+    } = scan(&file);
 
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let range = |n: &SyntaxNode| -> (usize, usize) {
@@ -827,4 +794,192 @@ fn binding_in_scope(pat: &SyntaxNode, at: TextSize) -> bool {
         }
     }
     true
+}
+
+/// What `flatten` learns before it edits: the modules, their `use`s (with those it removes or
+/// rewrites), errors, and the aliases block-level `use`s bring in.
+struct Scan {
+    f: Flattener,
+    errors: Vec<(usize, usize, String)>,
+    removed: Vec<(ast::Use, String)>,
+    block_uses: Vec<(ra_ap_syntax::TextRange, String, String)>,
+}
+
+fn scan(file: &ast::SourceFile) -> Scan {
+    let mut f = Flattener {
+        modules: HashMap::new(),
+    };
+    let root_items: Vec<ast::Item> = file.items().collect();
+    f.collect(root_items.iter().cloned(), Vec::new(), false);
+    // `use`s, per module (after every module's items are known).
+    let mut errors = Vec::new();
+    let mut removed: Vec<(ast::Use, String)> = f.uses(&root_items, &[], &mut errors);
+    for m in file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Module::cast)
+        .filter(inline_module)
+    {
+        // (A module's own node is among its ancestors, so this includes its name.)
+        let path = module_path(m.syntax());
+        let items: Vec<ast::Item> = m
+            .item_list()
+            .map(|l| l.items().collect())
+            .unwrap_or_default();
+        removed.extend(f.uses(&items, &path, &mut errors));
+    }
+    // `use`s inside function bodies (`fn main() { use geo::Point as P; .. }`): the alias is
+    // recorded with the module's (its scope is wider than the block, which is close enough).
+    // In that block it also wins over the module's own items (`use deeply::function;` there
+    // shadows the outer `fn function`).
+    let mut block_uses: Vec<(ra_ap_syntax::TextRange, String, String)> = Vec::new();
+    for u in file.syntax().descendants().filter_map(ast::Use::cast) {
+        let Some(block) = u
+            .syntax()
+            .parent()
+            .filter(|p| p.kind() == SyntaxKind::STMT_LIST)
+        else {
+            continue;
+        };
+        let path = module_path(u.syntax());
+        for (segs, rename, star) in crate::typeck::use_leaves(&u) {
+            if star {
+                continue;
+            }
+            let Some((start, rest, explicit)) = f.start(&path, &segs) else {
+                continue;
+            };
+            let (module, i) = f.walk(start, rest);
+            if (i > 0 || explicit) && i + 1 == rest.len() {
+                let name = &rest[i];
+                let mangled = f
+                    .lookup(&module, name, 0)
+                    .unwrap_or_else(|| mangle(&module, name));
+                let alias = rename.unwrap_or_else(|| name.clone());
+                block_uses.push((block.text_range(), alias, mangled));
+            }
+        }
+        removed.extend(f.uses(&[ast::Item::Use(u)], &path, &mut errors));
+    }
+    Scan {
+        f,
+        errors,
+        removed,
+        block_uses,
+    }
+}
+
+/// Which of a file's traits are in scope where, for the rule that a trait's methods can only be
+/// called with the trait in scope (`traitscope`): a trait is in scope in its own module, and
+/// where a `use` (also `as _` and `*`) brings it in. A block's `use` counts for its whole module,
+/// as in `flatten`.
+pub struct TraitScopes {
+    f: Flattener,
+    file: ast::SourceFile,
+}
+
+/// The scopes of `text` (the program as written), or `None` when it has no inline modules: then
+/// every trait it declares is in scope everywhere.
+pub fn trait_scopes(text: &str) -> Option<TraitScopes> {
+    if !has_inline_modules(text) {
+        return None;
+    }
+    let parsed = crate::macros::parse_file(text);
+    if !parsed.errors().is_empty() {
+        return None;
+    }
+    let file = parsed.tree();
+    let Scan { f, .. } = scan(&file);
+    Some(TraitScopes { f, file })
+}
+
+impl TraitScopes {
+    /// The module path of the code at `at`.
+    fn module_at(&self, at: usize) -> Option<Vec<String>> {
+        let tok = self
+            .file
+            .syntax()
+            .token_at_offset(TextSize::new(u32::try_from(at).ok()?))
+            .right_biased()?;
+        Some(module_path(&tok.parent()?))
+    }
+
+    /// The traits (mangled names) in scope at `at`; `None` when that can't be known (a macro
+    /// call among the module's items may write a `use`).
+    pub fn at(&self, at: usize) -> Option<HashSet<String>> {
+        let path = self.module_at(at)?;
+        if self.f.modules.get(&path)?.item_macros {
+            return None;
+        }
+        let mut out = HashSet::new();
+        self.visible(&path, &mut out, 0);
+        Some(out)
+    }
+
+    /// Every name module `path` sees, mangled: its own items, what its `use`s name, and through
+    /// its `*` imports, theirs (more than a glob brings in, which only lets more calls through).
+    fn visible(&self, path: &[String], out: &mut HashSet<String>, depth: usize) {
+        let Some(m) = self.f.modules.get(path) else { return };
+        if depth > 16 {
+            return;
+        }
+        out.extend(m.items.iter().map(|n| mangle(path, n)));
+        for t in m.uses.values() {
+            if let Target::Item(p, n) = t {
+                out.insert(self.f.lookup(p, n, 0).unwrap_or_else(|| mangle(p, n)));
+            }
+        }
+        for (p, n) in &m.anon {
+            out.insert(self.f.lookup(p, n, 0).unwrap_or_else(|| mangle(p, n)));
+        }
+        for g in &m.globs {
+            self.visible(g, out, depth + 1);
+        }
+    }
+
+    /// The trait whose mangled name is `mangled`: its module path and name.
+    pub fn trait_path(&self, mangled: &str) -> Option<(Vec<String>, String)> {
+        self.f.modules.iter().find_map(|(p, m)| {
+            m.traits
+                .iter()
+                .find(|t| mangle(p, t) == mangled)
+                .map(|t| (p.clone(), t.clone()))
+        })
+    }
+
+    /// Where rustc suggests a `use` for code at `at`: before its module's first `use`, or else
+    /// its first item.
+    pub fn use_site(&self, at: usize) -> Option<usize> {
+        let tok = self
+            .file
+            .syntax()
+            .token_at_offset(TextSize::new(u32::try_from(at).ok()?))
+            .right_biased()?;
+        let items: Vec<ast::Item> = match tok
+            .parent()?
+            .ancestors()
+            .filter_map(ast::Module::cast)
+            .find(inline_module)
+        {
+            Some(m) => m.item_list()?.items().collect(),
+            None => self.file.items().collect(),
+        };
+        let first = items
+            .iter()
+            .find(|i| matches!(i, ast::Item::Use(_)))
+            .or_else(|| items.first())?;
+        // (After its doc comments and attributes.)
+        let start = first
+            .syntax()
+            .children_with_tokens()
+            .find(|c| {
+                !matches!(
+                    c.kind(),
+                    SyntaxKind::COMMENT | SyntaxKind::WHITESPACE | SyntaxKind::ATTR
+                )
+            })
+            .map(|c| c.text_range().start())
+            .unwrap_or_else(|| first.syntax().text_range().start());
+        Some(start.into())
+    }
 }

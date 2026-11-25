@@ -224,3 +224,9 @@ export function setOverflowChecks(on: boolean): void;
  * for the compiles that follow (the program still runs).
  */
 export function setStrictBorrows(on: boolean): void;
+
+/**
+ * Errors in test code (`#[test]` functions, `#[cfg(test)]` modules) come from a second, test build
+ * of the file and are reported as warnings; `false` skips that build for the compiles that follow.
+ */
+export function setTestCodeChecks(on: boolean): void;

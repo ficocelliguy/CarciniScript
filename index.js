@@ -12,6 +12,7 @@ import init, {
   setNsBindings as setNsBindingsJson,
   setOverflowChecks as setOverflowChecksWasm,
   setStrictBorrows as setStrictBorrowsWasm,
+  setTestCodeChecks as setTestCodeChecksWasm,
   version,
 } from "./pkg/carciniscript.js";
 
@@ -132,4 +133,13 @@ export function setOverflowChecks(on) {
 export function setStrictBorrows(on) {
   if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
   setStrictBorrowsWasm(on);
+}
+
+/**
+ * Errors in test code (`#[test]` functions, `#[cfg(test)]` modules) come from a second, test build
+ * of the file and are reported as warnings; `false` skips that build for the compiles that follow.
+ */
+export function setTestCodeChecks(on) {
+  if (!ready) throw new Error("CarciniScript is not initialized; call initCarciniScript() first");
+  setTestCodeChecksWasm(on);
 }

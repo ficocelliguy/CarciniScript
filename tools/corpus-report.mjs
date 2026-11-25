@@ -39,7 +39,8 @@ for (const line of fs.readFileSync(input, "utf8").split("\n").filter(Boolean)) {
   }
   const cats = new Set(r.errs.map(e => e.cat));
   const ext = cats.has("EXT") || cats.has("THREAD");
-  r.v = r.errs.length === 0 ? "A compiles as-is"
+  r.v = r.panic ? "G compiler panic"
+    : r.errs.length === 0 ? "A compiles as-is"
     : cats.has("LANG") ? "E language gap"
     : cats.has("PARSE") ? "F parse error"
     : cats.has("GENERIC") && !ext ? "D other errors, nothing unresolved"
@@ -113,8 +114,26 @@ const full = all.filter(x => x.p === 1).sort((a, b) => b.n - a.n || a.c.localeCo
 console.log(`\ncrates: ${all.length}; language-OK in every file: ${full.length}; in 80% or more: ${all.filter(x => x.p >= 0.8).length}; under 50%: ${all.filter(x => x.p < 0.5).length}`);
 console.log(full.map(x => `${x.c} (${x.n})`).join(", "));
 
+// The compiler's slow files (fixtures included): by time, and by time per line against the
+// median (counting the module files a file reads), which puts the superlinear ones first. Their
+// profiles are the single-thread lever.
+const timed = [];
+for (const line of fs.readFileSync(input, "utf8").split("\n").filter(Boolean)) {
+  const r = JSON.parse(line);
+  if (r.ms !== undefined) timed.push({ f: r.f, ms: r.ms, per: r.ms / Math.max(r.lines + (r.modLines || 0), 1) });
+}
+if (timed.length) {
+  const median = [...timed].sort((a, b) => a.per - b.per)[timed.length >> 1].per;
+  const show = r => `${String(r.ms).padStart(9)} ms ${(r.per / median).toFixed(0).padStart(6)}x  ${r.f}`;
+  const total = timed.reduce((s, r) => s + r.ms, 0);
+  console.log(`\ncompile time: ${(total / 1000).toFixed(0)} s over ${timed.length} files, median ${(median * 1000).toFixed(0)} ms per 1,000 lines; slowest (ms, per line against the median):`);
+  for (const r of [...timed].sort((a, b) => b.ms - a.ms).slice(0, 10)) console.log(show(r));
+  console.log("slowest per line, of files over a second:");
+  for (const r of timed.filter(r => r.ms >= 1000).sort((a, b) => b.per - a.per).slice(0, 10)) console.log(show(r));
+}
+
 const csv = input.replace(/\.jsonl$/, "") + ".csv";
 const q = x => '"' + String(x).replace(/"/g, '""') + '"';
-fs.writeFileSync(csv, "file,kind,lines,verdict,language_gaps\n" +
-  rows.map(r => [r.f.split("\\").join("/"), r.k, r.lines, r.v.slice(2), r.lang.join("; ")].map(q).join(",")).join("\n") + "\n");
+fs.writeFileSync(csv, "file,kind,lines,ms,verdict,language_gaps\n" +
+  rows.map(r => [r.f.split("\\").join("/"), r.k, r.lines, r.ms ?? "", r.v.slice(2), r.lang.join("; ")].map(q).join(",")).join("\n") + "\n");
 console.log(`\nper-file results: ${csv}`);

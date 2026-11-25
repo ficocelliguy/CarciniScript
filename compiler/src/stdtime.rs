@@ -198,7 +198,12 @@ pub(crate) fn with_prelude(
         "ProcOutput",
         "ProcChild",
     ];
-    let os = os_names.iter().any(|n| text.contains(n))
+    // (`Path`'s methods that read the filesystem are the os prelude's.)
+    let path_fs = (has_word(text, "Path") || text.contains("PathBuf"))
+        && [".metadata(", ".symlink_metadata(", ".read_dir(", ".read_link(", ".canonicalize("]
+            .iter()
+            .any(|m| text.contains(m));
+    let os = (path_fs || os_names.iter().any(|n| text.contains(n)))
         && !text.contains("// (os prelude)")
         && !declares("FsFile");
     // (`use std::io::Write;` alone stays as written: its methods on a `Vec<u8>` need the impl.)
@@ -363,9 +368,8 @@ pub(crate) fn with_prelude(
     {
         out.push(TASK);
     }
-    // (`PhantomData`, `std::path`, which `DirEntry::path()` returns.)
-    let dir_entries = os && (text.contains("FsDirEntry") || text.contains("__fs_read_dir"));
-    out.extend(crate::stdgaps::preludes(text, dir_entries));
+    // (`PhantomData`, `std::path`: the os prelude's `impl PathBuf`, `DirEntry::path()`.)
+    out.extend(crate::stdgaps::preludes(text, os));
     if out.is_empty() {
         return None;
     }

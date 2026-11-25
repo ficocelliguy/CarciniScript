@@ -334,3 +334,25 @@ impl __OsPush for String {
         self.push_str(&p.__path_str());
     }
 }
+
+/// `OsStr::from_bytes(b)` (`std::os::unix::ffi::OsStrExt`; a pre-pass renames the call): the
+/// bytes as UTF-8, invalid sequences replaced with U+FFFD.
+pub fn __os_from_bytes(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+/// `OsString::from_vec(v)` (`std::os::unix::ffi::OsStringExt`), as `__os_from_bytes`.
+pub fn __os_from_vec(v: Vec<u8>) -> String {
+    String::from_utf8_lossy(&v).into_owned()
+}
+
+/// `OsString::into_vec()` (`std::os::unix::ffi::OsStringExt`).
+pub trait __OsStringExt {
+    fn into_vec(self) -> Vec<u8>;
+}
+
+impl __OsStringExt for String {
+    fn into_vec(self) -> Vec<u8> {
+        self.into_bytes()
+    }
+}

@@ -131,6 +131,27 @@ impl FsMetadata {
     pub fn is_symlink(&self) -> bool {
         false
     }
+    pub fn file_type(&self) -> FsFileType {
+        FsFileType { __kind: 0 }
+    }
+}
+
+/// `std::fs::FileType`: never made (`Metadata` and `DirEntry` aren't).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FsFileType {
+    __kind: u8,
+}
+
+impl FsFileType {
+    pub fn is_file(&self) -> bool {
+        self.__kind == 1
+    }
+    pub fn is_dir(&self) -> bool {
+        self.__kind == 2
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.__kind == 3
+    }
 }
 
 /// `std::fs::DirEntry`: never made (`fs::read_dir` fails).
@@ -149,6 +170,9 @@ impl FsDirEntry {
     pub fn metadata(&self) -> Result<FsMetadata, IoError> {
         Err(__fs_unsupported("DirEntry::metadata"))
     }
+    pub fn file_type(&self) -> Result<FsFileType, IoError> {
+        Err(__fs_unsupported("DirEntry::file_type"))
+    }
 }
 
 pub fn __fs_read_to_string<P>(_path: P) -> Result<String, IoError> {
@@ -165,6 +189,18 @@ pub fn __fs_metadata<P>(_path: P) -> Result<FsMetadata, IoError> {
 
 pub fn __fs_read_dir<P>(_path: P) -> Result<std::vec::IntoIter<Result<FsDirEntry, IoError>>, IoError> {
     Err(__fs_not_found("fs::read_dir"))
+}
+
+pub fn __fs_symlink_metadata<P>(_path: P) -> Result<FsMetadata, IoError> {
+    Err(__fs_not_found("fs::symlink_metadata"))
+}
+
+pub fn __fs_read_link<P>(_path: P) -> Result<PathBuf, IoError> {
+    Err(__fs_not_found("fs::read_link"))
+}
+
+pub fn __fs_canonicalize<P>(_path: P) -> Result<PathBuf, IoError> {
+    Err(__fs_not_found("fs::canonicalize"))
 }
 
 pub fn __fs_exists<P>(_path: P) -> Result<bool, IoError> {
@@ -201,6 +237,25 @@ pub fn __fs_copy<P, Q>(_from: P, _to: Q) -> Result<u64, IoError> {
 
 pub fn __fs_rename<P, Q>(_from: P, _to: Q) -> Result<(), IoError> {
     Err(__fs_unsupported("fs::rename"))
+}
+
+/// `Path`'s methods that read the filesystem: they fail like `fs::metadata` and the rest.
+impl PathBuf {
+    pub fn metadata(&self) -> Result<FsMetadata, IoError> {
+        Err(__fs_not_found("Path::metadata"))
+    }
+    pub fn symlink_metadata(&self) -> Result<FsMetadata, IoError> {
+        Err(__fs_not_found("Path::symlink_metadata"))
+    }
+    pub fn read_dir(&self) -> Result<std::vec::IntoIter<Result<FsDirEntry, IoError>>, IoError> {
+        Err(__fs_not_found("Path::read_dir"))
+    }
+    pub fn read_link(&self) -> Result<PathBuf, IoError> {
+        Err(__fs_not_found("Path::read_link"))
+    }
+    pub fn canonicalize(&self) -> Result<PathBuf, IoError> {
+        Err(__fs_not_found("Path::canonicalize"))
+    }
 }
 
 fn __proc_unsupported(what: &str) -> IoError {

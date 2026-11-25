@@ -120,6 +120,62 @@ struct Walker<'a> {
     ref_params: HashMap<(Option<String>, String), (Option<bool>, Vec<bool>)>,
     /// Struct fields declared `String` or `Box<..>`, by struct and field name (or tuple index).
     owned_fields: HashSet<(String, String)>,
+    /// The same for enum variants, by variant name: whether every variant of that name agrees.
+    owned_variant_fields: HashMap<(String, String), bool>,
+    /// Functions whose return type holds an owned `String` (`String`, `Option<String>`, ..).
+    string_fns: HashSet<(Option<String>, String)>,
+    /// Tracked bindings whose strings are `String`s, not `&str`s (types alone don't tell): a
+    /// string bound out of them by a pattern moves.
+    strings: HashSet<Decl>,
+    /// Closures that moved a capture, by where they start: where the capture is used in them.
+    closure_uses: HashMap<usize, usize>,
+    /// Pattern bindings that moved part of a value, by where they are: the moved part's type.
+    pattern_moves: HashMap<usize, (String, Option<String>)>,
+    /// While reading the binding under a field taken by value (`let w = p.v;`): a use of a
+    /// moved field there is a use, not a borrow.
+    field_by_value: bool,
+}
+
+/// How a pattern binding moves (part of) the value it destructures.
+const BY_PATTERN: &str = "by binding it in a pattern";
+/// How a closure that uses a capture by value takes it.
+const INTO_CLOSURE: &str = "into a closure";
+const INTO_MOVE_CLOSURE: &str = "into a `move` closure";
+
+/// A pattern move: the binding moved out of, where, the part's type and field (`top_field`),
+/// and the fields moved (`None`: the whole value).
+type PatMove = (Decl, usize, (String, Option<String>), Option<HashSet<String>>);
+
+/// What a destructuring pattern matches (see `Walker::binds_move`).
+#[derive(Clone, Copy)]
+struct PatCtx {
+    /// The value's strings are `String`s (a tracked binding in `Walker::strings`).
+    strings: bool,
+    /// A binding whose type isn't known moves.
+    unknown_moves: bool,
+}
+
+/// Whether `t` has a string in it (a `String`, when the value is known to own its strings).
+fn has_str(t: &Ty) -> bool {
+    match t {
+        Ty::Str => true,
+        Ty::Option(x) => has_str(x),
+        Ty::Result(a, b) => has_str(a) || has_str(b),
+        Ty::Tuple(es) => es.iter().any(has_str),
+        _ => false,
+    }
+}
+
+/// Whether a declared type certainly holds an owned `String`: `String`, `Option<String>`,
+/// `Result<String, E>`, a tuple with one; no references, functions or trait objects.
+fn string_ty(t: &str) -> bool {
+    let has_word = t.match_indices("String").any(|(i, _)| {
+        !t[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_')
+            && !t[i + 6..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+    });
+    has_word
+        && ["String", "Option<", "Result<", "("].iter().any(|p| t.starts_with(p))
+        && !["&", "fn(", "Fn", "impl ", "dyn "].iter().any(|x| t.contains(x))
 }
 
 /// Where `break`/`continue` go: the states they leave with.
@@ -142,11 +198,20 @@ pub fn check(
 ) -> (Vec<RawDiag>, HashSet<(usize, usize)>) {
     let mut fns = HashMap::new();
     let mut ref_params = HashMap::new();
+    let mut string_fns: HashMap<(Option<String>, String), bool> = HashMap::new();
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         let Some(n) = f.name() else { continue };
         let owned = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| {
             !t.syntax().text().contains_char('&') && !matches!(t, ast::Type::ImplTraitType(_))
         });
+        let string = f
+            .ret_type()
+            .and_then(|r| r.ty())
+            .is_some_and(|t| string_ty(&t.syntax().text().to_string()));
+        string_fns
+            .entry((impl_of(&f), n.text().to_string()))
+            .and_modify(|s| *s &= string)
+            .or_insert(string);
         // Same-named functions that disagree (in different modules) aren't trusted.
         fns.entry((impl_of(&f), n.text().to_string()))
             .and_modify(|o| *o &= owned)
@@ -207,6 +272,31 @@ pub fn check(
             None => {}
         }
     }
+    let mut owned_variant_fields: HashMap<(String, String), bool> = HashMap::new();
+    for v in file.syntax().descendants().filter_map(ast::Variant::cast) {
+        let Some(vn) = v.name().map(|n| n.text().to_string()) else {
+            continue;
+        };
+        let fields: Vec<(String, Option<ast::Type>)> = match v.field_list() {
+            Some(ast::FieldList::RecordFieldList(l)) => l
+                .fields()
+                .filter_map(|f| Some((f.name()?.text().to_string(), f.ty())))
+                .collect(),
+            Some(ast::FieldList::TupleFieldList(l)) => l
+                .fields()
+                .enumerate()
+                .map(|(i, f)| (i.to_string(), f.ty()))
+                .collect(),
+            None => Vec::new(),
+        };
+        for (f, t) in fields {
+            let owned = owned_ty(t);
+            owned_variant_fields
+                .entry((vn.clone(), f))
+                .and_modify(|o| *o &= owned)
+                .or_insert(owned);
+        }
+    }
     let mut w = Walker {
         src,
         types,
@@ -226,6 +316,12 @@ pub fn check(
         move_sites: HashSet::new(),
         ref_params,
         owned_fields,
+        owned_variant_fields,
+        string_fns: string_fns.into_iter().filter(|(_, s)| *s).map(|(k, _)| k).collect(),
+        strings: HashSet::new(),
+        closure_uses: HashMap::new(),
+        pattern_moves: HashMap::new(),
+        field_by_value: false,
     };
     for f in file.syntax().descendants().filter_map(ast::Fn::cast) {
         if !crate::adt::test_only(f.syntax()) {
@@ -279,6 +375,16 @@ impl Walker<'_> {
         declared || self.owned_fields.contains(&(n, field))
     }
 
+    /// The type of the binding `d`'s struct field `field`, as rustc writes it.
+    fn field_ty(&self, d: Decl, field: &str) -> Option<String> {
+        let Some(Ty::Adt(n, _)) = self.types.get(&d) else {
+            return None;
+        };
+        let def = self.adts.defs.get(n).filter(|d| !d.is_enum)?;
+        let (_, fd) = def.variants.first()?.field(field)?;
+        Some(fd.ty.describe())
+    }
+
     /// Whether values of `t` are moved (not copied) by assignment.
     fn moves(&self, t: &Ty) -> bool {
         match t {
@@ -313,7 +419,10 @@ impl Walker<'_> {
                 let text = t.syntax().text().to_string();
                 let owned = !text.contains('&')
                     && !matches!(t, ast::Type::ImplTraitType(_))
-                    && (self.ty(n.syntax()).is_some_and(|ty| self.moves(ty)) || text == "String");
+                    && (self.ty(n.syntax()).is_some_and(|ty| self.moves(ty)) || string_ty(&text));
+                if owned && string_ty(&text) {
+                    self.strings.insert(decl);
+                }
                 self.declare(&n, decl, owned);
                 self.soft_closure(&n, decl, owned);
             }
@@ -373,14 +482,15 @@ impl Walker<'_> {
 
     /// What destructuring with `p` moves out of the value: `Some(fields)` names the top-level
     /// fields (empty when nothing moves), `None` is the whole value (or fields we can't name).
-    fn moved_fields(&self, p: &ast::Pat) -> Option<HashSet<String>> {
+    /// `how` says what the value is (see `binds_move`).
+    fn moved_fields(&self, p: &ast::Pat, how: PatCtx) -> Option<HashSet<String>> {
         let elems = |fields: Vec<ast::Pat>| {
             let rest = fields
                 .iter()
                 .position(|f| matches!(f, ast::Pat::RestPat(_)));
             let mut out = HashSet::new();
             for (i, f) in fields.iter().enumerate() {
-                if self.binds_move(f) {
+                if self.binds_move(f, how) {
                     // (After a `..` the index depends on the arity.)
                     if rest.is_some_and(|r| i > r) {
                         return None;
@@ -391,7 +501,7 @@ impl Walker<'_> {
             Some(out)
         };
         match p {
-            ast::Pat::ParenPat(pp) => pp.pat().and_then(|i| self.moved_fields(&i)),
+            ast::Pat::ParenPat(pp) => pp.pat().and_then(|i| self.moved_fields(&i, how)),
             ast::Pat::RecordPat(rp) => {
                 let mut out = HashSet::new();
                 for f in rp
@@ -402,7 +512,7 @@ impl Walker<'_> {
                     let (Some(name), Some(sub)) = (f.field_name(), f.pat()) else {
                         continue;
                     };
-                    if self.binds_move(&sub) {
+                    if self.binds_move(&sub, how) {
                         out.insert(name.text().to_string());
                     }
                 }
@@ -410,30 +520,150 @@ impl Walker<'_> {
             }
             ast::Pat::TupleStructPat(tp) => elems(tp.fields().collect()),
             ast::Pat::TuplePat(tp) => elems(tp.fields().collect()),
-            other if self.binds_move(other) => None,
+            other if self.binds_move(other, how) => None,
             _ => Some(HashSet::new()),
         }
     }
 
     /// Whether `p` binds a value that moves by value (not by `ref`, nor through a `&` pattern).
-    fn binds_move(&self, p: &ast::Pat) -> bool {
+    fn binds_move(&self, p: &ast::Pat, how: PatCtx) -> bool {
+        self.move_binding(p, how).is_some()
+    }
+
+    /// The first binding in `p` that moves its part of the value, and that part's type.
+    fn move_binding(&self, p: &ast::Pat, how: PatCtx) -> Option<(ast::Name, String)> {
         p.syntax()
             .descendants()
             .filter_map(ast::IdentPat::cast)
-            .any(|ip| {
-                ip.ref_token().is_none()
-                    && !ip
+            .find_map(|ip| {
+                if ip.ref_token().is_some()
+                    || ip
                         .syntax()
                         .ancestors()
                         .take_while(|a| a != p.syntax())
                         .any(|a| ast::RefPat::can_cast(a.kind()))
-                    && !ast::RefPat::can_cast(p.syntax().kind())
-                    && ip.name().is_some_and(|n| match self.ty(n.syntax()) {
-                        Some(t) => self.moves(t),
-                        // (Unknown: as before, assume it moves.)
-                        None => true,
-                    })
+                    || ast::RefPat::can_cast(p.syntax().kind())
+                {
+                    return None;
+                }
+                let n = ip.name()?;
+                let t = self.ty(n.syntax());
+                let moves = match t {
+                    Some(t) => {
+                        self.moves(t)
+                            || (how.strings && has_str(t))
+                            || (*t == Ty::Str && self.owned_field_binding(&ip))
+                    }
+                    // (Unknown: as before, assume it moves, where the caller says so.)
+                    None => how.unknown_moves,
+                };
+                moves.then(|| (n, t.map_or_else(|| "String".into(), Ty::describe)))
             })
+    }
+
+    /// Whether `ip` binds a struct's or variant's field declared `String` / `Box<..>`
+    /// (`P { name, .. }`, `Cmd::Say(text)`).
+    fn owned_field_binding(&self, ip: &ast::IdentPat) -> bool {
+        let Some(parent) = ip.syntax().parent() else {
+            return false;
+        };
+        let last = |p: Option<ast::Path>| {
+            p.and_then(|p| p.segment()?.name_ref())
+                .map(|n| n.text().to_string())
+        };
+        let (owner, field) = if let Some(f) = ast::RecordPatField::cast(parent.clone()) {
+            let Some(rp) = f.syntax().ancestors().find_map(ast::RecordPat::cast) else {
+                return false;
+            };
+            let name = match f.field_name() {
+                Some(n) => n.text().to_string(),
+                None => return false,
+            };
+            (last(rp.path()), name)
+        } else if let Some(tp) = ast::TupleStructPat::cast(parent) {
+            let fields: Vec<ast::Pat> = tp.fields().collect();
+            let Some(i) = fields.iter().position(|f| f.syntax() == ip.syntax()) else {
+                return false;
+            };
+            // (After a `..` the index depends on the arity.)
+            if fields[..i].iter().any(|f| matches!(f, ast::Pat::RestPat(_))) {
+                return false;
+            }
+            (last(tp.path()), i.to_string())
+        } else {
+            return false;
+        };
+        let Some(owner) = owner else { return false };
+        let key = (owner, field);
+        match self.adts.defs.get(&key.0) {
+            Some(d) if !d.is_enum => self.owned_fields.contains(&key),
+            _ => self.owned_variant_fields.get(&key) == Some(&true),
+        }
+    }
+
+    /// What a pattern destructures: whether its strings are `String`s, and whether to assume
+    /// a binding of an unknown type moves.
+    fn pat_ctx(&self, scrutinee: Option<&ast::Expr>, unknown_moves: bool) -> PatCtx {
+        let strings = scrutinee
+            .and_then(|e| self.binding_of(e))
+            .is_some_and(|d| self.strings.contains(&d));
+        PatCtx {
+            strings,
+            unknown_moves,
+        }
+    }
+
+    /// The binding a plain path expression (`x`, `(x)`) names.
+    fn binding_of(&self, e: &ast::Expr) -> Option<Decl> {
+        let ast::Expr::PathExpr(p) = strip(e) else {
+            return None;
+        };
+        self.lookup(p.path()?.as_single_name_ref()?.text().to_string().as_str())
+    }
+
+    /// What a `match` arm's or `if let`'s pattern moves out of a tracked binding it matches:
+    /// the binding, where (the pattern binding that moved), the part's type, and the fields
+    /// (`None`: the whole value).
+    fn pattern_move(
+        &self,
+        p: &ast::Pat,
+        scrutinee: &ast::Expr,
+    ) -> Option<PatMove> {
+        let d = self.binding_of(scrutinee)?;
+        if !self.tracked.contains(&d) {
+            return None;
+        }
+        let how = self.pat_ctx(Some(scrutinee), false);
+        let fields = self.moved_fields(p, how);
+        if fields.as_ref().is_some_and(|f| f.is_empty()) {
+            return None;
+        }
+        let (n, t) = self.move_binding(p, how)?;
+        let field = top_field(self.adts, p, &n);
+        Some((d, self.range(n.syntax()).0, (t, field), fields))
+    }
+
+    /// Record a move that `pattern_move` found.
+    fn apply_pattern_move(
+        &mut self,
+        m: Option<PatMove>,
+        st: &mut State,
+    ) {
+        let Some((d, at, t, fields)) = m else { return };
+        if st.unreachable || (st.moved.contains_key(&d) && !st.partial.contains_key(&d)) {
+            return;
+        }
+        self.pattern_moves.insert(at, t);
+        match fields {
+            Some(f) => {
+                st.moved.entry(d).or_insert((at, BY_PATTERN));
+                st.partial.entry(d).or_default().extend(f);
+            }
+            None => {
+                st.moved.insert(d, (at, BY_PATTERN));
+                st.partial.remove(&d);
+            }
+        }
     }
 
     /// Whether `init` certainly produces an owned value (so the binding owns it).
@@ -468,6 +698,12 @@ impl Walker<'_> {
                             ) && matches!(f.as_str(), "new" | "from" | "with_capacity") =>
                         {
                             true
+                        }
+                        // `Path::new(..)` (the path prelude's `PathBuf::__new` by now): a `&Path`.
+                        [.., t, f] if t == "PathBuf" && f == "__new" => false,
+                        // `Some(v)`, `Ok(s)`: owned when what they wrap is.
+                        [f] if matches!(f.as_str(), "Some" | "Ok" | "Err") => {
+                            self.wrapped(&c).is_some_and(|a| self.owned_init(&a))
                         }
                         // A tuple struct.
                         [f] if self.adts.defs.contains_key(f.as_str()) => true,
@@ -557,8 +793,15 @@ impl Walker<'_> {
                 .map(|r| &r[..r.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(r.len())])
                 .filter(|f| !f.is_empty() && !self.src[at.1 + 1 + f.len()..].trim_start().starts_with(['(', ':']));
             let field_read = field.is_some_and(|f| !self.src[at.1 + 1 + f.len()..].starts_with('.'));
-            let verb = if matches!(mode, Mode::Use) && !field_read { "borrow" } else { "use" };
             let moved_field = field.filter(|f| st.partial.get(&decl).is_some_and(|m| m.contains(*f)));
+            // (A moved field isn't `Copy`: reading it in place borrows it.)
+            let verb = if matches!(mode, Mode::Use)
+                && (!field_read || (moved_field.is_some() && !self.field_by_value))
+            {
+                "borrow"
+            } else {
+                "use"
+            };
             let at = match field {
                 Some(f) if field_read || moved_field.is_some() => (at.0, at.1 + 1 + f.len()),
                 _ => at,
@@ -575,6 +818,32 @@ impl Walker<'_> {
                 );
                 spans.push((decl.0, decl.1, why));
             }
+            // (Moved by a pattern binding: the part's type, which rustc gives in a note.)
+            if (how == BY_PATTERN || how == INTO_CLOSURE)
+                && st.partial.contains_key(&decl)
+                && let Some((t, top)) = self.pattern_moves.get(&moved_at)
+            {
+                let why = match (moved_field, top) {
+                    (Some(f), _) => format!(
+                        "move occurs because `{n}.{f}` has type `{t}`, which does not implement the `Copy` trait"
+                    ),
+                    (None, Some(f)) => format!(
+                        "partial move occurs because `{n}.{f}` has type `{t}`, which does not implement the `Copy` trait"
+                    ),
+                    (None, None) => format!(
+                        "partial move occurs because value has type `{t}`, which does not implement the `Copy` trait"
+                    ),
+                };
+                spans.push((moved_at, moved_at, why));
+            }
+            // (Moved into a closure: where the closure uses it.)
+            let how = match self.closure_uses.get(&moved_at) {
+                Some(&u) if how == INTO_CLOSURE || how == INTO_MOVE_CLOSURE => {
+                    let (ul, uc) = idx.line_col(u);
+                    format!("{how}, by its use on line {}:{}", ul + 1, uc + 1)
+                }
+                _ => how.to_string(),
+            };
             self.diags.push(RawDiag {
                 start: at.0,
                 end: at.1,
@@ -592,7 +861,7 @@ impl Walker<'_> {
                     format!("{verb} of moved value: `{n}` (moved here {how} in the loop's previous iteration; `.clone()` it to keep a copy)")
                 } else if let Some(f) = moved_field {
                     format!(
-                        "use of moved value: `{n}.{f}` (moved on line {}:{} {how}; `.clone()` it there to keep a copy)",
+                        "{verb} of moved value: `{n}.{f}` (moved on line {}:{} {how}; `.clone()` it there to keep a copy)",
                         l + 1,
                         c + 1
                     )
@@ -649,9 +918,10 @@ impl Walker<'_> {
         let pat = l.pat();
         // A destructuring pattern moves only the fields it binds by value, and only when their
         // values move (`let S { x, .. } = s;` with a `Copy` `x` leaves `s` whole).
+        let how = self.pat_ctx(init.as_ref(), true);
         let moved_fields = match &pat {
             Some(ast::Pat::IdentPat(ip)) if ip.pat().is_none() => None,
-            Some(p) => Some(self.moved_fields(p)),
+            Some(p) => Some(self.moved_fields(p, how)),
             None => None,
         };
         if let Some(e) = &init {
@@ -671,6 +941,14 @@ impl Walker<'_> {
                     .is_some_and(|m| m.0 == self.range(p.syntax()).0)
             {
                 st.partial.insert(d, f.clone());
+                // (rustc points at the binding that took the field.)
+                if let Some(p) = &pat
+                    && let Some((n, t)) = self.move_binding(p, how)
+                {
+                    let at = self.range(n.syntax()).0;
+                    self.pattern_moves.insert(at, (t, top_field(self.adts, p, &n)));
+                    st.moved.insert(d, (at, BY_PATTERN));
+                }
             }
         }
         if let Some(le) = l.let_else()
@@ -684,15 +962,20 @@ impl Walker<'_> {
             ast::Pat::IdentPat(ip) if ip.pat().is_none() && ip.ref_token().is_none() => {
                 let Some(n) = ip.name() else { return };
                 let decl = self.range(n.syntax());
-                let typed_string = l.ty().is_some_and(|t| t.syntax().text() == "String");
+                let typed_string = l
+                    .ty()
+                    .is_some_and(|t| string_ty(&t.syntax().text().to_string()));
+                let string = typed_string || init.as_ref().is_some_and(|e| self.owned_string(e));
                 let owned = match &init {
                     Some(e) => {
                         self.owned_init(e)
-                            && (self.ty(n.syntax()).is_some_and(|t| self.moves(t))
-                                || (typed_string || self.owned_string(e)))
+                            && (self.ty(n.syntax()).is_some_and(|t| self.moves(t)) || string)
                     }
-                    None => self.ty(n.syntax()).is_some_and(|t| self.moves(t)),
+                    None => self.ty(n.syntax()).is_some_and(|t| self.moves(t)) || typed_string,
                 };
+                if owned && string {
+                    self.strings.insert(decl);
+                }
                 self.declare(&n, decl, owned);
                 self.soft_closure(&n, decl, owned);
                 st.moved.remove(&decl);
@@ -714,18 +997,66 @@ impl Walker<'_> {
                 .macro_call()
                 .and_then(|mc| macros::macro_name(&mc))
                 .is_some_and(|n| n == "format"),
-            ast::Expr::CallExpr(_) => {
+            ast::Expr::CallExpr(c) => {
                 let t = e.syntax().text().to_string();
-                t.starts_with("String::")
+                if t.starts_with("String::") {
+                    return true;
+                }
+                // (Not `Ok(s)` / `Err(s)`: the other side may hold a `&str`.)
+                if let Some(a) = self.wrapped(&c)
+                    && t.starts_with("Some")
+                {
+                    return self.owned_string(&a);
+                }
+                // A function of the file returning one (`-> Option<String>`).
+                let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+                    return false;
+                };
+                let segs: Vec<String> = p
+                    .path()
+                    .map(|p| {
+                        p.segments()
+                            .filter_map(|s| s.name_ref())
+                            .map(|n| n.text().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let key = match segs.as_slice() {
+                    [f] => (None, f.clone()),
+                    [.., t, f] if t == "Self" => (self.cur_impl.clone(), f.clone()),
+                    [.., t, f] => (Some(t.clone()), f.clone()),
+                    [] => return false,
+                };
+                self.string_fns.contains(&key)
             }
             ast::Expr::MethodCallExpr(m) => m.name_ref().is_some_and(|n| {
                 matches!(
                     n.text().to_string().as_str(),
                     "to_string" | "to_owned" | "to_uppercase" | "to_lowercase"
+                ) || matches!(
+                    m.receiver().and_then(|r| self.ty(r.syntax()).cloned()),
+                    Some(Ty::Adt(t, _)) if self.string_fns.contains(&(Some(t.clone()), n.text().to_string()))
                 )
             }),
+            ast::Expr::PathExpr(_) => self
+                .binding_of(e)
+                .is_some_and(|d| self.tracked.contains(&d) && self.strings.contains(&d)),
             _ => false,
         }
+    }
+
+    /// What `Some(x)` / `Ok(x)` / `Err(x)` wraps.
+    fn wrapped(&self, c: &ast::CallExpr) -> Option<ast::Expr> {
+        let ast::Expr::PathExpr(p) = c.expr()? else {
+            return None;
+        };
+        let name = p.path()?.as_single_name_ref()?.text().to_string();
+        if !matches!(name.as_str(), "Some" | "Ok" | "Err") {
+            return None;
+        }
+        let mut args = c.arg_list()?.args();
+        let a = args.next()?;
+        args.next().is_none().then_some(a)
     }
 
     /// Which arguments of the call `c` go to parameters declared `&T` (borrowed, not moved):
@@ -890,6 +1221,7 @@ impl Walker<'_> {
                                 {
                                     self.assign_deferred(d, self.range(p.syntax()), st);
                                     st.moved.remove(&d);
+                                    st.partial.remove(&d);
                                 }
                             }
                             // `p.a = ..` after `p.a` moved gives the field a value again.
@@ -984,7 +1316,10 @@ impl Walker<'_> {
                 if let Some(x) = f.expr()
                     && !kept
                 {
+                    let by_value = matches!(mode, Mode::Move(_)) && matches!(strip(&x), ast::Expr::PathExpr(_));
+                    let saved = std::mem::replace(&mut self.field_by_value, by_value);
                     self.expr(&x, st, Mode::Use);
+                    self.field_by_value = saved;
                 }
                 // `let a = p.a;` moves only that field: `p` is partly moved.
                 if let Mode::Move(how) = mode
@@ -1123,8 +1458,11 @@ impl Walker<'_> {
                 let mut then_st = st.clone();
                 self.scopes.push(HashMap::new());
                 if let Some(c) = i.condition() {
-                    for le in c.syntax().descendants().filter_map(ast::LetExpr::cast) {
+                    for le in let_chain(&c) {
                         if let Some(p) = le.pat() {
+                            // `if let Some(x) = o` moves out of `o` when `x` takes a `String`, ..
+                            let m = le.expr().and_then(|s| self.pattern_move(&p, &s));
+                            self.apply_pattern_move(m, &mut then_st);
                             self.bind_pattern(&p);
                         }
                     }
@@ -1148,15 +1486,23 @@ impl Walker<'_> {
                     self.expr(&s, st, Mode::Use);
                 }
                 let mut out: Option<State> = None;
+                let scrutinee = mx.expr();
                 for arm in mx.match_arm_list().into_iter().flat_map(|l| l.arms()) {
                     let mut s2 = st.clone();
                     self.scopes.push(HashMap::new());
+                    // (Looked up before the arm's own bindings, which may shadow it.)
+                    let m = arm
+                        .pat()
+                        .zip(scrutinee.as_ref())
+                        .and_then(|(p, s)| self.pattern_move(&p, s));
                     if let Some(p) = arm.pat() {
                         self.bind_pattern(&p);
                     }
                     if let Some(g) = arm.guard().and_then(|g| g.condition()) {
                         self.expr(&g, &mut s2, Mode::Use);
                     }
+                    // The arm's by-value bindings move out of the value once the arm is taken.
+                    self.apply_pattern_move(m, &mut s2);
                     if let Some(b) = arm.expr() {
                         self.expr(&b, &mut s2, mode);
                     }
@@ -1181,8 +1527,10 @@ impl Walker<'_> {
                     me.scopes.push(HashMap::new());
                     if let Some(c) = &cond {
                         me.condition(c, s);
-                        for le in c.syntax().descendants().filter_map(ast::LetExpr::cast) {
+                        for le in let_chain(c) {
                             if let Some(p) = le.pat() {
+                                let m = le.expr().and_then(|x| me.pattern_move(&p, &x));
+                                me.apply_pattern_move(m, s);
                                 me.bind_pattern(&p);
                             }
                         }
@@ -1249,11 +1597,58 @@ impl Walker<'_> {
                     .filter_map(|n| self.lookup(n.text().to_string().as_str()))
                     .collect();
                 self.scopes.pop();
-                if moves_captures && !st.unreachable {
-                    let at = self.range(c.syntax()).0;
-                    for d in captured {
-                        if self.tracked.contains(&d) && self.lookup_is_outer(d) {
-                            st.moved.insert(d, (at, "into a `move` closure"));
+                if st.unreachable {
+                    return;
+                }
+                let at = self.range(c.syntax());
+                let first_use = |me: &Self, d: Decl| {
+                    body.syntax()
+                        .descendants()
+                        .filter_map(ast::PathExpr::cast)
+                        .find(|p| {
+                            p.path()
+                                .and_then(|p| p.as_single_name_ref())
+                                .and_then(|n| me.lookup(n.text().to_string().as_str()))
+                                == Some(d)
+                        })
+                        .map(|p| me.range(p.syntax()).0)
+                };
+                for d in captured {
+                    if !self.tracked.contains(&d) || !self.lookup_is_outer(d) {
+                        continue;
+                    }
+                    if moves_captures {
+                        if let Some(u) = first_use(self, d) {
+                            self.closure_uses.insert(at.0, u);
+                        }
+                        st.moved.insert(d, (at.0, INTO_MOVE_CLOSURE));
+                        st.partial.remove(&d);
+                        continue;
+                    }
+                    // Without `move`, a capture the body moves (`drop(s)`, `s.into_bytes()`)
+                    // is taken by value: it moves into the closure where the closure is made.
+                    let Some(&(u, _)) = inner.moved.get(&d) else {
+                        continue;
+                    };
+                    if !(at.0..at.1).contains(&u) || st.moved.get(&d) == inner.moved.get(&d) {
+                        continue;
+                    }
+                    self.closure_uses.insert(at.0, u);
+                    match inner.partial.get(&d) {
+                        // (A field moved in the body: only that field is captured, by value.)
+                        Some(f) => {
+                            // (The field's type, for rustc's note.)
+                            if let Some(name) = f.iter().min()
+                                && let Some(t) = self.field_ty(d, name)
+                            {
+                                self.pattern_moves.insert(at.0, (t, Some(name.clone())));
+                            }
+                            st.moved.entry(d).or_insert((at.0, INTO_CLOSURE));
+                            st.partial.entry(d).or_default().extend(f.iter().cloned());
+                        }
+                        None => {
+                            st.moved.insert(d, (at.0, INTO_CLOSURE));
+                            st.partial.remove(&d);
                         }
                     }
                 }
@@ -1402,6 +1797,49 @@ fn impl_of(f: &ast::Fn) -> Option<String> {
         return None;
     }
     crate::adt::impl_parts(&imp).1
+}
+
+/// The field of a struct or tuple that the binding `n` takes, when it's one of `p`'s own fields
+/// (`P { name, .. }`, `(_, v)`), as rustc names the moved place (`p.name`).
+fn top_field(adts: &Adts, p: &ast::Pat, n: &ast::Name) -> Option<String> {
+    let ip = n.syntax().parent()?;
+    let parent = ip.parent()?;
+    match p {
+        ast::Pat::RecordPat(rp) => {
+            let s = rp.path()?.segment()?.name_ref()?.text().to_string();
+            adts.defs.get(&s).filter(|d| !d.is_enum)?;
+            let f = ast::RecordPatField::cast(parent)?;
+            (f.syntax().parent()?.parent()? == *rp.syntax()).then_some(())?;
+            Some(f.field_name()?.text().to_string())
+        }
+        ast::Pat::TuplePat(tp) if parent == *tp.syntax() => {
+            let fields: Vec<ast::Pat> = tp.fields().collect();
+            let i = fields.iter().position(|f| *f.syntax() == ip)?;
+            (!fields[..i].iter().any(|f| matches!(f, ast::Pat::RestPat(_)))).then(|| i.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The `let`s of an `if` / `while` condition (`let a = x && let b = y`), not those nested deeper.
+fn let_chain(c: &ast::Expr) -> Vec<ast::LetExpr> {
+    match c {
+        ast::Expr::LetExpr(le) => vec![le.clone()],
+        ast::Expr::ParenExpr(p) => p.expr().map(|i| let_chain(&i)).unwrap_or_default(),
+        ast::Expr::BinExpr(b)
+            if matches!(
+                b.op_kind(),
+                Some(ast::BinaryOp::LogicOp(ast::LogicOp::And))
+            ) =>
+        {
+            [b.lhs(), b.rhs()]
+                .into_iter()
+                .flatten()
+                .flat_map(|x| let_chain(&x))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn strip(e: &ast::Expr) -> ast::Expr {

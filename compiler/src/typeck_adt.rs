@@ -2774,6 +2774,7 @@ impl Checker<'_> {
         if let Some(sig) = self.adts.method(adt, method).cloned()
             && sig.receiver.is_some()
         {
+            self.note_trait_call(m, adt, method, &Ty::Adt(adt.to_string(), targs.to_vec()));
             let own_params = sig.type_params.len();
             let declared = sig.ret.clone();
             let sig = self.method_inst(&sig, Some(targs));

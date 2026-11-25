@@ -256,7 +256,9 @@ There is one JS thread, and scripts share it with the game.
 ## No OS
 
 - **`std::fs` and `process::Command` always fail**: there's no filesystem or process to reach.
-  Reading (`File::open`, `fs::read_to_string`, `fs::read`, `fs::metadata`, `fs::read_dir`) gives
+  Reading (`File::open`, `fs::read_to_string`, `fs::read`, `fs::metadata`, `fs::read_dir`,
+  `fs::read_link`, `fs::canonicalize`, and `Path`'s `metadata` / `read_dir` / `read_link` /
+  `canonicalize`) gives
   `ErrorKind::NotFound`, anything else (`File::create`, `fs::write`, `create_dir`, `remove_*`,
   `copy`, `rename`, `Command::output` / `status` / `spawn`) `Unsupported`, so programs that handle
   the error run; their messages say so (Rust's are the OS's). Use `ns.read` / `ns.write`.
@@ -275,6 +277,9 @@ There is one JS thread, and scripts share it with the game.
   `OsString` (`let s: OsString`, `OsString::from(..)`, `x.to_os_string()`, an `OsStr`'s
   `to_owned()`, a parameter); on a
   field or an element, `push` is `String`'s, which takes a `char`.
+  `std::os::unix::ffi`'s `OsStr::from_bytes` and `OsString::from_vec` read the bytes as UTF-8,
+  replacing invalid sequences with U+FFFD (a Unix `OsStr` keeps any bytes), so `as_bytes()` /
+  `into_vec()` may not give back what went in.
 - **`env!` is an error and `option_env!` `None`**, except for Cargo's own variables, which get
   placeholders (`CARGO_PKG_NAME` `"script"`, `CARGO_PKG_VERSION` `"0.1.0"`, `CARGO_MANIFEST_DIR`
   `"."`, the rest empty): a script isn't built by cargo.
@@ -325,10 +330,16 @@ There is one JS thread, and scripts share it with the game.
   when std hands it an item (`iter().map(..)`, `opt.map(..)`); use after move is `moves.rs`'s
   (see below). Such programs rustc rejects still run.
 - **Use after move is checked only where the checker is sure a local owns its value** (see
-  FEATURES). It misses moves out of fields by expression (`let v = s.items;` then `s.items`),
-  `match` / `if let` bindings that move, a `String` field bound by a `let` pattern (`let S {
-  name, .. } = s;` leaves `s` usable: a `String` field looks like a `&str` one here), and moves
-  into closures without `move`; those run with the JS value still shared.
+  FEATURES): one made in the function (a struct literal, `vec!`, `String::from`, `Some(..)` of
+  one, a call of a function declared to return an owned type) or a by-value parameter. A
+  `match` / `if let` / `while let` moves out of the value it matches only when that is such a
+  local named as is (`match o`, not `match self.o` or `match o.take()`), and a string bound out
+  of it counts as a `String` (a `&str` looks the same here) only when it is known to be one: a
+  field or variant field declared `String`, or a value whose strings are made in the function or
+  declared `String` (`Option<String>`). A `while let` that moves out of an owned value is
+  reported at the next iteration's read, where rustc points at the binding. A closure without
+  `move` that returns a capture as its value (`|| s`) isn't seen to take it. Those run with the
+  JS value still shared.
   Definite initialization is checked for `let x;` (use before assignment, assigning an immutable
   one twice); names declared by a `let (a, b);` pattern aren't checked yet.
 - **Type checking covers the supported subset only.** Within it, mismatches and mutability
@@ -634,6 +645,10 @@ There is one JS thread, and scripts share it with the game.
   is checked against, since traits are matched by their last path segment.
 - **A `&mut dyn fmt::Write` parameter is a type parameter**, so the function is generic over
   its writer; a `&mut dyn Write` struct field or closure parameter isn't supported.
+- **A trait's methods need the trait in scope, as in rustc, with two leniencies.** A `use`
+  inside a function body counts for its whole module, and a module with a macro call among its
+  items (which might write a `use`) isn't checked. A `mod` file's trait that isn't imported
+  gives "no method named .." without rustc's help to import it.
 
 ## Formatting
 

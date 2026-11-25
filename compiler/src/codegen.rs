@@ -784,6 +784,14 @@ pub(crate) fn overflow_checks() -> bool {
     OVERFLOW_CHECKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static TEST_CODE_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether `compile_with` also compiles a file with test code as a test build, for that code's
+/// errors as warnings (on by default; the corpus survey turns it off).
+pub fn set_test_code_checks(on: bool) {
+    TEST_CODE_CHECKS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// An integer kind's range as BigInt literals (JS compares them with numbers exactly).
 pub(crate) fn int_bounds(k: IntKind) -> (String, String) {
     let (min, max): (i128, u128) = match k {
@@ -814,7 +822,8 @@ pub fn compile_with(src: &str, filename: &str, resolver: typeck::Resolver) -> Co
     let mut out = compile_build(src, filename, resolver);
     // Errors in the test code, which only a test build compiles, as warnings: the script runs,
     // and the editor still marks them.
-    if crate::adt::has_test_code(src) {
+    if TEST_CODE_CHECKS.load(std::sync::atomic::Ordering::Relaxed) && crate::adt::has_test_code(src)
+    {
         let tests = compile_tests_with(src, filename, resolver);
         let file = crate::macros::parse_tree(src);
         for d in tests.diagnostics {
@@ -1014,6 +1023,7 @@ fn compile_text(
         let origin = typeck::Origin {
             map: map.clone(),
             len: original.len(),
+            src: original.into(),
         };
         let (types, type_diags) = typeck::check(&file, src, filename, resolver, &origin);
         cg.types = types;

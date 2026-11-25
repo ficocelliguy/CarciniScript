@@ -115,6 +115,7 @@ fn analyze_uncached(src: &str, filename: &str, resolver: Resolver) -> Analysis {
         let origin = typeck::Origin {
             map: Some(map.clone()),
             len: src.len(),
+            src: src.into(),
         };
         let (types, _) = typeck::check(&file, &text, filename, resolver, &origin);
         return Analysis {
@@ -126,6 +127,7 @@ fn analyze_uncached(src: &str, filename: &str, resolver: Resolver) -> Analysis {
     let origin = typeck::Origin {
         map: None,
         len: src.len(),
+        src: src.into(),
     };
     let with_time = crate::stdtime::with_prelude(src, filename, resolver, true);
     let src = with_time.as_deref().unwrap_or(src);

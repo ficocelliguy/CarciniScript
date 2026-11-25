@@ -166,11 +166,11 @@ encodes v3 JSON. Bitburner's existing inlining in `NetscriptJSEvaluator.ts` is u
 
 ## Real-world corpus survey
 
-Every `.rs` file in the local cargo registry (230 crates, 5,220 files after dropping parser and
-compile-fail fixtures) is compiled file by file, and each error is sorted into "missing crate or
+Every `.rs` file in the local cargo registry (235 crates, 5,428 files after dropping parser and
+compile-fail fixtures; 230 and 5,220 before 2026-11-25) is compiled file by file, and each error is sorted into "missing crate or
 module", "thread", "std library", or "language". Errors from names in other crates or other files of
 the same crate, and from threads, `Arc`, `Mutex` and atomics, don't count. Unresolved names don't
-hide later errors, so this is a fair per-file check. To run it: `npm run corpus` (about 5 minutes;
+hide later errors, so this is a fair per-file check. To run it: `npm run corpus` (about 10 minutes;
 results in the OS temp dir). Its three steps:
 - `tools/corpus-classify.mjs [root] [out.jsonl]` compiles each file and sorts each error (another
   crate or file, thread, std, language, parse, or uncategorized), with its byte range. A crate's
@@ -200,11 +200,25 @@ The classifier keys on the compiler's message wording, so a reworded diagnostic 
 its files into "uncategorized" (the 2026-11-22 run found `the standard library function ..`,
 `the iterator adapter ..` and `failed to resolve ..` that way, 800 files' worth). When the
 uncategorized count jumps, check the report's top messages before reading anything else into
-the numbers.
+the numbers. It happened again on 2026-11-25: `925963e` dropped the "yet" from `.. is not
+supported yet`, which moved about 1,000 files and put the headline at a false 86.0%; the
+classifier and the finer sort now match `not supported(?: yet)?`. The finer sort's "mismatched
+types" rules still read the old `expected X, found Y` text, so those 107 files sit in one
+`OTHER: mismatched types` bucket until they are re-keyed.
 
-**Latest run** (2026-11-24, working tree after `0310884`, same registry as before): language features all
-supported in **83.3%** of files (4,350 of 5,220; 71.1% counting std gaps, 67.0% by lines; 77
-crates pass in every file, 159 in 80% or more). Every per-file verdict is the same as the
+**Latest run** (2026-11-25, `0f371c8` built in a clean worktree; the registry has grown to 235
+crates and 5,428 files): language features all supported in **83.5%** of files (4,532 of 5,428;
+71.6% counting std gaps, 66.6% by lines; 80 crates pass in every file, 160 in 80% or more). On
+the 5,220 files both runs share, 4,360 are language-OK against 4,350 on 2026-11-24: 25 files
+improved (the `impl .. for Box<dyn ..>` / `Pin<P>` / `Option<T>` / `Formatter` work in `fc6a4ca`
+and `71241d5`: anyhow's kind.rs, futures-core, rayon's option.rs and result.rs, serde's ser,
+time's ext, tracing-core's field.rs, ..) and 15 changed verdict the other way without a compiler
+regression: 13 because raw-pointer casts now report as unsafe/memory, rand's uniform.rs (its
+`generics in this position` is now detected) and thiserror's test_generics.rs. 849 files have a
+language gap (683 unsafe/memory, 126 `union`, 58 proc-macro API, 70 `extern`: not planned), 645
+are std-only, 43 have only uncategorized errors, 4 a parse error. The run before (2026-11-24,
+working tree after `0310884`): 83.3% (4,350 of 5,220; 71.1% counting std gaps, 67.0% by lines;
+77 crates pass in every file, 159 in 80% or more), every per-file verdict the same as the
 2026-11-23 run (working tree after `0cab7c7` plus the `mod`-file type clash, blanket bound,
 `AsRef<[u8]>` and associated-iterator fixes), so the `#[test]` runner changed nothing here. The
 run before that (after `26e4143`): 83.0%
@@ -212,13 +226,49 @@ run before that (after `26e4143`): 83.0%
 that round's eight fixes; 82.9% on 2026-11-22, 81.8% on 2026-11-17, 67% at the first run on
 2026-11-16); counting std gaps, 70.6%; by lines, 66.6%. 827 files have a language gap (639 of
 them unsafe/memory, 126 `union`, 58 proc-macro API, 67 `extern`: not planned), 650 are std-only,
-50 have only uncategorized errors, 8 a parse error (2 more than before: serde's `de/impls.rs`,
-whose `atomic_impl!` failure a `forwarded_impl!` one used to hide; both fixed since). 76 crates
+50 have only uncategorized errors, 8 a parse error. 76 crates
 pass in every file; 156 in 80% or more. Every one of the ~90 feature probes compiles. The crash
 sweeps (registry 5,922 files, std 3,004) last ran on 2026-11-24 with 0 panics (2026-11-23 and
 2026-11-17 too). The slowest files there are windows-sys's `Windows/Win32/mod.rs` at 147 s and
 `Windows/mod.rs` at 121 s, nearly all of it their thousands of `mod` files, and stdarch's
 `core_arch/src/lib.rs` at 108 s.
+
+**Where the remaining gaps are** (2026-11-25, a "flip" pass over the run: for every file that
+isn't language-OK, the set of gaps in it, with memory, FFI, `union`, proc-macro, files,
+processes, sockets, env and threads treated as never fixable; 845 of the 1,797 failing files have
+only fixable gaps, and no single gap flips more than 30 of them, so the long tail is the shape).
+Ranked by files flipped when it is the file's only gap, each confirmed with a rustc-accepted
+probe (`q_*.rs` and the driver `probe-head.mjs` in the OS temp dir under
+`carciniscript-probes-2026-11-25/`, next to `flip.mjs` and `breakdown.mjs`):
+1. Dispatch through type parameters and associated types (74 files, 29 solo, 44 crates): a
+   method on a type parameter inside a macro expansion (either's `for_both!(self, inner =>
+   inner.next())`), `I::Item` / `<T as Tr>::Parser` / `Self::Value` projections in types and
+   `where` clauses, `T::CONST` and `T::f()` in `impl` methods with `self` (the `generics in this
+   position` row, 37 files), and methods of a bound on an associated type (`E::Engine`).
+2. Std trait methods called by name (45 files, 20 solo, 29 crates): `self.add(rhs)`, `x.shl(3)`,
+   `n.not()`, `s.deref()`, `buf.read(..)`, `Self::from` / `Duration::from(..)` as a path,
+   `Vec::default()` / `Box::default()`. The operators and `.into()` work; the method names don't.
+3. A file's own type that shares a name with a std or bundled type (27 files, 13 solo, plus the
+   hashbrown / indexmap / wasmparser files counted under the next two rows): env_logger's and
+   regex-syntax's `Formatter`, winnow's `Range`, jiff's `Error`, bumpalo's `String`, hashbrown's
+   `HashMap`, indexmap's `IndexSet<T, S>` (resolved to the bundled `IndexSet<T>`, so its own
+   fields and methods vanish). The local definition should win over the prelude and the models.
+4. Impls on std types and the derives that lean on them (25 + 26 files, 14 + 7 solo): `impl
+   Clone for Box<dyn Trait>` and then `#[derive(Clone)]` on a struct holding one, `impl Ext for
+   fmt::Formatter`, `impl Tr for Option<T>`, one trait implemented for both `str` and `String`
+   or `[T]` and `Vec<T>` with different bodies (today a hard error).
+5. `write!` into a generic or user `fmt::Write` sink, and `&mut` into a container held in a
+   local (`self.stack.last_mut()`, `&mut self.0` on an `Option` field) (10 files, all 10 solo).
+   Near ties: `include_str!` / `include_bytes!` of a sibling file (14 files, 11 solo;
+   compile-time, the `mod` loader already reads siblings), `Default::default()` for a field
+   whose type is a defaulted type parameter (`S = RandomState`), and `fmt::Alignment` /
+   `io::SeekFrom` as pattern constants.
+Two bigger buckets are not features: `.into()` with no annotation (58 files, 27 solo) and `.0` /
+`.1` on a value of unknown type (50 files, 22 solo) compile in every same-file shape probed
+(arguments, returns, fields, `Some(..)`, `unwrap_or(..)`, `map(Into::into)`, `assert_eq!`,
+closure parameters over user tuples); the corpus hits need a `From` impl or a tuple type from
+another file, or sit on the shadowing in 3. The same goes for `matches!` with enum patterns (22
+files): the enum is from another file in all but the std `Alignment` / `SeekFrom` cases.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
 `set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
@@ -234,12 +284,6 @@ unsafe/memory, not planned, and they say so; `a as *const T == b as *const T` st
 serde-wasm-bindgen's `JsValue`, fastrand's `WyRng`, rayon, rand); closures whose parameter type
 comes from another file's iterator (regex's `bytes.rs`); and autocfg's pre-2018
 `Option<&error::Error>`.
-
-**Open:** nothing from that triage. Its last three items are done (2026-11-24): `T::E::mk(..)`
-through a type parameter, `(..).start_bound()` typed by the expected type (it already worked;
-now in `fixtures/bound_ranges.rs`), and one trait for several tuples of one length (each impl's
-methods and defaults under keys of their own, picked by the elements; `$alts` on the class for
-`κσ.$dcall` / `$dcallT`).
 
 ### Crates for Bitburner scripts
 
@@ -265,11 +309,7 @@ and `corpus-report.mjs` on its output). The 40 blocks rustc rejects (deliberate 
 fixed.
 
 The 213 programs with a `main` were run against rustc's builds (`tools/diff-one.mjs`, 2026-11-23):
-190 print the same. Four differences were fixed (`stringify!` of an `expr` passed on through a
-recursive macro kept the parentheses each expansion added; a block's own `use` didn't shadow the
-module's item of that name; `#[cfg(panic = "unwind")]` was false; `Utf8Error` / `FromUtf8Error`
-printed as `Utf8Error { kind: Invalid }`), and `diff-one` now reads a JS panic whose message
-shares the line with its location (nine false differences before). The other 22 are expected:
+190 print the same, plus four differences since fixed. The other 22 are expected:
 threads and channels (4), `Rc::strong_count`, unsafe, FFI and `asm!` (7), the filesystem and
 processes (7), the executable's path, Windows path separators, and the two doc-test blocks
 rustc's build has no `main` for. The last, `std/hash_1`, prints a `HashMap` in iteration order,
@@ -292,13 +332,10 @@ and 325 (84.6%) had no language gap; the language gaps the report found are the 
 unsafe, FFI, `union` and proc-macro ones (30 files) plus two since fixed. The 157 compiled
 programs with a `main` were also run against rustc's builds (`tools/diff-one.mjs`): 142 printed
 the same; the rest differ in `{:p}`, filesystem errors, `process::exit` running `Drop`s and
-`Vec::capacity` (all in RUST_GAPS.md), and in a CR LF inside string literals and array index
-panic columns (both fixed since). (In five more, `diff-one` reported the JS location of a
-`todo!()` as `undefined` because the message follows the location on one line; the locations
-agree; `diff-one` reads that line since 2026-11-23.) Every compiler and std gap it found is fixed
-(the last, `let g = Vec::from_iter;` with no type anywhere, on 2026-11-24) except, of little use
-in a script, `PathBuf::read_dir` / `read_link` / `metadata` and `OsStr::from_bytes` (Programming
-Rust `copy`, the unsafe exercise).
+`Vec::capacity` (all in RUST_GAPS.md). Every compiler and std gap it found is fixed, the last
+(2026-11-25) `Path::read_dir` / `read_link` / `metadata` with `fs::FileType`, `Path::new(..)`
+used by value twice (a `&Path`, so `Copy`; Programming Rust `copy`), and `OsStr::from_bytes`
+(the unsafe exercise).
 
 **Expected:** threads, channels, `Arc` / `Mutex` and `thread::sleep` (13 files); raw pointers,
 `MaybeUninit`, `PhantomPinned` and `Pin` projections, `transmute`, `slice::from_raw_parts`,
@@ -306,24 +343,6 @@ Rust `copy`, the unsafe exercise).
 `union`; the proc-macro exercise; the async chat exercise and the Programming Rust network and
 `libgit2` crates (`async_std`, `reqwest`, `tokio_websockets`, `actix_web`, `libc` aren't
 bundled); `fern_sim`'s multi-file module tree (compiled file by file); `{:p}`.
-
-## Bitburner player gaps (2026-11-18)
-
-What a Bitburner player still misses, now that every item in `corpus/bitburner/GAPS.md` is
-fixed. The other items of the original list and of the 2026-11-18 probe (cross-folder modules
-via `#[path]`, serde tagging and `flatten`, `i32` NS results, `std::sync` / tokio sync shims,
-typed `ns.flags`, `u64` as a number, un-awaited futures, `&str + &str`, partial moves out of a
-struct, test builds with libtest's report) are done; see FEATURES.md.
-
-Running tests in game, from this repo only (Bitburner's `run` and its flag parsing stay as they
-are), is done: `compileTests`, the libtest report, `tests/` scripts as test builds, test-code
-errors as warnings, the language service inside test code, the README's "Testing your scripts"
-and the web REPL's Run tests button; see FEATURES.
-
-Inside a std macro's arguments, signature help with a stray closer in an unfinished nested call
-(`vec![v.insert(0, ];`, and `dbg!(v.insert(0, );` before the macro is closed) works since
-2026-11-24: the argument stops at the closer the parser left in an error node, and at an unclosed
-macro's trailing `;`. Hover on a closure parameter there already worked.
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 
@@ -373,6 +392,87 @@ throws (try/finally only for `Drop` types), `push_str` is `+=`.
   under node; stdout must match.
 - **Source maps:** assert specific Rust lines map to the expected JS.
 - **Bitburner:** RAM cost and import integration tests.
+
+### Test suite speed
+
+Measured 2026-11-25 (20 cores, after a compiler source change): wasm build 0:32,
+`test/run.mjs` plus the MVP suite 3:27, of which about 2.5–3 minutes is rebuilding the ~400
+fixtures natively with `rustc -O`, one at a time (~0.4 s each), whether or not they changed.
+The unit tests take 6 s as `npm test` runs them (`cargo test`, incremental dev profile) but 3:30
+as `cargo test --release`: the release profile's `lto = true` relinks the whole crate natively
+for 26 tests that run in 0.03 s. Run them without `--release`.
+
+- [x] Cache native fixture builds and their output (`tools/native-build.mjs`'s `nativeRuns` /
+  `cachedNative`, in `test/out/native-cache`), keyed by a hash of the source (the whole folder
+  for a module program), the flags, the crate versions and `rustc -vV`. Covers the fixture,
+  module, debug, libtest and MVP tests; a failed build isn't kept. Delete the folder to rebuild.
+- [x] Build the uncached ones in parallel: every section queues its native jobs up front into a
+  pool (`NATIVE_JOBS`, default half the cores; bundled-crate cargo builds take turns in their
+  shared project) and awaits each in order beside the JS side. Same day, same machine:
+  `test/run.mjs` 77 s with an empty cache, 29 s with a full one (was ~3 min either way); the
+  MVP suite 2 s / 1 s.
+- [x] A name filter: `node test/run.mjs moves borrow` runs the tests whose names contain one of
+  the words (the native and cargo sections skip the rest up front; the diagnostic tables still
+  compile but report only matches).
+
+### Corpus survey speed
+
+Measured 2026-11-25 over the registry (6,126 files, 101 MB, 235 crates; 20 cores), sampling
+every 21st file: the JS side of `tools/corpus-classify.mjs` (regexes, file reads, `JSON.parse`,
+rendering) is under 0.5 % of the run; everything else is `compile()`. Three samples extrapolate
+to 10–35 minutes for a full run, depending on which heavy files land in the sample: half the
+compile time sits in about 2 % of files (chrono-tz's 7 MB `prebuilt/timezones.rs` alone is 35 s;
+wasmparser `lib.rs`, chrono `format/parse.rs` and serde_core `de/impls.rs` run at 50–75 ms/KB
+against 5–7 ms/KB typical; a crate's `lib.rs` costs what its modules cost, clap_derive's 4 KB
+`lib.rs` is 810 ms). Files with `#[test]` / `cfg(test)` are compiled twice (`compile_with` runs the
+test build and demotes its errors to warnings the classifier drops): about 17 % of the time.
+Native is no faster: `sweep.exe` over wasmparser 17.2 s, the wasm build 15.0 s, so a Rust rewrite
+buys nothing. Fixed costs are small (an empty file 0.2 ms; a file naming clap, chrono or serde_json
+pays 28–63 ms for the bundled prelude, about 15 s over the whole registry). A wasm trap on one
+file ends the run.
+
+- [x] Time a full run: 30:06 sequentially on 2026-11-25 (so the compiler got slower on a few files
+  since the 2026-11-23 note of ~7 minutes). A quarter of it is one file: zerocopy's
+  `src/impls.rs` (2,400 lines), about 7 minutes alone.
+- [x] `worker_threads`: the main thread walks and sorts the files, compiles the wasm once
+  (`new WebAssembly.Module`) and hands the module to N workers (`initSync`), which pull one file
+  at a time from a queue ordered largest-first so the 35 s file starts at once and nothing
+  straggles. Results come back as JSON lines with their index and are written in sorted order
+  (the output stays diffable run to run). `resourceLimits.stackSizeMb` per worker (the main
+  thread's `--stack-size=8000` doesn't reach them); N defaults to `availableParallelism() - 2`
+  with a `CORPUS_JOBS` override, since each worker keeps its own wasm memory (110 MB typical,
+  500 MB after the 7 MB file) and the machine is shared. `definedIn` stays lazy per worker. Measured: 12:08 on 18 workers
+  ordered by size, 9:57 ordered by the last run's per-file times (kept in the OS temp dir as
+  `carciniscript-corpus-ms.json`; size alone misses the slow files), output byte-identical to the
+  sequential run. The run is now exactly as long as zerocopy `impls.rs` (597 s under load); next
+  are windows-sys `Windows/mod.rs` and `Windows/Win32/mod.rs` (~150 s alone, ~270 s under load),
+  gimli `arch.rs` and chrono-tz `timezones.rs` (~155 s). The run ends by printing the five
+  slowest files: the worklist for the superlinear-files item below.
+- [x] Trap isolation and `--resume`: a trap in the worker (a Rust panic's `unreachable`, a stack
+  overflow) or a worker out of memory writes the file's line with a `panic` field and no errors,
+  the worker is replaced and the run goes on; the run ends by listing the panics, and the report
+  gives them their own verdict ("G compiler panic"). Lines are appended as files finish and the
+  output is sorted once at the end, so `--resume` (any interrupted run) keeps every file with a
+  complete line, panics included, and compiles the rest.
+- [x] `setTestCodeChecks(false)` (`codegen::set_test_code_checks`, checked in `compile_with`)
+  skips the test build of a file with test code, whose errors only come back as warnings; the
+  survey's workers turn it off. Measured 2026-11-25: the full run 2:52 on 18 workers (was 9:57),
+  no panics; the errors are the same either way (checked file by file where the output changed).
+  zerocopy's `impls.rs` was nearly all test build. The run is now as long as windows-sys
+  `Windows/mod.rs` (172 s); then `Windows/Win32/mod.rs` (157 s), chrono-tz `timezones.rs`
+  (110 s), windows-sys `Wdk/mod.rs` and `Win32/System/mod.rs` (~100 s).
+- [x] Per-file `ms` (the compile alone) and `modLines` (lines of the module files it read) in the
+  JSONL; `corpus_ast.rs` passes them through. The report lists the ten slowest files and the ten
+  slowest per line (own lines plus `modLines`, against the median, files over a second), and the
+  CSV has an `ms` column. First list, 2026-11-25: zerofrom-derive `lib.rs` (121x the median),
+  gimli `arch.rs` (104x), deranged `lib.rs` (95x), syn `tests/common/eq.rs` (95x), time-core
+  `unit.rs`, walrus-macro `lib.rs`, funty `lib.rs`, displaydoc `lib.rs`; the windows-sys
+  `mod.rs` files are 8–20x, slow for their size, not their shape. Timings under load vary up to
+  5x (gimli `arch.rs`: 13.8 s alone, 16 s and 75 s in two full runs).
+- [ ] Profile the slowest-per-line files natively (the report's second list is the worklist):
+  the only single-thread lever left.
+- Not worth it (measured): tuning the classification regexes, trimming the JSON payload or
+  `rendered`, caching resolver reads (11k reads, 59 MB per 292 files, but cheap), a native port.
 
 ## Risks
 
