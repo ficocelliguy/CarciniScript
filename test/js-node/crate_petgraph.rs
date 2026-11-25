@@ -2,9 +2,9 @@
 // hops and by hack time, components), a dependency `DiGraph` (toposort, cycles, SCCs), a
 // `GraphMap` keyed by hostnames, and `min_spanning_tree`. `neighbors` / `edges` come newest
 // first as in petgraph, and `NodeIndex` prints as `NodeIndex(3)`.
-// (The crate isn't in the cargo cache: the expected output is rustc's on this program after the
-// rewrite, with the prelude (`compiler/src/petgraph_prelude.rs`) in place of the crate; the
-// prelude follows petgraph 0.6 / 0.8's code.)
+// (Expected output: petgraph 0.8.3's, from a cargo build of this file with `sorted` taking
+// 0.8's hashbrown maps and `use petgraph::data::FromElements`, which 0.8 needs for
+// `from_elements`.)
 use petgraph::algo::{
     astar, bellman_ford, connected_components, dijkstra, has_path_connecting, is_cyclic_directed,
     kosaraju_scc, min_spanning_tree, tarjan_scc, toposort,

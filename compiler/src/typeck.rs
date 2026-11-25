@@ -6556,6 +6556,19 @@ impl<'a> Checker<'a> {
                 return t;
             }
         }
+        // `T::E::mk(..)` with `T: Has` and `trait Has { type E: Mk; }`: `T`'s class's `$at$E`.
+        if let [p, a, f] = names.as_slice()
+            && p != "Self"
+            && self.param_bounds.contains_key(p)
+            && !self.bound_traits(&format!("{p}::{a}")).is_empty()
+        {
+            let p = format!("{p}::{a}");
+            if let Some(t) = self.param_static_call(c, &p, f, &args) {
+                let r = self.range(c.syntax());
+                self.param_paths.insert(r, p);
+                return t;
+            }
+        }
         // `i32::make()` / `Vec::<u8>::make()` / `Q::make()`: a blanket impl's associated function.
         if let [t, f] = names.as_slice()
             && let Some(qt) = self.blanket_qualifier(&path, t)
@@ -7641,10 +7654,16 @@ impl<'a> Checker<'a> {
         // A user trait method on a built-in type (`x.money()` with `impl Money for f64`); std's own
         // methods come first, as inherent methods do in Rust.
         // (A generic trait implemented twice for the type: the impl whose signature fits.)
+        // (Impls for two tuples of one length: by the receiver's elements.)
         let method = match crate::adt::ext_key_of(&self.shallow(&rt)) {
-            Some(key) => self
-                .pick_method_alt(m, key, &[], &method, &args, expected)
-                .unwrap_or(method),
+            Some(key) => {
+                let targs = match self.shallow(&rt) {
+                    t @ Ty::Tuple(_) => crate::adt::ext_args(&t),
+                    _ => Vec::new(),
+                };
+                self.pick_method_alt(m, key, &targs, &method, &args, expected)
+                    .unwrap_or(method)
+            }
             None => method,
         };
         if let Some(key) = crate::adt::ext_key_of(&self.shallow(&rt))
@@ -10782,6 +10801,11 @@ impl Checker<'_> {
         if let Some(a) = param.strip_prefix("Self::") {
             self.self_assoc_dicts.insert(a.to_string());
             return;
+        }
+        // (`T::E` of a `T: Has`: `T`'s class, and its impls' getter for `E`.)
+        if let Some((p, a)) = param.split_once("::") {
+            self.self_assoc_dicts.insert(a.to_string());
+            return self.note_dict(p, node);
         }
         if !self.try_note_dict(param) {
             self.error(

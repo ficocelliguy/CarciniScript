@@ -23,10 +23,10 @@ None
 [None, Some(NodeIndex(0)), Some(NodeIndex(0)), Some(NodeIndex(0)), Some(NodeIndex(2)), Some(NodeIndex(3)), None]
 components 2 false
 [NodeIndex(6)]
-topo ["lib.js", "hack.js", "grow.js", "batcher.js", "ui.js"]
+topo ["lib.js", "ui.js", "grow.js", "hack.js", "batcher.js"]
 false [NodeIndex(2), NodeIndex(1)]
 [NodeIndex(0)] [NodeIndex(3), NodeIndex(4)]
-true Err(NodeIndex(1))
+true Err(NodeIndex(3))
 kosaraju [[NodeIndex(4)], [NodeIndex(0), NodeIndex(1), NodeIndex(3), NodeIndex(2)]]
 tarjan [[NodeIndex(4)], [NodeIndex(3), NodeIndex(2), NodeIndex(1), NodeIndex(0)]]
 ["lib.js", "hack.js", "grow2.js", "batcher.js", "dashboard.js"]

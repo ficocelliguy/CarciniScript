@@ -62,6 +62,10 @@ fn main() {
     println!("{} {}", between(&m, ..).len(), m.range(..).count());
     println!("{} {}", by_value(..), by_value(1..2));
     println!("{}", unbounded_start(..3) && !unbounded_start(0..=1));
+    // `(..)`'s `T` from the expected type only, or from a later use.
+    let lo = (..).start_bound();
+    let hi: Bound<&u64> = (..).end_bound();
+    println!("{:?} {} {}", hi, (..).start_bound() == Bound::<&u8>::Unbounded, lo == hi);
     match r.end_bound() {
         Bound::Excluded(e) => println!("ends before {}", e),
         _ => println!("other"),

@@ -3094,7 +3094,7 @@
           break;
         }
       }
-      if (pick) return pick.cls.prototype[name].call(x, ...args);
+      if (pick) return pick.cls.prototype[pick.cls.$alts ? rt.$tupAlt(pick.cls, name, x, null) : name].call(x, ...args);
       // An `Option` is `null` or its value: its impl serves what no other impl takes (`None`
       // always; `Some(x)` unless `x`'s own type has the method).
       for (const r of regs.kinds.option ?? []) {
@@ -5058,6 +5058,48 @@
     $tupT(elem) {
       return { tup: elem.length, elem };
     },
+    // With impls of one trait for two tuples of one length (`(u8, u8)`, `(String, String)`):
+    // the key of `name` whose impl's element classes fit the elements' classes `elem` when the
+    // caller passed them, else the values of the tuple `x` (a whole number reaches an integer
+    // impl before a float one, as in `$dcall`).
+    $tupAlt(cls, name, x, elem) {
+      const alts = (cls.$altsV ??= cls.$alts())[name];
+      if (!alts) return name;
+      for (const strict of [true, false]) {
+        for (const [k, ds] of alts) {
+          if (ds.every((d, i) => (elem ? rt.$classFits(d, elem[i]) : rt.$valueFits(d, x?.[i], strict)))) return k;
+        }
+      }
+      return name;
+    },
+    // Whether an impl's element class `d` (`null`: a type parameter) is the class `c` passed for
+    // the element (`undefined` when the caller had none).
+    $classFits(d, c) {
+      if (d == null || c == null || d === c) return true;
+      if (typeof d === "function") return Object.prototype.isPrototypeOf.call(d, c);
+      if (d.kind !== undefined || c.kind !== undefined) return d.kind === c.kind;
+      if (d.tup !== undefined) return c.tup === d.tup && d.elem.every((e, i) => rt.$classFits(e, c.elem[i]));
+      if (d.vec || d.opt) return !!d.vec === !!c.vec && !!d.opt === !!c.opt && rt.$classFits(d.elem, c.elem);
+      for (const p of ["str", "bool", "char", "unit"]) if (d === rt.$prims[p] || c === rt.$prims[p]) return false;
+      return true;
+    },
+    // Whether the element value `v` could be of the impl's element class `d`. `strict`: a whole
+    // number isn't a float's.
+    $valueFits(d, v, strict) {
+      if (d == null) return true;
+      if (typeof d === "function") return v instanceof d;
+      if (d.kind !== undefined) {
+        if (d.big) return typeof v === "bigint";
+        return typeof v === "number" && (!strict || d.float !== Number.isInteger(v));
+      }
+      if (d === rt.$prims.str || d === rt.$prims.char) return typeof v === "string";
+      if (d === rt.$prims.bool) return typeof v === "boolean";
+      if (d.tup !== undefined) {
+        return Array.isArray(v) && v.length === d.tup && d.elem.every((e, i) => rt.$valueFits(e, v[i], strict));
+      }
+      if (d.vec) return Array.isArray(v);
+      return true;
+    },
     // A tuple's or `Vec`'s class `cls`: the impl of `name` among the array ones (a tuple's of its
     // length, a `Vec`'s of none), which all JS arrays reach by value alike.
     $arrayImpl(regs, cls, name) {
@@ -5095,7 +5137,7 @@
       const x = c[0];
       const arr = rt.$arrayImpl(regs, cls, name);
       if (arr) {
-        const f = arr.prototype[name];
+        const f = arr.prototype[arr.$alts ? rt.$tupAlt(arr, name, x, cls.elem) : name];
         return arr.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
       }
       if (kind !== undefined) {
@@ -5118,7 +5160,7 @@
       // (A tuple's or `Vec`'s: the impl for it, handed the elements' classes.)
       const arr = rt.$arrayImpl(regs, cls, name);
       if (arr) {
-        const f = arr.prototype[name];
+        const f = arr.prototype[arr.$alts ? rt.$tupAlt(arr, name, x, cls.elem) : name];
         return arr.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
       }
       const kind = cls?.kind;

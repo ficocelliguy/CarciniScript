@@ -19,4 +19,13 @@ fn main() {
     println!("{:?}", g([(2, 'b'), (1, 'a')]));
     let h = String::from_iter;
     println!("{} {}", h(vec!['a', 'b']), Vec::<Vec<u8>>::from_iter([vec![1u8]]).len());
+    // With no type anywhere: generic over the items too.
+    let g = Vec::from_iter;
+    println!("{:?}", g(1..4));
+    let s = std::collections::BTreeSet::from_iter;
+    println!("{:?}", s([3, 1, 2]));
+    let m = BTreeMap::from_iter;
+    println!("{:?}", m(vec![(2, 'b'), (1, 'a')]));
+    let d = std::collections::VecDeque::from_iter;
+    println!("{:?}", d("ab".chars()));
 }

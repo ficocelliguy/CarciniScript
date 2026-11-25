@@ -102,11 +102,16 @@ fn inner_elements(mc: &ast::MacroCall) -> Vec<SyntaxElement> {
         (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}'])
     );
     let end = if closed { elems.len() - 1 } else { elems.len() };
-    elems[1..end]
+    let mut inner: Vec<SyntaxElement> = elems[1..end]
         .iter()
         .filter(|el| !el.kind().is_trivia())
         .cloned()
-        .collect()
+        .collect();
+    // (Unclosed, the statement's `;` isn't an argument's: `dbg!(v.insert(0, );`.)
+    if !closed && inner.last().is_some_and(|el| el.kind() == T![;]) {
+        inner.pop();
+    }
+    inner
 }
 
 fn to_arg(src: &str, base: usize, mut group: Vec<SyntaxElement>) -> Option<MacroArg> {
@@ -124,7 +129,22 @@ fn to_arg(src: &str, base: usize, mut group: Vec<SyntaxElement>) -> Option<Macro
         group.drain(0..2);
     }
     let start = base + usize::from(group[0].text_range().start());
-    let end = base + usize::from(group.last()?.text_range().end());
+    // (Up to a stray closer, which the parser leaves inside an unclosed token tree as an error:
+    // `vec![v.insert(0, ];` as it is typed is `v.insert(0, `.)
+    let stray = group
+        .iter()
+        .flat_map(|el| match el {
+            NodeOrToken::Node(n) => n.descendants_with_tokens().collect::<Vec<_>>(),
+            t => vec![t.clone()],
+        })
+        .find(|el| {
+            matches!(el.kind(), T![')'] | T![']'] | T!['}'])
+                && el.parent().is_some_and(|p| p.kind() == SyntaxKind::ERROR)
+        });
+    let end = match stray {
+        Some(s) => base + usize::from(s.text_range().start()),
+        None => base + usize::from(group.last()?.text_range().end()),
+    };
     let single_token = match group.as_slice() {
         [NodeOrToken::Token(t)] => Some(t.clone()),
         // A string literal from a macro's `$x:expr` comes wrapped in parens (`debug!("{}", x)`

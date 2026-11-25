@@ -2,7 +2,7 @@
 // (also inside `println!`), removing nodes and edges (petgraph's swap-remove renumbering),
 // `g[n] += ..` on weights, `reverse`, `edges_directed`, struct weights, and `Dfs` /
 // `has_path_connecting` / `toposort` over a `DiGraphMap` keyed by hostnames.
-// (Expected output: rustc's on the rewritten program with the prelude, as `crate_petgraph.rs`.)
+// (Expected output: petgraph 0.8.3's, from a cargo build of this file.)
 use petgraph::algo;
 use petgraph::prelude::*;
 use petgraph::Direction::Incoming;

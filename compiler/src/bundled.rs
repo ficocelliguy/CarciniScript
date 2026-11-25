@@ -1954,11 +1954,13 @@ fn indexmap_macros(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
 
 /// petgraph's functions and walkers, which the prelude has as methods: `dijkstra(&g, a, ..)`
 /// (also `algo::dijkstra` / `petgraph::algo::dijkstra`) is `(&g).__pg_dijkstra(a, ..)`, so it's
-/// `Graph`'s or `GraphMap`'s by the graph's type; `bfs.next(&g)` (a walker's: an iterator's
-/// `next` takes no argument) is `bfs.__pg_next(|__pg_n| (&g).neighbors(__pg_n).collect::<..>())`;
-/// `from_edges(&[(0, 1), ..])` / `extend_with_edges` with pairs are their `__pg_..2` forms (with
-/// `E::default()` weights); and `Outgoing` / `Incoming` from `use petgraph::Direction::..`
-/// are `PgDirection`'s.
+/// `Graph`'s, `StableGraph`'s or `GraphMap`'s by the graph's type; `bfs.next(&g)` (a walker's:
+/// an iterator's `next` takes no argument) is `bfs.__pg_next(|__pg_n, __pg_d|
+/// (&g).neighbors_directed(__pg_n, __pg_d).collect::<..>())` (`Topo` looks both ways, and
+/// `Reversed(&g)` turns them round); `from_edges(&[(0, 1), ..])` / `extend_with_edges` with pairs
+/// are their `__pg_..2` forms (with `E::default()` weights); an index type argument
+/// (`Graph<N, E, Directed, u16>`, `NodeIndex<usize>`) goes; and `Outgoing` / `Incoming` from
+/// `use petgraph::Direction::..` are `PgDirection`'s.
 fn petgraph_edits(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
     let cx = PgCtx {
         algos: renamed_imports(file, &PETGRAPH_ALGO_IMPORTS),
@@ -1998,8 +2000,10 @@ fn petgraph_walk(
         match path.qualifier() {
             Some(q) => {
                 let qt = q.syntax().text().to_string();
+                let qt = qt.trim_start_matches("::");
+                // (Or the function's own module: `petgraph::algo::bridges::bridges`.)
                 let algo_mod = qt == "petgraph::algo"
-                    || qt == "::petgraph::algo"
+                    || qt == format!("petgraph::algo::{name}")
                     || (qt == "algo" && root_imports.get("algo").is_some_and(|i| i == "algo"));
                 (algo_mod && PETGRAPH_ALGOS.contains(&name.as_str())).then_some(name)
             }
@@ -2012,10 +2016,26 @@ fn petgraph_walk(
     };
     // `(f)(a, b)` -> `(a).__pg_f(b)`: the path goes, the first comma (or the closing paren) opens
     // the method call.
-    let as_method = |path_range: TextRange,
+    // A turbofish goes too (`all_simple_paths::<Vec<_>, _, RandomState>`'s paths are `Vec`s
+    // here), as a comment: the names in it are renamed (`NodeIndex`), and an edit around theirs
+    // would be dropped.
+    let as_method = |path: &ast::Path,
                      algo: &str,
                      args: &ra_ap_syntax::SyntaxNode,
                      edits: &mut Vec<(TextRange, String)>| {
+        let mut path_range = path.syntax().text_range();
+        if let Some(gl) = path.segment().and_then(|s| s.generic_arg_list())
+            && let Some(open) = gl.l_angle_token()
+            && let Some(close) = gl.r_angle_token()
+        {
+            let gl_range = gl.syntax().text_range();
+            path_range = TextRange::new(path_range.start(), gl_range.start());
+            edits.push((
+                TextRange::new(gl_range.start(), open.text_range().end()),
+                "/*".into(),
+            ));
+            edits.push((close.text_range(), "*/".into()));
+        }
         let toks: Vec<_> = args
             .children_with_tokens()
             .filter_map(|e| e.into_token())
@@ -2038,7 +2058,7 @@ fn petgraph_walk(
             if let Some(algo) = algo_of(&path)
                 && args.args().next().is_some()
             {
-                as_method(path.syntax().text_range(), &algo, args.syntax(), edits);
+                as_method(&path, &algo, args.syntax(), edits);
                 continue;
             }
             // `UnGraph::<i32, ()>::from_edges(&[(0, 1), ..])`.
@@ -2071,10 +2091,10 @@ fn petgraph_walk(
             if name.text() == "next" && list.len() == 1 {
                 let r = list[0].syntax().text_range();
                 edits.push((name.syntax().text_range(), "__pg_next".into()));
-                edits.push((TextRange::empty(r.start()), "|__pg_n| (".into()));
+                edits.push((TextRange::empty(r.start()), "|__pg_n, __pg_d| (".into()));
                 edits.push((
                     TextRange::empty(r.end()),
-                    ").neighbors(__pg_n).collect::<Vec<_>>()".into(),
+                    ").neighbors_directed(__pg_n, __pg_d).collect::<Vec<_>>()".into(),
                 ));
             } else if name.text() == "extend_with_edges"
                 && list.len() == 1
@@ -2101,21 +2121,48 @@ fn petgraph_walk(
                 None => types.get(&name.text().to_string()).cloned(),
             };
             let ty = match item.as_deref() {
-                Some("Graph" | "GraphMap" | "DiGraph" | "DiGraphMap") => "PgDirected",
-                Some("UnGraph" | "UnGraphMap") => "PgUndirected",
+                Some(
+                    "Graph" | "GraphMap" | "DiGraph" | "DiGraphMap" | "StableGraph"
+                    | "StableDiGraph",
+                ) => "PgDirected",
+                Some("UnGraph" | "UnGraphMap" | "StableUnGraph") => "PgUndirected",
                 _ => "",
             };
             let alias = matches!(
                 item.as_deref(),
-                Some("DiGraph" | "UnGraph" | "DiGraphMap" | "UnGraphMap")
+                Some(
+                    "DiGraph"
+                        | "UnGraph"
+                        | "DiGraphMap"
+                        | "UnGraphMap"
+                        | "StableDiGraph"
+                        | "StableUnGraph"
+                )
             );
+            // The index type (`Graph<N, E, Ty, u16>`, `DiGraph<N, E, usize>`, `NodeIndex<u8>`;
+            // a `GraphMap`'s hasher) goes: the prelude's indices are all `u32`.
+            if matches!(item.as_deref(), Some("NodeIndex" | "EdgeIndex"))
+                && let Some(gl) = seg.generic_arg_list()
+            {
+                edits.push((gl.syntax().text_range(), String::new()));
+            }
             match seg.generic_arg_list() {
-                Some(gl) if !ty.is_empty() && gl.generic_args().count() == 2 => {
+                Some(gl) if !ty.is_empty() => {
+                    let args: Vec<_> = gl.generic_args().collect();
+                    let keep = if alias { 2 } else { 3 };
                     if let Some(close) = gl.r_angle_token() {
-                        edits.push((
-                            TextRange::empty(close.text_range().start()),
-                            format!(", {ty}"),
-                        ));
+                        let close = close.text_range().start();
+                        if args.len() > keep {
+                            let from = args[keep - 1].syntax().text_range().end();
+                            let with = if alias {
+                                format!(", {ty}")
+                            } else {
+                                String::new()
+                            };
+                            edits.push((TextRange::new(from, close), with));
+                        } else if args.len() == 2 {
+                            edits.push((TextRange::empty(close), format!(", {ty}")));
+                        }
                     }
                 }
                 // (`UnGraph::new_undirected()`, `DiGraphMap::new()`.)
@@ -2873,6 +2920,8 @@ const PETGRAPH_RENAMES: Renames = Renames {
         "petgraph::algo",
         "petgraph::algo::bellman_ford",
         "petgraph::data",
+        "petgraph::stable_graph",
+        "petgraph::dot",
     ],
     names: PETGRAPH_NAMES,
     star: &[
@@ -2893,6 +2942,11 @@ const PETGRAPH_RENAMES: Renames = Renames {
         "Bfs",
         "Dfs",
         "DfsPostOrder",
+        "StableGraph",
+        "StableDiGraph",
+        "StableUnGraph",
+        "Topo",
+        "Reversed",
     ],
     result_err: None,
 };
@@ -2916,6 +2970,14 @@ pub(crate) const PETGRAPH_NAMES: &[(&str, &str)] = &[
     ("Bfs", "PgBfs"),
     ("Dfs", "PgDfs"),
     ("DfsPostOrder", "PgDfsPostOrder"),
+    ("StableGraph", "PgStableGraph"),
+    ("StableDiGraph", "PgStableGraph"),
+    ("StableUnGraph", "PgStableGraph"),
+    ("Topo", "PgTopo"),
+    ("Reversed", "PgReversed"),
+    ("Dot", "PgDot"),
+    ("Config", "PgDotConfig"),
+    ("RankDir", "PgRankDir"),
     ("Cycle", "PgCycle"),
     ("NegativeCycle", "PgNegativeCycle"),
     ("Paths", "PgPaths"),
@@ -2938,10 +3000,34 @@ const PETGRAPH_ALGOS: &[&str] = &[
     "tarjan_scc",
     "has_path_connecting",
     "min_spanning_tree",
+    "all_simple_paths",
+    "floyd_warshall",
+    "condensation",
+    "k_shortest_path",
+    "is_bipartite_undirected",
+    "find_negative_cycle",
+    "bridges",
+    "articulation_points",
+    "spfa",
+    "scc",
 ];
 
 const PETGRAPH_ALGO_IMPORTS: Renames = Renames {
-    roots: &["petgraph::algo", "::petgraph::algo"],
+    // (Also the modules some are in: `petgraph::algo::articulation_points::articulation_points`.)
+    roots: &[
+        "petgraph::algo",
+        "::petgraph::algo",
+        "petgraph::algo::articulation_points",
+        "petgraph::algo::astar",
+        "petgraph::algo::bellman_ford",
+        "petgraph::algo::bridges",
+        "petgraph::algo::dijkstra",
+        "petgraph::algo::floyd_warshall",
+        "petgraph::algo::k_shortest_path",
+        "petgraph::algo::min_spanning_tree",
+        "petgraph::algo::simple_paths",
+        "petgraph::algo::spfa",
+    ],
     names: &[],
     star: PETGRAPH_ALGOS,
     result_err: None,

@@ -1,10 +1,12 @@
 // (petgraph prelude)
 // The bundled `petgraph` crate: `Graph` (petgraph's adjacency lists, so `neighbors` and `edges`
-// come newest first, as there), `GraphMap` (insertion-ordered, keyed by the nodes themselves),
-// `Bfs` / `Dfs` / `DfsPostOrder`, and the `algo` functions, which the rewrite turns into methods
-// of the graph (`dijkstra(&g, ..)` is `(&g).__pg_dijkstra(..)`) and walkers' `next(&g)` into
-// `__pg_next(|n| (&g).neighbors(n).collect())`. Each algorithm follows petgraph's code (visiting
-// order, `BinaryHeap` ties), so results with ties come out the same.
+// come newest first, as there), `StableGraph` (the same, with vacant slots for what was
+// removed), `GraphMap` (insertion-ordered, keyed by the nodes themselves), `Bfs` / `Dfs` /
+// `DfsPostOrder` / `Topo` (and `Reversed`), `Dot`, and the `algo` functions, which the rewrite
+// turns into methods of the graph (`dijkstra(&g, ..)` is `(&g).__pg_dijkstra(..)`) and walkers'
+// `next(&g)` into `__pg_next(|n, d| (&g).neighbors_directed(n, d).collect())`. Each algorithm
+// follows petgraph 0.8's code (visiting order, `BinaryHeap` ties), so results with ties come out
+// the same. Indices are always `u32` (the rewrite drops an index type argument).
 
 /// `petgraph::graph::NodeIndex` (with the default `u32` index).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -277,6 +279,143 @@ impl PgFloatMeasure for f32 {
     }
 }
 
+/// The weights `floyd_warshall` and `spfa` take (`BoundedMeasure`): a maximum for "no path", and
+/// an addition that says when it overflowed (wrapping for integers; floats past their range).
+pub trait PgBoundedMeasure: Copy + PartialOrd + Default + std::ops::Add<Output = Self> {
+    fn __pg_max() -> Self;
+    fn __pg_overflowing_add(self, rhs: Self) -> (Self, bool);
+}
+impl PgBoundedMeasure for i8 {
+    fn __pg_max() -> i8 {
+        i8::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: i8) -> (i8, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for i16 {
+    fn __pg_max() -> i16 {
+        i16::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: i16) -> (i16, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for i32 {
+    fn __pg_max() -> i32 {
+        i32::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: i32) -> (i32, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for i64 {
+    fn __pg_max() -> i64 {
+        i64::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: i64) -> (i64, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for isize {
+    fn __pg_max() -> isize {
+        isize::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: isize) -> (isize, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for u8 {
+    fn __pg_max() -> u8 {
+        u8::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: u8) -> (u8, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for u16 {
+    fn __pg_max() -> u16 {
+        u16::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: u16) -> (u16, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for u32 {
+    fn __pg_max() -> u32 {
+        u32::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: u32) -> (u32, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for u64 {
+    fn __pg_max() -> u64 {
+        u64::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: u64) -> (u64, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for usize {
+    fn __pg_max() -> usize {
+        usize::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: usize) -> (usize, bool) {
+        match self.checked_add(rhs) {
+            Some(x) => (x, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+}
+impl PgBoundedMeasure for f64 {
+    fn __pg_max() -> f64 {
+        f64::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: f64) -> (f64, bool) {
+        let overflow = self > 0.0 && rhs > 0.0 && self > f64::MAX - rhs;
+        let underflow = !overflow && self < 0.0 && rhs < 0.0 && self < f64::MIN - rhs;
+        (self + rhs, overflow || underflow)
+    }
+}
+impl PgBoundedMeasure for f32 {
+    fn __pg_max() -> f32 {
+        f32::MAX
+    }
+    fn __pg_overflowing_add(self, rhs: f32) -> (f32, bool) {
+        let overflow = self > 0.0 && rhs > 0.0 && self > f32::MAX - rhs;
+        let underflow = !overflow && self < 0.0 && rhs < 0.0 && self < f32::MIN - rhs;
+        (self + rhs, overflow || underflow)
+    }
+}
+
 // ---------------------------------------------------------------- Graph
 
 #[derive(Clone)]
@@ -544,6 +683,10 @@ impl<N, E, Ty: PgEdgeType> PgGraph<N, E, Ty> {
         a: PgNodeIndex,
         dir: PgDirection,
     ) -> std::vec::IntoIter<PgNodeIndex> {
+        // (Undirected: both lists, whichever direction.)
+        if !self.directed {
+            return self.neighbors_undirected(a);
+        }
         let mut out = Vec::new();
         for (_, node) in self.__pg_edge_list(a, dir) {
             // (The other end: for an incoming edge of a directed graph, the source.)
@@ -738,10 +881,14 @@ impl<N, E, Ty: PgEdgeType> PgGraph<N, E, Ty> {
             out: Vec::new(),
             inc: Vec::new(),
             refs: Vec::new(),
+            raw: Vec::new(),
+            bound: n,
+            directed: self.directed,
         };
         for i in 0..n {
             let a = PgNodeIndex::new(i);
             v.ids.push(a);
+            v.raw.push(i);
             let mut out = Vec::new();
             for r in self.edges(a) {
                 out.push((r.target().index(), r));
@@ -816,6 +963,105 @@ impl<N, E, Ty: PgEdgeType> PgGraph<N, E, Ty> {
     ) -> bool {
         __pg_has_path_connecting_in(&self.__pg_view(), from.index(), to.index())
     }
+    pub fn __pg_scc(&self) -> Vec<Vec<PgNodeIndex>> {
+        __pg_kosaraju_scc_in(&self.__pg_view())
+    }
+    pub fn __pg_all_simple_paths(
+        &self,
+        from: PgNodeIndex,
+        to: PgNodeIndex,
+        min_intermediate_nodes: usize,
+        max_intermediate_nodes: Option<usize>,
+    ) -> PgSimplePaths<PgNodeIndex> {
+        __pg_all_simple_paths_in(
+            &self.__pg_view(),
+            from.index(),
+            to.index(),
+            min_intermediate_nodes,
+            max_intermediate_nodes,
+        )
+    }
+    pub fn __pg_floyd_warshall<'a, K, F>(
+        &'a self,
+        edge_cost: F,
+    ) -> Result<std::collections::HashMap<(PgNodeIndex, PgNodeIndex), K>, PgNegativeCycle>
+    where
+        K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+    {
+        __pg_floyd_warshall_in(&self.__pg_view(), edge_cost)
+    }
+    pub fn __pg_k_shortest_path<'a, K, F>(
+        &'a self,
+        start: PgNodeIndex,
+        goal: Option<PgNodeIndex>,
+        k: usize,
+        edge_cost: F,
+    ) -> std::collections::HashMap<PgNodeIndex, K>
+    where
+        K: Copy + Default + PartialOrd + std::ops::Add<Output = K>,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+    {
+        __pg_k_shortest_path_in(
+            &self.__pg_view(),
+            start.index(),
+            goal.map(|g| g.index()),
+            k,
+            edge_cost,
+        )
+    }
+    pub fn __pg_is_bipartite_undirected(&self, start: PgNodeIndex) -> bool {
+        __pg_is_bipartite_undirected_in(&self.__pg_view(), start.index())
+    }
+    pub fn __pg_bridges(&self) -> std::vec::IntoIter<PgEdgeReference<'_, E>> {
+        __pg_bridges_in(&self.__pg_view()).into_iter()
+    }
+    pub fn __pg_articulation_points(&self) -> std::collections::HashSet<PgNodeIndex> {
+        __pg_articulation_points_in(&self.__pg_view())
+    }
+    pub fn __pg_spfa<'a, K, F>(
+        &'a self,
+        source: PgNodeIndex,
+        edge_cost: F,
+    ) -> Result<PgPaths<PgNodeIndex, K>, PgNegativeCycle>
+    where
+        K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+    {
+        __pg_spfa_in(&self.__pg_view(), source.index(), edge_cost)
+    }
+    /// `condensation(g, make_acyclic)`: a node per strongly connected component (its nodes'
+    /// weights), and the edges between them (without self loops or repeats when acyclic).
+    pub fn __pg_condensation(self, make_acyclic: bool) -> PgGraph<Vec<N>, E, Ty> {
+        let sccs = self.__pg_kosaraju_scc();
+        let mut condensed: PgGraph<Vec<N>, E, Ty> = PgGraph::with_capacity(0, 0);
+        let mut node_map = vec![PgNodeIndex::end(); self.nodes.len()];
+        for comp in sccs {
+            let new_nix = condensed.add_node(Vec::new());
+            for nix in comp {
+                node_map[nix.index()] = new_nix;
+            }
+        }
+        let PgGraph { nodes, edges, .. } = self;
+        for (nix, node) in nodes.into_iter().enumerate() {
+            condensed[node_map[nix]].push(node.weight);
+        }
+        for edge in edges {
+            let source = node_map[edge.node[0].index()];
+            let target = node_map[edge.node[1].index()];
+            if make_acyclic {
+                if source != target {
+                    condensed.update_edge(source, target, edge.weight);
+                }
+            } else {
+                condensed.add_edge(source, target, edge.weight);
+            }
+        }
+        condensed
+    }
+    pub fn node_bound(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 impl<N: Default, E, Ty: PgEdgeType> PgGraph<N, E, Ty> {
@@ -874,6 +1120,9 @@ impl<N, E: PgFloatMeasure + Copy + PartialOrd + Default + std::ops::Add<Output =
         source: PgNodeIndex,
     ) -> Result<PgPaths<PgNodeIndex, E>, PgNegativeCycle> {
         __pg_bellman_ford_in(&self.__pg_view(), source.index(), |r| *r.weight())
+    }
+    pub fn __pg_find_negative_cycle(&self, source: PgNodeIndex) -> Option<Vec<PgNodeIndex>> {
+        __pg_find_negative_cycle_in(&self.__pg_view(), source.index(), |r| *r.weight())
     }
 }
 
@@ -1142,6 +1391,9 @@ impl<N: Copy + Ord + std::hash::Hash, E, Ty: PgEdgeType> PgGraphMap<N, E, Ty> {
             out: Vec::new(),
             inc: Vec::new(),
             refs: Vec::new(),
+            raw: (0..self.nodes.len()).collect(),
+            bound: self.nodes.len(),
+            directed: self.directed,
         };
         for &a in &self.nodes {
             let mut out = Vec::new();
@@ -1241,6 +1493,76 @@ impl<N: Copy + Ord + std::hash::Hash, E, Ty: PgEdgeType> PgGraphMap<N, E, Ty> {
         }
         __pg_has_path_connecting_in(&self.__pg_view(), self.__pg_ix(from), self.__pg_ix(to))
     }
+    pub fn __pg_scc(&self) -> Vec<Vec<N>> {
+        __pg_kosaraju_scc_in(&self.__pg_view())
+    }
+    pub fn __pg_all_simple_paths(
+        &self,
+        from: N,
+        to: N,
+        min_intermediate_nodes: usize,
+        max_intermediate_nodes: Option<usize>,
+    ) -> PgSimplePaths<N> {
+        __pg_all_simple_paths_in(
+            &self.__pg_view(),
+            self.__pg_ix(from),
+            self.__pg_ix(to),
+            min_intermediate_nodes,
+            max_intermediate_nodes,
+        )
+    }
+    pub fn __pg_floyd_warshall<'a, K, F>(
+        &'a self,
+        edge_cost: F,
+    ) -> Result<std::collections::HashMap<(N, N), K>, PgNegativeCycle>
+    where
+        K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+        F: FnMut(PgMapEdgeRef<'a, N, E>) -> K,
+    {
+        __pg_floyd_warshall_in(&self.__pg_view(), edge_cost)
+    }
+    pub fn __pg_k_shortest_path<'a, K, F>(
+        &'a self,
+        start: N,
+        goal: Option<N>,
+        k: usize,
+        edge_cost: F,
+    ) -> std::collections::HashMap<N, K>
+    where
+        K: Copy + Default + PartialOrd + std::ops::Add<Output = K>,
+        F: FnMut(PgMapEdgeRef<'a, N, E>) -> K,
+    {
+        __pg_k_shortest_path_in(
+            &self.__pg_view(),
+            self.__pg_ix(start),
+            goal.map(|g| self.__pg_ix(g)),
+            k,
+            edge_cost,
+        )
+    }
+    pub fn __pg_is_bipartite_undirected(&self, start: N) -> bool {
+        __pg_is_bipartite_undirected_in(&self.__pg_view(), self.__pg_ix(start))
+    }
+    pub fn __pg_bridges(&self) -> std::vec::IntoIter<PgMapEdgeRef<'_, N, E>> {
+        __pg_bridges_in(&self.__pg_view()).into_iter()
+    }
+    pub fn __pg_articulation_points(&self) -> std::collections::HashSet<N> {
+        __pg_articulation_points_in(&self.__pg_view())
+    }
+    pub fn __pg_spfa<'a, K, F>(
+        &'a self,
+        source: N,
+        edge_cost: F,
+    ) -> Result<PgPaths<N, K>, PgNegativeCycle>
+    where
+        K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+        F: FnMut(PgMapEdgeRef<'a, N, E>) -> K,
+    {
+        __pg_spfa_in(&self.__pg_view(), self.__pg_ix(source), edge_cost)
+    }
+    pub fn node_bound(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 impl<N: Copy + Ord + std::hash::Hash, E: Default, Ty: PgEdgeType> PgGraphMap<N, E, Ty> {
@@ -1262,6 +1584,9 @@ impl<
 {
     pub fn __pg_bellman_ford(&self, source: N) -> Result<PgPaths<N, E>, PgNegativeCycle> {
         __pg_bellman_ford_in(&self.__pg_view(), self.__pg_ix(source), |r| *r.weight())
+    }
+    pub fn __pg_find_negative_cycle(&self, source: N) -> Option<Vec<N>> {
+        __pg_find_negative_cycle_in(&self.__pg_view(), self.__pg_ix(source), |r| *r.weight())
     }
 }
 
@@ -1299,7 +1624,901 @@ impl<N: Copy + Ord + std::hash::Hash, E, Ty: PgEdgeType> std::ops::IndexMut<(N, 
     }
 }
 
+// ---------------------------------------------------------------- StableGraph
+
+/// `petgraph::stable_graph::StableGraph`: a `Graph` whose removed nodes and edges leave vacant
+/// slots (so the other indices stay put), reused by later additions, the latest freed first.
+/// The vacant nodes form a doubly linked list through their `next` (forward, back), the vacant
+/// edges a singly linked one through `next[0]`. A slot's weight is a `Vec` of one, empty when
+/// vacant (`&mut w[0]` is a place `index_mut` can hand out, where `Option::as_mut` isn't).
+#[derive(Clone)]
+pub struct PgStableGraph<N, E, Ty = PgDirected> {
+    g: PgGraph<Vec<N>, Vec<E>, Ty>,
+    node_count: usize,
+    edge_count: usize,
+    free_node: PgNodeIndex,
+    free_edge: PgEdgeIndex,
+}
+
+impl<N, E> PgStableGraph<N, E, PgDirected> {
+    pub fn new() -> PgStableGraph<N, E, PgDirected> {
+        PgStableGraph::with_capacity(0, 0)
+    }
+}
+impl<N, E, Ty: PgEdgeType> Default for PgStableGraph<N, E, Ty> {
+    fn default() -> Self {
+        PgStableGraph::with_capacity(0, 0)
+    }
+}
+
+impl<N, E, Ty: PgEdgeType> PgStableGraph<N, E, Ty> {
+    pub fn with_capacity(_nodes: usize, _edges: usize) -> PgStableGraph<N, E, Ty> {
+        PgStableGraph {
+            g: PgGraph::with_capacity(0, 0),
+            node_count: 0,
+            edge_count: 0,
+            free_node: PgNodeIndex::end(),
+            free_edge: PgEdgeIndex::end(),
+        }
+    }
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+    pub fn edge_count(&self) -> usize {
+        self.edge_count
+    }
+    pub fn is_directed(&self) -> bool {
+        self.g.directed
+    }
+    pub fn node_bound(&self) -> usize {
+        let mut i = self.g.nodes.len();
+        while i > 0 && self.g.nodes[i - 1].weight.is_empty() {
+            i -= 1;
+        }
+        i
+    }
+    pub fn clear(&mut self) {
+        self.node_count = 0;
+        self.edge_count = 0;
+        self.free_node = PgNodeIndex::end();
+        self.free_edge = PgEdgeIndex::end();
+        self.g.clear();
+    }
+    pub fn clear_edges(&mut self) {
+        self.edge_count = 0;
+        self.free_edge = PgEdgeIndex::end();
+        self.g.edges.clear();
+        for i in 0..self.g.nodes.len() {
+            if !self.g.nodes[i].weight.is_empty() {
+                self.g.nodes[i].next = [PgEdgeIndex::end(), PgEdgeIndex::end()];
+            }
+        }
+    }
+    pub fn contains_node(&self, a: PgNodeIndex) -> bool {
+        a.index() < self.g.nodes.len() && !self.g.nodes[a.index()].weight.is_empty()
+    }
+    pub fn add_node(&mut self, weight: N) -> PgNodeIndex {
+        if self.free_node != PgNodeIndex::end() {
+            let ix = self.free_node;
+            self.__pg_occupy_vacant_node(ix, weight);
+            return ix;
+        }
+        self.node_count += 1;
+        self.g.add_node(vec![weight])
+    }
+    /// Takes `ix` out of the vacant list (wherever it is in it) and puts `weight` there.
+    fn __pg_occupy_vacant_node(&mut self, ix: PgNodeIndex, weight: N) {
+        let i = ix.index();
+        self.g.nodes[i].weight = vec![weight];
+        let previous = self.g.nodes[i].next[1];
+        let next = self.g.nodes[i].next[0];
+        self.g.nodes[i].next = [PgEdgeIndex::end(), PgEdgeIndex::end()];
+        if previous != PgEdgeIndex::end() {
+            let p = self.g.nodes[previous.index()].next;
+            self.g.nodes[previous.index()].next = [next, p[1]];
+        }
+        if next != PgEdgeIndex::end() {
+            let q = self.g.nodes[next.index()].next;
+            self.g.nodes[next.index()].next = [q[0], previous];
+        }
+        if self.free_node == ix {
+            self.free_node = PgNodeIndex(next.0);
+        }
+        self.node_count += 1;
+    }
+    pub fn remove_node(&mut self, a: PgNodeIndex) -> Option<N> {
+        if !self.contains_node(a) {
+            return None;
+        }
+        // (A plain index, so the place is written.)
+        let i = a.index();
+        let weight = self.g.nodes[i].weight.pop();
+        for k in 0..2 {
+            loop {
+                let next = self.g.nodes[a.index()].next[k];
+                if next == PgEdgeIndex::end() {
+                    break;
+                }
+                self.remove_edge(next);
+            }
+        }
+        self.g.nodes[a.index()].next = [PgEdgeIndex(self.free_node.0), PgEdgeIndex::end()];
+        if self.free_node != PgNodeIndex::end() {
+            let f = self.g.nodes[self.free_node.index()].next;
+            self.g.nodes[self.free_node.index()].next = [f[0], PgEdgeIndex(a.0)];
+        }
+        self.free_node = a;
+        self.node_count -= 1;
+        weight
+    }
+    pub fn add_edge(&mut self, a: PgNodeIndex, b: PgNodeIndex, weight: E) -> PgEdgeIndex {
+        let n = self.g.nodes.len();
+        let wrong = if a.index().max(b.index()) >= n {
+            Some(a.index().max(b.index()))
+        } else if self.g.nodes[a.index()].weight.is_empty() {
+            Some(a.index())
+        } else if self.g.nodes[b.index()].weight.is_empty() {
+            Some(b.index())
+        } else {
+            None
+        };
+        if let Some(i) = wrong {
+            panic!(
+                "StableGraph::add_edge: node index {} is not a node in the graph",
+                i
+            );
+        }
+        let ix;
+        if self.free_edge != PgEdgeIndex::end() {
+            ix = self.free_edge;
+            self.free_edge = self.g.edges[ix.index()].next[0];
+            self.g.edges[ix.index()].weight = vec![weight];
+            self.g.edges[ix.index()].node = [a, b];
+        } else {
+            ix = PgEdgeIndex::new(self.g.edges.len());
+            self.g.edges.push(PgEdge {
+                weight: vec![weight],
+                next: [PgEdgeIndex::end(), PgEdgeIndex::end()],
+                node: [a, b],
+            });
+        }
+        if a == b {
+            let an = self.g.nodes[a.index()].next;
+            self.g.edges[ix.index()].next = an;
+            self.g.nodes[a.index()].next = [ix, ix];
+        } else {
+            let an = self.g.nodes[a.index()].next;
+            let bn = self.g.nodes[b.index()].next;
+            self.g.edges[ix.index()].next = [an[0], bn[1]];
+            self.g.nodes[a.index()].next = [ix, an[1]];
+            self.g.nodes[b.index()].next = [bn[0], ix];
+        }
+        self.edge_count += 1;
+        ix
+    }
+    pub fn update_edge(&mut self, a: PgNodeIndex, b: PgNodeIndex, weight: E) -> PgEdgeIndex {
+        if let Some(ix) = self.find_edge(a, b) {
+            self.g.edges[ix.index()].weight = vec![weight];
+            return ix;
+        }
+        self.add_edge(a, b, weight)
+    }
+    pub fn remove_edge(&mut self, e: PgEdgeIndex) -> Option<E> {
+        if e.index() >= self.g.edges.len() || self.g.edges[e.index()].weight.is_empty() {
+            return None;
+        }
+        let edge_node = self.g.edges[e.index()].node;
+        let edge_next = self.g.edges[e.index()].next;
+        self.g.__pg_change_edge_links(edge_node, e, edge_next);
+        self.g.edges[e.index()].next = [self.free_edge, PgEdgeIndex::end()];
+        self.g.edges[e.index()].node = [PgNodeIndex::end(), PgNodeIndex::end()];
+        self.free_edge = e;
+        self.edge_count -= 1;
+        let i = e.index();
+        self.g.edges[i].weight.pop()
+    }
+    pub fn node_weight(&self, a: PgNodeIndex) -> Option<&N> {
+        match self.g.nodes.get(a.index()) {
+            Some(n) => n.weight.first(),
+            None => None,
+        }
+    }
+    pub fn node_weight_mut(&mut self, a: PgNodeIndex) -> Option<&mut N> {
+        match self.g.nodes.get_mut(a.index()) {
+            Some(n) => n.weight.first_mut(),
+            None => None,
+        }
+    }
+    pub fn edge_weight(&self, e: PgEdgeIndex) -> Option<&E> {
+        match self.g.edges.get(e.index()) {
+            Some(x) => x.weight.first(),
+            None => None,
+        }
+    }
+    pub fn edge_weight_mut(&mut self, e: PgEdgeIndex) -> Option<&mut E> {
+        match self.g.edges.get_mut(e.index()) {
+            Some(x) => x.weight.first_mut(),
+            None => None,
+        }
+    }
+    pub fn edge_endpoints(&self, e: PgEdgeIndex) -> Option<(PgNodeIndex, PgNodeIndex)> {
+        match self.g.edges.get(e.index()) {
+            Some(x) if !x.weight.is_empty() => Some((x.node[0], x.node[1])),
+            _ => None,
+        }
+    }
+    pub fn node_indices(&self) -> std::vec::IntoIter<PgNodeIndex> {
+        let mut out = Vec::new();
+        for i in 0..self.g.nodes.len() {
+            if !self.g.nodes[i].weight.is_empty() {
+                out.push(PgNodeIndex::new(i));
+            }
+        }
+        out.into_iter()
+    }
+    pub fn edge_indices(&self) -> std::vec::IntoIter<PgEdgeIndex> {
+        let mut out = Vec::new();
+        for i in 0..self.g.edges.len() {
+            if !self.g.edges[i].weight.is_empty() {
+                out.push(PgEdgeIndex::new(i));
+            }
+        }
+        out.into_iter()
+    }
+    pub fn node_weights(&self) -> std::vec::IntoIter<&N> {
+        let mut out = Vec::new();
+        for n in &self.g.nodes {
+            if let Some(w) = n.weight.first() {
+                out.push(w);
+            }
+        }
+        out.into_iter()
+    }
+    pub fn edge_weights(&self) -> std::vec::IntoIter<&E> {
+        let mut out = Vec::new();
+        for e in &self.g.edges {
+            if let Some(w) = e.weight.first() {
+                out.push(w);
+            }
+        }
+        out.into_iter()
+    }
+    pub fn neighbors(&self, a: PgNodeIndex) -> std::vec::IntoIter<PgNodeIndex> {
+        self.neighbors_directed(a, PgDirection::Outgoing)
+    }
+    pub fn neighbors_directed(
+        &self,
+        a: PgNodeIndex,
+        dir: PgDirection,
+    ) -> std::vec::IntoIter<PgNodeIndex> {
+        if !self.contains_node(a) {
+            return Vec::new().into_iter();
+        }
+        self.g.neighbors_directed(a, dir)
+    }
+    pub fn neighbors_undirected(&self, a: PgNodeIndex) -> std::vec::IntoIter<PgNodeIndex> {
+        if !self.contains_node(a) {
+            return Vec::new().into_iter();
+        }
+        self.g.neighbors_undirected(a)
+    }
+    pub fn edges(&self, a: PgNodeIndex) -> std::vec::IntoIter<PgEdgeReference<'_, E>> {
+        self.edges_directed(a, PgDirection::Outgoing)
+    }
+    pub fn edges_directed(
+        &self,
+        a: PgNodeIndex,
+        dir: PgDirection,
+    ) -> std::vec::IntoIter<PgEdgeReference<'_, E>> {
+        let mut out = Vec::new();
+        if self.contains_node(a) {
+            for (e, node) in self.g.__pg_edge_list(a, dir) {
+                if let Some(weight) = self.g.edges[e.index()].weight.first() {
+                    out.push(PgEdgeReference {
+                        index: e,
+                        node,
+                        weight,
+                    });
+                }
+            }
+        }
+        out.into_iter()
+    }
+    pub fn edges_connecting(
+        &self,
+        a: PgNodeIndex,
+        b: PgNodeIndex,
+    ) -> std::vec::IntoIter<PgEdgeReference<'_, E>> {
+        let mut out = Vec::new();
+        for r in self.edges_directed(a, PgDirection::Outgoing) {
+            if r.target() == b {
+                out.push(r);
+            }
+        }
+        out.into_iter()
+    }
+    pub fn edge_references(&self) -> std::vec::IntoIter<PgEdgeReference<'_, E>> {
+        let mut out = Vec::new();
+        for i in 0..self.g.edges.len() {
+            if let Some(weight) = self.g.edges[i].weight.first() {
+                out.push(PgEdgeReference {
+                    index: PgEdgeIndex::new(i),
+                    node: self.g.edges[i].node,
+                    weight,
+                });
+            }
+        }
+        out.into_iter()
+    }
+    pub fn find_edge(&self, a: PgNodeIndex, b: PgNodeIndex) -> Option<PgEdgeIndex> {
+        if !self.contains_node(a) {
+            return None;
+        }
+        self.g.find_edge(a, b)
+    }
+    pub fn find_edge_undirected(
+        &self,
+        a: PgNodeIndex,
+        b: PgNodeIndex,
+    ) -> Option<(PgEdgeIndex, PgDirection)> {
+        if !self.contains_node(a) {
+            return None;
+        }
+        self.g.find_edge_undirected(a, b)
+    }
+    pub fn contains_edge(&self, a: PgNodeIndex, b: PgNodeIndex) -> bool {
+        self.find_edge(a, b).is_some()
+    }
+    pub fn externals(&self, dir: PgDirection) -> std::vec::IntoIter<PgNodeIndex> {
+        let k = dir.index();
+        let mut out = Vec::new();
+        for i in 0..self.g.nodes.len() {
+            let next = self.g.nodes[i].next;
+            if !self.g.nodes[i].weight.is_empty()
+                && next[k] == PgEdgeIndex::end()
+                && (self.g.directed || next[1 - k] == PgEdgeIndex::end())
+            {
+                out.push(PgNodeIndex::new(i));
+            }
+        }
+        out.into_iter()
+    }
+    pub fn reverse(&mut self) {
+        for i in 0..self.g.edges.len() {
+            if !self.g.edges[i].weight.is_empty() {
+                let n = self.g.edges[i].node;
+                let x = self.g.edges[i].next;
+                self.g.edges[i].node = [n[1], n[0]];
+                self.g.edges[i].next = [x[1], x[0]];
+            }
+        }
+        for i in 0..self.g.nodes.len() {
+            if !self.g.nodes[i].weight.is_empty() {
+                let x = self.g.nodes[i].next;
+                self.g.nodes[i].next = [x[1], x[0]];
+            }
+        }
+    }
+    /// The live nodes in index order; positions in the view, `raw` their indices.
+    fn __pg_view(&self) -> PgView<PgNodeIndex, PgEdgeReference<'_, E>> {
+        let live: Vec<PgNodeIndex> = self.node_indices().collect();
+        let mut pos = vec![usize::MAX; self.g.nodes.len()];
+        for (p, a) in live.iter().enumerate() {
+            pos[a.index()] = p;
+        }
+        let mut v = PgView {
+            ids: Vec::new(),
+            out: Vec::new(),
+            inc: Vec::new(),
+            refs: Vec::new(),
+            raw: Vec::new(),
+            bound: self.node_bound(),
+            directed: self.g.directed,
+        };
+        for &a in &live {
+            v.ids.push(a);
+            v.raw.push(a.index());
+            let mut out = Vec::new();
+            for r in self.edges(a) {
+                out.push((pos[r.target().index()], r));
+            }
+            v.out.push(out);
+            let mut inc = Vec::new();
+            for b in self.neighbors_directed(a, PgDirection::Incoming) {
+                inc.push(pos[b.index()]);
+            }
+            v.inc.push(inc);
+        }
+        for r in self.edge_references() {
+            v.refs
+                .push((pos[r.source().index()], pos[r.target().index()], r));
+        }
+        v
+    }
+    fn __pg_pos(&self, a: PgNodeIndex) -> usize {
+        let mut p = 0;
+        for i in 0..a.index().min(self.g.nodes.len()) {
+            if !self.g.nodes[i].weight.is_empty() {
+                p += 1;
+            }
+        }
+        p
+    }
+    pub fn __pg_dijkstra<'a, K, F>(
+        &'a self,
+        start: PgNodeIndex,
+        goal: Option<PgNodeIndex>,
+        edge_cost: F,
+    ) -> std::collections::HashMap<PgNodeIndex, K>
+    where
+        K: Copy + Default + PartialOrd + std::ops::Add<Output = K>,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+    {
+        let v = self.__pg_view();
+        __pg_dijkstra_in(
+            &v,
+            self.__pg_pos(start),
+            goal.map(|g| self.__pg_pos(g)),
+            edge_cost,
+        )
+    }
+    pub fn __pg_astar<'a, K, IsGoal, F, H>(
+        &'a self,
+        start: PgNodeIndex,
+        is_goal: IsGoal,
+        edge_cost: F,
+        estimate_cost: H,
+    ) -> Option<(K, Vec<PgNodeIndex>)>
+    where
+        K: Copy + Default + PartialOrd + std::ops::Add<Output = K>,
+        IsGoal: FnMut(PgNodeIndex) -> bool,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+        H: FnMut(PgNodeIndex) -> K,
+    {
+        let v = self.__pg_view();
+        __pg_astar_in(&v, self.__pg_pos(start), is_goal, edge_cost, estimate_cost)
+    }
+    pub fn __pg_toposort(
+        &self,
+        _space: Option<&mut PgDfsSpace>,
+    ) -> Result<Vec<PgNodeIndex>, PgCycle<PgNodeIndex>> {
+        __pg_toposort_in(&self.__pg_view())
+    }
+    pub fn __pg_is_cyclic_directed(&self) -> bool {
+        __pg_is_cyclic_directed_in(&self.__pg_view())
+    }
+    pub fn __pg_is_cyclic_undirected(&self) -> bool {
+        __pg_is_cyclic_undirected_in(&self.__pg_view())
+    }
+    pub fn __pg_kosaraju_scc(&self) -> Vec<Vec<PgNodeIndex>> {
+        __pg_kosaraju_scc_in(&self.__pg_view())
+    }
+    pub fn __pg_scc(&self) -> Vec<Vec<PgNodeIndex>> {
+        __pg_kosaraju_scc_in(&self.__pg_view())
+    }
+    pub fn __pg_tarjan_scc(&self) -> Vec<Vec<PgNodeIndex>> {
+        __pg_tarjan_scc_in(&self.__pg_view())
+    }
+    pub fn __pg_has_path_connecting(
+        &self,
+        from: PgNodeIndex,
+        to: PgNodeIndex,
+        _space: Option<&mut PgDfsSpace>,
+    ) -> bool {
+        __pg_has_path_connecting_in(&self.__pg_view(), self.__pg_pos(from), self.__pg_pos(to))
+    }
+    pub fn __pg_all_simple_paths(
+        &self,
+        from: PgNodeIndex,
+        to: PgNodeIndex,
+        min_intermediate_nodes: usize,
+        max_intermediate_nodes: Option<usize>,
+    ) -> PgSimplePaths<PgNodeIndex> {
+        __pg_all_simple_paths_in(
+            &self.__pg_view(),
+            self.__pg_pos(from),
+            self.__pg_pos(to),
+            min_intermediate_nodes,
+            max_intermediate_nodes,
+        )
+    }
+    pub fn __pg_k_shortest_path<'a, K, F>(
+        &'a self,
+        start: PgNodeIndex,
+        goal: Option<PgNodeIndex>,
+        k: usize,
+        edge_cost: F,
+    ) -> std::collections::HashMap<PgNodeIndex, K>
+    where
+        K: Copy + Default + PartialOrd + std::ops::Add<Output = K>,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+    {
+        __pg_k_shortest_path_in(
+            &self.__pg_view(),
+            self.__pg_pos(start),
+            goal.map(|g| self.__pg_pos(g)),
+            k,
+            edge_cost,
+        )
+    }
+    pub fn __pg_is_bipartite_undirected(&self, start: PgNodeIndex) -> bool {
+        __pg_is_bipartite_undirected_in(&self.__pg_view(), self.__pg_pos(start))
+    }
+    pub fn __pg_bridges(&self) -> std::vec::IntoIter<PgEdgeReference<'_, E>> {
+        __pg_bridges_in(&self.__pg_view()).into_iter()
+    }
+    pub fn __pg_articulation_points(&self) -> std::collections::HashSet<PgNodeIndex> {
+        __pg_articulation_points_in(&self.__pg_view())
+    }
+    /// `spfa`: its vectors run to `node_bound()`, vacant slots unreached.
+    pub fn __pg_spfa<'a, K, F>(
+        &'a self,
+        source: PgNodeIndex,
+        edge_cost: F,
+    ) -> Result<PgPaths<PgNodeIndex, K>, PgNegativeCycle>
+    where
+        K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+        F: FnMut(PgEdgeReference<'a, E>) -> K,
+    {
+        let v = self.__pg_view();
+        let p = __pg_spfa_in(&v, self.__pg_pos(source), edge_cost)?;
+        Ok(PgPaths {
+            distances: __pg_spread(&v, p.distances, K::__pg_max()),
+            predecessors: __pg_spread(&v, p.predecessors, None),
+        })
+    }
+}
+
+impl<N: Default, E, Ty: PgEdgeType> PgStableGraph<N, E, Ty> {
+    /// A missing node: vacant slots up to it, then it (with `N::default()`).
+    fn __pg_ensure_node_exists(&mut self, ix: PgNodeIndex) {
+        if self.contains_node(ix) {
+            return;
+        }
+        while ix.index() >= self.g.nodes.len() {
+            let node_idx = self.g.add_node(Vec::new());
+            self.g.nodes[node_idx.index()].next =
+                [PgEdgeIndex(self.free_node.0), PgEdgeIndex::end()];
+            if self.free_node != PgNodeIndex::end() {
+                let f = self.g.nodes[self.free_node.index()].next;
+                self.g.nodes[self.free_node.index()].next = [f[0], PgEdgeIndex(node_idx.0)];
+            }
+            self.free_node = node_idx;
+        }
+        self.__pg_occupy_vacant_node(ix, N::default());
+    }
+    pub fn extend_with_edges<X: PgIntoNodeIndex, I: IntoIterator<Item = (X, X, E)>>(
+        &mut self,
+        iterable: I,
+    ) {
+        for (a, b, w) in iterable {
+            let a: PgNodeIndex = a.__pg_into_ix();
+            let b: PgNodeIndex = b.__pg_into_ix();
+            self.__pg_ensure_node_exists(a);
+            self.__pg_ensure_node_exists(b);
+            self.add_edge(a, b, w);
+        }
+    }
+    pub fn from_edges<X: PgIntoNodeIndex, I: IntoIterator<Item = (X, X, E)>>(
+        iterable: I,
+    ) -> PgStableGraph<N, E, Ty> {
+        let mut g = PgStableGraph::with_capacity(0, 0);
+        g.extend_with_edges(iterable);
+        g
+    }
+}
+
+impl<N: Default, E: Default, Ty: PgEdgeType> PgStableGraph<N, E, Ty> {
+    pub fn __pg_extend_with_edges2<X: PgIntoNodeIndex, I: IntoIterator<Item = (X, X)>>(
+        &mut self,
+        iterable: I,
+    ) {
+        for (a, b) in iterable {
+            let a: PgNodeIndex = a.__pg_into_ix();
+            let b: PgNodeIndex = b.__pg_into_ix();
+            self.__pg_ensure_node_exists(a);
+            self.__pg_ensure_node_exists(b);
+            self.add_edge(a, b, E::default());
+        }
+    }
+    pub fn __pg_from_edges2<X: PgIntoNodeIndex, I: IntoIterator<Item = (X, X)>>(
+        iterable: I,
+    ) -> PgStableGraph<N, E, Ty> {
+        let mut g = PgStableGraph::with_capacity(0, 0);
+        g.__pg_extend_with_edges2(iterable);
+        g
+    }
+}
+
+impl<N, E: PgFloatMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = E>, Ty: PgEdgeType>
+    PgStableGraph<N, E, Ty>
+{
+    /// `bellman_ford`: its vectors run to `node_bound()`, vacant slots unreached.
+    pub fn __pg_bellman_ford(
+        &self,
+        source: PgNodeIndex,
+    ) -> Result<PgPaths<PgNodeIndex, E>, PgNegativeCycle> {
+        let v = self.__pg_view();
+        let p = __pg_bellman_ford_in(&v, self.__pg_pos(source), |r| *r.weight())?;
+        Ok(PgPaths {
+            distances: __pg_spread(&v, p.distances, E::__pg_infinite()),
+            predecessors: __pg_spread(&v, p.predecessors, None),
+        })
+    }
+    pub fn __pg_find_negative_cycle(&self, source: PgNodeIndex) -> Option<Vec<PgNodeIndex>> {
+        __pg_find_negative_cycle_in(&self.__pg_view(), self.__pg_pos(source), |r| *r.weight())
+    }
+}
+
+impl<N: Clone, E: Clone + PartialOrd, Ty: PgEdgeType> PgStableGraph<N, E, Ty> {
+    /// `min_spanning_tree`: its edges' ends are the nodes' indices.
+    pub fn __pg_min_spanning_tree(&self) -> std::vec::IntoIter<PgElement<N, E>> {
+        let v = self.__pg_view();
+        let mut nodes = Vec::new();
+        for w in self.node_weights() {
+            nodes.push(w.clone());
+        }
+        let mut edges = Vec::new();
+        for &(a, b, r) in &v.refs {
+            edges.push((a, b, r.weight().clone()));
+        }
+        let mut out = Vec::new();
+        for el in __pg_min_spanning_tree_in(nodes, edges) {
+            out.push(match el {
+                PgElement::Edge {
+                    source,
+                    target,
+                    weight,
+                } => PgElement::Edge {
+                    source: v.raw[source],
+                    target: v.raw[target],
+                    weight,
+                },
+                node => node,
+            });
+        }
+        out.into_iter()
+    }
+}
+
+impl<N, E, Ty: PgEdgeType> From<PgGraph<N, E, Ty>> for PgStableGraph<N, E, Ty> {
+    fn from(g: PgGraph<N, E, Ty>) -> PgStableGraph<N, E, Ty> {
+        // (Built field by field: `with_capacity` asks `Ty`, which a `From` call doesn't carry.)
+        let mut out: PgStableGraph<N, E, Ty> = PgStableGraph {
+            g: PgGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                directed: g.directed,
+                ty: None,
+            },
+            node_count: g.nodes.len(),
+            edge_count: g.edges.len(),
+            free_node: PgNodeIndex::end(),
+            free_edge: PgEdgeIndex::end(),
+        };
+        for n in g.nodes {
+            out.g.nodes.push(PgNode {
+                weight: vec![n.weight],
+                next: n.next,
+            });
+        }
+        for e in g.edges {
+            out.g.edges.push(PgEdge {
+                weight: vec![e.weight],
+                next: e.next,
+                node: e.node,
+            });
+        }
+        out
+    }
+}
+
+impl<N, E, Ty: PgEdgeType> From<PgStableGraph<N, E, Ty>> for PgGraph<N, E, Ty> {
+    /// The live nodes and edges, in index order, renumbered.
+    fn from(graph: PgStableGraph<N, E, Ty>) -> PgGraph<N, E, Ty> {
+        let mut result: PgGraph<N, E, Ty> = PgGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            directed: graph.g.directed,
+            ty: None,
+        };
+        let mut node_index_map = vec![PgNodeIndex::end(); graph.g.nodes.len()];
+        for (i, node) in graph.g.nodes.into_iter().enumerate() {
+            if let Some(w) = node.weight.into_iter().next() {
+                node_index_map[i] = result.add_node(w);
+            }
+        }
+        for edge in graph.g.edges {
+            if let Some(w) = edge.weight.into_iter().next() {
+                let source = node_index_map[edge.node[0].index()];
+                let target = node_index_map[edge.node[1].index()];
+                result.add_edge(source, target, w);
+            }
+        }
+        result
+    }
+}
+
+impl<N, E, Ty> std::ops::Index<PgNodeIndex> for PgStableGraph<N, E, Ty> {
+    type Output = N;
+    fn index(&self, i: PgNodeIndex) -> &N {
+        let i = i.index();
+        &self.g.nodes[i].weight[0]
+    }
+}
+impl<N, E, Ty> std::ops::IndexMut<PgNodeIndex> for PgStableGraph<N, E, Ty> {
+    fn index_mut(&mut self, i: PgNodeIndex) -> &mut N {
+        let i = i.index();
+        &mut self.g.nodes[i].weight[0]
+    }
+}
+impl<N, E, Ty> std::ops::Index<PgEdgeIndex> for PgStableGraph<N, E, Ty> {
+    type Output = E;
+    fn index(&self, i: PgEdgeIndex) -> &E {
+        let i = i.index();
+        &self.g.edges[i].weight[0]
+    }
+}
+impl<N, E, Ty> std::ops::IndexMut<PgEdgeIndex> for PgStableGraph<N, E, Ty> {
+    fn index_mut(&mut self, i: PgEdgeIndex) -> &mut E {
+        let i = i.index();
+        &mut self.g.edges[i].weight[0]
+    }
+}
+
+/// An algorithm's per-node vector over a view's positions, spread out to its raw indices (a
+/// `StableGraph`'s vacant slots get `fill`).
+fn __pg_spread<Id, R, T: Clone>(v: &PgView<Id, R>, compact: Vec<T>, fill: T) -> Vec<T> {
+    if v.bound == compact.len() {
+        return compact;
+    }
+    let mut out = vec![fill; v.bound];
+    for (p, x) in compact.into_iter().enumerate() {
+        out[v.raw[p]] = x;
+    }
+    out
+}
+
 // ---------------------------------------------------------------- walkers
+
+/// What the walkers need of a graph (`&Graph`, `&StableGraph`, `&GraphMap`, `Reversed(..)`):
+/// its nodes and their neighbors either way.
+pub trait PgVisitGraph: Copy {
+    type NodeId: Copy;
+    fn __pg_node_ids(&self) -> Vec<Self::NodeId>;
+    fn __pg_neighbors_directed(&self, n: Self::NodeId, dir: PgDirection) -> Vec<Self::NodeId>;
+}
+impl<'a, N, E, Ty: PgEdgeType> PgVisitGraph for &'a PgGraph<N, E, Ty> {
+    type NodeId = PgNodeIndex;
+    fn __pg_node_ids(&self) -> Vec<PgNodeIndex> {
+        self.node_indices().collect()
+    }
+    fn __pg_neighbors_directed(&self, n: PgNodeIndex, dir: PgDirection) -> Vec<PgNodeIndex> {
+        self.neighbors_directed(n, dir).collect()
+    }
+}
+impl<'a, N, E, Ty: PgEdgeType> PgVisitGraph for &'a PgStableGraph<N, E, Ty> {
+    type NodeId = PgNodeIndex;
+    fn __pg_node_ids(&self) -> Vec<PgNodeIndex> {
+        self.node_indices().collect()
+    }
+    fn __pg_neighbors_directed(&self, n: PgNodeIndex, dir: PgDirection) -> Vec<PgNodeIndex> {
+        self.neighbors_directed(n, dir).collect()
+    }
+}
+impl<'a, N: Copy + Ord + std::hash::Hash, E, Ty: PgEdgeType> PgVisitGraph
+    for &'a PgGraphMap<N, E, Ty>
+{
+    type NodeId = N;
+    fn __pg_node_ids(&self) -> Vec<N> {
+        self.nodes.clone()
+    }
+    fn __pg_neighbors_directed(&self, n: N, dir: PgDirection) -> Vec<N> {
+        self.neighbors_directed(n, dir).collect()
+    }
+}
+
+/// `petgraph::visit::Reversed`: the graph with its edges turned around.
+#[derive(Clone, Copy, Debug)]
+pub struct PgReversed<G>(pub G);
+impl<G: PgVisitGraph> PgVisitGraph for PgReversed<G> {
+    type NodeId = G::NodeId;
+    fn __pg_node_ids(&self) -> Vec<G::NodeId> {
+        self.0.__pg_node_ids()
+    }
+    fn __pg_neighbors_directed(&self, n: G::NodeId, dir: PgDirection) -> Vec<G::NodeId> {
+        self.0.__pg_neighbors_directed(n, dir.opposite())
+    }
+}
+impl<G: PgVisitGraph> PgReversed<G> {
+    pub fn neighbors(&self, n: G::NodeId) -> std::vec::IntoIter<G::NodeId> {
+        self.0
+            .__pg_neighbors_directed(n, PgDirection::Incoming)
+            .into_iter()
+    }
+    pub fn neighbors_directed(
+        &self,
+        n: G::NodeId,
+        dir: PgDirection,
+    ) -> std::vec::IntoIter<G::NodeId> {
+        self.0
+            .__pg_neighbors_directed(n, dir.opposite())
+            .into_iter()
+    }
+}
+
+/// `petgraph::visit::Topo`: a node once all its incoming neighbors have been (nodes on a cycle
+/// never are).
+#[derive(Clone)]
+pub struct PgTopo<N> {
+    pub tovisit: Vec<N>,
+    pub ordered: std::collections::HashSet<N>,
+}
+impl<N: Copy + Eq + std::hash::Hash> PgTopo<N> {
+    pub fn new<G: PgVisitGraph<NodeId = N>>(graph: G) -> PgTopo<N> {
+        let mut topo = PgTopo {
+            tovisit: Vec::new(),
+            ordered: std::collections::HashSet::new(),
+        };
+        topo.__pg_extend_with_initials(graph);
+        topo
+    }
+    pub fn with_initials<G: PgVisitGraph<NodeId = N>, I: IntoIterator<Item = N>>(
+        graph: G,
+        initials: I,
+    ) -> PgTopo<N> {
+        let mut tovisit = Vec::new();
+        for n in initials {
+            if graph
+                .__pg_neighbors_directed(n, PgDirection::Incoming)
+                .is_empty()
+            {
+                tovisit.push(n);
+            }
+        }
+        PgTopo {
+            tovisit,
+            ordered: std::collections::HashSet::new(),
+        }
+    }
+    fn __pg_extend_with_initials<G: PgVisitGraph<NodeId = N>>(&mut self, graph: G) {
+        for a in graph.__pg_node_ids() {
+            if graph
+                .__pg_neighbors_directed(a, PgDirection::Incoming)
+                .is_empty()
+            {
+                self.tovisit.push(a);
+            }
+        }
+    }
+    pub fn reset<G: PgVisitGraph<NodeId = N>>(&mut self, graph: G) {
+        self.ordered.clear();
+        self.tovisit.clear();
+        self.__pg_extend_with_initials(graph);
+    }
+    pub fn __pg_next<F: FnMut(N, PgDirection) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
+        while let Some(nix) = self.tovisit.pop() {
+            if self.ordered.contains(&nix) {
+                continue;
+            }
+            self.ordered.insert(nix);
+            for neigh in neighbors(nix, PgDirection::Outgoing) {
+                let mut ready = true;
+                for b in neighbors(neigh, PgDirection::Incoming) {
+                    if !self.ordered.contains(&b) {
+                        ready = false;
+                        break;
+                    }
+                }
+                if ready {
+                    self.tovisit.push(neigh);
+                }
+            }
+            return Some(nix);
+        }
+        None
+    }
+}
 
 /// `petgraph::visit::Bfs`: `while let Some(n) = bfs.next(&g)`.
 #[derive(Clone)]
@@ -1315,9 +2534,9 @@ impl<N: Copy + Eq + std::hash::Hash> PgBfs<N> {
         stack.push_front(start);
         PgBfs { stack, discovered }
     }
-    pub fn __pg_next<F: FnMut(N) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
+    pub fn __pg_next<F: FnMut(N, PgDirection) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
         if let Some(node) = self.stack.pop_front() {
-            for succ in neighbors(node) {
+            for succ in neighbors(node, PgDirection::Outgoing) {
                 if self.discovered.insert(succ) {
                     self.stack.push_back(succ);
                 }
@@ -1357,10 +2576,10 @@ impl<N: Copy + Eq + std::hash::Hash> PgDfs<N> {
         self.stack.clear();
         self.stack.push(start);
     }
-    pub fn __pg_next<F: FnMut(N) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
+    pub fn __pg_next<F: FnMut(N, PgDirection) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
         while let Some(node) = self.stack.pop() {
             if self.discovered.insert(node) {
-                for succ in neighbors(node) {
+                for succ in neighbors(node, PgDirection::Outgoing) {
                     if !self.discovered.contains(&succ) {
                         self.stack.push(succ);
                     }
@@ -1405,10 +2624,10 @@ impl<N: Copy + Eq + std::hash::Hash> PgDfsPostOrder<N> {
         self.stack.clear();
         self.stack.push(start);
     }
-    pub fn __pg_next<F: FnMut(N) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
+    pub fn __pg_next<F: FnMut(N, PgDirection) -> Vec<N>>(&mut self, mut neighbors: F) -> Option<N> {
         while let Some(&nx) = self.stack.last() {
             if self.discovered.insert(nx) {
-                for succ in neighbors(nx) {
+                for succ in neighbors(nx, PgDirection::Outgoing) {
                     if !self.discovered.contains(&succ) {
                         self.stack.push(succ);
                     }
@@ -1424,15 +2643,293 @@ impl<N: Copy + Eq + std::hash::Hash> PgDfsPostOrder<N> {
     }
 }
 
+// ---------------------------------------------------------------- Dot
+
+/// `petgraph::dot::RankDir`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgRankDir {
+    TB,
+    BT,
+    LR,
+    RL,
+}
+
+/// `petgraph::dot::Config`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PgDotConfig {
+    NodeIndexLabel,
+    EdgeIndexLabel,
+    EdgeNoLabel,
+    NodeNoLabel,
+    GraphContentOnly,
+    RankDir(PgRankDir),
+}
+
+/// What `Dot` prints of a graph: whether it's directed, its nodes (`to_index`, weight) and its
+/// edges (`to_index` of each end, weight), in `node_references()` / `edge_references()` order.
+pub trait PgDotGraph {
+    type NodeWeight;
+    type EdgeWeight;
+    fn __pg_dot_directed(&self) -> bool;
+    fn __pg_dot_nodes(&self) -> Vec<(usize, &Self::NodeWeight)>;
+    fn __pg_dot_edges(&self) -> Vec<(usize, usize, &Self::EdgeWeight)>;
+}
+impl<N, E, Ty: PgEdgeType> PgDotGraph for PgGraph<N, E, Ty> {
+    type NodeWeight = N;
+    type EdgeWeight = E;
+    fn __pg_dot_directed(&self) -> bool {
+        self.directed
+    }
+    fn __pg_dot_nodes(&self) -> Vec<(usize, &N)> {
+        let mut out = Vec::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            out.push((i, &n.weight));
+        }
+        out
+    }
+    fn __pg_dot_edges(&self) -> Vec<(usize, usize, &E)> {
+        let mut out = Vec::new();
+        for e in &self.edges {
+            out.push((e.node[0].index(), e.node[1].index(), &e.weight));
+        }
+        out
+    }
+}
+impl<N, E, Ty: PgEdgeType> PgDotGraph for PgStableGraph<N, E, Ty> {
+    type NodeWeight = N;
+    type EdgeWeight = E;
+    fn __pg_dot_directed(&self) -> bool {
+        self.g.directed
+    }
+    fn __pg_dot_nodes(&self) -> Vec<(usize, &N)> {
+        let mut out = Vec::new();
+        for (i, n) in self.g.nodes.iter().enumerate() {
+            if let Some(w) = n.weight.first() {
+                out.push((i, w));
+            }
+        }
+        out
+    }
+    fn __pg_dot_edges(&self) -> Vec<(usize, usize, &E)> {
+        let mut out = Vec::new();
+        for e in &self.g.edges {
+            if let Some(w) = e.weight.first() {
+                out.push((e.node[0].index(), e.node[1].index(), w));
+            }
+        }
+        out
+    }
+}
+impl<N: Copy + Ord + std::hash::Hash, E, Ty: PgEdgeType> PgDotGraph for PgGraphMap<N, E, Ty> {
+    type NodeWeight = N;
+    type EdgeWeight = E;
+    fn __pg_dot_directed(&self) -> bool {
+        self.directed
+    }
+    fn __pg_dot_nodes(&self) -> Vec<(usize, &N)> {
+        let mut out = Vec::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            out.push((i, n));
+        }
+        out
+    }
+    fn __pg_dot_edges(&self) -> Vec<(usize, usize, &E)> {
+        let mut out = Vec::new();
+        for e in &self.edges {
+            out.push((self.node_ix[&e.0], self.node_ix[&e.1], &e.2));
+        }
+        out
+    }
+}
+impl<'b, G: PgDotGraph> PgDotGraph for &'b G {
+    type NodeWeight = G::NodeWeight;
+    type EdgeWeight = G::EdgeWeight;
+    fn __pg_dot_directed(&self) -> bool {
+        (**self).__pg_dot_directed()
+    }
+    fn __pg_dot_nodes(&self) -> Vec<(usize, &G::NodeWeight)> {
+        (**self).__pg_dot_nodes()
+    }
+    fn __pg_dot_edges(&self) -> Vec<(usize, usize, &G::EdgeWeight)> {
+        (**self).__pg_dot_edges()
+    }
+}
+
+/// `petgraph::dot::Dot`: the graph in Graphviz's format, its weights by `{}` or `{:?}` (as the
+/// `Dot` itself is formatted).
+pub struct PgDot<'a, G> {
+    graph: G,
+    config: &'a [PgDotConfig],
+}
+impl<'a, G> PgDot<'a, G> {
+    pub fn new(graph: G) -> PgDot<'a, G> {
+        PgDot { graph, config: &[] }
+    }
+    pub fn with_config(graph: G, config: &'a [PgDotConfig]) -> PgDot<'a, G> {
+        PgDot { graph, config }
+    }
+}
+impl<'a, G: PgDotGraph> std::fmt::Display for PgDot<'a, G>
+where
+    G::NodeWeight: std::fmt::Display,
+    G::EdgeWeight: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let alt = f.alternate();
+        let mut nodes = Vec::new();
+        for (i, w) in self.graph.__pg_dot_nodes() {
+            nodes.push((
+                i,
+                if alt {
+                    format!("{:#}\n", w)
+                } else {
+                    format!("{}", w)
+                },
+            ));
+        }
+        let mut edges = Vec::new();
+        for (a, b, w) in self.graph.__pg_dot_edges() {
+            edges.push((
+                a,
+                b,
+                if alt {
+                    format!("{:#}\n", w)
+                } else {
+                    format!("{}", w)
+                },
+            ));
+        }
+        __pg_dot_write(f, self.config, self.graph.__pg_dot_directed(), nodes, edges)
+    }
+}
+impl<'a, G: PgDotGraph> std::fmt::Debug for PgDot<'a, G>
+where
+    G::NodeWeight: std::fmt::Debug,
+    G::EdgeWeight: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let alt = f.alternate();
+        let mut nodes = Vec::new();
+        for (i, w) in self.graph.__pg_dot_nodes() {
+            nodes.push((
+                i,
+                if alt {
+                    format!("{:#?}\n", w)
+                } else {
+                    format!("{:?}", w)
+                },
+            ));
+        }
+        let mut edges = Vec::new();
+        for (a, b, w) in self.graph.__pg_dot_edges() {
+            edges.push((
+                a,
+                b,
+                if alt {
+                    format!("{:#?}\n", w)
+                } else {
+                    format!("{:?}", w)
+                },
+            ));
+        }
+        __pg_dot_write(f, self.config, self.graph.__pg_dot_directed(), nodes, edges)
+    }
+}
+
+/// A label between `"`s: `"` and `\` escaped, a newline Graphviz's left-justified `\l`.
+fn __pg_dot_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\l"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn __pg_dot_write(
+    f: &mut std::fmt::Formatter,
+    config: &[PgDotConfig],
+    directed: bool,
+    nodes: Vec<(usize, String)>,
+    edges: Vec<(usize, usize, String)>,
+) -> std::fmt::Result {
+    let has = |c: PgDotConfig| config.contains(&c);
+    let content_only = has(PgDotConfig::GraphContentOnly);
+    let mut rank_dir = None;
+    for c in config {
+        if let PgDotConfig::RankDir(d) = c {
+            rank_dir = Some(*d);
+        }
+    }
+    if !content_only {
+        writeln!(f, "{} {{", if directed { "digraph" } else { "graph" })?;
+    }
+    if let Some(d) = rank_dir {
+        let value = match d {
+            PgRankDir::TB => "TB",
+            PgRankDir::BT => "BT",
+            PgRankDir::LR => "LR",
+            PgRankDir::RL => "RL",
+        };
+        writeln!(f, "    rankdir=\"{}\"", value)?;
+    }
+    for (i, label) in nodes {
+        write!(f, "    {} [ ", i)?;
+        if !has(PgDotConfig::NodeNoLabel) {
+            write!(f, "label = \"")?;
+            if has(PgDotConfig::NodeIndexLabel) {
+                write!(f, "{}", i)?;
+            } else {
+                write!(f, "{}", __pg_dot_escape(&label))?;
+            }
+            write!(f, "\" ")?;
+        }
+        writeln!(f, "]")?;
+    }
+    for (k, (a, b, label)) in edges.into_iter().enumerate() {
+        write!(
+            f,
+            "    {} {} {} [ ",
+            a,
+            if directed { "->" } else { "--" },
+            b
+        )?;
+        if !has(PgDotConfig::EdgeNoLabel) {
+            write!(f, "label = \"")?;
+            if has(PgDotConfig::EdgeIndexLabel) {
+                write!(f, "{}", k)?;
+            } else {
+                write!(f, "{}", __pg_dot_escape(&label))?;
+            }
+            write!(f, "\" ")?;
+        }
+        writeln!(f, "]")?;
+    }
+    if !content_only {
+        writeln!(f, "}}")?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- algorithms
 
 /// A graph as the algorithms see it: node ids by position, each node's `edges(n)` (with the
-/// target's position), its incoming neighbors (for `Reversed`), and `edge_references()`.
+/// target's position), its incoming neighbors (for `Reversed`), and `edge_references()`; each
+/// position's index (`to_index`: a `StableGraph`'s skip its vacant slots) and `node_bound()`.
 pub struct PgView<Id, R> {
     ids: Vec<Id>,
     out: Vec<Vec<(usize, R)>>,
     inc: Vec<Vec<usize>>,
     refs: Vec<(usize, usize, R)>,
+    raw: Vec<usize>,
+    bound: usize,
+    directed: bool,
 }
 
 /// petgraph's `MinScored`: a min-heap entry by score (NaN last), ties equal.
@@ -1591,7 +3088,39 @@ where
     W: FnMut(R) -> K,
 {
     let n = v.ids.len();
-    let mut predecessors: Vec<Option<Id>> = vec![None; n];
+    let (distances, predecessors) = __pg_bellman_ford_relax(v, source, &mut weight);
+    for i in 0..n {
+        for &(j, r) in &v.out[i] {
+            let w = weight(r);
+            if distances[i] + w < distances[j] {
+                return Err(PgNegativeCycle(()));
+            }
+        }
+    }
+    let mut preds = Vec::new();
+    for p in predecessors {
+        preds.push(p.map(|p| v.ids[p]));
+    }
+    Ok(PgPaths {
+        distances,
+        predecessors: preds,
+    })
+}
+
+/// Bellman-Ford's first two steps: the distances from `source` after relaxing every edge up to
+/// `n - 1` times, and each node's predecessor (by position).
+fn __pg_bellman_ford_relax<Id, R, K, W>(
+    v: &PgView<Id, R>,
+    source: usize,
+    weight: &mut W,
+) -> (Vec<K>, Vec<Option<usize>>)
+where
+    R: Copy,
+    K: PgFloatMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+    W: FnMut(R) -> K,
+{
+    let n = v.ids.len();
+    let mut predecessors: Vec<Option<usize>> = vec![None; n];
     let mut distances: Vec<K> = vec![K::__pg_infinite(); n];
     if source < n {
         distances[source] = K::default();
@@ -1603,7 +3132,7 @@ where
                 let w = weight(r);
                 if distances[i] + w < distances[j] {
                     distances[j] = distances[i] + w;
-                    predecessors[j] = Some(v.ids[i]);
+                    predecessors[j] = Some(i);
                     did_update = true;
                 }
             }
@@ -1612,18 +3141,62 @@ where
             break;
         }
     }
-    for i in 0..n {
+    (distances, predecessors)
+}
+
+/// `find_negative_cycle`: from the first edge that still relaxes, back along the predecessors
+/// until the walk comes round.
+fn __pg_find_negative_cycle_in<Id, R, K, W>(
+    v: &PgView<Id, R>,
+    source: usize,
+    mut weight: W,
+) -> Option<Vec<Id>>
+where
+    Id: Copy,
+    R: Copy,
+    K: PgFloatMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+    W: FnMut(R) -> K,
+{
+    let n = v.ids.len();
+    let (distance, predecessor) = __pg_bellman_ford_relax(v, source, &mut weight);
+    let mut path: Vec<usize> = Vec::new();
+    'outer: for i in 0..n {
         for &(j, r) in &v.out[i] {
             let w = weight(r);
-            if distances[i] + w < distances[j] {
-                return Err(PgNegativeCycle(()));
+            if distance[i] + w < distance[j] {
+                let start = j;
+                let mut node = start;
+                let mut visited = vec![false; n];
+                loop {
+                    let ancestor = match predecessor[node] {
+                        Some(p) => p,
+                        None => node,
+                    };
+                    if ancestor == start {
+                        path.push(ancestor);
+                        break;
+                    } else if visited[ancestor] {
+                        let pos = path.iter().position(|&p| p == ancestor).unwrap();
+                        path = path[pos..].to_vec();
+                        break;
+                    }
+                    path.push(ancestor);
+                    visited[ancestor] = true;
+                    node = ancestor;
+                }
+                break 'outer;
             }
         }
     }
-    Ok(PgPaths {
-        distances,
-        predecessors,
-    })
+    if path.is_empty() {
+        return None;
+    }
+    path.reverse();
+    let mut out = Vec::new();
+    for p in path {
+        out.push(v.ids[p]);
+    }
+    Some(out)
 }
 
 /// `Dfs::next` over positions, with `reversed` following incoming edges (`Reversed(g)`).
@@ -1661,7 +3234,7 @@ fn __pg_toposort_in<Id: Copy, R>(v: &PgView<Id, R>) -> Result<Vec<Id>, PgCycle<I
     let mut finished = vec![false; n];
     let mut finish_stack: Vec<usize> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
-    for i in (0..n).rev() {
+    for i in 0..n {
         if discovered[i] {
             continue;
         }
@@ -1949,4 +3522,398 @@ fn __pg_min_spanning_tree_in<NW, EW: PartialOrd>(
         }
     }
     out
+}
+
+/// `all_simple_paths`' iterator: a depth-first walk keeping the path so far, yielding each
+/// time it can step onto `to` (petgraph's order, lazily). The paths are `Vec`s, whatever
+/// collection the turbofish names.
+pub struct PgSimplePaths<Id> {
+    ids: Vec<Id>,
+    out: Vec<Vec<usize>>,
+    to: usize,
+    min_length: usize,
+    max_length: usize,
+    visited: Vec<usize>,
+    on_path: Vec<bool>,
+    // (A node on the path, and the next of its neighbors to try.)
+    stack: Vec<(usize, usize)>,
+}
+impl<Id: Copy> PgSimplePaths<Id> {
+    fn __pg_pop(&mut self) {
+        self.stack.pop();
+        if let Some(x) = self.visited.pop() {
+            self.on_path[x] = false;
+        }
+    }
+}
+impl<Id: Copy> Iterator for PgSimplePaths<Id> {
+    type Item = Vec<Id>;
+    fn next(&mut self) -> Option<Vec<Id>> {
+        while let Some(&(node, k)) = self.stack.last() {
+            let last = self.stack.len() - 1;
+            if k >= self.out[node].len() {
+                self.__pg_pop();
+                continue;
+            }
+            let child = self.out[node][k];
+            self.stack[last] = (node, k + 1);
+            if self.on_path[child] {
+                continue;
+            }
+            if self.visited.len() < self.max_length {
+                if child == self.to {
+                    if self.visited.len() >= self.min_length {
+                        return Some(self.__pg_path());
+                    }
+                } else {
+                    self.visited.push(child);
+                    self.on_path[child] = true;
+                    self.stack.push((child, 0));
+                }
+            } else {
+                // (At the longest: is `to` among this node's remaining neighbors?)
+                let mut found = child == self.to;
+                if !found {
+                    let mut j = k + 1;
+                    while j < self.out[node].len() {
+                        let x = self.out[node][j];
+                        j += 1;
+                        if x == self.to && !self.on_path[x] {
+                            found = true;
+                            break;
+                        }
+                    }
+                    self.stack[last] = (node, j);
+                }
+                if found && self.visited.len() >= self.min_length {
+                    return Some(self.__pg_path());
+                }
+                self.__pg_pop();
+            }
+        }
+        None
+    }
+}
+impl<Id: Copy> PgSimplePaths<Id> {
+    fn __pg_path(&self) -> Vec<Id> {
+        let mut path = Vec::new();
+        for &p in &self.visited {
+            path.push(self.ids[p]);
+        }
+        path.push(self.ids[self.to]);
+        path
+    }
+}
+
+fn __pg_all_simple_paths_in<Id: Copy, R>(
+    v: &PgView<Id, R>,
+    from: usize,
+    to: usize,
+    min_intermediate_nodes: usize,
+    max_intermediate_nodes: Option<usize>,
+) -> PgSimplePaths<Id> {
+    let n = v.ids.len();
+    let max_length = match max_intermediate_nodes {
+        Some(l) => l + 1,
+        None => n.saturating_sub(1),
+    };
+    let mut out = Vec::new();
+    for edges in &v.out {
+        let mut targets = Vec::new();
+        for &(t, _) in edges {
+            targets.push(t);
+        }
+        out.push(targets);
+    }
+    let mut on_path = vec![false; n];
+    on_path[from] = true;
+    PgSimplePaths {
+        ids: v.ids.clone(),
+        out,
+        to,
+        min_length: min_intermediate_nodes + 1,
+        max_length,
+        visited: vec![from],
+        on_path,
+        stack: vec![(from, 0)],
+    }
+}
+
+fn __pg_floyd_warshall_in<Id, R, K, F>(
+    v: &PgView<Id, R>,
+    mut edge_cost: F,
+) -> Result<std::collections::HashMap<(Id, Id), K>, PgNegativeCycle>
+where
+    Id: Copy + Eq + std::hash::Hash,
+    R: Copy,
+    K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+    F: FnMut(R) -> K,
+{
+    let n = v.ids.len();
+    let mut dist = vec![vec![K::__pg_max(); n]; n];
+    for &(s, t, r) in &v.refs {
+        let cost = edge_cost(r);
+        if dist[s][t] > cost {
+            dist[s][t] = cost;
+            if !v.directed {
+                dist[t][s] = cost;
+            }
+        }
+    }
+    for i in 0..n {
+        dist[i][i] = K::default();
+    }
+    for k in 0..n {
+        for i in 0..n {
+            for j in 0..n {
+                let (result, overflow) = dist[i][k].__pg_overflowing_add(dist[k][j]);
+                if !overflow && dist[i][j] > result {
+                    dist[i][j] = result;
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        if dist[i][i] < K::default() {
+            return Err(PgNegativeCycle(()));
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for i in 0..n {
+        for j in 0..n {
+            out.insert((v.ids[i], v.ids[j]), dist[i][j]);
+        }
+    }
+    Ok(out)
+}
+
+/// `k_shortest_path`: each node's cost the `k`-th time the search pops it.
+fn __pg_k_shortest_path_in<Id, R, K, F>(
+    v: &PgView<Id, R>,
+    start: usize,
+    goal: Option<usize>,
+    k: usize,
+    mut edge_cost: F,
+) -> std::collections::HashMap<Id, K>
+where
+    Id: Copy + Eq + std::hash::Hash,
+    R: Copy,
+    K: Copy + Default + PartialOrd + std::ops::Add<Output = K>,
+    F: FnMut(R) -> K,
+{
+    let mut counter = vec![0usize; v.ids.len()];
+    let mut scores = std::collections::HashMap::new();
+    let mut visit_next = std::collections::BinaryHeap::new();
+    visit_next.push(PgMinScored(K::default(), start));
+    while let Some(PgMinScored(node_score, node)) = visit_next.pop() {
+        counter[node] += 1;
+        let current_counter = counter[node];
+        if current_counter > k {
+            continue;
+        }
+        if current_counter == k {
+            scores.insert(v.ids[node], node_score);
+        }
+        if goal == Some(node) && current_counter == k {
+            break;
+        }
+        for &(next, r) in &v.out[node] {
+            visit_next.push(PgMinScored(node_score + edge_cost(r), next));
+        }
+    }
+    scores
+}
+
+/// `is_bipartite_undirected`: a breadth-first two-coloring from `start`.
+fn __pg_is_bipartite_undirected_in<Id, R>(v: &PgView<Id, R>, start: usize) -> bool {
+    let n = v.ids.len();
+    let mut red = vec![false; n];
+    let mut blue = vec![false; n];
+    red[start] = true;
+    let mut stack = std::collections::VecDeque::new();
+    stack.push_front(start);
+    while let Some(node) = stack.pop_front() {
+        let is_red = red[node];
+        let is_blue = blue[node];
+        assert!(is_red ^ is_blue);
+        for &(neighbour, _) in &v.out[node] {
+            let is_neighbour_red = red[neighbour];
+            let is_neighbour_blue = blue[neighbour];
+            if (is_red && is_neighbour_red) || (is_blue && is_neighbour_blue) {
+                return false;
+            }
+            if !is_neighbour_red && !is_neighbour_blue {
+                if is_red {
+                    blue[neighbour] = true;
+                } else {
+                    red[neighbour] = true;
+                }
+                stack.push_back(neighbour);
+            }
+        }
+    }
+    true
+}
+
+/// `bridges`: the edges (in `edge_references()` order) whose removal splits their component,
+/// by the earliest node each depth-first subtree reaches back to.
+fn __pg_bridges_in<Id, R: Copy>(v: &PgView<Id, R>) -> Vec<R> {
+    let n = v.ids.len();
+    let mut clock = 0usize;
+    let mut visit_time: Vec<Option<usize>> = vec![None; n];
+    let mut earliest_backedge = vec![usize::MAX; n];
+    for start in 0..n {
+        if visit_time[start].is_some() {
+            continue;
+        }
+        visit_time[start] = Some(clock);
+        clock += 1;
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&(node, k)) = stack.last() {
+            let last = stack.len() - 1;
+            let parent = if last > 0 {
+                Some(stack[last - 1].0)
+            } else {
+                None
+            };
+            if k < v.out[node].len() {
+                stack[last] = (node, k + 1);
+                let child = v.out[node][k].0;
+                if parent != Some(child) {
+                    if let Some(time) = visit_time[child] {
+                        earliest_backedge[node] = earliest_backedge[node].min(time);
+                    } else {
+                        visit_time[child] = Some(clock);
+                        clock += 1;
+                        stack.push((child, 0));
+                    }
+                }
+            } else {
+                if let Some(p) = parent {
+                    earliest_backedge[p] = earliest_backedge[p].min(earliest_backedge[node]);
+                }
+                stack.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &(s, t, r) in &v.refs {
+        let (parent, node) = if visit_time[s].unwrap() < visit_time[t].unwrap() {
+            (s, t)
+        } else {
+            (t, s)
+        };
+        if earliest_backedge[node] > visit_time[parent].unwrap() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// `articulation_points`: petgraph's iterative depth-first search, its recursion as steps on a
+/// stack (0: visit, 1: a child, 2: back from a child, 3: the root's child count).
+fn __pg_articulation_points_in<Id: Copy + Eq + std::hash::Hash, R>(
+    v: &PgView<Id, R>,
+) -> std::collections::HashSet<Id> {
+    let n = v.ids.len();
+    let mut visited = vec![false; n];
+    let mut low = vec![usize::MAX; n];
+    let mut disc = vec![usize::MAX; n];
+    let mut parent = vec![usize::MAX; n];
+    let mut time = 0usize;
+    let mut points = std::collections::HashSet::new();
+    for root in 0..n {
+        if visited[root] {
+            continue;
+        }
+        let mut stack: Vec<(u8, usize, usize)> = vec![(0, root, 0)];
+        let mut children_count = vec![0usize; n];
+        while let Some((step, current, child)) = stack.pop() {
+            match step {
+                0 => {
+                    visited[current] = true;
+                    disc[current] = time;
+                    low[current] = time;
+                    time += 1;
+                    stack.push((3, current, 0));
+                    for &(c, _) in &v.out[current] {
+                        stack.push((1, current, c));
+                    }
+                }
+                1 => {
+                    if !visited[child] {
+                        parent[child] = current;
+                        children_count[current] += 1;
+                        stack.push((2, current, child));
+                        stack.push((0, child, 0));
+                    } else if child != parent[current] {
+                        low[current] = low[current].min(disc[child]);
+                    }
+                }
+                2 => {
+                    low[current] = low[current].min(low[child]);
+                    if parent[current] != usize::MAX && low[child] >= disc[current] {
+                        points.insert(v.ids[current]);
+                    }
+                }
+                _ => {
+                    if parent[current] == usize::MAX && children_count[current] > 1 {
+                        points.insert(v.ids[current]);
+                    }
+                }
+            }
+        }
+    }
+    points
+}
+
+/// `spfa`: Bellman-Ford with a queue of the nodes whose distance just went down; a node queued
+/// `node_bound()` times means a negative cycle.
+fn __pg_spfa_in<Id, R, K, F>(
+    v: &PgView<Id, R>,
+    source: usize,
+    mut edge_cost: F,
+) -> Result<PgPaths<Id, K>, PgNegativeCycle>
+where
+    Id: Copy,
+    R: Copy,
+    K: PgBoundedMeasure + Copy + PartialOrd + Default + std::ops::Add<Output = K>,
+    F: FnMut(R) -> K,
+{
+    let n = v.ids.len();
+    let mut distances = vec![K::__pg_max(); n];
+    let mut predecessors: Vec<Option<usize>> = vec![None; n];
+    distances[source] = K::default();
+    let mut queue = std::collections::VecDeque::new();
+    let mut in_queue = vec![false; n];
+    queue.push_back(source);
+    in_queue[source] = true;
+    let mut visits = vec![0usize; n];
+    while let Some(i) = queue.pop_front() {
+        in_queue[i] = false;
+        if visits[i] >= v.bound {
+            return Err(PgNegativeCycle(()));
+        }
+        visits[i] += 1;
+        for &(j, r) in &v.out[i] {
+            let w = edge_cost(r);
+            let (dist, overflow) = distances[i].__pg_overflowing_add(w);
+            if !overflow && dist < distances[j] {
+                distances[j] = dist;
+                predecessors[j] = Some(i);
+                if !in_queue[j] {
+                    in_queue[j] = true;
+                    queue.push_back(j);
+                }
+            }
+        }
+    }
+    let mut preds = Vec::new();
+    for p in predecessors {
+        preds.push(p.map(|p| v.ids[p]));
+    }
+    Ok(PgPaths {
+        distances,
+        predecessors: preds,
+    })
 }

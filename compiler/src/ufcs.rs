@@ -473,6 +473,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                         "{{ fn __from_iter{i}<I: IntoIterator<Item = {item}>>(it: I) -> {t} {{ it.into_iter().collect() }} __from_iter{i} }}"
                     )
                 }
+                // (`let g = Vec::from_iter;`: generic over the items too.)
+                _ if at(name + 1) == ";"
+                    && let Some(f) = ty.as_deref().and_then(|t| from_iter_generic_fn(t, i)) =>
+                {
+                    f
+                }
                 _ => {
                     let fish = ty.map(|t| format!("::<{t}>")).unwrap_or_default();
                     format!("(|__ufcs0| (__ufcs0).into_iter().collect{fish}())")
@@ -1030,6 +1036,35 @@ fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Optio
         k += sep(k)?;
     }
     (at(k) == "from_iter").then_some((first, k, ty))
+}
+
+/// `let g = Vec::from_iter;` with no type argument written (`ty` is `Vec<_>`): a generic fn over
+/// the items, with the bounds the collection's `FromIterator` impl has. (Not `HashMap` /
+/// `HashSet`: their hasher would be unknown, rustc's E0283.)
+fn from_iter_generic_fn(ty: &str, i: usize) -> Option<String> {
+    let (name, args) = ty.split_once('<')?;
+    if args.split(',').any(|a| a.trim().trim_end_matches('>') != "_") {
+        return None;
+    }
+    let collect = "{ it.into_iter().collect() }";
+    let (params, ret, bound) = match name {
+        "Vec" => ("I: IntoIterator", "Vec<I::Item>".to_string(), ""),
+        "VecDeque" | "LinkedList" => ("I: IntoIterator", format!("std::collections::{name}<I::Item>"), ""),
+        "BTreeSet" | "BinaryHeap" => (
+            "I: IntoIterator",
+            format!("std::collections::{name}<I::Item>"),
+            " where I::Item: Ord",
+        ),
+        "BTreeMap" => (
+            "K: Ord, V, I: IntoIterator<Item = (K, V)>",
+            "std::collections::BTreeMap<K, V>".to_string(),
+            "",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "{{ fn __from_iter{i}<{params}>(it: I) -> {ret}{bound} {collect} __from_iter{i} }}"
+    ))
 }
 
 /// The item type a std collection `ty` (`Vec<i32>`, `HashMap<u8, String>`) is collected from,

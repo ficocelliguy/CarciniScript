@@ -937,7 +937,24 @@ impl Codegen<'_> {
                 }
                 self.extra_consts = extra;
             }
-            if let Some(sig) = self.types.adts.method(key, n.text()).cloned() {
+            // (Impls of the trait for two tuples of this length: a copy for each, with its own
+            // elements as `self`'s, so its calls on `self` reach that impl's methods.)
+            let alts = self
+                .types
+                .adts
+                .method_alts
+                .get(&format!("{key}::{}", n.text()))
+                .filter(|_| crate::adt::tuple_arity(key).is_some())
+                .cloned();
+            if let Some(alts) = alts {
+                for k in alts {
+                    if let Some(sig) = self.types.adts.method(key, &k).cloned() {
+                        let own = Ty::Tuple(sig.impl_args.clone());
+                        let k = (k != n.text()).then_some(k);
+                        self.emit_method_fn(&f, sig, own, "}", k);
+                    }
+                }
+            } else if let Some(sig) = self.types.adts.method(key, n.text()).cloned() {
                 self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
             }
             self.extra_consts = saved_extra;
@@ -981,6 +998,56 @@ impl Codegen<'_> {
                 "$ext${key}.$elem = new Set([{}]);",
                 elems.join(", ")
             )));
+        }
+        // Impls of one trait for two tuples of this length (`(u8, u8)`, `(String, String)`): each
+        // method's keys with the impl's element classes, which `κσ.$dcall` / `$dcallT` match
+        // against the elements' classes or values. (A function: those classes may come later.)
+        if crate::adt::tuple_arity(key).is_some() {
+            let mut alts: Vec<String> = Vec::new();
+            let mut names: Vec<&String> = self
+                .types
+                .adts
+                .method_alts
+                .keys()
+                .filter(|k| {
+                    k.strip_prefix(&format!("{key}::")).is_some()
+                        && self.types.adts.inherent_alts.contains(*k)
+                })
+                .collect();
+            names.sort();
+            for k in names {
+                let m = &k[key.len() + 2..];
+                let entries: Vec<String> = self.types.adts.method_alts[k]
+                    .iter()
+                    .filter_map(|alt| {
+                        let sig = self.types.adts.method(key, alt)?;
+                        let ds: Vec<String> = sig
+                            .impl_args
+                            .iter()
+                            .map(|a| match self.dict_of(a) {
+                                d if d == "undefined" => "null".to_string(),
+                                d => d,
+                            })
+                            .collect();
+                        Some(format!(
+                            "[{}, [{}]]",
+                            super::js_string(&prop(alt)),
+                            ds.join(", ")
+                        ))
+                    })
+                    .collect();
+                alts.push(format!(
+                    "{}: [{}]",
+                    super::js_string(&prop(m)),
+                    entries.join(", ")
+                ));
+            }
+            if !alts.is_empty() {
+                self.line(Frag::text(format!(
+                    "$ext${key}.$alts = () => ({{ {} }});",
+                    alts.join(", ")
+                )));
+            }
         }
         // `Box<dyn Shape>`'s `from`s: called by name only.
         if key.starts_with("dyn$") {

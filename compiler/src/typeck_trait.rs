@@ -488,17 +488,58 @@ impl Checker<'_> {
             None => Vec::new(),
         };
         self.diags.truncate(n_diags);
-        self.adts
+        let heads = self
+            .adts
             .impl_heads
             .entry((type_name.to_string(), tr.to_string()))
-            .or_default()
-            .push((self_args, head_args));
+            .or_default();
+        // (`impl Tr for (u8, u8)` next to `impl Tr for (String, String)`: one class whose
+        // methods are picked by the elements, see `typeck_adt.rs`.)
+        let other_tuple = crate::adt::tuple_arity(type_name).is_some()
+            && !heads.is_empty()
+            && heads.iter().all(|(sa, _)| {
+                sa.len() == self_args.len()
+                    && sa
+                        .iter()
+                        .zip(&self_args)
+                        .any(|(a, b)| crate::adt::disjoint_args(a, b))
+            });
+        let tuple_args = crate::adt::tuple_arity(type_name).map(|_| self_args.clone());
+        heads.push((self_args, head_args));
         for tm in def
             .methods
             .iter()
             .filter(|tm| tm.has_default && !given.iter().any(|(n, _)| *n == tm.name))
         {
-            let sig = subst_method(&tm.sig, &m);
+            let mut sig = subst_method(&tm.sig, &m);
+            // (A tuple's: with its elements, which pick between impls for two tuples of one
+            // length; the second's default under a key of its own, as its own methods are.)
+            if let Some(args) = &tuple_args {
+                sig.impl_args = args.clone();
+            }
+            let n = &tm.name;
+            if other_tuple
+                && self
+                    .adts
+                    .methods
+                    .get(type_name)
+                    .is_some_and(|ms| ms.contains_key(n.as_str()))
+            {
+                let alts = self
+                    .adts
+                    .method_alts
+                    .entry(format!("{type_name}::{n}"))
+                    .or_insert_with(|| vec![n.clone()]);
+                let key = format!("{n}${}", alts.len());
+                alts.push(key.clone());
+                self.adts.inherent_alts.insert(format!("{type_name}::{n}"));
+                self.adts
+                    .methods
+                    .entry(type_name.to_string())
+                    .or_default()
+                    .insert(key, sig);
+                continue;
+            }
             self.adts
                 .methods
                 .entry(type_name.to_string())
@@ -510,7 +551,7 @@ impl Checker<'_> {
             .trait_impls
             .entry(type_name.to_string())
             .or_default();
-        if impls.iter().any(|t| t == tr) && def.type_params.is_empty() {
+        if impls.iter().any(|t| t == tr) && def.type_params.is_empty() && !other_tuple {
             let node = imp
                 .trait_()
                 .map(|t| t.syntax().clone())
@@ -543,9 +584,11 @@ impl Checker<'_> {
                 format!(
                     "conflicting implementations of trait `{tr}` for type `{type_name}` ({same} are one type in JS)"
                 )
-            } else if let Some(n) = crate::adt::tuple_arity(type_name) {
+            } else if let Some(args) = tuple_args {
+                // (Impls for tuples whose elements don't overlap are each their own.)
                 format!(
-                    "`{tr}` for two tuples of {n} isn't supported yet (tuples are JS arrays, which a call through a type parameter tells apart by length only)"
+                    "conflicting implementations of trait `{tr}` for type `{}`",
+                    Ty::Tuple(args).describe()
                 )
             } else if def.type_params.is_empty() {
                 format!("conflicting implementations of trait `{tr}` for type `{type_name}`")

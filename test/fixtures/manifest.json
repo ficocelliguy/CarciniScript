@@ -126,6 +126,12 @@
     "panic": null
   },
   {
+    "file": "assoc_type_static_calls.rs",
+    "stdout": "6\nb30\n18 5\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "async_closures.rs",
     "stdout": "15\nhi x3\nhi x4\nroot\n  a\n    a1\n  b\n4 4\n15\n[0, 2, 4]\nboxed\n28\nn=7\nOk(40)\ntrue\n55\n99\n9\n",
     "exitCode": 0,
@@ -181,7 +187,7 @@
   },
   {
     "file": "bound_ranges.rs",
-    "stdout": "[(3, 6), (4, 8), (5, 10)]\n[(7, 14), (8, 16), (9, 18)]\n[(0, 0), (1, 2)]\n0\n[7, 8]\n[(2, 4), (3, 6)]\n[5, 6]\n[9]\n[10, 15]\n[\"bee\", \"cat\"]\nIncluded(3) Excluded(7) true\nIncluded(1) Included(4)\nIncluded(2) Excluded(5)\nIncluded(5)\nIncluded(10) Excluded(20)\nExcluded(1) Unbounded\n[2, 3] [8, 9] [0, 1]\n10 10\nUnbounded Unbounded Included(1) Excluded(2)\ntrue\nends before 7\n",
+    "stdout": "[(3, 6), (4, 8), (5, 10)]\n[(7, 14), (8, 16), (9, 18)]\n[(0, 0), (1, 2)]\n0\n[7, 8]\n[(2, 4), (3, 6)]\n[5, 6]\n[9]\n[10, 15]\n[\"bee\", \"cat\"]\nIncluded(3) Excluded(7) true\nIncluded(1) Included(4)\nIncluded(2) Excluded(5)\nIncluded(5)\nIncluded(10) Excluded(20)\nExcluded(1) Unbounded\n[2, 3] [8, 9] [0, 1]\n10 10\nUnbounded Unbounded Included(1) Excluded(2)\ntrue\nUnbounded true true\nends before 7\n",
     "exitCode": 0,
     "panic": null
   },
@@ -829,7 +835,7 @@
   },
   {
     "file": "from_iter_values.rs",
-    "stdout": "[[1, 2], [3]]\n[{1}]\n[{1: 'a', 2: 'b'}]\n[\"hi\"]\nSome([4, 5])\n[0, 1, 2]\n{1: 'a', 2: 'b'}\nab 1\n",
+    "stdout": "[[1, 2], [3]]\n[{1}]\n[{1: 'a', 2: 'b'}]\n[\"hi\"]\nSome([4, 5])\n[0, 1, 2]\n{1: 'a', 2: 'b'}\nab 1\n[1, 2, 3]\n{1, 2, 3}\n{1: 'a', 2: 'b'}\n['a', 'b']\n",
     "exitCode": 0,
     "panic": null
   },
@@ -2234,6 +2240,12 @@
   {
     "file": "tuple_trait_impls.rs",
     "stdout": "(u3,i4)\n<s2:abu9i-2>\n(u1,s1:x)(u1,s1:x)\n((u1,u2),i7)((u1,u2),i7)\n7\n14\n(u1,u2) (u3,u4)\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "tuple_trait_two_impls.rs",
+    "stdout": "u8s 3 \ni32s -1 \ni32s 5 \nf64s 1.5 \nstrs ab \nflag s true \nps 4 \nthree \ni32s -1 i32s -1 \nu8s 15 i32s -1 f64s 2.0 \nflag 9 false strs xy \nu8s 11 u8s 11 i32s -1 i32s -1 \nu8s 2 \nf64s 1.5 \nstrs pq \nflag c true \nps 8 \n",
     "exitCode": 0,
     "panic": null
   },

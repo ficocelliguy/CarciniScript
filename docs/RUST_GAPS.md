@@ -601,8 +601,10 @@ There is one JS thread, and scripts share it with the game.
 - **A tuple is a JS array**, as are a slice, array and `Vec`. Through a generic `T: Trait` whose
   trait has impls on both, the impl goes by `T`'s class when the caller passes it
   (`κσ.$tupT`, `$dcallT`); through a `T` no caller passes a class for (a function value), or
-  `dyn Trait`, by the value: a tuple's impl takes any array of its length. Two impls for tuples
-  of one length (`(u8, u8)` and `(String, String)`) conflict.
+  `dyn Trait`, by the value: a tuple's impl takes any array of its length. Impls for several tuples
+  of one length go by the elements: their classes when the caller passes them, else their values,
+  so through `dyn` `(1u8, 2u8)` and `(1i32, 2i32)` reach the first of those impls (a whole `f64`
+  pair the integer one, as for numbers).
 - **An `Option` through a generic `T: Trait`** is `null` or its value at run time, so it goes
   by the class the caller passes for `T` (`Some(Some(4))` reaches the `Option` impl twice).
   Where no class comes with it (a `T` the caller can't name, a `dyn Trait`), by the value: the
@@ -759,12 +761,18 @@ There is one JS thread, and scripts share it with the game.
   `global`, `num_args`, `arg!` / `command!`, `#[arg(value_parser = ..)]` ranges and nested
   subcommand variants aren't there. `get_one::<T>` parses the value it's asked for (clap checks
   the type it was given).
-- **`petgraph`:** `Graph`'s index type is always `u32` (no `Graph<N, E, Ty, Ix>` / `NodeIndex<Ix>`),
-  and there's no `StableGraph`, `MatrixGraph`, `Csr`, `Dot`, `Graph`'s `{:?}`, `map` /
-  `filter_map` / `retain_*`, `Topo`, `Reversed`, `Walker::iter` or the other `algo` functions
-  (`all_simple_paths`, `floyd_warshall`, `condensation`, ..). `neighbors(..)` and the other
+- **`petgraph`:** an index type (`Graph<N, E, Ty, u16>`, `NodeIndex<usize>`) is dropped, so
+  indices are `u32`s whatever it says (no panic past `u16::MAX` nodes), and a generic
+  `Ix: IndexType` parameter isn't supported. There's no `MatrixGraph`, `Csr`, `Graph`'s or
+  `StableGraph`'s `{:?}`, `map` / `filter_map` / `retain_*`, `Walker::iter`,
+  `Dot::with_attr_getters`, or the other `algo` functions (`page_rank`, `dsatur_coloring`,
+  `dominators`, `is_isomorphic`, matchings, `ford_fulkerson` / `dinics`, `johnson`,
+  `bidirectional_dijkstra`, `floyd_warshall_path`, `all_simple_paths_multi`, ..). The algorithms
+  and `Dot` take a graph, not `Reversed(&g)`, and `Topo::new(Reversed(&g))` can't tell its node
+  type (walking `Reversed(&g)` with `Dfs` / `Bfs` / `DfsPostOrder` works).
+  `all_simple_paths::<C, _, _>` yields `Vec`s whatever `C` is. `neighbors(..)` and the other
   iterators are collected when called (no `detach()`). `node_weight_mut` / `edge_weight_mut` /
-  `GraphMap::edge_weight_mut` write through for struct weights only; for numbers and strings use
+  `GraphMap::edge_weight_mut` (and `StableGraph`'s) write through for struct weights only; for numbers and strings use
   `g[n] = ..` / `g[n] += ..`. `from_edges` / `extend_with_edges` take pairs (`E::default()`
   weights) only when the list is written out (`&[(0, 1), ..]`, `vec![..]`); anything else is
   read as `(a, b, w)` triples. A `GraphMap` algorithm's cost closure gets the edge as a tuple

@@ -881,6 +881,8 @@ function decodeMappings(mappings) {
 // The `fn main` wrapper is added; bodies start on line 2.
 const rejected = [
   ["assign to immutable", "let x = 1;\n    x = 2;", "3:5 cannot assign twice to immutable variable `x`"],
+  ["one trait for one tuple type twice", "}\ntrait K { fn k(&self) -> u8; }\nimpl K for (u8, u8) { fn k(&self) -> u8 { 1 } }\nimpl K for (u8, u8) { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `(u8, u8)`"],
+  ["one trait for a generic tuple and a concrete one", "}\ntrait K { fn k(&self) -> u8; }\nimpl<A, B> K for (A, B) { fn k(&self) -> u8 { 1 } }\nimpl K for (u8, String) { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `(u8, String)`"],
   ["unsupported construct", "let v = vec![1];\n    let r = v.as_ptr();", "3:15 no method named `as_ptr` found for struct `Vec<{integer}>` in the current scope: method not found in `Vec<{integer}>`"],
   ["an unknown type", "let x: Foo = 1;", "2:12 cannot find type `Foo` in this scope"],
   ["a misspelled type", "}\nstruct Stack { n: i32 }\nfn f() {\n    let s: Stak = Stack { n: 1 };", "5:12 cannot find type `Stak` in this scope: not found in this scope (a struct with a similar name exists: `Stack`)"],
@@ -1584,6 +1586,11 @@ for (const [label, files, want] of rejectedFiles) {
     ["signature help in `vec!`", () => { const h = signatureHelp(inMacro("    let w = vec![v.insert(0, )];"), "svc.rs", 8, 29); return h && `${h.label} @${h.active}`; }, "fn insert(&mut self, index: usize, element: i32) @1"],
     ["signature help in an unclosed `debug_assert!`", () => { const h = signatureHelp(inMacro("    debug_assert!(t.score("), "svc.rs", 8, 27); return h && `${h.label} @${h.active}`; }, "fn score(&self) -> f64 @0"],
     ["hover in `assert_eq!`", () => hover(inMacro("    assert_eq!(s, 3.0);"), "svc.rs", 8, 16)?.contents, "s: f64"],
+    // (A stray closer in an unfinished nested call: the parser leaves `];` inside `insert(`.)
+    ["signature help before a stray closer in `vec!`", () => { const h = signatureHelp(inMacro("    let w = vec![v.insert(0, ];"), "svc.rs", 8, 30); return h && `${h.label} @${h.active}`; }, "fn insert(&mut self, index: usize, element: i32) @1"],
+    ["signature help in an unclosed `dbg!` before its `;`", () => { const h = signatureHelp(inMacro("    dbg!(v.insert(0, );"), "svc.rs", 8, 22); return h && `${h.label} @${h.active}`; }, "fn insert(&mut self, index: usize, element: i32) @1"],
+    ["hover on a closure parameter in `assert!`", () => hover(inMacro("    assert!(v.iter().all(|x| *x > 0));"), "svc.rs", 8, 27)?.contents, "x: i32"],
+    ["hover on a closure parameter in an unclosed `vec!`", () => hover(inMacro("    let w = vec![v.iter().map(|q| q + 1).count()"), "svc.rs", 8, 35)?.contents, "q: i32"],
   );
   // `jsx!`: hover on tags and attributes (markup) and in embedded expressions; completions of
   // tags, a component's props and an element's attributes.

@@ -5637,6 +5637,12 @@ impl<'a> Codegen<'a> {
         if self.dict_scope.contains(&first) {
             return Some(format!("${first}"));
         }
+        // (`T::E::mk(..)`: `T`'s class's getter for its impl's `type E`.)
+        if let Some((t, a)) = first.split_once("::")
+            && self.dict_scope.iter().any(|d| d == t)
+        {
+            return Some(format!("${t}.$at${a}"));
+        }
         // (A blanket impl's associated function: `T::make()` / `Self::make()` on `this`.)
         if let Some(t) = &self.blanket_this
             && (first == *t || first == "Self")
@@ -5739,6 +5745,30 @@ impl<'a> Codegen<'a> {
 
     /// The class (or built-in stand-in) passed for a type parameter's `T::make()` calls, with
     /// the blanket impls' associated functions it lacks (`κσ.$bdict`).
+    /// Of the impls of `method` for several tuples of one length (`key` is `Tuple2`), the key of
+    /// the one for elements `es` (the method's own name when there's one impl, or none fits).
+    fn tuple_alt_key(&self, key: &str, method: &str, es: &[Ty]) -> String {
+        let adts = &self.types.adts;
+        let k = format!("{key}::{method}");
+        if !adts.inherent_alts.contains(&k) {
+            return method.to_string();
+        }
+        adts.method_alts[&k]
+            .iter()
+            .find(|alt| {
+                adts.method(key, alt).is_some_and(|s| {
+                    s.impl_args.len() == es.len()
+                        && !s
+                            .impl_args
+                            .iter()
+                            .zip(es)
+                            .any(|(a, e)| crate::adt::disjoint_args(a, e))
+                })
+            })
+            .cloned()
+            .unwrap_or_else(|| method.to_string())
+    }
+
     fn dict_of(&self, t: &Ty) -> String {
         let d = self.dict_of_own(t);
         let wrap = match t {
@@ -7186,12 +7216,15 @@ impl<'a> Codegen<'a> {
         };
         if let Some(key) = ext {
             // (One of several impls of a generic trait: its key.)
-            let method = self
-                .types
-                .method_keys
-                .get(&self.range_of(m.syntax()))
-                .cloned()
-                .unwrap_or(method);
+            let method = match self.types.method_keys.get(&self.range_of(m.syntax())) {
+                Some(k) => k.clone(),
+                // (`self.kind()` in a default method's copy for one of several tuple impls:
+                // that impl's, by `self`'s elements.)
+                None => match self.lookup("self").map(|l| l.ty.clone()) {
+                    Some(Ty::Tuple(es)) => self.tuple_alt_key(&key, &method, &es),
+                    _ => method,
+                },
+            };
             let sig = self.types.adts.method(&key, &method).cloned();
             let (rf, rt) = self.emit_expr(&recv, None);
             // (Only a `self` receiver takes a copy: `&mut self` writes into the value itself, or

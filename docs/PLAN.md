@@ -11,78 +11,6 @@ Finished work is recorded in [FEATURES.md](FEATURES.md) (what compiles) and
 [RUST_GAPS.md](RUST_GAPS.md) (where behavior differs from rustc); this document keeps the design
 decisions and the open work.
 
-## MVP: as far as the user knows, this is Rust
-
-The goal: someone who knows Rust writes small Bitburner scripts (a hack loop, a server scanner,
-a contract solver, a few hundred lines over one or two files) and nothing they see says this
-isn't rustc. That covers what the code does, and also every message the toolchain shows them:
-panics, compile errors, warnings, printed values. Not perfect, just nothing they'd hit in the
-first weeks. (`println!` stays `console.log`, which Bitburner shows in the script's terminal.)
-
-**Measured 2026-11-24** with programs a Rust user would write, against rustc 2021 builds:
-
-- **Behavior is there.** A 170-line probe of the usual idioms (`VecDeque` BFS, `BTreeMap`
-  counts, `entry`, `sort_by` / `binary_search_by` / `partition` / `chunks` / `windows`, `impl
-  Display` with widths, trait defaults, `Box<dyn Fn>`, `mem::swap` / `take`, `{:#?}`) printed
-  exactly what rustc's build did; NS scripts type-check against the bindings; 83% of the 5,220
-  registry files have no language gap.
-- **Printed values match** (2026-11-24) but for `u64::MAX` / `i64::MAX` / `MIN`, which are
-  2^53 − 1 by design, and 64-bit values a double can't hold.
-
-Panics, compile errors and warnings in rustc's format are done (FEATURES "rustc's diagnostic
-format" and "rustc's warnings (lints)", RUST_GAPS "Diagnostics"), and so is what was left
-(2026-11-24):
-
-1. **Printed values.** A 64-bit integer past 2^53 prints the double's exact digits (`1u64 <<
-   60` is `1152921504606846976`), `{:e}` of `±inf` / NaN is rustc's, `{:.N}` from 1e21 up
-   keeps its digits, `-0.0` keeps its sign under `{:e}` / `{:.N}`, and every stable `f64` /
-   `f32` constant is there, also through `use std::f64::consts;` and `use
-   std::f64::consts::PI;` (FEATURES "Float constants and printing edge cases").
-2. **`drain()`** on `HashMap` and `HashSet`; `BTreeMap` and `BTreeSet` have none in std, so
-   theirs is rustc's E0599, whose headline now names a std type as rustc does
-   (`BTreeMap<K, V, A>`). The stale "not supported yet" messages are gone.
-3. **The acceptance test**, `test/mvp/` (`node test/mvp/run.mjs`, part of `npm test`): 36
-   scripts against rustc 2024 as `cargo build` runs it (a debug build): the rendered errors and
-   warnings line for line apart from paths, stdout, the exit code and the panic, and libtest's
-   report for the `#[test]` module. Netscript scripts run natively against
-   `tools/ns-shim.rs` (the NS API as plain Rust over a small network) and here against a mock
-   read from the same table. Ten were written by an agent that saw only the NS API, not the
-   project (`array_jumping`, `graph_two_coloring`, `grid_shortest_path`, `hgw_manager`,
-   `lz_decompress`, `sanitize_parentheses`, `scan_and_root`, `total_ways_to_sum`,
-   `triangle_min_path`, `vigenere_cipher`); a person who writes Rust is still the better
-   test. It found, besides items 1 and 2: E0004 naming only the first missing variant and
-   without rustc's note and new arm, E0061 without its label, note and placeholders, E0596
-   without its `let mut`, E0382's `for` loop wording, the derived-impl note on a dead variant,
-   and rustc's packing of labels onto shared rows; all fixed. All 36 match (2026-11-24); the
-   last three differences it found are fixed too:
-   - `Vec<&str>` given a `String` (`vigenere_cipher.rs`): rustc's E0308 for what's pushed or
-     inserted into a local declared `Vec<&T>` / `VecDeque<&T>`, and for `s.push_str(t)`, where
-     the value is certainly owned (RUST_GAPS "Type checking"; `&str` and `String` are still
-     one type).
-   - E0502 for a `Vec` grown inside a `for` loop over it (`err_borrow_conflict.rs`): the loop
-     as a multi-line span beside the other labels (its start joined by `_____|` below them),
-     and rustc's "borrow later used here" on every borrow error, found by following the
-     control flow to the next use of what holds the borrow.
-   - Notes into std's own source (`total_ways_to_sum.rs`, `--> collect.rs:312:18`) for
-     `into_iter` and "method defined here" on `Vec::push` and the like, following rustc
-     1.100's rust-src.
-   Fixing these brought E0308's "function defined here" note and `&x` suggestion for a
-   mistyped argument, E0382's "moved due to this method call" with its note and `.clone()`
-   suggestion, and the place used (`s.n`, not `s`) under E0382's label.
-
-Considered and left out:
-- Programs rustc rejects that compile here (`let s: &str = String::from(..)`, `.clone()` on a
-  struct without `Clone`, the use-after-move cases in RUST_GAPS "Type checking"). They run
-  correctly, so a user only notices by missing an error they expected. After the MVP.
-- Width on a derived `{:?}` (`{:<5?}` of `Some(1)`), and the other minor differences in
-  RUST_GAPS part 3. Rare in scripts.
-- Threads, raw pointers and the OS (RUST_GAPS part 2): a Bitburner script doesn't expect them,
-  and `std::env::args` / `thread::sleep` / `stdin` / `fs` behave as documented.
-
-After the MVP: re-run the corpus survey (`npm run corpus`) to measure the 2026-11-24
-"mismatched types" fixes, which all landed after the last run, and refresh the uncategorized
-sort; then the open items in the sections below.
-
 ## Contracts inherited from the RapydScript integration
 
 | Concern | Python (RapydScript-NS) today | CarciniScript |
@@ -307,15 +235,11 @@ serde-wasm-bindgen's `JsValue`, fastrand's `WyRng`, rayon, rand); closures whose
 comes from another file's iterator (regex's `bytes.rs`); and autocfg's pre-2018
 `Option<&error::Error>`.
 
-**Open** (each confirmed with a program rustc accepts, edition 2021, `--crate-type lib`):
-
-- [ ] `T::E::mk(..)` in a generic free function (an associated type's trait function through a
-  type parameter; `Self::Error::custom` in a trait default method works).
-- [ ] `(..).start_bound()` where only the expected type says what `T` is (the `RangeFull`
-  impl's `T` isn't in its self type).
-- [ ] One trait for two tuples of one length (`(u8, u8)` and `(String, String)`). Both impls
-  are keyed `Tuple2` (one `$ext$Tuple2` class, methods by name), so this needs a key per
-  element types before the class can pick between them.
+**Open:** nothing from that triage. Its last three items are done (2026-11-24): `T::E::mk(..)`
+through a type parameter, `(..).start_bound()` typed by the expected type (it already worked;
+now in `fixtures/bound_ranges.rs`), and one trait for several tuples of one length (each impl's
+methods and defaults under keys of their own, picked by the elements; `$alts` on the class for
+`κσ.$dcall` / `$dcallT`).
 
 ### Crates for Bitburner scripts
 
@@ -325,8 +249,6 @@ itertools, hashbrown, once_cell, either, num, clap, chrono, regex, tokio / futur
 rustc_hash, smallvec, indexmap), plus two for players: `ordered-float` (`f64` scores as
 `BinaryHeap` / `BTreeMap` keys) and `petgraph`.
 
-- [ ] `petgraph`: `StableGraph`, `Topo` / `Reversed`, more `algo` functions, `Dot`, a `Graph`
-  index type other than `u32`.
 - Marginal: `static_assertions`, `tap`, `strsim`, a `base64` alias over `js::btoa` / `js::atob`,
   and a `js_sys` alias over the `js` crate. Not useful in a script: proc-macro, test and bench
   tooling (criterion, quickcheck, proptest, insta), system and FFI crates, zero-copy and binary
@@ -374,12 +296,9 @@ the same; the rest differ in `{:p}`, filesystem errors, `process::exit` running 
 panic columns (both fixed since). (In five more, `diff-one` reported the JS location of a
 `todo!()` as `undefined` because the message follows the location on one line; the locations
 agree; `diff-one` reads that line since 2026-11-23.) Every compiler and std gap it found is fixed
-except:
-
-- [ ] `let g = Vec::from_iter;` with no type anywhere (the closure's parameter would have none;
-  with a `let` type or a turbofish it works).
-- Of little use in a script: `PathBuf::read_dir` / `read_link` / `metadata` and
-  `OsStr::from_bytes` (Programming Rust `copy`, the unsafe exercise).
+(the last, `let g = Vec::from_iter;` with no type anywhere, on 2026-11-24) except, of little use
+in a script, `PathBuf::read_dir` / `read_link` / `metadata` and `OsStr::from_bytes` (Programming
+Rust `copy`, the unsafe exercise).
 
 **Expected:** threads, channels, `Arc` / `Mutex` and `thread::sleep` (13 files); raw pointers,
 `MaybeUninit`, `PhantomPinned` and `Pin` projections, `transmute`, `slice::from_raw_parts`,
@@ -401,9 +320,10 @@ are), is done: `compileTests`, the libtest report, `tests/` scripts as test buil
 errors as warnings, the language service inside test code, the README's "Testing your scripts"
 and the web REPL's Run tests button; see FEATURES.
 
-- [ ] Inside a std macro's arguments (completions, signature help and hover work there): signature
-  help with a stray closer in an unfinished nested call (`vec![add(1, ];`), and hover on a
-  closure parameter.
+Inside a std macro's arguments, signature help with a stray closer in an unfinished nested call
+(`vec![v.insert(0, ];`, and `dbg!(v.insert(0, );` before the macro is closed) works since
+2026-11-24: the argument stops at the closer the parser left in an error node, and at an unclosed
+macro's trailing `;`. Hover on a closure parameter there already worked.
 
 ## React and `jsx!` (for `ns.printRaw` / `tprintRaw`)
 

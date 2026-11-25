@@ -1359,8 +1359,18 @@ impl Checker<'_> {
                 .is_some_and(|trs| trs.iter().any(|t| t == b))
         };
         let array_impls = has("Vec") && (1..=12).filter_map(crate::adt::tuple_key).any(has);
-        (numeric_impls >= 2 || option_impl || array_impls)
-            && (self.try_note_dict(name) || array_impls && self.elem_class(name))
+        // And with impls on two tuples of one length (`(u8, u8)`, `(i32, i32)`): only the
+        // elements' classes tell them apart.
+        let tuple_alts = self.adts.traits.get(b).is_some_and(|d| {
+            d.methods.iter().any(|tm| {
+                (1..=12)
+                    .filter_map(crate::adt::tuple_key)
+                    .any(|k| self.adts.inherent_alts.contains(&format!("{k}::{}", tm.name)))
+            })
+        });
+        let arrays = array_impls || tuple_alts;
+        (numeric_impls >= 2 || option_impl || arrays)
+            && (self.try_note_dict(name) || arrays && self.elem_class(name))
     }
 
     /// Methods on a value of type parameter `T`.

@@ -1771,6 +1771,50 @@ impl Checker<'_> {
                     .alt_arg_refs
                     .insert(format!("{type_name}::{}", name.text()), w);
             }
+            // One trait for another tuple of this length (`impl Show for (String, String)` next to
+            // `impl Show for (u8, u8)`): its methods under keys of their own, picked by the
+            // receiver's element types (and at run time by the elements' classes or values).
+            if let Some(tr) = trait_name.as_deref()
+                && crate::adt::tuple_arity(&type_name).is_some()
+                && self.adts.traits.contains_key(tr)
+                && let Some(existing) = self.adts.methods.get(&type_name)
+                && existing.contains_key(name.text().to_string().as_str())
+            {
+                let n = name.text().to_string();
+                let keys = self
+                    .adts
+                    .method_alts
+                    .get(&format!("{type_name}::{n}"))
+                    .cloned()
+                    .unwrap_or_else(|| vec![n.clone()]);
+                let disjoint = keys.iter().all(|k| {
+                    existing.get(k).is_some_and(|m| {
+                        m.impl_args.len() == impl_args.len()
+                            && m.impl_args
+                                .iter()
+                                .zip(&impl_args)
+                                .any(|(a, b)| crate::adt::disjoint_args(a, b))
+                    })
+                });
+                if disjoint {
+                    let alts = self
+                        .adts
+                        .method_alts
+                        .entry(format!("{type_name}::{n}"))
+                        .or_insert_with(|| vec![n.clone()]);
+                    let key = format!("{n}${}", alts.len());
+                    alts.push(key.clone());
+                    let at = self.range(name.syntax()).0;
+                    self.adts.alt_keys_at.insert(at, key.clone());
+                    self.adts.inherent_alts.insert(format!("{type_name}::{n}"));
+                    self.adts
+                        .methods
+                        .entry(type_name.clone())
+                        .or_default()
+                        .insert(key, method);
+                    continue;
+                }
+            }
             // A second user trait with a method of this name (`impl UsernameWidget for Form {
             // fn get }` next to `impl AgeWidget for Form { fn get }`), or one an inherent method
             // has: under `Trait$method`, what `Trait::method(&x)` calls (the plain name stays

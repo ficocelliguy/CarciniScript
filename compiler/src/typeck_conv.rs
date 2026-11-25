@@ -434,7 +434,18 @@ impl Checker<'_> {
                 self.resolve_vars(t)
                     .walk(&mut |x| open_lit |= *x == Ty::IntLit);
             }
-            if keys.len() > 1 && open_lit {
+            // (Impls of a trait for several tuples, `(u8, u8)` and `(i32, i32)`: rustc's
+            // integer fallback, `(1, 2).k()` is the `i32` one's.)
+            if keys.len() > 1 && open_lit && crate::adt::tuple_arity(ty).is_some() {
+                let defaulted: Vec<Ty> = targs
+                    .iter()
+                    .map(|t| match self.resolve_vars(t) {
+                        Ty::IntLit => Ty::Int(IntKind::I32),
+                        t => t,
+                    })
+                    .collect();
+                keys = self.alts_for_args(ty, keys, &defaulted);
+            } else if keys.len() > 1 && open_lit {
                 self.error(
                     m.syntax(),
                     format!(
@@ -500,6 +511,8 @@ impl Checker<'_> {
         match self.shallow(t) {
             v @ Ty::Var(_) => match self.var_kind(&v) {
                 Some(VarKind::Int) => Ty::IntLit,
+                // (`(1.5, 2.0).kind()` with impls for `(f64, f64)` and `(u8, u8)`.)
+                Some(VarKind::Float) => Ty::Float { f32: false },
                 _ => v,
             },
             Ty::Adt(n, args) => Ty::Adt(n, args.iter().map(|a| self.resolve_vars(a)).collect()),
