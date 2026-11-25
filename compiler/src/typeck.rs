@@ -398,6 +398,7 @@ impl<'a> Checker<'a> {
             mut_ref_loops: Default::default(),
             copy_arrays: Default::default(),
             str_locals: Default::default(),
+            ref_vecs: Default::default(),
             move_sites: Default::default(),
             io_writes: Default::default(),
             slot_item_calls: Default::default(),
@@ -964,6 +965,9 @@ struct Checker<'a> {
     /// `let` locals whose initializer is certainly a `&str` (`let s = "a";`, `let t = s;`,
     /// `let u = x.as_str();`), by declaration: `s + ".."` is rustc's E0369.
     str_locals: std::collections::HashSet<(usize, usize)>,
+    /// Locals and parameters declared `Vec<&T>` / `VecDeque<&T>` (also behind `&mut`), by
+    /// declaration, with `&T` as written: what they're given must be a reference.
+    ref_vecs: HashMap<(usize, usize), String>,
     /// Uses that move a binding (filled by the move checker).
     move_sites: std::collections::HashSet<(usize, usize)>,
     /// `write!` destinations that are `io::Write`rs (by their start).
@@ -2628,6 +2632,25 @@ impl<'a> Checker<'a> {
         self.error_help(a.syntax(), msg, diag_help::REFS);
     }
 
+    /// `v.push(x)` into a local declared `Vec<&T>` (`ref_vecs`): an owned `x` of the element's
+    /// type is rustc's E0308, as for a `&T` parameter.
+    pub(super) fn check_ref_elem(&mut self, recv: &ast::Expr, a: &ast::Expr, elem: &Ty) {
+        let ast::Expr::PathExpr(p) = strip_parens(recv) else { return };
+        let Some(shown) = p
+            .path()
+            .and_then(|p| p.as_single_name_ref())
+            .and_then(|n| self.lookup(n.text().to_string().as_str()))
+            .and_then(|l| l.decl)
+            .and_then(|d| self.ref_vecs.get(&d).cloned())
+        else {
+            return;
+        };
+        let found = self.raw.get(&self.range(a.syntax())).cloned().map(|t| self.zonk(&t));
+        if found.is_some_and(|f| f == self.zonk(elem)) {
+            self.check_ref_arg(a, &shown);
+        }
+    }
+
     /// `Some(is_mut)` when a declared type is a reference.
     fn ref_kind(t: &ast::Type) -> Option<bool> {
         match t {
@@ -2734,6 +2757,10 @@ impl<'a> Checker<'a> {
                         decl: None,
                     };
                     self.declare(&n, local);
+                    if let Some(shown) = p.ty().and_then(|t| ref_elem_written(&t)) {
+                        let r = self.range(n.syntax());
+                        self.ref_vecs.insert(r, shown);
+                    }
                     // `t: &mut (usize, &mut i32)`: `t.1` is a slot.
                     if let Some(s) = p.ty().and_then(|t| self.param_tuple_slot_shape(&t)) {
                         self.slot_items.insert(n.text().to_string(), s);
@@ -3263,6 +3290,10 @@ impl<'a> Checker<'a> {
                 self.let_types.push((r, ty.clone()));
             }
             self.declare(&name, local);
+            if let Some(shown) = l.ty().and_then(|t| ref_elem_written(&t)) {
+                let r = self.range(name.syntax());
+                self.ref_vecs.insert(r, shown);
+            }
             if let Some(s) = slot_item {
                 self.slot_items.insert(name.text().to_string(), s);
             }
@@ -4100,11 +4131,147 @@ impl<'a> Checker<'a> {
                 .expr()
                 .map(|e| e.syntax().clone())
                 .unwrap_or_else(|| m.syntax().clone());
-            self.error(
-                &node,
-                format!("non-exhaustive patterns: `{}` not covered", witness[0]),
-            );
+            // rustc names each missing constructor (`A`, `B` and `C`; past three, `and N
+            // more`), through the reference the scrutinee is.
+            let mut all = self.top_witnesses(&rows, &st);
+            if all.is_empty() {
+                all = vec![witness[0].clone()];
+            }
+            let amp = self.scrutinee_ref(m);
+            let all: Vec<String> = all.iter().map(|w| format!("{amp}{w}")).collect();
+            let ticked: Vec<String> = all.iter().map(|w| format!("`{w}`")).collect();
+            let list = match ticked.as_slice() {
+                [one] => one.clone(),
+                [init @ .., last] if init.len() < 3 => format!("{} and {last}", init.join(", ")),
+                _ => format!("{} and {} more", ticked[..3].join(", "), ticked.len() - 3),
+            };
+            let (start, end) = self.range(&node);
+            let spans = self.non_exhaustive_spans(m, arms, &st, amp, &all);
+            self.diags.push(RawDiag {
+                start,
+                end,
+                message: format!("non-exhaustive patterns: {list} not covered"),
+                severity: "error",
+                help: None,
+                spans,
+            });
         }
+    }
+
+    /// Each constructor of the scrutinee's type the arms leave values of, as rustc lists them
+    /// (empty for a type without a fixed set of constructors).
+    fn top_witnesses(&self, rows: &[Vec<Ap>], st: &Ty) -> Vec<String> {
+        let ctors: Vec<Ap> = match self.zonk(st) {
+            Ty::Adt(n, targs) if self.adts.defs.contains_key(&n) => (0..self.adts.defs[&n].variants.len())
+                .map(|v| Ap::Ctor(v, vec![Ap::Wild; self.variant_inst(&n, v, &targs).fields.len()]))
+                .collect(),
+            Ty::Option(_) => vec![Ap::None, Ap::Some(Box::new(Ap::Wild))],
+            Ty::Result(..) => vec![Ap::Ctor(0, vec![Ap::Wild]), Ap::Ctor(1, vec![Ap::Wild])],
+            Ty::Bool => vec![Ap::Bool(false), Ap::Bool(true)],
+            Ty::Ordering => vec![Ap::Ord(-1), Ap::Ord(0), Ap::Ord(1)],
+            _ => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for i in 0..ctors.len() {
+            // (The other constructors covered: a witness is one of this constructor's values.)
+            let mut with_others = rows.to_vec();
+            with_others.extend(ctors.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| vec![c.clone()]));
+            self.missing_steps.set(0);
+            if let Some(w) = self.missing(&with_others, std::slice::from_ref(st)) {
+                out.push(w[0].clone());
+            }
+        }
+        out
+    }
+
+    /// `"&"` / `"&mut "` when the scrutinee is a reference (`&x`, a `&T` parameter, `&self`).
+    fn scrutinee_ref(&self, m: &ast::MatchExpr) -> &'static str {
+        let reference = match m.expr() {
+            Some(ast::Expr::RefExpr(r)) => Some(r.mut_token().is_some()),
+            Some(ast::Expr::PathExpr(p)) => p
+                .path()
+                .and_then(|p| p.as_single_name_ref())
+                .and_then(|n| self.lookup(&n.text().to_string()))
+                .and_then(|l| l.reference),
+            _ => None,
+        };
+        match reference {
+            Some(true) => "&mut ",
+            Some(false) => "&",
+            None => "",
+        }
+    }
+
+    /// For a match over one of the file's own enums (not generic), what rustc adds to E0004, as
+    /// spans for `rustc_diag` to lay out: the enum's name (label `""`) and each missing
+    /// variant (`"not covered"`) for the "defined here" note, the matched type (`"=.."`), and the
+    /// new arm after the last one (`"+.."`, inserted there).
+    fn non_exhaustive_spans(
+        &self,
+        m: &ast::MatchExpr,
+        arms: &[ast::MatchArm],
+        st: &Ty,
+        amp: &str,
+        witnesses: &[String],
+    ) -> Vec<(usize, usize, String)> {
+        let Ty::Adt(name, targs) = self.zonk(st) else { return Vec::new() };
+        let Some(root) = m.syntax().ancestors().last() else { return Vec::new() };
+        let Some(e) = root
+            .descendants()
+            .filter_map(ast::Enum::cast)
+            .find(|e| e.name().is_some_and(|n| n.text() == name.as_str()))
+        else {
+            return Vec::new();
+        };
+        if !targs.is_empty() || e.generic_param_list().is_some() {
+            return Vec::new();
+        }
+        let Some(en) = e.name() else { return Vec::new() };
+        let (s, t) = self.range(en.syntax());
+        let mut spans = vec![(s, t, String::new())];
+        for w in witnesses {
+            let Some(v) = w.strip_prefix(amp).and_then(|w| w.strip_prefix(&format!("{name}::"))) else {
+                return Vec::new();
+            };
+            let vname = v.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or("");
+            let Some(var) = e
+                .variant_list()
+                .into_iter()
+                .flat_map(|l| l.variants())
+                .find_map(|x| x.name().filter(|n| n.text() == vname))
+            else {
+                return Vec::new();
+            };
+            let (s, t) = self.range(var.syntax());
+            spans.push((s, t, "not covered".into()));
+        }
+        spans.push((0, 0, format!("=the matched value is of type `{amp}{name}`")));
+        // The new arm: after the last one (before its comma), on a line of its own.
+        if let Some(last) = arms.last()
+            && let Some(text) = root.text().to_string().get(..usize::from(last.syntax().text_range().start())).map(str::to_string)
+        {
+            let indent: String = text
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let pat = match witnesses {
+                [one] => one.clone(),
+                ws if ws.len() <= 3 => ws.join(" | "),
+                _ => "_".into(),
+            };
+            let at = match last.comma_token() {
+                Some(c) => {
+                    self.range(last.syntax()).0
+                        + usize::from(c.text_range().start() - last.syntax().text_range().start())
+                }
+                None => self.range(last.syntax()).1,
+            };
+            spans.push((at, at, format!("+,\n{indent}{pat} => todo!()")));
+        }
+        spans
     }
 
     /// Whether a pattern with `|` alternatives or enum variants covers every value (`let (Ok(n) |
@@ -5463,6 +5630,9 @@ impl<'a> Checker<'a> {
                     ret: Box::new(ret),
                 };
             }
+            if let Some((_, ty)) = crate::ty::std_alias_const(&self.std_fns, &[name.text()]) {
+                return ty;
+            }
             self.error(
                 p.syntax(),
                 format!("cannot find value `{}` in this scope", name.text()),
@@ -5549,7 +5719,9 @@ impl<'a> Checker<'a> {
         if let [.., "Ordering", "Less" | "Equal" | "Greater"] = segs.as_slice() {
             return Ty::Ordering;
         }
-        if let Some((_, ty)) = std_const(std_tail(&segs)) {
+        if let Some((_, ty)) = std_const(std_tail(&segs))
+            .or_else(|| crate::ty::std_alias_const(&self.std_fns, &segs))
+        {
             return ty;
         }
         if let Some(t) = self.jsvalue_path(&segs) {
@@ -7862,7 +8034,14 @@ impl<'a> Checker<'a> {
                 }
                 "push_str" => {
                     self.check_mutable(&recv, Mutation::Borrow);
-                    sig(self, &[Ty::Str], Ty::Unit)
+                    let t = sig(self, &[Ty::Str], Ty::Unit);
+                    // `s.push_str(t)` with an owned `t`: rustc wants `&t`.
+                    if let Some(a) = args.first()
+                        && self.raw.get(&self.range(a.syntax())).map(|t| self.zonk(t)) == Some(Ty::Str)
+                    {
+                        self.check_ref_arg(a, "&str");
+                    }
+                    t
                 }
                 "push" => {
                     self.check_mutable(&recv, Mutation::Borrow);
@@ -7942,7 +8121,10 @@ impl<'a> Checker<'a> {
                     "len" => sig(self, &[], USIZE),
                     "is_empty" => sig(self, &[], Ty::Bool),
                     "push" => {
-                        let t = sig(self, &[elem], Ty::Unit);
+                        let t = sig(self, &[elem.clone()], Ty::Unit);
+                        if let Some(a) = args.first() {
+                            self.check_ref_elem(&recv, a, &elem);
+                        }
                         // `refs.push(&mut a)` into a `Vec<&mut i32>`: the slot over `a`.
                         if let Some(a) = args.first()
                             && self.slot_vec_local(&recv)
@@ -7951,7 +8133,13 @@ impl<'a> Checker<'a> {
                         }
                         t
                     }
-                    "insert" => sig(self, &[USIZE, elem], Ty::Unit),
+                    "insert" => {
+                        let t = sig(self, &[USIZE, elem.clone()], Ty::Unit);
+                        if let Some(a) = args.get(1) {
+                            self.check_ref_elem(&recv, a, &elem);
+                        }
+                        t
+                    }
                     "remove" => sig(self, &[USIZE], elem),
                     "swap" => sig(self, &[USIZE, USIZE], Ty::Unit),
                     "truncate" => sig(self, &[USIZE], Ty::Unit),
@@ -8217,6 +8405,7 @@ impl<'a> Checker<'a> {
                 if matches!(
                     m2,
                     "insert" | "remove" | "clear" | "entry" | "get_mut" | "values_mut" | "iter_mut"
+                        | "drain"
                 ) {
                     self.check_mutable(&recv, Mutation::Borrow);
                 }
@@ -8276,18 +8465,12 @@ impl<'a> Checker<'a> {
                         self.note_map_iter_mut(m, &v);
                         sig(self, &[], iter(v, true))
                     }
-                    "iter" | "into_iter" => sig(self, &[], iter(Ty::Tuple(vec![k, v]), false)),
+                    "iter" | "into_iter" | "drain" => {
+                        sig(self, &[], iter(Ty::Tuple(vec![k, v]), false))
+                    }
                     "iter_mut" => {
                         self.note_map_iter_mut(m, &v);
                         sig(self, &[], iter(Ty::Tuple(vec![k, v]), true))
-                    }
-                    "retain" | "extend" | "drain" | "and_modify" => {
-                        self.error(
-                            m.syntax(),
-                            format!("`HashMap::{m2}` needs iterators or closures, which are not supported yet; loop and `insert` instead"),
-                        );
-                        loose(self);
-                        Ty::Unknown
                     }
                     _ => no_method(self, &t),
                 }
@@ -8356,7 +8539,7 @@ impl<'a> Checker<'a> {
             }
             (Ty::Set(elem), m2) => {
                 let elem = (**elem).clone();
-                if matches!(m2, "insert" | "remove" | "clear") {
+                if matches!(m2, "insert" | "remove" | "clear" | "drain") {
                     self.check_mutable(&recv, Mutation::Borrow);
                 }
                 match m2 {
@@ -8367,7 +8550,7 @@ impl<'a> Checker<'a> {
                     "is_subset" | "is_superset" | "is_disjoint" => {
                         sig(self, &[t.clone()], Ty::Bool)
                     }
-                    "iter" | "into_iter" => sig(
+                    "iter" | "into_iter" | "drain" => sig(
                         self,
                         &[],
                         Ty::Iter {
@@ -8375,19 +8558,6 @@ impl<'a> Checker<'a> {
                             mutable: false,
                         },
                     ),
-                    "union"
-                    | "intersection"
-                    | "difference"
-                    | "symmetric_difference"
-                    | "retain"
-                    | "extend" => {
-                        self.error(
-                            m.syntax(),
-                            format!("`HashSet::{m2}` needs iterators or closures, which are not supported yet; loop and `insert` instead"),
-                        );
-                        loose(self);
-                        Ty::Unknown
-                    }
                     _ => no_method(self, &t),
                 }
             }
@@ -11562,6 +11732,27 @@ pub(super) fn written_mut_ref(t: &ast::Type) -> bool {
 /// `&mut T` as written (not `Option<&mut T>`).
 pub(super) fn written_mut_ref_type(t: &ast::Type) -> bool {
     matches!(t, ast::Type::RefType(r) if r.mut_token().is_some())
+}
+
+/// `Vec<&T>` / `VecDeque<&T>`, also behind `&mut`: `&T` as written.
+pub(super) fn ref_elem_written(t: &ast::Type) -> Option<String> {
+    let t = match t {
+        ast::Type::RefType(r) => r.ty()?,
+        t => t.clone(),
+    };
+    let ast::Type::PathType(p) = &t else { return None };
+    let seg = p.path()?.segment()?;
+    if !matches!(seg.name_ref()?.text().to_string().as_str(), "Vec" | "VecDeque") {
+        return None;
+    }
+    let Some(ast::GenericArg::TypeArg(ta)) = seg.generic_arg_list()?.generic_args().next() else {
+        return None;
+    };
+    let ast::Type::RefType(r) = ta.ty()? else { return None };
+    if r.mut_token().is_some() {
+        return None;
+    }
+    Some(r.syntax().text().to_string().split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Whether a type is written as an owned value: not a reference, pointer, `impl Trait` or

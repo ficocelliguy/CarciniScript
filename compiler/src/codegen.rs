@@ -112,8 +112,9 @@ pub struct SubSpan {
 
 /// A rustc sub-diagnostic: `kind` is `help` or `note`. With `spans` it is shown with its own
 /// `-->` and snippet; with `edits` (each a range and, as its label, the text replacing it) it
-/// is a suggestion, shown as the source would read after it.
-#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+/// is a suggestion, shown as the source would read after it. With `source`, its spans are in
+/// that file (std's own source) rather than the diagnostic's.
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Child {
     pub kind: String,
@@ -122,6 +123,18 @@ pub struct Child {
     pub spans: Vec<SubSpan>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<SubSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+}
+
+/// Another file a note points into: rustc's path for it, and the text of its line `line` (the
+/// one line the note's spans are on).
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
 }
 
 impl Diagnostic {
@@ -4349,6 +4362,9 @@ impl<'a> Codegen<'a> {
                 let ty = self.ty_of(p.syntax()).unwrap_or(Ty::Fn);
                 return (Frag::text(js), ty);
             }
+            if let Some((js, ty)) = crate::ty::std_alias_const(&self.types.std_fns, &[name.text()]) {
+                return (Frag::text(js), ty);
+            }
             self.error(
                 p.syntax(),
                 format!("cannot find value `{}` in this scope", name.text()),
@@ -4410,7 +4426,9 @@ impl<'a> Codegen<'a> {
             return (Frag::text("((b) => String.fromCharCode(b))"), Ty::Unknown);
         }
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-        if let Some((js, ty)) = std_const(std_tail(&segs)) {
+        if let Some((js, ty)) = std_const(std_tail(&segs))
+            .or_else(|| crate::ty::std_alias_const(&self.types.std_fns, &segs))
+        {
             return (Frag::text(js), ty);
         }
         if let [.., "Ordering", v @ ("Less" | "Equal" | "Greater")] = segs.as_slice() {
@@ -7617,6 +7635,7 @@ impl<'a> Codegen<'a> {
                     "clamp" => (fcall("κσ.$clamp", vec![rf.clone(), a(0), a(1)]), rt.clone()),
                     "signum" => (fcall("Math.sign", vec![rf.clone()]), rt.clone()),
                     "rem_euclid" => (fcall("κσ.$remEuclid", vec![rf.clone(), a(0)]), rt.clone()),
+                    "to_string" if k.is_64() => (fcall("κσ.$fmtI64", vec![rf.clone()]), Ty::Str),
                     "to_string" => (fcall("String", vec![rf.clone()]), Ty::Str),
                     _ => self.no_method(&node, &method, &rt),
                 }
@@ -10000,6 +10019,7 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
     match ty {
         Ty::Str => Some("κσ.$dbgStr".into()),
         Ty::Char => Some("κσ.$dbgChar".into()),
+        Ty::Int(k) if k.is_64() => Some("κσ.$fmtI64".into()),
         // (An `f32` prints its own shortest digits, not the double's.)
         Ty::Float { f32: true } => Some("κσ.$dbgF32".into()),
         Ty::Float { .. } => Some("κσ.$dbgF".into()),
@@ -10324,11 +10344,13 @@ fn format_value(
     } else if let Some(p) = precision {
         match ty {
             Ty::Str => call_with("κσ.$truncChars", f, vec![p]),
+            Ty::Int(k) if k.is_64() => call("κσ.$fmtI64", f, ""),
             Ty::Int(_) | Ty::IntLit => f,
             _ => call_with("κσ.$fixed", f, vec![p]),
         }
     } else {
         match ty {
+            Ty::Int(k) if k.is_64() => call("κσ.$fmtI64", f, ""),
             Ty::Float { f32: true } => call("κσ.$fmtF32", f, ""),
             Ty::Float { .. } => call("κσ.$fmtF", f, ""),
             Ty::Unknown => call("κσ.$disp", f, ""),

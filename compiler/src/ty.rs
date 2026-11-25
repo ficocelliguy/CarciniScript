@@ -62,6 +62,11 @@ impl IntKind {
         matches!(self, IntKind::I128 | IntKind::U128)
     }
 
+    /// The 64-bit kinds, JS numbers that may go past 2^53 (and print as `κσ.$fmtI64` does).
+    pub fn is_64(self) -> bool {
+        matches!(self, IntKind::I64 | IntKind::U64 | IntKind::Isize | IntKind::Usize)
+    }
+
     /// Prefix/suffix that wrap a JS integer-valued number into this kind, or None for wide kinds,
     /// which are plain JS numbers. The inner expression is always parenthesized: JS's `>>>` and
     /// `&` bind tighter than `^`/`|`, so `x ^ y >>> 0` would wrap only `y`.
@@ -673,31 +678,100 @@ pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
             }
         }
         if let Ty::Float { f32 } = Ty::from_name(ty_name) {
-            let v = match *konst {
-                "INFINITY" => "Infinity",
-                "NEG_INFINITY" => "-Infinity",
-                "NAN" => "NaN",
-                "MAX" if !f32 => "Number.MAX_VALUE",
-                "MIN" if !f32 => "-Number.MAX_VALUE",
-                "EPSILON" if !f32 => "Number.EPSILON",
+            // The format's integer constants.
+            let int = |v: &'static str, k| Some((v, Ty::Int(k)));
+            match (*konst, f32) {
+                ("RADIX", _) => return int("2", IntKind::U32),
+                ("DIGITS", false) => return int("15", IntKind::U32),
+                ("DIGITS", true) => return int("6", IntKind::U32),
+                ("MANTISSA_DIGITS", false) => return int("53", IntKind::U32),
+                ("MANTISSA_DIGITS", true) => return int("24", IntKind::U32),
+                ("MAX_EXP", false) => return int("1024", IntKind::I32),
+                ("MAX_EXP", true) => return int("128", IntKind::I32),
+                ("MIN_EXP", false) => return int("-1021", IntKind::I32),
+                ("MIN_EXP", true) => return int("-125", IntKind::I32),
+                ("MAX_10_EXP", false) => return int("308", IntKind::I32),
+                ("MAX_10_EXP", true) => return int("38", IntKind::I32),
+                ("MIN_10_EXP", false) => return int("-307", IntKind::I32),
+                ("MIN_10_EXP", true) => return int("-37", IntKind::I32),
+                _ => {}
+            }
+            // (An `f32` is the double it rounds to.)
+            let v = match (*konst, f32) {
+                ("INFINITY", _) => "Infinity",
+                ("NEG_INFINITY", _) => "-Infinity",
+                ("NAN", _) => "NaN",
+                ("MAX", false) => "Number.MAX_VALUE",
+                ("MIN", false) => "-Number.MAX_VALUE",
+                ("EPSILON", false) => "Number.EPSILON",
+                ("MIN_POSITIVE", false) => "2.2250738585072014e-308",
+                ("MAX", true) => "3.4028234663852886e38",
+                ("MIN", true) => "-3.4028234663852886e38",
+                ("EPSILON", true) => "1.1920928955078125e-7",
+                ("MIN_POSITIVE", true) => "1.1754943508222875e-38",
                 _ => return None,
             };
             return Some((v, Ty::Float { f32 }));
         }
     }
     if let [ty @ ("f64" | "f32"), "consts", c] = tail {
-        let v = match *c {
-            "PI" => "Math.PI",
-            "E" => "Math.E",
-            "TAU" => "(2 * Math.PI)",
-            "SQRT_2" => "Math.SQRT2",
-            "LN_2" => "Math.LN2",
-            "LN_10" => "Math.LN10",
+        let f32 = *ty == "f32";
+        let v = match (*c, f32) {
+            ("PI", false) => "Math.PI",
+            ("TAU", false) => "6.283185307179586",
+            ("E", false) => "Math.E",
+            ("SQRT_2", false) => "Math.SQRT2",
+            ("FRAC_1_SQRT_2", false) => "Math.SQRT1_2",
+            ("FRAC_1_PI", false) => "0.3183098861837907",
+            ("FRAC_2_PI", false) => "0.6366197723675814",
+            ("FRAC_2_SQRT_PI", false) => "1.1283791670955126",
+            ("FRAC_PI_2", false) => "1.5707963267948966",
+            ("FRAC_PI_3", false) => "1.0471975511965979",
+            ("FRAC_PI_4", false) => "0.7853981633974483",
+            ("FRAC_PI_6", false) => "0.5235987755982989",
+            ("FRAC_PI_8", false) => "0.39269908169872414",
+            ("LN_2", false) => "Math.LN2",
+            ("LN_10", false) => "Math.LN10",
+            ("LOG2_E", false) => "Math.LOG2E",
+            ("LOG2_10", false) => "3.321928094887362",
+            ("LOG10_E", false) => "Math.LOG10E",
+            ("LOG10_2", false) => "0.3010299956639812",
+            ("PI", true) => "3.1415927410125732",
+            ("TAU", true) => "6.2831854820251465",
+            ("E", true) => "2.7182817459106445",
+            ("SQRT_2", true) => "1.4142135381698608",
+            ("FRAC_1_SQRT_2", true) => "0.7071067690849304",
+            ("FRAC_1_PI", true) => "0.31830987334251404",
+            ("FRAC_2_PI", true) => "0.6366197466850281",
+            ("FRAC_2_SQRT_PI", true) => "1.128379225730896",
+            ("FRAC_PI_2", true) => "1.5707963705062866",
+            ("FRAC_PI_3", true) => "1.0471975803375244",
+            ("FRAC_PI_4", true) => "0.7853981852531433",
+            ("FRAC_PI_6", true) => "0.5235987901687622",
+            ("FRAC_PI_8", true) => "0.39269909262657166",
+            ("LN_2", true) => "0.6931471824645996",
+            ("LN_10", true) => "2.3025851249694824",
+            ("LOG2_E", true) => "1.4426950216293335",
+            ("LOG2_10", true) => "3.321928024291992",
+            ("LOG10_E", true) => "0.4342944920063019",
+            ("LOG10_2", true) => "0.3010300099849701",
             _ => return None,
         };
-        return Some((v, Ty::Float { f32: *ty == "f32" }));
+        return Some((v, Ty::Float { f32 }));
     }
     None
+}
+
+/// A std constant through a `use`: `PI` after `use std::f64::consts::PI;`, `consts::PI` after
+/// `use std::f64::consts;` (`std_fns` maps the imported name to its path after `std`).
+pub fn std_alias_const(
+    std_fns: &std::collections::HashMap<String, Vec<String>>,
+    segs: &[&str],
+) -> Option<(&'static str, Ty)> {
+    let (first, rest) = segs.split_first()?;
+    let mut tail: Vec<&str> = std_fns.get(*first)?.iter().map(String::as_str).collect();
+    tail.extend(rest);
+    std_const(&tail)
 }
 
 /// Float method names CarciniScript lowers. Values of unknown type (NS results until typed

@@ -221,6 +221,7 @@ impl<'a> Linter<'a> {
             message: message.into(),
             spans: Vec::new(),
             edits: edits.iter().map(|&(s, e, t)| self.span(s, e, t)).collect(),
+            ..Default::default()
         }
     }
 
@@ -1185,6 +1186,7 @@ impl Linter<'_> {
                         message: "multiple earlier patterns match some of the same values".into(),
                         spans,
                         edits: Vec::new(),
+                        ..Default::default()
                     });
                 }
                 found.push(d);
@@ -2713,6 +2715,7 @@ impl Linter<'_> {
                     let (noun, verb) = if many { ("variants", "are") } else { ("variant", "is") };
                     let mut d = self.diag_spans(&spans, format!("{noun} {} {verb} never constructed", list(&names)));
                     d.spans.push(self.span(owner_s, owner_e, format!("{noun} in this enum")));
+                    d.notes.extend(derived_note(&it.name, &ignored));
                     found.push(d);
                 }
                 if reads_all.contains(&it.name) {
@@ -2791,16 +2794,7 @@ impl Linter<'_> {
         if removable {
             d.helps.push(format!("consider removing {}", if many { "these fields" } else { "this field" }));
         }
-        match ignored {
-            [] => {}
-            [one] => d.notes.push(format!(
-                "`{ty_name}` has a derived impl for the trait `{one}`, but this is intentionally ignored during dead code analysis"
-            )),
-            many => d.notes.push(format!(
-                "`{ty_name}` has derived impls for the traits {}, but these are intentionally ignored during dead code analysis",
-                list(many)
-            )),
-        }
+        d.notes.extend(derived_note(ty_name, ignored));
         if tuple && !removable {
             let (it, them) = if many { ("fields", "fields") } else { ("field", "field") };
             let edits: Vec<(usize, usize, &str)> = spans.iter().map(|&(s, e)| (s, e, "()")).collect();
@@ -3093,3 +3087,18 @@ const NAMED_KINDS: &[K] = &[
     K::STRUCT, K::ENUM, K::UNION, K::TYPE_ALIAS, K::TRAIT, K::VARIANT, K::TYPE_PARAM, K::FN,
     K::MODULE, K::RECORD_FIELD, K::CONST, K::STATIC,
 ];
+
+/// rustc's note on dead code in a type with derived `Debug` / `Clone` (`ignored`), whose uses
+/// don't count.
+fn derived_note(ty_name: &str, ignored: &[String]) -> Option<String> {
+    match ignored {
+        [] => None,
+        [one] => Some(format!(
+            "`{ty_name}` has a derived impl for the trait `{one}`, but this is intentionally ignored during dead code analysis"
+        )),
+        many => Some(format!(
+            "`{ty_name}` has derived impls for the traits {}, but these are intentionally ignored during dead code analysis",
+            list(many)
+        )),
+    }
+}

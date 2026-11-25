@@ -895,6 +895,26 @@ impl Checker<'_> {
             self.imported_names.insert(alias);
         }
         match rel.as_slice() {
+            // `use std::f64::consts::PI;` / `use std::f64::consts::*;`: the constants by name.
+            ["std" | "core", ty @ ("f64" | "f32"), "consts", c] => {
+                let alias = tree
+                    .rename()
+                    .and_then(|r| r.name())
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_else(|| c.to_string());
+                self.std_fns
+                    .insert(alias, vec![ty.to_string(), "consts".to_string(), c.to_string()]);
+            }
+            ["std" | "core", ty @ ("f64" | "f32"), "consts"] if tree.star_token().is_some() => {
+                for c in [
+                    "PI", "TAU", "E", "SQRT_2", "FRAC_1_SQRT_2", "FRAC_1_PI", "FRAC_2_PI",
+                    "FRAC_2_SQRT_PI", "FRAC_PI_2", "FRAC_PI_3", "FRAC_PI_4", "FRAC_PI_6",
+                    "FRAC_PI_8", "LN_2", "LN_10", "LOG2_E", "LOG2_10", "LOG10_E", "LOG10_2",
+                ] {
+                    self.std_fns
+                        .insert(c.to_string(), vec![ty.to_string(), "consts".to_string(), c.to_string()]);
+                }
+            }
             // `use std::cmp::max;` / `use std::mem::{swap, take as grab};`: calls of the name are
             // calls of `cmp::max` etc.
             ["std" | "core" | "alloc", module, f]

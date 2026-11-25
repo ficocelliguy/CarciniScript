@@ -512,7 +512,13 @@ impl Checker<'_> {
                 }
                 sig(self, &[this], Ty::Unit)
             }
-            (Coll::VecDeque, "push_back" | "push_front") => sig(self, &[elem], Ty::Unit),
+            (Coll::VecDeque, "push_back" | "push_front") => {
+                let t = sig(self, &[elem.clone()], Ty::Unit);
+                if let Some(a) = args.first() {
+                    self.check_ref_elem(recv, a, &elem);
+                }
+                t
+            }
             (Coll::VecDeque, "pop_back" | "pop_front" | "front" | "back") => {
                 sig(self, &[], opt(elem))
             }

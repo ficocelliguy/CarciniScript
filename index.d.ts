@@ -21,6 +21,11 @@ export interface DiagnosticChild {
   message: string;
   spans?: DiagnosticSpan[];
   edits?: DiagnosticSpan[];
+  /**
+   * A note into another file (std's own source, as rustc shows it with rust-src installed):
+   * rustc's path for it, and the text of line `line`, which `spans` are on.
+   */
+  source?: { path: string; line: number; text: string };
 }
 
 export interface Diagnostic {

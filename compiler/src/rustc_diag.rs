@@ -5,9 +5,9 @@
 //! `shape` splits that into rustc's parts (code, headline, label, `help:` lines) by the message's
 //! wording, as `diag_help` keys on it, and `render` prints them the way rustc does.
 
-use crate::codegen::{Child, CompileOutput, Diagnostic, SubSpan};
+use crate::codegen::{Child, CompileOutput, Diagnostic, Source, SubSpan};
 use crate::lineindex::LineIndex;
-use ra_ap_syntax::{AstNode, ast};
+use ra_ap_syntax::{AstNode, ast, ast::HasLoopBody, ast::HasName};
 use serde::Deserialize;
 
 /// Gives each diagnostic rustc's structure, puts them in the order rustc reports them (lints
@@ -21,6 +21,7 @@ pub fn finish(src: &str, filename: &str, out: &mut CompileOutput) {
         }
     }
     order(src, &mut out.diagnostics);
+    dedup_self_notes(src, &mut out.diagnostics);
     lint_notes(&idx, &mut out.diagnostics);
     let views: Vec<View> = out.diagnostics.iter().map(View::from).collect();
     out.rendered = render(src, filename, &views);
@@ -135,6 +136,7 @@ fn lint_notes(idx: &LineIndex, diags: &mut [Diagnostic]) {
                     message: "the lint level is defined here".into(),
                     spans: vec![span],
                     edits: Vec::new(),
+                    ..Default::default()
                 });
                 if *written != lint {
                     d.children.push(Child {
@@ -142,6 +144,7 @@ fn lint_notes(idx: &LineIndex, diags: &mut [Diagnostic]) {
                         message: format!("`#[{level}({lint})]` implied by `#[{level}({written})]`"),
                         spans: Vec::new(),
                         edits: Vec::new(),
+                        ..Default::default()
                     });
                 }
             }
@@ -187,18 +190,33 @@ pub fn shape(d: &mut Diagnostic, src: &str, idx: &LineIndex) {
     d.code = s.code.map(str::to_string);
     d.label = s.label;
     // rustc's own help replaces the hint it stands for.
-    if s.helps.is_empty() && s.suggestion.is_none() {
+    if s.helps.is_empty() && s.suggestion.is_none() && s.code != Some("E0382") {
         d.helps = hints.into_iter().map(|h| tidy_hint(&h)).collect();
     } else {
         d.helps = s.helps;
     }
     d.notes = s.notes;
-    if let Some((message, edits)) = s.suggestion {
+    if let Some((message, spans)) = s.note {
+        let spans = spans
+            .into_iter()
+            .enumerate()
+            .map(|(i, (a, b, label))| SubSpan { primary: i == 0, ..SubSpan::at(idx, a, b, label) })
+            .collect();
+        d.children.push(Child { kind: "note".into(), message, spans, edits: Vec::new(), ..Default::default() });
+    }
+    if let Some(c) = s.extra_note.take() {
+        d.children.push(c);
+    }
+    if s.code == Some("E0004") && !d.spans.is_empty() {
+        non_exhaustive_children(d, src, idx);
+    }
+    for (message, edits) in s.suggestion.into_iter().chain(s.more_suggestions) {
         d.children.push(Child {
             kind: "help".into(),
             message,
             spans: Vec::new(),
             edits: edits.into_iter().map(|(a, b, text)| SubSpan::at(idx, a, b, text)).collect(),
+            ..Default::default()
         });
     }
     for (start, end, label) in s.spans {
@@ -230,6 +248,13 @@ struct Shaped {
     spans: Vec<(usize, usize, String)>,
     /// rustc's suggestion: its message and edits (a range and the text replacing it).
     suggestion: Option<(String, Vec<(usize, usize, String)>)>,
+    /// rustc's further suggestions, after `suggestion`.
+    more_suggestions: Vec<(String, Vec<(usize, usize, String)>)>,
+    /// A note pointing elsewhere (`function defined here`): its message and spans, the first
+    /// one primary.
+    note: Option<(String, Vec<(usize, usize, String)>)>,
+    /// A note into std's own source (`std_note`), after `note`.
+    extra_note: Option<Child>,
 }
 
 /// Whether `s` talks about the implementation (JS, this compiler, its docs).
@@ -391,6 +416,24 @@ fn ty_words(label: &str) -> String {
         .replace("`{float}`", "floating-point number")
 }
 
+/// How rustc's E0599 headline names a std type that has no `Deref`: by its definition's
+/// parameters (`BTreeMap<K, V, A>`), where the label shows the type itself.
+fn std_def_generics(t: &str) -> Option<&'static str> {
+    let (base, _) = t.split_once('<')?;
+    Some(match base {
+        "Option" => "Option<T>",
+        "Result" => "Result<T, E>",
+        "HashMap" => "HashMap<K, V, S, A>",
+        "HashSet" => "HashSet<T, S, A>",
+        "BTreeMap" => "BTreeMap<K, V, A>",
+        "BTreeSet" => "BTreeSet<T, A>",
+        "VecDeque" => "VecDeque<T, A>",
+        "BinaryHeap" => "BinaryHeap<T, A>",
+        "LinkedList" => "LinkedList<T, A>",
+        _ => return None,
+    })
+}
+
 /// What rustc calls a type in "no method named `m` found for struct `S`".
 fn type_kind(t: &str, src: &str) -> &'static str {
     let base = t.split('<').next().unwrap_or(t);
@@ -542,6 +585,12 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
             s.spans.push((a, b, "expected due to this".into()));
         } else if let Some((a, b, what)) = enclosing_call(src, start) {
             s.spans.push((a, b, format!("arguments to this {what} are incorrect")));
+            arg_callee_note(s, src, (a, b), what, start, &label);
+            char_literal(s, src, start, end, &label);
+            // `f(s)` for `fn f(s: &str)`: rustc's suggestion adds the `&`.
+            if d.message.contains("(consider borrowing here") {
+                s.suggestion = Some(("consider borrowing here".into(), vec![(start, start, "&".into())]));
+            }
         }
         s.label = Some(label);
     } else if has("mismatched types") {
@@ -616,8 +665,9 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
             .filter(|t| !t.contains('`'))
         {
             s.headline = Some(format!(
-                "no method named `{m}` found for {} `{ty}` in the current scope",
-                type_kind(ty, src)
+                "no method named `{m}` found for {} `{}` in the current scope",
+                type_kind(ty, src),
+                std_def_generics(ty).unwrap_or(ty)
             ));
             s.label = Some(format!("method not found in `{ty}`"));
         } else if !msg.ends_with("in the current scope") && msg.contains(" found for ") {
@@ -663,8 +713,15 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
                 format!("{n} arguments were supplied")
             };
             s.headline = Some(format!("this {what} takes {want} but {supplied}"));
+            let want_n: usize = want.split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            s.focus = callee(src, start, end);
+            if matches!(what, "function" | "method") && n < want_n {
+                missing_args(s, src, end, what, n, want_n);
+            } else if matches!(what, "function" | "method") && n > want_n {
+                extra_args(s, src, end, what, want_n);
+            }
         }
-        s.focus = callee(src, start, end);
+        s.focus = s.focus.or_else(|| callee(src, start, end));
     } else if has("this closure takes ") {
         s.code = Some("E0057");
     } else if let Some(rest) = msg.strip_prefix("no field `") {
@@ -840,7 +897,13 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
     } else if has("cannot borrow `") && msg.ends_with(", as it is not declared as mutable") {
         s.code = Some("E0596");
         s.label = Some("cannot borrow as mutable".into());
-        s.helps.push("consider changing this to be mutable".into());
+        // (rustc shows the `mut` added to the `let` or the parameter.)
+        match binding_before(src, start, t0).or_else(|| param_before(src, start, t0)) {
+            Some(b) => {
+                s.suggestion = Some(("consider changing this to be mutable".into(), vec![(b.0, b.0, "mut ".into())]));
+            }
+            None => s.helps.push("consider changing this to be mutable".into()),
+        }
     } else if has("cannot borrow `") && msg.contains(", as it is behind a `&` reference") {
         s.code = Some("E0596");
         s.label = Some(format!(
@@ -881,18 +944,103 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
             if borrow { "borrowed" } else { "used" },
             if partially { "partial " } else { "" }
         ));
+        // `s.n.len()` after `s` moved: rustc points at the place used, `s.n`.
+        let mut place_end = end;
+        while let Some(rest) = src.get(place_end..).and_then(|r| r.strip_prefix('.')) {
+            let len = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+            if len == 0 || rest[len..].starts_with('(') || rest[len..].starts_with("::") {
+                break;
+            }
+            place_end += 1 + len;
+        }
+        if place_end != end && src[start..end].chars().all(|c| c.is_alphanumeric() || c == '_') {
+            s.focus = Some((start, place_end));
+        }
         // (The hint said where it moved: `moved on line 3:13 by `let``.)
         let moved = d.message.split("moved on line ").nth(1).and_then(|r| {
             let (l, c) = r.split(|c: char| !(c.is_ascii_digit() || c == ':')).next()?.split_once(':')?;
             offset_of(src, l.parse().ok()?, c.parse().ok()?)
         });
         let moved = moved.or_else(|| d.message.contains("moved here").then_some(start));
+        let mut own_help = false;
         if let Some(at) = moved
             && let Some((a, b)) = word_at(src, at)
         {
             let partial = has("use of partially") || has("borrow of partially");
             let what = if partial { "value partially moved here" } else { "value moved here" };
-            if (a, b) == (start, end) {
+            // `for x in v`: the loop's call of `into_iter()` took it.
+            let line_start = src[..a].rfind('\n').map_or(0, |i| i + 1);
+            if !partial
+                && src[..a].trim_end().ends_with(" in")
+                && src[line_start..a].trim_start().starts_with("for ")
+                && src[b..].trim_start().starts_with('{')
+            {
+                own_help = true;
+                s.spans.push((a, b, format!("`{t0}` moved due to this implicit call to `.into_iter()`")));
+                s.extra_note = std_note(
+                    "note",
+                    format!("the `for` loop is desugared into a call to `std::iter::IntoIterator::into_iter`, which takes ownership of the receiver `self`, which moves `{t0}`"),
+                    "IntoIterator::into_iter",
+                );
+                // (The type, from the checker's "move occurs because .. has type `T`".)
+                let ty = d
+                    .spans
+                    .iter()
+                    .find_map(|sp| sp.label.split("has type `").nth(1)?.split('`').next().map(str::to_string));
+                match ty {
+                    Some(ty) if ty.starts_with("Vec<") => {
+                        s.suggestion = Some((
+                            format!("consider iterating over a slice of the `{ty}`'s content to avoid moving into the `for` loop"),
+                            vec![(a, a, "&".into())],
+                        ));
+                    }
+                    _ => s.helps.push("consider cloning the value if the performance cost is acceptable".into()),
+                }
+            } else if !partial && (a, b) != (start, end) && let Some((m0, m1, call_end)) = method_after(src, b) {
+                // `v.into_iter()`: a method taking `self`.
+                own_help = true;
+                s.spans.push((m0, call_end, format!("`{t0}` moved due to this method call")));
+                let name = &src[m0..m1];
+                let clone = || {
+                    (
+                        "you can `clone` the value and consume it, but this might not be your desired behavior".to_string(),
+                        vec![(b, b, ".clone()".to_string())],
+                    )
+                };
+                match callee_def(src, name, "method") {
+                    Some(f) => {
+                        // (Your own method: rustc names it by its type, `S::done`.)
+                        let ty = f
+                            .syntax()
+                            .ancestors()
+                            .find_map(ast::Impl::cast)
+                            .filter(|i| i.trait_().is_none())
+                            .and_then(|i| i.self_ty())
+                            .map(|t| t.syntax().text().to_string().split('<').next().unwrap_or("").trim().to_string());
+                        let by_value = f.param_list().and_then(|l| l.self_param()).filter(|p| p.amp_token().is_none());
+                        if let (Some(ty), Some(p)) = (ty, by_value) {
+                            let r = p.name().map_or(p.syntax().text_range(), |n| n.syntax().text_range());
+                            s.note = Some((
+                                format!("`{ty}::{name}` takes ownership of the receiver `self`, which moves `{t0}`"),
+                                vec![(usize::from(r.start()), usize::from(r.end()), String::new())],
+                            ));
+                            if derives(src, &ty, "Clone") {
+                                s.suggestion = Some(clone());
+                            }
+                        }
+                    }
+                    None => {
+                        if name == "into_iter" {
+                            s.extra_note = std_note(
+                                "note",
+                                format!("`std::iter::IntoIterator::into_iter` takes ownership of the receiver `self`, which moves `{t0}`"),
+                                "IntoIterator::into_iter",
+                            );
+                        }
+                        s.suggestion = Some(clone());
+                    }
+                }
+            } else if (a, b) == (start, end) {
                 s.label = Some(format!(
                     "{what}, in previous iteration of loop"
                 ));
@@ -900,7 +1048,9 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
                 s.spans.push((a, b, what.into()));
             }
         }
-        s.helps.push("consider cloning the value if the performance cost is acceptable".into());
+        if !own_help {
+            s.helps.push("consider cloning the value if the performance cost is acceptable".into());
+        }
     } else if has("used binding `") && msg.ends_with("isn't initialized") {
         s.code = Some("E0381");
         s.label = Some(format!("`{t0}` used here but it isn't initialized"));
@@ -919,6 +1069,7 @@ fn rules(msg: &str, s: &mut Shaped, d: &Diagnostic, src: &str) {
     } else if has("cannot borrow `") && msg.ends_with("as mutable because it is also borrowed as immutable") {
         s.code = Some("E0502");
         s.label = Some("mutable borrow occurs here".into());
+        for_loop_borrow(s, d, src, t0);
     } else if has("cannot borrow `") && msg.ends_with("as immutable because it is also borrowed as mutable") {
         s.code = Some("E0502");
         s.label = Some("immutable borrow occurs here".into());
@@ -1240,6 +1391,372 @@ fn binding_before(src: &str, at: usize, name: &str) -> Option<(usize, usize)> {
     best
 }
 
+/// E0004 over the file's own enum: the checker's spans (see `Checker::non_exhaustive_spans`)
+/// become rustc's "`E` defined here" note with the variants not covered, the matched type, and
+/// the arm to add.
+fn non_exhaustive_children(d: &mut Diagnostic, src: &str, idx: &LineIndex) {
+    let mut note_spans = Vec::new();
+    let mut type_note = None;
+    let mut arm = None;
+    for sp in std::mem::take(&mut d.spans) {
+        if let Some(t) = sp.label.strip_prefix('=') {
+            type_note = Some(t.to_string());
+        } else if let Some(t) = sp.label.strip_prefix('+') {
+            arm = Some((sp.start, sp.end, t.to_string()));
+        } else {
+            note_spans.push(sp);
+        }
+    }
+    if let Some(first) = note_spans.first_mut() {
+        first.primary = true;
+        let name = src.get(first.start..first.end).unwrap_or("").to_string();
+        d.children.push(Child {
+            kind: "note".into(),
+            message: format!("`{name}` defined here"),
+            spans: note_spans,
+            edits: Vec::new(),
+            ..Default::default()
+        });
+    }
+    if let Some(t) = type_note {
+        d.children.push(Child { kind: "note".into(), message: t, spans: Vec::new(), edits: Vec::new(), ..Default::default() });
+    }
+    if let Some((a, b, text)) = arm {
+        let how = if text.ends_with("_ => todo!()") {
+            "a match arm with a wildcard pattern as shown, or multiple match arms"
+        } else if text.contains(" | ") {
+            "a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms"
+        } else {
+            "a match arm with a wildcard pattern or an explicit pattern as shown"
+        };
+        d.children.push(Child {
+            kind: "help".into(),
+            message: format!("ensure that all possible cases are being handled by adding {how}"),
+            spans: Vec::new(),
+            edits: vec![SubSpan::at(idx, a, b, text)],
+            ..Default::default()
+        });
+    }
+}
+
+/// E0502 for growing what a `for` loop walks, inside the loop (the loop's next step is the later
+/// use): rustc marks the loop and suggests other ways.
+fn for_loop_borrow(s: &mut Shaped, d: &Diagnostic, src: &str, name: &str) {
+    let Some(later) = d.spans.iter().find(|sp| sp.label == "immutable borrow later used here") else {
+        return;
+    };
+    let range = |n: &ra_ap_syntax::SyntaxNode| (usize::from(n.text_range().start()), usize::from(n.text_range().end()));
+    let file = crate::macros::parse_tree(src);
+    let Some(f) = file.syntax().descendants().filter_map(ast::ForExpr::cast).find(|f| {
+        f.iterable().is_some_and(|i| range(i.syntax()) == (later.start, later.end))
+            && f.loop_body().is_some_and(|b| {
+                let (b0, b1) = range(b.syntax());
+                b0 <= d.start && d.start < b1
+            })
+    }) else {
+        return;
+    };
+    let (a, b) = range(f.syntax());
+    s.spans.push((a, b, format!("this for loop borrows `{name}` immutably, preventing mutation within its body")));
+    s.helps.push("consider using an index-based loop instead, or collecting modifications into a separate collection".into());
+}
+
+/// `.name(..)` right after `at`: the name's range and the call's end.
+fn method_after(src: &str, at: usize) -> Option<(usize, usize, usize)> {
+    let rest = src.get(at..)?.strip_prefix('.')?;
+    let len = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    if len == 0 || !rest[len..].starts_with('(') {
+        return None;
+    }
+    let (m0, m1) = (at + 1, at + 1 + len);
+    let mut depth = 0;
+    for (i, c) in src[m1..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((m0, m1, m1 + i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the file's type `ty` derives `tr` (`#[derive(.., Clone)] struct S`).
+fn derives(src: &str, ty: &str, tr: &str) -> bool {
+    let file = crate::macros::parse_file(src).tree();
+    file.syntax().descendants().filter_map(ast::Adt::cast).any(|a| {
+        a.name().is_some_and(|n| n.text() == ty)
+            && ra_ap_syntax::ast::HasAttrs::attrs(&a).any(|at| {
+                let t = at.syntax().text().to_string();
+                t.contains("derive") && find_word(&t, 0, t.len(), tr, false).is_some()
+            })
+    })
+}
+
+/// `"a"` where a `char` is expected: rustc's suggestions of `'a'`, and of `push_str` for
+/// `s.push("a")`.
+fn char_literal(s: &mut Shaped, src: &str, start: usize, end: usize, label: &str) {
+    if label != "expected `char`, found `&str`" {
+        return;
+    }
+    let Some(inner) = src.get(start..end).and_then(|t| t.strip_prefix('"')?.strip_suffix('"')) else { return };
+    if inner.chars().count() != 1 || inner == "'" {
+        return;
+    }
+    s.more_suggestions.push((
+        "if you meant to write a `char` literal, use single quotes".into(),
+        vec![(start, end, format!("'{inner}'"))],
+    ));
+    if let Some((_, open, "method")) = enclosing_call(src, start)
+        && src[..open].ends_with(".push")
+    {
+        s.more_suggestions.push(("you might have meant to use `push_str`".into(), vec![(open, open, "_str".into())]));
+    }
+}
+
+/// rustc's note on what an argument starting at `at` is passed to: "function defined here" on
+/// your own function's name and the parameter it's for, or on std's definition for the std
+/// methods `STD_SITES` has. `callee` is the callee's range, ending at the `(`.
+fn arg_callee_note(s: &mut Shaped, src: &str, (a, open): (usize, usize), what: &str, at: usize, label: &str) {
+    if !matches!(what, "function" | "method") || open >= at {
+        return;
+    }
+    let callee = &src[a..open];
+    let name = callee.rsplit("::").next().unwrap_or(callee);
+    // (Which argument: the top-level commas before it.)
+    let mut depth = 0i32;
+    let mut index = 0;
+    for c in src[open + 1..at].chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => index += 1,
+            _ => {}
+        }
+    }
+    let range = |n: &ra_ap_syntax::SyntaxNode| (usize::from(n.text_range().start()), usize::from(n.text_range().end()));
+    if let Some(f) = callee_def(src, name, what) {
+        let Some(fname) = f.name() else { return };
+        let (n0, n1) = range(fname.syntax());
+        let mut spans = vec![(n0, n1, String::new())];
+        if let Some(p) = f.param_list().and_then(|l| l.params().nth(index)) {
+            let (p0, p1) = range(p.syntax());
+            spans.push((p0, p1, String::new()));
+        }
+        s.note = Some((format!("{what} defined here"), spans));
+        return;
+    }
+    let key = match name {
+        "push" if what == "method" && label.starts_with("expected `char`") => "String::push",
+        "push" => "Vec::push",
+        "push_str" => "String::push_str",
+        "push_back" => "VecDeque::push_back",
+        "push_front" => "VecDeque::push_front",
+        _ => return,
+    };
+    if what == "method" {
+        s.extra_note = std_note("note", "method defined here".into(), key);
+    }
+}
+
+/// The one definition a call of `name` can be: a free function, or a method with `self`.
+fn callee_def(src: &str, name: &str, what: &str) -> Option<ast::Fn> {
+    let file = crate::macros::parse_file(src).tree();
+    let mut defs = file.syntax().descendants().filter_map(ast::Fn::cast).filter(|f| {
+        let method = f.syntax().parent().is_some_and(|p| ast::AssocItemList::can_cast(p.kind()));
+        f.name().is_some_and(|n| n.text() == name)
+            && (what == "method") == (method && f.param_list().is_some_and(|l| l.self_param().is_some()))
+    });
+    match (defs.next(), defs.next()) {
+        (Some(f), None) => Some(f),
+        _ => None,
+    }
+}
+
+/// E0061 for a call with arguments past the last parameter, each a literal (whose type rustc
+/// names): a label on each, the note on the definition, and the suggestion to remove them.
+fn extra_args(s: &mut Shaped, src: &str, end: usize, what: &str, want: usize) {
+    let Some((name_s, name_e)) = s.focus else { return };
+    let Some(f) = callee_def(src, &src[name_s..name_e], what) else { return };
+    let Some(fname) = f.name() else { return };
+    if f.param_list().map_or(0, |l| l.params().count()) != want {
+        return;
+    }
+    let file = crate::macros::parse_file(src).tree();
+    let Some(list) = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::ArgList::cast)
+        .find(|l| usize::from(l.syntax().text_range().end()) == end && usize::from(l.syntax().text_range().start()) >= name_e)
+    else {
+        return;
+    };
+    let args: Vec<ast::Expr> = list.args().collect();
+    let range = |n: &ra_ap_syntax::SyntaxNode| (usize::from(n.text_range().start()), usize::from(n.text_range().end()));
+    let mut labels = Vec::new();
+    for (i, a) in args.iter().enumerate().skip(want) {
+        let ty = match a {
+            ast::Expr::Literal(l) => match l.kind() {
+                ast::LiteralKind::IntNumber(_) => "{integer}",
+                ast::LiteralKind::FloatNumber(_) => "{float}",
+                ast::LiteralKind::String(_) => "&'static str",
+                ast::LiteralKind::Bool(_) => "bool",
+                ast::LiteralKind::Char(_) => "char",
+                _ => return,
+            },
+            _ => return,
+        };
+        let (a0, a1) = range(a.syntax());
+        labels.push((a0, a1, format!("unexpected argument #{} of type `{ty}`", i + 1)));
+    }
+    s.spans.extend(labels);
+    let (a, b) = range(fname.syntax());
+    s.note = Some((format!("{what} defined here"), vec![(a, b, String::new())]));
+    // From the end of the last argument kept (or the `(`) to the end of the last one given.
+    let cut_from = match want {
+        0 => usize::from(list.syntax().text_range().start()) + 1,
+        k => range(args[k - 1].syntax()).1,
+    };
+    let cut_to = range(args[args.len() - 1].syntax()).1;
+    let many = args.len() - want > 1;
+    let message = if many { "remove the extra arguments" } else { "remove the extra argument" };
+    s.suggestion = Some((message.into(), vec![(cut_from, cut_to, String::new())]));
+}
+
+/// E0061 for a call that leaves off its last arguments (`f(a)` for `fn f(a: A, b: B)`), with
+/// the callee's name as `s.focus` and the call ending at `end`: rustc's label on the argument
+/// list, its note on the definition and its suggestion of placeholders.
+fn missing_args(s: &mut Shaped, src: &str, end: usize, what: &str, n: usize, want: usize) {
+    let Some((name_s, name_e)) = s.focus else { return };
+    let name = &src[name_s..name_e];
+    let Some(open) = src.get(name_e..end).and_then(|t| t.find('(')).map(|i| name_e + i) else {
+        return;
+    };
+    if !src[..end].ends_with(')') {
+        return;
+    }
+    let Some(f) = callee_def(src, name, what) else { return };
+    let (Some(fname), Some(pl)) = (f.name(), f.param_list()) else { return };
+    let params: Vec<ast::Param> = pl.params().collect();
+    if params.len() != want {
+        return;
+    }
+    let range = |n: &ra_ap_syntax::SyntaxNode| (usize::from(n.text_range().start()), usize::from(n.text_range().end()));
+    let tys: Vec<String> = params[n..]
+        .iter()
+        .map(|p| p.ty().map(|t| t.syntax().text().to_string().split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    if tys.len() != want - n {
+        return;
+    }
+    let label = match tys.as_slice() {
+        [t] => format!("argument #{} of type `{t}` is missing", n + 1),
+        [a, b] => format!("two arguments of type `{a}` and `{b}` are missing"),
+        [a, b, c] => format!("three arguments of type `{a}`, `{b}`, and `{c}` are missing"),
+        _ => "multiple arguments are missing".into(),
+    };
+    s.spans.push((open, end, label));
+    let mut spans = vec![{
+        let (a, b) = range(fname.syntax());
+        (a, b, String::new())
+    }];
+    spans.extend(params[n..].iter().map(|p| {
+        let (a, b) = range(p.syntax());
+        (a, b, String::new())
+    }));
+    s.note = Some((format!("{what} defined here"), spans));
+    let holes: Vec<String> = tys.iter().map(|t| format!("/* {t} */")).collect();
+    let text = format!("{}{}", if n > 0 { ", " } else { "" }, holes.join(", "));
+    let message = if tys.len() == 1 { "provide the argument" } else { "provide the arguments" };
+    s.suggestion = Some((message.into(), vec![(end - 1, end - 1, text)]));
+}
+
+/// The parameter `name` of the function around `at`: `name` in `fn f(a: T, name: U)`.
+fn param_before(src: &str, at: usize, name: &str) -> Option<(usize, usize)> {
+    let text = src.get(..at)?;
+    let fn_at = text.rfind("fn ")?;
+    let params_end = fn_at + text[fn_at..].find('{')?;
+    let params = &text[fn_at..params_end];
+    let is_id = |c: char| c.is_alphanumeric() || c == '_';
+    params.match_indices(name).map(|(i, _)| fn_at + i).find(|&i| {
+        let before = text[..i].trim_end();
+        let after = text[i + name.len()..].trim_start();
+        (before.ends_with('(') || before.ends_with(','))
+            && after.starts_with(':')
+            && !text[i + name.len()..].starts_with(is_id)
+    }).map(|i| (i, i + name.len()))
+}
+
+// ------------------------------------------------------------------------------- std's source
+
+/// The rustc whose std source the notes into it follow (1.100.0's rust-src): the lines move with
+/// the toolchain.
+const RUSTC_COMMIT: &str = "0ef1bc386059596dada8fb65b50425aab2ea637a";
+
+/// The std definitions rustc's notes point at: a key, the file under `library/`, the line, its
+/// text, and the word the note marks.
+const STD_SITES: &[(&str, &str, u32, &str, &str)] = &[
+    ("IntoIterator::into_iter", "core/src/iter/traits/collect.rs", 312, "    fn into_iter(self) -> Self::IntoIter;", "self"),
+    ("Vec::push", "alloc/src/vec/mod.rs", 962, "    pub fn push(&mut self, value: T) {", "push"),
+    ("String::push_str", "alloc/src/string.rs", 1126, "    pub fn push_str(&mut self, string: &str) {", "push_str"),
+    ("String::push", "alloc/src/string.rs", 1455, "    pub fn push(&mut self, ch: char) {", "push"),
+    ("VecDeque::push_front", "alloc/src/collections/vec_deque/mod.rs", 2342, "    pub fn push_front(&mut self, value: T) {", "push_front"),
+    ("VecDeque::push_back", "alloc/src/collections/vec_deque/mod.rs", 2385, "    pub fn push_back(&mut self, value: T) {", "push_back"),
+];
+
+/// A note on the std definition `key` (see `STD_SITES`), marking its word.
+fn std_note(kind: &str, message: String, key: &str) -> Option<Child> {
+    let &(_, file, line, text, mark) = STD_SITES.iter().find(|s| s.0 == key)?;
+    let (a, b) = find_word(text, 0, text.len(), mark, false)?;
+    let span = SubSpan {
+        start: 0,
+        end: 0,
+        line,
+        column: a as u32 + 1,
+        end_line: line,
+        end_column: b as u32 + 1,
+        label: String::new(),
+        primary: true,
+    };
+    Some(Child {
+        kind: kind.into(),
+        message,
+        spans: vec![span],
+        source: Some(Source { path: format!("/rustc/{RUSTC_COMMIT}/library/{file}"), line, text: text.into() }),
+        ..Default::default()
+    })
+}
+
+/// rustc notes where a method taking `self` is defined once per function (and definition): the
+/// second move into `into_iter` in a function has no note.
+fn dedup_self_notes(src: &str, diags: &mut [Diagnostic]) {
+    let file = crate::macros::parse_tree(src);
+    let fns: Vec<(usize, usize)> = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .map(|f| (usize::from(f.syntax().text_range().start()), usize::from(f.syntax().text_range().end())))
+        .collect();
+    let body = |at: usize| fns.iter().filter(|(s, e)| *s <= at && at < *e).map(|(s, _)| *s).max();
+    let mut seen = std::collections::HashSet::new();
+    for d in diags {
+        let f = body(d.start);
+        d.children.retain(|c| {
+            if !c.message.contains("takes ownership of the receiver `self`") {
+                return true;
+            }
+            let Some(sp) = c.spans.first() else { return true };
+            let at = (c.source.as_ref().map(|s| s.path.clone()), sp.line, sp.column);
+            seen.insert((f, at))
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------------- rendering
 
 /// What `render` reads of a diagnostic (also from a host's JSON, for `formatDiagnostics`).
@@ -1294,6 +1811,8 @@ struct Ann {
     end_col: usize,
     primary: bool,
     label: Option<String>,
+    /// A multi-line span's start, among a line's other annotations (see `annotate`).
+    takes_space: bool,
 }
 
 /// The diagnostics as rustc prints them, then rustc's summary (`error: aborting due to ..`).
@@ -1382,7 +1901,7 @@ fn ann(lines: &[&str], line: u32, col: u32, end_line: u32, end_col: u32, primary
     if l1 == l0 && c1 <= c0 {
         c1 = c0 + 1;
     }
-    Ann { line: l0, col: c0, end_line: l1, end_col: c1, primary, label }
+    Ann { line: l0, col: c0, end_line: l1, end_col: c1, primary, label, takes_space: false }
 }
 
 fn render_one(out: &mut String, lines: &[&str], filename: &str, d: &View) {
@@ -1440,6 +1959,16 @@ fn render_one(out: &mut String, lines: &[&str], filename: &str, d: &View) {
     }
     for c in &d.children {
         if let Some(first) = c.spans.iter().find(|s| s.primary).or(c.spans.first()) {
+            // (A note into another file: its one line, at its number.)
+            let other: Option<Vec<&str>> = c.source.as_ref().map(|s| {
+                let mut v = vec![""; s.line.saturating_sub(1) as usize];
+                v.push(&s.text);
+                v
+            });
+            let (lines, filename) = match (&other, &c.source) {
+                (Some(v), Some(s)) => (v.as_slice(), s.path.as_str()),
+                _ => (lines, filename),
+            };
             out.push_str(&format!("{}: {}\n", c.kind, c.message));
             let line = lines.get(first.line.saturating_sub(1) as usize).copied().unwrap_or("");
             out.push_str(&format!("{pad}--> {filename}:{}:{}\n", first.line, char_col(line, first.column)));
@@ -1475,7 +2004,8 @@ fn byte_col(line: &str, col16: u32) -> usize {
 
 /// A suggestion as rustc shows it: the lines it changes as they would read, with `+++` under
 /// what it inserts, or (when it removes or replaces text) the old lines marked `-` and the new
-/// ones `+`. Each edit's label is its replacement text; edits don't contain line breaks.
+/// ones `+`. Each edit's label is its replacement text. An edit that adds lines shows each
+/// changed line marked `~` and each new one `+`.
 fn suggestion(out: &mut String, lines: &[&str], edits: &[SubSpan], width: usize) {
     let pad = " ".repeat(width);
     out.push_str(&format!("{pad} |\n"));
@@ -1486,6 +2016,9 @@ fn suggestion(out: &mut String, lines: &[&str], edits: &[SubSpan], width: usize)
     let mut new_lines: Vec<String> = Vec::new();
     let mut marks: Vec<Vec<(usize, usize)>> = Vec::new();
     let insert_only = edits.iter().all(|e| (e.line, e.column) == (e.end_line, e.end_column));
+    let adds_lines = edits.iter().any(|e| e.label.contains('\n'));
+    // (What each line keeps after its last edit.)
+    let mut rests: Vec<String> = Vec::new();
     for l in first..=last {
         let old = lines.get(l).copied().unwrap_or("");
         let mut here: Vec<(usize, usize, &str)> = edits
@@ -1509,10 +2042,26 @@ fn suggestion(out: &mut String, lines: &[&str], edits: &[SubSpan], width: usize)
             at = b.max(at);
         }
         s.push_str(&old[at.min(old.len())..]);
+        rests.push(old[at.min(old.len())..].to_string());
         new_lines.push(s);
         marks.push(m);
     }
-    if insert_only {
+    if adds_lines {
+        // A line is new (`+`) unless it holds what was there: the first of each edited line, and
+        // the last when text followed the edit.
+        let mut n = first + 1;
+        for (i, s) in new_lines.iter().enumerate() {
+            let parts: Vec<&str> = s.split('\n').collect();
+            for (j, part) in parts.iter().enumerate() {
+                let kept = j == 0 || (j == parts.len() - 1 && !rests[i].is_empty());
+                let row = format!("{:>width$} {} {}", n, if kept { '~' } else { '+' }, expand_tabs(part));
+                out.push_str(row.trim_end());
+                out.push('\n');
+                n += 1;
+            }
+        }
+        out.push_str(&format!("{pad} |\n"));
+    } else if insert_only {
         for (i, s) in new_lines.iter().enumerate() {
             let row = format!("{:>width$} | {}", first + i + 1, expand_tabs(s));
             out.push_str(row.trim_end());
@@ -1567,21 +2116,32 @@ fn snippet(out: &mut String, lines: &[&str], anns: &[Ann], width: usize) {
         }
     }
     let m = multi.map(|i| anns[i].clone());
-    // (Whether the multi-line span starts at its line's first non-blank: drawn with `/`.)
+    // (Whether the multi-line span starts at its line's first non-blank, with nothing else on
+    // that line: drawn with `/`.)
     let starts_line = m.as_ref().is_some_and(|m| {
         expand_tabs(lines.get(m.line).copied().unwrap_or(""))
             .chars()
             .take(m.col)
             .all(char::is_whitespace)
+            && !singles.iter().any(|a| a.line == m.line)
     });
-    // The lines to show: annotated ones, a long multi-line span's first three and last two,
-    // and a single line between two shown ones.
+    // The lines to show: annotated ones, a single line between two shown ones, and for a
+    // multi-line span (rustc's `collect_annotations`) its first and last lines, the lines after
+    // the first up to the last non-blank one within four, and the one before the last if it's
+    // further on and not blank (a bare brace, a comment or nothing is blank).
     let mut show: Vec<usize> = singles.iter().map(|a| a.line).collect();
     if let Some(m) = &m {
-        if m.end_line - m.line < 6 {
-            show.extend(m.line..=m.end_line);
-        } else {
-            show.extend([m.line, m.line + 1, m.line + 2, m.end_line - 1, m.end_line]);
+        let blank = |l: usize| {
+            let s = lines.get(l).map_or("", |s| s.trim());
+            (s.starts_with("//") && !s.starts_with("///") && !s.starts_with("//!"))
+                || ["", "{", "}", "(", ")", "[", "]"].contains(&s)
+        };
+        show.extend([m.line, m.end_line]);
+        if let Some(k) = (m.line..(m.line + 4).min(m.end_line)).rev().find(|&l| !blank(l)) {
+            show.extend(m.line + 1..=k);
+        }
+        if m.line + 5 < m.end_line && !blank(m.end_line - 1) {
+            show.push(m.end_line - 1);
         }
     }
     show.retain(|&l| l < lines.len());
@@ -1621,16 +2181,18 @@ fn snippet(out: &mut String, lines: &[&str], anns: &[Ann], width: usize) {
         let row = format!("{:>width$} | {}{}", l + 1, margin(l, true), expand_tabs(lines[l]));
         out.push_str(row.trim_end());
         out.push('\n');
-        let here: Vec<&Ann> = singles.iter().filter(|a| a.line == l).collect();
+        let mut here: Vec<&Ann> = singles.iter().filter(|a| a.line == l).collect();
+        let start;
         if let Some(m) = &m
             && l == m.line
             && !starts_line
         {
-            let ch = if m.primary { '^' } else { '-' };
-            out.push_str(&format!("{pad} |  {}{ch}\n", "_".repeat(m.col + 1)));
-        }
-        if !here.is_empty() {
-            annotate(out, &format!("{pad} | {}", margin(l, false)), &here);
+            // (Where it starts: `__^`, or `_____|` below the line's other labels.)
+            start = Ann { end_line: m.line, end_col: m.col + 1, label: None, takes_space: true, ..m.clone() };
+            here.push(&start);
+            annotate(out, &format!("{pad} | "), &here, Margin::Start);
+        } else if !here.is_empty() {
+            annotate(out, &format!("{pad} | "), &here, Margin::Text(margin(l, false)));
         }
         if let Some(m) = &m
             && l == m.end_line
@@ -1647,55 +2209,115 @@ fn snippet(out: &mut String, lines: &[&str], anns: &[Ann], width: usize) {
     }
 }
 
-/// The underline row of a line's annotations and their labels: the rightmost label inline,
-/// the others below it on their own rows, joined to their spans by `|`. `prefix` is the gutter
-/// (and margin) each row starts with.
-fn annotate(out: &mut String, prefix: &str, here: &[&Ann]) {
+/// How a line's annotation rows start, after the gutter: with a fixed margin (`| ` along a
+/// multi-line span, `  ` beside one, nothing without one), or as the line where a multi-line
+/// span starts among other annotations, whose `_` runs in from the margin (`Start`).
+enum Margin<'a> {
+    Text(&'a str),
+    Start,
+}
+
+/// The underline row of a line's annotations and their labels, laid out as rustc's emitter does
+/// (`render_source_line`): from the rightmost annotation leftwards, a label goes on the
+/// underline row until one would run into the next one's; from then on, labels go a row lower
+/// each time they would collide, joined to their spans by `|`. A multi-line span's start
+/// (`takes_space`) gets a row of its own, where `_` joins it to the margin. `gutter` is what
+/// each row starts with.
+fn annotate(out: &mut String, gutter: &str, here: &[&Ann], margin: Margin) {
     let mut anns: Vec<&Ann> = here.to_vec();
-    anns.sort_by_key(|a| (a.col, a.end_col));
-    let row = |cells: &[char]| -> String {
-        let s: String = cells.iter().collect();
-        format!("{prefix}{s}").trim_end().to_string()
+    anns.sort_by_key(|a| std::cmp::Reverse(a.col));
+    let labeled = |a: &Ann| a.label.as_deref().is_some_and(|l| !l.is_empty());
+    let overlaps = |a1: &Ann, a2: &Ann, pad: usize| {
+        (a2.col..a2.end_col + pad).contains(&a1.col) || (a1.col..a1.end_col + pad).contains(&a2.col)
     };
-    let width = anns.iter().map(|a| a.end_col).max().unwrap_or(0);
-    let mut cells = vec![' '; width];
-    // Drawn right to left (the primary first among those starting together), so the leftmost
-    // wins where they overlap, as rustc draws them (`----^` under `mut x`, the `mut ` over it).
-    let mut draw: Vec<&Ann> = here.to_vec();
-    draw.sort_by_key(|a| (std::cmp::Reverse(a.col), !a.primary));
-    for a in draw {
-        cells[a.col..a.end_col].fill(if a.primary { '^' } else { '-' });
-    }
-    let mut first = row(&cells);
-    let mut rest: Vec<&Ann> = anns.iter().copied().filter(|a| a.label.is_some()).collect();
-    // The rightmost annotation's label goes on the underline row.
-    if let Some(&last) = anns.last()
-        && let Some(label) = &last.label
-    {
-        first.push(' ');
-        first.push_str(label);
-        rest.retain(|a| !std::ptr::eq(*a, last));
-    }
-    out.push_str(&first);
-    out.push('\n');
-    if rest.is_empty() {
-        return;
-    }
-    let bars = |upto: &[&Ann]| -> Vec<char> {
-        let w = upto.iter().map(|a| a.col + 1).max().unwrap_or(0);
-        let mut cells = vec![' '; w];
-        for a in upto {
-            cells[a.col] = '|';
+    // Each annotation's label row below the underline (0: on it).
+    let mut rows = Vec::new();
+    let mut p = 0;
+    for (i, a) in anns.iter().enumerate() {
+        for next in &anns[i + 1..] {
+            if overlaps(next, a, 0) && labeled(a) && p == 0 {
+                if (next.col, next.end_col) == (a.col, a.end_col) && !labeled(next) {
+                    continue;
+                }
+                p += 1;
+                break;
+            }
         }
-        cells
+        rows.push(p);
+        for next in &anns[i + 1..] {
+            let l = next.label.as_ref().map_or(0, |l| l.chars().count() + 2);
+            if (overlaps(next, a, l) && labeled(a) && labeled(next))
+                || (a.takes_space && labeled(next))
+                || (labeled(a) && next.takes_space)
+                || (a.takes_space && next.takes_space)
+                || (overlaps(next, a, l) && next.end_col <= a.end_col && labeled(next) && p == 0)
+            {
+                p += 1;
+                break;
+            }
+        }
+    }
+    // (With a margin in the grid, the code starts two columns in.)
+    let (prefix, off) = match margin {
+        Margin::Text(m) => (format!("{gutter}{m}"), 0),
+        Margin::Start => (gutter.to_string(), 2),
     };
-    out.push_str(&row(&bars(&rest)));
-    out.push('\n');
-    while let Some(a) = rest.pop() {
-        let mut cells = bars(&rest);
-        cells.resize(a.col, ' ');
-        let s: String = cells.iter().collect();
-        out.push_str(&format!("{prefix}{s}{}\n", a.label.as_deref().unwrap_or("")));
+    let mut grid: Vec<Vec<char>> = vec![Vec::new(); p + 2];
+    let mut put = |row: usize, col: usize, s: &str| {
+        let cells = &mut grid[row];
+        for (i, ch) in s.chars().enumerate() {
+            if cells.len() <= col + i {
+                cells.resize(col + i + 1, ' ');
+            }
+            cells[col + i] = ch;
+        }
+    };
+    for (a, &row) in anns.iter().zip(&rows) {
+        if row > 0 && (labeled(a) || a.takes_space) {
+            for r in 1..=row {
+                put(r, off + a.col, "|");
+            }
+        }
+    }
+    // The multi-line span's start: `_` from the margin on its row, the margin's `|` below.
+    let mut bar_from = None;
+    for (a, &row) in anns.iter().zip(&rows) {
+        if a.takes_space {
+            put(row, 1, &"_".repeat(off + a.col - 1));
+            bar_from = Some(row + 1);
+        }
+    }
+    for (a, &row) in anns.iter().zip(&rows) {
+        if let Some(label) = a.label.as_deref().filter(|l| !l.is_empty()) {
+            if row == 0 {
+                put(0, off + a.end_col + 1, label);
+            } else {
+                put(row + 1, off + a.col, label);
+            }
+        }
+    }
+    // Longest first, the primary over a secondary: `----^^^^^^^` under `mut servers`.
+    let mut by_len = anns.clone();
+    by_len.sort_by_key(|a| (std::cmp::Reverse(a.end_col - a.col), a.primary));
+    for a in by_len {
+        let ch = if a.primary { "^" } else { "-" };
+        put(0, off + a.col, &ch.repeat(a.end_col - a.col));
+    }
+    // (rustc keeps a row under the last label when there are any; the margin's `|` shows in it.)
+    let used = match bar_from {
+        Some(from) => {
+            let rows = if p == 0 { 1 } else { p + 2 };
+            for r in from..rows {
+                put(r, 0, "|");
+            }
+            rows
+        }
+        None => grid.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1),
+    };
+    for cells in grid.into_iter().take(used) {
+        let s: String = cells.into_iter().collect();
+        out.push_str(format!("{prefix}{s}").trim_end());
+        out.push('\n');
     }
 }
 

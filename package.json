@@ -28,7 +28,7 @@
   ],
   "scripts": {
     "build": "node tools/build.mjs",
-    "test": "node tools/build.mjs && cd compiler && cargo test && cd .. && node test/run.mjs",
+    "test": "node tools/build.mjs && cd compiler && cargo test && cd .. && node test/run.mjs && node test/mvp/run.mjs",
     "repl": "node tools/serve.mjs",
     "test:browser": "node tools/browser-check.mjs",
     "test:react": "node test/react/run.mjs",

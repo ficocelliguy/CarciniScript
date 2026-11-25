@@ -54,7 +54,10 @@ The gaps fall into three parts:
   (lengths, indexes and every figure the game hands out stay far below). Past that, values round
   (a literal that would warns), `+ - *` and the `wrapping_*` methods don't wrap at 2^64, `MAX` /
   `MIN` are ±(2^53 − 1), and casting a negative value to `u64` / `usize` keeps the sign. Bit
-  operations and shifts are exact and do wrap to 64 bits. So a 64-bit hash or random number
+  operations and shifts are exact and do wrap to 64 bits, and a value past 2^53 prints the
+  double's exact digits (`1u64 << 60` is `1152921504606846976`), so it prints as rustc's
+  whenever a double holds it exactly: powers of two and masks of bits less than 53 apart
+  (`(1 << 59) | (1 << 3)` can't be held, and prints `576460752303423488`). So a 64-bit hash or random number
   generator (FNV-1a, xorshift, SplitMix, `wrapping_mul` by a large odd constant) doesn't give
   rustc's values as `u64`; write it over `u128` (exact BigInts, wrapping at 128 bits) and mask
   with `& 0xffff_ffff_ffff_ffff` where the width matters (the `inexact_64bit` warning points
@@ -334,9 +337,12 @@ There is one JS thread, and scripts share it with the game.
   with `fn f(s: &str)` and `t: String` is rustc's "expected `&str`, found `String`" when `t` is
   a by-value parameter, a `let` of a made value (`String::from(..)`, `x.clone()`, `format!`,
   a struct literal, a function declared to return an owned type) or an NS result (nothing from
-  the bindings holds a reference). A `v[i]`, a field, a `match` binding or an `if` result may
-  be a reference as far as the checker can tell (`Vec<&str>` and `Vec<String>` are one type
-  here), so passing one bare is accepted and runs with the JS value shared.
+  the bindings holds a reference). The same goes for `s.push_str(t)` and for what's pushed or
+  inserted into a local or parameter declared `Vec<&T>` / `VecDeque<&T>` (`push`, `insert`,
+  `push_back`, `push_front`); a `Vec<&str>` whose type is inferred, a struct field of one or a
+  `HashMap<&str, _>` takes an owned value silently. A `v[i]`, a field, a `match` binding or an
+  `if` result may be a reference as far as the checker can tell (`Vec<&str>` and `Vec<String>`
+  are one type here), so passing one bare is accepted and runs with the JS value shared.
 - **"Type annotations needed" is reported for `let` bindings only.** `let v = Vec::new();` that
   nothing types is rustc's error (also `HashMap<_, _>`, `Option<_>`, `Stack<_>`), but a value
   that's never bound (`Vec::new().len()`) or an unused closure parameter is treated as untyped.
@@ -361,12 +367,25 @@ There is one JS thread, and scripts share it with the game.
 
 ## Diagnostics
 
-- **rustc's rendering, with few of its suggestions for errors.** `rendered` has rustc's layout,
+- **rustc's rendering, with some of its suggestions for errors.** `rendered` has rustc's layout,
   codes, labels and secondary spans. The warnings' suggestions are rustc's patches of the source,
-  and so is E0384's `let mut x`, but most errors' (`help: consider changing this to be mutable`
-  with `let mut v` underneath) are a single `= help:` line, and some secondary spans and notes
-  rustc adds aren't there: "borrow later used here", "note: function defined here", the type in
-  E0004's "the matched value is of type `T`", E0061's missing or extra arguments. Codes and
+  and so are E0384's and E0596's `let mut x`, E0061's `/* f64 */` for a missing argument and
+  removal of an extra literal one (with "note: function defined here"), E0004's new arm over the
+  file's own enum (with "`E` defined here" and the matched type), E0382's `&v` for a `Vec`
+  a `for` loop moved and `.clone()` before a method that takes `self`, and E0308's `&x` for an
+  owned argument and `'a'` for `"a"`. Other errors' suggestions are a single `= help:` line,
+  and some spans and notes rustc adds aren't there: E0061's labels for arguments rustc matches
+  out of order or extra ones that aren't literals, E0004's note for a generic or std enum,
+  "borrow later used by call" (it's "later used here") and the note when a borrow's later use
+  is a value's drop, and the unused-variable warnings rustc still gives next to type errors.
+  Notes into std's own source follow rustc 1.100's (`--> /rustc/0ef1bc38../library/core/src/
+  iter/traits/collect.rs:312:18`, its line shown as with rust-src installed) and are there for
+  `into_iter` (a `for` loop's or a call's, once per function as rustc gives it) and "method
+  defined here" for `Vec::push`, `VecDeque::push_back` / `push_front` and `String::push` /
+  `push_str`; another std method's note is missing.
+  The E0599 headline for a type a glob import brought in (`use std::collections::*;`) names it
+  without rustc's path (`HashMap<K, V, S, A>`, where rustc says
+  `std::collections::HashMap<K, V, S, A>`). Codes and
   labels are given for the common errors; a rarer one is `error: ..` without a code. Diagnostics
   come in rustc's order by pass (the early lints, type errors, each function's borrow errors and
   lints, dead code, the late lints); within the type errors, in source order.

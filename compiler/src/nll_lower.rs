@@ -1237,7 +1237,9 @@ impl<'e, 'a> Lower<'e, 'a> {
             _ => self.rty_at(ix.syntax()),
         };
         let region = self.fresh();
-        let recv = self.borrow(region, mutable, place.clone(), rty, span, mutable);
+        // (`Index::index(&v, i)`: rustc puts the borrow on `v`.)
+        let base_span = self.span(base.syntax());
+        let recv = self.borrow(region, mutable, place.clone(), rty, base_span, mutable);
         let i = self.expr(&idx, Ctx::default());
         let iop = self.operand(&i);
         let out = self.temp(RTy::Ref(region, mutable, Box::new(elem.clone())), span);
@@ -1663,11 +1665,13 @@ impl<'e, 'a> Lower<'e, 'a> {
         let brk = self.new_block();
         self.goto(head, span);
         self.switch_to(head);
-        // `next(&mut it)`
+        // `next(&mut it)`, on the iterable as rustc has it (`immutable borrow later used here`
+        // under `&v`).
+        let iter_span = self.span(iterable.syntax());
         let region = self.fresh();
         let it_rty = self.body.locals[it.idx()].rty.clone();
-        let recv = self.borrow(region, true, Place::local(it), it_rty, span, true);
-        let next = self.temp(RTy::Option(Box::new(elem.clone())), span);
+        let recv = self.borrow(region, true, Place::local(it), it_rty, iter_span, true);
+        let next = self.temp(RTy::Option(Box::new(elem.clone())), iter_span);
         self.emit(
             StmtKind::Assign(
                 Place::local(next),
@@ -1675,20 +1679,20 @@ impl<'e, 'a> Lower<'e, 'a> {
                     args: vec![Operand {
                         place: Place::local(recv),
                         moves: false,
-                        span,
+                        span: iter_span,
                     }],
                     activate: vec![(Place::local(it), region)],
                 },
             ),
-            span,
+            iter_span,
         );
-        self.emit(StmtKind::StorageDead(recv), span);
+        self.emit(StmtKind::StorageDead(recv), iter_span);
         let op = Operand {
             place: Place::local(next),
             moves: false,
-            span,
+            span: iter_span,
         };
-        self.terminate(Term::Switch(Some(op), vec![body, brk]), span);
+        self.terminate(Term::Switch(Some(op), vec![body, brk]), iter_span);
         self.switch_to(body);
         self.push_scope();
         self.pattern(
@@ -2459,7 +2463,10 @@ impl<'e, 'a> Lower<'e, 'a> {
                                     None => (Place::local(u.local), self.body.locals[u.local.idx()].rty.clone()),
                                 }));
                             if let Some((place, rty)) = p {
-                                borrows.push((place, rty, (a.start, a.end())));
+                                // (On the name inside the string, as rustc has it: `{t}`.)
+                                let at = a.text.find(&format!("{{{cap}}}")).or_else(|| a.text.find(&format!("{{{cap}:")));
+                                let cspan = at.map_or((a.start, a.end()), |i| (a.start + i + 1, a.start + i + 1 + cap.len()));
+                                borrows.push((place, rty, cspan));
                             }
                         }
                         continue;

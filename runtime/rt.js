@@ -691,6 +691,14 @@
     $retain(p) {
       for (const [k, x] of this.m) if (!p(x)) this.m.delete(k);
     }
+    // `drain()`: the items, the set emptied at once.
+    $drain() {
+      const xs = [...this.m.values()];
+      this.m.clear();
+      return Iter.of(function* () {
+        yield* xs;
+      });
+    }
     $extend(xs) {
       for (const x of xs) this.$insert(x);
     }
@@ -782,6 +790,14 @@
     }
     $extend(pairs) {
       for (const [k, v] of pairs) this.$insert(k, v);
+    }
+    // `drain()`: the `(k, v)` pairs (the slots, no longer the map's), the map emptied at once.
+    $drain() {
+      const slots = [...this.m.values()];
+      this.m.clear();
+      return Iter.of(function* () {
+        yield* slots;
+      });
     }
     // Fresh `(k, v)` pairs, so callers can't disturb the slots.
     $entries() {
@@ -3958,10 +3974,18 @@
     // `0.10000000149011612`), then formatted like an f64.
     $fmtF32: (x) => fmtF(shortF32(x)),
     $dbgF32: (x) => dbgF(shortF32(x)),
+    // A 64-bit integer: past 2^53 the double's exact digits (`1 << 60` is
+    // 1152921504606846976, where JS prints 1152921504606847000).
+    $fmtI64(x) {
+      return typeof x === "number" && !Number.isSafeInteger(x) && Number.isInteger(x) ? BigInt(x).toString() : String(x);
+    },
     // `{:.p}`: like `toFixed`, except that an exact tie rounds to even, as Rust does
-    // (`format!("{:.0}", 2.5)` is "2"; JS's `toFixed` rounds ties up).
+    // (`format!("{:.0}", 2.5)` is "2"; JS's `toFixed` rounds ties up). From 1e21 on (where
+    // `toFixed` gives exponent notation) the double's exact digits; `-0.0` keeps its sign.
     $fixed(x, p) {
       if (!Number.isFinite(x)) return fmtF(x);
+      if (Object.is(x, -0)) return "-" + rt.$fixed(0, p);
+      if (Math.abs(x) >= 1e21) return BigInt(x).toString() + (p > 0 ? "." + "0".repeat(p) : "");
       const up = x.toFixed(p);
       if (Math.abs(x) < 1e21) {
         // Every double this size has an exact decimal expansion within 100 digits.
@@ -3999,7 +4023,8 @@
     },
     // `{:e}` / `{:.2e}` / `{:E}`: `1.2345e3`, Rust's form (no `+` in the exponent).
     $exp(x, p, upper) {
-      const s = (p == null ? x.toExponential() : x.toExponential(p)).replace("e+", "e");
+      if (!Number.isFinite(x)) return fmtF(x);
+      const s = (Object.is(x, -0) ? "-" : "") + (p == null ? x.toExponential() : x.toExponential(p)).replace("e+", "e");
       return upper ? s.toUpperCase() : s;
     },
     // `{:#?}`: re-lays the one-line `{:?}` text one item per line, indented by four spaces,

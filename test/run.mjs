@@ -894,7 +894,7 @@ const rejected = [
     "let mut v = Vec::new();\n    v.push(1u8);\n    v.push(\"x\");",
     "4:12 mismatched types: expected `u8`, found `&str`",
   ],
-  ["mutating an immutable Vec", "let v = vec![1];\n    v.push(2);", "3:5 cannot borrow `v` as mutable, as it is not declared as mutable: cannot borrow as mutable (consider changing this to be mutable)", "Variables are read-only unless declared `let mut`."],
+  ["mutating an immutable Vec", "let v = vec![1];\n    v.push(2);", "3:5 cannot borrow `v` as mutable, as it is not declared as mutable: cannot borrow as mutable", "Variables are read-only unless declared `let mut`."],
   ["`&mut` of an immutable binding", "let v = vec![1];\n    let r = &mut v;", "3:18 cannot borrow `v` as mutable"],
   ["indexing with i32", "let v = vec![1];\n    let i: i32 = 0;\n    let x = v[i];", "4:15 the type `[{integer}]` cannot be indexed by `i32`"],
   ["Display of a Vec", "let v = vec![1];\n    println!(\"{}\", v);", "3:20 `Vec<{integer}>` doesn't implement `std::fmt::Display`: `Vec<{integer}>` cannot be formatted with the default formatter"],
@@ -1021,7 +1021,7 @@ const rejected = [
   ["gen_range of a range in a variable", "}\nuse rand::Rng;\nfn g() {\n    let mut rng = rand::thread_rng();\n    let r = 0..5;\n    let x = rng.gen_range(r);", "7:13 `gen_range` takes a range written out here (`lo..hi` or `lo..=hi`)"],
   ["an RNG that isn't mut", "}\nuse rand::Rng;\nfn g() {\n    let rng = rand::thread_rng();\n    let x: u8 = rng.gen_range(0..5);", "6:17 cannot borrow `rng` as mutable, as it is not declared as mutable"],
   ["sorted() on floats", "}\nuse itertools::Itertools;\nfn g() {\n    let v = vec![1.5, 0.5];\n    let s: Vec<f64> = v.into_iter().sorted().collect();", "6:37 the trait bound `{float}: Ord` is not satisfied: the trait `Ord` is not implemented for `{float}`"],
-  [".context() without anyhow", "let r: Result<i32, String> = Ok(1);\n    let x = r.context(\"x\");", "3:15 no method named `context` found for enum `Result<i32, String>` in the current scope (if you meant `anyhow::Context`'s, add `use anyhow::Context;`)"],
+  [".context() without anyhow", "let r: Result<i32, String> = Ok(1);\n    let x = r.context(\"x\");", "3:15 no method named `context` found for enum `Result<T, E>` in the current scope (if you meant `anyhow::Context`'s, add `use anyhow::Context;`)"],
   ["a thiserror message naming no field", "}\nuse thiserror::Error;\n#[derive(Error, Debug)]\nenum E {\n    #[error(\"bad {nope}\")]\n    A { x: i32 },\n}\nfn g() {", "6:5 there is no field `nope` here"],
   ["an unknown bitflags flag", "}\nbitflags::bitflags! {\n    struct F: u8 {\n        const A = 1;\n    }\n}\nfn g() {\n    let f = F::B;", "9:13 no function or associated item named `B` found for struct `F`"],
   ["serde_json::from_str with nothing to parse into", "let v = serde_json::from_str(\"1\");", "2:13 type annotations needed (say what to parse into, e.g. `serde_json::from_str::<Config>(..)`)"],
@@ -1070,12 +1070,12 @@ const rejected = [
   // An owned value where the parameter is `&T`: rustc's E0308 at the argument, with the borrow
   // suggestion (only where the value certainly owns itself: a `let` of a made value, an owned
   // parameter, an NS result).
-  ["an owned String for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f() {\n    let t = String::from(\"abc\");\n    take(t);", "6:10 mismatched types: expected `&str`, found `String` (consider borrowing here: `&t`)"],
-  ["a Vec for a `&[T]` parameter", "}\nfn total(v: &[i32]) -> i32 { v.iter().sum() }\nfn f() {\n    let v = vec![1];\n    total(v);", "6:11 mismatched types: expected `&[i32]`, found `Vec<i32>` (consider borrowing here: `&v`)"],
-  ["a struct for a method's `&Self` parameter", "}\nstruct P { x: i32 }\nimpl P {\n    fn far(&self, o: &P) -> i32 { (self.x - o.x).abs() }\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = P { x: 2 };\n    p.far(q);", "10:11 mismatched types: expected `&P`, found `P` (consider borrowing here: `&q`)"],
-  ["a made value for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f(n: i32) {\n    take(format!(\"{}\", n));", "5:10 mismatched types: expected `&str`, found `String` (consider borrowing here: `&format!(\"{}\", n)`)"],
-  ["use after a `for` loop", "let v = vec![1, 2];\n    for x in v { println!(\"{x}\"); }\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move (consider cloning the value if the performance cost is acceptable)"],
-  ["use after `into_iter()`", "let v = vec![1];\n    let it = v.into_iter();\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move (consider cloning the value if the performance cost is acceptable)"],
+  ["an owned String for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f() {\n    let t = String::from(\"abc\");\n    take(t);", "6:10 mismatched types: expected `&str`, found `String`"],
+  ["a Vec for a `&[T]` parameter", "}\nfn total(v: &[i32]) -> i32 { v.iter().sum() }\nfn f() {\n    let v = vec![1];\n    total(v);", "6:11 mismatched types: expected `&[i32]`, found `Vec<i32>`"],
+  ["a struct for a method's `&Self` parameter", "}\nstruct P { x: i32 }\nimpl P {\n    fn far(&self, o: &P) -> i32 { (self.x - o.x).abs() }\n}\nfn f() {\n    let p = P { x: 1 };\n    let q = P { x: 2 };\n    p.far(q);", "10:11 mismatched types: expected `&P`, found `P`"],
+  ["a made value for a `&str` parameter", "}\nfn take(s: &str) -> usize { s.len() }\nfn f(n: i32) {\n    take(format!(\"{}\", n));", "5:10 mismatched types: expected `&str`, found `String`"],
+  ["use after a `for` loop", "let v = vec![1, 2];\n    for x in v { println!(\"{x}\"); }\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move"],
+  ["use after `into_iter()`", "let v = vec![1];\n    let it = v.into_iter();\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move"],
   ["use after a partial move out of a tuple", "let p = (1, vec![1]);\n    let (_, v) = p;\n    println!(\"{:?} {}\", v, p.0);\n    println!(\"{:?}\", p);", "5:22 borrow of partially moved value: `p`: value borrowed here after partial move (consider cloning the value if the performance cost is acceptable)"],
   ["use after a partial move out of a struct", "}\nstruct P { x: i32, v: Vec<i32> }\nfn f() {\n    let p = P { x: 1, v: vec![1] };\n    let P { v, .. } = p;\n    println!(\"{:?} {}\", v, p.x);\n    let q = p;", "8:13 use of partially moved value: `p`"],
   ["a moved field read after a partial move", "}\nstruct P { x: i32, v: Vec<i32> }\nfn f() {\n    let p = P { x: 1, v: vec![1] };\n    let P { v, .. } = p;\n    let w = p.v;", "7:13 use of moved value: `p.v`: value used here after move"],
@@ -1088,7 +1088,7 @@ const rejected = [
   ["range up to an associated const, not exhaustive", "}\nstruct B;\nimpl B { const MID: u8 = 127; }\nfn f() {\n    match 3u8 { 0..=B::MID => {} }", "6:11 non-exhaustive patterns: `128_u8..=u8::MAX` not covered"],
   ["a move in a previous loop iteration", "}\nfn take(s: String) {}\nfn f() {\n    let s = String::from(\"a\");\n    for _ in 0..3 {\n        take(s);\n    }", "7:14 use of moved value: `s`: value moved here, in previous iteration of loop (consider cloning the value if the performance cost is acceptable)"],
   ["use after a `move` closure", "let v = vec![1];\n    let f = move || v.len();\n    v.len();", "4:5 borrow of moved value: `v`: value borrowed here after move (consider cloning the value if the performance cost is acceptable)"],
-  ["use after a `self` method", "}\nstruct P { x: i32 }\nimpl P { fn eat(self) -> i32 { self.x } }\nfn f() {\n    let p = P { x: 1 };\n    p.eat();\n    p.x;", "8:5 use of moved value: `p`: value used here after move (consider cloning the value if the performance cost is acceptable)"],
+  ["use after a `self` method", "}\nstruct P { x: i32 }\nimpl P { fn eat(self) -> i32 { self.x } }\nfn f() {\n    let p = P { x: 1 };\n    p.eat();\n    p.x;", "8:5 use of moved value: `p`: value used here after move"],
   ["use after `String + &str`", "let s = String::from(\"a\");\n    let t = s + \"b\";\n    println!(\"{s}{t}\");", "4:5 borrow of moved value: `s`: value borrowed here after move (consider cloning the value if the performance cost is acceptable)"],
   ["use after a move in one branch", "}\nfn take(v: Vec<i32>) {}\nfn f() {\n    let v = vec![1];\n    if v.len() > 3 { take(v); }\n    v.len();", "7:5 borrow of moved value: `v`: value borrowed here after move (consider cloning the value if the performance cost is acceptable)"],
   ["use after a move into a struct", "}\nstruct W { v: Vec<i32> }\nfn f() {\n    let v = vec![1];\n    let w = W { v };\n    v.len();", "7:5 borrow of moved value: `v`: value borrowed here after move (consider cloning the value if the performance cost is acceptable)"],
@@ -1097,7 +1097,7 @@ const rejected = [
   ["`.into()` with no target type", "}\nstruct V(i64);\nimpl From<i64> for V { fn from(n: i64) -> Self { V(n) } }\nfn f() {\n    let v = 5i64.into();", "6:13 type annotations needed (say what `.into()` converts to)"],
   ["`?` without a `From` impl for the error", "}\nstruct A;\nstruct B;\nfn g() -> Result<i32, A> { Err(A) }\nfn h() -> Result<i32, B> {\n    let x = g()?;\n    Ok(x)", "7:13 `?` couldn't convert the error to `B` (add `impl From<A> for B`"],
   ["lossy `.into()`", "let a: i64 = 5;\n    let b: i32 = a.into();", "3:20 the trait bound `i32: From<i64>` is not satisfied: the trait `From<i64>` is not implemented for `i32`"],
-  ["`Vec` method on a `VecDeque`", "let mut q = std::collections::VecDeque::new();\n    q.push(1);", "3:7 no method named `push` found for struct `VecDeque<_>` in the current scope: method not found in `VecDeque<_>`"],
+  ["`Vec` method on a `VecDeque`", "let mut q = std::collections::VecDeque::new();\n    q.push(1);", "3:7 no method named `push` found for struct `VecDeque<T, A>` in the current scope: method not found in `VecDeque<_>`"],
   ["push_back on an immutable `VecDeque`", "let q: std::collections::VecDeque<i32> = std::collections::VecDeque::new();\n    q.push_back(1);", "3:5 cannot borrow `q` as mutable, as it is not declared as mutable"],
   ["float keys in a `BTreeSet`", "let mut s = std::collections::BTreeSet::new();\n    s.insert(1.5);", "2:13 the trait bound `f64: Ord` is not satisfied"],
   ["wrong item type in a `BinaryHeap`", "let mut h = std::collections::BinaryHeap::new();\n    h.push(1);\n    h.push(\"x\");", "4:12 mismatched types: expected integer, found `&str`"],
@@ -1950,8 +1950,8 @@ for (const [label, src] of quiet) {
 
 const rejectedNs = [
   ["`.await` in a closure", "let f = || ns.sleep(10).await;", "2:16 `await` is only allowed inside `async` functions and blocks"],
-  ["an owned String for an NS `&str` parameter", "let target = ns.args[0].as_string().unwrap();\n    ns.nuke(target);", "3:13 mismatched types: expected `&str`, found `String` (consider borrowing here: `&target`)", "`&` in a parameter type means the function borrows the value instead of taking it; add `&` in front of the argument."],
-  ["an NS result's element for an NS `&str` parameter", "let servers = ns.scan(\"home\");\n    ns.nuke(servers[0]);", "3:13 mismatched types: expected `&str`, found `String` (consider borrowing here: `&servers[0]`)"],
+  ["an owned String for an NS `&str` parameter", "let target = ns.args[0].as_string().unwrap();\n    ns.nuke(target);", "3:13 mismatched types: expected `&str`, found `String`", "`&` in a parameter type means the function borrows the value instead of taking it; add `&` in front of the argument."],
+  ["an NS result's element for an NS `&str` parameter", "let servers = ns.scan(\"home\");\n    ns.nuke(servers[0]);", "3:13 mismatched types: expected `&str`, found `String`"],
   [
     "forgotten .await",
     'let stolen: f64 = ns.hack("n00dles");',
@@ -2159,7 +2159,7 @@ for (const [label, body, want, wantHelp] of rejectedNs) {
       h1.includes("args: Vec<ScriptArg>") && h2.includes("ScriptArg::Str(String)") && h3.includes("enum ScriptArg { Str(String), Num(f64), Bool(bool) }") && h3.includes("TypeScript: `string | number | boolean`"),
       JSON.stringify([h1, h2, h3]),
     );
-    check("a union's missing variant", d.some((m) => m.includes("non-exhaustive patterns: `ScriptArg::Bool(_)` not covered")), JSON.stringify(d));
+    check("a union's missing variant", d.some((m) => m.includes("non-exhaustive patterns: `&ScriptArg::Bool(_)` not covered")), JSON.stringify(d));
   }
   // (Without typed bindings an NS method's result isn't checked.)
   const ns = "pub async fn main(ns: NS) {\n    let m: String = ns.get_server_money_available(\"home\");\n    ns.tprint(&format!(\"{}\", m));\n}\n";

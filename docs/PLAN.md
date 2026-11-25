@@ -26,58 +26,49 @@ first weeks. (`println!` stays `console.log`, which Bitburner shows in the scrip
   Display` with widths, trait defaults, `Box<dyn Fn>`, `mem::swap` / `take`, `{:#?}`) printed
   exactly what rustc's build did; NS scripts type-check against the bindings; 83% of the 5,220
   registry files have no language gap.
-- **Panic messages match.** Of 18 common panics (`unwrap` / `expect` on `None` and `Err`,
-  index and slice ranges, a char boundary, divide by zero, a missing map key, `panic!`,
-  `unreachable!`, `todo!`, `assert!` / `assert_eq!` with their `left` / `right`, overflow with
-  Bitburner's overflow checks), 17 have rustc's message and line:column exactly. The odd one out
-  is a second `borrow_mut()` on a `RefCell`, which doesn't panic. What's wrong is the frame:
-  the thrown error reads as JS's (`String(e)` is `panic: p.rs:8:15: called ..`, and `e.stack`
-  is a JS stack), and that is what a host shows.
-- **Compile errors mostly have rustc's headline and position** (20 common mistakes:
-  mismatched types, unknown names, E0596 / E0382 / E0502 / E0384, wrong argument counts,
-  unknown fields and methods, non-exhaustive `match`, `&str + &str`, ..). What gives it away:
-  - The layout. A diagnostic is a headline and a position; there is no rustc rendering (no
-    `error[E0308]`, `-->` line, source snippet or span labels) for a host to show.
-  - Hints appended to the message in parentheses (`(declare it with `let mut v`)`) where
-    rustc has a `help:` line.
-  - About 70 messages that mention the implementation ("see docs/FEATURES.md", "not supported
-    yet", JS).
-  - A `&str` described as `String` (`let x: i32 = "hello"` says "found `String`"; references
-    are erased).
-  - Small wording and caret differences ("1 were supplied", "use of moved value" for rustc's
-    "borrow of moved value", carets on the left operand rather than the operator or the
-    method name).
-- **No warnings.** rustc's `unused variable`, `unused mut`, dead code and the others never
-  appear.
-- **Printed values mostly match**; the misses are an integer past 2^53 printed with rounded
-  digits (`1u64 << 60` prints `1152921504606847000`; JS's shortest form), `u64::MAX` /
-  `i64::MAX` printing `9007199254740991` (they are 2^53 − 1 by design), `{:e}` of infinity
-  printing `Infinity`, `{:.3}` of a float ≥ 1e21 dropping its decimals, `-0.0` losing its sign
-  under `{:e}` / `{:.3}`, and `f64::MIN_POSITIVE` missing.
+- **Printed values match** (2026-11-24) but for `u64::MAX` / `i64::MAX` / `MIN`, which are
+  2^53 − 1 by design, and 64-bit values a double can't hold.
 
-The MVP, in the order a Rust user would run into it. Panics and compile errors in rustc's format are
-done (FEATURES "rustc's diagnostic format", RUST_GAPS "Diagnostics"), and so are rustc's warnings
-with their lint levels and the 64-bit wrapping warning `inexact_64bit` (FEATURES "rustc's
-warnings (lints)" and "Warn on inexact 64-bit arithmetic", 2026-11-24; what's missing is in
-RUST_GAPS "Diagnostics"); what's left:
+Panics, compile errors and warnings in rustc's format are done (FEATURES "rustc's diagnostic
+format" and "rustc's warnings (lints)", RUST_GAPS "Diagnostics"), and so is what was left
+(2026-11-24):
 
-1. **Printed values.** Integers past 2^53 print the double's exact digits (`BigInt(n)`'s:
-   `1u64 << 60` is `1152921504606846976`, which is right whenever the value came from shifts and
-   masks); `{:e}` of `±inf`; `{:.N}` at or above 1e21; `-0.0` under `{:e}` / `{:.N}`; and the
-   float constants rustc has (`MIN_POSITIVE`, `EPSILON`, `consts::*`; check them all). `u64::MAX`
-   and `i64::MAX` / `MIN` stay 2^53 − 1 (comparisons against them must keep working), a
-   documented difference.
-2. **`drain()` on `HashMap`, `HashSet`, `BTreeMap` and `BTreeSet`** (with the stale message
-   "needs iterators or closures, which are not supported yet" gone).
-3. **The acceptance test.** A `test/mvp/` set of about 30 scripts written the way a Rust user
-   would write them without reading our docs: scanners and hack loops over the NS mock,
-   coding-contract solvers (BFS, DP, string parsing), a two-file script with `mod util;`, a
-   `#[test]` module, a few that panic, and a dozen with the mistakes and warnings people
-   actually make (`String` vs `&str`, a borrow conflict, a moved value, an unused variable, a
-   needless `mut`). Each must match rustc: stdout for the pure ones, the panic text, and
-   `cargo build`'s rendered errors and warnings line for line apart from paths. Write it first
-   so items 1 and 2 have failing tests to turn green, and have someone who writes Rust but
-   hasn't seen the project write a third of the scripts.
+1. **Printed values.** A 64-bit integer past 2^53 prints the double's exact digits (`1u64 <<
+   60` is `1152921504606846976`), `{:e}` of `±inf` / NaN is rustc's, `{:.N}` from 1e21 up
+   keeps its digits, `-0.0` keeps its sign under `{:e}` / `{:.N}`, and every stable `f64` /
+   `f32` constant is there, also through `use std::f64::consts;` and `use
+   std::f64::consts::PI;` (FEATURES "Float constants and printing edge cases").
+2. **`drain()`** on `HashMap` and `HashSet`; `BTreeMap` and `BTreeSet` have none in std, so
+   theirs is rustc's E0599, whose headline now names a std type as rustc does
+   (`BTreeMap<K, V, A>`). The stale "not supported yet" messages are gone.
+3. **The acceptance test**, `test/mvp/` (`node test/mvp/run.mjs`, part of `npm test`): 36
+   scripts against rustc 2024 as `cargo build` runs it (a debug build): the rendered errors and
+   warnings line for line apart from paths, stdout, the exit code and the panic, and libtest's
+   report for the `#[test]` module. Netscript scripts run natively against
+   `tools/ns-shim.rs` (the NS API as plain Rust over a small network) and here against a mock
+   read from the same table. Ten were written by an agent that saw only the NS API, not the
+   project (`array_jumping`, `graph_two_coloring`, `grid_shortest_path`, `hgw_manager`,
+   `lz_decompress`, `sanitize_parentheses`, `scan_and_root`, `total_ways_to_sum`,
+   `triangle_min_path`, `vigenere_cipher`); a person who writes Rust is still the better
+   test. It found, besides items 1 and 2: E0004 naming only the first missing variant and
+   without rustc's note and new arm, E0061 without its label, note and placeholders, E0596
+   without its `let mut`, E0382's `for` loop wording, the derived-impl note on a dead variant,
+   and rustc's packing of labels onto shared rows; all fixed. All 36 match (2026-11-24); the
+   last three differences it found are fixed too:
+   - `Vec<&str>` given a `String` (`vigenere_cipher.rs`): rustc's E0308 for what's pushed or
+     inserted into a local declared `Vec<&T>` / `VecDeque<&T>`, and for `s.push_str(t)`, where
+     the value is certainly owned (RUST_GAPS "Type checking"; `&str` and `String` are still
+     one type).
+   - E0502 for a `Vec` grown inside a `for` loop over it (`err_borrow_conflict.rs`): the loop
+     as a multi-line span beside the other labels (its start joined by `_____|` below them),
+     and rustc's "borrow later used here" on every borrow error, found by following the
+     control flow to the next use of what holds the borrow.
+   - Notes into std's own source (`total_ways_to_sum.rs`, `--> collect.rs:312:18`) for
+     `into_iter` and "method defined here" on `Vec::push` and the like, following rustc
+     1.100's rust-src.
+   Fixing these brought E0308's "function defined here" note and `&x` suggestion for a
+   mistyped argument, E0382's "moved due to this method call" with its note and `.clone()`
+   suggestion, and the place used (`s.n`, not `s`) under E0382's label.
 
 Considered and left out:
 - Programs rustc rejects that compile here (`let s: &str = String::from(..)`, `.clone()` on a

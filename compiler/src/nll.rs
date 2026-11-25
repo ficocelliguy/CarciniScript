@@ -690,6 +690,7 @@ impl Analysis<'_, '_, '_> {
             }
         }
         let Some((li, lm)) = hit else { return };
+        let at = p;
         let p = self.body.describe(place);
         let loan_label = match (access, lm) {
             (Access::Read | Access::ShallowRead | Access::Write, _) => format!("`{p}` is borrowed here"),
@@ -715,7 +716,93 @@ impl Analysis<'_, '_, '_> {
                 format!("cannot borrow `{p}` as mutable because it is also borrowed as immutable")
             }
         };
-        self.diags.push((span, msg, vec![(loan_span, loan_label)]));
+        let later = match (access, lm) {
+            (Access::MutBorrow, false) => "immutable borrow later used here",
+            (Access::Borrow, _) => "mutable borrow later used here",
+            (Access::MutBorrow, true) => "first borrow later used here",
+            _ => "borrow later used here",
+        };
+        let mut spans = vec![(loan_span, loan_label)];
+        spans.extend(self.later_use(li, at).map(|s| (s, later.to_string())));
+        self.diags.push((span, msg, spans));
+    }
+
+    /// Where loan `li` is used after the conflict at `p`, for rustc's "borrow later used here":
+    /// the nearest statement after `p` (following the control flow, around loops too) that uses
+    /// a local whose type holds the loan's region or one it flows into, where the loan is live.
+    fn later_use(&self, li: usize, p: usize) -> Option<Span> {
+        let loan = &self.loans[li];
+        // The regions the loan's flows into (`'loan: 'r`).
+        let mut flows = vec![false; self.body.regions.len()];
+        flows[loan.region.idx()] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for c in &self.body.constraints {
+                if flows[c.longer.idx()] && !flows[c.shorter.idx()] {
+                    flows[c.shorter.idx()] = true;
+                    changed = true;
+                }
+            }
+        }
+        let holds = |l: Local| {
+            let mut rs = Vec::new();
+            self.body.locals[l.idx()].rty.regions(&mut rs);
+            rs.iter().any(|r| flows[r.idx()])
+        };
+        // (Point `q` as a block and an index in it.)
+        let locate = |q: usize| {
+            let bi = self.block_start.partition_point(|&s| s <= q) - 1;
+            (bi, q - self.block_start[bi])
+        };
+        let next = |q: usize| -> Vec<usize> {
+            let (bi, si) = locate(q);
+            let b = &self.body.blocks[bi];
+            if si < b.stmts.len() {
+                vec![q + 1]
+            } else {
+                b.term.successors().iter().map(|s| self.block_start[s.idx()]).collect()
+            }
+        };
+        let mut seen = vec![false; self.n_points];
+        let mut queue: std::collections::VecDeque<usize> = next(p).into();
+        while let Some(q) = queue.pop_front() {
+            if std::mem::replace(&mut seen[q], true) {
+                continue;
+            }
+            if self.region_contains(loan.region, q) {
+                let (bi, si) = locate(q);
+                let b = &self.body.blocks[bi];
+                let mut uses: Vec<(Local, Span)> = Vec::new();
+                match b.stmts.get(si).map(|s| (&s.kind, s.span)) {
+                    Some((StmtKind::Assign(dest, rv), span)) => {
+                        // (A write through it, `*r += y`: the statement.)
+                        if !dest.is_local() {
+                            uses.push((dest.local, span));
+                        }
+                        match rv {
+                            Rvalue::Use(op) => uses.push((op.place.local, op.span)),
+                            Rvalue::Ref { place, .. } => uses.push((place.local, span)),
+                            Rvalue::Ops { args, activate } => {
+                                uses.extend(args.iter().map(|o| (o.place.local, o.span)));
+                                uses.extend(activate.iter().map(|(pl, _)| (pl.local, span)));
+                            }
+                        }
+                    }
+                    Some((StmtKind::StorageDead(_), _)) => {}
+                    None => {
+                        if let Term::Switch(Some(op), _) = &b.term {
+                            uses.push((op.place.local, op.span));
+                        }
+                    }
+                }
+                if let Some(&(_, span)) = uses.iter().find(|(l, _)| *l != Local(0) && holds(*l)) {
+                    return Some(span);
+                }
+            }
+            queue.extend(next(q));
+        }
+        None
     }
 
     /// A two-phase borrow becomes a `&mut` at its call: like taking it there, against every
@@ -742,13 +829,17 @@ impl Analysis<'_, '_, '_> {
             }
         }
         let Some((li, lm)) = hit else { return };
+        let at = p;
         let p = self.body.describe(place);
         let (msg, label) = if lm {
             (format!("cannot borrow `{p}` as mutable more than once at a time"), "first mutable borrow occurs here")
         } else {
             (format!("cannot borrow `{p}` as mutable because it is also borrowed as immutable"), "immutable borrow occurs here")
         };
-        self.diags.push((span, msg, vec![(self.loans[li].span, label.to_string())]));
+        let later = if lm { "first borrow later used here" } else { "immutable borrow later used here" };
+        let mut spans = vec![(self.loans[li].span, label.to_string())];
+        spans.extend(self.later_use(li, at).map(|s| (s, later.to_string())));
+        self.diags.push((span, msg, spans));
     }
 
     /// The end of a local's storage: a loan of it still in scope outlives it.

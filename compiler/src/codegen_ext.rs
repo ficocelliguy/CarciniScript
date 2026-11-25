@@ -563,6 +563,8 @@ impl Codegen<'_> {
                 out(helper(method, vec![n]))
             }
             (Ty::Map(..), "iter" | "into_iter") => out(call("entries", vec![])),
+            // (Empties the map or set at once, as dropping a `Drain` does.)
+            (Ty::Map(..) | Ty::Set(_), "drain") => out(call("drain", vec![])),
             (Ty::Map(..), "keys" | "into_keys") => out(call("keys", vec![])),
             (Ty::Map(..), "values" | "into_values") => out(call("values", vec![])),
             // Slots over numbers, strings and bools; over JS objects, the values themselves.
