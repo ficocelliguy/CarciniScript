@@ -3029,7 +3029,7 @@
         return r;
       }
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
-        return x[name](...args);
+        return x.constructor.$mut?.has(name) ? x[name].call(c, ...args) : x[name](...args);
       }
       const kind = x instanceof Deque && regs.kinds.deque ? "deque" : Array.isArray(x) || x instanceof Deque ? "array" : x instanceof RefCell ? "refcell" : x instanceof Iter ? "iter" : typeof x;
       for (const r of regs.kinds[kind] ?? []) {
@@ -3060,7 +3060,7 @@
         }
       }
       if (x !== null && typeof x === "object" && !Array.isArray(x) && typeof x[name] === "function") {
-        return x[name](...args);
+        return x.constructor.$mut?.has(name) ? x[name].call(c, ...args) : x[name](...args);
       }
       // (A `VecDeque` is a `Deque`: its own impls', else a `Vec`'s.)
       const kind = x instanceof Deque && regs.kinds.deque
@@ -3103,7 +3103,7 @@
       for (const cls of regs.blankets) {
         if (typeof cls.prototype[name] === "function") return cls.prototype[name].call(x, ...args);
       }
-      return x[name](...args);
+      return x.constructor.$mut?.has(name) ? x[name].call(c, ...args) : x[name](...args);
     },
     // `i128` / `u128` are BigInts, wrapped to their width like Rust's release builds.
     $w128(x, signed, bits = 128) {
@@ -4334,6 +4334,19 @@
     },
     $resOrElse(r, f) {
       return r.$tag ? f(r[0]) : r[0];
+    },
+    // `r.as_mut()` unwrapped, of a number: `Ok` of a slot over the payload, which stays in `r`.
+    $resSlot(r) {
+      if (r.$tag) return r;
+      return new Res(
+        0,
+        rt.$cell(
+          () => r[0],
+          (v) => {
+            r[0] = v;
+          },
+        ),
+      );
     },
     $resOk(r) {
       return r.$tag ? null : r[0];

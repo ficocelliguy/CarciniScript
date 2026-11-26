@@ -375,17 +375,6 @@ are within a small factor of a hand-written JS loop; plain map/filter/sum chains
 one. `for i in 0..n` and reversed ranges are plain `for` loops, `?` and panics are returns and
 throws (try/finally only for `Drop` types), `push_str` is `+=`.
 
-- [ ] Merging the read-only pre-pass rewrites into one walk; the remaining cost in chrono's
-  formatter (`__chrono_format` handles every specifier, so `{}` on a date reaches `NaiveTime`,
-  `TimeDelta` and `Weekday`).
-- [ ] `match` as a `switch` on `$tag` (the `else if` chain is cheap once the subject is a name,
-  so not pressing); skipping a `Copy` struct's clone at its last use; unit-variant singletons
-  (blocked: `*r = Dir::E` through a `&mut` is `κσ.$replace`, which rewrites the object in place,
-  so a shared instance would change every holder); named `Result` / tuple fields (no measured win
-  yet, and tuples are arrays everywhere).
-- [ ] Generic traits on numbers through `$dcall`: the rest/spread and `.call` are the cost, not
-  the registry scan (a per-site cache was slower). Left as is unless a shape shows up.
-
 ## Testing
 
 - **Differential:** a corpus of subset programs runs under native `cargo run` and as transpiled JS
@@ -395,25 +384,13 @@ throws (try/finally only for `Drop` types), `push_str` is `+=`.
 
 ### Test suite speed
 
-Measured 2026-11-25 (20 cores, after a compiler source change): wasm build 0:32,
-`test/run.mjs` plus the MVP suite 3:27, of which about 2.5–3 minutes is rebuilding the ~400
-fixtures natively with `rustc -O`, one at a time (~0.4 s each), whether or not they changed.
-The unit tests take 6 s as `npm test` runs them (`cargo test`, incremental dev profile) but 3:30
-as `cargo test --release`: the release profile's `lto = true` relinks the whole crate natively
-for 26 tests that run in 0.03 s. Run them without `--release`.
-
-- [x] Cache native fixture builds and their output (`tools/native-build.mjs`'s `nativeRuns` /
-  `cachedNative`, in `test/out/native-cache`), keyed by a hash of the source (the whole folder
-  for a module program), the flags, the crate versions and `rustc -vV`. Covers the fixture,
-  module, debug, libtest and MVP tests; a failed build isn't kept. Delete the folder to rebuild.
-- [x] Build the uncached ones in parallel: every section queues its native jobs up front into a
-  pool (`NATIVE_JOBS`, default half the cores; bundled-crate cargo builds take turns in their
-  shared project) and awaits each in order beside the JS side. Same day, same machine:
-  `test/run.mjs` 77 s with an empty cache, 29 s with a full one (was ~3 min either way); the
-  MVP suite 2 s / 1 s.
-- [x] A name filter: `node test/run.mjs moves borrow` runs the tests whose names contain one of
-  the words (the native and cargo sections skip the rest up front; the diagnostic tables still
-  compile but report only matches).
+Native fixture builds are cached in `test/out/native-cache` (keyed by source, flags, crate
+versions and `rustc -vV`; delete the folder to rebuild) and the uncached ones build in parallel
+(`NATIVE_JOBS`). Measured 2026-11-25 (20 cores): wasm build 0:32; `test/run.mjs` 77 s with an
+empty cache, 29 s with a full one; the MVP suite 2 s / 1 s. `node test/run.mjs moves borrow`
+runs only the tests whose names contain one of the words. The unit tests take 6 s as `npm test`
+runs them but 3:30 as `cargo test --release` (`lto = true` relinks the crate): run them without
+`--release`.
 
 ### Corpus survey speed
 
@@ -428,51 +405,23 @@ against 5–7 ms/KB typical; a crate's `lib.rs` costs what its modules cost, cla
 test build and demotes its errors to warnings the classifier drops): about 17 % of the time.
 Native is no faster: `sweep.exe` over wasmparser 17.2 s, the wasm build 15.0 s, so a Rust rewrite
 buys nothing. Fixed costs are small (an empty file 0.2 ms; a file naming clap, chrono or serde_json
-pays 28–63 ms for the bundled prelude, about 15 s over the whole registry). A wasm trap on one
-file ends the run.
+pays 28–63 ms for the bundled prelude, about 15 s over the whole registry). The survey runs on
+worker threads (`CORPUS_JOBS`, ordered by the last run's per-file times), survives a trap in one
+file (`--resume` continues an interrupted run) and skips the test build
+(`setTestCodeChecks(false)`): 2:52 on 18 workers on 2026-11-25, bounded by windows-sys
+`Windows/mod.rs` (172 s). The report lists the ten slowest files and the ten slowest per line.
 
-- [x] Time a full run: 30:06 sequentially on 2026-11-25 (so the compiler got slower on a few files
-  since the 2026-11-23 note of ~7 minutes). A quarter of it is one file: zerocopy's
-  `src/impls.rs` (2,400 lines), about 7 minutes alone.
-- [x] `worker_threads`: the main thread walks and sorts the files, compiles the wasm once
-  (`new WebAssembly.Module`) and hands the module to N workers (`initSync`), which pull one file
-  at a time from a queue ordered largest-first so the 35 s file starts at once and nothing
-  straggles. Results come back as JSON lines with their index and are written in sorted order
-  (the output stays diffable run to run). `resourceLimits.stackSizeMb` per worker (the main
-  thread's `--stack-size=8000` doesn't reach them); N defaults to `availableParallelism() - 2`
-  with a `CORPUS_JOBS` override, since each worker keeps its own wasm memory (110 MB typical,
-  500 MB after the 7 MB file) and the machine is shared. `definedIn` stays lazy per worker. Measured: 12:08 on 18 workers
-  ordered by size, 9:57 ordered by the last run's per-file times (kept in the OS temp dir as
-  `carciniscript-corpus-ms.json`; size alone misses the slow files), output byte-identical to the
-  sequential run. The run is now exactly as long as zerocopy `impls.rs` (597 s under load); next
-  are windows-sys `Windows/mod.rs` and `Windows/Win32/mod.rs` (~150 s alone, ~270 s under load),
-  gimli `arch.rs` and chrono-tz `timezones.rs` (~155 s). The run ends by printing the five
-  slowest files: the worklist for the superlinear-files item below.
-- [x] Trap isolation and `--resume`: a trap in the worker (a Rust panic's `unreachable`, a stack
-  overflow) or a worker out of memory writes the file's line with a `panic` field and no errors,
-  the worker is replaced and the run goes on; the run ends by listing the panics, and the report
-  gives them their own verdict ("G compiler panic"). Lines are appended as files finish and the
-  output is sorted once at the end, so `--resume` (any interrupted run) keeps every file with a
-  complete line, panics included, and compiles the rest.
-- [x] `setTestCodeChecks(false)` (`codegen::set_test_code_checks`, checked in `compile_with`)
-  skips the test build of a file with test code, whose errors only come back as warnings; the
-  survey's workers turn it off. Measured 2026-11-25: the full run 2:52 on 18 workers (was 9:57),
-  no panics; the errors are the same either way (checked file by file where the output changed).
-  zerocopy's `impls.rs` was nearly all test build. The run is now as long as windows-sys
-  `Windows/mod.rs` (172 s); then `Windows/Win32/mod.rs` (157 s), chrono-tz `timezones.rs`
-  (110 s), windows-sys `Wdk/mod.rs` and `Win32/System/mod.rs` (~100 s).
-- [x] Per-file `ms` (the compile alone) and `modLines` (lines of the module files it read) in the
-  JSONL; `corpus_ast.rs` passes them through. The report lists the ten slowest files and the ten
-  slowest per line (own lines plus `modLines`, against the median, files over a second), and the
-  CSV has an `ms` column. First list, 2026-11-25: zerofrom-derive `lib.rs` (121x the median),
-  gimli `arch.rs` (104x), deranged `lib.rs` (95x), syn `tests/common/eq.rs` (95x), time-core
-  `unit.rs`, walrus-macro `lib.rs`, funty `lib.rs`, displaydoc `lib.rs`; the windows-sys
-  `mod.rs` files are 8–20x, slow for their size, not their shape. Timings under load vary up to
-  5x (gimli `arch.rs`: 13.8 s alone, 16 s and 75 s in two full runs).
 - [ ] Profile the slowest-per-line files natively (the report's second list is the worklist):
   the only single-thread lever left.
 - Not worth it (measured): tuning the classification regexes, trimming the JSON payload or
   `rendered`, caching resolver reads (11k reads, 59 MB per 292 files, but cheap), a native port.
+
+## Known bugs
+
+Found in passing and not fixed yet (checked against the current tree, 2026-11-25). Gaps that are
+by design or long-standing differences from rustc are in `RUST_GAPS.md`.
+
+None open.
 
 ## Risks
 

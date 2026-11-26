@@ -172,6 +172,7 @@ impl Checker<'_> {
                     assoc_iters.insert(an.text().to_string(), elem);
                 }
             }
+            let trait_name = n.clone();
             for it in t
                 .assoc_item_list()
                 .into_iter()
@@ -183,7 +184,11 @@ impl Checker<'_> {
                     if let ast::AssocItem::Const(k) = &it {
                         if let Some(n) = k.name() {
                             consts.push(n.text().to_string());
-                            let t = k.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                            let ann = k.ty();
+                            let t = ann.as_ref().map(|t| self.lower_type(t)).unwrap_or(Ty::Unknown);
+                            if self.copy_array(ann.as_ref(), None, &t) {
+                                self.copy_array_assoc.insert((trait_name.clone(), n.text().to_string()));
+                            }
                             const_tys.insert(n.text().to_string(), t);
                             if k.body().is_some() {
                                 const_defaults.push(n.text().to_string());
@@ -384,6 +389,9 @@ impl Checker<'_> {
         for k in &def.const_defaults {
             if !given_consts.contains(k) {
                 let ty = def.const_tys.get(k).cloned().unwrap_or(Ty::Unknown);
+                if self.copy_array_assoc.contains(&(tr.to_string(), k.clone())) {
+                    self.copy_array_assoc.insert((type_name.to_string(), k.clone()));
+                }
                 self.adts
                     .assoc_consts
                     .entry(type_name.to_string())

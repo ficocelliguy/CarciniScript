@@ -20,7 +20,9 @@ thread_local! {
 }
 
 /// How many parses `PARSES` keeps.
-const PARSES_KEPT: usize = 8;
+/// (A compile with a few rewriting pre-passes and two preludes parses ten texts, and the lints
+/// parse the first again at the end.)
+const PARSES_KEPT: usize = 12;
 
 /// `SourceFile::parse(text, EDITION)`, from the parses kept when `text` was parsed recently
 /// (the tree is then the same one, so caches keyed by its root hit too).

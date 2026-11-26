@@ -1633,7 +1633,11 @@ impl Checker<'_> {
                 if let ast::AssocItem::Const(k) = &item
                     && let Some(n) = k.name()
                 {
-                    let ty = k.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
+                    let ann = k.ty();
+                    let ty = ann.as_ref().map(|t| self.lower_type(t)).unwrap_or(Ty::Unknown);
+                    if self.copy_array(ann.as_ref(), None, &ty) {
+                        self.copy_array_assoc.insert((type_name.clone(), n.text().to_string()));
+                    }
                     let consts = self.adts.assoc_consts.entry(type_name.clone()).or_default();
                     if consts.insert(n.text().to_string(), ty).is_some() {
                         self.error(
@@ -2271,6 +2275,11 @@ impl Checker<'_> {
                         .get(&adt)
                         .is_some_and(|c| c.contains_key(&m)) =>
             {
+                // (`let mut a = Self::QS;`: JS would share the item's array.)
+                if self.copy_array_assoc.contains(&(adt.clone(), m.clone())) {
+                    let r = self.range(p.syntax());
+                    self.array_reads.insert(r);
+                }
                 Some(self.adts.assoc_consts[&adt][&m].clone())
             }
             Resolved::Assoc(adt, m) => match self.adts.method(&adt, &m).cloned() {
@@ -3080,7 +3089,13 @@ impl Checker<'_> {
             };
             let Some(name) = name else { continue };
             let ty = match ty {
-                Some(t) => self.lower_type(&t),
+                Some(t) => {
+                    let lowered = self.lower_type(&t);
+                    if self.copy_array(Some(&t), None, &lowered) {
+                        self.copy_array_consts.insert(name.text().to_string());
+                    }
+                    lowered
+                }
                 None => {
                     self.error(
                         &node,

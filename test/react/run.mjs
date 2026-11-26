@@ -155,6 +155,8 @@ for (const f of fs.readdirSync(here).filter((f) => f.endsWith(".rs"))) {
 }
 
 // --- diagnostics
+// A diagnostic on one line: the headline, its label after a colon, its help lines in parentheses.
+const oneLine = (d) => `${d.message}${d.label ? `: ${d.label}` : ""}${(d.helps ?? []).map((h) => ` (${h})`).join("")}`;
 const prelude = "use react::{jsx, Node};\nfn gauge(label: &str, value: f64) -> Node { jsx! { <b>{label} {value}</b> } }\n";
 const cases = [
   ["jsx! { <p>hello world</p> }", "text in `jsx!` is written as a string literal"],
@@ -189,7 +191,7 @@ const cases = [
 for (const [body, want] of cases) {
   const name = `react rejects: ${body}`;
   const src = `${prelude}pub async fn main(ns: NS) { ns.print_raw(${body}); }\n`;
-  const msgs = compile(src, "bad.rs").diagnostics.filter((d) => d.severity === "error").map((d) => d.message);
+  const msgs = compile(src, "bad.rs").diagnostics.filter((d) => d.severity === "error").map(oneLine);
   if (!msgs.some((m) => m.startsWith(want))) fail(name, `want: ${want}\ngot:\n${msgs.join("\n")}`);
   else pass(name);
 }
@@ -274,7 +276,7 @@ for (const [body, want] of cases) {
   const got = compile(src, "pos.rs")
     .diagnostics.filter((d) => d.severity === "error")
     .map((d) => `${d.line}:${d.column} ${d.message}`);
-  const want = ["6:17 cannot add `String` to `u32`", "7:26 cannot find value `undefined_thing` in this scope"];
+  const want = ["6:19 cannot add `String` to `u32`", "7:26 cannot find value `undefined_thing` in this scope"];
   if (got.join("\n") !== want.join("\n")) fail(name, `want:\n${want.join("\n")}\ngot:\n${got.join("\n")}`);
   else pass(name);
 }

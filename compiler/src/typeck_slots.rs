@@ -67,7 +67,7 @@ fn method_parent(m: &ast::MethodCallExpr) -> Option<ast::MethodCallExpr> {
 /// `let` initializer, a `return`, a call's argument, a struct field's value, the right side of an
 /// assignment, or the tail of a function body or of an `if` / `match` / block in one of those.
 /// A `get_mut`-style call there may yield its slot.
-pub(super) fn keep_position(n: &SyntaxNode) -> bool {
+pub(crate) fn keep_position(n: &SyntaxNode) -> bool {
     let mut n = n.clone();
     loop {
         let Some(p) = n.parent() else { return false };
@@ -585,7 +585,7 @@ impl Checker<'_> {
         let Ty::Option(inner) = self.zonk(&t) else {
             return false;
         };
-        if !self.zonk(&inner).is_js_primitive() || !is_place_expr(&recv) {
+        if !self.prim(&self.zonk(&inner)) || !is_place_expr(&recv) {
             return false;
         }
         if matches!(recv, ast::Expr::PathExpr(_)) {
@@ -655,7 +655,7 @@ impl Checker<'_> {
     /// it's looped over by index.
     pub(super) fn note_iter_mut(&mut self, m: &ast::MethodCallExpr, elem: &Ty) {
         let z = self.zonk(elem);
-        if z.is_js_primitive() && !iter_mut_indexed(m) {
+        if self.prim(&z) && !iter_mut_indexed(m) {
             let r = self.range(m.syntax());
             self.slot_calls.insert(r);
         }
@@ -676,7 +676,7 @@ impl Checker<'_> {
             .and_then(ast::ForExpr::cast)
             .and_then(|f| f.iterable())
             .is_some_and(|it| it.syntax() == &n);
-        if self.zonk(v).is_js_primitive() && !for_iterable {
+        if self.prim(&self.zonk(v)) && !for_iterable {
             let r = self.range(m.syntax());
             self.slot_calls.insert(r);
         }
@@ -767,7 +767,7 @@ impl Checker<'_> {
             Ty::Iter {
                 elem,
                 mutable: true,
-            } if elem.is_js_primitive() => Some(SlotShape::Slot),
+            } if self.prim(&elem) => Some(SlotShape::Slot),
             // `-> impl Iterator<Item = (usize, &mut u8)>`: the call's items hold slots where
             // the declared type says.
             Ty::Iter {

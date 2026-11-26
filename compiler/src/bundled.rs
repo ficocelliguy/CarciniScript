@@ -3108,12 +3108,31 @@ fn renamed_crates(text: &str) -> Vec<&'static Renames> {
     let mut out: Vec<&'static Renames> = Vec::new();
     // (A use of `std::io`'s items names `io::` somewhere, `std::io::Error`, `use std::{io::Write}`,
     // or is `use std::io;` itself; `std::` alone says nothing.)
+    // (The words before a `::`, read once: `text.contains("{last}::")` is one of them ending
+    // in `last`.)
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let before_colons: std::collections::HashSet<&str> = text
+        .match_indices("::")
+        .map(|(i, _)| {
+            let head = &text[..i];
+            &head[head.trim_end_matches(ident).len()..]
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    // (And what follows each `use ` and `mod `.)
+    let after = |kw: &str| -> Vec<&str> {
+        text.match_indices(kw)
+            .map(|(i, _)| &text[i + kw.len()..])
+            .collect()
+    };
+    let (uses, mods) = (after("use "), after("mod "));
     let has = |root: &str| {
         let root = root.trim_start_matches("::");
         let first = root.split("::").next().unwrap_or(root);
         let last = root.rsplit("::").next().unwrap_or(root);
-        (text.contains(&format!("{last}::")) || text.contains(&format!("use {root}")))
-            && !text.contains(&format!("mod {first}"))
+        (before_colons.iter().any(|w| w.ends_with(last))
+            || uses.iter().any(|u| u.starts_with(root)))
+            && !mods.iter().any(|m| m.starts_with(first))
     };
     // (`mpsc::channel` is tokio's in a file that imports tokio's `mpsc`.)
     let tokio_mpsc = text.contains("tokio::sync::mpsc")

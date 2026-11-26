@@ -155,11 +155,18 @@ fn words_of<'a>(s: &'a str, out: &mut Vec<&'a str>) {
         let len = s[start..]
             .find(|c: char| !ident(c))
             .unwrap_or(s.len() - start);
-        if !s.as_bytes()[start].is_ascii_digit() {
+        if !s.as_bytes()[start].is_ascii_digit() && !macro_name(&s[start + len..]) {
             out.push(&s[start..start + len]);
         }
         from = start + len;
     }
+}
+
+/// Whether a word followed by `rest` is a macro's name (`format!(..)`, not `a != b`): it reaches
+/// nothing, where as a word it would keep every method of that name (`format!` in a `Display`
+/// impl kept `ChronoNaiveDate::format` and so chrono's whole formatter).
+fn macro_name(rest: &str) -> bool {
+    rest.starts_with('!') && !rest[1..].starts_with('=')
 }
 
 /// The identifiers `node` mentions outside the `skip` ranges (relative to `base`, the start of
@@ -172,6 +179,32 @@ fn node_words(
     skip: &[(usize, usize)],
 ) -> Vec<&'static str> {
     let mut out = Vec::new();
+    // (A lowercase name being declared, a parameter, local, field or method, reaches nothing,
+    // nor does a plain path to a local of the node: `fn from_ymd_opt(year: i32, ..)` and its
+    // `year` don't call `Datelike::year`. An uppercase one in a pattern may be a const or
+    // variant.)
+    let lower = |t: &ra_ap_syntax::SyntaxToken| !t.text().starts_with(|c: char| c.is_uppercase());
+    let locals: HashSet<String> = node
+        .descendants()
+        .filter_map(ast::IdentPat::cast)
+        .filter_map(|p| p.name())
+        .filter_map(|n| n.ident_token())
+        .filter(lower)
+        .map(|t| t.text().to_string())
+        .collect();
+    let declared = |t: &ra_ap_syntax::SyntaxToken| {
+        let Some(p) = t.parent() else { return false };
+        match p.kind() {
+            SyntaxKind::NAME => lower(t),
+            SyntaxKind::NAME_REF => {
+                locals.contains(t.text())
+                    && p.ancestors().nth(3).is_some_and(|e| e.kind() == SyntaxKind::PATH_EXPR)
+                    && ast::Path::cast(p.ancestors().nth(2).unwrap())
+                        .is_some_and(|path| path.qualifier().is_none())
+            }
+            _ => false,
+        }
+    };
     for t in node.descendants_with_tokens() {
         let NodeOrToken::Token(t) = t else { continue };
         let r = t.text_range();
@@ -180,7 +213,9 @@ fn node_words(
             continue;
         }
         match t.kind() {
-            SyntaxKind::IDENT => out.push(&text[a..b]),
+            SyntaxKind::IDENT if !macro_name(&text[b..]) && !declared(&t) => {
+                out.push(&text[a..b])
+            }
             SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING => {
                 words_of(&text[a..b], &mut out);
             }

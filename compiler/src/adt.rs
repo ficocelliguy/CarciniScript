@@ -677,6 +677,27 @@ pub enum Conv {
 }
 
 impl Adts {
+    /// A fieldless `Copy` enum (`enum Dir { N, E, S, W }`): one shared, immutable instance per
+    /// variant, so reads don't copy it and a `&mut` to one is a cell over its place, as a
+    /// number's is. (Not generic, nor with const parameters, whose instances carry their own; nor
+    /// an `Iterator`, whose `next` the runtime calls on the value.)
+    pub fn is_atom(&self, name: &str) -> bool {
+        self.defs.get(name).is_some_and(|d| {
+            d.is_enum
+                && !d.has_data()
+                && !d.variants.is_empty()
+                && d.derives("Copy")
+                && d.type_params.is_empty()
+                && !self.const_params.get(name).is_some_and(|c| !c.is_empty())
+                && !self.iter_items.contains_key(name)
+        })
+    }
+
+    /// `is_atom` of a type.
+    pub fn atom_ty(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Adt(n, _) if self.is_atom(n))
+    }
+
     pub fn method(&self, ty: &str, name: &str) -> Option<&Method> {
         self.methods.get(ty)?.get(name)
     }

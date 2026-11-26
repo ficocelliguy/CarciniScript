@@ -32,6 +32,8 @@ mod iface_gen;
 mod json_gen;
 #[path = "codegen_jsval.rs"]
 mod jsval_gen;
+#[path = "codegen_lastuse.rs"]
+mod lastuse_gen;
 #[path = "codegen_quote.rs"]
 mod quote_gen;
 #[path = "codegen_res.rs"]
@@ -1003,6 +1005,7 @@ fn compile_text(
         prelude_at,
         crate_imports: Default::default(),
         const_bodies: HashMap::new(),
+        last_copies: Default::default(),
     };
     for e in parse.errors() {
         if crate::lineindex::crlf_only_error(&e.to_string(), src) {
@@ -1208,6 +1211,9 @@ struct Codegen<'a> {
     crate_imports: std::cell::OnceCell<HashMap<String, (String, String)>>,
     /// The file's `const` / `static` values by name: their range, for `{NAME}` in format strings.
     const_bodies: HashMap<String, (usize, usize)>,
+    /// Reads of a `Copy` value that are its binding's last use: moved, not copied (see
+    /// `lastuse_gen`). Found when first needed.
+    last_copies: std::cell::OnceCell<std::collections::HashSet<(usize, usize)>>,
 }
 
 impl<'a> Codegen<'a> {
@@ -1751,7 +1757,7 @@ impl<'a> Codegen<'a> {
         // impls of them there too, so this file's generic functions find them.
         if self.has_pub_traits() {
             self.line(Frag::text("export const $extRegs = κσ.$newRegs();"));
-        } else if !self.types.adts.ext_types.is_empty() {
+        } else if !self.types.adts.ext_types.is_empty() || self.atom_mut_methods() {
             self.line(Frag::text("const $extRegs = κσ.$newRegs();"));
         }
         // (Each item starts from the globals: its names are undone after it.)
@@ -3569,8 +3575,18 @@ impl<'a> Codegen<'a> {
         let (sf, st) = self.emit_expr(&source, None);
         let custom_iter =
             matches!(&st, Ty::Adt(n, _) if self.types.adts.iter_items.contains_key(n));
+        // (`for x in &mut c` of your iterator loops over `c` itself, advancing it: not by index.)
+        if custom_iter {
+            by_mut_ref = false;
+        }
+        // (`for x in c` of a `Copy` iterator loops over a copy; `for x in &mut c` doesn't.)
+        let sf = if custom_iter && !matches!(inner, ast::Expr::RefExpr(_)) {
+            self.by_value(&source, sf, &st)
+        } else {
+            sf
+        };
         // An `iter_mut()` chain over JS objects loops over the objects themselves.
-        let object_iter = matches!(&st, Ty::Iter { mutable: true, elem } if !elem.is_js_primitive() && **elem != Ty::Unknown);
+        let object_iter = matches!(&st, Ty::Iter { mutable: true, elem } if !self.prim(elem) && **elem != Ty::Unknown);
         // A slot iterator (`v.iter_mut().filter(..)` of numbers or strings): the loop's names
         // were bound as slots, which read and write the elements.
         let slot_iter = matches!(&st, Ty::Iter { mutable: true, .. })
@@ -3697,6 +3713,20 @@ impl<'a> Codegen<'a> {
         let (frag, ty) = self.emit_expr_inner(e, expected);
         let ty = self.ty_of(e.syntax()).unwrap_or(ty);
         let r = self.range_of(e.syntax());
+        // Your own iterator as an `I: Iterator` / `impl Iterator` (an argument, a return value),
+        // which uses the runtime's adapters (`it.$sum(..)`): consumed by value, so a `Copy` one
+        // is copied first.
+        if self.types.iter_of_args.contains(&r)
+            && let Ty::Adt(n, _) = ty.view()
+            && let Some(elem) = self.types.adts.iter_items.get(&n).cloned()
+        {
+            let f = self.by_value(e, frag, &ty).wrap("κσ.$iterOf(", ")");
+            let it = Ty::Iter {
+                elem: Box::new(elem),
+                mutable: false,
+            };
+            return (f.at(start), it);
+        }
         // A slot-valued argument (`bump(s.at(0))`) to a `&mut i32` parameter: as a cell.
         if self.types.slot_cell_args.contains(&r) {
             return (frag.wrap("κσ.$slotCell(", ")").at(start), ty);
@@ -4592,6 +4622,12 @@ impl<'a> Codegen<'a> {
                 let mut f = Frag::text(format!("$ext${k}.prototype.{key}.call("));
                 f.append(lf).push(", ").append(rf).push(")");
                 f
+            } else if assign && let Ty::Adt(n, _) = &lt && self.types.adts.is_atom(n) {
+                // (`d += 1` on an immutable enum: `add_assign` takes the place's cell.)
+                let cell = self.mut_recv_cell(&lhs, lf);
+                let mut f = Frag::text(format!("{}.prototype.{key}.call(", self.class(n)));
+                f.append(cell).push(", ").append(rf).push(")");
+                f
             } else {
                 let mut f = lf.wrap("(", ")");
                 f.push(format!(".{key}(")).append(rf).push(")");
@@ -4802,12 +4838,14 @@ impl<'a> Codegen<'a> {
                     ast::Expr::PathExpr(_) => lf.plain() == "this",
                     _ => false,
                 };
+                // (An immutable enum's `&mut` is a cell: `*r = v` writes the cell.)
                 if op.is_none()
                     && through_ref
                     && matches!(
                         lt,
                         Ty::Adt(..) | Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..)
                     )
+                    && !self.types.adts.atom_ty(&lt)
                 {
                     let mut f = Frag::text("κσ.$replace(");
                     f.append(lf).push(", ").append(value).push(")");
@@ -5347,6 +5385,17 @@ impl<'a> Codegen<'a> {
             .array_reads
             .contains(&self.range_of(strip_refs(e).syntax()));
         if place && (array || self.copied_on_read(ty)) {
+            // (Its binding's last use: nothing else sees the value, so it moves. `Dir::N` is a
+            // new object already.)
+            if let ast::Expr::PathExpr(p) = strip_refs(e)
+                && (self.last_copy_use(&p)
+                    || matches!(
+                        self.resolve(&adt_gen::path_segments(p.path())),
+                        Some(crate::adt::Resolved::Ctor(..))
+                    ))
+            {
+                return f;
+            }
             // (A `Copy` struct's derived `$clone`, without the dispatch in `κσ.$clone`.)
             if !array
                 && let Ty::Adt(n, _) = ty
@@ -6200,7 +6249,7 @@ impl<'a> Codegen<'a> {
                     let (rf, rt) = self.emit_expr(&recv, None);
                     let rf = if sig
                         .as_ref()
-                        .is_some_and(|s| adt_gen::cell_self(s, &adt_gen::ext_self_ty(&key)))
+                        .is_some_and(|s| self.key_cell_self(s, &key))
                     {
                         self.recv_cell(&recv, rf)
                     } else if sig
@@ -6690,13 +6739,21 @@ impl<'a> Codegen<'a> {
             .iter()
             .any(|k| self.types.adts.method(k, method).is_some())
             || self.pub_trait_method(method);
-        // A `&mut self` method of a string or number impl: hand over the receiver's cell.
-        let mut_ext = self.types.adts.ext_types.iter().any(|k| {
+        // A `&mut self` method of a string or number impl, or of an immutable enum: hand over
+        // the receiver's cell.
+        let mut_ref = |k: &String| {
             self.types
                 .adts
                 .method(k, method)
                 .is_some_and(|s| s.receiver == Some(crate::adt::Receiver::MutRef))
-        });
+        };
+        let mut_ext = self.types.adts.ext_types.iter().any(mut_ref)
+            || self
+                .types
+                .adts
+                .defs
+                .keys()
+                .any(|k| self.types.adts.is_atom(k) && mut_ref(k));
         if mut_ext
             && let Some(recv) = m.receiver()
             && matches!(
@@ -6753,6 +6810,29 @@ impl<'a> Codegen<'a> {
     /// A cell over a method receiver's place, for a `&mut self` method of a string or number: the
     /// variable's own cell (a `&mut` parameter, `self` in such a method), a getter/setter over a
     /// place, or a cell of its own for a temporary.
+    /// `recv_cell`, and for `o.get_or_insert(d)` (and the like) a cell over the option once it's
+    /// filled: `o.get_or_insert(Dir::N).turn()` writes `o`.
+    fn mut_recv_cell(&mut self, recv: &ast::Expr, rf: Frag) -> Frag {
+        // (`*d += 2` with `d` a `&mut`: `d`'s cell or place.)
+        if let ast::Expr::PrefixExpr(p) = strip_parens_expr(recv)
+            && p.op_kind() == Some(UnaryOp::Deref)
+            && let Some(inner) = p.expr()
+        {
+            return self.recv_cell(&inner, rf);
+        }
+        if let Some((fill, place)) = self.option_place(recv) {
+            let mut f = Frag::text("(");
+            f.append(fill)
+                .push(", κσ.$cell(() => ")
+                .append(place.clone())
+                .push(", ($v) => { ")
+                .append(place)
+                .push(" = $v; }))");
+            return f;
+        }
+        self.recv_cell(recv, rf)
+    }
+
     fn recv_cell(&self, recv: &ast::Expr, rf: Frag) -> Frag {
         let e = strip_refs(recv);
         // (`self` too, which isn't a name reference.)
@@ -6776,6 +6856,14 @@ impl<'a> Codegen<'a> {
                 .append(rf)
                 .push(" = $v; })");
             return f;
+        }
+        // (`bot.dir_mut().turn()`, `m.get_mut(k).unwrap().turn()`: a call read through its slot,
+        // `(..)[1]`, hands over a cell over the slot, whose `[0]` is the value. A map's slot is
+        // `[key, value]`.)
+        if matches!(e, ast::Expr::MethodCallExpr(_) | ast::Expr::CallExpr(_))
+            && let Some(slot) = rf.plain().strip_suffix("[1]")
+        {
+            return Frag::text(format!("κσ.$slotCell({slot})"));
         }
         rf.wrap("[", "]")
     }
@@ -7241,7 +7329,7 @@ impl<'a> Codegen<'a> {
             // into its place through a cell when it's a string or number.)
             let rf = if sig
                 .as_ref()
-                .is_some_and(|s| adt_gen::cell_self(s, &adt_gen::ext_self_ty(&key)))
+                .is_some_and(|s| self.key_cell_self(s, &key))
             {
                 self.recv_cell(&recv, rf)
             } else if sig
@@ -7319,6 +7407,13 @@ impl<'a> Codegen<'a> {
                     && !crate::adt::own_method(&method) =>
             {
                 let elem = self.types.adts.iter_items[n].clone();
+                // (A `Copy` one is consumed by value: `l.take(4)` leaves `l` as it was, where
+                // `l.by_ref()` / `(&mut l)` don't.)
+                let rf = if method == "by_ref" {
+                    rf
+                } else {
+                    self.by_value(&recv, rf, &rt)
+                };
                 (
                     rf.wrap("κσ.$iterOf(", ")"),
                     Ty::Iter {
@@ -7763,7 +7858,7 @@ impl<'a> Codegen<'a> {
             && m.name_ref().is_some_and(|n| n.text() == "as_mut")
             && let Some(r) = m.receiver()
             && is_pure(&r)
-            && matches!(self.ty_of(r.syntax()), Some(Ty::Option(_)))
+            && matches!(self.ty_of(r.syntax()), Some(Ty::Option(_) | Ty::Result(..)))
         {
             return self.subject(&r);
         }
@@ -8931,7 +9026,7 @@ impl<'a> Codegen<'a> {
     fn vec_repeat(&self, value: Frag, count: Frag, elem: &Ty) -> Frag {
         let mut f = Frag::text("κσ.$vecRepeat(");
         f.append(value).push(", ").append(count);
-        if !elem.is_js_primitive() {
+        if !self.prim(elem) {
             f.push(", true");
         }
         f.push(")");

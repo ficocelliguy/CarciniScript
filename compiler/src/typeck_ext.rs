@@ -930,7 +930,7 @@ impl Checker<'_> {
         // writes through any adapter reach them; over numbers and strings they'd be copies.
         let objects = {
             let z = self.zonk(&e);
-            !z.is_js_primitive() && z != Ty::Unknown
+            !self.prim(&z) && z != Ty::Unknown
         };
         // (`for (x, y) in v.iter_mut().zip(..)` loops by index, so writes reach `v`.)
         let for_zip = method == "zip"
@@ -1096,14 +1096,14 @@ impl Checker<'_> {
             "peek_mut" => {
                 count(self, 0);
                 let resolved = self.zonk(&e);
-                if resolved.is_js_primitive() && super::slot_position(m) {
+                if self.prim(&resolved) && super::slot_position(m) {
                     let r = self.range(m.syntax());
                     self.slot_calls.insert(r);
                     if let Some(n) = super::slot_let_binding(m) {
                         let r = self.range(n.syntax());
                         self.slot_bindings.insert(r);
                     }
-                } else if resolved.is_js_primitive() && !super::only_tested(m) {
+                } else if self.prim(&resolved) && !super::only_tested(m) {
                     let msg = format!(
                         "`Peekable::peek_mut` over `{}` items isn't supported here (the item would be copied, so changes wouldn't stick); use it in `if let Some(x) = ..` / `match`, or as `*it.peek_mut().unwrap()`",
                         self.describe(&e)

@@ -546,7 +546,7 @@ impl Codegen<'_> {
             (Ty::Str, "lines") => out(helper("lines", vec![])),
             (Ty::Vec(_) | Ty::Set(_), "iter" | "into_iter") => out(helper("iter", vec![])),
             // Over JS objects, the items are the objects themselves, so writes reach the Vec.
-            (Ty::Vec(e), "iter_mut") if !e.is_js_primitive() && **e != Ty::Unknown => {
+            (Ty::Vec(e), "iter_mut") if !self.prim(e) && **e != Ty::Unknown => {
                 out(helper("iter", vec![]))
             }
             (Ty::Str, "split_at") => {
@@ -578,10 +578,10 @@ impl Codegen<'_> {
                 });
                 out(helper("mapMutSlots", vec![pairs]))
             }
-            (Ty::Map(_, v), "values_mut") if !v.is_js_primitive() && **v != Ty::Unknown => {
+            (Ty::Map(_, v), "values_mut") if !self.prim(v) && **v != Ty::Unknown => {
                 out(call("values", vec![]))
             }
-            (Ty::Map(_, v), "iter_mut") if !v.is_js_primitive() && **v != Ty::Unknown => {
+            (Ty::Map(_, v), "iter_mut") if !self.prim(v) && **v != Ty::Unknown => {
                 out(call("entries", vec![]))
             }
 
@@ -893,7 +893,7 @@ impl Codegen<'_> {
                 }
             }
             "cloned" | "copied" => {
-                if elem.is_js_primitive() {
+                if self.prim(elem) {
                     rf.clone()
                 } else {
                     call("map", vec![Frag::text("κσ.$clone")])
@@ -988,7 +988,7 @@ impl Codegen<'_> {
                 let boxed = a0
                     .as_ref()
                     .and_then(|a| self.ty_of(a.syntax()))
-                    .is_some_and(|t| crate::typeck::ptr_cellable(&t));
+                    .is_some_and(|t| crate::typeck::ptr_cellable(&t) || self.types.adts.atom_ty(&t));
                 let init = self.fn_arg(a0);
                 let f = self.fn_arg(a1);
                 call("scan", vec![init, f, Frag::text(boxed.to_string())])

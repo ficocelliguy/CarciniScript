@@ -500,15 +500,10 @@ pub fn array_type_dims(t: &ast::Type) -> Vec<usize> {
 
 /// `[T; N]` with `const N: usize = 4;` in the file: 4.
 fn const_len(a: &ast::ArrayType) -> Option<usize> {
-    use ast::HasName;
     let name = a.const_arg()?.syntax().text().to_string();
     let name = name.trim();
     let root = a.syntax().ancestors().last()?;
-    let body = root
-        .descendants()
-        .filter_map(ast::Const::cast)
-        .find(|c| c.name().is_some_and(|n| n.text() == name))?
-        .body()?;
+    let body = file_items(&root, |i| i.consts.get(name).cloned())?.body()?;
     body.syntax()
         .text()
         .to_string()
@@ -521,7 +516,6 @@ fn const_len(a: &ast::ArrayType) -> Option<usize> {
 
 /// `array_len_in_file` with the lengths of nested arrays too (`[[1, 2], [3, 4]]` → `[2, 2]`).
 pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
-    use ast::HasName;
     if depth > 4 {
         return array_expr_len(e).into_iter().collect();
     }
@@ -538,7 +532,6 @@ pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
     let Some(root) = e.syntax().ancestors().last() else {
         return Vec::new();
     };
-    let name_of = |n: Option<ast::Name>| n.map(|n| n.text().to_string());
     let type_dims = |t: Option<ast::Type>| t.map(|t| array_type_dims(&t)).unwrap_or_default();
     match super::strip_parens(e) {
         ast::Expr::PathExpr(p) => {
@@ -563,12 +556,7 @@ pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
                 None => {}
             }
             // `const ARR: [T; N] = ..`
-            type_dims(
-                root.descendants()
-                    .filter_map(ast::Const::cast)
-                    .find(|c| name_of(c.name()).as_deref() == Some(name.as_str()))
-                    .and_then(|c| c.ty()),
-            )
+            type_dims(file_items(&root, |i| i.consts.get(&name).and_then(|c| c.ty())))
         }
         ast::Expr::CallExpr(c) => match c.expr() {
             Some(ast::Expr::PathExpr(p)) => p
@@ -587,13 +575,8 @@ pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
             let Some(field) = fe.name_ref().map(|n| n.text().to_string()) else {
                 return Vec::new();
             };
-            let all: Vec<Vec<usize>> = root
-                .descendants()
-                .filter_map(ast::RecordField::cast)
-                .filter(|rf| name_of(rf.name()).as_deref() == Some(field.as_str()))
-                .map(|rf| type_dims(rf.ty()))
-                .collect();
-            agreed(all)
+            let tys = file_items(&root, |i| i.fields.get(&field).cloned()).unwrap_or_default();
+            agreed(tys.into_iter().map(type_dims).collect())
         }
         _ => Vec::new(),
     }
@@ -629,7 +612,9 @@ pub fn decl_at(
     let name_of = |n: Option<ast::Name>| n.map(|n| n.text().to_string());
     let here = root.token_at_offset(at).right_biased()?.parent()?;
     let mut best: Option<ast::LetStmt> = None;
-    for l in root.descendants().filter_map(ast::LetStmt::cast) {
+    // (Only `let`s in a block around `e` count: those of its outermost one.)
+    let outer = here.ancestors().filter(|a| ast::BlockExpr::can_cast(a.kind())).last();
+    for l in outer.iter().flat_map(|b| b.descendants()).filter_map(ast::LetStmt::cast) {
         if l.syntax().text_range().end() > at {
             continue;
         }
@@ -688,19 +673,62 @@ fn agreed(all: Vec<Vec<usize>>) -> Vec<usize> {
 
 /// The array dimensions every function named `name` in the file returns, if they agree.
 fn fn_ret_dims(root: &ra_ap_syntax::SyntaxNode, name: &str) -> Vec<usize> {
+    let tys = file_items(root, |i| i.fns.get(name).cloned()).unwrap_or_default();
+    agreed(
+        tys.into_iter()
+            .map(|t| t.map(|t| array_type_dims(&t)).unwrap_or_default())
+            .collect(),
+    )
+}
+
+/// The file's items by name, for the lookups above (each would otherwise search the file).
+#[derive(Default)]
+struct FileItems {
+    /// Every function's and method's return type.
+    fns: std::collections::HashMap<String, Vec<Option<ast::Type>>>,
+    /// The first `const` of each name.
+    consts: std::collections::HashMap<String, ast::Const>,
+    /// Every named struct or variant field's type.
+    fields: std::collections::HashMap<String, Vec<Option<ast::Type>>>,
+}
+
+/// `f` of the items of the file `root`, indexed once per tree (the last one kept).
+fn file_items<R>(root: &ra_ap_syntax::SyntaxNode, f: impl FnOnce(&FileItems) -> R) -> R {
     use ast::HasName;
-    let all: Vec<Vec<usize>> = root
-        .descendants()
-        .filter_map(ast::Fn::cast)
-        .filter(|f| f.name().is_some_and(|n| n.text() == name))
-        .map(|f| {
-            f.ret_type()
-                .and_then(|r| r.ty())
-                .map(|t| array_type_dims(&t))
-                .unwrap_or_default()
-        })
-        .collect();
-    agreed(all)
+    thread_local! {
+        static ITEMS: std::cell::RefCell<Option<(ra_ap_syntax::SyntaxNode, std::rc::Rc<FileItems>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let kept = ITEMS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(r, _)| r == root)
+            .map(|(_, i)| i.clone())
+    });
+    let items = kept.unwrap_or_else(|| {
+        let mut items = FileItems::default();
+        let name = |n: Option<ast::Name>| n.map(|n| n.text().to_string());
+        for n in root.descendants() {
+            if let Some(x) = ast::Fn::cast(n.clone()) {
+                if let Some(k) = name(x.name()) {
+                    let ret = x.ret_type().and_then(|r| r.ty());
+                    items.fns.entry(k).or_default().push(ret);
+                }
+            } else if let Some(x) = ast::Const::cast(n.clone()) {
+                if let Some(k) = name(x.name()) {
+                    items.consts.entry(k).or_insert(x);
+                }
+            } else if let Some(x) = ast::RecordField::cast(n)
+                && let Some(k) = name(x.name())
+            {
+                items.fields.entry(k).or_default().push(x.ty());
+            }
+        }
+        let items = std::rc::Rc::new(items);
+        ITEMS.with(|c| *c.borrow_mut() = Some((root.clone(), items.clone())));
+        items
+    });
+    f(&items)
 }
 
 /// What's known of a value's array lengths, for a pattern over it (`Checker::pat_fits`).

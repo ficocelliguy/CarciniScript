@@ -818,7 +818,7 @@ impl Checker<'_> {
                     );
                     self.error(m.syntax(), msg);
                 }
-                let slots = self.zonk(&e).is_js_primitive();
+                let slots = self.prim(&self.zonk(&e));
                 (if slots { "setFromSlots" } else { "setFrom" }, usize_ty)
             }
             "take_while_inclusive" | "positions" => {

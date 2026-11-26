@@ -726,7 +726,7 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
         .collect();
     let at = |i: usize| {
         toks.get(i)
-            .map(|t| t.text().to_string())
+            .map(|t| t.text())
             .unwrap_or_default()
     };
     let start = |i: usize| usize::from(toks[i].text_range().start());
@@ -764,7 +764,7 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
                     | SyntaxKind::TRUE_KW
                     | SyntaxKind::FALSE_KW
             ) || matches!(
-                prev.as_str(),
+                prev,
                 "::" | ":"
                     | ")"
                     | "]"
@@ -792,7 +792,7 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
         let mut nested_opens = Vec::new();
         while j < toks.len() {
             let t = at(j);
-            match t.as_str() {
+            match t {
                 "<" => {
                     if depth == 0 && !colons(j - 1) && !(at(j - 1) == ":" && colons(j - 2)) {
                         nested_opens.push(j);
@@ -821,7 +821,7 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
             && at(c - 1) == ")"
             && toks[i + 2].kind() == SyntaxKind::IDENT
             && colons(c + 1)
-            && !(i + 2..c - 1).any(|k| matches!(at(k).as_str(), "," | "(" | ")"))
+            && !(i + 2..c - 1).any(|k| matches!(at(k), "," | "(" | ")"))
         {
             edits.push((start(i), end(i + 1), String::new()));
             for o in nested_opens {
@@ -835,7 +835,7 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
         let path_like = c > i + 1
             && !(i + 1..c).any(|k| at(k) == "!")
             && (toks[i + 1].kind() == SyntaxKind::IDENT
-                || matches!(first.as_str(), "Self" | "crate" | "self" | "super" | "$")
+                || matches!(first, "Self" | "crate" | "self" | "super" | "$")
                 || first == "::");
         if !path_like || !colons(c + 1) {
             i += 1;
@@ -971,12 +971,6 @@ fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Optio
     };
     let name = at(i);
     let &(_, n_params) = FROM_ITER_TYPES.iter().find(|(t, _)| *t == name)?;
-    if toks.iter().zip(toks.iter().skip(1)).any(|(kw, n)| {
-        matches!(kw.kind(), SyntaxKind::STRUCT_KW | SyntaxKind::ENUM_KW | SyntaxKind::TRAIT_KW)
-            && n.text() == name
-    }) {
-        return None;
-    }
     // `std::collections::` / `std::iter::` before it.
     let mut first = i;
     loop {
@@ -1035,7 +1029,17 @@ fn from_iter_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize, Optio
         ty = Some(format!("{name}<{inner}>"));
         k += sep(k)?;
     }
-    (at(k) == "from_iter").then_some((first, k, ty))
+    if at(k) != "from_iter" {
+        return None;
+    }
+    // (Not the file's own type of that name. Checked last: it reads the whole file.)
+    if toks.iter().zip(toks.iter().skip(1)).any(|(kw, n)| {
+        matches!(kw.kind(), SyntaxKind::STRUCT_KW | SyntaxKind::ENUM_KW | SyntaxKind::TRAIT_KW)
+            && n.text() == name
+    }) {
+        return None;
+    }
+    Some((first, k, ty))
 }
 
 /// `let g = Vec::from_iter;` with no type argument written (`ty` is `Vec<_>`): a generic fn over

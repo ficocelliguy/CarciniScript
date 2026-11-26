@@ -95,12 +95,29 @@ pub(super) fn ext_self_ty(key: &str) -> Ty {
 
 /// A `&mut self` method of a trait implemented for a string, number, bool, char or `Option`: JS
 /// can't change those through `this`, so `this` is a cell (`this[0]` is `self`).
-pub(super) fn cell_self(sig: &crate::adt::Method, self_ty: &Ty) -> bool {
+/// So is one on an immutable enum (`Adts::is_atom`).
+pub(super) fn cell_self(
+    sig: &crate::adt::Method,
+    self_ty: &Ty,
+    adts: &crate::adt::Adts,
+) -> bool {
     sig.receiver == Some(crate::adt::Receiver::MutRef)
-        && (crate::typeck::ptr_cellable(self_ty) || sig.cell_self)
+        && (crate::typeck::ptr_cellable(self_ty) || adts.atom_ty(self_ty) || sig.cell_self)
 }
 
 impl Codegen<'_> {
+    /// `cell_self` for a method stored under `key` (a struct or enum, or a built-in type's
+    /// `ext_self_ty`).
+    pub(super) fn key_cell_self(&self, sig: &crate::adt::Method, key: &str) -> bool {
+        let adts = &self.types.adts;
+        let self_ty = if adts.defs.contains_key(key) {
+            Ty::Adt(key.to_string(), Vec::new())
+        } else {
+            ext_self_ty(key)
+        };
+        cell_self(sig, &self_ty, adts)
+    }
+
     fn adt(&self, name: &str) -> Option<AdtDef> {
         self.types.adts.defs.get(name).cloned()
     }
@@ -210,7 +227,36 @@ impl Codegen<'_> {
                 self.line(Frag::text("  return $v;"));
                 self.line(Frag::text("}"));
             }
+            let atom = self.types.adts.is_atom(&def.name);
+            // (Its `&mut self` methods, which a generic call (`κσ.$dcallMut`) hands the cell.)
+            let muts: Vec<String> = match self.types.adts.methods.get(&def.name) {
+                Some(ms) if atom => {
+                    let mut v: Vec<String> = ms
+                        .iter()
+                        .filter(|(_, s)| s.receiver == Some(crate::adt::Receiver::MutRef))
+                        .map(|(n, _)| super::js_string(&prop(n)))
+                        .collect();
+                    v.sort();
+                    v
+                }
+                _ => Vec::new(),
+            };
+            if !muts.is_empty() {
+                self.line(Frag::text(format!(
+                    "static $mut = new Set([{}]);",
+                    muts.join(", ")
+                )));
+            }
             for (i, v) in def.variants.iter().enumerate() {
+                // One shared instance of an immutable enum (`Adts::is_atom`), frozen so a write
+                // that misses its cell fails loudly.
+                if atom {
+                    self.line(Frag::text(format!(
+                        "static {} = Object.freeze(new {cls}({i}));",
+                        v.name
+                    )));
+                    continue;
+                }
                 if v.shape == Shape::Unit {
                     // A fresh instance each time: `*self = ..` replaces contents in place.
                     self.line(Frag::text(format!("static get {}() {{", v.name)));
@@ -482,10 +528,20 @@ impl Codegen<'_> {
         self.ret_ty = sig.ret.clone();
         self.in_async = sig.is_async;
         self.scopes.push(HashMap::new());
+        // `fn bump(mut self)` on a `Copy` type: changes to `self` mustn't reach the caller's
+        // value, so the method works on a copy.
+        let copy_self = matches!(sig.receiver, Some(crate::adt::Receiver::Value))
+            && f.param_list()
+                .and_then(|pl| pl.self_param())
+                .is_some_and(|sp| sp.mut_token().is_some() && sp.amp_token().is_none())
+            && matches!(self_ty, Ty::Adt(..))
+            && (self.copied_on_read(&self_ty) || self.types.adts.atom_ty(&self_ty));
         if sig.receiver.is_some() {
             // (A `&mut self` method on a string or number: `this` is a cell.)
-            let js = if cell_self(&sig, &self_ty) {
+            let js = if cell_self(&sig, &self_ty, &self.types.adts) {
                 "this[0]"
+            } else if copy_self {
+                "$self"
             } else {
                 "this"
             };
@@ -742,6 +798,9 @@ impl Codegen<'_> {
             .push(") {");
         self.line(header);
         self.out.indent += 1;
+        if copy_self {
+            self.line(Frag::text("let $self = this.$clone();"));
+        }
         for l in const_lines {
             self.line(Frag::text(l));
         }
@@ -971,7 +1030,7 @@ impl Codegen<'_> {
             .map(|ms| {
                 let mut v: Vec<String> = ms
                     .iter()
-                    .filter(|(_, s)| cell_self(s, &self_ty))
+                    .filter(|(_, s)| cell_self(s, &self_ty, &self.types.adts))
                     .map(|(n, _)| super::js_string(&prop(n)))
                     .collect();
                 v.sort();
@@ -1590,8 +1649,21 @@ impl Codegen<'_> {
         };
         if def.derives("Clone") || (def.derives("Copy") && manual("Clone")) {
             let mut ls = vec!["$clone() {".to_string()];
-            if def.is_enum && !def.has_data() {
+            // A unit variant is a new object too: `*r = ..` through a `&mut` to a copy rewrites
+            // the copy in place (`κσ.$replace`), which mustn't reach the original.
+            let carried = self.carried_names(&def.name);
+            let unit = |tag: &str| {
+                if carried.is_empty() {
+                    format!("return new {cls}({tag});")
+                } else {
+                    let cs: Vec<String> = carried.iter().map(|n| format!("this.${n}")).collect();
+                    format!("return {cls}.$with(new {cls}({tag}), {});", cs.join(", "))
+                }
+            };
+            if self.types.adts.is_atom(&def.name) {
                 ls.push("  return this;".into());
+            } else if def.is_enum && !def.has_data() {
+                ls.push(format!("  {}", unit("this.$tag")));
             } else {
                 ls.extend(per_variant(
                     def,
@@ -1604,7 +1676,7 @@ impl Codegen<'_> {
                             .collect();
                         if def.is_enum {
                             if v.shape == Shape::Unit {
-                                "return this;".to_string()
+                                unit("this.$tag")
                             } else {
                                 let mut fields = fields;
                                 fields.extend(
@@ -2239,11 +2311,27 @@ impl Codegen<'_> {
                 }
             }
             args.extend(self.dbg_arg_frags(m.syntax()));
-            let mut f = rf.clone();
-            f.push(".")
-                .append(Frag::mapped(name_off, prop(method)))
-                .push("(");
-            f.append(Frag::join(args, ", ")).push(")");
+            // A `&mut self` method on an immutable enum: `this` is the receiver's cell
+            // (`Dir.prototype.turn.call(cell)`).
+            let self_ty = Ty::Adt(adt.to_string(), Vec::new());
+            let f = if cell_self(&sig, &self_ty, &self.types.adts)
+                && let Some(recv) = m.receiver()
+            {
+                let cell = self.mut_recv_cell(&recv, rf.clone());
+                let mut f = Frag::mapped(
+                    name_off,
+                    format!("{}.prototype.{}.call(", self.class(adt), prop(method)),
+                );
+                f.append(Frag::join([vec![cell], args].concat(), ", ")).push(")");
+                f
+            } else {
+                let mut f = rf.clone();
+                f.push(".")
+                    .append(Frag::mapped(name_off, prop(method)))
+                    .push("(");
+                f.append(Frag::join(args, ", ")).push(")");
+                f
+            };
             let ret = if sig.is_async {
                 Ty::Future(Box::new(sig.ret))
             } else {
@@ -2424,18 +2512,60 @@ impl Codegen<'_> {
         }
     }
 
+    /// Whether an immutable enum has a `&mut self` method: generic calls of those go through
+    /// `κσ.$dcallMut` and the file's registry.
+    pub(super) fn atom_mut_methods(&self) -> bool {
+        let adts = &self.types.adts;
+        adts.defs.keys().any(|k| {
+            adts.is_atom(k)
+                && adts.methods.get(k).is_some_and(|ms| {
+                    ms.values()
+                        .any(|s| s.receiver == Some(crate::adt::Receiver::MutRef))
+                })
+        })
+    }
+
+    /// A number, string, bool or char, or an immutable enum (`Adts::is_atom`): `typeck`'s `prim`.
+    pub(super) fn prim(&self, t: &Ty) -> bool {
+        t.is_js_primitive() || self.types.adts.atom_ty(t)
+    }
+
     /// Whether values of `ty` are copied when read from a place (tuples, `Copy` structs).
     pub(super) fn copied_on_read(&self, ty: &Ty) -> bool {
         match ty {
             // A generic value may be a tuple or `Copy` struct; `κσ.$clone` copies those and leaves
             // numbers and strings alone.
             Ty::Tuple(_) | Ty::Param(_) => true,
+            // (An immutable enum is shared: `Adts::is_atom`.)
+            Ty::Adt(n, _) if self.types.adts.is_atom(n) => false,
             Ty::Adt(n, _) => self
                 .types
                 .adts
                 .defs
                 .get(n)
-                .is_some_and(|d| d.derives("Copy") && !(d.is_enum && !d.has_data())),
+                .is_some_and(|d| d.derives("Copy")),
+            // `Some(p)` is `p` itself and `Ok(x)` an object whose payload `ref mut` / `.as_mut()`
+            // writes in place, so a copy of either mustn't share them with the original.
+            Ty::Option(e) => self.copied_on_read(e),
+            Ty::Result(a, b) => self.is_copy(a) && self.is_copy(b),
+            _ => false,
+        }
+    }
+
+    /// A type whose values are `Copy` (as far as the types say): reading one from a place leaves
+    /// the original usable.
+    fn is_copy(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Unit => true,
+            Ty::Tuple(ts) => ts.iter().all(|t| self.is_copy(t)),
+            Ty::Option(e) => self.is_copy(e),
+            Ty::Result(a, b) => self.is_copy(a) && self.is_copy(b),
+            Ty::Adt(n, _) => self
+                .types
+                .adts
+                .defs
+                .get(n)
+                .is_some_and(|d| d.derives("Copy")),
             _ => false,
         }
     }

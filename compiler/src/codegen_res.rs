@@ -6,7 +6,7 @@ use ra_ap_syntax::{
     ast::{self, HasArgList},
 };
 
-use super::{Codegen, Frag, PatCode, debug_fn, default_value, js_string};
+use super::{Codegen, Frag, PatCode, debug_fn, default_value, js_string, strip_parens_expr};
 use crate::ty::Ty;
 
 /// A formatter function for `{:?}` of `ty`.
@@ -145,6 +145,10 @@ impl Codegen<'_> {
                 let f = arg(self, 1);
                 helper("resMapOr", vec![d, f])
             }
+            // `*r.as_mut().unwrap() += 1` of a number: a slot over the payload.
+            "as_mut" if self.types.slot_calls.contains(&self.range_of(m.syntax())) => {
+                helper("resSlot", vec![])
+            }
             "as_ref" | "as_mut" => rf.clone(),
             "clone" | "cloned" | "copied" => {
                 let mut f = Frag::mapped(name_off, "κσ.$clone(");
@@ -153,6 +157,16 @@ impl Codegen<'_> {
             }
             _ => return None,
         };
+        // `*r.as_mut().unwrap() += 1`: the slot's value, a place writes go to. (`let x = ..`, an
+        // argument or a return keep the slot.)
+        if matches!(method, "unwrap" | "expect")
+            && let Some(ast::Expr::MethodCallExpr(am)) = m.receiver().map(|r| strip_parens_expr(&r))
+            && am.name_ref().is_some_and(|n| n.text() == "as_mut")
+            && self.types.slot_calls.contains(&self.range_of(am.syntax()))
+            && !crate::typeck::slot_keep_position(m.syntax())
+        {
+            return Some((f.wrap("", "[1]"), result_ty));
+        }
         Some((f, result_ty))
     }
 

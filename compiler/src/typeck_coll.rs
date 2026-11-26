@@ -378,7 +378,7 @@ impl Checker<'_> {
                             self.check_mutable(&recv, Mutation::Borrow);
                         }
                         let resolved = self.zonk(&v);
-                        if resolved.is_js_primitive() || resolved == Ty::Unknown {
+                        if self.prim(&resolved) || resolved == Ty::Unknown {
                             if super::matched_position(m) {
                                 let r = self.range(m.syntax());
                                 self.slot_calls.insert(r);

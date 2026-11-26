@@ -283,6 +283,9 @@ impl Checker<'_> {
             }
             "as_ref" | "as_mut" | "clone" | "cloned" | "copied" => {
                 count(self, 0);
+                if method == "as_mut" {
+                    self.mark_res_as_mut_slot(m, &t);
+                }
                 res(t, e)
             }
             _ => return None,

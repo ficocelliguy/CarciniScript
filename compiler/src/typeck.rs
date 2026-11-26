@@ -20,6 +20,7 @@ pub(crate) use arrays::{Decl, array_dims_in_file, array_type_dims, array_type_le
 #[path = "typeck_coll.rs"]
 mod coll;
 pub(crate) use coll::index_method as coll_index_method;
+pub(crate) use slots::keep_position as slot_keep_position;
 #[path = "typeck_any.rs"]
 mod any;
 #[path = "typeck_conv.rs"]
@@ -142,6 +143,9 @@ pub struct Types {
     /// Reads of a fixed-size array of `Copy` values (a local or a struct field), which copy in
     /// by-value positions like rustc's `[T; N]: Copy`.
     pub array_reads: std::collections::HashSet<(usize, usize)>,
+    /// Values of your own iterator type given where an `I: Iterator` / `impl Iterator` is
+    /// expected (`total(Count { n: 0 })`): the runtime's iterator over it (`κσ.$iterOf`).
+    pub iter_of_args: std::collections::HashSet<(usize, usize)>,
     /// Bindings (by name range) that a mutation needed declared `mut`: an assignment, a `&mut`
     /// borrow or a `&mut self` method call rooted at them (rustc's `unused_mut` reads it).
     pub mut_roots: std::collections::HashSet<(usize, usize)>,
@@ -399,6 +403,8 @@ impl<'a> Checker<'a> {
             slot_bindings: Default::default(),
             mut_ref_loops: Default::default(),
             copy_arrays: Default::default(),
+            copy_array_consts: Default::default(),
+            copy_array_assoc: Default::default(),
             str_locals: Default::default(),
             ref_vecs: Default::default(),
             move_sites: Default::default(),
@@ -414,6 +420,7 @@ impl<'a> Checker<'a> {
             shared_ref_fields: Default::default(),
             fn_ptr_fields: Default::default(),
             array_reads: Default::default(),
+            iter_of_args: Default::default(),
             mut_roots: Default::default(),
             cell_returns: Default::default(),
             index_places: Default::default(),
@@ -775,6 +782,7 @@ pub fn check(
     let slot_bindings = std::mem::take(&mut c.slot_bindings);
     let mut_ref_loops = std::mem::take(&mut c.mut_ref_loops);
     let array_reads = std::mem::take(&mut c.array_reads);
+    let iter_of_args = std::mem::take(&mut c.iter_of_args);
     let cell_returns = std::mem::take(&mut c.cell_returns);
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
@@ -832,6 +840,7 @@ pub fn check(
             slot_bindings,
             mut_ref_loops,
             array_reads,
+            iter_of_args,
             mut_roots: std::mem::take(&mut c.mut_roots),
             cell_returns,
             index_places,
@@ -968,6 +977,10 @@ struct Checker<'a> {
     mut_ref_loops: std::collections::HashSet<(usize, usize)>,
     /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
     copy_arrays: std::collections::HashSet<(usize, usize)>,
+    /// `const` / `static` items that are fixed-size arrays of `Copy` values: a read copies.
+    pub(super) copy_array_consts: std::collections::HashSet<String>,
+    /// Associated `const`s that are fixed-size arrays of `Copy` values, by type and name.
+    pub(super) copy_array_assoc: std::collections::HashSet<(String, String)>,
     /// `let` locals whose initializer is certainly a `&str` (`let s = "a";`, `let t = s;`,
     /// `let u = x.as_str();`), by declaration: `s + ".."` is rustc's E0369.
     str_locals: std::collections::HashSet<(usize, usize)>,
@@ -1000,6 +1013,7 @@ struct Checker<'a> {
     /// but `Copy`, `Clone`, `Debug` and `PartialEq`. (struct or variant, field)
     pub(super) fn_ptr_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
+    iter_of_args: std::collections::HashSet<(usize, usize)>,
     mut_roots: std::collections::HashSet<(usize, usize)>,
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
@@ -1569,6 +1583,16 @@ impl<'a> Checker<'a> {
                     None => false,
                 }
             }
+            // An `I: Iterator<Item = T>` / `impl Iterator<Item = T>` parameter takes your own
+            // iterator of `T` (`total(Count { n: 0 })`), as it takes std's.
+            (Ty::Iter { elem, .. }, other @ Ty::Adt(..)) | (other @ Ty::Adt(..), Ty::Iter { elem, .. }) =>
+            {
+                let (e, other) = (elem.clone(), other.clone());
+                match self.iter_elem(&other) {
+                    Some(item) => self.unify(&e, &item),
+                    None => false,
+                }
+            }
             // (A `const` item's value isn't known here: it matches any value.)
             (Ty::ConstVal(x), Ty::ConstVal(y)) => x == y || !(const_literal(x) && const_literal(y)),
             (Ty::Adt(a, xs), Ty::Adt(b, ys)) if a == b && xs.len() == ys.len() => {
@@ -1692,6 +1716,17 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Your own iterator (`found`) as an `I: Iterator` / `impl Iterator` (an argument, a return
+    /// value): `n` is the runtime's iterator over it (`iter_of_args`).
+    fn note_iter_of(&mut self, n: &SyntaxNode, found: &Ty, expected: &Ty) {
+        if matches!(self.shallow(expected), Ty::Iter { .. })
+            && matches!(self.shallow(found), Ty::Adt(a, _) if self.adts.iter_items.contains_key(&a))
+        {
+            let r = self.range(n);
+            self.iter_of_args.insert(r);
+        }
+    }
+
     /// Unify `found` with `expected`, reporting rustc's "mismatched types" on failure.
     fn expect(&mut self, n: &SyntaxNode, found: &Ty, expected: &Ty) {
         if let Ty::Dyn(tr) = self.shallow(expected)
@@ -1713,6 +1748,7 @@ impl<'a> Checker<'a> {
             self.error(n, msg);
             return;
         }
+        self.note_iter_of(n, found, expected);
         if !self.unify(found, expected) && !self.iface_coerces(found, expected) {
             let hint = match (self.shallow(expected), self.var_kind(found)) {
                 (Ty::Float { .. }, Some(VarKind::Int)) => {
@@ -2794,6 +2830,10 @@ impl<'a> Checker<'a> {
             self.auto_deref(&tail, &n, &target);
             found = target;
         }
+        // `-> impl Iterator<Item = u32> { Count { n } }`: the runtime's iterator over it.
+        if let Some(tail) = body.stmt_list().and_then(|l| l.tail_expr()) {
+            self.note_iter_of(tail.syntax(), &found, &ret);
+        }
         if !self.unify(&found, &ret) {
             let tail = body.stmt_list().and_then(|l| l.tail_expr());
             let has_tail = tail.is_some();
@@ -3550,7 +3590,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// `place.as_mut()` of an `Option` in a place (`self.timer.as_mut()`, `t.as_mut()`,
+    /// `place.as_mut()` of an `Option` or `Result` in a place (`self.timer.as_mut()`, `t.as_mut()`,
     /// `v[i].as_mut()`): codegen emits the place itself for it, so a pattern against it can
     /// alias the place.
     pub(super) fn as_mut_of_place(&self, e: &ast::Expr) -> bool {
@@ -3564,7 +3604,30 @@ impl<'a> Checker<'a> {
             && self
                 .raw
                 .get(&self.range(r.syntax()))
-                .is_some_and(|t| matches!(self.zonk(t), Ty::Option(_)))
+                .is_some_and(|t| matches!(self.zonk(t), Ty::Option(_) | Ty::Result(..)))
+    }
+
+    /// `*r.as_mut().unwrap() += 1` / `let x = r.as_mut().expect("..");` of a `Result` in a place
+    /// holding a number, string or bool: the `Ok` payload is a slot over the result's own
+    /// (`κσ.$resSlot`), so the write reaches it. (Matched, the bindings alias it instead.)
+    pub(super) fn mark_res_as_mut_slot(&mut self, m: &ast::MethodCallExpr, ok: &Ty) {
+        let Some(recv) = m.receiver() else { return };
+        let unwrapped = ast::MethodCallExpr::cast(m.syntax().parent().unwrap())
+            .and_then(|u| u.name_ref())
+            .is_some_and(|n| matches!(n.text(), "unwrap" | "expect"));
+        if !unwrapped
+            || !unwrapped_position(m)
+            || !is_place_expr(&strip_parens(&recv))
+            || !self.prim(&self.zonk(ok))
+        {
+            return;
+        }
+        let r = self.range(m.syntax());
+        self.slot_calls.insert(r);
+        if let Some(n) = slot_let_binding(m) {
+            let r = self.range(n.syntax());
+            self.slot_bindings.insert(r);
+        }
     }
 
     /// `*self.timer.as_mut().unwrap() += 1` / `let r = v[i].as_mut().unwrap();` of a number,
@@ -3577,7 +3640,7 @@ impl<'a> Checker<'a> {
         let recv = strip_parens(&recv);
         if !is_place_expr(&recv)
             || !slots::opt_slot_position(m)
-            || !self.zonk(inner).is_js_primitive()
+            || !self.prim(&self.zonk(inner))
         {
             return;
         }
@@ -4127,11 +4190,15 @@ impl<'a> Checker<'a> {
                 rows.extend(self.abstract_pat(&p).into_iter().map(|ap| vec![ap]));
             }
         }
-        // (An array of known length: `[]` or longer arrays aren't values to cover.)
-        let dims = m
-            .expr()
-            .map(|e| arrays::array_dims_in_file(&e, 0))
-            .unwrap_or_default();
+        // (An array of known length: `[]` or longer arrays aren't values to cover. Looked up only
+        // for an array: `array_dims_in_file` searches the file.)
+        let dims = match self.zonk(st) {
+            Ty::Vec(_) => m
+                .expr()
+                .map(|e| arrays::array_dims_in_file(&e, 0))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let st = self.with_dims(st, &dims);
         self.missing_steps.set(0);
         if let Some(witness) = self.missing(&rows, std::slice::from_ref(&st)) {
@@ -5013,7 +5080,7 @@ impl<'a> Checker<'a> {
                         strip_parens(&inner),
                         ast::Expr::IndexExpr(ix) if matches!(ix.index(), Some(ast::Expr::RangeExpr(_)))
                     );
-                    if (z.is_js_primitive() || matches!(z, Ty::Option(_)))
+                    if (self.prim(&z) || matches!(z, Ty::Option(_)))
                         && !range_index
                         && let Some(n) = let_name
                     {
@@ -5021,7 +5088,7 @@ impl<'a> Checker<'a> {
                         self.place_slots.insert(rr);
                         let nr = self.range(n.syntax());
                         self.slot_bindings.insert(nr);
-                    } else if z.is_js_primitive() || matches!(z, Ty::Option(_)) {
+                    } else if self.prim(&z) || matches!(z, Ty::Option(_)) {
                         let msg = format!(
                             "keeping a `&mut` to a `{}` inside a struct, tuple or Vec in a variable isn't supported yet (JS can't reference that slot, so writes through it would be lost); assign through the place itself (`{} = ..`)",
                             self.describe(&t),
@@ -5582,6 +5649,11 @@ impl<'a> Checker<'a> {
                 return local.ty;
             }
             if let Some(t) = self.consts.get(name.text().to_string().as_str()).cloned() {
+                // (`let mut w = ORDER;`: JS would share the item's array.)
+                if self.copy_array_consts.contains(name.text()) {
+                    let r = self.range(p.syntax());
+                    self.array_reads.insert(r);
+                }
                 if self.static_muts.contains(name.text())
                     && !self.macro_in_unsafe
                     && !in_unsafe(p.syntax()) {
@@ -7351,8 +7423,14 @@ impl<'a> Checker<'a> {
             | Ty::Str
             | Ty::Option(_) => true,
             Ty::Var(_) => matches!(self.var_kind(t), Some(VarKind::Int | VarKind::Float)),
-            _ => false,
+            ref z => self.adts.atom_ty(z),
         }
+    }
+
+    /// A number, string, bool or char, or an immutable enum (`Adts::is_atom`): a value JS can't
+    /// point into, so a `&mut` to one in a collection is a slot.
+    pub(super) fn prim(&self, t: &Ty) -> bool {
+        t.is_js_primitive() || self.adts.atom_ty(t)
     }
 
     /// A `&mut` parameter of this type takes a cell: a number, string, bool or `Option`, or a type
@@ -8257,7 +8335,7 @@ impl<'a> Checker<'a> {
                     "get_mut" | "first_mut" | "last_mut" => {
                         self.check_mutable(&recv, Mutation::Borrow);
                         let resolved = self.zonk(&elem);
-                        if (resolved.is_js_primitive() || resolved == Ty::Unknown)
+                        if (self.prim(&resolved) || resolved == Ty::Unknown)
                             && slot_position(m)
                         {
                             let r = self.range(m.syntax());
@@ -8269,7 +8347,7 @@ impl<'a> Checker<'a> {
                                 let r = self.range(n.syntax());
                                 self.slot_bindings.insert(r);
                             }
-                        } else if !only_tested(m) && resolved.is_js_primitive()
+                        } else if !only_tested(m) && self.prim(&resolved)
                             || resolved == Ty::Unknown
                         {
                             self.error(
@@ -8455,14 +8533,14 @@ impl<'a> Checker<'a> {
                     }
                     "get_mut" => {
                         let resolved = self.zonk(&v);
-                        if resolved.is_js_primitive() && slot_position(m) {
+                        if self.prim(&resolved) && slot_position(m) {
                             let r = self.range(m.syntax());
                             self.slot_calls.insert(r);
                             if let Some(n) = slot_let_binding(m) {
                                 let r = self.range(n.syntax());
                                 self.slot_bindings.insert(r);
                             }
-                        } else if !only_tested(m) && resolved.is_js_primitive() {
+                        } else if !only_tested(m) && self.prim(&resolved) {
                             let msg = format!(
                                 "`HashMap::get_mut` on a map of `{}` values isn't supported here (the value would be copied, so changes wouldn't stick); use it in `if let Some(x) = ..` / `match`, as `*map.get_mut(..).unwrap()`, or `*map.entry(k).or_insert(..) += ..`",
                                 self.describe(&v)
@@ -8888,9 +8966,12 @@ impl<'a> Checker<'a> {
         };
         self.scopes.push(HashMap::new());
         if let Some(pat) = f.pat() {
-            let dims = f.iterable().map(|i| self.item_dims(&i)).unwrap_or_default();
             if !self.irrefutable_pat(&pat)
-                && !self.array_pat_covers(&pat, &elem, &dims)
+                && !self.array_pat_covers(
+                    &pat,
+                    &elem,
+                    &f.iterable().map(|i| self.item_dims(&i)).unwrap_or_default(),
+                )
                 && !f.iterable().is_some_and(|i| self.pat_fits(&pat, &self.item_shape(&i)))
             {
                 self.error(pat.syntax(), "refutable pattern in `for` loop binding");
@@ -11003,10 +11084,15 @@ impl Checker<'_> {
         if !self.param_bounds.contains_key(param) {
             return None;
         }
-        let t = self
-            .bound_traits(param)
-            .iter()
-            .find_map(|b| self.adts.traits.get(b)?.const_tys.get(konst).cloned())?;
+        let (tr, t) = self.bound_traits(param).into_iter().find_map(|b| {
+            let t = self.adts.traits.get(&b)?.const_tys.get(konst).cloned()?;
+            Some((b, t))
+        })?;
+        // (`let mut r = Self::ROWS;`: JS would share the item's array.)
+        if self.copy_array_assoc.contains(&(tr, konst.to_string())) {
+            let r = self.range(node);
+            self.array_reads.insert(r);
+        }
         self.note_dict(param, node);
         Some(t)
     }
@@ -11595,11 +11681,10 @@ impl Checker<'_> {
                 | "Keys"
                 | "Values"
                 | "ValuesMut"
-        ) || ((qualified || self.std_imported(name))
-            && matches!(
-                name,
-                "Iter" | "IntoIter" | "IterMut" | "Bytes" | "Lines" | "Split"
-            ))
+        ) || (matches!(
+            name,
+            "Iter" | "IntoIter" | "IterMut" | "Bytes" | "Lines" | "Split"
+        ) && (qualified || self.std_imported(name)))
             || (qualified
                 && matches!(
                     name,
