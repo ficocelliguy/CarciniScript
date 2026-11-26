@@ -56,6 +56,8 @@ impl<'a, B: ?Sized + PartialEq> PartialEq for Cow<'a, B> {
     }
 }
 
+impl<'a, B: ?Sized + Eq> Eq for Cow<'a, B> {}
+
 impl<'a, B: ?Sized + std::fmt::Display> std::fmt::Display for Cow<'a, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {

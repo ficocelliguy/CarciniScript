@@ -576,6 +576,17 @@ impl Codegen<'_> {
                 "{n}::{}",
                 js_name.clone().unwrap_or_else(|| name.text().to_string())
             )),
+            // (A trait's default method: its own type parameters' classes, as `Tr::m`'s.)
+            Ty::Param(p) if p == "Self" && self.in_trait_default => {
+                Some(format!("{}::{}", self.default_trait, name.text()))
+            }
+            // (An impl for a built-in type, `impl<T: Decode> Decode for Vec<T>`: `Vec::decode`.)
+            _ if !self.in_trait_default => self.ext_class.as_ref().map(|k| {
+                format!(
+                    "{k}::{}",
+                    js_name.clone().unwrap_or_else(|| name.text().to_string())
+                )
+            }),
             _ => None,
         };
         let dbg_key = dict_key.clone();
@@ -1369,6 +1380,7 @@ impl Codegen<'_> {
         self.line(header);
         self.out.indent += 1;
         self.in_trait_default = true;
+        self.default_trait = tr.clone();
         // Methods here; functions without `self` in `Trait$statics`, mixed onto the class.
         let defaults = |statics: bool| {
             let mut out = Vec::new();

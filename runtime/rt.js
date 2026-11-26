@@ -2699,6 +2699,19 @@
     $extend(v, other) {
       for (const x of other) v.push(x);
     },
+    // `c.extend(xs)` on a `C: Extend<T>`: by what `c` is (a string's new value is returned).
+    $extendAny(c, xs) {
+      if (typeof c === "string") {
+        for (const x of xs) c += x;
+      } else if (typeof c.$extend === "function") {
+        c.$extend(xs);
+      } else if (typeof c.extend === "function") {
+        c.extend(xs);
+      } else {
+        for (const x of xs) c.push(x);
+      }
+      return c;
+    },
     $pop(v) {
       return v.length ? some(v.pop()) : null;
     },
@@ -3146,9 +3159,9 @@
     $schemaOf(d) {
       if (d == null) return { t: "any" };
       if (d.$jsonSchema) return d.$jsonSchema;
-      if (d === rt.$prims.str) return { t: "str" };
-      if (d === rt.$prims.bool) return { t: "bool" };
-      if (d === rt.$prims.char) return { t: "char" };
+      if (rt.$p(d) === rt.$prims.str) return { t: "str" };
+      if (rt.$p(d) === rt.$prims.bool) return { t: "bool" };
+      if (rt.$p(d) === rt.$prims.char) return { t: "char" };
       if (d.kind !== undefined) {
         if (d.float) return { t: "float", f32: d.kind === "f32" };
         const bits = BigInt(d.bits);
@@ -5068,23 +5081,39 @@
     $prims: {
       num: { default: () => 0, dbg: String },
       big: { default: () => 0n, dbg: String },
-      str: { default: () => "", from_str: (s) => new Res(0, s), dbg: (s) => rt.$dbgStr(s) },
+      str: { default: () => "", from_iter: (it) => rt.$iter(it).$collectString(), from_str: (s) => new Res(0, s), dbg: (s) => rt.$dbgStr(s) },
       bool: { default: () => false, from_str: (s) => rt.$parseBool(s), dbg: String },
       char: { default: () => "\0", from_str: (s) => rt.$parseChar(s), dbg: (c) => rt.$dbgChar(c) },
-      vec: { default: () => [], vec: true },
+      vec: { default: () => [], from_iter: (it) => Array.from(it), vec: true },
       option: { default: () => null, opt: true },
       unit: { default: () => undefined },
+      // (Collections: `C::default()`, and `collect()` into a `C: FromIterator<T>`.)
+      ...Object.fromEntries(
+        ["Map", "Set", "Deque", "BTreeMap", "BTreeSet", "IndexMap", "IndexSet", "Heap"].map((k) => {
+          const from_iter = (it) => rt.$iter(it)[`$collect${k}`]();
+          return [k, { default: () => from_iter([]), from_iter }];
+        }),
+      ),
     },
     // A `Vec<T>`'s or `Option<T>`'s class with `T`'s (`impl<T> S<Vec<T>>` reads it as `.elem`).
     $withElem(prim, elem) {
       return { ...prim, elem };
     },
-    // A `Vec<T>`'s or `Option<T>`'s class with the associated functions of your trait impls for
-    // it (`ext`, `impl Array for [T; 4]`), for `A::size()`.
+    // The built-in class a wrapped one (`$withStatics`) stands for, for identity checks.
+    $p(d) {
+      return d?.$prim ?? d;
+    },
+    // A built-in type's class with the associated functions and consts of your trait impls for
+    // it (`ext`: `impl Array for [T; 4]`, `impl Kind for String`), for `A::size()`.
     $withStatics(d, ext) {
       const o = { ...d };
+      o.$prim = rt.$p(d);
       for (const k of Object.getOwnPropertyNames(ext)) {
-        if (typeof ext[k] === "function" && !["length", "name", "prototype"].includes(k)) o[k] = ext[k].bind(ext);
+        if (k === "prototype" || ((k === "name" || k === "length") && typeof ext[k] !== "function")) continue;
+        const desc = Object.getOwnPropertyDescriptor(ext, k);
+        if (!desc.get && typeof desc.value === "function") o[k] = ext[k].bind(ext);
+        // (Associated consts, `T::SIZE`: read off the impl class.)
+        else if (k[0] !== "$") Object.defineProperty(o, k, { get: () => ext[k], enumerable: true });
       }
       return o;
     },
@@ -5115,7 +5144,7 @@
       if (d.kind !== undefined || c.kind !== undefined) return d.kind === c.kind;
       if (d.tup !== undefined) return c.tup === d.tup && d.elem.every((e, i) => rt.$classFits(e, c.elem[i]));
       if (d.vec || d.opt) return !!d.vec === !!c.vec && !!d.opt === !!c.opt && rt.$classFits(d.elem, c.elem);
-      for (const p of ["str", "bool", "char", "unit"]) if (d === rt.$prims[p] || c === rt.$prims[p]) return false;
+      for (const p of ["str", "bool", "char", "unit"]) if (rt.$p(d) === rt.$prims[p] || rt.$p(c) === rt.$prims[p]) return false;
       return true;
     },
     // Whether the element value `v` could be of the impl's element class `d`. `strict`: a whole
@@ -5127,8 +5156,8 @@
         if (d.big) return typeof v === "bigint";
         return typeof v === "number" && (!strict || d.float !== Number.isInteger(v));
       }
-      if (d === rt.$prims.str || d === rt.$prims.char) return typeof v === "string";
-      if (d === rt.$prims.bool) return typeof v === "boolean";
+      if (rt.$p(d) === rt.$prims.str || rt.$p(d) === rt.$prims.char) return typeof v === "string";
+      if (rt.$p(d) === rt.$prims.bool) return typeof v === "boolean";
       if (d.tup !== undefined) {
         return Array.isArray(v) && v.length === d.tup && d.elem.every((e, i) => rt.$valueFits(e, v[i], strict));
       }
@@ -5221,7 +5250,8 @@
         if (d === undefined) {
           d = byKind[kind] = Object.create(rt.$numT(kind));
           for (const k of Object.getOwnPropertyNames(ext)) {
-            if (["length", "name", "prototype"].includes(k)) continue;
+            // (A class's own `name` and `length`, unless the impl declares `fn name()`.)
+            if (k === "prototype" || ((k === "name" || k === "length") && typeof ext[k] !== "function")) continue;
             const desc = Object.getOwnPropertyDescriptor(ext, k);
             if (!desc.get && typeof desc.value === "function") d[k] = ext[k].bind(ext);
             // (Its associated consts, `T::ZERO`: lazy getters that turn into values.)
@@ -5301,8 +5331,8 @@
         const v = typeof x === "string" ? x.codePointAt(0) : x;
         return T.big ? BigInt(v) : Number(v);
       }
-      if (T === rt.$prims.str) return String(x);
-      if (T === rt.$prims.char) return String.fromCodePoint(Number(x));
+      if (rt.$p(T) === rt.$prims.str) return String(x);
+      if (rt.$p(T) === rt.$prims.char) return String.fromCodePoint(Number(x));
       const f = T["$from$" + src];
       return f ? f.call(T, x) : T.from(x);
     },
@@ -5313,8 +5343,8 @@
         const v = typeof x === "string" ? x.codePointAt(0) : typeof x === "boolean" ? Number(x) : x;
         return T.float ? new Res(0, Number(v)) : rt.$tryInt(v, T.bits, T.signed, T.big);
       }
-      if (T === rt.$prims.char) return rt.$tryChar(x);
-      if (T === rt.$prims.str) return new Res(0, String(x));
+      if (rt.$p(T) === rt.$prims.char) return rt.$tryChar(x);
+      if (rt.$p(T) === rt.$prims.str) return new Res(0, String(x));
       const f = T["$tryfrom$" + src];
       if (f) return f.call(T, x);
       const g = T["$from$" + src];
@@ -6216,8 +6246,8 @@
     fromSeedChaCha20: (b) => rand.fromSeed(b, "chacha20"),
     // `rng.gen::<T>()`: integers over their whole range, floats in [0, 1), bools.
     gen(rng, T) {
-      if (T === rt.$prims.bool) return (rng.u32() | 0) < 0;
-      if (T === rt.$prims.char) {
+      if (rt.$p(T) === rt.$prims.bool) return (rng.u32() | 0) < 0;
+      if (rt.$p(T) === rt.$prims.char) {
         let n = intUniform(rng, 0x800, 0x10ffff, U32T);
         if (n <= 0xdfff) n -= 0x800;
         return String.fromCodePoint(n);
@@ -6247,7 +6277,7 @@
     },
     // `rng.fill(&mut buf)`: `fill_bytes` over the buffer's bytes, little-endian per element.
     fill(rng, buf, T) {
-      if (T?.kind === undefined || T.float || T === rt.$prims.bool) {
+      if (T?.kind === undefined || T.float || rt.$p(T) === rt.$prims.bool) {
         for (let i = 0; i < buf.length; i++) buf[i] = rand.gen(rng, T);
         return new Res(0, undefined);
       }

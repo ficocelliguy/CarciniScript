@@ -141,7 +141,9 @@ object results and `Named & { .. }` intersections → structs of their own, `Rea
 `react::Node`, `any` → `JsValue` (wasm-bindgen's, with `as_string()` and friends; a `JsValue`
 parameter takes any value). Scripts can name the interfaces and build the option ones
 (`RunOptions { .., ..Default::default() }`). Bitburner regenerates its copy with
-`npm run generate:rust-bindings`, and a jest test fails when it's stale.
+`npm run generate:rust-bindings`, and a jest test fails when it's stale. FEATURES.md describes
+bindings host-neutrally (its "JS interop" section); the Netscript specifics live here and in
+RUST_GAPS.md ("Netscript values").
 
 **Unions are enums that view the JS value.** A d.ts union is a Rust enum named after the TS type
 (`ScriptArg`, `FilenameOrPID`, `PlayerRequirement`, `Task`, `SleeveTask`, `NsResult`, one struct
@@ -206,7 +208,33 @@ classifier and the finer sort now match `not supported(?: yet)?`. The finer sort
 types" rules still read the old `expected X, found Y` text, so those 107 files sit in one
 `OTHER: mismatched types` bucket until they are re-keyed.
 
-**Latest run** (2026-11-25, `0f371c8` built in a clean worktree; the registry has grown to 235
+**Latest run** (2026-11-26, working tree after `a2e9d47` with open items 1–6 below): language
+features all supported in **83.8%** of files (4,550 of 5,428; 72.2% counting std gaps, 68.6% by
+lines). Against the run with items 1–3, 60 files have fewer errors that aren't external names or
+threads and none have more; 8 have none left (num-traits' int.rs, quote's to_tokens.rs,
+clap_builder's derive.rs, petgraph's simple_paths.rs, writeable's impls.rs, rayon's update.rs,
+time's integration error.rs, multipart's local_test.rs). The classify step took 64 s on 18
+workers. The run before (2026-11-26, with open items 1–3): language
+features all supported in **83.8%** of files (4,547 of 5,428; 72.1% counting std gaps, 68.5% by
+lines). 8 files improved and none went the other way: memchr's vector.rs and num-traits' bounds.rs
+now compile as-is, bumpalo's two `collect_in.rs`, wasm-bindgen's cast.rs, fallible-iterator,
+itertools' lib.rs and defmt-parser have only gaps of other kinds left. Most item 1–3 hits sit in
+files with other gaps, so the per-file count moves less than the hit counts did. The classify
+step took 63 s on 18 workers. The run before (2026-11-26, `a2e9d47` built in a clean worktree): language features all supported
+in **83.6%** of files (4,540 of 5,428; 72.0% counting std gaps, 68.1% by lines; 79 crates pass in
+every file, 159 in 80% or more). 41 files improved on 2026-11-25 (the five gaps closed that day:
+hashbrown's three `map.rs`, rustls's key_log_file.rs and vecbuf.rs, time's instant.rs and its
+integration tests, miniz_oxide's inflate, ureq's multipart and send_body, winnow's bits, ..) and 18
+went the other way, all new false positives from the same work rather than classifier drift: a
+type that was unknown before now resolves and runs into a std gap or an extension method.
+hashbrown 0.17's `A: Allocator = Global` default now evaluates `Global` (4 files), jiff's
+`.context(..)` on a now-known `Result` (strtime's printer.rs), time's `try_into()` on a std
+`Duration` (ext/instant.rs, ext/systemtime.rs), powerfmt's `Formatter::align`, indexmap's
+`append` on its set, rayon's `drive` / `opt_len` through a chain, wasmparser's `BTreeMap::get_key_value`.
+840 files have a language gap (683 unsafe/memory, 126 `union`, 58 proc-macro API, 70 `extern`:
+not planned), 630 are std-only, 44 have only uncategorized errors, 4 a parse error. Zero compiler
+panics; the classify step took 175 s on 18 workers (10 minutes before `e12bd92`), the whole
+pipeline under 8 minutes. The run before (2026-11-25, `0f371c8` built in a clean worktree; the registry has grown to 235
 crates and 5,428 files): language features all supported in **83.5%** of files (4,532 of 5,428;
 71.6% counting std gaps, 66.6% by lines; 80 crates pass in every file, 160 in 80% or more). On
 the 5,220 files both runs share, 4,360 are language-OK against 4,350 on 2026-11-24: 25 files
@@ -233,7 +261,152 @@ sweeps (registry 5,922 files, std 3,004) last ran on 2026-11-24 with 0 panics (2
 `Windows/mod.rs` at 121 s, nearly all of it their thousands of `mod` files, and stdarch's
 `core_arch/src/lib.rs` at 108 s.
 
-**Where the remaining gaps are** (2026-11-25, a "flip" pass over the run: for every file that
+**Where the remaining gaps are** (2026-11-26, the flip pass over the latest run with the feature
+table re-keyed by what same-file probes confirm; 818 of the 1,769 failing files have only fixable
+gaps). The biggest buckets by raw count are still not language gaps: `.into()` inference (57
+files, 27 solo), `.0` / `.1` on a value of unknown type (46, 21), a file's own std-named type
+declared in another file of the crate (28, 15), `matches!` on an enum from another file (21, 10)
+and `include!` of sibling files (14, 12). Each same-file shape of the first four compiles,
+including `.into()` in a closure's return, a struct-literal field and `collect()` into a field,
+and `matches!` on a same-file enum. The five features that do cause gaps, every one confirmed
+by a rustc-accepted probe that the compiler rejects (files among the flippable set, files where it
+is the only gap, crates; then files among all failing files):
+
+1. **One trait implemented for types that share a JS representation** (36 files, 9 solo, 29
+   crates; 61 overall, of which about a third are cfg'd or macro-generated twin impls instead):
+   `str` and `String`, `[T]` and `Vec<T>`, `u8` with `NonZeroU8` and `Wrapping<u8>`. tracing-core's
+   `Value`, borsh's `Write`, wasm-encoder's `Encode`, wasm-bindgen's `WasmDescribe`, zerovec's
+   `ZeroMapKV`, ring's `Word`, phf_shared, form_urlencoded, regex's `Replacer`. `f32` with `f64`
+   already works. **Done for `str` / `String` and `[T]` / `Vec<T>`** (2026-11-26): each direct
+   call picks its impl at compile time (`fixtures/str_string_twin_impls.rs`); calls through a type
+   parameter or `dyn` and receivers whose type isn't written are errors, which is where most of the
+   corpus hits sit (tracing-core's is `fmt::Arguments` vs `str`, both strings in JS). Left: those
+   generic calls, `NonZeroU8` / `u8`, `&T` impls next to `T`'s (num-traits' `Inv for &f32`,
+   form_urlencoded's `&mut String`), and specialization-like `[u8]` next to `[T]` (wasm-encoder).
+2. **Dispatch on an impl's type parameter inside a trait method body, and through a bound on an
+   associated type** (27 files, 11 solo, 22 crates; 42 overall): `T::ZERO` / `T::f()` /
+   `<T as Tr>::f()` in a method with `self` (num-traits `ConstZero for Wrapping<T>`, serde's
+   `Error::invalid_type`, rustls `Codec`, borsh schema, wasm-bindgen `JsCast`, itertools, bumpalo,
+   petgraph, ppv-lite86), and methods of a bounded associated type (`v.movemask().has_non_zero()`
+   with `type Mask: MoveMask` in memchr, `Self::Seed::default()` / `.as_mut()` in rand_core,
+   jiff-core's `Bounds::Primitive`, regex-syntax's `Interval::Bound`, libm's `DInt::H`).
+   **Done** (2026-11-26, `fixtures/trait_param_dispatch.rs`): a trait default method's own type
+   parameters (most of the hits: serde's `visit_bool<E>`, wasm-bindgen's `has_type<T>`,
+   fallible-iterator's `partition<B>`), also through a bound; `Self::f()` in a generic impl's
+   associated function (it passed no class: a silent miscompile); `T::f()` in associated
+   functions of `impl<T> Tr for Vec<T>`; a bounded associated type's methods in default methods.
+   Left (RUST_GAPS "Where a type parameter's class can't reach"): `T::..` in a method with `self`
+   of an impl for `Vec<T>` (rustls), an associated const reading `T` (num-traits), and `Self::Seed`'s
+   std bounds (rand_core, item 4).
+3. **`derive(..)` over a field whose impl is std's, not the field type's** (24 files, 15 solo, 17
+   crates; 44 overall): `Rc<T>` / `Arc<T>` in a `Clone` derive demands `T: Clone` (futures-util's
+   `AbortHandle`, cc's `BuildEnv`, crossbeam-channel, wasmparser), `Cow<str>` is not `Eq`
+   (defmt-parser), `[T; N]` is not `Copy` (zerotrie, http). `Result<A, B>` fields and `&[T]`
+   fields compile. **Done** (2026-11-26, `fixtures/derive_std_wrapper_fields.rs`); the rest of
+   the bucket is fields whose types come from another file or crate.
+4. **Std trait bounds on type parameters** (22 files, 6 solo, 14 crates; 31 overall): `R: Read`,
+   `BufRead`, `Future`, `Extend`, `FromIterator`, `Any` and `E: Error` are rejected as bounds
+   (brotli-decompressor, flate2, futures-util's join_all, itertools, petgraph, clap_builder), and
+   modeled bounds miss methods: `S: Clone` has no `clone_from` (indexmap, either, once_cell),
+   `I: IntoIterator` no `into_iter` (strsim, either), `E: Error` no `source` (time's tests),
+   `R: Read` no `read_vectored` (tiny_http, futures-util). `W: Write` with `write`,
+   `T: AsRef<[u8]>` and `H: Hasher` work. **Done** (2026-11-26, `fixtures/std_bounds_error_collections.rs`,
+   `fixtures/clone_from.rs`): `E: Error` (with `source()` and its `Display` / `Debug`),
+   `C: Extend<T>`, `C: FromIterator<T>` (`collect()` and `C::from_iter` by `C`'s class, now also
+   passed for std maps, sets and `VecDeque`), `T: Any`, and `clone_from` on any `Clone` value
+   (it was missing on concrete types too). `R: Read`, `BufRead`, `Write`, `Future` and
+   `IntoIterator` (also path-qualified, `io::Read`) already worked by then. Left:
+   `read_vectored` (`IoSliceMut`), and `TypeId::of::<T>()` for a `T: Any` (types are erased).
+5. **Operators on `Self` whose bound comes through a supertrait** (12 files, 1 solo, 10 crates;
+   78 overall, most of the rest in unsafe files): `trait Float: PartialOrd { fn is_nan(self) ->
+   bool { self != self } }` fails on `!=`, `<`, `*`, `/`, `|` and `+` (num-traits, libm, petgraph's
+   page_rank, ring's sha2, rand_distr, winnow, leb128fmt). The same operators on a function's own
+   `T: PartialEq` bound work. **Done** (2026-11-26, `fixtures/supertrait_operators.rs`): a
+   bound's supertraits count for operators on `Self` and on a `T: Float`, and an integer `/` on
+   `Self` in a default method's copy for `i32` truncates.
+
+Runners-up: a blanket `impl<T: Tr + ?Sized> Tr for &T / &mut T / Box<T>` with behavior of its own
+(11 files, 4 solo, 9 crates; 18 overall: serde's forwarded impls, syn's `Parse for Box<T>`, quote,
+borsh, clap_builder, writeable); **done** 2026-11-26 for impls that forward once references and boxes are
+erased (`fixtures/forwarding_impls.rs`: `Self::new(T::f())`, `.map(Box::new)`, `<T as Tr>::f(*self)`,
+`Borrow::borrow(self)`, `self.clone().f()`, a forwarder leaving a default another impl overrides,
+a `write_fmt` of the file's own trait): 15 of the 22 files with the error lose it; left are impls
+that do differ (powerfmt's `.reuse()`, tracing-core's `drop_span` / `downcast_raw`, wasm-bindgen's
+`inform(REF)`), syn's `input.parse().map(Box::new)` and bodies made by another file's macro
+(wasmparser, writeable's `try_writeable`); `write!` into a generic sink or a `&mut` kept in a variable (8
+files, all solo, 3 crates: clap_builder's usage, heck, rustversion); `let [a, b] = x.to_le_bytes()`
+and `for [a, b] in rows` reported as refutable because the array type is lost through a std return
+or slice iteration (4 files: zerovec, ring, wasm-bindgen-cli-support, itertools' iris example; a
+`let [first, .., last] = v` on an array parameter and `|[a, b]|` closure parameters work); a
+generic trait implemented more than once for one type and called through `T` (8 files, 3 solo);
+and an inherent `impl dyn Tr { .. }` (walrus). Of the 18 "no method on a type parameter" files
+that are left, the bound's trait lives in another file (hashbrown's `Equivalent`, rayon's
+`Consumer`, serde_json's `Read`). The probes (`q1a..q10*.rs`), the re-keyed ranking (`flip2.mjs`),
+a per-file error dumper (`errs.mjs`) and the driver (`probe.mjs`) are in the OS temp dir under
+`carciniscript-probes-2026-11-26/`.
+
+**Open items at a glance** (2026-11-26). One plain-words sentence, a time estimate and an
+importance rating for each item above. The estimates are calibrated against 2026-11-26, when
+eleven gaps of this size closed in one day; importance weighs how often a Bitburner script would
+hit the shape over how many registry files do.
+
+1. **One trait for types that share a JS representation.** A trait written once for borrowed text
+   and once for owned text (or for a slice and a vector) fails because both become the same kind
+   of JS value, so the compiler has to pick the right one when it compiles each call instead of
+   leaving it to the running program. Estimate: 1–2 days, the largest item here; `f32` with `f64`
+   shows the mechanism. Importance: high. Implementing a trait for both `str` and `String` is an
+   ordinary Rust habit, and 29 crates do it. **Done 2026-11-26 for direct calls**; calls through a
+   type parameter or `dyn` remain (they need the borrowed/owned distinction in the type itself,
+   which is erased today): 1–2 days more.
+2. **Asking a type parameter for a constant or method from inside a method.** Generic code that
+   says "whatever type I am over, give me its zero" or calls a method on a type the trait only
+   names indirectly is not resolved. Estimate: 1 day. Importance: high. This is the shape of a
+   generic numeric helper, which is what a player's utility library turns into; 22 crates.
+   **Done 2026-11-26**, apart from the three shapes listed under item 2 above.
+3. **Auto-generated `Clone`, `Eq` and `Copy` over standard wrappers.** The derived impl is refused
+   when a field is a shared pointer, a copy-on-write string or a fixed-size array, though Rust
+   accepts all three. Estimate: 2–4 hours, three entries in the std model. Importance: medium.
+   Cheap, and each hit blocks the whole struct; `Rc<T>` under a derived `Clone` and arrays under
+   `Copy` are everyday shapes. **Done 2026-11-26.**
+4. **Standard capabilities as bounds on type parameters.** Generic functions that require a
+   standard capability such as readable, iterable or error-like are rejected outright, or
+   accepted without all the methods that capability brings. Estimate: half a day to 1 day; each
+   bound is an entry, each missing method a line. Importance: high for `IntoIterator` and
+   `Error`, which scripts write; low for `Read`, `BufRead` and `Future`, which they rarely do.
+   **Done 2026-11-26**: `Error`, `Extend`, `FromIterator`, `Any` and `clone_from`; `Read`,
+   `BufRead`, `Future` and `IntoIterator` turned out to work already.
+5. **Operators inherited through a parent trait.** A trait that builds on a comparison or
+   arithmetic trait cannot use those operators on its own values inside its default methods.
+   Estimate: 2–4 hours, walking the supertrait chain where the function-bound case already
+   looks. Importance: medium. Numeric trait hierarchies; 78 files overall. **Done 2026-11-26.**
+6. **Forwarding impls with behavior of their own.** An impl that says every reference or box to a
+   thing with the trait also has the trait, and adds code of its own, is not honored. Estimate: 1
+   day. Importance: low to medium, a library-author shape that scripts seldom write.
+   **Done 2026-11-26** for impls that forward once references and boxes are erased, which is
+   every corpus hit but a few; an impl that really behaves differently for `&T` stays an error
+   (`&T` and `T` are one JS value, so nothing can tell them apart at run time).
+7. **Formatting into an output held in a variable or passed generically.** `write!` works into a
+   string but not into a reference to one kept in a variable, nor into a generic sink. Estimate:
+   2–4 hours. Importance: medium. Building a report string through a `&mut` variable is a normal
+   script pattern, and every hit is the only error in its file.
+8. **Taking apart a fixed-size list that came from a standard function.** A pattern like `[a, b]`
+   fails when the list came from a std call or from looping over rows, because its length is
+   lost on the way. Estimate: 2–4 hours. Importance: low to medium. `for [a, b] in rows` reads
+   naturally in grid code; 4 files.
+9. **One trait implemented several times for one type with different parameters, called
+   generically.** The call cannot tell the impls apart. Estimate: 1–2 days, since dispatch has
+   to key on the trait's argument (the prelude notes record the same shape miscompiling there).
+   Importance: medium. `From<A>` and `From<B>` for one type is the archetype; 8 files.
+10. **Methods written directly on a trait-object type.** Methods declared in an `impl dyn Tr`
+    block are not found. Estimate: 2–3 hours. Importance: low, one crate.
+11. **Survey tooling: re-key the "mismatched types" rules.** The finer sort still looks for an old
+    error wording, so 107 files sit in one unexplained bucket. Estimate: 1–2 hours. Importance:
+    medium for reading the survey, none for users.
+12. **Survey tooling: profile the slowest-per-line files.** Find out why a few files take far
+    longer per line than the rest. Estimate: half a day. Importance: low; the full run is already
+    under 8 minutes.
+
+**Where the remaining gaps were** (2026-11-25, a "flip" pass over the run: for every file that
 isn't language-OK, the set of gaps in it, with memory, FFI, `union`, proc-macro, files,
 processes, sockets, env and threads treated as never fixable; 845 of the 1,797 failing files have
 only fixable gaps, and no single gap flips more than 30 of them, so the long tail is the shape).
@@ -409,12 +582,64 @@ file (`--resume` continues an interrupted run) and skips the test build
 - Not worth it (measured): tuning the classification regexes, trimming the JSON payload or
   `rendered`, caching resolver reads (11k reads, 59 MB per 292 files, but cheap), a native port.
 
+## Gaps from the feature chart (2026-11-26)
+
+What FEATURES.md still marks ⬜ or calls out as missing, each confirmed against the current tree
+with a small probe, in order of how often a script would hit it. Gaps the registry ranking above
+already carries ("Open items at a glance") are referenced, not repeated.
+
+- [ ] **`&mut dyn Write` kept in a struct field or taken by a closure.** `struct Rep<'a> { out:
+  &'a mut dyn fmt::Write }` with `write!(self.out, ..)` is "cannot write into a value of type
+  `dyn FmtWrite`", and `|w: &mut dyn Write| write!(w, ..)` is a type mismatch; the parameter form,
+  `Box<dyn io::Write>` and `W: Write` type parameters work. The field half of open item 7.
+  Estimate: 2–4 hours. Importance: medium (a report builder that keeps its sink).
+- [ ] **`Into<String>` from a `char`.** `fn f(s: impl Into<String>)` given `'c'` is "mismatched
+  types", and `let s: String = 'x'.into()` is "the trait bound `String: From<char>` is not
+  satisfied"; `&str` and `String` sources work. Audit the other std `From` impls that aren't the
+  identity at the same time. Estimate: 1–2 hours in the std `From` table. Importance: medium.
+- [ ] **Re-exporting a `mod` file's item from an inline module.** `mod prelude { pub use
+  crate::geo::Point; }` then `use prelude::Point;` fails with "cannot find struct
+  `prelude__Point`": the flattener renames the `use` target instead of resolving it to
+  `geo::Point`. Estimate: 2–3 hours in `modflat`. Importance: medium (the `prelude` module idiom).
+- [ ] **tokio: `time::interval`, `sync::oneshot`, `broadcast`, `watch`, `Notify`, and
+  `#[tokio::test]`.** None are in `tokio_prelude.rs`; `oneshot` and `interval` are what a script
+  reaches for, and the test build skips `#[tokio::test]` functions. Estimate: half a day for the
+  primitives (the prelude already has timers and queues), 1 hour for `#[tokio::test]` (a `#[test]`
+  whose body is awaited). Importance: medium.
+- [ ] **`#[must_use]` and `#[deprecated]` on the program's own items.** `calc();` with
+  `#[must_use] fn calc()` (or a `#[must_use]` struct) doesn't warn `unused_must_use`, and calling
+  a `#[deprecated]` function doesn't warn `deprecated`; std's `Result`, `write!` and the iterator
+  adapters do warn. Estimate: 1–2 hours in `lints.rs`. Importance: low to medium.
+- [ ] **Proc-macro API edges.** `syn::Expr` / `syn::Type` matched as enums (they are token lists
+  here), `Span` values beyond `call_site()`, `ParseStream::step` / `cursor`. Estimate: 1 day for a
+  token-list-backed `Expr` enum with the common variants; the rest as needed. Importance: low.
+- [ ] **Smaller checks the compiler skips:** `pub(in crate::..)` visibility (the `super` forms are
+  checked); `T::Error` of a `TryFrom<X>` bound; `#[cfg(..)]` on an element inside a macro's
+  arguments (`vec![#[cfg(..)] x]`); exhaustiveness of a `match` on an enum from another crate.
+  Each an hour or two. Importance: low (none changes what runs).
+- [ ] **`js` crate:** `requestIdleCallback` / `cancelIdleCallback`, and `crypto.subtle.digest` as
+  an `async fn` returning `Vec<u8>`. Estimate: 1 hour in `bindings/js.rs`. Importance: low.
+- [ ] **Raw pointers to numbers in struct fields or as return values, and `as_mut()` on one.**
+  Errors today, where the local and collection cases work. Estimate: half a day. Importance: low,
+  next to the not-planned pointer arithmetic.
+
+Closed while checking, and FEATURES.md updated: `Option::flatten`, `Box<[T]>` / `Box<str>`, an
+enum's `impl<T>` methods reading `T`'s class, a `Vec<&mut i32>` built by `push(&mut a)`,
+`get_mut(..).unwrap_or_else(..)` and `o.as_mut().map(|n| *n += 1)` on a local all work and were
+still marked as gaps. `super::` at the top of a module file is now marked ❌ there, matching "Not
+planned" above.
+
 ## Known bugs
 
-Found in passing and not fixed yet (checked against the current tree, 2026-11-25). Gaps that are
+Found in passing and not fixed yet (checked against the current tree, 2026-11-26). Gaps that are
 by design or long-standing differences from rustc are in `RUST_GAPS.md`.
 
-None open.
+- [ ] `if let Some(n) = o.as_mut() { bump(n) }` (and `match o.as_mut() { Some(n) => bump(n), .. }`)
+  on a *local* `Option<i32>`: `n` reaches the `&mut i32` parameter as the bare number, so `bump`
+  writes `n[0]` on a number and throws `TypeError: Cannot create property '0' on number '5'`. The
+  same on a struct field (`s.t.as_mut()`) gets a `κσ.$cell` and works, and so do
+  `o.as_mut().map(bump)` and `*o.as_mut().unwrap() += 1`. Found 2026-11-26 while checking
+  FEATURES.md (the `ref mut` / `as_mut()` row).
 
 ## Risks
 

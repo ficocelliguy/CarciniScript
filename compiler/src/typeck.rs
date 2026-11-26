@@ -57,6 +57,8 @@ mod slots;
 mod std_lib;
 #[path = "typeck_trait.rs"]
 mod traits;
+#[path = "typeck_twins.rs"]
+mod twins;
 pub use arrays::array_try_from_len;
 pub use crates::CrateCall;
 pub use ext::{char_predicate, is_option_closure_method};
@@ -409,6 +411,7 @@ impl<'a> Checker<'a> {
             copy_arrays: Default::default(),
             copy_array_consts: Default::default(),
             copy_array_assoc: Default::default(),
+            twin_sides: HashMap::new(),
             str_locals: Default::default(),
             ref_vecs: Default::default(),
             move_sites: Default::default(),
@@ -422,6 +425,8 @@ impl<'a> Checker<'a> {
             fmt_writes: Default::default(),
             array_fields: Default::default(),
             shared_ref_fields: Default::default(),
+            rc_fields: Default::default(),
+            array_ann_fields: Default::default(),
             fn_ptr_fields: Default::default(),
             array_reads: Default::default(),
             iter_of_args: Default::default(),
@@ -686,6 +691,7 @@ pub fn check(
     c.check_impls(file);
     c.check_trait_defaults(file);
     c.check_trait_scopes(file, origin);
+    c.check_twin_paths();
     let map: HashMap<(usize, usize), Ty> = c.raw.iter().map(|(k, t)| (*k, c.zonk(t))).collect();
     let float_set = |t: &Ty| -> bool {
         fn walk(t: &Ty) -> bool {
@@ -988,6 +994,9 @@ struct Checker<'a> {
     pub(super) copy_array_consts: std::collections::HashSet<String>,
     /// Associated `const`s that are fixed-size arrays of `Copy` values, by type and name.
     pub(super) copy_array_assoc: std::collections::HashSet<(String, String)>,
+    /// Path calls that may reach a `str` / `String` (or `[T]` / `Vec<T>`) pair of impls (see
+    /// `Adts::own_twins`): the method, and whether the call is for the owned type (None: unknown).
+    twin_sides: HashMap<(usize, usize), (String, Option<bool>)>,
     /// `let` locals whose initializer is certainly a `&str` (`let s = "a";`, `let t = s;`,
     /// `let u = x.as_str();`), by declaration: `s + ".."` is rustc's E0369.
     str_locals: std::collections::HashSet<(usize, usize)>,
@@ -1016,6 +1025,10 @@ struct Checker<'a> {
     /// Fields declared as shared references (`&'a [u8]`, `Option<&T>`): `Copy` and `Clone`
     /// whatever they point at. (struct or variant, field)
     pub(super) shared_ref_fields: std::collections::HashSet<(String, String)>,
+    /// Fields declared as `Rc<T>` / `Arc<T>`: `Clone` whatever `T` is. (struct or variant, field)
+    pub(super) rc_fields: std::collections::HashSet<(String, String)>,
+    /// Fields declared as `[T; N]`: `Copy` when `T` is. (struct or variant, field)
+    pub(super) array_ann_fields: std::collections::HashSet<(String, String)>,
     /// Fields declared as function pointers (`fn(u8) -> u8`, `Option<fn()>`): typed as closures,
     /// but `Copy`, `Clone`, `Debug` and `PartialEq`. (struct or variant, field)
     pub(super) fn_ptr_fields: std::collections::HashSet<(String, String)>,
@@ -6835,6 +6848,12 @@ impl<'a> Checker<'a> {
                     self.check(a, p);
                 }
                 self.record_ext(c.syntax(), key);
+                // (`String::decode(..)` next to `impl Decode for &str`: by the path's type.)
+                if self.twin_name(f) {
+                    let side = path.qualifier().and_then(|q| self.qualifier_owned(&q, c.syntax()));
+                    let r = self.range(c.syntax());
+                    self.twin_sides.insert(r, (f.to_string(), side));
+                }
                 return sig.ret;
             }
         }
@@ -7828,6 +7847,13 @@ impl<'a> Checker<'a> {
         // (A generic trait implemented twice for the type: the impl whose signature fits.)
         // (Impls for two tuples of one length: by the receiver's elements.)
         let method = match crate::adt::ext_key_of(&self.shallow(&rt)) {
+            // (One trait for both `str` and `String` (`[T]` and `Vec<T>`): by how the receiver is
+            // written.)
+            Some(key @ ("String" | "Vec"))
+                if self.adts.own_twins.contains(&format!("{key}::{method}")) =>
+            {
+                self.pick_twin(m, &recv, key, &method)
+            }
             Some(key) => {
                 let targs = match self.shallow(&rt) {
                     t @ Ty::Tuple(_) => crate::adt::ext_args(&t),
@@ -8075,7 +8101,8 @@ impl<'a> Checker<'a> {
         // Trait methods on an unsuffixed literal use the literal's fallback type, as in rustc.
         let trait_method = matches!(
             method.as_str(),
-            "to_string" | "clone" | "eq" | "ne" | "partial_cmp" | "lt" | "le" | "gt" | "ge"
+            "to_string" | "clone" | "clone_from" | "eq" | "ne" | "partial_cmp" | "lt" | "le" | "gt"
+                | "ge"
         ) || (self.var_kind(&rt) == Some(VarKind::Int)
             && matches!(method.as_str(), "max" | "min" | "clamp" | "cmp"));
         let resolved = match self.var_kind(&rt) {
@@ -8106,6 +8133,19 @@ impl<'a> Checker<'a> {
         if method == "clone" || method == "to_owned" {
             self.arg_count(m.syntax(), "method", 0, args.len());
             return rt;
+        }
+        // `a.clone_from(&b)`: `*a = b.clone()`, for a `Clone` type without a `clone_from` of
+        // its own.
+        if method == "clone_from"
+            && !matches!(&resolved, Ty::Adt(n, _) if self.adts.method(n, "clone_from").is_some())
+            && self.satisfies(&resolved, "Clone")
+        {
+            self.check_mutable(&recv, Mutation::Borrow);
+            self.arg_count(m.syntax(), "method", 1, args.len());
+            if let Some(a) = args.first() {
+                self.check(a, &resolved);
+            }
+            return Ty::Unit;
         }
 
         // `sig(params, ret)` checks the arguments against `params` and returns `ret`.
@@ -10832,6 +10872,16 @@ impl Checker<'_> {
         {
             self.class_dispatch.insert(r);
         }
+        // (`<String as Tr>::m(..)` by the written type, `Tr::m(&s)` by its argument: decided now,
+        // while the locals are in scope.)
+        if self.twin_name(&method) {
+            let side = match (&anchor_ty, receiver, args.first()) {
+                (Some(t), _, _) => twins::written_owned(t),
+                (None, true, Some(a)) => self.twin_arg_side(a),
+                _ => None,
+            };
+            self.twin_sides.insert(r, (method.clone(), side));
+        }
         self.qualified_calls.insert(
             r,
             QualifiedCall {
@@ -10873,6 +10923,24 @@ impl Checker<'_> {
         let mut out: Vec<String> = Vec::new();
         let mut todo: Vec<String> = match (self.param_bounds.get(param), param.rsplit_once("::")) {
             (Some(b), _) => b.clone(),
+            // `Vector::Mask`, a trait's own template for `Self::Mask` (a default method's
+            // `self.movemask()`): what `Vector` or a supertrait declares.
+            (None, Some((p, a))) if !self.param_bounds.contains_key(p) && self.adts.traits.contains_key(p) => {
+                let mut seen: Vec<String> = Vec::new();
+                let mut tr_todo = vec![p.to_string()];
+                let mut found = Vec::new();
+                while let Some(t) = tr_todo.pop() {
+                    if seen.contains(&t) {
+                        continue;
+                    }
+                    seen.push(t.clone());
+                    if let Some(d) = self.adts.traits.get(&t) {
+                        found.extend(d.assoc_bounds.get(a).cloned().unwrap_or_default());
+                        tr_todo.extend(d.supers.iter().cloned());
+                    }
+                }
+                found
+            }
             // `T::P` with `T: Fac` and `trait Fac { type P: Parser; }`: what `Fac` declares.
             (None, Some((p, a))) => self
                 .bound_traits(p)
@@ -10901,10 +10969,7 @@ impl Checker<'_> {
             return;
         }
         let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
-            Some((ty, m)) => self
-                .adts
-                .method(ty, m)
-                .is_some_and(|s| s.dict_names().iter().any(|p| p == param)),
+            Some((ty, m)) => self.own_dict_param(ty, m, param),
             None => true,
         });
         match (own, need) {
@@ -11020,10 +11085,7 @@ impl Checker<'_> {
     /// it can't (a trait's default method, an impl for a tuple or `Vec<T>`).
     pub(super) fn try_note_dict(&mut self, param: &str) -> bool {
         let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
-            Some((ty, m)) => self
-                .adts
-                .method(ty, m)
-                .is_some_and(|s| s.dict_names().iter().any(|p| p == param)),
+            Some((ty, m)) => self.own_dict_param(ty, m, param),
             None => true,
         });
         match own {
@@ -11052,6 +11114,9 @@ impl Checker<'_> {
             if !bounds.contains(&tr) {
                 bounds.push(tr);
             }
+        }
+        for tr in bounds.clone() {
+            self.twin_generic_call(c.syntax(), &tr, f);
         }
         // `T::from(x)` with `T: From<X>`.
         if f == "from" && self.param_has(param, "From") {
@@ -11096,6 +11161,15 @@ impl Checker<'_> {
                 Box::new(pty),
                 Box::new(Ty::Param(format!("{param}::Error"))),
             ));
+        }
+        // `C::from_iter(xs)` with `C: FromIterator<T>`: by `C`'s class.
+        if f == "from_iter" && self.param_has(param, "FromIterator") {
+            self.arg_count(c.syntax(), "function", 1, args.len());
+            for a in args {
+                self.infer(a, None);
+            }
+            self.note_dict(param, c.syntax());
+            return Some(pty);
         }
         if f == "default" && bounds.iter().any(|b| b == "Default") {
             self.arg_count(c.syntax(), "function", 0, args.len());
@@ -11215,10 +11289,7 @@ impl Checker<'_> {
             return;
         }
         let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
-            Some((ty, m)) => self
-                .adts
-                .method(ty, m)
-                .is_some_and(|s| s.dict_names().iter().any(|p| p == param)),
+            Some((ty, m)) => self.own_dict_param(ty, m, param),
             None => true,
         });
         if let Some(f) = own {
@@ -11266,6 +11337,19 @@ impl Checker<'_> {
     /// for, in the order of its type arguments: a function's type parameters then their
     /// projections (`S::Unit`), in the order `instantiate` gives them variables; a method's
     /// `dict_names`.
+    /// Whether `param` is one `ty::m` takes a class for: its own type parameter, or its impl's in
+    /// an associated function. (`ty` may be a trait whose default method `m` is.)
+    fn own_dict_param(&self, ty: &str, m: &str, param: &str) -> bool {
+        match self.adts.method(ty, m) {
+            Some(s) => s.dict_names().iter().any(|p| p == param),
+            None => self.adts.traits.get(ty).is_some_and(|d| {
+                d.methods
+                    .iter()
+                    .any(|t| t.name == m && t.sig.type_params.iter().any(|p| p == param))
+            }),
+        }
+    }
+
     fn need_names(&self, f: &str) -> Vec<String> {
         match f.split_once("::") {
             // A method: `Type::name`.
@@ -11582,6 +11666,36 @@ impl Checker<'_> {
                     });
                     if any {
                         uses.push((callee.clone(), n));
+                    }
+                }
+            }
+            // A trait's method with type parameters of its own (`fn visit<E: Kind>`), its default
+            // and each type's (own or inherited) take the same classes, by position: a call
+            // through a bound or `dyn` (`Tr::m`) can't tell which one it reaches.
+            for (tr, def) in &self.adts.traits {
+                for tm in def.methods.iter().filter(|tm| !tm.sig.type_params.is_empty()) {
+                    let mut all: Vec<(String, Vec<String>)> = self
+                        .adts
+                        .trait_impls
+                        .iter()
+                        .filter(|(_, trs)| trs.iter().any(|t| t == tr))
+                        .filter_map(|(ty, _)| {
+                            let s = self.adts.method(ty, &tm.name)?;
+                            Some((format!("{ty}::{}", tm.name), s.type_params.clone()))
+                        })
+                        .collect();
+                    all.push((format!("{tr}::{}", tm.name), tm.sig.type_params.clone()));
+                    for i in 0..tm.sig.type_params.len() {
+                        let needed = all.iter().any(|(k, ps)| {
+                            ps.get(i).is_some_and(|n| needs.contains(&(k.clone(), n.clone())))
+                        });
+                        if needed {
+                            for (k, ps) in &all {
+                                if let Some(n) = ps.get(i) {
+                                    uses.push((k.clone(), n.clone()));
+                                }
+                            }
+                        }
                     }
                 }
             }

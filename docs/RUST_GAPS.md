@@ -307,7 +307,8 @@ There is one JS thread, and scripts share it with the game.
   arguments), numbers by their JS type and the target's range (so a boxed `5u8` is also an
   `i32`, a `u64` and an `f64`; `i128` / `u128` are BigInts and tell apart), a `String` and a
   `&str` alike (also a one-char string and a `char`). `Option` / `Result` / closures can't be
-  told apart (an error). `type_id()` of a `dyn Any` isn't known (use `is::<T>()`); `TypeId`'s
+  told apart (an error). `type_id()` of a `dyn Any` isn't known (use `is::<T>()`); nor is
+  `TypeId::of::<T>()` / `t.type_id()` for a type parameter `T: Any` (an error); `TypeId`'s
   `{:?}` is the type's name, not a hash, and `String` / `&str` share one. `type_name` puts the
   file's name as the crate (`my_script::Point`), ignoring the `mod` a type is in.
 - **`PhantomData`'s `{:?}` is `PhantomData<_>`**: Rust names the type (`PhantomData<i32>`), whose
@@ -566,6 +567,11 @@ There is one JS thread, and scripts share it with the game.
   build (`--debug` comparisons), where Rust panics. `T::Err` of a `T: FromStr` and `T::Error`
   of a `T: TryFrom<X>` are unchecked, and a `T: TryFrom<X>` given a type without that impl fails
   when the call runs, not at compile time.
+- **Where a type parameter's class can't reach**, `T::f()` / `T::CONST` is an error: a method
+  with `self` of `impl<T: Tr> Tr2 for Vec<T>` (or a tuple; the value carries no class for its
+  elements, as rustls's `T::SIZE_LEN` needs), an associated const of a generic impl that reads
+  `T` (`const ZERO: Self = Wrapping(T::ZERO);`, num-traits), and a trait's type parameter that
+  only its arguments name (`impl<E: Default> Tr<E> for (Ix, Ix)`, petgraph).
 - **Generic functions take each `Fn`-bounded type parameter as a single concrete closure type**,
   so one function can't be called with closures of different signatures.
 - **`T: Into<PathBuf>` (and other non-number targets) is the target type itself**, so a closure
@@ -635,17 +641,30 @@ There is one JS thread, and scripts share it with the game.
   class for every iterator and adapter: a second iterator type's impl of the same trait
   conflicts. `Cell<T>` shares `RefCell<T>`'s. (Each range type has its own: `Range`,
   `RangeFrom`, `RangeTo`, `RangeFull`, ..)
-- **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`, `Path` and `PathBuf`): one
-  type in JS, so the borrowed type's impl serves both. The owned one must hand each call on to it
-  (`self.as_str().f(a)`, `Tr::f(&self.as_str())`, `self[..].f()`) or do what the borrowed one's
-  method does (the same body, with `self.as_str()` / `(*self).as_ref()` / `&self[..]` read as
-  `self`); one that does something else (zeroize's `Vec` impl also truncates) is an error.
+- **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`): one type in JS. When the
+  owned impl hands each call on to the borrowed one or does the same thing, the borrowed impl
+  serves both. When they differ, each call picks its impl at compile time by how the receiver is
+  written: a literal, `as_str()` / `&s[..]` / an array, `to_string()` / `format!` / `vec![..]`, a
+  local's or parameter's declared type (or its initializer), a struct field's declared type, a
+  function's return type, `self` in either impl, or the path (`String::f(..)`, `<&str as Tr>::f(..)`).
+  A receiver none of these settles (an element `v[0]` of a `Vec<String>`, a closure parameter,
+  another file's field) is an error that asks for a declared type. So is a call through a type
+  parameter or `dyn` (`fn f<T: Tr + ?Sized>(t: &T) { t.f() }`): which impl runs depends on a type
+  erased at run time. So is an owned impl that leaves the trait's default methods to the
+  default (whose `self.f()` can't tell the two apart). `Path` and `PathBuf` keep the older rule
+  (the owned impl must hand each call on to the borrowed one or do the same), and impls for both
+  `u8` and `NonZeroU8` (one number in JS) are a conflict.
 - **Arrays and slices share `Vec`'s impls**: `impl Tr for [u8; 4]` and `impl Tr for Vec<u8>` (or
   `[u16]`) would collide, and the element type isn't checked.
 - **`impl Tr for &T` / `&mut T` / `Box<T>` must forward to `T`'s impl.** References and boxes are
   erased, so `&x` is `x` and its methods are `T`'s: an impl whose methods each call `T`'s
-  (`(**self).f(a)`, `T::f(self, a)`, `self.as_ref().f(a)`) is left out, and one that does
-  anything else (or leaves to the default a method another impl overrides) is an error.
+  (`(**self).f(a)`, `T::f(self, a)`, `<T as Tr>::f(*self, a)`, `self.as_ref().f(a)`,
+  `Borrow::borrow(self).f()`, `self.clone().f()` for a `fn f(self)`, and associated functions
+  that wrap `T`'s result: `Self::new(T::f())`, `T::f().map(Box::new)`) is left out, and one that
+  does anything else (`format!("&{}", (**self).f())`, `(**self).f().reuse()`) is an error. A
+  default method the forwarding impl leaves to the trait while `T`'s impl overrides it runs `T`'s
+  override, where rustc runs the default for `&T`. `<Box<T>>::f()` written out (not through a
+  type parameter) isn't found, the impl being left out.
 - **`impl PartialEq for Box<dyn Tr>` doesn't move the operands of `==`.** rustc's `a == b`
   on two such boxes moves `b` (and a derived `PartialEq` over a bare `Box<dyn Tr>` field is its
   E0507); here both compile and `b` stays usable. Write `&a == &b` for code rustc accepts.

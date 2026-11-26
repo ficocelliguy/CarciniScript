@@ -384,6 +384,11 @@ impl Checker<'_> {
                     _ => true,
                 }
             }
+            // `C: FromIterator<T>`: by `C`'s class.
+            Ty::Param(p) if self.param_has(&p, "FromIterator") => {
+                self.param_class(&p, node, None);
+                true
+            }
             Ty::Unknown => true,
             Ty::Var(_) => return None,
             _ => false,
@@ -1398,6 +1403,11 @@ impl Checker<'_> {
                             | Ty::Coll(..)),
                         ) => t,
                         Some(t @ Ty::Adt(..)) if matches!(&t, Ty::Adt(n, _) if n == "TokenStream") => {
+                            t
+                        }
+                        Some(t @ Ty::Param(_))
+                            if matches!(&t, Ty::Param(p) if self.param_has(p, "FromIterator")) =>
+                        {
                             t
                         }
                         _ => fresh(self),

@@ -322,9 +322,13 @@ impl Checker<'_> {
                 _ => None,
             })
             .collect();
+        // (And an impl for `String` / `Vec<T>` after one for `str` / `[T]`: see `own_twins`.)
         impls.sort_by_key(|imp| {
-            !imp.trait_()
-                .is_some_and(|t| t.syntax().text().to_string().ends_with("Deref"))
+            (
+                !imp.trait_()
+                    .is_some_and(|t| t.syntax().text().to_string().ends_with("Deref")),
+                crate::adt::twin_side(imp) == Some(true),
+            )
         });
         for imp in &impls {
             self.collect_impl(imp);
@@ -1072,6 +1076,13 @@ impl Checker<'_> {
                             self.shared_ref_fields
                                 .insert((variant_name.to_string(), name.clone()));
                         }
+                        if f.ty().as_ref().is_some_and(rc_type) {
+                            self.rc_fields.insert((variant_name.to_string(), name.clone()));
+                        }
+                        if matches!(f.ty(), Some(ast::Type::ArrayType(_))) {
+                            self.array_ann_fields
+                                .insert((variant_name.to_string(), name.clone()));
+                        }
                         if f.ty().as_ref().is_some_and(fn_ptr_type) {
                             self.fn_ptr_fields
                                 .insert((variant_name.to_string(), name.clone()));
@@ -1122,6 +1133,13 @@ impl Checker<'_> {
                         }
                         if f.ty().as_ref().is_some_and(shared_ref_type) {
                             self.shared_ref_fields
+                                .insert((variant_name.to_string(), i.to_string()));
+                        }
+                        if f.ty().as_ref().is_some_and(rc_type) {
+                            self.rc_fields.insert((variant_name.to_string(), i.to_string()));
+                        }
+                        if matches!(f.ty(), Some(ast::Type::ArrayType(_))) {
+                            self.array_ann_fields
                                 .insert((variant_name.to_string(), i.to_string()));
                         }
                         if f.ty().as_ref().is_some_and(fn_ptr_type) {
@@ -1204,6 +1222,15 @@ impl Checker<'_> {
                         && self
                             .shared_ref_fields
                             .contains(&(v.name.clone(), f.name.clone()));
+                    // `Rc<T>` / `Arc<T>` is `Clone` whatever `T` is.
+                    let rc = d == "Clone"
+                        && self.rc_fields.contains(&(v.name.clone(), f.name.clone()));
+                    // `[T; N]` is `Copy` when `T` is (also a type parameter, as derived impls require).
+                    let param_array = d == "Copy"
+                        && self
+                            .array_ann_fields
+                            .contains(&(v.name.clone(), f.name.clone()))
+                        && matches!(&f.ty, Ty::Vec(e) if !matches!(**e, Ty::Str) && self.implements(&subst(e, &unknowns), "Copy"));
                     let fn_ptr =
                         matches!(d.as_str(), "Copy" | "Clone" | "Debug" | "PartialEq" | "Eq")
                         && self
@@ -1212,6 +1239,8 @@ impl Checker<'_> {
                     if !copy_array
                         && !shared_ref
                         && !fn_ptr
+                        && !rc
+                        && !param_array
                         && !self.implements(&subst(&f.ty, &unknowns), d)
                     {
                         self.error(
@@ -1798,6 +1827,41 @@ impl Checker<'_> {
                     .map(|t| crate::adt::written_arg_ref(&t)),
                 _ => None,
             };
+            // One trait for both `str` and `String` (`[T]` and `Vec<T>`), one type in JS: the
+            // owned impl's methods under `m$own`, picked at each call by how the receiver is
+            // written.
+            if let Some(tr) = trait_name.as_deref()
+                && matches!(type_name.as_str(), "String" | "Vec")
+                && self.adts.traits.contains_key(tr)
+            {
+                match crate::adt::twin_side(imp) {
+                    Some(false) => {
+                        self.adts
+                            .twin_borrowed
+                            .insert((type_name.clone(), tr.to_string()));
+                    }
+                    Some(true)
+                        if self
+                            .adts
+                            .twin_borrowed
+                            .contains(&(type_name.clone(), tr.to_string())) =>
+                    {
+                        let key = format!("{}$own", name.text());
+                        let at = self.range(name.syntax()).0;
+                        self.adts.alt_keys_at.insert(at, key.clone());
+                        self.adts
+                            .own_twins
+                            .insert(format!("{type_name}::{}", name.text()));
+                        self.adts
+                            .methods
+                            .entry(type_name.clone())
+                            .or_default()
+                            .insert(key, method);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             // A generic trait's second impl for this type (`impl IntoS<u16> for Vec<u8>` after
             let foreign_cmp = matches!(trait_name.as_deref(), Some("PartialEq" | "PartialOrd"))
                 && foreign_rhs(imp, &type_name);
@@ -2415,7 +2479,33 @@ impl Checker<'_> {
             }
         }
         // `Punctuated::<Ident, Comma>::f`: the type's arguments, for the `impl`'s parameters.
-        let type_args = args_of(path.qualifier().and_then(|q| q.segment()));
+        let qual = path.qualifier().and_then(|q| q.segment());
+        // `Self::f()`: the impl's parameters are the enclosing impl's (`T` for `T`).
+        let self_args = qual
+            .as_ref()
+            .filter(|s| s.self_type_token().is_some())
+            .and_then(|_| {
+                let (ty, m) = self.cur_fn.as_deref()?.split_once("::")?;
+                Some(self.adts.method(ty, m)?.impl_args.clone())
+            });
+        if let Some(cur) = self_args {
+            let mut k = own;
+            let mut seen: Vec<String> = Vec::new();
+            for (i, ia) in impl_args.iter().enumerate() {
+                if let Ty::Param(u) = ia
+                    && !seen.contains(u)
+                {
+                    seen.push(u.clone());
+                    if let (Some(v), Some(t)) = (vars.get(k), cur.get(i)) {
+                        let t = t.clone();
+                        self.unify(v, &t);
+                    }
+                    k += 1;
+                }
+            }
+            return;
+        }
+        let type_args = args_of(qual);
         let mut k = own;
         let mut seen: Vec<String> = Vec::new();
         for (i, ia) in impl_args.iter().enumerate() {
@@ -3454,6 +3544,19 @@ impl Checker<'_> {
             }
         });
         found
+    }
+}
+
+/// `Rc<T>` / `Arc<T>` (`std::rc::Rc<T>`).
+fn rc_type(t: &ast::Type) -> bool {
+    match t {
+        ast::Type::ParenType(p) => p.ty().is_some_and(|t| rc_type(&t)),
+        ast::Type::PathType(p) => p
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|s| s.name_ref())
+            .is_some_and(|n| matches!(&*n.text(), "Rc" | "Arc")),
+        _ => false,
     }
 }
 

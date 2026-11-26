@@ -99,7 +99,7 @@ impl Checker<'_> {
         b
     }
 
-    fn note_crate(&mut self, node: &SyntaxNode, js: &str, tys: Vec<Ty>) {
+    pub(super) fn note_crate(&mut self, node: &SyntaxNode, js: &str, tys: Vec<Ty>) {
         let r = self.range(node);
         self.crate_calls.insert(
             r,

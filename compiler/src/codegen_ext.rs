@@ -1052,6 +1052,12 @@ impl Codegen<'_> {
                         "collectOption",
                         vec![Frag::text(format!("\"${}\"", into(c)))],
                     ),
+                    // `C: FromIterator<T>`: `$C.from_iter(it)`.
+                    Ty::Param(_) => {
+                        let mut f = Frag::text(format!("{}.from_iter(", self.dict_of(result_ty)));
+                        f.append(rf.clone()).push(")");
+                        f
+                    }
                     // `impl FromIterator<T> for Bag`: `Bag.from_iter(it)`.
                     Ty::Adt(n, _) if self.types.adts.method(n, "from_iter").is_some() => {
                         // (One of several `impl FromIterator<X>`: its key.)

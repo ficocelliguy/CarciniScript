@@ -1001,6 +1001,7 @@ fn compile_text(
         extra_consts: Vec::new(),
         ext_class: None,
         in_trait_default: false,
+        default_trait: String::new(),
         loop_dests: Vec::new(),
         prelude_at,
         crate_imports: Default::default(),
@@ -1205,6 +1206,8 @@ struct Codegen<'a> {
     pub(super) ext_class: Option<String>,
     /// Emitting a trait's default methods: `Self::f()` is `this` (static) or `this.constructor`.
     in_trait_default: bool,
+    /// The trait whose default methods are being emitted (`Tr::m` keys their classes).
+    default_trait: String,
     /// Enclosing loops, innermost last: (label, where a `loop`'s `break value` goes; None for
     /// `while`/`for`).
     loop_dests: Vec<(Option<String>, Option<Dest>, bool)>,
@@ -5973,6 +5976,16 @@ impl<'a> Codegen<'a> {
                 self.static_view(n, args, view)
             }
             Ty::Param(p) if self.dict_scope.contains(p) => format!("${p}"),
+            // (A trait default's copy in `$ext$i32`: `Self` is `i32`, so its `self / two`
+            // truncates.)
+            Ty::Param(p)
+                if p == "Self"
+                    && !self.in_trait_default
+                    && let Some(k) = &self.ext_class
+                    && let n @ (Ty::Int(_) | Ty::Float { .. }) = Ty::from_name(k) =>
+            {
+                self.dict_of_own(&n)
+            }
             // (The number kind: generic `/` truncates for integers, results wrap.)
             // (And your trait impls' associated functions, `T::zero()`.)
             Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => {
@@ -5986,9 +5999,28 @@ impl<'a> Codegen<'a> {
                     None => format!("κσ.$numT(\"{name}\")"),
                 }
             }
-            Ty::Str => "κσ.$prims.str".into(),
-            Ty::Bool => "κσ.$prims.bool".into(),
-            Ty::Char => "κσ.$prims.char".into(),
+            // (With your impls' associated functions and consts, `T::kind()` for `impl Kind for
+            // String`.)
+            Ty::Str | Ty::Bool | Ty::Char => {
+                let d = match t {
+                    Ty::Str => "κσ.$prims.str",
+                    Ty::Bool => "κσ.$prims.bool",
+                    _ => "κσ.$prims.char",
+                };
+                let adts = &self.types.adts;
+                let statics = |k: &str| {
+                    adts.methods
+                        .get(k)
+                        .is_some_and(|ms| ms.values().any(|m| m.receiver.is_none()))
+                        || adts.assoc_consts.get(k).is_some_and(|c| !c.is_empty())
+                };
+                match crate::adt::ext_key_of(t)
+                    .filter(|k| adts.ext_types.contains(*k) && statics(k))
+                {
+                    Some(key) => format!("κσ.$withStatics({d}, $ext${key})"),
+                    None => d.into(),
+                }
+            }
             // (With the element's class when it has one, for `impl<T> S<Vec<T>>`.)
             Ty::Vec(e) | Ty::Option(e) => {
                 let prim = if matches!(t, Ty::Vec(_)) { "vec" } else { "option" };
@@ -5999,7 +6031,12 @@ impl<'a> Codegen<'a> {
                 // (With your impls' associated functions, `A::size()` for `impl Array for
                 // [T; 4]`.)
                 match crate::adt::ext_key_of(t).filter(|k| self.types.adts.ext_types.contains(*k)) {
-                    Some(key) => format!("κσ.$withStatics({d}, $ext${key})"),
+                    Some(key) => {
+                        // (Which hand the element's class on: `T::decode(..)` in `impl<T> Decode
+                        // for Vec<T>`.)
+                        let view = format!("κσ.$withStatics({d}, $ext${key})");
+                        self.static_view(key, std::slice::from_ref(e.as_ref()), view)
+                    }
                     None => d,
                 }
             }
@@ -6010,6 +6047,22 @@ impl<'a> Codegen<'a> {
             ),
             // (`()`: `N::default()` for `Graph::<(), u32>::from_edges`'s new nodes.)
             Ty::Unit => "κσ.$prims.unit".into(),
+            // (Collections: `C::default()`, and `collect()` into a `C: FromIterator<T>`.)
+            Ty::Map(..) => "κσ.$prims.Map".into(),
+            Ty::Set(_) => "κσ.$prims.Set".into(),
+            Ty::Coll(k, view) => {
+                use crate::ty::Coll;
+                let k = match k {
+                    Coll::FixedArray(_) => return self.dict_of_own(view),
+                    Coll::VecDeque => "Deque",
+                    Coll::BinaryHeap => "Heap",
+                    Coll::BTreeMap => "BTreeMap",
+                    Coll::BTreeSet => "BTreeSet",
+                    Coll::IndexMap => "IndexMap",
+                    Coll::IndexSet => "IndexSet",
+                };
+                format!("κσ.$prims.{k}")
+            }
             _ => "undefined".into(),
         }
     }
@@ -6276,7 +6329,7 @@ impl<'a> Codegen<'a> {
                     let args = self.emit_args(c.arg_list(), &[]);
                     let mut out = Frag::mapped(
                         self.off(c.syntax()),
-                        format!("$ext${key}.{}(", adt_gen::prop(&q.method)),
+                        format!("$ext${key}.{}(", adt_gen::prop(&self.twin_key(c.syntax(), &q.method))),
                     );
                     out.append(Frag::join(args, ", ")).push(")");
                     return (out, ty);
@@ -6288,7 +6341,7 @@ impl<'a> Codegen<'a> {
                     let Some(recv) = all.first() else {
                         return (Frag::text("undefined"), ty);
                     };
-                    let sig = self.types.adts.method(&key, &q.method).cloned();
+                    let sig = self.types.adts.method(&key, &self.twin_key(c.syntax(), &q.method)).cloned();
                     let recv = strip_refs(recv);
                     let (rf, rt) = self.emit_expr(&recv, None);
                     let rf = if sig
@@ -6319,7 +6372,7 @@ impl<'a> Codegen<'a> {
                     }
                     let mut out = Frag::mapped(
                         self.off(c.syntax()),
-                        format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&q.method)),
+                        format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&self.twin_key(c.syntax(), &q.method))),
                     );
                     out.append(Frag::join(parts, ", ")).push(")");
                     return (out, ty);
@@ -6521,7 +6574,7 @@ impl<'a> Codegen<'a> {
                 let args = self.emit_args(c.arg_list(), &params);
                 let mut out = Frag::mapped(
                     self.off(c.syntax()),
-                    format!("$ext${key}.{}(", adt_gen::prop(f)),
+                    format!("$ext${key}.{}(", adt_gen::prop(&self.twin_key(c.syntax(), f))),
                 );
                 out.append(Frag::join(args, ", ")).push(")");
                 return (out, ret);
@@ -6754,7 +6807,20 @@ impl<'a> Codegen<'a> {
         {
             return rf.clone().wrap(&format!("{c}.call("), ")");
         }
-        let args = self.emit_args(m.arg_list(), &[]);
+        let mut args = self.emit_args(m.arg_list(), &[]);
+        // The classes for the method's own type parameters (`t.visit::<u8>()`, `E::kind()` in
+        // the impl or the trait's default).
+        if let Some(tys) = self
+            .types
+            .dict_args
+            .get(&self.range_of(m.syntax()))
+            .cloned()
+        {
+            for t in &tys {
+                args.push(Frag::text(self.dict_of(t)));
+            }
+        }
+        args.extend(self.dbg_arg_frags(m.syntax()));
         // `s.hash_one(x)` on an `S: BuildHasher`: the hasher it builds may be std's.
         if method == "hash_one"
             && let [x] = &args[..]
@@ -7505,6 +7571,33 @@ impl<'a> Codegen<'a> {
             _ => (rf, rt),
         };
 
+        // `a.clone_from(&b)` without a `clone_from` of `a`'s own: `*a = b.clone()`. An object
+        // keeps its identity (others may hold a `&mut` to it); any other value is written to
+        // the place.
+        if method == "clone_from"
+            && !matches!(&rt, Ty::Adt(n, _) if self.types.adts.method(n, "clone_from").is_some())
+        {
+            let src = match m.arg_list().and_then(|a| a.args().next()) {
+                Some(a) => self.emit_expr(&a, None).0,
+                None => Frag::text("undefined"),
+            };
+            let value = src.wrap("κσ.$clone(", ")");
+            let object = matches!(
+                rt,
+                Ty::Adt(..) | Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..) | Ty::Tuple(_)
+            ) && !self.types.adts.atom_ty(&rt);
+            let mut f = if object {
+                Frag::mapped(name_off, "κσ.$replace(")
+            } else {
+                if !self.place_receiver(&recv) {
+                    self.unsupported(&node, "`clone_from` on this expression");
+                }
+                Frag::text("(")
+            };
+            f.append(rf).push(if object { ", " } else { " = " }).append(value);
+            f.push(if object { ")" } else { ", undefined)" });
+            return (f, Ty::Unit);
+        }
         if let Ty::Extern(type_name) = &rt {
             let b = bindings::current();
             let sig = b
@@ -7650,6 +7743,21 @@ impl<'a> Codegen<'a> {
                 _ => rf.clone(),
             };
             return (f, ret);
+        }
+        // `c.extend(xs)` on a `C: Extend<T>`: by what `c` is at run time; a string's new value
+        // is written back (`c = κσ.$extendAny(c, xs)`).
+        if let Ty::Param(_) = &rt
+            && method == "extend"
+        {
+            let src = self.iterable_arg(m.arg_list().and_then(|a| a.args().next()));
+            let mut f = Frag::mapped(self.off(name.syntax()), "κσ.$extendAny(");
+            f.append(rf.clone()).push(", ").append(src).push(")");
+            if self.place_receiver(&recv) {
+                let mut w = rf.clone();
+                w.push(" = ").append(f);
+                f = w.wrap("(", ", undefined)");
+            }
+            return (f, Ty::Unit);
         }
         if let Ty::Param(_) = &rt {
             let name_off = self.off(name.syntax());
@@ -10774,4 +10882,15 @@ fn byte_reader(f: &ast::Fn, t: &ast::Type) -> bool {
                 && reads(pred.type_bound_list())
         })
     })
+}
+
+impl Codegen<'_> {
+    /// The key a path call of `method` goes by: `m$own` where the checker picked the `String` /
+    /// `Vec<T>` impl of a trait that has one for `str` / `[T]` too (see `Adts::own_twins`).
+    fn twin_key(&self, call: &ra_ap_syntax::SyntaxNode, method: &str) -> String {
+        match self.types.method_keys.get(&self.range_of(call)) {
+            Some(k) if k.ends_with("$own") => k.clone(),
+            _ => method.to_string(),
+        }
+    }
 }

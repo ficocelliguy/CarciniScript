@@ -1026,8 +1026,8 @@ const rejected = [
   ["a required trait const next to a default one", "}\ntrait T { const N: usize = 1; const M: usize; }\nstruct S;\nimpl T for S {}\nfn g() {", "5:12 not all trait items implemented, missing: `M`"],
   ["a trait const default of the wrong type", "}\ntrait T { const N: usize = \"x\"; }\nfn g() {", "3:28 mismatched types: expected `usize`, found `&str`"],
   ["get_or_insert on an immutable binding", "let o: Option<i32> = None;\n    *o.get_or_insert(1) += 1;", "3:6 cannot borrow `o` as mutable, as it is not declared as mutable"],
-  ["str and String impls that disagree", "}\ntrait S {\n    fn s(&self) -> String;\n}\nimpl S for str {\n    fn s(&self) -> String {\n        self.to_uppercase()\n    }\n}\nimpl S for String {\n    fn s(&self) -> String {\n        format!(\"{}!\", self)\n    }\n}\nfn g() {", "11:6 `S` is implemented for both `str` and `String` with different behavior: the `String` impl's methods must hand each call on to the `str` impl's"],
-  ["slice and Vec impls that disagree", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for [u8] {\n    fn s(&self) -> usize {\n        self.len()\n    }\n}\nimpl S for Vec<u8> {\n    fn s(&self) -> usize {\n        self.len() + 1\n    }\n}\nfn g() {", "11:6 `S` is implemented for both `[T]` and `Vec<T>` with different behavior: the `Vec<T>` impl's methods must hand each call on to the `[T]` impl's"],
+  ["str and String impls called through a type parameter", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for str {\n    fn s(&self) -> usize {\n        1\n    }\n}\nimpl S for String {\n    fn s(&self) -> usize {\n        2\n    }\n}\nfn h<T: S + ?Sized>(t: &T) -> usize {\n    t.s()\n}\nfn g() {", "17:5 `S::s` can't be called through a type parameter or `dyn` here"],
+  ["slice and Vec impls, a receiver of either", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for [u8] {\n    fn s(&self) -> usize {\n        self.len()\n    }\n}\nimpl S for Vec<u8> {\n    fn s(&self) -> usize {\n        self.len() + 1\n    }\n}\nfn h(v: Vec<Vec<u8>>) -> usize {\n    v[0].s()\n}\nfn g() {", "17:5 can't tell whether this receiver is a `[T]` or a `Vec<T>`"],
   ["an impl of a trait that isn't declared or loaded, on a built-in type", "}\nimpl Format for u8 {\n    fn format(&self) {}\n}\nfn g() {", "3:6 `impl Format for ..` is not supported"],
   ["TryFrom twice, neither taking the argument", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<bool> for E {\n    type Error = ();\n    fn try_from(v: bool) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {\n    let _ = E::try_from(\"x\");", "17:25 mismatched types"],
   ["try_into without a target", "let x = 5i64.try_into();", "2:13 type annotations needed (say what `.try_into()` converts to)"],
@@ -1231,11 +1231,6 @@ const rejected = [
     "an impl for `Box<T>` that doesn't forward to `T`'s",
     "}\ntrait T { fn a(&self) -> i32; }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 1 } }\nimpl<X: T> T for Box<X> { fn a(&self) -> i32 { (**self).a() + 1 } }\nfn f() {",
     "6:18 an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl",
-  ],
-  [
-    "an impl for `&T` leaving a default method another impl overrides",
-    "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 0 } }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 1 } fn b(&self) -> i32 { 2 } }\nimpl<X: T + ?Sized> T for &X { fn a(&self) -> i32 { (**self).a() } }\nfn f() {",
-    "6:27 an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl",
   ],
   [
     "a blanket impl of another file's trait",

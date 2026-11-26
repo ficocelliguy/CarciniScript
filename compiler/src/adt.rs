@@ -277,6 +277,12 @@ pub struct Adts {
     pub method_alts: HashMap<String, Vec<String>>,
     /// Those keys by the absolute offset of the method's name.
     pub alt_keys_at: HashMap<usize, String>,
+    /// `"String::m"` / `"Vec::m"` of a trait implemented for both `str` and `String` (`[T]` and
+    /// `Vec<T>`) with different behavior: the owned impl's method is `m$own`, the borrowed
+    /// one's `m`, picked at each call by how the receiver is written (`twin_side`).
+    pub own_twins: std::collections::HashSet<String>,
+    /// (`String` or `Vec`, trait) of the borrowed impls those pair with.
+    pub twin_borrowed: std::collections::HashSet<(String, String)>,
     /// The `"Type::method"`s of `method_alts` from inherent impls for different instantiations
     /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
     /// arguments, not by a trait.
@@ -546,6 +552,31 @@ pub fn tuple_key(n: usize) -> Option<&'static str> {
 }
 
 /// `Tuple2` → 2.
+/// For a trait impl on a type that shares its JS value with another: true for `String` and
+/// `Vec<T>` (owned), false for `str`, `&str`, `[T]`, `&[T]` and `[T; N]` (borrowed). None for
+/// anything else, and for `&String` / `&Vec<T>` (references to the owned types).
+pub fn twin_side(imp: &ast::Impl) -> Option<bool> {
+    imp.trait_()?;
+    let mut t = imp.self_ty()?;
+    let mut by_ref = false;
+    while let ast::Type::RefType(r) = t {
+        t = r.ty()?;
+        by_ref = true;
+    }
+    match &t {
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            match seg.name_ref()?.text().as_ref() {
+                "String" | "Vec" if !by_ref => Some(true),
+                "str" => Some(false),
+                _ => None,
+            }
+        }
+        ast::Type::SliceType(_) | ast::Type::ArrayType(_) => Some(false),
+        _ => None,
+    }
+}
+
 pub fn tuple_arity(key: &str) -> Option<usize> {
     let n: usize = key.strip_prefix("Tuple")?.parse().ok()?;
     (tuple_key(n) == Some(key)).then_some(n)
@@ -1085,6 +1116,23 @@ pub fn wrapping_impl(imp: &ast::Impl) -> bool {
     }
 }
 
+/// `Self::new` / `Box::new` / `Rc::new` / `Arc::new` / `Pin::new` (the path, as a callee or a
+/// function value): a constructor of a wrapper that is erased in JS.
+fn wrapper_new(e: Option<ast::Expr>) -> Option<()> {
+    let mut e = e?;
+    while let ast::Expr::ParenExpr(p) = e {
+        e = p.expr()?;
+    }
+    let ast::Expr::PathExpr(p) = e else {
+        return None;
+    };
+    let path = p.path()?;
+    let q = path.qualifier()?.segment()?.syntax().text().to_string();
+    (path.segment()?.syntax().text() == "new"
+        && matches!(q.as_str(), "Self" | "Box" | "Rc" | "Arc" | "Pin"))
+    .then_some(())
+}
+
 /// `e` through parentheses, `&`, `*` and the views of a `String` or `Vec` that are the same
 /// value in JS (`self.as_str()`, `(*self).as_ref()`, `&self[..]`).
 fn strip_views(mut e: ast::Expr) -> Option<ast::Expr> {
@@ -1110,6 +1158,35 @@ fn strip_views(mut e: ast::Expr) -> Option<ast::Expr> {
                                 | "as_slice"
                                 | "as_mut_slice"
                         )
+                    }) =>
+            {
+                m.receiver()?
+            }
+            // (`Self::new(x)` / `Box::new(x)` / `Pin::new(x)` in an impl for a box or pointer:
+            // `x`, the box being erased.)
+            ast::Expr::CallExpr(c) if wrapper_new(c.expr()).is_some() => {
+                let mut args = c.arg_list()?.args();
+                match (args.next(), args.next()) {
+                    (Some(a), None) => a,
+                    _ => return Some(ast::Expr::CallExpr(c)),
+                }
+            }
+            // (`Borrow::<T>::borrow(self)`, `AsRef::as_ref(self)`: the views above as paths.)
+            ast::Expr::CallExpr(c)
+                if matches!(c.expr(), Some(ast::Expr::PathExpr(p)) if p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()).is_some_and(|n| matches!(n.text().to_string().as_str(), "as_ref" | "as_mut" | "borrow" | "borrow_mut" | "deref" | "deref_mut"))) =>
+            {
+                let mut args = c.arg_list()?.args();
+                match (args.next(), args.next()) {
+                    (Some(a), None) => a,
+                    _ => return Some(ast::Expr::CallExpr(c)),
+                }
+            }
+            // (`r.map(Self::new)`: `r`.)
+            ast::Expr::MethodCallExpr(m)
+                if m.name_ref().is_some_and(|n| n.text() == "map")
+                    && m.arg_list().is_some_and(|l| {
+                        let mut args = l.args();
+                        matches!((args.next(), args.next()), (Some(a), None) if wrapper_new(Some(a.clone())).is_some())
                     }) =>
             {
                 m.receiver()?
@@ -1181,6 +1258,18 @@ fn forwards(f: &ast::Fn) -> bool {
         })
         .collect::<Option<_>>()
         .unwrap_or_else(|| vec![String::new()]);
+    // (`self.clone().f()` with `f(self)`: the value `self` points at, by value.)
+    let by_value = pl.self_param().is_some_and(|s| s.amp_token().is_none());
+    let by_value_clone = |e: ast::Expr| -> ast::Expr {
+        if let (true, Some(ast::Expr::MethodCallExpr(m))) = (by_value, strip_views(e.clone()))
+            && m.name_ref().is_some_and(|n| n.text() == "clone")
+            && m.arg_list().is_some_and(|l| l.args().next().is_none())
+            && let Some(r) = m.receiver()
+        {
+            return r;
+        }
+        e
+    };
     let Some(body) = f.body().and_then(|b| b.stmt_list()) else {
         return false;
     };
@@ -1219,6 +1308,10 @@ fn forwards(f: &ast::Fn) -> bool {
             _ => break,
         };
     }
+    // (Through `Self::new(..)` / `.map(Self::new)`: `Box<T>`'s `parse()` is `T`'s.)
+    let Some(tail) = strip_views(tail) else {
+        return false;
+    };
     let (callee, recv, args): (String, Option<ast::Expr>, Vec<ast::Expr>) = match tail {
         ast::Expr::MethodCallExpr(m) => {
             if pl.self_param().is_none() {
@@ -1253,51 +1346,12 @@ fn forwards(f: &ast::Fn) -> bool {
         _ => return false,
     };
     callee == name
-        && (pl.self_param().is_none() || recv.and_then(path_name).as_deref() == Some("self"))
+        && (pl.self_param().is_none() || recv.map(by_value_clone).and_then(path_name).as_deref() == Some("self"))
         && args.len() == params.len()
         && args
             .into_iter()
             .zip(&params)
             .all(|(a, p)| path_name(a).as_deref() == Some(p.as_str()))
-}
-
-/// The default methods of trait `tr` (declared in `items`) that a forwarding impl leaves to the
-/// default while another impl of `tr` overrides them: then `&T`'s method isn't `T`'s.
-fn shadowed_defaults(imp: &ast::Impl, tr: &str, items: &[ast::Item]) -> bool {
-    let fn_names = |l: Option<ast::AssocItemList>| -> Vec<String> {
-        l.into_iter()
-            .flat_map(|l| l.assoc_items())
-            .filter_map(|i| match i {
-                ast::AssocItem::Fn(f) => f.name().map(|n| n.text().to_string()),
-                _ => None,
-            })
-            .collect()
-    };
-    let own = fn_names(imp.assoc_item_list());
-    let defaults: Vec<String> = items
-        .iter()
-        .filter_map(|i| match i {
-            ast::Item::Trait(t) if t.name().is_some_and(|n| n.text() == tr) => Some(t),
-            _ => None,
-        })
-        .flat_map(|t| t.assoc_item_list())
-        .flat_map(|l| l.assoc_items())
-        .filter_map(|i| match i {
-            ast::AssocItem::Fn(f) if f.body().is_some() => f.name().map(|n| n.text().to_string()),
-            _ => None,
-        })
-        .filter(|n| !own.contains(n))
-        .collect();
-    !defaults.is_empty()
-        && items.iter().any(|i| match i {
-            ast::Item::Impl(other) if other.syntax() != imp.syntax() => {
-                impl_parts(other).0.as_deref() == Some(tr)
-                    && fn_names(other.assoc_item_list())
-                        .iter()
-                        .any(|n| defaults.contains(n))
-            }
-            _ => false,
-        })
 }
 
 thread_local! {
@@ -1404,19 +1458,12 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
             .filter(|n| !test_only(n))
             .filter_map(ast::Item::cast)
             .collect();
-        // `impl<T: Tr> Tr for &T` handing every call on to `T`'s impl: nothing to do in JS.
+        // `impl<T: Tr> Tr for &T` handing every call on to `T`'s impl: nothing to do in JS. (A
+        // default method it leaves to the trait while `T`'s impl overrides it runs `T`'s
+        // override: `&x` is `x`.)
         let items: Vec<ast::Item> = items
-            .iter()
-            .filter(|i| match i {
-                ast::Item::Impl(imp) => {
-                    !(forwarding_impl(imp)
-                        && !impl_parts(imp)
-                            .0
-                            .is_some_and(|tr| shadowed_defaults(imp, &tr, &items)))
-                }
-                _ => true,
-            })
-            .cloned()
+            .into_iter()
+            .filter(|i| !matches!(i, ast::Item::Impl(imp) if forwarding_impl(imp)))
             .collect();
         // `impl Tr for String` next to `impl Tr for str` (or `Vec<T>` next to `[T]`): one type in
         // JS, so the borrowed type's impl serves and the owned one goes when it hands each call

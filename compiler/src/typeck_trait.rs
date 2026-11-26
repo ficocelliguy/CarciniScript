@@ -554,6 +554,37 @@ impl Checker<'_> {
                 .or_default()
                 .insert(tm.name.clone(), sig);
         }
+        // (`impl Tr for String` next to `impl Tr for str`: each its own, see `Adts::own_twins`.)
+        let own_twin = crate::adt::twin_side(imp) == Some(true)
+            && self
+                .adts
+                .twin_borrowed
+                .contains(&(type_name.to_string(), tr.to_string()));
+        if own_twin {
+            // (A default method's `self.m()` can't tell the two apart.)
+            let inherited: Vec<String> = def
+                .methods
+                .iter()
+                .filter(|m| m.has_default && !given.iter().any(|(n, _)| *n == m.name))
+                .map(|m| format!("`{}`", m.name))
+                .collect();
+            if !inherited.is_empty() {
+                let node = imp
+                    .self_ty()
+                    .map(|t| t.syntax().clone())
+                    .unwrap_or_else(|| imp.syntax().clone());
+                let (owned, borrowed) = if type_name == "String" {
+                    ("String", "str")
+                } else {
+                    ("Vec<T>", "[T]")
+                };
+                self.error(
+                    &node,
+                    format!("`{tr}` is implemented for both `{borrowed}` and `{owned}` with different behavior (one type in JS): the `{owned}` impl must also write the default methods it inherits ({}), which can't tell the two apart", inherited.join(", ")),
+                );
+            }
+            return;
+        }
         let impls = self
             .adts
             .trait_impls
@@ -693,6 +724,8 @@ impl Checker<'_> {
                     });
                 // (`trait Buf<const N: usize>`: `N` is a value in the body.)
                 self.enter_trait_const_params(t);
+                // (`Tr::m`: a default method's own type parameters' classes, `E::f()`.)
+                let saved_fn = self.cur_fn.replace(format!("{tr}::{}", fname.text()));
                 self.check_body(
                     &f,
                     tm.sig.params.clone(),
@@ -700,6 +733,7 @@ impl Checker<'_> {
                     tm.sig.is_async,
                     self_local,
                 );
+                self.cur_fn = saved_fn;
                 self.leave_generics();
                 self.const_tys.clear();
                 self.param_bounds.clear();
@@ -1066,6 +1100,7 @@ impl Checker<'_> {
         &mut self,
         m: &ast::MethodCallExpr,
         recv: &ast::Expr,
+        tr: &str,
         sig: Method,
         self_ty: Ty,
         args: &[ast::Expr],
@@ -1078,12 +1113,41 @@ impl Checker<'_> {
         {
             sub.extend(self.bound_subst(p));
         }
+        if let Some(name) = m.name_ref()
+            && let Some((owner, _)) = self.trait_method_of(tr, name.text().as_ref())
+        {
+            self.twin_generic_call(m.syntax(), &owner, name.text().as_ref());
+        }
         let sig = subst_method(&sig, &sub);
         // The method's own type parameters (`fn fold_with<F>`): fresh at each call.
         let sig = if sig.type_params.is_empty() {
             sig
         } else {
-            self.method_inst(&sig, None)
+            let inst = self.method_inst(&sig, None);
+            let own = std::mem::take(&mut self.last_type_args);
+            // `t.visit::<u8>()`
+            if let Some(gal) = ra_ap_syntax::ast::HasGenericArgs::generic_arg_list(m) {
+                let given: Vec<Ty> = gal
+                    .generic_args()
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .filter_map(|g| self.generic_arg_ty(g))
+                    .collect();
+                for (v, t) in own.iter().zip(given) {
+                    self.unify(v, &t);
+                }
+            }
+            // (Its own parameters' classes, which an impl's body or the default may need
+            // (`E::kind()`), go with the call as `Tr::m`'s: see `finish_needs`.)
+            if let Some(name) = m.name_ref()
+                && let Some((owner, _)) = self.trait_method_of(tr, name.text().as_ref())
+            {
+                let r = self.range(m.syntax());
+                let caller = self.cur_fn.clone().unwrap_or_default();
+                self.generic_calls
+                    .push((r, caller, format!("{owner}::{}", name.text()), own));
+            }
+            inst
         };
         if sig.receiver == Some(Receiver::MutRef) {
             self.check_mutable(recv, Mutation::Borrow);
@@ -1394,7 +1458,7 @@ impl Checker<'_> {
         match self.trait_method(tr, method) {
             Some(sig) if sig.receiver.is_some() => {
                 self.note_split_method(m, tr, method);
-                self.call_trait_method(m, recv, sig, Ty::Dyn(tr.to_string()), args)
+                self.call_trait_method(m, recv, tr, sig, Ty::Dyn(tr.to_string()), args)
             }
             // `boxed.as_ref()`: the `dyn` value itself (boxes are erased).
             _ if matches!(method, "as_ref" | "as_mut" | "borrow") && args.is_empty() => {

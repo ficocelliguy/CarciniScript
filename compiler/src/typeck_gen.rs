@@ -66,6 +66,13 @@ pub(super) const KNOWN_BOUNDS: &[&str] = &[
     "Serialize",
     "Deserialize",
     "DeserializeOwned",
+    // (`E: Error`: `Debug + Display`, with `source()`.)
+    "Error",
+    // (`C: Extend<T>` / `C: FromIterator<T>`: by the value, or by `C`'s class.)
+    "Extend",
+    "FromIterator",
+    // (`T: Any`: `&T as &dyn Any` checks the value by its shape, as concrete ones do.)
+    "Any",
 ];
 
 /// A type parameter with the names of its bounds (`T: PartialOrd + Copy` → `["PartialOrd", "Copy"]`).
@@ -1114,7 +1121,7 @@ impl Checker<'_> {
                 None => return false,
             },
         };
-        bounds.iter().any(|x| {
+        let meets = |x: &String| {
             x == b
                 || matches!(
                     (x.as_str(), b),
@@ -1123,8 +1130,15 @@ impl Checker<'_> {
                         | ("PartialOrd", "PartialEq")
                         | ("Copy", "Clone")
                         | ("Display", "ToString")
+                        | ("Error", "Display" | "Debug" | "ToString")
                 )
-        })
+        };
+        // (Else through a user trait's supertraits: `trait Float: PartialOrd + Mul<Output =
+        // Self>` gives a default method's `self < o` and `self * self`.)
+        bounds.iter().any(meets)
+            || (!name.contains("::")
+                && bounds.iter().any(|x| self.adts.traits.contains_key(x))
+                && self.bound_traits(name).iter().any(meets))
     }
 
     /// Whether a concrete type meets a bound.
@@ -1179,6 +1193,22 @@ impl Checker<'_> {
             "FromStr" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
                 Ty::Adt(n, _) => self.adts.method(n, "from_str").is_some(),
+                Ty::Param(n) => self.param_has(n, b),
+                _ => false,
+            },
+            // (Std's, unless the file declares a trait of that name.)
+            "FromIterator" | "Extend" if !self.adts.traits.contains_key(b) => match t {
+                Ty::Vec(_) | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) | Ty::Str => true,
+                Ty::Adt(n, _) => {
+                    let m = if b == "Extend" { "extend" } else { "from_iter" };
+                    self.adts.method(n, m).is_some()
+                }
+                Ty::Param(n) => self.param_has(n, b),
+                _ => false,
+            },
+            "Error" if !self.adts.traits.contains_key(b) => match t {
+                Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| d.implements("Error")),
+                Ty::Extern(n) => super::is_std_error(n),
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
@@ -1418,7 +1448,7 @@ impl Checker<'_> {
                 self.class_dispatch.insert(r);
             }
             self.note_split_method(m, &b, method);
-            return self.call_trait_method(m, recv, sig, Ty::Param(name.to_string()), args);
+            return self.call_trait_method(m, recv, &b, sig, Ty::Param(name.to_string()), args);
         }
         let t = Ty::Param(name.to_string());
         let need = |c: &mut Self, b: &str| {
@@ -1464,6 +1494,22 @@ impl Checker<'_> {
             // `self.0.fmt(f)`: `Display::fmt` / `Debug::fmt` delegation.
             "fmt" if self.param_has(name, "Display") || self.param_has(name, "Debug") => {
                 sig(self, &[Ty::Formatter], super::gaps::fmt_result())
+            }
+            // An `E: Error`: the next error in its chain, as a `dyn Error`'s.
+            "source" if self.param_has(name, "Error") => {
+                self.arg_count(m.syntax(), "method", 0, args.len());
+                self.note_crate(m.syntax(), "err.source", vec![]);
+                Ty::Option(Box::new(Ty::Dyn("Error".into())))
+            }
+            // A `C: Extend<T>`: by what the value is at run time (a `Vec`, map, set, string or
+            // your own `impl Extend`).
+            "extend" if self.param_has(name, "Extend") => {
+                self.check_mutable(recv, super::Mutation::Borrow);
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                for a in args {
+                    self.infer(a, None);
+                }
+                Ty::Unit
             }
             // An `S: BuildHasher` (a `RandomState`, or your own): `x.hash(&mut h)` feeds the
             // hasher it builds.

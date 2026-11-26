@@ -909,6 +909,17 @@ fn writer_params(file: &SourceFile) -> Vec<(usize, usize, String)> {
 /// `w.write_fmt(args)` as `write!(w, "{}", args)` (a `String`, a `Formatter` or an `io::Write`).
 fn write_fmt_calls(file: &SourceFile) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
+    // (Not with a trait of the file's own that declares `write_fmt`: its calls are its.)
+    if file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Trait::cast)
+        .flat_map(|t| t.assoc_item_list())
+        .flat_map(|l| l.assoc_items())
+        .any(|i| matches!(i, ast::AssocItem::Fn(f) if f.name().is_some_and(|n| n.text() == "write_fmt")))
+    {
+        return out;
+    }
     for m in file
         .syntax()
         .descendants()

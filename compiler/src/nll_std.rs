@@ -54,7 +54,7 @@ pub fn recv_mode(base: &RTy, name: &str) -> Recv {
             | "chunks_mut" | "chunks_exact_mut" | "split_at_mut" | "split_first_mut"
             | "split_last_mut" | "make_ascii_uppercase" | "make_ascii_lowercase" | "reserve"
             | "reserve_exact" | "shrink_to_fit" | "shrink_to" | "copy_from_slice"
-            | "clone_from_slice" | "copy_within" | "splice" | "pop_first" | "pop_last"
+            | "clone_from_slice" | "clone_from" | "copy_within" | "splice" | "pop_first" | "pop_last"
             | "remove_entry" | "take" | "replace_range" | "get_or_insert_with"
             | "get_mut_or_insert_with" | "extract_if" | "swap_indices" | "shift_remove"
             | "swap_remove_index" | "shift_insert" | "move_index" | "sort_keys"
