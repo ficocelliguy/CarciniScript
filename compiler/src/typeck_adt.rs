@@ -219,6 +219,7 @@ impl Checker<'_> {
                 ast::Item::Struct(s) => {
                     let Some(name) = s.name() else { continue };
                     self.enter_type_params(&type_param_names(&item));
+                    self.note_type_defaults(&name.text(), s.generic_param_list());
                     let saved_bounds = self.enter_param_bounds(&item);
                     // `struct Pairs<I: Iterator<Item = T>> { it: I }`: the runtime's iterator.
                     for tp in s
@@ -252,6 +253,7 @@ impl Checker<'_> {
                 ast::Item::Enum(e) => {
                     let Some(name) = e.name() else { continue };
                     self.enter_type_params(&type_param_names(&item));
+                    self.note_type_defaults(&name.text(), e.generic_param_list());
                     let saved_bounds = self.enter_param_bounds(&item);
                     let mut variants = Vec::new();
                     let mut default_variant = None;
@@ -475,6 +477,22 @@ impl Checker<'_> {
             }
         }
         saved
+    }
+
+    /// `struct Map<K, S = RandomState>`: `S`'s default, for `Map<K>` written as a type.
+    fn note_type_defaults(&mut self, adt: &str, list: Option<ast::GenericParamList>) {
+        let mut out = Vec::new();
+        for p in list.into_iter().flat_map(|l| l.generic_params()) {
+            if let ast::GenericParam::TypeParam(tp) = p
+                && let (Some(n), Some(d)) = (tp.name(), tp.default_type())
+            {
+                let t = self.lower_type(&d);
+                out.push((n.text().to_string(), t));
+            }
+        }
+        if !out.is_empty() {
+            self.adts.type_defaults.insert(adt.to_string(), out);
+        }
     }
 
     fn enter_type_params(&mut self, names: &[String]) {
@@ -936,7 +954,46 @@ impl Checker<'_> {
                         continue;
                     }
                     // `impl<I: Iterator<Item = T>> .. for Pairs<I>`: the runtime's iterator.
-                    if let Some(it) = self.iter_param(&tp) {
+                    // Without `Item = ..` (inline or `where I: Iterator`), its items are a
+                    // parameter of their own, `I::Item`.
+                    let lists: Vec<ast::TypeBoundList> = tp
+                        .type_bound_list()
+                        .into_iter()
+                        .chain(where_clause_bounds(imp.where_clause(), &n))
+                        .collect();
+                    if let Some(item) = lists.iter().find_map(super::bounds_iterator_item) {
+                        let elem = match item {
+                            Some(t) => self.lower_type(&t),
+                            None => {
+                                let p = format!("{n}::Item");
+                                // (With `where I::Item: Display`, as `Item: Display` becomes.)
+                                let item_lists: Vec<ast::TypeBoundList> = imp
+                                    .where_clause()
+                                    .into_iter()
+                                    .flat_map(|w| w.predicates())
+                                    .filter(|pr| {
+                                        pr.ty().is_some_and(|t| t.syntax().text() == p.as_str())
+                                    })
+                                    .filter_map(|pr| pr.type_bound_list())
+                                    .collect();
+                                let bounds: Vec<String> =
+                                    super::generic::bound_names(&item_lists)
+                                        .into_iter()
+                                        .map(|(b, _)| b)
+                                        .filter(|b| {
+                                            super::generic::KNOWN_BOUNDS.contains(&b.as_str())
+                                                || self.adts.traits.contains_key(b)
+                                        })
+                                        .collect();
+                                self.generics.insert(p.clone(), Ty::Param(p.clone()));
+                                self.param_bounds.insert(p.clone(), bounds);
+                                Ty::Param(p)
+                            }
+                        };
+                        let it = Ty::Iter {
+                            elem: Box::new(elem),
+                            mutable: false,
+                        };
                         self.generics.insert(n, it);
                         continue;
                     }
@@ -1286,7 +1343,15 @@ impl Checker<'_> {
             Ty::Dyn(tr) if tr == "Error" && !self.adts.traits.contains_key("Error") => {
                 matches!(t, "Debug" | "Display" | "Error")
             }
-            Ty::Dyn(tr) => self.trait_includes(tr, t),
+            // (Or `impl Clone for Box<dyn Tr>`.)
+            Ty::Dyn(tr) => {
+                self.trait_includes(tr, t)
+                    || self
+                        .adts
+                        .trait_impls
+                        .get(&format!("dyn${tr}"))
+                        .is_some_and(|ts| ts.iter().any(|x| x == t))
+            }
             _ => true,
         }
     }
@@ -1332,8 +1397,15 @@ impl Checker<'_> {
                 self.adts.traits.contains_key(t)
                     || matches!(t, "From" | "PartialEq" | "PartialOrd")
                     || crate::adt::op_method(t).is_some()
+                    || key.starts_with("dyn$")
             })
         {
+            // (`impl Clone for Box<dyn Tr>`: what `implements` asks of `dyn Tr`.)
+            if key.starts_with("dyn$")
+                && let Some(t) = &trait_name
+            {
+                self.adts.trait_impls.entry(key.clone()).or_default().push(t.clone());
+            }
             type_name = key;
             self.adts.ext_types.insert(type_name.clone());
         }
@@ -2494,7 +2566,7 @@ impl Checker<'_> {
             Resolved::Assoc(adt, m) => {
                 if m == "from"
                     && self.adts.method(&adt, &m).is_none()
-                    && self.adts.from_impls.contains_key(&adt)
+                    && (self.adts.from_impls.contains_key(&adt) || args.len() == 1)
                 {
                     return Some(self.conv_from_call(c, &adt, args));
                 }

@@ -67,7 +67,7 @@ pub(crate) fn with_prelude(
     let declares = |name: &str| {
         ["struct", "enum", "type", "trait", "union"]
             .iter()
-            .any(|kw| full.contains(&format!("{kw} {name}")))
+            .any(|kw| has_word(full, &format!("{kw} {name}")))
     };
     let mut out: Vec<&'static str> = Vec::new();
     // (After the rewrite: `chrono::NaiveDate` is `ChronoNaiveDate`, ..; its `TimeDelta::to_std`
@@ -183,7 +183,7 @@ pub(crate) fn with_prelude(
     }
     // (After the rewrite: `io::Error` is `IoError`, `io::stdout()` `__io_stdout()`, ..)
     let io_names = [
-        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor", "FmtWrite",
+        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor", "IoSeek", "FmtWrite", "FmtAlignment",
     ];
     // (After the rewrite: `std::fs::File` is `FsFile`, `process::Command` `ProcCommand`, ..)
     let os_names = [
@@ -206,10 +206,13 @@ pub(crate) fn with_prelude(
     let os = (path_fs || os_names.iter().any(|n| text.contains(n)))
         && !text.contains("// (os prelude)")
         && !declares("FsFile");
-    // (`use std::io::Write;` alone stays as written: its methods on a `Vec<u8>` need the impl.)
+    // (`use std::io::Write;` / `Read` alone stay as written: their methods on a `Vec<u8>` /
+    // `&[u8]` need the impls.)
     if (os
         || io_names.iter().any(|n| text.contains(n))
         || text.contains("io::Write")
+        || text.contains("io::Read")
+        || (text.contains("io::{") && (has_word(text, "Read") || has_word(text, "Write")))
         || text.contains("io::prelude")
         // (serde_json's `to_writer` / `from_reader` take an `io::Write` / `io::Read`.)
         || (text.contains("serde_json") && (text.contains("to_writer") || text.contains("from_reader"))))

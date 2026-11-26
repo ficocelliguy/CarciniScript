@@ -736,6 +736,25 @@ pub fn flatten(text: &mut String, map: &mut OffsetMap) -> Flattened {
 /// Whether `name` is bound by a pattern or parameter in the function around `n` that is in scope
 /// at `at` (`let ln = ln(x)?;` calls the item `ln`).
 fn is_local(n: &SyntaxNode, at: TextSize, name: &str) -> bool {
+    // An item of a block around it (`fn f() { struct Formatter { .. } .. }`), which wins over
+    // the module's names and imports.
+    let block_item = n
+        .ancestors()
+        .filter(|a| a.kind() == SyntaxKind::STMT_LIST)
+        .flat_map(|b| b.children().filter_map(ast::Item::cast))
+        .any(|item| match item {
+            ast::Item::Struct(s) => s.name().is_some_and(|x| x.text() == name),
+            ast::Item::Enum(e) => e.name().is_some_and(|x| x.text() == name),
+            ast::Item::Fn(f) => f.name().is_some_and(|x| x.text() == name),
+            ast::Item::Trait(t) => t.name().is_some_and(|x| x.text() == name),
+            ast::Item::TypeAlias(t) => t.name().is_some_and(|x| x.text() == name),
+            ast::Item::Const(c) => c.name().is_some_and(|x| x.text() == name),
+            ast::Item::Static(s) => s.name().is_some_and(|x| x.text() == name),
+            _ => false,
+        });
+    if block_item {
+        return true;
+    }
     let Some(f) = n
         .ancestors()
         .find(|a| ast::Fn::can_cast(a.kind()) || ast::ClosureExpr::can_cast(a.kind()))

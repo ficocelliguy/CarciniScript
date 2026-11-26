@@ -1243,9 +1243,9 @@ const rejected = [
     "4:16 `impl Sink for ..` is not supported",
   ],
   [
-    "reading through a `&mut &[u8]`",
-    "}\nuse std::io::Read;\nfn r<R: Read>(r: &mut R) -> usize { 0 }\nfn f() {\n    let d = vec![1u8];\n    let mut s = &d[..];\n    r(&mut s);",
-    "8:7 reading from a `&mut &[u8]` would advance the caller's slice",
+    "reading through a `&mut &[u8]` taken by value",
+    "}\nuse std::io::Read;\nfn r<R: Read>(r: R) -> usize { 0 }\nfn f() {\n    let d = vec![1u8];\n    let mut s = &d[..];\n    r(&mut s);",
+    "8:7 reading from a `&mut &[u8]` taken by value would advance the caller's slice",
   ],
   // Std gaps (PLAN "Std-library gaps").
   ["`env!` of a variable the build doesn't have", 'let v = env!("CARCINI_NOPE");', "2:13 environment variable `CARCINI_NOPE` not defined at compile time"],

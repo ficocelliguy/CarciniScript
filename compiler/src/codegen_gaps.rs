@@ -7,7 +7,7 @@ use ra_ap_syntax::{
 };
 
 use super::adt_gen::prop;
-use super::{Codegen, Frag, format_value, js_string, member};
+use super::{Codegen, Frag, format_value, js_string};
 use crate::macros;
 use crate::ty::{IntKind, Ty};
 
@@ -276,16 +276,8 @@ impl Codegen<'_> {
                 let bits = IntKind::from_name(&m2["write_".len()..])?.bits();
                 helper("hasherWrite", vec![x, Frag::text(bits.to_string())])
             }
-            (Ty::Adt(..), "hash_one") => {
-                let x = self.gap_arg(a0);
-                let (finish, build) = (prop("finish"), prop("build_hasher"));
-                let mut f = Frag::text("((h) => (κσ.$hashInto(");
-                f.append(x)
-                    .push(format!(", h), h{}()))(", member(&finish)))
-                    .append(rf.clone())
-                    .push(format!("{}())", member(&build)));
-                f
-            }
+            // (`RandomState`'s hasher is std's, your own builder's may not be.)
+            (Ty::Adt(..), "hash_one") => helper("hashOne", vec![self.gap_arg(a0)]),
             _ => return None,
         };
         Some((f, ty))

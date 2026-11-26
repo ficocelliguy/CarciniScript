@@ -2278,8 +2278,10 @@ const IO_RENAMES: Renames = Renames {
         ("BufWriter", "IoBufWriter"),
         ("BufReader", "IoBufReader"),
         ("IoSlice", "IoIoSlice"),
+        ("SeekFrom", "IoSeekFrom"),
+        ("Seek", "IoSeek"),
     ],
-    star: &["Write", "Error", "ErrorKind", "stdout", "stderr", "stdin"],
+    star: &["Write", "Seek", "Error", "ErrorKind", "stdout", "stderr", "stdin"],
     result_err: Some("IoError"),
 };
 
@@ -2300,7 +2302,7 @@ const RUSTC_HASH_RENAMES: Renames = Renames {
 // `fmt::Write` (`use std::fmt::Write;`): the io prelude's `FmtWrite`.
 const FMT_RENAMES: Renames = Renames {
     roots: &["fmt", "std::fmt", "::std::fmt", "core::fmt", "::core::fmt"],
-    names: &[("Write", "FmtWrite")],
+    names: &[("Write", "FmtWrite"), ("Alignment", "FmtAlignment")],
     star: &["Write"],
     result_err: None,
 };
@@ -3189,7 +3191,7 @@ fn renamed_imports(file: &SourceFile, r: &Renames) -> std::collections::HashMap<
                     let declared = |n: &str| {
                         ["struct", "enum", "type", "trait", "fn"]
                             .iter()
-                            .any(|kw| text.contains(&format!("{kw} {n}")))
+                            .any(|kw| crate::stdtime::has_word(&text, &format!("{kw} {n}")))
                     };
                     for n in r.star {
                         if !declared(n) {

@@ -33,6 +33,7 @@ mod moves;
 mod nav;
 mod inst_consts;
 mod nested;
+mod opmethods;
 mod ownstd;
 mod procmacro;
 mod prune;

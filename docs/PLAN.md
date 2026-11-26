@@ -237,38 +237,31 @@ sweeps (registry 5,922 files, std 3,004) last ran on 2026-11-24 with 0 panics (2
 isn't language-OK, the set of gaps in it, with memory, FFI, `union`, proc-macro, files,
 processes, sockets, env and threads treated as never fixable; 845 of the 1,797 failing files have
 only fixable gaps, and no single gap flips more than 30 of them, so the long tail is the shape).
-Ranked by files flipped when it is the file's only gap, each confirmed with a rustc-accepted
-probe (`q_*.rs` and the driver `probe-head.mjs` in the OS temp dir under
-`carciniscript-probes-2026-11-25/`, next to `flip.mjs` and `breakdown.mjs`):
-1. Dispatch through type parameters and associated types (74 files, 29 solo, 44 crates): a
-   method on a type parameter inside a macro expansion (either's `for_both!(self, inner =>
-   inner.next())`), `I::Item` / `<T as Tr>::Parser` / `Self::Value` projections in types and
-   `where` clauses, `T::CONST` and `T::f()` in `impl` methods with `self` (the `generics in this
-   position` row, 37 files), and methods of a bound on an associated type (`E::Engine`).
-2. Std trait methods called by name (45 files, 20 solo, 29 crates): `self.add(rhs)`, `x.shl(3)`,
-   `n.not()`, `s.deref()`, `buf.read(..)`, `Self::from` / `Duration::from(..)` as a path,
-   `Vec::default()` / `Box::default()`. The operators and `.into()` work; the method names don't.
-3. A file's own type that shares a name with a std or bundled type (27 files, 13 solo, plus the
-   hashbrown / indexmap / wasmparser files counted under the next two rows): env_logger's and
-   regex-syntax's `Formatter`, winnow's `Range`, jiff's `Error`, bumpalo's `String`, hashbrown's
-   `HashMap`, indexmap's `IndexSet<T, S>` (resolved to the bundled `IndexSet<T>`, so its own
-   fields and methods vanish). The local definition should win over the prelude and the models.
-4. Impls on std types and the derives that lean on them (25 + 26 files, 14 + 7 solo): `impl
-   Clone for Box<dyn Trait>` and then `#[derive(Clone)]` on a struct holding one, `impl Ext for
-   fmt::Formatter`, `impl Tr for Option<T>`, one trait implemented for both `str` and `String`
-   or `[T]` and `Vec<T>` with different bodies (today a hard error).
-5. `write!` into a generic or user `fmt::Write` sink, and `&mut` into a container held in a
-   local (`self.stack.last_mut()`, `&mut self.0` on an `Option` field) (10 files, all 10 solo).
-   Near ties: `include_str!` / `include_bytes!` of a sibling file (14 files, 11 solo;
-   compile-time, the `mod` loader already reads siblings), `Default::default()` for a field
-   whose type is a defaulted type parameter (`S = RandomState`), and `fmt::Alignment` /
-   `io::SeekFrom` as pattern constants.
+The five top-ranked gaps (dispatch through type parameters, std trait methods by name, a file's
+own std-named types, impls on std types, `&mut` into a field through `let .. else`) were closed
+2026-11-26 and are recorded in FEATURES.md and RUST_GAPS.md; their probes (`q_*.rs` and the
+driver `probe-head.mjs` in the OS temp dir under `carciniscript-probes-2026-11-25/`, next to
+`flip.mjs` and `breakdown.mjs`) still apply. Of what they left, three more were closed the same
+day: `buf.read(..)` on a `&[u8]` binding (std's `impl Read for &[u8]`), std-named types declared
+in a function body or a `#[cfg(test)]` module (inline modules were already flattened to
+`fmt__Formatter`), and `impl Debug` / `Display` / `PartialEq` / `PartialOrd` for `Box<dyn Tr>`
+and `dyn Tr` (`{:?}`, `{}`, `==` and `<` call the impl). The last three were closed the same day
+too: `Default::default()` for a field whose type is a defaulted type parameter (`struct Map<K, S =
+RandomState>` written `Map<K>` is the default now, and `RandomState` is a `BuildHasher` with
+`build_hasher` / `hash_one`, also through an `S: BuildHasher`); `impl io::Read for Reader<R>`, which
+turned out to be any type named `Read..` (`struct Reader` counted as declaring `Read`, so `Read`
+wasn't std's); and reads through a `&mut &[u8]` (`take(&mut s)` advances `s`, also for an `r: &mut
+R`). A gap found on the way, `impl Seek for ..` (either's and buf_redux's `lib.rs`), is closed
+too: `Seek` is the io prelude's `IoSeek`, with `Cursor`'s impl. The other corpus `impl Read /
+Write for ..` errors (flate2, borsh) reach `Read` through another crate's or file's `io`
+re-export.
+
 Two bigger buckets are not features: `.into()` with no annotation (58 files, 27 solo) and `.0` /
 `.1` on a value of unknown type (50 files, 22 solo) compile in every same-file shape probed
 (arguments, returns, fields, `Some(..)`, `unwrap_or(..)`, `map(Into::into)`, `assert_eq!`,
 closure parameters over user tuples); the corpus hits need a `From` impl or a tuple type from
-another file, or sit on the shadowing in 3. The same goes for `matches!` with enum patterns (22
-files): the enum is from another file in all but the std `Alignment` / `SeekFrom` cases.
+another file. The same goes for `matches!` with enum patterns (22 files): the enum is from
+another file in all but the std `Alignment` / `SeekFrom` cases, which now compile.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
 `set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the

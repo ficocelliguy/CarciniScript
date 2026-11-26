@@ -1,5 +1,5 @@
 //! A file's own struct or enum named like a std type the compiler builds in (bumpalo's
-//! `collections/vec.rs` has `pub struct Vec<'bump, T>`). The checker and codegen know `Vec` as
+//! `collections/vec.rs` has `pub struct Vec<'bump, T>`; see `NAMES` for the others). The checker and codegen know `Vec` as
 //! std's everywhere, and the preludes compiled in after the program (`Vec::new()` in the io
 //! prelude) need it to stay std's, so this pre-pass renames the file's type `Vec__file`, along
 //! with every path that names it (`Vec<'b, T>`, `Vec::new_in(b)`, `Vec { .. }`, `self::Vec`).
@@ -8,12 +8,20 @@
 
 use std::collections::HashMap;
 
-use ra_ap_syntax::{AstNode, SyntaxKind, SyntaxToken, ast, ast::{HasModuleItem, HasName}};
+use ra_ap_syntax::{AstNode, SyntaxKind, SyntaxToken, TextRange, TextSize, ast, ast::HasName};
 
 use crate::mbe::OffsetMap;
 
-/// The std names a file's own type may shadow this way.
-const NAMES: [&str; 1] = ["Vec"];
+/// The std and bundled-crate names a file's own type may shadow this way (env_logger's and
+/// regex-syntax's `Formatter`, winnow's `Range`, jiff's `Error`, bumpalo's `String`, hashbrown's
+/// `HashMap`, indexmap's `IndexSet`).
+const NAMES: &[&str] = &[
+    "Vec", "String", "Formatter", "Range", "RangeInclusive", "Error", "HashMap", "HashSet",
+    "BTreeMap", "BTreeSet", "VecDeque", "BinaryHeap", "IndexMap", "IndexSet", "Box", "Rc", "Arc",
+    "Weak", "Cow", "Duration", "Instant", "Mutex", "RwLock", "Path", "PathBuf", "Bound",
+    "ControlFlow", "Iter", "IterMut", "IntoIter", "Keys", "Values", "ValuesMut", "Drain", "Entry",
+    "Lines", "Chars", "Bytes", "Peekable", "Rev", "Take", "Skip", "StepBy", "Fuse",
+];
 
 /// The name the file's own `name` goes by.
 fn renamed(name: &str) -> String {
@@ -22,11 +30,11 @@ fn renamed(name: &str) -> String {
 
 /// Whether `text` may declare its own `Vec` (a cheap check before parsing).
 pub(crate) fn has_own_std_types(text: &str) -> bool {
-    NAMES.iter().any(|n| {
-        ["struct ", "enum "].iter().any(|kw| {
-            text.match_indices(&format!("{kw}{n}")).any(|(i, m)| {
-                !text[i + m.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
-            })
+    ["struct ", "enum "].iter().any(|kw| {
+        text.match_indices(kw).any(|(i, m)| {
+            let rest = &text[i + m.len()..];
+            let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+            NAMES.contains(&&rest[..end])
         })
     })
 }
@@ -37,29 +45,41 @@ pub(crate) fn expand(
     names: &mut HashMap<String, String>,
 ) -> bool {
     let file = crate::macros::parse_tree(text);
-    // The file's top-level structs and enums with one of `NAMES`.
-    let own: Vec<String> = file
-        .items()
-        .filter_map(|item| match item {
-            ast::Item::Struct(s) => s.name(),
-            ast::Item::Enum(e) => e.name(),
+    // The file's structs and enums with one of `NAMES`, each with where it's in scope: the whole
+    // file for a top-level one, the block or module around one declared in a function body or a
+    // `#[cfg(test)]` module (other inline modules are flattened by now).
+    let mut own: Vec<(String, TextRange)> = Vec::new();
+    for n in file.syntax().descendants() {
+        let name = match ast::Item::cast(n.clone()) {
+            Some(ast::Item::Struct(s)) => s.name(),
+            Some(ast::Item::Enum(e)) => e.name(),
             _ => None,
-        })
-        .map(|n| n.text().to_string())
-        .filter(|n| NAMES.contains(&n.as_str()))
-        .collect();
+        };
+        let Some(name) = name.map(|n| n.text().to_string()) else {
+            continue;
+        };
+        let scope = match n.parent() {
+            _ if !NAMES.contains(&name.as_str()) => continue,
+            Some(p) if p.kind() == SyntaxKind::SOURCE_FILE => p.text_range(),
+            Some(p) if matches!(p.kind(), SyntaxKind::STMT_LIST | SyntaxKind::ITEM_LIST) => {
+                p.text_range()
+            }
+            _ => continue,
+        };
+        own.push((name, scope));
+    }
     if own.is_empty() {
         return false;
     }
+    // Whether `name` at `at` names one of them.
+    let owns = |name: &str, at: TextSize| own.iter().any(|(n, s)| n == name && s.contains(at));
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for n in file.syntax().descendants() {
         if let Some(name) = ast::Name::cast(n.clone()) {
             // The declaration itself, and its impls' `impl .. for Vec<..>` (paths, below).
-            if own.contains(&name.text().to_string())
-                && n.parent().is_some_and(|p| {
-                    matches!(p.kind(), SyntaxKind::STRUCT | SyntaxKind::ENUM)
-                        && p.parent().is_some_and(|f| f.kind() == SyntaxKind::SOURCE_FILE)
-                })
+            if n.parent()
+                .is_some_and(|p| matches!(p.kind(), SyntaxKind::STRUCT | SyntaxKind::ENUM))
+                && owns(name.text().as_ref(), n.text_range().start())
             {
                 let r = n.text_range();
                 edits.push((r.start().into(), r.end().into(), renamed(name.text().as_ref())));
@@ -73,7 +93,7 @@ pub(crate) fn expand(
             let Some(name) = p.segment().and_then(|s| s.name_ref()) else {
                 continue;
             };
-            if !own.contains(&name.text().to_string()) {
+            if !owns(name.text().as_ref(), name.syntax().text_range().start()) {
                 continue;
             }
             let rooted = match p.qualifier() {
@@ -95,7 +115,7 @@ pub(crate) fn expand(
                 .collect();
             let text_at = |j: Option<usize>| j.and_then(|j| toks.get(j)).map(|t| t.text());
             for (i, t) in toks.iter().enumerate() {
-                if t.kind() != SyntaxKind::IDENT || !own.contains(&t.text().to_string()) {
+                if t.kind() != SyntaxKind::IDENT || !owns(t.text(), t.text_range().start()) {
                     continue;
                 }
                 // (`std::vec::Vec`, `$crate::collections::Vec`: another path's.)
@@ -112,7 +132,7 @@ pub(crate) fn expand(
     if edits.is_empty() {
         return false;
     }
-    for n in &own {
+    for (n, _) in &own {
         names.insert(renamed(n), n.clone());
     }
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));

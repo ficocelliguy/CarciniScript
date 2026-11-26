@@ -648,8 +648,16 @@ impl Checker<'_> {
                 let Some(tm) = def.methods.iter().find(|m| m.name == fname.text()) else {
                     continue;
                 };
-                // The method's own type parameters and bounds (`fn pick<B: Ord>`).
+                // The method's own type parameters and bounds (`fn pick<B: Ord>`), which may
+                // name `Self`'s associated types (`where F: Fn(Self::Value) -> U`).
+                let assoc = def
+                    .assoc_types
+                    .iter()
+                    .map(|a| (a.clone(), Ty::Param(format!("Self::{a}"))))
+                    .collect();
+                let saved_assoc = std::mem::replace(&mut self.impl_assoc, assoc);
                 self.enter_generics(&f, false);
+                self.impl_assoc = saved_assoc;
                 let saved = self.self_ty.replace(Ty::Param("Self".into()));
                 self.param_bounds.insert("Self".into(), vec![tr.clone()]);
                 // (`trait Stats: Iterator`: `self` is an iterator, of items unchecked here.)
@@ -1224,13 +1232,27 @@ impl Checker<'_> {
         for pred in wc.into_iter().flat_map(|w| w.predicates()) {
             if let Some(ast::Type::PathType(pt)) = pred.ty()
                 && let Some(path) = pt.path()
-                && let Some(q) = path.qualifier()
                 && let (Some(qn), Some(n)) = (
-                    q.as_single_name_ref(),
+                    super::proj_qual(&path),
                     path.segment().and_then(|s| s.name_ref()),
                 )
             {
-                let proj = format!("{}::{}", qn.text(), n.text());
+                let proj = format!("{qn}::{}", n.text());
+                // (`where <T as Factory>::Parser: Typed<Value = T>`: `T::parser().map(..)`
+                // through the file's trait.)
+                let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+                let traits: Vec<String> = super::generic::bound_names(&lists)
+                    .into_iter()
+                    .map(|(b, _)| b)
+                    .filter(|b| self.adts.traits.contains_key(b))
+                    .collect();
+                if !traits.is_empty() && self.param_bounds.contains_key(qn.as_str()) {
+                    self.param_bounds
+                        .entry(proj.clone())
+                        .or_default()
+                        .extend(traits);
+                    self.record_bound_args(&proj, &lists);
+                }
                 // (`where I::Item: PartialEq<J::Item>`: `a.into_iter().eq(b)`, `x == y`.)
                 for b in pred.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
                     if let Some(ast::Type::PathType(bt)) = b.ty()
@@ -1377,6 +1399,27 @@ impl Checker<'_> {
             // `boxed.as_ref()`: the `dyn` value itself (boxes are erased).
             _ if matches!(method, "as_ref" | "as_mut" | "borrow") && args.is_empty() => {
                 Ty::Dyn(tr.to_string())
+            }
+            // A method of an impl for `Box<dyn Tr>` (`a.eq(&b)` with `impl PartialEq for
+            // Box<dyn Shape>`).
+            _ if let key = format!("dyn${tr}")
+                && let Some(sig) = self.adts.method(&key, method).cloned()
+                && sig.receiver.is_some() =>
+            {
+                let sig = self.method_inst(&sig, None);
+                self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
+                for (a, p) in args.iter().zip(&sig.params) {
+                    self.check(a, p);
+                }
+                self.record_ext(m.syntax(), &key);
+                sig.ret
+            }
+            // `ToString` through `Display` (a supertrait, or `impl Display for Box<dyn Tr>`).
+            _ if method == "to_string"
+                && args.is_empty()
+                && self.implements(&Ty::Dyn(tr.to_string()), "Display") =>
+            {
+                Ty::Str
             }
             _ => {
                 for a in args {

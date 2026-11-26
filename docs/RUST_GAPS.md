@@ -84,7 +84,12 @@ The gaps fall into three parts:
 - **Types share one namespace across files.** A `mod` file's struct or enum named like one of
   the loading file's, or like one an earlier `mod` file exports, goes by a mangled name there
   (`bytes::Shlex` is `Shlex__bytes`), which hover and error messages show. A file's own
-  top-level `Vec` is `Vec__file` in the same way, so the bundled preludes keep std's. Traits, type aliases
+  struct or enum named like a std or bundled type the compiler models (`Vec`, `String`,
+  `Formatter`, `Range`, `Error`, `HashMap`, `IndexSet`, `Duration`, `Iter`, ..; `ownstd.rs`) is
+  `Vec__file` in the same way, so the bundled preludes keep std's (a top-level one is exported
+  under its own name too, for the files that import it; `fixtures/own_std_names.rs`). One in an
+  inline module is `fmt__Formatter` already; one in a function body or a `#[cfg(test)]` module
+  is renamed within that block or module (`fixtures/own_std_names_nested.rs`). Traits, type aliases
   and constants aren't renamed that way: a `mod` file's trait named like this file's is still
   "defined multiple times". A renamed import of another file's or a crate's type, trait or
   constant (`use geo::Point as P;`, `pub use area::Error as AreaError;`) is written back under
@@ -458,6 +463,8 @@ There is one JS thread, and scripts share it with the game.
   array).
 - **`VecDeque::insert` past the end appends instead of panicking.**
 - **`HashMap::with_hasher(..)` ignores the hasher**: keys compare by value.
+- **Every `RandomState` hashes alike.** std seeds each one randomly, so two `RandomState`s give
+  different `hash_one` values for one key; here they give the same (a `DefaultHasher`'s).
 - **A hand-written `Hash` sets map keys only with a hand-written `PartialEq`.** Keys are
   structural (every field) for a derived `PartialEq`, and what `hash` writes for a hand-written
   one, so the two should use the same fields (as Rust requires anyway). `DefaultHasher::finish()`
@@ -630,14 +637,20 @@ There is one JS thread, and scripts share it with the game.
   `RangeFrom`, `RangeTo`, `RangeFull`, ..)
 - **A trait for both `str` and `String`** (or `[T]` and `Vec<T>`, `Path` and `PathBuf`): one
   type in JS, so the borrowed type's impl serves both. The owned one must hand each call on to it
-  (`self.as_str().f(a)`, `Tr::f(&self.as_str())`, `self[..].f()`); one that does something else
-  (zeroize's `Vec` impl also truncates) is an error.
+  (`self.as_str().f(a)`, `Tr::f(&self.as_str())`, `self[..].f()`) or do what the borrowed one's
+  method does (the same body, with `self.as_str()` / `(*self).as_ref()` / `&self[..]` read as
+  `self`); one that does something else (zeroize's `Vec` impl also truncates) is an error.
 - **Arrays and slices share `Vec`'s impls**: `impl Tr for [u8; 4]` and `impl Tr for Vec<u8>` (or
   `[u16]`) would collide, and the element type isn't checked.
 - **`impl Tr for &T` / `&mut T` / `Box<T>` must forward to `T`'s impl.** References and boxes are
   erased, so `&x` is `x` and its methods are `T`'s: an impl whose methods each call `T`'s
   (`(**self).f(a)`, `T::f(self, a)`, `self.as_ref().f(a)`) is left out, and one that does
   anything else (or leaves to the default a method another impl overrides) is an error.
+- **`impl PartialEq for Box<dyn Tr>` doesn't move the operands of `==`.** rustc's `a == b`
+  on two such boxes moves `b` (and a derived `PartialEq` over a bare `Box<dyn Tr>` field is its
+  E0507); here both compile and `b` stays usable. Write `&a == &b` for code rustc accepts.
+  Such a `PartialOrd` impl serves `<` / `<=` / `>` / `>=` and `a.partial_cmp(&b)`; `Ord` and
+  `Hash` impls only their methods by name (`a.cmp(&b)`), not sorting or hashing.
 - **`Box<dyn Error>` from a string** (`"x".into()`, `format!(..).into()`) is the string itself:
   `{}`, `{:?}` and `to_string()` match std, but `downcast_ref::<String>()` style checks see a
   plain string.
@@ -692,15 +705,20 @@ There is one JS thread, and scripts share it with the game.
 
 - **`write_vectored` writes every buffer** (as a `Vec<u8>` does in Rust; std's default, and
   Windows' stdout, write only the first).
-- **`Read` / `BufRead` are the io prelude's traits.** `BufRead::fill_buf` gives a copy of the
+- **`Read` / `BufRead` / `Seek` are the io prelude's traits.** `BufRead::fill_buf` gives a copy of the
   buffer (a `Vec<u8>`), and `lines()` / `split()` / `bytes()` read everything up front rather
-  than lazily. `Seek` isn't there. `Cursor::new(Vec::new())` is a `Cursor<Vec<u8>>` (as its
+  than lazily. `Cursor::new(Vec::new())` is a `Cursor<Vec<u8>>` (as its
   `Write` impl would say in Rust); another untyped `Vec` inside a `Cursor` needs an annotation. A
   `Cursor` over a `String` accepts writes (Rust has no such impl), which don't change the string.
 - **`&[u8]` reads through a `Cursor` of its own.** Passed for an `R: Read` parameter, the bytes
   are wrapped on entry, so reading leaves the caller's slice where it was, as passing `&[u8]` by
-  value does in Rust. Passing `&mut slice` (whose reads advance `slice` in Rust) is an error: use
-  a `Cursor`. `get_ref()` of a `BufReader` over bytes gives that `Cursor`.
+  value does in Rust. Passing `&mut slice` for a parameter taken by value (`r: R`, `impl Read`,
+  whose reads advance `slice` in Rust) is an error: take `r: &mut R`, or use
+  a `Cursor`. `get_ref()` of a `BufReader` over bytes gives that `Cursor`. Reading a slice
+  binding itself (`s.read(&mut buf)`) advances it, as in Rust, and so does reading through a
+  `&mut &[u8]` or an `r: &mut R` given `&mut s` (the call hands over a copy); each read copies
+  what's left of it. A `Vec<u8>` is the same type here, so `v.read(..)` on one compiles too
+  (rustc: no `Read` for `Vec<u8>`) and takes bytes off the front of the `Vec`.
 
 ## std::time
 

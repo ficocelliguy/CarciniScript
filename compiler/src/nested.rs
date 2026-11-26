@@ -102,7 +102,9 @@ pub(crate) fn expand(
         };
         edits.push((at.start().into(), at.end().into(), new.clone()));
         if is_type {
-            names.insert(new.clone(), name.clone());
+            // (Through an earlier pass's name: `Error__file` is the file's `Error`.)
+            let written = names.get(&name).cloned().unwrap_or_else(|| name.clone());
+            names.insert(new.clone(), written);
         }
         scopes.push((name, scope, new, is_type));
     }

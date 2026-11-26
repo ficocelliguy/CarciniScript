@@ -38,7 +38,8 @@ use ra_ap_syntax::{
 /// Names the compiler reaches on its own, without the program's text naming them: the
 /// `.entry()` helper, `write!` into a `fmt::Write` / `io::Write` (`__write_str`), the types it
 /// makes for a `JoinHandle`'s result or `serde_json::from_str`, `rng.gen::<Adt>()` through
-/// `RandStandard`, the `jsx!` attribute marker traits, the `json!` value constructors the
+/// `RandStandard`, the `Cursor` an `R: Read` parameter given bytes reads through, the `jsx!`
+/// attribute marker traits, the `json!` value constructors the
 /// `JSON` schema names, and what the runtime calls back into (`e.__m()` on an entry, the
 /// context a hand-written future is polled with and the
 /// waker it wakes when a polled promise settles).
@@ -65,6 +66,7 @@ const IMPLICIT: &[&str] = &[
     "IoWrite",
     "IoRead",
     "IoBufRead",
+    "IoCursor",
     "IoError",
     "TaskPoll",
     "__task_context",

@@ -424,6 +424,10 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
             let (base, assoc) = n.split_once("::").unwrap_or_default();
             match m.get(base) {
                 Some(Ty::Param(p)) => Ty::Param(format!("{p}::{assoc}")),
+                // (`I::Item` with `I` an iterator of `u8`.)
+                Some(Ty::Iter { elem, .. } | Ty::IntoIter(elem)) if assoc == "Item" => {
+                    (**elem).clone()
+                }
                 Some(_) => Ty::Unknown,
                 None => t.clone(),
             }
@@ -1124,8 +1128,9 @@ impl Checker<'_> {
     }
 
     /// Whether a concrete type meets a bound.
-    /// `f(&mut bytes)` for an `R: Read` parameter: reading would advance the caller's `&[u8]`,
-    /// but the function reads from a `Cursor` of its own (see `is_bytes`).
+    /// `f(&mut bytes)` for an `R: Read` parameter taken by value: reading would advance the
+    /// caller's `&[u8]`, but the function reads from a `Cursor` of its own (see `is_bytes`). (An
+    /// `r: &mut R` reads the caller's copy in place: `slice_ref_muts`.)
     pub(super) fn check_byte_readers(&mut self, f: &str, args: &[ast::Expr], inst: &[Ty]) {
         let Some(sig) = self.fns.get(f) else { return };
         let readers: Vec<usize> = (sig.params.iter().enumerate())
@@ -1139,13 +1144,22 @@ impl Checker<'_> {
             })
             .map(|(i, _)| i)
             .collect();
+        let mut_ref_params: Vec<bool> = (sig.ref_params.iter())
+            .map(|r| r.as_deref().is_some_and(|r| r.starts_with("&mut")))
+            .collect();
         for i in readers {
+            // (An `impl Read` parameter stays `dyn`: the argument's own type.)
+            let arg_ty = |c: &Self, r: &ast::RefExpr| c.raw.get(&c.range(r.syntax())).cloned();
             if let (Some(ast::Expr::RefExpr(r)), Some(t)) = (args.get(i), inst.get(i))
                 && r.mut_token().is_some()
-                && self.is_bytes(t)
+                && (self.is_bytes(t)
+                    || matches!(t, Ty::Dyn(_)) && arg_ty(self, r).is_some_and(|a| self.is_bytes(&a)))
+                // (`r: &mut R` given `&mut s`, `s: &[u8]`: it reads `s`'s own copy in place.)
+                && !(mut_ref_params.get(i) == Some(&true)
+                    && self.slice_ref_muts.contains(&self.range(r.syntax())))
             {
                 let node = r.syntax().clone();
-                self.error(&node, "reading from a `&mut &[u8]` would advance the caller's slice, which isn't supported; pass the bytes (`&data[..]`) or an `io::Cursor::new(data)`");
+                self.error(&node, "reading from a `&mut &[u8]` taken by value would advance the caller's slice, which isn't supported; take `r: &mut R`, or pass the bytes (`&data[..]`) or an `io::Cursor::new(data)`");
             }
         }
     }
@@ -1450,6 +1464,16 @@ impl Checker<'_> {
             // `self.0.fmt(f)`: `Display::fmt` / `Debug::fmt` delegation.
             "fmt" if self.param_has(name, "Display") || self.param_has(name, "Debug") => {
                 sig(self, &[Ty::Formatter], super::gaps::fmt_result())
+            }
+            // An `S: BuildHasher` (a `RandomState`, or your own): `x.hash(&mut h)` feeds the
+            // hasher it builds.
+            "build_hasher" if self.param_has(name, "BuildHasher") => sig(self, &[], Ty::Hasher),
+            "hash_one" if self.param_has(name, "BuildHasher") => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                for a in args {
+                    self.infer(a, None);
+                }
+                Ty::Int(crate::ty::IntKind::U64)
             }
             _ => {
                 for a in args {

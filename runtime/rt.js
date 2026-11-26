@@ -3746,6 +3746,13 @@
       else if (typeof h.$write === "function") h.$write(v);
       else ownMethod(h, "write")(rt.$hashBytes(v));
     },
+    // `b.hash_one(x)`: the hasher `b` builds (std's `Hasher` for a `RandomState`, or your own),
+    // fed `x`, finished.
+    $hashOne(b, x) {
+      const h = ownMethod(b, "build_hasher")();
+      rt.$hashInto(x, h);
+      return h instanceof Hasher ? h.$finish() : ownMethod(h, "finish")();
+    },
     // The bytes std's `Hash` gives your own `Hasher` for a value: integers as 8 bytes
     // (`usize` / `u64`'s), a string's UTF-8 then `0xff`, a Vec's length then its items.
     $hashBytes(v) {
@@ -4251,6 +4258,21 @@
       const f = { s: "" };
       v.fmt(f);
       return f.s;
+    },
+    // `{}` / `{:?}` of a `dyn Tr` through `impl Display` / `Debug for Box<dyn Tr>`: `fmt` is
+    // that impl's, called with the value as `self`.
+    $fmtVia(v, fmt) {
+      const f = { s: "" };
+      fmt.call(v, f);
+      return f.s;
+    },
+    // `==` on `Vec`s / `Option`s of such a `dyn Tr` (`impl PartialEq for Box<dyn Tr>`): element
+    // by element through that impl's `eq`.
+    $eqBy(a, b, eq) {
+      return a.length === b.length && a.every((x, i) => eq(x, b[i]));
+    },
+    $eqOptBy(a, b, eq) {
+      return a == null ? b == null : b != null && eq(unsome(a), unsome(b));
     },
     // `{:>8}` / `{:.2?}` of a value with its own `fmt`: the impl gets the spec
     // `o = { w, p, align, fill, plus, alt, zero }` (`f.width()`, `f.precision()`, ..) and, like
@@ -5199,7 +5221,11 @@
         if (d === undefined) {
           d = byKind[kind] = Object.create(rt.$numT(kind));
           for (const k of Object.getOwnPropertyNames(ext)) {
-            if (typeof ext[k] === "function" && !["length", "name", "prototype"].includes(k)) d[k] = ext[k].bind(ext);
+            if (["length", "name", "prototype"].includes(k)) continue;
+            const desc = Object.getOwnPropertyDescriptor(ext, k);
+            if (!desc.get && typeof desc.value === "function") d[k] = ext[k].bind(ext);
+            // (Its associated consts, `T::ZERO`: lazy getters that turn into values.)
+            else if (k[0] !== "$") Object.defineProperty(d, k, { get: () => ext[k] });
           }
         }
         return d;
@@ -8075,7 +8101,8 @@
     macroSteps = 0;
     let crate = macroCrates.get(code);
     if (!crate) {
-      const body = code.replace(/^export (?=(async )?function |class |const |let )/gm, "");
+      // (`export { Error__file as Error };`: a renamed type's other name, for importers only.)
+      const body = code.replace(/^export (?=(async )?function |class |const |let )/gm, "").replace(/^export \{[^}]*\};$/gm, "");
       const names = [...code.matchAll(/^export (?:async )?function ([\w$]+)/gm)].map((m) => m[1]);
       try {
         crate = new Function(`${body}\nreturn { ${names.join(", ")} };`)();

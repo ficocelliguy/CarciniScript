@@ -624,7 +624,7 @@ impl Codegen<'_> {
             }
             ["hint", "black_box"] => emit(self, 0),
             ["Rc" | "Arc", "downgrade"] => self.emit_expr(args.first()?, None).0,
-            ["Rc" | "Arc", "default"] => Frag::mapped(
+            ["Rc" | "Arc" | "Box", "default"] => Frag::mapped(
                 start,
                 super::default_value(&ty).unwrap_or_else(|| "undefined".into()),
             ),

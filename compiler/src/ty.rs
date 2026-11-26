@@ -377,6 +377,7 @@ impl Ty {
             "char" => Ty::Char,
             "String" | "str" => Ty::Str,
             "NS" => Ty::Extern("NS".into()),
+            "Formatter" => Ty::Formatter,
             // (A tuple's extension key, `Tuple2`.)
             k => match crate::adt::tuple_arity(k) {
                 Some(n) => Ty::Tuple(vec![Ty::Unknown; n]),

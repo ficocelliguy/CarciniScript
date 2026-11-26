@@ -148,6 +148,38 @@ pub trait IoWrite {
     }
 }
 
+/// `std::io::SeekFrom`, for your own `Seek` impls and patterns over it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum IoSeekFrom {
+    Start(u64),
+    End(i64),
+    Current(i64),
+}
+
+/// `std::io::Seek`: your own `seek`, and std's provided methods on it.
+pub trait IoSeek {
+    fn seek(&mut self, pos: IoSeekFrom) -> Result<u64, IoError>;
+    fn rewind(&mut self) -> Result<(), IoError> {
+        self.seek(IoSeekFrom::Start(0))?;
+        Ok(())
+    }
+    fn stream_position(&mut self) -> Result<u64, IoError> {
+        self.seek(IoSeekFrom::Current(0))
+    }
+    fn seek_relative(&mut self, offset: i64) -> Result<(), IoError> {
+        self.seek(IoSeekFrom::Current(offset))?;
+        Ok(())
+    }
+}
+
+/// `std::fmt::Alignment`, as a value and in patterns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum FmtAlignment {
+    Left,
+    Right,
+    Center,
+}
+
 /// `std::io::IoSlice`: a byte slice for `write_vectored`.
 #[derive(Clone, Debug)]
 pub struct IoIoSlice {
@@ -423,6 +455,19 @@ impl<R: IoRead> IoBufRead for IoBufReader<R> {
     }
 }
 
+/// `impl Read for &[u8]`: a read takes the bytes off the front of the slice. (The call gives
+/// the binding its own copy first, so the data the slice was made from stays as it was.)
+impl IoRead for Vec<u8> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let n = std::cmp::min(buf.len(), self.len());
+        for i in 0..n {
+            buf[i] = self[i];
+        }
+        self.drain(..n);
+        Ok(n)
+    }
+}
+
 impl IoRead for IoStdin {
     fn read(&mut self, _buf: &mut [u8]) -> Result<usize, IoError> {
         Ok(0)
@@ -656,6 +701,24 @@ impl<T> IoRead for IoCursor<T> {
         }
         self.pos += n as u64;
         Ok(n)
+    }
+}
+
+impl<T> IoSeek for IoCursor<T> {
+    fn seek(&mut self, pos: IoSeekFrom) -> Result<u64, IoError> {
+        let to = match pos {
+            IoSeekFrom::Start(n) => n as i64,
+            IoSeekFrom::End(n) => js::__io_bytes(&self.inner).len() as i64 + n,
+            IoSeekFrom::Current(n) => self.pos as i64 + n,
+        };
+        if to < 0 {
+            return Err(IoError::new(
+                IoErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            ));
+        }
+        self.pos = to as u64;
+        Ok(self.pos)
     }
 }
 

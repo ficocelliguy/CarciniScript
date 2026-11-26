@@ -1031,6 +1031,7 @@ fn compile_text(
         let (types, type_diags) = typeck::check(&file, src, filename, resolver, &origin);
         cg.types = types;
         cg.type_errors = type_diags.iter().any(|d| d.severity == "error");
+        set_dyn_fmt(&cg.types.adts);
         cg.emit_file(&file);
         // The type checker owns name and type errors. Codegen may report the same problem at the
         // same node (it re-checks some things while lowering); the checker's report wins.
@@ -3855,8 +3856,14 @@ impl<'a> Codegen<'a> {
                 let mut f = Frag::text("κσ.$cell(() => ");
                 f.append(pf.clone())
                     .push(", ($v) => { ")
-                    .append(pf)
+                    .append(pf.clone())
                     .push(" = $v; })");
+                // (`&mut s` of a `s: &[u8]`: its own copy first, as for `slice_ref_muts`.)
+                if self.types.slice_ref_muts.contains(&self.range_of(r.syntax())) {
+                    let mut c = pf.clone().wrap("(", " = ");
+                    c.append(pf).push(".slice(), ").append(f).push(")");
+                    f = c;
+                }
                 (f, t)
             }
             // `index_mut`'s `&mut self.cells[i]`: a cell reading and writing that place. (Arrow
@@ -3955,6 +3962,19 @@ impl<'a> Codegen<'a> {
                 let out = self.emit_expr(&inner, expected);
                 self.slice_view = false;
                 out
+            }
+            // `&mut s` of a `s: &[u8]`: `s` gets its own copy first, which the callee may write
+            // (`*r = &r[1..]`), so what it was sliced from stays as it was.
+            ast::Expr::RefExpr(r)
+                if self.types.slice_ref_muts.contains(&self.range_of(r.syntax())) =>
+            {
+                let Some(inner) = r.expr() else {
+                    return (Frag::text("undefined"), Ty::Unknown);
+                };
+                let (f, t) = self.emit_expr(&inner, expected);
+                let mut out = f.clone().wrap("(", " = ");
+                out.append(f).push(".slice())");
+                (out, t)
             }
             ast::Expr::RefExpr(r) => match r.expr() {
                 Some(inner) => self.emit_expr(&inner, expected),
@@ -4918,6 +4938,27 @@ impl<'a> Codegen<'a> {
                     f.push(".$eq(").append(rf).push(")");
                     return (if negated { f.wrap("!", "") } else { f }, Ty::Bool);
                 }
+                // `a == b` on a `dyn Tr` (or a `Vec` / `Option` of one) with `impl PartialEq for
+                // Box<dyn Tr>`: that `eq`.
+                if let CmpOp::Eq { negated } = op
+                    && let Some(eq) = adt_gen::dyn_eq_fn(&self.types.adts, &lt)
+                {
+                    let mut f = Frag::text(format!("{}{eq}(", if negated { "!" } else { "" }));
+                    f.append(lf).push(", ").append(rf).push(")");
+                    return (f, Ty::Bool);
+                }
+                // `a < b` on a `dyn Tr` with `impl PartialOrd for Box<dyn Tr>`: its `partial_cmp`
+                // (`None` makes every comparison false).
+                if let (Ty::Dyn(tr), CmpOp::Ord { .. }) = (&lt, op)
+                    && let key = format!("dyn${tr}")
+                    && self.types.adts.method(&key, "partial_cmp").is_some()
+                {
+                    let mut f = Frag::text(format!(
+                        "((r) => r != null && r {op} 0)($ext${key}.prototype.partial_cmp.call("
+                    ));
+                    f.append(lf).push(", ").append(rf).push("))");
+                    return (f, Ty::Bool);
+                }
                 // Tuples and Vecs order lexicographically, like Rust's derived `Ord`; `None` is below
                 // every `Some` (an NS field's type is the checker's).
                 let option = matches!(self.ty_of(lhs.syntax()), Some(Ty::Option(_)));
@@ -5522,7 +5563,10 @@ impl<'a> Codegen<'a> {
         let ast::Expr::RefExpr(r) = strip_parens_expr(a) else {
             return None;
         };
-        if !self.types.slot_args.contains(&self.range_of(r.syntax())) {
+        // (A `&mut s` of a `s: &[u8]` takes its copy first: a cell.)
+        if !self.types.slot_args.contains(&self.range_of(r.syntax()))
+            || self.types.slice_ref_muts.contains(&self.range_of(r.syntax()))
+        {
             return None;
         }
         let inner = strip_parens_expr(&r.expr()?);
@@ -6536,7 +6580,7 @@ impl<'a> Codegen<'a> {
                 )
             }
             // Capacity is only a hint; JS arrays grow on their own.
-            ["Vec" | "vec", "new" | "with_capacity"] => {
+            ["Vec" | "vec", "new" | "with_capacity" | "default"] => {
                 (Frag::text("[]"), Ty::Vec(Box::new(Ty::Unknown)))
             }
             ["Vec" | "vec", "from"] => {
@@ -6702,7 +6746,25 @@ impl<'a> Codegen<'a> {
         // (`Trait$method`, when another trait has a method of that name too.)
         let key = self.types.method_keys.get(&self.range_of(m.syntax())).cloned();
         let method = key.as_deref().unwrap_or(method);
+        // `b.clone()` of a `Box<dyn Tr>` with `impl Clone for Box<dyn Tr>`: that `clone`.
+        if method == "clone"
+            && let Some(recv) = m.receiver()
+            && let Some(t) = self.ty_of(recv.syntax())
+            && let Some(c) = adt_gen::dyn_clone(&self.types.adts, &t)
+        {
+            return rf.clone().wrap(&format!("{c}.call("), ")");
+        }
         let args = self.emit_args(m.arg_list(), &[]);
+        // `s.hash_one(x)` on an `S: BuildHasher`: the hasher it builds may be std's.
+        if method == "hash_one"
+            && let [x] = &args[..]
+            && let Some(recv) = m.receiver()
+            && matches!(self.ty_of(recv.syntax()), Some(Ty::Param(_)))
+        {
+            let mut f = Frag::mapped(name_off, "κσ.$hashOne(");
+            f.append(rf.clone()).push(", ").append(x.clone()).push(")");
+            return f;
+        }
         // `w.write_str(s)` with `W: fmt::Write`: `w` may be a `String` or a `Formatter`, so the
         // call goes through its cell.
         if matches!(method, "write_str" | "write_char")
@@ -7327,7 +7389,25 @@ impl<'a> Codegen<'a> {
             let (rf, rt) = self.emit_expr(&recv, None);
             // (Only a `self` receiver takes a copy: `&mut self` writes into the value itself, or
             // into its place through a cell when it's a string or number.)
-            let rf = if sig
+            let rf = if self.slice_read(&key, &method, &rt) {
+                // `s.read(&mut buf)` on `s: &[u8]` takes bytes off the front of `s`, so `s`
+                // gets its own copy first: what it was sliced from stays as it was.
+                let place = strip_parens_expr(&recv);
+                // (`r.read(..)` on `r: &mut &[u8]` advances the caller's `s`, a copy already.)
+                if matches!(place, ast::Expr::PathExpr(_))
+                    && self.types.slice_ref_muts.contains(&self.range_of(place.syntax()))
+                {
+                    rf
+                } else if matches!(place, ast::Expr::PathExpr(_) | ast::Expr::FieldExpr(_))
+                    && is_pure(&place)
+                {
+                    let mut f = rf.clone().wrap("(", " = ");
+                    f.append(rf).push(".slice())");
+                    f
+                } else {
+                    rf.wrap("(", ").slice()")
+                }
+            } else if sig
                 .as_ref()
                 .is_some_and(|s| self.key_cell_self(s, &key))
             {
@@ -7501,6 +7581,19 @@ impl<'a> Codegen<'a> {
         {
             return r;
         }
+        // `shape.to_string()`: through `impl Display for Box<dyn Shape>`, or the value's own.
+        if let Ty::Dyn(tr) = &rt
+            && method == "to_string"
+            && self.types.adts.method(&format!("dyn${tr}"), "to_string").is_none()
+            && !self.types.adts.traits.get(tr).is_some_and(|t| t.methods.iter().any(|m| m.name == "to_string"))
+        {
+            let mut f = Frag::mapped(self.off(name.syntax()), "κσ.");
+            match dyn_fmt(tr, false) {
+                Some(fmt) => f.push("$fmtVia(").append(rf).push(format!(", {fmt})")),
+                None => f.push("$disp(").append(rf).push(")"),
+            };
+            return (f, Ty::Str);
+        }
         if let Ty::RefCell(inner) = &rt {
             let name_off = self.off(name.syntax());
             let ret = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
@@ -7647,6 +7740,12 @@ impl<'a> Codegen<'a> {
         // An iterator's clone goes on over what's left by itself.
         if method == "clone" && matches!(rt, Ty::Iter { .. }) {
             return (rf.wrap("", ".$clone()"), rt);
+        }
+        // `b.clone()` of a `Box<dyn Tr>` with `impl Clone for Box<dyn Tr>`: that `clone`.
+        if method == "clone"
+            && let Some(c) = adt_gen::dyn_clone(&self.types.adts, &rt)
+        {
+            return (rf.wrap(&format!("{c}.call("), ")"), rt);
         }
         if matches!(method.as_str(), "clone" | "to_owned" | "as_str" | "into") && rt != Ty::Unknown
             || (method == "into_owned" && rt == Ty::Str)
@@ -10125,6 +10224,33 @@ fn debug_fn(ty: &Ty) -> Option<String> {
 }
 
 thread_local! {
+    /// The `dyn Tr`s with an `impl Debug for Box<dyn Tr>` (`.0`) / `impl Display` (`.1`), whose
+    /// `{:?}` / `{}` go through that impl rather than the boxed value's own.
+    static DYN_FMT: std::cell::RefCell<HashMap<String, (bool, bool)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Fill `DYN_FMT` for the program being emitted.
+fn set_dyn_fmt(adts: &crate::adt::Adts) {
+    let m = (adts.ext_types.iter())
+        .filter_map(|k| {
+            let tr = k.strip_prefix("dyn$")?;
+            let dbg = adts.method(k, "fmt$dbg").is_some();
+            let disp = adts.method(k, "fmt").is_some();
+            (dbg || disp).then(|| (tr.to_string(), (dbg, disp)))
+        })
+        .collect();
+    DYN_FMT.with(|d| *d.borrow_mut() = m);
+}
+
+/// The `fmt` of `impl Debug` (`debug`) or `impl Display` for `Box<dyn tr>`, as a JS function
+/// taking the value as `this`.
+fn dyn_fmt(tr: &str, debug: bool) -> Option<String> {
+    let (dbg, disp) = DYN_FMT.with(|d| d.borrow().get(tr).copied())?;
+    let m = if debug { "fmt$dbg" } else { "fmt" };
+    (if debug { dbg } else { disp }).then(|| format!("$ext$dyn${tr}.prototype.{m}"))
+}
+
+thread_local! {
     /// Inside a `{:x?}` / `{:X?}`: the spec each integer is printed with (`{:x}` / `{:X}`, with
     /// the `#`, `0` and width given).
     static HEX_DBG: std::cell::RefCell<Option<Spec>> = const { std::cell::RefCell::new(None) };
@@ -10221,6 +10347,10 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
             ))
         }
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),
+        // `impl Debug for Box<dyn Tr>`: that `fmt`, not the boxed value's.
+        Ty::Dyn(tr) if let Some(m) = dyn_fmt(tr, true) => {
+            Some(format!("((v) => κσ.$fmtVia(v, {m}))"))
+        }
         // (A `Box<dyn Error>` may hold a string, whose `{:?}` is quoted.)
         Ty::Dyn(_) => Some("κσ.$dbgAny".into()),
         Ty::Ordering => Some("κσ.$dbgOrdering".into()),
@@ -10382,6 +10512,13 @@ fn format_value(
     // A user `Display` impl formats itself; like `write!`-based impls in Rust, it ignores width.
     if !spec.debug && matches!(ty, Ty::Adt(..)) {
         return call("κσ.$display", f, "");
+    }
+    // `impl Display for Box<dyn Tr>`: that `fmt`, not the boxed value's.
+    if !spec.debug
+        && let Ty::Dyn(tr) = ty
+        && let Some(m) = dyn_fmt(tr, false)
+    {
+        return call("κσ.$fmtVia", f, &format!(", {m}"));
     }
     // A generic value or trait object: decided at run time.
     let f = if !spec.debug && matches!(ty, Ty::Param(_) | Ty::Dyn(_)) {

@@ -1119,7 +1119,9 @@ fn from_value_path(toks: &[SyntaxToken], i: usize) -> Option<(usize, usize)> {
     let type_like = name.starts_with(|c: char| c.is_ascii_uppercase())
         || PRIMS.contains(&name.as_str());
     let taken = matches!(name.as_str(), "From" | "String");
-    if toks[i].kind() != SyntaxKind::IDENT || !type_like || taken {
+    // (`.map(Self::from)` in an impl too.)
+    let kind = toks[i].kind();
+    if !matches!(kind, SyntaxKind::IDENT | SyntaxKind::SELF_TYPE_KW) || !type_like || taken {
         return None;
     }
     let m = i + 1 + sep(i + 1)?;

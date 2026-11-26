@@ -595,7 +595,7 @@ impl Checker<'_> {
             }
             // `Rc::downgrade(&rc)`: a `Weak` is the value itself (or `null`).
             // `Rc::default()`: the value's own default (an `Rc` is the value here).
-            ["Rc" | "Arc", "default"] => {
+            ["Rc" | "Arc" | "Box", "default"] => {
                 count(self, 0);
                 self.fresh(VarKind::General)
             }

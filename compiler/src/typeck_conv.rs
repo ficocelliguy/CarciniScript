@@ -668,6 +668,21 @@ impl Checker<'_> {
                     return ret;
                 }
             }
+            // `Dt::from(d)` of a `Dt`: std's `impl<T> From<T> for T`.
+            None if {
+                // (Not an argument of no type yet when impls could take it.)
+                let open = matches!(self.shallow(&at), Ty::Var(_))
+                    && self.adts.from_impls.contains_key(adt);
+                let own = Ty::Adt(adt.to_string(), self.fresh_args(adt));
+                !open && self.could_be(&own, &at) && {
+                    self.unify(&own, &at);
+                    true
+                }
+            } =>
+            {
+                self.record_conv(c.syntax(), Conv::Identity);
+                return at;
+            }
             None => {
                 let msg = format!(
                     "the trait bound `{adt}: From<{}>` is not satisfied (`{adt}` implements {})",

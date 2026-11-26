@@ -51,19 +51,62 @@ pub(super) fn path_segments(path: Option<ast::Path>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-fn clone_of(ty: &Ty, e: &str) -> String {
+/// `clone()` of a value of type `ty`, with `dyn_clones` from `dyn_clones`.
+fn clone_of(dyn_clones: &[(Ty, String)], ty: &Ty, e: &str) -> String {
     if ty.is_js_primitive() || matches!(ty, Ty::Unit) {
         e.to_string()
+    } else if let Some((_, c)) = dyn_clones.iter().find(|(t, _)| t == ty) {
+        format!("{c}.call({e})")
     } else {
         format!("κσ.$clone({e})")
     }
 }
 
-fn eq_of(ty: &Ty, a: &str, b: &str) -> String {
+/// The `clone` of `impl Clone for Box<dyn Tr>` when `ty` is that `dyn Tr` (it typically calls
+/// `self.clone_box()`), as a JS function taking the value as `this`.
+pub(super) fn dyn_clone(adts: &crate::adt::Adts, ty: &Ty) -> Option<String> {
+    let Ty::Dyn(tr) = ty else {
+        return None;
+    };
+    let key = format!("dyn${tr}");
+    adts.method(&key, "clone")?;
+    Some(format!("$ext${key}.prototype.clone"))
+}
+
+/// Each `dyn Tr` with an `impl Clone for Box<dyn Tr>`, and that `clone` (`dyn_clone`).
+fn dyn_clones(adts: &crate::adt::Adts) -> Vec<(Ty, String)> {
+    adts.ext_types
+        .iter()
+        .filter_map(|k| {
+            let t = Ty::Dyn(k.strip_prefix("dyn$")?.to_string());
+            Some((t.clone(), dyn_clone(adts, &t)?))
+        })
+        .collect()
+}
+
+fn eq_of(adts: &crate::adt::Adts, ty: &Ty, a: &str, b: &str) -> String {
     if ty.is_js_primitive() || matches!(ty, Ty::Unit) {
         format!("{a} === {b}")
+    } else if let Some(f) = dyn_eq_fn(adts, ty) {
+        format!("{f}({a}, {b})")
     } else {
         format!("κσ.$eq({a}, {b})")
+    }
+}
+
+/// `==` on a `ty` that is or holds a `dyn Tr` with `impl PartialEq for Box<dyn Tr>`: a JS
+/// function of the two sides calling that `eq` (the boxed values' own `$eq` would compare them
+/// field by field); `None` when `ty` holds no such `dyn`.
+pub(super) fn dyn_eq_fn(adts: &crate::adt::Adts, ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Dyn(tr) => {
+            let key = format!("dyn${tr}");
+            adts.method(&key, "eq")?;
+            Some(format!("((a, b) => $ext${key}.prototype.eq.call(a, b))"))
+        }
+        Ty::Vec(e) => Some(format!("((a, b) => κσ.$eqBy(a, b, {}))", dyn_eq_fn(adts, e)?)),
+        Ty::Option(e) => Some(format!("((a, b) => κσ.$eqOptBy(a, b, {}))", dyn_eq_fn(adts, e)?)),
+        _ => None,
     }
 }
 
@@ -89,6 +132,7 @@ pub(super) fn ext_self_ty(key: &str) -> Ty {
         "Option" => Ty::Option(Box::new(Ty::Unknown)),
         "bool" => Ty::Bool,
         "char" => Ty::Char,
+        k if let Some(tr) = k.strip_prefix("dyn$") => Ty::Dyn(tr.to_string()),
         k => Ty::from_name(k),
     }
 }
@@ -116,6 +160,15 @@ impl Codegen<'_> {
             ext_self_ty(key)
         };
         cell_self(sig, &self_ty, adts)
+    }
+
+    /// `s.read(&mut buf)` on `s: &[u8]`: the io prelude's `impl IoRead for Vec<u8>` (see the
+    /// checker's `slice_read`).
+    pub(super) fn slice_read(&self, key: &str, method: &str, rt: &Ty) -> bool {
+        key == "Vec"
+            && matches!(rt, Ty::Vec(e) if matches!(**e, Ty::Int(crate::ty::IntKind::U8)))
+            && (self.types.adts.traits.get("IoRead"))
+                .is_some_and(|t| t.methods.iter().any(|m| m.name == method))
     }
 
     fn adt(&self, name: &str) -> Option<AdtDef> {
@@ -482,6 +535,13 @@ impl Codegen<'_> {
         self.emit_derives(&def, &cls, node);
         self.out.indent -= 1;
         self.line(Frag::text("}"));
+        // (A file's own `Duration`, renamed `Duration__file` by `ownstd.rs`: the files that
+        // import it ask for `Duration`.)
+        if let Some(orig) = def.name.strip_suffix("__file")
+            && self.display_names.get(&def.name).is_some_and(|o| o == orig)
+        {
+            self.line(Frag::text(format!("export {{ {cls} as {orig} }};")));
+        }
         self.line(Frag::default());
     }
 
@@ -878,6 +938,7 @@ impl Codegen<'_> {
             k if crate::ty::RangeKind::from_name(k).is_some() => ext_self_ty(k),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
+            k if let Some(tr) = k.strip_prefix("dyn$") => Ty::Dyn(tr.to_string()),
             k => Ty::from_name(k),
         };
         // (`Self::make()` in its methods is the class's own function.)
@@ -888,6 +949,7 @@ impl Codegen<'_> {
         self.line(Frag::text(format!("class $ext${key} {{")));
         self.out.indent += 1;
         let mut given: Vec<String> = Vec::new();
+        let mut given_consts: Vec<ast::Const> = Vec::new();
         let mut traits: Vec<String> = Vec::new();
         for imp in impls {
             if let (Some(tr), _) = crate::adt::impl_parts(imp) {
@@ -937,6 +999,21 @@ impl Codegen<'_> {
                     self.emit_method_fn(f, sig, self_ty.clone(), "}", Some(fi.key.clone()));
                     continue;
                 }
+                // `impl Debug for Box<dyn Tr>`'s `fmt`, as `fmt$dbg` (next to `Display`'s).
+                if let ast::AssocItem::Fn(f) = &item
+                    && let Some(n) = f.name()
+                    && self.types.adts.debug_fmt.get(key) == Some(&self.off(n.syntax()))
+                    && let Some(sig) = self.types.adts.method(key, "fmt$dbg").cloned()
+                {
+                    self.emit_method_fn(f, sig, self_ty.clone(), "}", Some("fmt$dbg".into()));
+                    continue;
+                }
+                // `const ZERO: u32 = 0;`: `$ext$u32.ZERO`, which `T::ZERO` reads off the class
+                // passed for `T`.
+                if let ast::AssocItem::Const(k) = &item {
+                    given_consts.push(k.clone());
+                    continue;
+                }
                 if let ast::AssocItem::Fn(f) = item
                     && let Some(n) = f.name()
                     && let Some(sig) = self.types.adts.method(key, n.text()).cloned()
@@ -945,6 +1022,43 @@ impl Codegen<'_> {
                     self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
                 }
             }
+        }
+        // (And the trait's default consts the impls leave out.)
+        let named: Vec<String> = given_consts
+            .iter()
+            .filter_map(|k| Some(k.name()?.text().to_string()))
+            .collect();
+        let default_consts: Vec<ast::Const> = self
+            .file_traits
+            .iter()
+            .filter(|t| t.name().is_some_and(|n| traits.contains(&n.text().to_string())))
+            .flat_map(|t| t.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()))
+            .filter_map(|i| match i {
+                ast::AssocItem::Const(k) if k.body().is_some() => Some(k),
+                _ => None,
+            })
+            .filter(|k| k.name().is_some_and(|n| !named.contains(&n.text().to_string())))
+            .collect();
+        for k in given_consts.iter().chain(&default_consts) {
+            let (Some(n), Some(body)) = (k.name(), k.body()) else {
+                continue;
+            };
+            let ty = k
+                .ty()
+                .filter(|t| !t.syntax().text().to_string().contains("Self"))
+                .map(|t| self.lower_type(&t))
+                .or_else(|| Some(self_ty.clone()).filter(|_| !key.ends_with("$all")));
+            let (f, _) = self.emit_expr(&body, ty.as_ref());
+            let name = escape_ident(n.text());
+            let mut line = Frag::mapped(
+                self.off(k.syntax()),
+                format!("static get {name}() {{ const v = "),
+            );
+            line.append(f);
+            line.push(format!(
+                "; Object.defineProperty(this, \"{name}\", {{ value: v }}); return v; }}"
+            ));
+            self.line(line);
         }
         // Default methods the impls don't override, from the trait declarations in this file.
         let defaults: Vec<ast::Fn> = self
@@ -1109,7 +1223,7 @@ impl Codegen<'_> {
             }
         }
         // `Box<dyn Shape>`'s `from`s: called by name only.
-        if key.starts_with("dyn$") {
+        if key.starts_with("dyn$") || key == "Formatter" {
             self.line(Frag::default());
             return;
         }
@@ -1631,6 +1745,8 @@ impl Codegen<'_> {
                 ],
             );
         }
+        // (`impl Clone for Box<dyn Tr>`'s, for fields holding one.)
+        let dyn_clones = dyn_clones(&self.types.adts);
         // Per-variant bodies, switched on `$tag` for enums.
         let per_variant = |def: &AdtDef,
                            body: &dyn Fn(usize, &Variant) -> String,
@@ -1672,7 +1788,7 @@ impl Codegen<'_> {
                             .fields
                             .iter()
                             .enumerate()
-                            .map(|(k, f)| clone_of(&f.ty, &format!("this{}", access(v, k))))
+                            .map(|(k, f)| clone_of(&dyn_clones, &f.ty, &format!("this{}", access(v, k))))
                             .collect();
                         if def.is_enum {
                             if v.shape == Shape::Unit {
@@ -1713,6 +1829,7 @@ impl Codegen<'_> {
                     let parts: Vec<String> = (0..v.fields.len())
                         .map(|k| {
                             eq_of(
+                                &self.types.adts,
                                 &v.fields[k].ty,
                                 &format!("this{}", access(v, k)),
                                 &format!("o{}", access(v, k)),
@@ -1950,6 +2067,7 @@ impl Codegen<'_> {
                     None => {
                         let b = base_js.clone().unwrap_or_else(|| "undefined".into());
                         Frag::text(clone_of(
+                            &dyn_clones(&self.types.adts),
                             &variant.fields[i].ty,
                             &format!("{b}{}", access(&variant, i)),
                         ))
@@ -1975,6 +2093,7 @@ impl Codegen<'_> {
             .map(|i| match given.iter().position(|g| g.0 == i) {
                 Some(k) => Frag::text(params[k].clone()),
                 None => Frag::text(clone_of(
+                    &dyn_clones(&self.types.adts),
                     &variant.fields[i].ty,
                     &format!(
                         "{}{}",

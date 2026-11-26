@@ -20,12 +20,14 @@ const LINKED_LIST: &str = include_str!("linked_list_prelude.rs");
 const CONTROL_FLOW: &str = include_str!("control_flow_prelude.rs");
 const BOUND: &str = include_str!("bound_prelude.rs");
 const UNWIND: &str = include_str!("unwind_prelude.rs");
+const RANDOM_STATE: &str = include_str!("random_state_prelude.rs");
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
+/// (`struct Reader` doesn't declare `Read`.)
 fn declares(text: &str, name: &str) -> bool {
     ["struct", "enum", "type", "trait", "union"]
         .iter()
-        .any(|kw| text.contains(&format!("{kw} {name}")))
+        .any(|kw| crate::stdtime::has_word(text, &format!("{kw} {name}")))
 }
 
 /// The preludes `text` needs (after `stdtime`'s), when it names their types; `paths`: another
@@ -89,6 +91,12 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
         && !declares(text, "AssertUnwindSafe")
     {
         out.push(UNWIND);
+    }
+    if crate::stdtime::has_word(text, "RandomState")
+        && !text.contains("// (random state prelude)")
+        && !declares(text, "RandomState")
+    {
+        out.push(RANDOM_STATE);
     }
     out
 }

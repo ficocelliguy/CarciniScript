@@ -155,6 +155,10 @@ pub struct Types {
     pub index_places: std::collections::HashSet<(usize, usize)>,
     /// `&mut v[a..b]` of a Vec: a view whose writes reach `v` (`κσ.$sliceMut`), by the `&mut`.
     pub slice_views: std::collections::HashSet<(usize, usize)>,
+    /// `&mut &[T]` places, by range: `&mut s` of a `&[T]` binding, which hands over a copy of its
+    /// own (`*r = &r[1..]` writes into the array, which may be another binding's), and the uses
+    /// of a `&mut &[u8]` binding, which `r.read(..)` advances in place instead of copying.
+    pub slice_ref_muts: std::collections::HashSet<(usize, usize)>,
     /// `let r = &mut v[i];` / `&mut s.count` of a number, string, bool or `Option`: a slot over
     /// that element or field (`κσ.$placeSlot`), by the `&mut`; `r` is a slot binding.
     pub place_slots: std::collections::HashSet<(usize, usize)>,
@@ -425,6 +429,7 @@ impl<'a> Checker<'a> {
             cell_returns: Default::default(),
             index_places: Default::default(),
             slice_views: Default::default(),
+            slice_ref_muts: Default::default(),
             place_slots: Default::default(),
             deref_slots: Default::default(),
             slot_values: Default::default(),
@@ -786,6 +791,7 @@ pub fn check(
     let cell_returns = std::mem::take(&mut c.cell_returns);
     let index_places = std::mem::take(&mut c.index_places);
     let slice_views = std::mem::take(&mut c.slice_views);
+    let slice_ref_muts = std::mem::take(&mut c.slice_ref_muts);
     let place_slots = std::mem::take(&mut c.place_slots);
     let deref_slots = std::mem::take(&mut c.deref_slots);
     let slot_values = std::mem::take(&mut c.slot_values);
@@ -845,6 +851,7 @@ pub fn check(
             cell_returns,
             index_places,
             slice_views,
+            slice_ref_muts,
             place_slots,
             deref_slots,
             slot_values,
@@ -1018,6 +1025,7 @@ struct Checker<'a> {
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
     slice_views: std::collections::HashSet<(usize, usize)>,
+    slice_ref_muts: std::collections::HashSet<(usize, usize)>,
     place_slots: std::collections::HashSet<(usize, usize)>,
     deref_slots: std::collections::HashSet<(usize, usize)>,
     slot_values: std::collections::HashSet<(usize, usize)>,
@@ -2249,6 +2257,17 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                    // (`Map<K>` with `struct Map<K, S = RandomState>`: `S` is `RandomState`, not
+                    // inferred. A default may name the parameters before it.)
+                    if let Some(tds) = self.adts.type_defaults.get(&name).cloned() {
+                        for (i, p) in params.iter().enumerate().skip(n_given) {
+                            if let Some((_, d)) = tds.iter().find(|(n, _)| n == p) {
+                                let map: HashMap<String, Ty> =
+                                    params.iter().cloned().zip(args.iter().cloned()).take(i).collect();
+                                args[i] = generic::subst(d, &map);
+                            }
+                        }
+                    }
                     return Ty::Adt(name, args);
                 }
                 if name == "Self"
@@ -2282,34 +2301,29 @@ impl<'a> Checker<'a> {
                 }
                 // `T::Err` of a `T: FromStr`: unchecked.
                 if name == "Err"
-                    && let Some(q) = p.path().and_then(|p| p.qualifier())
-                    && let Some(qn) = q.as_single_name_ref()
-                    && self.param_has(qn.text().to_string().as_str(), "FromStr")
+                    && let Some(qn) = p.path().and_then(|p| proj_qual(&p))
+                    && self.param_has(qn.as_str(), "FromStr")
                 {
                     return Ty::Unknown;
                 }
                 // `I::Item` of an `I: IntoIterator` (its own type parameter).
-                if let Some(q) = p.path().and_then(|p| p.qualifier())
-                    && let Some(qn) = q.as_single_name_ref()
-                    && let Some(t) = self.generics.get(&format!("{}::{name}", qn.text()))
+                if let Some(qn) = p.path().and_then(|p| proj_qual(&p))
+                    && let Some(t) = self.generics.get(&format!("{qn}::{name}"))
                 {
                     return t.clone();
                 }
                 // `S::Unit` of a type parameter bounded by a trait with `type Unit;`.
-                if let Some(q) = p.path().and_then(|p| p.qualifier())
-                    && let Some(qn) = q.as_single_name_ref()
+                if let Some(qn) = p.path().and_then(|p| proj_qual(&p))
                     && self
                         .param_bounds
-                        .contains_key(qn.text().to_string().as_str())
-                    && let Some(t) = self.projection(qn.text().to_string().as_str(), &name)
+                        .contains_key(qn.as_str())
+                    && let Some(t) = self.projection(qn.as_str(), &name)
                 {
                     return t;
                 }
                 // `A::Item` in a field of `struct S<A: Array>`: fields are lowered before the
                 // file's traits are, so `A`'s projection, as the impls' `A::Item` will be.
-                if let Some(q) = p.path().and_then(|p| p.qualifier())
-                    && let Some(qn) = q.as_single_name_ref()
-                    && let qn = qn.text().to_string()
+                if let Some(qn) = p.path().and_then(|p| proj_qual(&p))
                     && self.generics.get(&qn) == Some(&Ty::Param(qn.clone()))
                     && self.param_bounds.get(&qn).is_some_and(|bs| {
                         bs.iter().any(|b| {
@@ -2320,13 +2334,12 @@ impl<'a> Checker<'a> {
                     return Ty::Param(format!("{qn}::{name}"));
                 }
                 // `T::Error` of a `T: TryFrom<X>` (unchecked).
-                if let Some(q) = p.path().and_then(|p| p.qualifier())
-                    && let Some(qn) = q.as_single_name_ref()
+                if let Some(qn) = p.path().and_then(|p| proj_qual(&p))
                     && self
                         .lenient_projs
-                        .contains(&format!("{}::{name}", qn.text()))
+                        .contains(&format!("{qn}::{name}"))
                 {
-                    return Ty::Param(format!("{}::{name}", qn.text()));
+                    return Ty::Param(format!("{qn}::{name}"));
                 }
                 // `Self::Output` in an operator impl, `Self::Item` in an iterator.
                 if (name == "Output" || name == "Item")
@@ -5032,6 +5045,15 @@ impl<'a> Checker<'a> {
                 // (After the place is typed: `through_mut_field` reads its fields' owners.)
                 if r.mut_token().is_some() {
                     self.check_mutable(&inner, Mutation::Borrow);
+                    if let ast::Expr::PathExpr(p) = strip_parens(&inner)
+                        && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+                        && let Some(local) = self.lookup(n.text())
+                        && local.reference == Some(false)
+                        && matches!(self.shallow(&local.ty), Ty::Vec(_))
+                    {
+                        let rr = self.range(r.syntax());
+                        self.slice_ref_muts.insert(rr);
+                    }
                 }
                 // `&mut v[a..b]`: a view of that part of `v`.
                 if r.mut_token().is_some()
@@ -5080,7 +5102,13 @@ impl<'a> Checker<'a> {
                         strip_parens(&inner),
                         ast::Expr::IndexExpr(ix) if matches!(ix.index(), Some(ast::Expr::RangeExpr(_)))
                     );
-                    if (self.prim(&z) || matches!(z, Ty::Option(_)))
+                    // `let Some(file) = &mut self.file else { .. };`: the pattern's bindings
+                    // alias the place (`alias_place_bindings`), as in `if let`.
+                    let destructures = ast::LetStmt::cast(p.clone())
+                        .and_then(|l| l.pat())
+                        .is_some_and(|pat| !matches!(pat, ast::Pat::IdentPat(_)));
+                    if destructures {
+                    } else if (self.prim(&z) || matches!(z, Ty::Option(_)))
                         && !range_index
                         && let Some(n) = let_name
                     {
@@ -5646,6 +5674,10 @@ impl<'a> Checker<'a> {
                         self.array_reads.insert(r);
                     }
                 }
+                if local.reference == Some(true) && matches!(self.shallow(&local.ty), Ty::Vec(_)) {
+                    let r = self.range(p.syntax());
+                    self.slice_ref_muts.insert(r);
+                }
                 return local.ty;
             }
             if let Some(t) = self.consts.get(name.text().to_string().as_str()).cloned() {
@@ -6052,6 +6084,41 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `s.read(&mut buf)` with `s: &[u8]`: the io prelude's `impl IoRead for Vec<u8>` (std's
+    /// `impl Read for &[u8]`), which advances the slice binding.
+    pub(super) fn slice_read(&self, key: &str, method: &str, rt: &Ty) -> bool {
+        key == "Vec"
+            && self.is_bytes(rt)
+            && self
+                .adts
+                .traits
+                .get("IoRead")
+                .is_some_and(|t| t.methods.iter().any(|m| m.name == method))
+    }
+
+    /// The receiver of a `slice_read`: a `&[u8]` binding is itself borrowed mutably (`let mut s:
+    /// &[u8]`), not the bytes behind it.
+    fn check_slice_reader(&mut self, recv: &ast::Expr) {
+        if let ast::Expr::PathExpr(p) = strip_parens(recv)
+            && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
+            && let Some(local) = self.lookup(n.text()).cloned()
+            && local.reference == Some(false)
+        {
+            if let Some(d) = local.decl {
+                self.mut_roots.insert(d);
+            }
+            if !local.mutable {
+                let n = n.text();
+                self.error(
+                    recv.syntax(),
+                    format!("cannot borrow `{n}` as mutable, as it is not declared as mutable (declare it with `let mut {n}`)"),
+                );
+            }
+            return;
+        }
+        self.check_mutable(recv, Mutation::Borrow);
+    }
+
     /// rustc's mutability rules for assigning to or mutably borrowing a place.
     fn check_mutable(&mut self, e: &ast::Expr, how: Mutation) {
         // (Whatever the outcome, the root binding is one a mutation goes through.)
@@ -6136,7 +6203,22 @@ impl<'a> Checker<'a> {
             }
             return;
         }
-        match local.reference {
+        // `&mut s` with `s: &[u8]`: a `&mut &[u8]`, borrowing the binding, not what it points to.
+        let reference = match local.reference {
+            Some(false)
+                if !through
+                    && e.syntax()
+                        .ancestors()
+                        .skip(1)
+                        .find(|a| !ast::ParenExpr::can_cast(a.kind()))
+                        .and_then(ast::RefExpr::cast)
+                        .is_some_and(|r| r.mut_token().is_some()) =>
+            {
+                None
+            }
+            r => r,
+        };
+        match reference {
             Some(true) => {}
             Some(false) => self.error(
                 e.syntax(),
@@ -6781,7 +6863,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Str
             }
-            ["Vec" | "vec", ctor @ ("new" | "with_capacity")] => {
+            ["Vec" | "vec", ctor @ ("new" | "with_capacity" | "default")] => {
                 self.arg_count(
                     c.syntax(),
                     "function",
@@ -7439,7 +7521,8 @@ impl<'a> Checker<'a> {
         self.cellable(t) || matches!(self.zonk(t), Ty::Param(_))
     }
 
-    /// `&mut x` with `x` a number/string/bool/Option local: `x` lives in a cell.
+    /// `&mut x` with `x` a number/string/bool/Option local (or a `&str` one, for a `&mut &str`):
+    /// `x` lives in a cell.
     fn box_if_needed(&mut self, inner: &ast::Expr) {
         let ast::Expr::PathExpr(p) = strip_parens(inner) else {
             return;
@@ -7450,7 +7533,7 @@ impl<'a> Checker<'a> {
         let Some(local) = self.lookup(name.text().to_string().as_str()).cloned() else {
             return;
         };
-        if local.reference.is_none()
+        if local.reference != Some(true)
             && self.cellable(&local.ty)
             && let Some(d) = local.decl
         {
@@ -7472,11 +7555,14 @@ impl<'a> Checker<'a> {
             ast::Expr::RefExpr(r) => {
                 let Some(inner) = r.expr() else { return };
                 match strip_parens(&inner) {
-                    // Any other local, for a `&mut T` parameter: a getter/setter cell over it.
+                    // Any other local, for a `&mut T` parameter: a getter/setter cell over it. (And
+                    // a `&[u8]` one, for an `R: Read` parameter's `&mut R`.)
                     ast::Expr::PathExpr(p)
                         if p.path().and_then(|p| p.as_single_name_ref()).is_some_and(|n| {
                             self.lookup(n.text().to_string().as_str()).is_some_and(|l| {
-                                l.reference.is_none() && !self.cellable(&l.ty)
+                                (l.reference.is_none()
+                                    || l.reference == Some(false) && matches!(self.shallow(&l.ty), Ty::Vec(_)))
+                                    && !self.cellable(&l.ty)
                             })
                         }) =>
                     {
@@ -7758,7 +7844,9 @@ impl<'a> Checker<'a> {
             && sig.receiver.is_some()
             && !crate::service::std_methods(&self.shallow(&rt)).contains(&method.as_str())
         {
-            if sig.receiver == Some(crate::adt::Receiver::MutRef) {
+            if self.slice_read(key, &method, &rt) {
+                self.check_slice_reader(&recv);
+            } else if sig.receiver == Some(crate::adt::Receiver::MutRef) {
                 self.check_mutable(&recv, Mutation::Borrow);
             }
             // The impl's type arguments: its parameters take the receiver's, and the receiver
@@ -7778,7 +7866,11 @@ impl<'a> Checker<'a> {
                 self.method_inst(&sig, None)
             };
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
-            for (a, p) in args.iter().zip(&sig.params) {
+            for (i, (a, p)) in args.iter().zip(&sig.params).enumerate() {
+                // (`&mut String`: `bytes.read_to_string(&mut text)`.)
+                if sig.cell_params.get(i) == Some(&true) {
+                    self.cell_arg(a);
+                }
                 self.check(a, p);
             }
             self.record_ext(m.syntax(), key);
@@ -9490,7 +9582,8 @@ impl Checker<'_> {
             Ty::RefCell(_) => !debug,
             Ty::Param(n) => !self.param_has(n, if debug { "Debug" } else { "Display" }),
             Ty::Dyn(tr) if tr == "Error" => false,
-            Ty::Dyn(tr) => !self.trait_includes(tr, if debug { "Debug" } else { "Display" }),
+            // (Or `impl Debug for Box<dyn Tr>`.)
+            Ty::Dyn(_) => !self.implements(resolved, if debug { "Debug" } else { "Display" }),
             // (A JS type prints with `{}` when it declares `to_string`: `Date`, `Url`, ..)
             Ty::Extern(n)
                 if is_std_error(n)
@@ -10175,6 +10268,21 @@ pub(super) fn bounds_into_iter_item(list: &ast::TypeBoundList) -> Option<Option<
         }
         _ => None,
     })
+}
+
+/// The type parameter a projection path is on: `T` of `T::Item` and of `<T as Tr>::Item`.
+pub(super) fn proj_qual(path: &ast::Path) -> Option<String> {
+    let q = path.qualifier()?;
+    if let Some(n) = q.as_single_name_ref() {
+        return Some(n.text().to_string());
+    }
+    if q.qualifier().is_some() {
+        return None;
+    }
+    match q.segment()?.type_anchor()?.ty()? {
+        ast::Type::PathType(pt) => Some(pt.path()?.as_single_name_ref()?.text().to_string()),
+        _ => None,
+    }
 }
 
 pub(super) fn bounds_iterator_item(list: &ast::TypeBoundList) -> Option<Option<ast::Type>> {
@@ -11088,6 +11196,8 @@ impl Checker<'_> {
             let t = self.adts.traits.get(&b)?.const_tys.get(konst).cloned()?;
             Some((b, t))
         })?;
+        // (`const ZERO: Self;` is `T` here.)
+        let t = generic::subst(&t, &[("Self".to_string(), Ty::Param(param.to_string()))].into());
         // (`let mut r = Self::ROWS;`: JS would share the item's array.)
         if self.copy_array_assoc.contains(&(tr, konst.to_string())) {
             let r = self.range(node);

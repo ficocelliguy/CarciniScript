@@ -236,6 +236,9 @@ pub struct Adts {
     pub param_bounds: HashMap<String, Vec<Vec<String>>>,
     /// Structs' const generic parameters, in order, by struct.
     pub const_params: HashMap<String, Vec<ConstParam>>,
+    /// Type parameters' defaults (`struct Map<K, S = RandomState>`), by type, then parameter:
+    /// what `Map<K>` written as a type has for `S`.
+    pub type_defaults: HashMap<String, Vec<(String, Ty)>>,
     /// Enum variants under a `#[cfg(..)]` (by enum, then variant index): they may not exist, so
     /// exhaustiveness checking never asks for them.
     pub cfg_variants: std::collections::HashSet<(String, usize)>,
@@ -372,6 +375,7 @@ pub fn ext_key(name: &str) -> Option<&'static str> {
         "RangeToInclusive" => "RangeToInclusive",
         "RangeFull" => "RangeFull",
         "FnPtr" => "FnPtr",
+        "Formatter" => "Formatter",
         // (A `Cell` is a `RefCell` at run time.)
         "Cell" | "RefCell" => "RefCell",
         // Iterators and adapters are all the runtime's `Iter`: one class of impls.
@@ -406,6 +410,7 @@ pub fn ext_key_of(t: &Ty) -> Option<&'static str> {
         Ty::Range(_, k) => Some(k.name()),
         Ty::Tuple(es) => tuple_key(es.len()),
         Ty::Closure { .. } | Ty::Fn => Some("FnPtr"),
+        Ty::Formatter => Some("Formatter"),
         Ty::RefCell(_) => Some("RefCell"),
         Ty::Iter { .. } => Some("Iter"),
         _ => None,
@@ -875,9 +880,28 @@ pub fn impl_parts(imp: &ast::Impl) -> (Option<String>, Option<String>) {
         {
             boxed_named(&p, imp).or_else(|| name_of(Some(ast::Type::PathType(p))))
         }
+        // `impl Debug for dyn Shape`: as `Box<dyn Shape>`'s.
+        Some(ast::Type::DynTraitType(d))
+            if name_of(imp.trait_()).is_some_and(|t| DYN_IMPL_TRAITS.contains(&t.as_str())) =>
+        {
+            dyn_key(&d)
+        }
         t => name_of(t),
     };
     (name_of(imp.trait_()), self_name)
+}
+
+/// The std traits whose impls for `Box<dyn Tr>` (or `dyn Tr`) are `dyn$Tr`'s (`boxed_named`).
+const DYN_IMPL_TRAITS: &[&str] =
+    &["From", "Clone", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash"];
+
+/// `dyn$Shape` for `dyn Shape`.
+fn dyn_key(d: &ast::DynTraitType) -> Option<String> {
+    let b = d.type_bound_list()?.bounds().next()?;
+    let ast::Type::PathType(p) = b.ty()? else {
+        return None;
+    };
+    Some(format!("dyn${}", p.path()?.segment()?.name_ref()?.text()))
 }
 
 /// The named type in `Box<Shape>` / `Rc<Node>` / `Pin<Box<Fut>>` (a box is its contents in JS,
@@ -889,15 +913,14 @@ fn boxed_named(p: &ast::PathType, imp: &ast::Impl) -> Option<String> {
     let ast::GenericArg::TypeArg(a) = seg.generic_arg_list()?.generic_args().next()? else {
         return None;
     };
-    // `impl From<Sq> for Box<dyn Shape>`: `dyn$Shape`, a class of its own for the `from`s.
+    // `impl From<Sq> for Box<dyn Shape>`: `dyn$Shape`, a class of its own for the `from`s. So
+    // is `impl Clone for Box<dyn Shape>` (`self.clone_box()`), which a derived `Clone` of a
+    // struct holding one calls. And `Debug`, `Display`, `PartialEq`, .. for one: `{:?}`, `{}`
+    // and `==` on a `dyn Shape` call those rather than the boxed value's own.
     if let Some(ast::Type::DynTraitType(d)) = a.ty()
-        && impl_parts_trait(imp).as_deref() == Some("From")
+        && impl_parts_trait(imp).is_some_and(|t| DYN_IMPL_TRAITS.contains(&t.as_str()))
     {
-        let b = d.type_bound_list()?.bounds().next()?;
-        let ast::Type::PathType(p) = b.ty()? else {
-            return None;
-        };
-        return Some(format!("dyn${}", p.path()?.segment()?.name_ref()?.text()));
+        return dyn_key(&d);
     }
     let ast::Type::PathType(inner) = a.ty()? else {
         return None;
@@ -1062,49 +1085,84 @@ pub fn wrapping_impl(imp: &ast::Impl) -> bool {
     }
 }
 
+/// `e` through parentheses, `&`, `*` and the views of a `String` or `Vec` that are the same
+/// value in JS (`self.as_str()`, `(*self).as_ref()`, `&self[..]`).
+fn strip_views(mut e: ast::Expr) -> Option<ast::Expr> {
+    use ra_ap_syntax::ast::HasArgList;
+    loop {
+        e = match e {
+            ast::Expr::ParenExpr(p) => p.expr()?,
+            ast::Expr::RefExpr(r) => r.expr()?,
+            ast::Expr::PrefixExpr(p) if p.op_kind() == Some(ast::UnaryOp::Deref) => p.expr()?,
+            ast::Expr::MethodCallExpr(m)
+                if m.arg_list().is_some_and(|l| l.args().next().is_none())
+                    && m.name_ref().is_some_and(|n| {
+                        matches!(
+                            n.text().to_string().as_str(),
+                            "as_ref"
+                                | "as_mut"
+                                | "deref"
+                                | "deref_mut"
+                                | "borrow"
+                                | "borrow_mut"
+                                | "as_str"
+                                | "as_mut_str"
+                                | "as_slice"
+                                | "as_mut_slice"
+                        )
+                    }) =>
+            {
+                m.receiver()?
+            }
+            // (`self[..]`: a `String`'s or `Vec`'s whole slice.)
+            ast::Expr::IndexExpr(i)
+                if matches!(i.index(), Some(ast::Expr::RangeExpr(r))
+                    if ast::RangeItem::start(&r).is_none() && ast::RangeItem::end(&r).is_none()) =>
+            {
+                i.base()?
+            }
+            other => return Some(other),
+        };
+    }
+}
+
+/// `f`'s body as its tokens, with each view of `self` (`self.as_str()`, `(*self).as_ref()`,
+/// `&self[..]`) read as `self`: the same for `impl Tr for str` and `impl Tr for String` when they
+/// do the same thing.
+fn body_shape(f: &ast::Fn) -> Option<String> {
+    fn walk(n: &ra_ap_syntax::SyntaxNode, out: &mut String) {
+        for el in n.children_with_tokens() {
+            match el {
+                ra_ap_syntax::NodeOrToken::Token(t) => {
+                    if !t.kind().is_trivia() {
+                        out.push_str(t.text());
+                        out.push(' ');
+                    }
+                }
+                ra_ap_syntax::NodeOrToken::Node(c) => {
+                    let is_self = ast::Expr::cast(c.clone())
+                        .and_then(strip_views)
+                        .is_some_and(|e| matches!(&e, ast::Expr::PathExpr(p) if p.syntax().text() == "self"));
+                    if is_self {
+                        out.push_str("self ");
+                    } else {
+                        walk(&c, out);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(f.body()?.syntax(), &mut out);
+    Some(out)
+}
+
 /// Whether `f`'s body is just the same method of what `self` points at, with `f`'s parameters:
 /// `(**self).f(a, b)`, `T::f(self, a)`, `Tr::f(&**self, a)`.
 fn forwards(f: &ast::Fn) -> bool {
     use ra_ap_syntax::ast::HasArgList;
-    fn strip(mut e: ast::Expr) -> Option<ast::Expr> {
-        loop {
-            e = match e {
-                ast::Expr::ParenExpr(p) => p.expr()?,
-                ast::Expr::RefExpr(r) => r.expr()?,
-                ast::Expr::PrefixExpr(p) if p.op_kind() == Some(ast::UnaryOp::Deref) => p.expr()?,
-                ast::Expr::MethodCallExpr(m)
-                    if m.arg_list().is_some_and(|l| l.args().next().is_none())
-                        && m.name_ref().is_some_and(|n| {
-                            matches!(
-                                n.text().to_string().as_str(),
-                                "as_ref"
-                                    | "as_mut"
-                                    | "deref"
-                                    | "deref_mut"
-                                    | "borrow"
-                                    | "borrow_mut"
-                                    | "as_str"
-                                    | "as_mut_str"
-                                    | "as_slice"
-                                    | "as_mut_slice"
-                            )
-                        }) =>
-                {
-                    m.receiver()?
-                }
-                // (`self[..]`: a `String`'s or `Vec`'s whole slice.)
-                ast::Expr::IndexExpr(i)
-                    if matches!(i.index(), Some(ast::Expr::RangeExpr(r))
-                        if ast::RangeItem::start(&r).is_none() && ast::RangeItem::end(&r).is_none()) =>
-                {
-                    i.base()?
-                }
-                other => return Some(other),
-            };
-        }
-    }
     let path_name = |e: ast::Expr| -> Option<String> {
-        match strip(e)? {
+        match strip_views(e)? {
             ast::Expr::PathExpr(p) => Some(p.path()?.as_single_name_ref()?.text().to_string()),
             _ => None,
         }
@@ -1393,24 +1451,47 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
             };
             Some((format!("{tr}:{kind}"), owned))
         };
-        let borrowed: Vec<String> = items
+        let borrowed: Vec<(String, ast::Impl)> = items
             .iter()
             .filter_map(|i| match i {
-                ast::Item::Impl(imp) => twin(imp).filter(|(_, owned)| !owned).map(|(k, _)| k),
+                ast::Item::Impl(imp) => twin(imp)
+                    .filter(|(_, owned)| !owned)
+                    .map(|(k, _)| (k, imp.clone())),
                 _ => None,
             })
             .collect();
+        // (Or does what the borrowed one's method of that name does: `fn as_body(&mut self) {
+        // .. (*self).as_ref() .. }` in both.)
+        let same_as = |f: &ast::Fn, twin: &ast::Impl| -> bool {
+            let name = f.name().map(|n| n.text().to_string());
+            twin.assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+                .find_map(|item| match item {
+                    ast::AssocItem::Fn(g) if g.name().map(|n| n.text().to_string()) == name => {
+                        Some(g)
+                    }
+                    _ => None,
+                })
+                .is_some_and(|g| body_shape(&g).is_some_and(|b| Some(b) == body_shape(f)))
+        };
         let items: Vec<ast::Item> = items
             .into_iter()
             .filter(|i| match i {
                 ast::Item::Impl(imp) => {
-                    !(twin(imp).is_some_and(|(k, owned)| owned && borrowed.contains(&k))
+                    let twin_of = twin(imp)
+                        .filter(|(_, owned)| *owned)
+                        .and_then(|(k, _)| borrowed.iter().find(|(b, _)| *b == k))
+                        .map(|(_, t)| t);
+                    !(twin_of.is_some()
                         && imp
                             .assoc_item_list()
                             .into_iter()
                             .flat_map(|l| l.assoc_items())
                             .all(|item| match item {
-                                ast::AssocItem::Fn(f) => forwards(&f),
+                                ast::AssocItem::Fn(f) => {
+                                    forwards(&f) || twin_of.is_some_and(|t| same_as(&f, t))
+                                }
                                 ast::AssocItem::TypeAlias(_) | ast::AssocItem::Const(_) => true,
                                 ast::AssocItem::MacroCall(_) => false,
                             }))
