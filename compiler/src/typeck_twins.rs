@@ -2,11 +2,14 @@
 //! in JS: each method call picks its impl the way rustc's method probing does, by the receiver's
 //! Rust type, read off how the receiver is written (a literal, a conversion, a local's or
 //! field's declared type, a function's return type). Where that doesn't say, the call is an
-//! error rather than a guess. A child module of `typeck`.
+//! error rather than a guess. Through a type parameter the caller passes the owned type's class
+//! (`κσ.$ownT`); likewise a reference's (`κσ.$wrapT`) where an impl for `&T` does more than
+//! `T`'s, and the classes an impl's associated functions need when they are called by path. A
+//! child module of `typeck`.
 
 use ra_ap_syntax::{
     AstNode, SyntaxNode, TextRange, TextSize,
-    ast::{self, HasLoopBody, HasName},
+    ast::{self, HasArgList, HasLoopBody, HasName},
 };
 
 use super::Checker;
@@ -92,6 +95,8 @@ impl Checker<'_> {
                     [.., "String" | "Vec", "new" | "from" | "with_capacity" | "from_utf8_lossy"] => {
                         Some(true)
                     }
+                    // (A box or pointer of it, into a `Box<dyn Tr>`.)
+                    [.., "Box" | "Rc" | "Arc", "new"] => rec(&c.arg_list()?.args().next()?),
                     [f] => self.fn_returns_owned(c.syntax(), f, key),
                     _ => None,
                 }
@@ -123,17 +128,36 @@ impl Checker<'_> {
 
     /// A local declared at `decl`: its written type, or else its initializer's.
     fn decl_owned(&self, at: &SyntaxNode, decl: (usize, usize), key: &str, depth: usize) -> Option<bool> {
-        let root = at.ancestors().last()?;
-        let start = decl.0.checked_sub(self.base)?;
-        let end = decl.1.checked_sub(self.base)?;
+        let ident = self.decl_ident(at, decl)?;
+        self.binding_owned(&ident, key, depth)
+    }
+
+    /// The binding a local declared at `decl` (absolute offsets) names.
+    fn decl_ident(&self, at: &SyntaxNode, decl: (usize, usize)) -> Option<ast::IdentPat> {
+        let mut root = at.ancestors().last()?;
+        let mut base = self.base;
+        // (A macro argument, re-parsed on its own, naming a local declared before it: the file's.)
+        if decl.0 < base || decl.1 - base > usize::from(root.text_range().end()) {
+            root = self
+                .file_root
+                .get_or_init(|| {
+                    ast::SourceFile::parse(self.src, crate::macros::EDITION)
+                        .tree()
+                        .syntax()
+                        .clone()
+                })
+                .clone();
+            base = 0;
+        }
+        let start = decl.0.checked_sub(base)?;
+        let end = decl.1.checked_sub(base)?;
         let range = TextRange::new(TextSize::try_from(start).ok()?, TextSize::try_from(end).ok()?);
         let name = root.covering_element(range);
         let node = match name {
             ra_ap_syntax::NodeOrToken::Node(n) => n,
             ra_ap_syntax::NodeOrToken::Token(t) => t.parent()?,
         };
-        let ident = node.ancestors().find_map(ast::IdentPat::cast)?;
-        self.binding_owned(&ident, key, depth)
+        node.ancestors().find_map(ast::IdentPat::cast)
     }
 
     /// A `let` or parameter binding: its written type, or else its initializer's.
@@ -230,16 +254,39 @@ impl Checker<'_> {
     /// Whether `tr`'s method `m` has different impls for `str` and `String` (or `[T]` and
     /// `Vec<T>`).
     pub(super) fn twin_trait_method(&self, tr: &str, m: &str) -> bool {
+        if !self.adts.traits.get(tr).is_some_and(|d| d.methods.iter().any(|x| x.name == m)) {
+            return false;
+        }
         ["String", "Vec"].iter().any(|k| {
             self.adts.own_twins.contains(&format!("{k}::{m}"))
                 && self.adts.twin_borrowed.contains(&(k.to_string(), tr.to_string()))
         })
     }
 
-    /// `m` called through a type parameter or `dyn` (by its trait `tr`): which impl it reaches
-    /// isn't known where it's compiled.
-    pub(super) fn twin_generic_call(&mut self, node: &SyntaxNode, tr: &str, m: &str) {
-        if self.twin_trait_method(tr, m) {
+    /// `m` called through a type parameter or `dyn` (by its trait `tr`, on a `self_ty`): through
+    /// a `T` whose class the function can take, by the class (the caller passes the owned type's
+    /// as `κσ.$ownT(..)`); through a `dyn`, by the tag an owned value gets where it's coerced
+    /// (`κσ.$dynNum(v, "$own")`). Elsewhere which impl it reaches isn't known where it's compiled.
+    pub(super) fn twin_generic_call(
+        &mut self,
+        node: &SyntaxNode,
+        tr: &str,
+        m: &str,
+        self_ty: &crate::ty::Ty,
+    ) {
+        if !self.twin_trait_method(tr, m) {
+            return;
+        }
+        match self_ty {
+            crate::ty::Ty::Dyn(_) => return,
+            crate::ty::Ty::Param(p) if self.try_note_dict(p) => {
+                let r = self.range(node);
+                self.class_dispatch.insert(r);
+                return;
+            }
+            _ => {}
+        }
+        {
             self.error(
                 node,
                 format!("`{tr}::{m}` can't be called through a type parameter or `dyn` here: `{tr}` has different impls for a borrowed and an owned type that are one type in JS (`str` and `String`, or `[T]` and `Vec<T>`), so which one runs depends on a type erased at run time"),
@@ -368,4 +415,376 @@ fn binding_before(at: &SyntaxNode, name: &str) -> Option<ast::IdentPat> {
         }
     }
     None
+}
+
+impl Checker<'_> {
+    /// Whether trait `tr` has impls for both a borrowed and an owned type (`str` and `String`,
+    /// `[T]` and `Vec<T>`) whose methods differ.
+    pub(super) fn twin_trait(&self, tr: &str) -> bool {
+        self.adts.twin_borrowed.iter().any(|(_, t)| t == tr)
+    }
+
+    /// Whether trait `tr` has an impl for `&T`, `&mut T` or `Box<T>` that does more than `T`'s
+    /// (`adt::wrapper_impl`).
+    pub(super) fn wrapper_trait(&self, tr: &str) -> bool {
+        ["ref", "refmut", "box"]
+            .iter()
+            .any(|k| self.adts.ext_types.contains(&format!("{tr}${k}")))
+    }
+
+    /// A generic call `r`: for each type parameter bounded by a twin trait (`T: Enc` with
+    /// `impl Enc for str` and `impl Enc for String`), whether the argument it's inferred from is
+    /// the owned type, so the caller can pass the owned type's class; and for one bounded by a
+    /// trait with a `&T` impl of its own, the references (or boxes) the argument adds to what the
+    /// parameter is declared to take (`g(&x)` for `fn g<T: Tr>(t: T)`: `T` is `&X`), so the
+    /// caller can pass a reference's class (`finish_twin_dicts`).
+    pub(super) fn note_twin_targs(
+        &mut self,
+        r: (usize, usize),
+        type_params: &[super::generic::TypeParam],
+        params: &[crate::ty::Ty],
+        ref_params: &[Option<String>],
+        args: &[ast::Expr],
+    ) {
+        if self.adts.twin_borrowed.is_empty()
+            && !self.adts.ext_types.iter().any(|k| crate::adt::is_wrapper_key(k))
+        {
+            return;
+        }
+        let mut sides = Vec::new();
+        for (p, bounds) in type_params {
+            let twin = bounds.iter().any(|b| self.twin_trait(b));
+            let wraps = bounds.iter().any(|b| self.wrapper_trait(b));
+            if !twin && !wraps {
+                continue;
+            }
+            let Some((i, a)) = params
+                .iter()
+                .zip(args)
+                .enumerate()
+                .find(|(_, (t, _))| matches!(t, crate::ty::Ty::Param(q) if q == p))
+                .map(|(i, (_, a))| (i, a))
+            else {
+                continue;
+            };
+            let side = if twin { self.owned_expr(a, "", 0) } else { Some(false) };
+            let kinds = if wraps {
+                let declared = ref_params
+                    .get(i)
+                    .and_then(|r| r.as_deref())
+                    .map_or(0, |r| r.matches('&').count());
+                self.arg_wraps(a, 0).into_iter().skip(declared).collect()
+            } else {
+                Vec::new()
+            };
+            sides.push((p.clone(), side, self.range(a.syntax()), kinds));
+        }
+        if !sides.is_empty() {
+            self.twin_targs.insert(r, sides);
+        }
+    }
+
+    /// The references and boxes the expression `e` puts around its value, outermost first:
+    /// `&x` is `["ref"]`, `&mut Box::new(x)` `["refmut", "box"]`, a `r` declared `&X` `["ref"]`.
+    fn arg_wraps(&self, e: &ast::Expr, depth: usize) -> Vec<&'static str> {
+        if depth > 8 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        match e {
+            ast::Expr::ParenExpr(p) => {
+                if let Some(x) = p.expr() {
+                    out = self.arg_wraps(&x, depth + 1);
+                }
+            }
+            ast::Expr::RefExpr(r) => {
+                out.push(if r.mut_token().is_some() { "refmut" } else { "ref" });
+                if let Some(x) = r.expr() {
+                    out.extend(self.arg_wraps(&x, depth + 1));
+                }
+            }
+            ast::Expr::CallExpr(c) => {
+                if let Some(ast::Expr::PathExpr(p)) = c.expr()
+                    && p.syntax().text() == "Box::new"
+                    && let Some(x) = c.arg_list().and_then(|l| l.args().next())
+                {
+                    out.push("box");
+                    out.extend(self.arg_wraps(&x, depth + 1));
+                }
+            }
+            ast::Expr::PathExpr(p) => {
+                let Some(name) = p.path().and_then(|p| p.as_single_name_ref()) else {
+                    return out;
+                };
+                let decl = self.lookup(&name.text()).and_then(|l| l.decl);
+                let Some(ident) = decl
+                    .and_then(|d| self.decl_ident(e.syntax(), d))
+                    .or_else(|| binding_before(e.syntax(), &name.text()))
+                else {
+                    return out;
+                };
+                let parent = ident.syntax().parent();
+                let written = parent
+                    .clone()
+                    .and_then(ast::Param::cast)
+                    .and_then(|p| p.ty())
+                    .or_else(|| parent.clone().and_then(ast::LetStmt::cast).and_then(|l| l.ty()));
+                if let Some(t) = written {
+                    out = written_wraps(&t);
+                } else if let Some(init) =
+                    parent.and_then(ast::LetStmt::cast).and_then(|l| l.initializer())
+                {
+                    out = self.arg_wraps(&init, depth + 1);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// A string or vector coerced to `dyn tr` whose trait has twin impls: an owned one is tagged
+    /// (`κσ.$dynNum(v, "$own")`), so a call through the `dyn` reaches the owned impl.
+    pub(super) fn note_dyn_twin(&mut self, n: &SyntaxNode, found: &crate::ty::Ty, tr: &str) {
+        if !matches!(self.shallow(found), crate::ty::Ty::Str | crate::ty::Ty::Vec(_))
+            || !self.twin_trait(tr)
+        {
+            return;
+        }
+        let Some(e) = ast::Expr::cast(n.clone()) else {
+            return;
+        };
+        match self.owned_expr(&e, "", 0) {
+            Some(true) => {
+                let r = self.range(n);
+                self.dyn_twins.insert(r);
+            }
+            Some(false) => {}
+            None => self.error(
+                n,
+                format!("can't tell whether this value is a borrowed `str` / `[T]` or an owned `String` / `Vec<T>`, whose impls of `{tr}` differ (they are one type in JS): give it a declared type, or call `.to_string()` / `.as_str()` (`.to_vec()` / `.as_slice()`) on it"),
+            ),
+        }
+    }
+
+    /// The classes `finish_needs` decided each generic call passes: the wrappers each one gets,
+    /// innermost first (`own`: the owned type of a twin pair, `κσ.$ownT(..)`; `ref`, `refmut`,
+    /// `box`: a reference's or box's, `κσ.$wrapT(..)`). A string or vector argument whose side of
+    /// a twin pair nothing settles is an error.
+    pub(super) fn finish_twin_dicts(
+        &mut self,
+        params: &std::collections::HashMap<String, Vec<String>>,
+        args: &std::collections::HashMap<(usize, usize), Vec<crate::ty::Ty>>,
+    ) -> std::collections::HashMap<(usize, usize), Vec<Vec<String>>> {
+        let mut out = std::collections::HashMap::new();
+        let callees: std::collections::HashMap<(usize, usize), String> = self
+            .generic_calls
+            .iter()
+            .map(|(r, _, callee, _)| (*r, callee.clone()))
+            .collect();
+        let mut calls: Vec<_> = std::mem::take(&mut self.twin_targs).into_iter().collect();
+        calls.sort_by_key(|(r, _)| *r);
+        for (r, sides) in calls {
+            let (Some(callee), Some(tys)) = (callees.get(&r), args.get(&r)) else {
+                continue;
+            };
+            let Some(names) = params.get(callee) else {
+                continue;
+            };
+            let mut wraps: Vec<Vec<String>> = vec![Vec::new(); names.len()];
+            for (p, side, at, kinds) in sides {
+                let Some(i) = names.iter().position(|n| *n == p) else {
+                    continue;
+                };
+                let twin_ty = matches!(
+                    tys.get(i).map(|t| self.zonk(t)),
+                    Some(crate::ty::Ty::Str | crate::ty::Ty::Vec(_))
+                );
+                match side {
+                    Some(true) if twin_ty => wraps[i].push("own".to_string()),
+                    None if twin_ty => self.error_spans(
+                        at,
+                        format!("can't tell whether `{p}` is a borrowed `str` / `[T]` or an owned `String` / `Vec<T>` here, whose impls of its bound differ (they are one type in JS): give the argument a declared type, or call `.to_string()` / `.as_str()` (`.to_vec()` / `.as_slice()`) on it"),
+                        None,
+                        Vec::new(),
+                    ),
+                    _ => {}
+                }
+                wraps[i].extend(kinds.iter().rev().map(|k| k.to_string()));
+            }
+            if wraps.iter().any(|w| !w.is_empty()) {
+                out.insert(r, wraps);
+            }
+        }
+        out
+    }
+}
+
+/// The references and boxes a written type puts around its value, outermost first.
+fn written_wraps(t: &ast::Type) -> Vec<&'static str> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let mut out = Vec::new();
+    let mut t = t.clone();
+    loop {
+        let next = match &t {
+            ast::Type::RefType(r) => {
+                out.push(if r.mut_token().is_some() { "refmut" } else { "ref" });
+                r.ty()
+            }
+            ast::Type::PathType(p)
+                if p.path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.name_ref())
+                    .is_some_and(|n| n.text() == "Box") =>
+            {
+                out.push("box");
+                match p
+                    .path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.generic_arg_list())
+                    .and_then(|l| l.generic_args().next())
+                {
+                    Some(ast::GenericArg::TypeArg(ta)) => ta.ty(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match next {
+            Some(n) => t = n,
+            None => break,
+        }
+    }
+    out
+}
+
+impl Checker<'_> {
+    /// `recv.method(args)` of the file's `impl .. adt` with type parameters of its own: as
+    /// `note_twin_targs`, with the bounds read off the method's declaration.
+    pub(super) fn note_twin_method_targs(
+        &mut self,
+        r: (usize, usize),
+        adt: &str,
+        method: &str,
+        params: &[crate::ty::Ty],
+        args: &[ast::Expr],
+    ) {
+        if self.adts.twin_borrowed.is_empty()
+            && !self.adts.ext_types.iter().any(|k| crate::adt::is_wrapper_key(k))
+        {
+            return;
+        }
+        let root = self
+            .file_root
+            .get_or_init(|| {
+                ast::SourceFile::parse(self.src, crate::macros::EDITION)
+                    .tree()
+                    .syntax()
+                    .clone()
+            })
+            .clone();
+        let Some(f) = root
+            .descendants()
+            .filter_map(ast::Impl::cast)
+            .filter(|i| {
+                i.self_ty().is_some_and(|t| {
+                    t.syntax().text().to_string().split('<').next().map(str::trim) == Some(adt)
+                })
+            })
+            .filter_map(|i| i.assoc_item_list())
+            .flat_map(|l| l.assoc_items())
+            .find_map(|it| match it {
+                ast::AssocItem::Fn(f) if f.name().is_some_and(|n| n.text() == method) => Some(f),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let bounds = super::generic::plain_bounds(&f);
+        let ref_params = self.adts.method(adt, method).map(|m| m.ref_params.clone()).unwrap_or_default();
+        self.note_twin_targs(r, &bounds, params, &ref_params, args);
+    }
+}
+
+impl Checker<'_> {
+    /// `<Vec<u16> as Codec>::name()` of `impl<T: Codec> Codec for Vec<T>`: the classes its body
+    /// needs (`T::name()`), passed as for a generic function's (`dict_args`). `self_ty` is the
+    /// written type.
+    pub(super) fn note_ext_static_dicts(
+        &mut self,
+        c: &ast::CallExpr,
+        self_ty: &crate::ty::Ty,
+        method: &str,
+    ) {
+        use crate::ty::Ty;
+        let Some(key) = crate::adt::ext_key_of(self_ty) else {
+            return;
+        };
+        let Some(sig) = self.adts.method(key, method).cloned() else {
+            return;
+        };
+        let names = sig.dict_names();
+        if sig.receiver.is_some() || names.len() <= sig.type_params.len() {
+            return;
+        }
+        let Some(caller) = self.cur_fn.clone() else {
+            return;
+        };
+        let elems: Vec<Ty> = match self_ty {
+            Ty::Vec(e) | Ty::Option(e) => vec![(**e).clone()],
+            Ty::Tuple(es) => es.clone(),
+            _ => Vec::new(),
+        };
+        let mut targs: Vec<Ty> = Vec::new();
+        for (j, n) in names.iter().enumerate() {
+            let i = sig.impl_args.iter().position(|a| matches!(a, Ty::Param(p) if p == n));
+            targs.push(match i.and_then(|i| elems.get(i)) {
+                Some(e) if j >= sig.type_params.len() => e.clone(),
+                _ => Ty::Unknown,
+            });
+        }
+        let r = self.range(c.syntax());
+        self.generic_calls.push((r, caller, format!("{key}::{method}"), targs));
+    }
+}
+
+impl Checker<'_> {
+    /// `<&A as Tr>::f()` where `Tr` has an impl for `&T` of its own (`adt::wrapper_impl`): that
+    /// impl's function, handed `A`'s class (the referent, `self_ty` with the reference erased).
+    pub(super) fn note_wrapper_static(
+        &mut self,
+        c: &ast::CallExpr,
+        written: &ast::Type,
+        tr: &str,
+        method: &str,
+        self_ty: &crate::ty::Ty,
+    ) {
+        let kind = match written_wraps(written).first() {
+            Some(k) => *k,
+            None => return,
+        };
+        let key = format!("{tr}${kind}");
+        let Some(sig) = self.adts.method(&key, method).cloned() else {
+            return;
+        };
+        if sig.receiver.is_some() {
+            return;
+        }
+        self.record_ext(c.syntax(), &key);
+        let Some(caller) = self.cur_fn.clone() else {
+            return;
+        };
+        let targs = sig
+            .dict_names()
+            .iter()
+            .map(|n| {
+                if sig.impl_args.iter().any(|a| matches!(a, crate::ty::Ty::Param(p) if p == n)) {
+                    self_ty.clone()
+                } else {
+                    crate::ty::Ty::Unknown
+                }
+            })
+            .collect();
+        let r = self.range(c.syntax());
+        self.generic_calls.push((r, caller, format!("{key}::{method}"), targs));
+    }
 }

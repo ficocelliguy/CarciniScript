@@ -424,6 +424,30 @@ impl Codegen<'_> {
                         };
                         let ty = k.ty().map(|t| self.lower_type(&t));
                         let name = escape_ident(n.text());
+                        // `impl<T: Zero> Zero for W<T> { const ZERO: Self = W(T::ZERO); }`: a
+                        // getter reading `T`'s class off the class view it's read through
+                        // (`κσ.$tv(W, [cls]).ZERO`, see `tparam_consts`).
+                        if let Some(read) = self
+                            .tparam_consts
+                            .get(&(def.name.clone(), n.text().to_string()))
+                            .cloned()
+                        {
+                            let saved_consts = super::set_const_scope(None);
+                            for (p, i) in &read {
+                                super::CONST_SCOPE.with(|s| {
+                                    s.borrow_mut().insert(p.clone(), format!("this.$targs?.[{i}]"))
+                                });
+                            }
+                            let (f, _) = self.emit_expr(&body, ty.as_ref());
+                            super::set_const_scope(Some(saved_consts));
+                            let mut line = Frag::mapped(
+                                self.off(k.syntax()),
+                                format!("static get {name}() {{ return "),
+                            );
+                            line.append(f).push("; }");
+                            self.line(line);
+                            continue;
+                        }
                         // `impl<const P: u128> U<P> { const PER: u128 = P * 1000; }`: a getter
                         // reading `P` off the class view it's read through (`κσ.$cv(U, [7]).PER`,
                         // see `param_consts`).
@@ -520,7 +544,16 @@ impl Codegen<'_> {
                             continue;
                         }
                         let ty = self.lower_type(&t);
-                        let d = self.dict_of(&ty);
+                        let mut d = self.dict_of(&ty);
+                        // (`type Seed = [u8; 4];`: its `default()` has four elements.)
+                        if let ast::Type::ArrayType(a) = &t
+                            && let Some(ast::Expr::Literal(l)) = a.const_arg().and_then(|c| c.expr())
+                            && let ast::LiteralKind::IntNumber(n) = l.kind()
+                            && let Ok(n) = n.value()
+                            && let Ty::Vec(e) = &ty
+                        {
+                            d = format!("κσ.$arrT({n}, {})", self.dict_of(e));
+                        }
                         self.line(Frag::mapped(
                             self.off(ta.syntax()),
                             format!("static get $at${}() {{ return {d}; }}", n.text()),
@@ -535,6 +568,7 @@ impl Codegen<'_> {
         self.emit_derives(&def, &cls, node);
         self.out.indent -= 1;
         self.line(Frag::text("}"));
+        self.emit_alt_dispatch(&def.name, &cls);
         // (A file's own `Duration`, renamed `Duration__file` by `ownstd.rs`: the files that
         // import it ask for `Duration`.)
         if let Some(orig) = def.name.strip_suffix("__file")
@@ -561,6 +595,82 @@ impl Codegen<'_> {
 
     /// A method in JS method syntax (`[static] [async] name(params) { .. }`), for a class body or
     /// an object literal (`close` is then `},`). `self_ty` is the type `self` has.
+    /// The methods that several impls of one generic trait give type `key`, where the impls'
+    /// arguments tell them apart (`Adts::alt_dispatch`): the method's own name becomes a
+    /// dispatcher to the impl whose parameter types the arguments fit (`κσ.$altDispatch`), so
+    /// a call through a type parameter or `dyn` reaches the right one.
+    fn emit_alt_dispatch(&mut self, key: &str, cls: &str) {
+        let mut names: Vec<String> = self
+            .types
+            .adts
+            .method_alts
+            .keys()
+            .filter_map(|k| k.strip_prefix(&format!("{key}::")).map(str::to_string))
+            .collect();
+        names.sort();
+        for m in names {
+            let Some(sigs) = self.types.adts.alt_dispatch(key, &m) else {
+                continue;
+            };
+            let statik = self
+                .types
+                .adts
+                .method(key, &m)
+                .is_some_and(|s| s.receiver.is_none());
+            let entries: Vec<String> = sigs
+                .iter()
+                .map(|(k, ps)| {
+                    let ds: Vec<String> = ps
+                        .iter()
+                        .map(|p| {
+                            let mut generic = false;
+                            p.walk(&mut |t| generic |= matches!(t, Ty::Param(_)));
+                            match self.dict_of(p) {
+                                d if generic || d == "undefined" => "null".to_string(),
+                                d => d,
+                            }
+                        })
+                        .collect();
+                    format!("[{}, [{}]]", super::js_string(&prop(k)), ds.join(", "))
+                })
+                .collect();
+            let target = if statik {
+                cls.to_string()
+            } else {
+                format!("{cls}.prototype")
+            };
+            self.line(Frag::text(format!(
+                "κσ.$altDispatch({target}, {}, () => [{}]);",
+                super::js_string(&prop(&m)),
+                entries.join(", ")
+            )));
+        }
+        // `Y::from(x)` with `x: T` in a function `where Y: From<T>`: a `from` that picks among
+        // the `From` impls (`from$0`, `from$1`, ..) by the value.
+        let froms = self.types.adts.from_impls.get(key).cloned().unwrap_or_default();
+        if !froms.is_empty()
+            && froms.iter().all(|f| f.key != "from")
+            && self.types.adts.method(key, "from").is_none()
+        {
+            let entries: Vec<String> = froms
+                .iter()
+                .map(|f| {
+                    let mut generic = f.via_into || f.via_as_ref;
+                    f.src.walk(&mut |t| generic |= matches!(t, Ty::Param(_)));
+                    let d = match self.dict_of(&f.src) {
+                        d if generic || d == "undefined" => "null".to_string(),
+                        d => d,
+                    };
+                    format!("[{}, [{d}]]", super::js_string(&prop(&f.key)))
+                })
+                .collect();
+            self.line(Frag::text(format!(
+                "κσ.$altDispatch({cls}, \"from\", () => [{}]);",
+                entries.join(", ")
+            )));
+        }
+    }
+
     fn emit_method_fn(
         &mut self,
         f: &ast::Fn,
@@ -793,6 +903,10 @@ impl Codegen<'_> {
             Ty::Option(_) => Some("Option"),
             Ty::Vec(_) => Some("Vec"),
             Ty::Tuple(es) => crate::adt::tuple_key(es.len()),
+            // (A `&T` impl's methods: `T`'s.)
+            Ty::Param(_) if self.ext_class.as_deref().is_some_and(crate::adt::is_wrapper_key) => {
+                self.ext_class.as_deref()
+            }
             _ => None,
         };
         if let Some(key) = elem_key
@@ -931,6 +1045,10 @@ impl Codegen<'_> {
             .flatten();
         let self_ty = match key {
             _ if blanket.is_some() => Ty::Param(blanket.map(|(_, t, _)| t).unwrap_or_default()),
+            // (A `&T` impl's `self` is its `T`.)
+            k if crate::adt::is_wrapper_key(k) => Ty::Param(
+                impls.first().and_then(crate::adt::wrapper_impl).map(|(_, t)| t).unwrap_or_default(),
+            ),
             "String" => Ty::Str,
             "Vec" => Ty::Vec(Box::new(Ty::Unknown)),
             "Option" => Ty::Option(Box::new(Ty::Unknown)),
@@ -1146,6 +1264,7 @@ impl Codegen<'_> {
         self.ext_class = saved_ext;
         self.out.indent -= 1;
         self.line(Frag::text("}"));
+        self.emit_alt_dispatch(key, &format!("$ext${key}"));
         // The `&mut self` methods, which `κσ.$dcallMut` calls with the receiver's cell.
         let muts: Vec<String> = self
             .types
@@ -1277,6 +1396,37 @@ impl Codegen<'_> {
             if !modules.contains(&m) {
                 modules.push(m);
             }
+        }
+        // A `&T` impl's class: `κσ.$dcallT` takes it for a reference's class (`κσ.$wrapT`).
+        if let Some((_, kind)) = key.rsplit_once('$')
+            && crate::adt::is_wrapper_key(key)
+        {
+            // (Its associated functions that take `T`'s class: where it goes among their
+            // arguments, for `T::f()` through the reference's class.)
+            let mut statics: Vec<String> = self
+                .types
+                .adts
+                .methods
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter(|(m, s)| {
+                    s.receiver.is_none()
+                        && self
+                            .types
+                            .dict_params
+                            .get(&format!("{key}::{m}"))
+                            .is_some_and(|ps| !ps.is_empty())
+                })
+                .map(|(m, s)| format!("{}: {}", super::js_string(&prop(m)), s.params.len()))
+                .collect();
+            statics.sort();
+            self.line(Frag::text(format!(
+                "κσ.$wrapReg($extRegs, \"{kind}\", $ext${key}, {{{}}});",
+                statics.join(", ")
+            )));
+            self.line(Frag::default());
+            return;
         }
         // A blanket impl's class: `κσ.$dcall` tries it for any value.
         if key.ends_with("$all") {
@@ -1556,6 +1706,28 @@ impl Codegen<'_> {
                     tr.clone(),
                 );
                 self.trait_const_args.insert(key, accessors);
+            }
+            // `impl<T: Zero> Zero for W<T> { const ZERO: Self = W(T::ZERO); }`
+            for a in imp.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()) {
+                let ast::AssocItem::Const(k) = a else { continue };
+                let (Some(n), Some(body)) = (k.name(), k.body()) else { continue };
+                let mut read: Vec<(String, usize)> = Vec::new();
+                for p in body.syntax().descendants().filter_map(ast::Path::cast) {
+                    let Some(first) = p.first_segment().and_then(|s| s.name_ref()) else {
+                        continue;
+                    };
+                    let name = first.text().to_string();
+                    if p.qualifier().is_none() || read.iter().any(|(x, _)| *x == name) {
+                        continue;
+                    }
+                    if let Some(i) = crate::adt::impl_type_param_pos(&imp, &name) {
+                        read.push((name, i));
+                    }
+                }
+                if !read.is_empty() {
+                    self.tparam_consts
+                        .insert((type_name.clone(), n.text().to_string()), read);
+                }
             }
             // `impl<const P: u128> U<P> { const PER: u128 = P * 1000; }`
             if !impl_consts.is_empty() {
@@ -2163,6 +2335,16 @@ impl Codegen<'_> {
                         .is_some_and(|c| c.contains_key(&m)) =>
             {
                 let ty = self.types.adts.assoc_consts[&adt][&m].clone();
+                // A const reading the impl's type parameters: through a class view carrying their
+                // classes (`W::<f64>::ZERO` → `κσ.$tv(W, [..]).ZERO`), by the value's type.
+                if self.tparam_consts.contains_key(&(adt.clone(), m.clone()))
+                    && let Some(Ty::Adt(a, targs)) =
+                        path.and_then(|p| p.syntax().parent()).and_then(|e| self.ty_of(&e))
+                    && a == adt
+                {
+                    let d = self.dict_of(&Ty::Adt(a, targs));
+                    return Some((Frag::text(format!("{d}.{}", escape_ident(&m))), ty));
+                }
                 // A const reading the impl's const parameters: through a class view carrying
                 // them (`U::<3>::PER` → `κσ.$cv(U, [3]).PER`; `Self::PER` in a method, `this.$P`).
                 if self.param_consts.contains(&(adt.clone(), m.clone())) {
@@ -2313,14 +2495,9 @@ impl Codegen<'_> {
                     None => {
                         let mut args = self.emit_args(c.arg_list(), &sig.params);
                         // The classes for `T::make()` in its body.
-                        if let Some(tys) = self
-                            .types
-                            .dict_args
-                            .get(&self.range_of(c.syntax()))
-                            .cloned()
-                        {
-                            for t in &tys {
-                                args.push(Frag::text(self.dict_of(t)));
+                        if let Some(ds) = self.dict_args_at(self.range_of(c.syntax())) {
+                            for d in ds {
+                                args.push(Frag::text(d));
                             }
                         }
                         args.extend(self.dbg_arg_frags(c.syntax()));
@@ -2431,14 +2608,9 @@ impl Codegen<'_> {
             }
             let mut args = self.emit_args(m.arg_list(), &sig.params);
             // The classes for the method's `T::make()` calls.
-            if let Some(tys) = self
-                .types
-                .dict_args
-                .get(&self.range_of(m.syntax()))
-                .cloned()
-            {
-                for t in &tys {
-                    args.push(Frag::text(self.dict_of(t)));
+            if let Some(ds) = self.dict_args_at(self.range_of(m.syntax())) {
+                for d in ds {
+                    args.push(Frag::text(d));
                 }
             }
             args.extend(self.dbg_arg_frags(m.syntax()));

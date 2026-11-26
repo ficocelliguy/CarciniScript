@@ -3,7 +3,7 @@
 //! own static method (`from$0`, `from$1`, ..); the checker picks one per call by the argument's
 //! type and records it in `Types::conversions` for codegen. A child module of `typeck`.
 
-use ra_ap_syntax::{AstNode, SyntaxNode, ast, ast::ArithOp, ast::HasArgList};
+use ra_ap_syntax::{AstNode, SyntaxNode, ast, ast::ArithOp, ast::HasArgList, ast::HasName, ast::HasTypeBounds};
 
 use super::{Checker, VarKind};
 use crate::adt::{ArgRef, Conv, FromImpl};
@@ -406,6 +406,84 @@ impl Checker<'_> {
         })
     }
 
+    /// `m.scale(r)` in `fn twice<R>(m: Meters, r: R) where Meters: Scale<R>`: the trait's method
+    /// with the clause's arguments, as through a bound on a type parameter (at run time `m`'s
+    /// own method, a dispatcher when there are several impls: `Adts::alt_dispatch`). Only when
+    /// the clause names one of the function's type parameters; otherwise the impls decide.
+    pub(super) fn where_self_method(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        recv: &ast::Expr,
+        self_ty: &Ty,
+        method: &str,
+        args: &[ast::Expr],
+    ) -> Option<Ty> {
+        use ra_ap_syntax::ast::{HasGenericArgs, HasGenericParams};
+        if !matches!(self_ty, Ty::Adt(..) | Ty::Str | Ty::Char | Ty::Bool | Ty::Int(_) | Ty::Float { .. } | Ty::Vec(_)) {
+            return None;
+        }
+        let f = m.syntax().ancestors().find_map(ast::Fn::cast)?;
+        let preds: Vec<ast::WherePred> = f.where_clause()?.predicates().collect();
+        for pred in preds {
+            let Some(lhs) = pred.ty() else { continue };
+            let same = match (self.lower_type(&lhs), self_ty) {
+                (Ty::Adt(a, _), Ty::Adt(b, _)) => a == *b,
+                (Ty::Vec(_), Ty::Vec(_)) => true,
+                (l, s) => l == *s,
+            };
+            if !same {
+                continue;
+            }
+            for b in pred.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
+                let Some(ast::Type::PathType(pt)) = b.ty() else {
+                    continue;
+                };
+                let Some(seg) = pt.path().and_then(|p| p.segment()) else {
+                    continue;
+                };
+                let Some(tr) = seg.name_ref().map(|n| n.text().to_string()) else {
+                    continue;
+                };
+                let Some(def) = self.adts.traits.get(&tr).cloned() else {
+                    continue;
+                };
+                let Some(sig) = self.trait_method(&tr, method).filter(|s| s.receiver.is_some())
+                else {
+                    continue;
+                };
+                let given: Vec<Ty> = seg
+                    .generic_arg_list()
+                    .into_iter()
+                    .flat_map(|l| l.generic_args())
+                    .filter_map(|g| match g {
+                        ast::GenericArg::TypeArg(ta) => ta.ty().map(|t| self.lower_type(&t)),
+                        _ => None,
+                    })
+                    .collect();
+                let mut generic = false;
+                for g in &given {
+                    g.walk(&mut |t| generic |= matches!(t, Ty::Param(_)));
+                }
+                if !generic {
+                    continue;
+                }
+                let mut sub = std::collections::HashMap::new();
+                for (tp, g) in def.type_params.iter().zip(given) {
+                    sub.insert(format!("{tr}::{tp}"), g);
+                }
+                self.where_sub = Some(sub);
+                // (On a built-in type: its impls' class, `$ext$String`.)
+                if !matches!(self_ty, Ty::Adt(..))
+                    && let Some(k) = crate::adt::ext_key_of(self_ty)
+                {
+                    self.record_ext(m.syntax(), k);
+                }
+                return Some(self.call_trait_method(m, recv, &tr, sig, self_ty.clone(), args));
+            }
+        }
+        None
+    }
+
     /// `v.into_s()` where a generic trait is implemented more than once for `ty`
     /// (`impl IntoS<u8> for Vec<u8>`, `impl IntoS<u16> for Vec<u8>`): the key of the impl whose
     /// signature fits the arguments and the expected type (the first that fits when several do),
@@ -643,6 +721,31 @@ impl Checker<'_> {
             .join(", ")
     }
 
+    /// Whether the function around `n` has `where {adt}: From<{p}>`.
+    fn where_from_param(&mut self, n: &SyntaxNode, adt: &str, p: &str) -> bool {
+        use ra_ap_syntax::ast::{HasGenericArgs, HasGenericParams};
+        let Some(f) = n.ancestors().find_map(ast::Fn::cast) else {
+            return false;
+        };
+        let preds: Vec<ast::WherePred> =
+            f.where_clause().into_iter().flat_map(|w| w.predicates()).collect();
+        preds.iter().any(|pred| {
+            pred.ty().is_some_and(|t| matches!(self.lower_type(&t), Ty::Adt(n, _) if n == adt))
+                && pred.type_bound_list().into_iter().flat_map(|l| l.bounds()).any(|b| {
+                    let Some(ast::Type::PathType(pt)) = b.ty() else {
+                        return false;
+                    };
+                    let Some(seg) = pt.path().and_then(|p| p.segment()) else {
+                        return false;
+                    };
+                    seg.name_ref().is_some_and(|n| n.text() == "From")
+                        && seg.generic_arg_list().is_some_and(|l| {
+                            l.generic_args().any(|g| g.syntax().text() == p)
+                        })
+                })
+        })
+    }
+
     /// `Y::from(x)` for a struct or enum with `impl From<X> for Y`.
     pub(super) fn conv_from_call(
         &mut self,
@@ -682,6 +785,17 @@ impl Checker<'_> {
             {
                 self.record_conv(c.syntax(), Conv::Identity);
                 return at;
+            }
+            // `Meters::from(x)` with `x: T` in a function `where Meters: From<T>`: the impl that
+            // `x`'s value fits, at run time (`Meters.from`, see `emit_from_dispatch`).
+            None if matches!(self.shallow(&at), Ty::Param(p) if self.where_from_param(c.syntax(), adt, &p)) => {
+                self.record_conv(
+                    c.syntax(),
+                    Conv::From {
+                        adt: adt.to_string(),
+                        key: "from".into(),
+                    },
+                );
             }
             None => {
                 let msg = format!(
@@ -810,7 +924,10 @@ impl Checker<'_> {
             .or_else(|| {
                 let imp = m.syntax().ancestors().find_map(ast::Impl::cast)?;
                 param_into_target(&p, tr, imp.generic_param_list(), imp.where_clause())
-            })?;
+            })
+            // `seed.as_mut()` with `seed: Self::Seed` where the trait declares `type Seed:
+            // AsMut<[u8]>` (or `S::Seed` of an `S` bounded by it).
+            .or_else(|| self.assoc_into_target(m.syntax(), &p, tr))?;
         let t = self.lower_type(&x);
         let bytes = matches!(&t, Ty::Vec(e) if **e == Ty::Int(IntKind::U8));
         self.record_conv(
@@ -1679,5 +1796,46 @@ impl Checker<'_> {
             }
             None => false,
         }
+    }
+}
+
+impl Checker<'_> {
+    /// `X` of the `tr<X>` bound (`AsRef`, `AsMut`, `Into`, `Borrow`, ..) the trait declaring the
+    /// associated type `p` (`Self::Seed`, `S::Seed`) puts on it (`type Seed: AsMut<[u8]>;`).
+    fn assoc_into_target(&self, at: &SyntaxNode, p: &str, tr: &str) -> Option<ast::Type> {
+        let (owner, assoc) = p.split_once("::")?;
+        let traits: Vec<String> = if owner == "Self" {
+            self.param_bounds.get("Self").cloned().unwrap_or_default()
+        } else {
+            self.bound_traits(owner)
+        };
+        let root = at.ancestors().last()?;
+        root.descendants()
+            .filter_map(ast::Trait::cast)
+            .filter(|t| t.name().is_some_and(|n| traits.iter().any(|x| *x == n.text())))
+            .filter_map(|t| t.assoc_item_list())
+            .flat_map(|l| l.assoc_items())
+            .filter_map(|it| match it {
+                ast::AssocItem::TypeAlias(ta) if ta.name().is_some_and(|n| n.text() == assoc) => {
+                    ta.type_bound_list()
+                }
+                _ => None,
+            })
+            .find_map(|list| {
+                use ra_ap_syntax::ast::HasGenericArgs;
+                list.bounds().find_map(|b| match b.ty()? {
+                    ast::Type::PathType(pt) => {
+                        let seg = pt.path()?.segment()?;
+                        if seg.name_ref()?.text() != tr {
+                            return None;
+                        }
+                        seg.generic_arg_list()?.generic_args().find_map(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+            })
     }
 }

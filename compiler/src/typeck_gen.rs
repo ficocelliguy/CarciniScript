@@ -1412,9 +1412,23 @@ impl Checker<'_> {
                     .any(|k| self.adts.inherent_alts.contains(&format!("{k}::{}", tm.name)))
             })
         });
-        let arrays = array_impls || tuple_alts;
-        (numeric_impls >= 2 || option_impl || arrays)
-            && (self.try_note_dict(name) || arrays && self.elem_class(name))
+        // And with a generic `impl<T: Tr> Tr for Vec<T>`: its methods may need `T`'s class, which
+        // only a caller that knows the `Vec`'s type has (`κσ.$callElem`).
+        let generic_vec = self.adts.traits.get(b).is_some_and(|d| {
+            d.methods.iter().any(|tm| {
+                self.adts.method("Vec", &tm.name).is_some_and(|s| {
+                    s.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                })
+            })
+        }) && has("Vec");
+        let arrays = array_impls || tuple_alts || generic_vec;
+        // And with impls on `str` and `String` (or `[T]` and `Vec<T>`) that differ: one type in JS.
+        let twins = self.twin_trait(b);
+        // And with an impl for `&T` (`Box<T>`) that does more than `T`'s: a reference passed for
+        // `T` reaches it by its class (`κσ.$wrapT`).
+        let wraps = self.wrapper_trait(b);
+        (numeric_impls >= 2 || option_impl || arrays || twins || wraps)
+            && (self.try_note_dict(name) || (arrays || wraps) && self.elem_class(name))
     }
 
     /// Methods on a value of type parameter `T`.
@@ -1532,5 +1546,33 @@ impl Checker<'_> {
                 Ty::Unknown
             }
         }
+    }
+}
+
+impl Checker<'_> {
+    /// `i32::ZERO` (an associated const of your trait impl for a built-in type) or `Tr::ZERO`
+    /// (`Self` from the context: `let p: P = Tr::ZERO;`): read off `Self`'s class
+    /// (`const_paths`).
+    pub(super) fn trait_const_path(
+        &mut self,
+        node: &SyntaxNode,
+        owner: &str,
+        konst: &str,
+    ) -> Option<Ty> {
+        let (self_ty, t) = if let Some(key) =
+            crate::adt::ext_key(owner).filter(|k| self.adts.ext_types.contains(*k))
+        {
+            let t = self.adts.assoc_consts.get(key)?.get(konst)?.clone();
+            (Ty::from_name(owner), t)
+        } else if let Some(d) = self.adts.traits.get(owner) {
+            let t = d.const_tys.get(konst)?.clone();
+            (self.fresh(VarKind::General), t)
+        } else {
+            return None;
+        };
+        let t = subst(&t, &[("Self".to_string(), self_ty.clone())].into());
+        let r = self.range(node);
+        self.const_paths.insert(r, (self_ty, konst.to_string()));
+        Some(t)
     }
 }

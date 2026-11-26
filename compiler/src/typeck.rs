@@ -231,6 +231,13 @@ pub struct Types {
     pub dict_params: HashMap<String, Vec<String>>,
     /// Calls of those functions: the types to pass a class for, in order, by the call's range.
     pub dict_args: HashMap<(usize, usize), Vec<Ty>>,
+    /// Wrappers of those classes, innermost first, by the call's range and position: `own` for an
+    /// owned `String` / `Vec<T>` whose trait also has a `str` / `[T]` impl (`κσ.$ownT(..)`), `ref` /
+    /// `refmut` / `box` for a reference whose trait has a `&T` impl of its own (`κσ.$wrapT(..)`).
+    pub dict_owned: HashMap<(usize, usize), Vec<Vec<String>>>,
+    /// `i32::ZERO` / `Tr::ZERO` (with `Self` from the context): an associated const of a trait
+    /// impl, read off the class of `Self` (the type here), by the path's range.
+    pub const_paths: HashMap<(usize, usize), (Ty, String)>,
     /// The type parameters each function takes a `{:?}` formatter for (`$dbg$T`): those it
     /// prints with `{:?}` (or hands to a function that does), so `Some(..)` and whole floats
     /// print as the caller's type says.
@@ -365,6 +372,7 @@ impl<'a> Checker<'a> {
         Checker {
             src,
             base: 0,
+            file_root: Default::default(),
             vars: Vec::new(),
             raw: HashMap::new(),
             diags: Vec::new(),
@@ -390,6 +398,7 @@ impl<'a> Checker<'a> {
             root_file: None,
             param_bounds: HashMap::new(),
             method_where: Vec::new(),
+            where_sub: None,
             into_targets: HashMap::new(),
             nested_ok: Default::default(),
             slot_locals: HashMap::new(),
@@ -412,6 +421,10 @@ impl<'a> Checker<'a> {
             copy_array_consts: Default::default(),
             copy_array_assoc: Default::default(),
             twin_sides: HashMap::new(),
+            twin_targs: HashMap::new(),
+            dyn_twins: Default::default(),
+            str_writers: Default::default(),
+            const_paths: HashMap::new(),
             str_locals: Default::default(),
             ref_vecs: Default::default(),
             move_sites: Default::default(),
@@ -781,6 +794,11 @@ pub fn check(
     for v in stored.values_mut() {
         v.sort();
     }
+    let dict_owned = c.finish_twin_dicts(&dict_params, &dict_args);
+    let const_paths: HashMap<(usize, usize), (Ty, String)> = std::mem::take(&mut c.const_paths)
+        .into_iter()
+        .map(|(r, (t, k))| (r, (c.zonk(&t), k)))
+        .collect();
     let dyn_nums = c.finish_dyn_nums();
     let adts = std::mem::take(&mut c.adts);
     let mut_bindings = std::mem::take(&mut c.mut_bindings);
@@ -881,6 +899,8 @@ pub fn check(
             qualified_calls,
             dict_params,
             dict_args,
+            dict_owned,
+            const_paths,
             dbg_params,
             dbg_args,
             modules,
@@ -905,6 +925,9 @@ struct Checker<'a> {
     /// Absolute offset of the text the current AST was parsed from (non-zero inside re-parsed
     /// macro arguments).
     base: usize,
+    /// The whole file's syntax, parsed again when a re-parsed macro argument names a local
+    /// declared outside it (see `typeck_twins`).
+    file_root: std::cell::OnceCell<SyntaxNode>,
     vars: Vec<VarState>,
     raw: HashMap<(usize, usize), Ty>,
     diags: Vec<RawDiag>,
@@ -952,6 +975,9 @@ struct Checker<'a> {
     /// The impl's parameters a method's `where` clause bounds further (`fn log(&self) where T:
     /// Display`), with their bounds before it, put back after the method.
     method_where: Vec<(String, Vec<String>)>,
+    /// Trait arguments for the next `call_trait_method`, from a `where Meters: Scale<R>` clause
+    /// (see `where_self_method`).
+    where_sub: Option<HashMap<String, Ty>>,
     /// `T: Into<f64>`: what `.into()` on a `T` makes (a number type; `T` stays generic).
     into_targets: HashMap<String, Ty>,
     /// Expressions of type `Option<Option<T>>` that only feed a `.flatten()`.
@@ -997,6 +1023,16 @@ struct Checker<'a> {
     /// Path calls that may reach a `str` / `String` (or `[T]` / `Vec<T>`) pair of impls (see
     /// `Adts::own_twins`): the method, and whether the call is for the owned type (None: unknown).
     twin_sides: HashMap<(usize, usize), (String, Option<bool>)>,
+    /// Generic calls whose type parameter has a bound with `str` / `String` (or `[T]` / `Vec<T>`)
+    /// twin impls: per parameter, whether its argument is the owned type (None: unknown), and the
+    /// argument's range. The owned type's class goes as `κσ.$ownT(..)` (see `finish_twin_dicts`).
+    twin_targs: HashMap<(usize, usize), Vec<(String, Option<bool>, (usize, usize), Vec<&'static str>)>>,
+    /// Owned strings and vectors coerced to a `dyn Trait` with twin impls, by range.
+    dyn_twins: std::collections::HashSet<(usize, usize)>,
+    /// Strings and `Formatter`s coerced to a `dyn fmt::Write`, by range (see `dyn_nums`).
+    str_writers: std::collections::HashSet<(usize, usize)>,
+    /// See `Types::const_paths` (zonked when the file is done).
+    const_paths: HashMap<(usize, usize), (Ty, String)>,
     /// `let` locals whose initializer is certainly a `&str` (`let s = "a";`, `let t = s;`,
     /// `let u = x.as_str();`), by declaration: `s + ".."` is rustc's E0369.
     str_locals: std::collections::HashSet<(usize, usize)>,
@@ -1758,6 +1794,18 @@ impl<'a> Checker<'a> {
         {
             let r = self.range(n);
             self.dyn_num_coercions.push((r, found.clone(), tr));
+        }
+        if let Ty::Dyn(tr) = self.shallow(expected) {
+            self.note_dyn_twin(n, found, &tr);
+        }
+        // A `String` or a `Formatter` into a `&mut dyn fmt::Write` (a struct field, a closure's
+        // parameter, a `Box`): a writer object over the place (`κσ.$fmtWriter`).
+        if matches!(self.shallow(expected), Ty::Dyn(tr) if tr == "FmtWrite")
+            && matches!(self.shallow(found), Ty::Str | Ty::Formatter)
+        {
+            let r = self.range(n);
+            self.str_writers.insert(r);
+            return;
         }
         if let (Ty::Dyn(tr), Ty::Adt(adt, _)) = (self.shallow(expected), self.shallow(found))
             && tr != "Any"
@@ -2990,6 +3038,10 @@ impl<'a> Checker<'a> {
             let Some(q) = self.qualified_calls.get(&r).cloned() else {
                 continue;
             };
+            // (`<&A as Tr>::f()` of a `&T` impl of its own: decided where it was checked.)
+            if matches!(self.conversions.get(&r), Some(crate::adt::Conv::Ext { key }) if crate::adt::is_wrapper_key(key)) {
+                continue;
+            }
             let adt = match &t {
                 Ty::Adt(n, _) if self.adts.defs.get(n).is_some_and(|d| d.module.is_none()) => {
                     Some(n.clone())
@@ -4962,6 +5014,13 @@ impl<'a> Checker<'a> {
                 out.insert(r, k.to_string());
             }
         }
+        // (An owned string or vector into a `dyn` of a twin trait: see `note_dyn_twin`.)
+        for r in std::mem::take(&mut self.dyn_twins) {
+            out.insert(r, "$own".to_string());
+        }
+        for r in std::mem::take(&mut self.str_writers) {
+            out.insert(r, "$fmtWriter".to_string());
+        }
         out
     }
 
@@ -5838,6 +5897,12 @@ impl<'a> Checker<'a> {
         // `T::SIDES`: an associated const of a bound of `T`.
         if let [param, konst] = segs.as_slice()
             && let Some(t) = self.param_const(param, konst, p.syntax())
+        {
+            return t;
+        }
+        // `i32::ZERO`, `Tr::ZERO`: a trait impl's associated const.
+        if let [owner, konst] = segs.as_slice()
+            && let Some(t) = self.trait_const_path(p.syntax(), owner, konst)
         {
             return t;
         }
@@ -6842,7 +6907,50 @@ impl<'a> Checker<'a> {
                 && let Some(sig) = self.adts.method(key, f).cloned()
                 && sig.receiver.is_none()
             {
+                let impl_args = sig.impl_args.clone();
+                let dict_names = sig.dict_names();
                 let sig = self.method_inst(&sig, None);
+                // (`<Vec<u16>>::name()` of `impl<T: Codec> Codec for Vec<T>`: `T`'s class, for
+                // `T::name()` in its body.)
+                if dict_names.len() > sig.type_params.len()
+                    && let Some(caller) = self.cur_fn.clone()
+                {
+                    let qseg = path.qualifier().and_then(|q| q.segment());
+                    let written = qseg
+                        .as_ref()
+                        .and_then(|s| s.type_anchor())
+                        .and_then(|a| a.ty())
+                        .map(|t| self.lower_type(&t));
+                    let elems: Vec<Ty> = match written {
+                        Some(Ty::Vec(e) | Ty::Option(e)) => vec![*e],
+                        Some(Ty::Tuple(es)) => es,
+                        // (`Vec::<u16>::name()`.)
+                        _ => qseg
+                            .and_then(|s| s.generic_arg_list())
+                            .into_iter()
+                            .flat_map(|l| l.generic_args())
+                            .filter_map(|g| match g {
+                                ast::GenericArg::TypeArg(t) => t.ty(),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .iter()
+                            .map(|t| self.lower_type(t))
+                            .collect(),
+                    };
+                    let mut targs = std::mem::take(&mut self.last_type_args);
+                    // (`method_inst` made the impl's parameters fresh, after the method's own.)
+                    targs.resize(dict_names.len(), Ty::Unknown);
+                    for (j, n) in dict_names.iter().enumerate().skip(sig.type_params.len()) {
+                        let i = impl_args.iter().position(|a| matches!(a, Ty::Param(p) if p == n));
+                        if let Some(e) = i.and_then(|i| elems.get(i)) {
+                            let t = targs[j].clone();
+                            self.unify(&t, e);
+                        }
+                    }
+                    let r = self.range(c.syntax());
+                    self.generic_calls.push((r, caller, format!("{key}::{f}"), targs));
+                }
                 self.arg_count(c.syntax(), "function", sig.params.len(), args.len());
                 for (a, p) in args.iter().zip(&sig.params) {
                     self.check(a, p);
@@ -7341,6 +7449,7 @@ impl<'a> Checker<'a> {
         };
         let (params, ret, is_async) = (sig.params.clone(), sig.ret.clone(), sig.is_async);
         let type_params = sig.type_params.clone();
+        let ref_params_raw = sig.ref_params.clone();
         let bound_args = sig.bound_args.clone();
         let (params, ret) = if type_params.is_empty() {
             (params, ret)
@@ -7371,6 +7480,7 @@ impl<'a> Checker<'a> {
             if let Some(caller) = self.cur_fn.clone() {
                 let r = self.range(c.syntax());
                 let targs = std::mem::take(&mut self.last_type_args);
+                self.note_twin_targs(r, &type_params, &params, &ref_params_raw, args);
                 self.generic_calls
                     .push((r, caller, name.to_string(), targs));
             }
@@ -7767,6 +7877,11 @@ impl<'a> Checker<'a> {
             return Ty::Bool;
         }
         let mut rt = self.infer(&recv, None);
+        // (`where Meters: Scale<R>`: the trait's method with the clause's arguments.)
+        let shallow = self.shallow(&rt);
+        if let Some(t) = self.where_self_method(m, &recv, &shallow, &method, &args) {
+            return t;
+        }
         // `b.as_ref()` with `B: AsRef<[u8]>`: what the bound says.
         if let Some(t) = self.conv_as_ref_call(m, &method) {
             return t;
@@ -8169,15 +8284,18 @@ impl<'a> Checker<'a> {
                     .unwrap_or(method);
                 return self.adt_method(m, &recv, &name, &targs, &method, &args);
             }
-            // (A method that several impls of one generic trait give a type can't be told apart
-            // at run time.)
+            // (A method that several impls of one generic trait give a type: told apart at run
+            // time by its arguments when their types differ there, see `alt_dispatch`.)
             Ty::Param(_) | Ty::Dyn(_)
                 if self.adts.method_alts.keys().any(|k| {
-                    k.ends_with(&format!("::{method}")) && !self.adts.inherent_alts.contains(k)
+                    k.strip_suffix(&format!("::{method}")).is_some_and(|ty| {
+                        !self.adts.inherent_alts.contains(k)
+                            && self.adts.alt_dispatch(ty, &method).is_none()
+                    })
                 }) =>
             {
                 let msg = format!(
-                    "`{method}` comes from a generic trait implemented more than once for one type; calling it through a type parameter or `dyn` isn't supported yet (call it on the concrete type)"
+                    "`{method}` comes from a generic trait implemented more than once for one type; through a type parameter or `dyn` the impl is picked by the arguments at run time, and these impls take arguments that look alike in JS (two number types, or `str` and `char`): call it on the concrete type"
                 );
                 self.error(m.syntax(), msg);
                 for a in &args {
@@ -9310,8 +9428,9 @@ impl<'a> Checker<'a> {
                 // Into a `fmt::Write` of your own, or a `W: fmt::Write` (a `String`, a `Formatter`
                 // or your own writer): its `write_str` of the text.
                 if self.adts.traits.contains_key("FmtWrite")
-                    && matches!(self.zonk(&tt), Ty::Adt(..) | Ty::Param(_))
-                    && self.implements_user_trait(&tt, "FmtWrite")
+                    && (matches!(self.zonk(&tt), Ty::Dyn(t) if t == "FmtWrite")
+                        || matches!(self.zonk(&tt), Ty::Adt(..) | Ty::Param(_))
+                            && self.implements_user_trait(&tt, "FmtWrite"))
                 {
                     if args.len() > 1 {
                         self.format_args(&args[1..]);
@@ -10862,6 +10981,14 @@ impl Checker<'_> {
             }
             self.check(a, p);
         }
+        if !receiver && anchor_ty.is_some() {
+            self.note_ext_static_dicts(c, &self_ty, &method);
+        }
+        if !receiver
+            && let Some(t) = &anchor_ty
+        {
+            self.note_wrapper_static(c, t, &trait_name, &method, &self_ty);
+        }
         let local_trait = def.module.is_none();
         let r = self.range(c.syntax());
         // `T::money(&x)` on a `T` whose impls JS can't tell apart: by `T`'s class, as `x.money()`.
@@ -10919,7 +11046,7 @@ impl Checker<'_> {
     }
 
     /// `T`'s bounds and their supertraits, of this file.
-    fn bound_traits(&self, param: &str) -> Vec<String> {
+    pub(super) fn bound_traits(&self, param: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut todo: Vec<String> = match (self.param_bounds.get(param), param.rsplit_once("::")) {
             (Some(b), _) => b.clone(),
@@ -11022,7 +11149,7 @@ impl Checker<'_> {
         let Some((ty, m)) = f.split_once("::") else {
             return false;
         };
-        if ty != "Vec" && crate::adt::tuple_arity(ty).is_none() {
+        if ty != "Vec" && crate::adt::tuple_arity(ty).is_none() && !crate::adt::is_wrapper_key(ty) {
             return false;
         }
         let bare = self.adts.method(ty, m).is_some_and(|s| {
@@ -11071,7 +11198,12 @@ impl Checker<'_> {
             self.self_assoc_dicts.insert(a.to_string());
             return self.note_dict(p, node);
         }
-        if !self.try_note_dict(param) {
+        // (In a method with `self` of `impl<T> Tr for Vec<T>` or a tuple's: handed over by a
+        // caller that knows the value's type, `κσ.$callElem`.)
+        // (In an associated const of `impl<T> Tr for S<T>`: read off the class view it's read
+        // through, which carries `T`'s class, `this.$targs`.)
+        if !self.try_note_dict(param) && !self.elem_class(param) && !impl_const_param(node, param)
+        {
             self.error(
                 node,
                 format!("`{param}::..` on a type parameter of an `impl` isn't supported yet in methods with `self` of a trait or of `impl<T> S<Vec<T>>` (it works in a struct's or enum's `impl<T> S<T>`, on a function's or method's own type parameters, and in associated functions)"),
@@ -11116,7 +11248,7 @@ impl Checker<'_> {
             }
         }
         for tr in bounds.clone() {
-            self.twin_generic_call(c.syntax(), &tr, f);
+            self.twin_generic_call(c.syntax(), &tr, f, &pty);
         }
         // `T::from(x)` with `T: From<X>`.
         if f == "from" && self.param_has(param, "From") {
@@ -12296,4 +12428,16 @@ fn placeholder_at(fmt: &MacroArg, n: usize) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Whether `node` is in an associated const of an `impl` whose self type takes the type
+/// parameter `param` (`impl<T: Zero> Zero for Wrapping<T> { const ZERO: Self = Wrapping(T::ZERO); }`).
+fn impl_const_param(node: &SyntaxNode, param: &str) -> bool {
+    let Some(k) = node.ancestors().find_map(ast::Const::cast) else {
+        return false;
+    };
+    let Some(imp) = k.syntax().ancestors().find_map(ast::Impl::cast) else {
+        return false;
+    };
+    crate::adt::impl_type_param_pos(&imp, param).is_some()
 }

@@ -738,6 +738,12 @@
     "panic": null
   },
   {
+    "file": "dyn_write_sinks.rs",
+    "stdout": "a1-b[2]<3>(4)[5]!\n1 x\n2 y\nheld9\n1;2;\n24\n[\"q\", \"pq\"]\nroot\n  a\n    b\n  c\n19\n8\n  1\n  2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "dyn_writers.rs",
     "stdout": "n=1; doneline\nN=2; DONE\n[n=3; done]\na:(1, \"x\") b:2.5 /B:(1, \"X\") A:2.5 \n[x][y]| N=2; DONE[X][Y]|\n\"<x>!<y>!\"\n<z>!\n",
     "exitCode": 0,
@@ -1002,6 +1008,12 @@
     "panic": null
   },
   {
+    "file": "generic_trait_multi_impls.rs",
+    "stdout": "Meters(3.048)\nMeters(2.54)\n0.914\n0.076\nMeters(6.0) Meters(0.6096) Meters(0.5)\nMeters(8.0) Meters(18.0)\na#1 b@z\n[Meters(0.3048), Meters(0.254)]\n6 3\n9 [(\"gem\", 6), (\"ore\", 3)]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "generic_trait_twice.rs",
     "stdout": "51 307\nx3 = 120 | 40k | 20.0\n",
     "exitCode": 0,
@@ -1106,6 +1118,12 @@
   {
     "file": "impl_iter_fns.rs",
     "stdout": "[2, 4, 6] [1, 4, 9, 16]\n[3, 6, 9, 12]\n7\n20 60\n1 [\"a\"]\n2 [\"hi\", \"yo\"]\n3 [\"hey\"]\n165\n14 [1, 3, 5, 7, 9] [0, 2]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "impl_param_classes.rs",
+    "stdout": "[2, 2, 1, 2, 4, 3, 0, 3, 0, 4]\nVec<u16> Vec<u8> Vec<Vec<u8>>\n[2, 3, 0, 5] [0, 7, 1, 2, 6]\n0.5 0 Pair(0.5, 0.5) Pair(0, 0)\nUnit(1) Unit(1) 0 0.5\n[61, 233, 156, 237] [61, 24]\n",
     "exitCode": 0,
     "panic": null
   },
@@ -2454,6 +2472,12 @@
     "panic": null
   },
   {
+    "file": "twin_impls_generic.rs",
+    "stdout": "[20, 1, 97, 98, 10, 99, 100, 10, 97, 98, 40, 2, 7, 30, 7, 20, 1, 97, 98, 10, 101]\n[1, 97, 98, 2, 7, 1, 97, 98, 102, 1, 97, 98, 2, 7]\n[1, 97, 98, 2, 7, 1, 113, 2, 3]\n[\"String:ab\", \"str:g\", \"i32:5\"]\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
     "file": "type_aliases.rs",
     "stdout": ".../..#\n[(\"a\", 3), (\"b\", 1), (\"c\", 1)]\nRobot { at: (0, 1), facing: East, score: 2 }\n5 20\n0 true\n",
     "exitCode": 0,
@@ -2564,6 +2588,12 @@
   {
     "file": "where_fn_bounds.rs",
     "stdout": "3 s\n[10, 20, 30]\n[1, 2]\nOk(200) Err(\"fail 2\")\n[(0, [3, 6]), (1, [1, 4]), (2, [2, 5])]\n9 16 2\n",
+    "exitCode": 0,
+    "panic": null
+  },
+  {
+    "file": "wrapper_impls.rs",
+    "stdout": "&cat1 | &mut cat2 | box cat3 | &&i7\n&cat1 | cat1 | &cat1\n&cat1 | &cat1 | cat1 | i7\ncat1cat1\n[1, 9, 1, 9, 9, 2, 9, 1]\n",
     "exitCode": 0,
     "panic": null
   },

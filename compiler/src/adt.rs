@@ -1638,3 +1638,123 @@ pub fn attr_text(a: &ast::Attr) -> String {
         .map(|t| t.text().to_string())
         .collect()
 }
+
+/// The position of the impl's type parameter `param` among its self type's generic arguments
+/// (`impl<T> Tr for Wrapping<T>`: `T` is 0).
+pub fn impl_type_param_pos(imp: &ast::Impl, param: &str) -> Option<usize> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let declared = imp.generic_param_list()?.generic_params().any(|p| match p {
+        ast::GenericParam::TypeParam(tp) => tp.name().is_some_and(|n| n.text() == param),
+        _ => false,
+    });
+    if !declared {
+        return None;
+    }
+    let ast::Type::PathType(p) = imp.self_ty()? else {
+        return None;
+    };
+    p.path()?
+        .segment()?
+        .generic_arg_list()?
+        .generic_args()
+        .position(|a| a.syntax().text() == param)
+}
+
+/// `impl<T: Tr + ?Sized> Tr for &T` (or `&mut T`, `Box<T>`) whose methods do more than hand each
+/// call on to `T`'s: its class's key (`Tr$ref`, `Tr$refmut`, `Tr$box`) and `T`. A generic call
+/// whose `T` is a reference (`g(&x)` for `fn g<T: Tr>(t: T)`) reaches it by the class it passes
+/// (`κσ.$wrapT("ref", ..)`); references and boxes are erased otherwise.
+pub fn wrapper_impl(imp: &ast::Impl) -> Option<(String, String)> {
+    if !wrapping_impl(imp) || forwarding_impl(imp) {
+        return None;
+    }
+    let p = wrapped_param(imp)?;
+    if p.starts_with("dyn ") {
+        return None;
+    }
+    let tr = impl_parts(imp).0?;
+    let kind = match imp.self_ty()? {
+        ast::Type::RefType(r) if r.mut_token().is_some() => "refmut",
+        ast::Type::RefType(_) => "ref",
+        _ => "box",
+    };
+    Some((format!("{tr}${kind}"), p))
+}
+
+/// Whether `key` is a `wrapper_impl`'s class key.
+pub fn is_wrapper_key(key: &str) -> bool {
+    key.ends_with("$ref") || key.ends_with("$refmut") || key.ends_with("$box")
+}
+
+/// What a value of `t` looks like at run time, for telling a generic trait's impls apart by
+/// their arguments (`κσ.$argAlt`): None when it could be anything a sibling impl takes.
+fn run_kind(adts: &Adts, t: &Ty) -> Option<String> {
+    Some(match t {
+        Ty::Int(_) | Ty::Float { .. } | Ty::IntLit => "num".into(),
+        Ty::Str | Ty::Char => "str".into(),
+        Ty::Bool => "bool".into(),
+        Ty::Vec(_) => "array".into(),
+        Ty::Tuple(es) if !es.is_empty() => {
+            let ks: Vec<String> = es
+                .iter()
+                .map(|e| run_kind(adts, e).unwrap_or_else(|| "_".into()))
+                .collect();
+            format!("({})", ks.join(","))
+        }
+        // (A struct is an instance of its class; a field-less enum is a number.)
+        Ty::Adt(n, _) => match adts.defs.get(n) {
+            Some(d) if !d.is_enum => n.clone(),
+            Some(_) => return None,
+            None => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Whether two run kinds certainly differ (`_` inside a tuple matches anything).
+fn kinds_differ(a: &str, b: &str) -> bool {
+    match (a.strip_prefix('('), b.strip_prefix('(')) {
+        (Some(x), Some(y)) => {
+            let xs: Vec<&str> = x.trim_end_matches(')').split(',').collect();
+            let ys: Vec<&str> = y.trim_end_matches(')').split(',').collect();
+            xs.len() != ys.len()
+                || xs.iter().zip(&ys).any(|(p, q)| *p != "_" && *q != "_" && p != q)
+        }
+        _ => a != b,
+    }
+}
+
+impl Adts {
+    /// For a method that several impls of one generic trait give `ty` (`Scale<f64>` and
+    /// `Scale<Feet>` for `Meters`), each impl's key and parameter types, when every two of them
+    /// differ in a parameter whose values tell them apart at run time (a struct's class, a
+    /// number against a string, a tuple's length): a call through a type parameter or `dyn`
+    /// then reaches the right one through `κσ.$argAlt`. None otherwise.
+    pub fn alt_dispatch(&self, ty: &str, method: &str) -> Option<Vec<(String, Vec<Ty>)>> {
+        let k = format!("{ty}::{method}");
+        if self.inherent_alts.contains(&k) || tuple_arity(ty).is_some() {
+            return None;
+        }
+        let keys = self.method_alts.get(&k)?;
+        let sigs: Vec<(String, Vec<Ty>)> = keys
+            .iter()
+            .map(|alt| Some((alt.clone(), self.method(ty, alt)?.params.clone())))
+            .collect::<Option<_>>()?;
+        let kinds: Vec<Vec<Option<String>>> = sigs
+            .iter()
+            .map(|(_, ps)| ps.iter().map(|p| run_kind(self, p)).collect())
+            .collect();
+        for i in 0..kinds.len() {
+            for j in i + 1..kinds.len() {
+                let apart = kinds[i].iter().zip(&kinds[j]).any(|(a, b)| match (a, b) {
+                    (Some(a), Some(b)) => kinds_differ(a, b),
+                    _ => false,
+                });
+                if !apart && kinds[i].len() == kinds[j].len() {
+                    return None;
+                }
+            }
+        }
+        Some(sigs)
+    }
+}

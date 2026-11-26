@@ -246,7 +246,9 @@ function classifyFile(f) {
     let [cat, why] = classify(d.message, (L[i]||"").trim(), file);
     // A parse error on a line with a macro call is in that macro's expansion.
     if (cat === "PARSE" && /[\w:]+!\s*[\(\[\{]/.test(L[d.line-1] || "")) [cat, why] = ["LANG", "macro_rules expansion"];
-    return { cat, why, line: d.line, start: d.start, end: d.end, m: d.message.slice(0, 160) };
+    // (A bare "mismatched types" keeps its types in the label: `lb`, for the finer sort.)
+    const lb = d.message === "mismatched types" && d.label ? d.label + (/NS numbers/.test(d.help ?? "") ? " (NS numbers)" : "") : undefined;
+    return { cat, why, line: d.line, start: d.start, end: d.end, m: d.message.slice(0, 160), ...(lb ? { lb: lb.slice(0, 200) } : {}) };
   });
   const thread = THREAD_USE.test(src);
   return JSON.stringify({ f: path.relative(root, f), lines: L.length, ok: !!r.code, thread, ms, modLines, errs }) + "\n";

@@ -785,11 +785,13 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
                 continue;
             }
         }
-        // The matching `>`, with no `as` (`<T as Tr>::f` is another pass's) at the top level.
+        // The matching `>`, with no `as` (`<T as Tr>::f` is another pass's) at the top level, but
+        // for an associated const (`<P as Tr>::ZERO`, as `P::ZERO`).
         let mut depth = 0usize;
         let mut j = i + 1;
         let mut close = None;
         let mut nested_opens = Vec::new();
+        let mut as_at = None;
         while j < toks.len() {
             let t = at(j);
             match t {
@@ -804,6 +806,7 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
                     break;
                 }
                 ">" => depth -= 1,
+                "as" if depth == 0 && as_at.is_none() && j > i + 1 => as_at = Some(j),
                 ">>" | "->" | "=>" | ";" | "{" | "}" | "=" | "as" | "<<" | "<=" | ">=" => break,
                 _ => {}
             }
@@ -813,6 +816,29 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
             i += 1;
             continue;
         };
+        if let Some(a) = as_at {
+            // (In a macro's tokens `::` is two `:`.)
+            let kc = if at(c + 1) == "::" { c + 2 } else { c + 3 };
+            let konst = at(kc);
+            let const_like = colons(c + 1)
+                && toks.get(kc).is_some_and(|t| t.kind() == SyntaxKind::IDENT)
+                && konst.chars().any(|ch| ch.is_ascii_uppercase())
+                && konst.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+                && !matches!(at(kc + 1), "(" | "::" | "!" | ":");
+            let path_like = toks[i + 1].kind() == SyntaxKind::IDENT
+                && !(i + 1..a).any(|k| matches!(at(k), "!" | "(" | "[" | "&"));
+            if !const_like || !path_like {
+                i += 1;
+                continue;
+            }
+            edits.push((start(i), end(i), String::new()));
+            for o in nested_opens.into_iter().filter(|&o| o < a) {
+                edits.push((start(o), start(o), "::".to_string()));
+            }
+            edits.push((end(a - 1), end(c), String::new()));
+            i = c + 1;
+            continue;
+        }
         let first = at(i + 1);
         // `<(Comma)>::default()` (what `<Token![,]>` expands to): one parenthesized path, not a
         // tuple, is that path.

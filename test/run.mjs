@@ -1026,7 +1026,7 @@ const rejected = [
   ["a required trait const next to a default one", "}\ntrait T { const N: usize = 1; const M: usize; }\nstruct S;\nimpl T for S {}\nfn g() {", "5:12 not all trait items implemented, missing: `M`"],
   ["a trait const default of the wrong type", "}\ntrait T { const N: usize = \"x\"; }\nfn g() {", "3:28 mismatched types: expected `usize`, found `&str`"],
   ["get_or_insert on an immutable binding", "let o: Option<i32> = None;\n    *o.get_or_insert(1) += 1;", "3:6 cannot borrow `o` as mutable, as it is not declared as mutable"],
-  ["str and String impls called through a type parameter", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for str {\n    fn s(&self) -> usize {\n        1\n    }\n}\nimpl S for String {\n    fn s(&self) -> usize {\n        2\n    }\n}\nfn h<T: S + ?Sized>(t: &T) -> usize {\n    t.s()\n}\nfn g() {", "17:5 `S::s` can't be called through a type parameter or `dyn` here"],
+  ["str and String impls through a type parameter, an argument of either", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for str {\n    fn s(&self) -> usize {\n        1\n    }\n}\nimpl S for String {\n    fn s(&self) -> usize {\n        2\n    }\n}\nfn h<T: S + ?Sized>(t: &T) -> usize {\n    t.s()\n}\nfn k(v: Vec<String>) -> usize {\n    h(&v[0])\n}\nfn g() {", "20:7 can't tell whether `T` is a borrowed `str` / `[T]` or an owned `String` / `Vec<T>` here"],
   ["slice and Vec impls, a receiver of either", "}\ntrait S {\n    fn s(&self) -> usize;\n}\nimpl S for [u8] {\n    fn s(&self) -> usize {\n        self.len()\n    }\n}\nimpl S for Vec<u8> {\n    fn s(&self) -> usize {\n        self.len() + 1\n    }\n}\nfn h(v: Vec<Vec<u8>>) -> usize {\n    v[0].s()\n}\nfn g() {", "17:5 can't tell whether this receiver is a `[T]` or a `Vec<T>`"],
   ["an impl of a trait that isn't declared or loaded, on a built-in type", "}\nimpl Format for u8 {\n    fn format(&self) {}\n}\nfn g() {", "3:6 `impl Format for ..` is not supported"],
   ["TryFrom twice, neither taking the argument", "}\nstruct E(i32);\nimpl TryFrom<i32> for E {\n    type Error = ();\n    fn try_from(v: i32) -> Result<Self, ()> {\n        Ok(E(v))\n    }\n}\nimpl TryFrom<bool> for E {\n    type Error = ();\n    fn try_from(v: bool) -> Result<Self, ()> {\n        Ok(E(v as i32))\n    }\n}\nfn g() {\n    let _ = E::try_from(\"x\");", "17:25 mismatched types"],
@@ -1226,12 +1226,7 @@ const rejected = [
   ["a mismatch inside `u32::pow(..)`", "let x = u32::pow(2, \"a\");", "2:25 mismatched types: expected `u32`, found `&str`"],
   ["unzip of non-pairs","let v: (Vec<i32>, Vec<i32>) = vec![1, 2].into_iter().unzip();", "2:35 `unzip` needs an iterator of pairs"],
   ["returning a pointer to a number", "}\nfn g(p: *mut i32) -> *mut i32 {\n    p", "3:22 returning a raw pointer to a number, string or bool isn't supported"],
-  // Language gaps (PLAN): impls for `&T` / `Box<T>`, byte readers, const generics on traits.
-  [
-    "an impl for `Box<T>` that doesn't forward to `T`'s",
-    "}\ntrait T { fn a(&self) -> i32; }\nstruct S;\nimpl T for S { fn a(&self) -> i32 { 1 } }\nimpl<X: T> T for Box<X> { fn a(&self) -> i32 { (**self).a() + 1 } }\nfn f() {",
-    "6:18 an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl",
-  ],
+  // Language gaps (PLAN): byte readers, const generics on traits.
   [
     "a blanket impl of another file's trait",
     "}\nuse crate::io::Sink;\nimpl<T: Clone> Sink for T {}\nfn f() {",

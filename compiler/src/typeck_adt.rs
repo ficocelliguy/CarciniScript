@@ -1398,6 +1398,14 @@ impl Checker<'_> {
             .self_ty()
             .map(|t| t.syntax().clone())
             .unwrap_or_else(|| imp.syntax().clone());
+        // `impl<T: Tr> Tr for &T` doing more than `T`'s impl: a class of its own, reached by a
+        // generic call whose `T` is a reference (see `adt::wrapper_impl`).
+        if let Some((key, _)) = crate::adt::wrapper_impl(imp)
+            && trait_name.as_deref().is_some_and(|t| self.adts.traits.contains_key(t))
+        {
+            type_name = key;
+            self.adts.ext_types.insert(type_name.clone());
+        }
         // `impl<T: Display> Shout for T`: for every type meeting the bounds.
         if let Some((tr, param, bounds)) = crate::adt::blanket_impl(imp)
             && self.adts.traits.contains_key(&tr)
@@ -1442,7 +1450,7 @@ impl Checker<'_> {
             // `impl<T: Tr> Tr for &T` whose methods do more than call `T`'s: `&T` and `T` are
             // the same value in JS, so they can't have different impls.
             if crate::adt::wrapping_impl(imp) {
-                self.error(&node, "an impl for `&T` / `&mut T` / `Box<T>` must hand each method on to `T`'s impl (`(**self).method(args)`, overriding the default methods `T`'s impls override): references and boxes are erased in JS, so `&T` can't behave differently from `T`");
+                self.error(&node, "an impl for `&T` / `&mut T` / `Box<T>` of a trait not declared in this file must hand each method on to `T`'s impl (`(**self).method(args)`, overriding the default methods `T`'s impls override): references and boxes are erased in JS, so `&T` can't behave differently from `T` there");
                 return;
             }
             // `impl<T: Bound> Other for T` with `Other` from another file or crate: what any impl
@@ -1563,6 +1571,8 @@ impl Checker<'_> {
             Ty::Adt(_, args) => args.clone(),
             // A blanket impl's `T`: its associated functions take `T`'s class (as `this`).
             Ty::Param(p) if type_name.ends_with("$all") => vec![Ty::Param(p.clone())],
+            // (And a `&T` impl's: its methods take `T`'s class, `$elem`.)
+            Ty::Param(p) if crate::adt::is_wrapper_key(&type_name) => vec![Ty::Param(p.clone())],
             // `impl Total for HashMap<String, i64>` / `impl<T> Tr for Option<T>`.
             t => crate::adt::ext_args(t),
         };
@@ -2189,6 +2199,11 @@ impl Checker<'_> {
             {
                 type_name = format!("{tr}$all");
             }
+            if let Some((key, _)) = crate::adt::wrapper_impl(imp)
+                && self.adts.ext_types.contains(&key)
+            {
+                type_name = key;
+            }
             if !(self.adts.defs.contains_key(&type_name)
                 || self.adts.ext_types.contains(&type_name))
                 || trait_name.as_deref().is_some_and(|t| {
@@ -2416,7 +2431,41 @@ impl Checker<'_> {
                     let r = self.range(p.syntax());
                     self.array_reads.insert(r);
                 }
-                Some(self.adts.assoc_consts[&adt][&m].clone())
+                let t = self.adts.assoc_consts[&adt][&m].clone();
+                // (A generic impl's `const ZERO: Self`: `W<T>` with `T` fresh, or as written,
+                // `W::<f64>::ZERO`.)
+                let mut ps = Vec::new();
+                Self::params_in(&t, &mut ps);
+                ps.retain(|p| !self.generics.contains_key(p) && p != "Self");
+                if ps.is_empty() {
+                    return Some(t);
+                }
+                let m: HashMap<String, Ty> =
+                    ps.iter().map(|p| (p.clone(), self.fresh(VarKind::General))).collect();
+                let t = super::generic::subst(&t, &m);
+                if let Ty::Adt(a, args) = &t
+                    && *a == adt
+                {
+                    use ra_ap_syntax::ast::HasGenericArgs;
+                    let written: Vec<ast::Type> = p
+                        .path()
+                        .into_iter()
+                        .flat_map(|p| p.segments().collect::<Vec<_>>())
+                        .find(|s| s.name_ref().is_some_and(|n| n.text() == adt.as_str()))
+                        .and_then(|s| s.generic_arg_list())
+                        .into_iter()
+                        .flat_map(|l| l.generic_args())
+                        .filter_map(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .collect();
+                    for (a, w) in args.clone().iter().zip(&written) {
+                        let w = self.lower_type(w);
+                        self.unify(a, &w);
+                    }
+                }
+                Some(t)
             }
             Resolved::Assoc(adt, m) => match self.adts.method(&adt, &m).cloned() {
                 Some(method) => {
@@ -2948,6 +2997,7 @@ impl Checker<'_> {
             self.note_trait_call(m, adt, method, &Ty::Adt(adt.to_string(), targs.to_vec()));
             let own_params = sig.type_params.len();
             let declared = sig.ret.clone();
+            let raw_params = sig.params.clone();
             let sig = self.method_inst(&sig, Some(targs));
             if own_params > 0 {
                 let own = std::mem::take(&mut self.last_type_args);
@@ -2965,6 +3015,7 @@ impl Checker<'_> {
                 }
                 let r = self.range(m.syntax());
                 let caller = self.cur_fn.clone().unwrap_or_default();
+                self.note_twin_method_targs(r, adt, method, &raw_params, args);
                 self.generic_calls
                     .push((r, caller, format!("{adt}::{method}"), own));
             }

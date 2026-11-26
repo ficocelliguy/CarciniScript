@@ -79,8 +79,11 @@ const shape = (a, b) => {
   if (/^(String|&str|str|&'static str)$/.test(a) && /^(String|&str|str|&'static str)$/.test(b)) return "String vs &str";
   return "two unrelated named types";
 };
+// A bare "mismatched types" with its label (`lb`, from the classifier) put back as the checker
+// words it, `expected `X`, found `{integer}``: the label says "integer" and "floating-point number".
+const fullMessage = e => !e.lb ? e.m : `${e.m}: ${e.lb.replace(/(?<![`\w])integer(?![`\w])/g, "`{integer}`").replace(/floating-point number/g, "`{float}`")}`;
 function bucket(f, e) {
-  const m = e.m, t = e.node?.text || "", mac = inMacro(e) ? " [in a macro expansion]" : "";
+  const m = fullMessage(e), t = e.node?.text || "", mac = inMacro(e) ? " [in a macro expansion]" : "";
   let x;
   if ((x = m.match(/^no method named `(\w+)` found for (struct|enum|union) `(\w+)`/))) {
     const [, meth, , ty] = x;

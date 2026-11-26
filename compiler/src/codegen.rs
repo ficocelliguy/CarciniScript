@@ -998,6 +998,7 @@ fn compile_text(
         blanket_this: None,
         trait_const_args: HashMap::new(),
         param_consts: Default::default(),
+        tparam_consts: HashMap::new(),
         extra_consts: Vec::new(),
         ext_class: None,
         in_trait_default: false,
@@ -1199,6 +1200,11 @@ struct Codegen<'a> {
     /// U<P> { const PER: u128 = P * 1000; }`), by (type, name): getters read through a class
     /// view (`κσ.$cv(U, [7]).PER`).
     pub(super) param_consts: std::collections::HashSet<(String, String)>,
+    /// Associated consts whose value reads the impl's type parameters (`impl<T: Zero> Zero for
+    /// W<T> { const ZERO: Self = W(T::ZERO); }`), by (type, name): each parameter and its position
+    /// among the type's arguments. Getters read their classes off the class view they're read
+    /// through (`κσ.$tv(W, [cls]).ZERO`, `this.$targs`).
+    pub(super) tparam_consts: HashMap<(String, String), Vec<(String, usize)>>,
     /// Const values every method emitted next has in scope besides its own (a trait's const
     /// parameters in its default methods: `N` is `$N(this)`), as (name, JS, type).
     pub(super) extra_consts: Vec<(String, String, Ty)>,
@@ -1741,6 +1747,11 @@ impl<'a> Codegen<'a> {
                     }
                     _ => t,
                 };
+                // `impl<T: Tr> Tr for &T` doing more than `T`'s: `$ext$Tr$ref`.
+                let t = match crate::adt::wrapper_impl(imp) {
+                    Some((k, _)) if self.types.adts.ext_types.contains(&k) => k,
+                    _ => t,
+                };
                 // `impl Money for f64` goes into the `$ext$f64` class.
                 let t = match crate::adt::ext_key_any(&t) {
                     Some(k)
@@ -1798,6 +1809,11 @@ impl<'a> Codegen<'a> {
                     let blanket = crate::adt::blanket_impl(imp)
                         .map(|(tr, _, _)| format!("{tr}$all"))
                         .filter(|k| self.types.adts.ext_types.contains(k));
+                    let blanket = blanket.or_else(|| {
+                        crate::adt::wrapper_impl(imp)
+                            .map(|(k, _)| k)
+                            .filter(|k| self.types.adts.ext_types.contains(k))
+                    });
                     let key = blanket.or_else(|| {
                         crate::adt::impl_parts(imp)
                             .1
@@ -3784,6 +3800,26 @@ impl<'a> Codegen<'a> {
         }
         // A number into a `dyn Trait` with impls on two number types: tagged with its own.
         if let Some(k) = self.types.dyn_nums.get(&r) {
+            // A `String` or `Formatter` into a `dyn fmt::Write`: a writer over the place, so
+            // what's written lands in it.
+            if k == "$fmtWriter" {
+                let place = match strip_parens_expr(e) {
+                    ast::Expr::RefExpr(re) => re.expr().map(|p| self.emit_expr(&p, None).0),
+                    ast::Expr::PathExpr(_) | ast::Expr::FieldExpr(_) | ast::Expr::IndexExpr(_) => {
+                        Some(frag.clone())
+                    }
+                    _ => None,
+                };
+                let cell = match place {
+                    Some(p) => {
+                        let mut c = Frag::text("κσ.$cell(() => ");
+                        c.append(p.clone()).push(", ($v) => { ").append(p).push(" = $v; })");
+                        c
+                    }
+                    None => frag.wrap("[", "]"),
+                };
+                return (cell.wrap("κσ.$fmtWriter(", ")").at(start), ty);
+            }
             return (frag.wrap("κσ.$dynNum(", &format!(", \"{k}\")")).at(start), ty);
         }
         (frag.at(start), ty)
@@ -4453,13 +4489,7 @@ impl<'a> Codegen<'a> {
         }
         if let Some(r) = self.emit_adt_path(&segs, Some(&path)) {
             // An associated function as a value that takes classes (`Stack::<T>::make`): bound.
-            if let Some(tys) = self
-                .types
-                .dict_args
-                .get(&self.range_of(p.syntax()))
-                .cloned()
-            {
-                let mut ds: Vec<String> = tys.iter().map(|t| self.dict_of(t)).collect();
+            if let Some(mut ds) = self.dict_args_at(self.range_of(p.syntax())) {
                 ds.extend(
                     self.dbg_arg_frags(p.syntax())
                         .into_iter()
@@ -4507,6 +4537,12 @@ impl<'a> Codegen<'a> {
         }
         if let Some(r) = self.emit_jsvalue_path(&segs) {
             return r;
+        }
+        // `i32::ZERO`, `Tr::ZERO`: off `Self`'s class.
+        if let Some((t, k)) = self.types.const_paths.get(&self.range_of(p.syntax())).cloned() {
+            let ty = self.ty_of(p.syntax()).unwrap_or(Ty::Unknown);
+            let d = self.dict_of(&t);
+            return (Frag::text(format!("{d}.{}", escape_ident(&k))), ty);
         }
         if !self.type_errors {
             self.error(
@@ -5623,9 +5659,9 @@ impl<'a> Codegen<'a> {
             names.push(name);
         }
         let mut inner: Vec<Frag> = names.iter().map(|n| Frag::text(n.clone())).collect();
-        if let Some(tys) = self.types.dict_args.get(&self.range_of(node)).cloned() {
-            for t in &tys {
-                inner.push(Frag::text(self.dict_of(t)));
+        if let Some(ds) = self.dict_args_at(self.range_of(node)) {
+            for d in ds {
+                inner.push(Frag::text(d));
             }
         }
         inner.extend(self.dbg_arg_frags(node));
@@ -5703,14 +5739,9 @@ impl<'a> Codegen<'a> {
         self.view_args = self.view_params.get(name).cloned().unwrap_or_default();
         let mut args = self.emit_args(c.arg_list(), &params);
         // The classes a generic function takes for its `T::make()` calls.
-        if let Some(tys) = self
-            .types
-            .dict_args
-            .get(&self.range_of(c.syntax()))
-            .cloned()
-        {
-            for t in &tys {
-                args.push(Frag::text(self.dict_of(t)));
+        if let Some(ds) = self.dict_args_at(self.range_of(c.syntax())) {
+            for d in ds {
+                args.push(Frag::text(d));
             }
         }
         args.extend(self.dbg_arg_frags(c.syntax()));
@@ -5875,6 +5906,29 @@ impl<'a> Codegen<'a> {
             .unwrap_or_else(|| method.to_string())
     }
 
+    /// The classes a generic call `r` passes (`dict_args`), wrapped as `dict_owned` says: an owned
+    /// `String` / `Vec<T>`'s as `κσ.$ownT(..)` where its trait also has a `str` / `[T]` impl, a
+    /// reference's as `κσ.$wrapT("ref", ..)` where its trait has a `&T` impl of its own.
+    pub(super) fn dict_args_at(&self, r: (usize, usize)) -> Option<Vec<String>> {
+        let tys = self.types.dict_args.get(&r)?;
+        let owned = self.types.dict_owned.get(&r);
+        Some(
+            tys.iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut d = self.dict_of(t);
+                    for w in owned.and_then(|o| o.get(i)).into_iter().flatten() {
+                        d = match w.as_str() {
+                            "own" => format!("κσ.$ownT({d})"),
+                            k => format!("κσ.$wrapT($extRegs, \"{k}\", {d})"),
+                        };
+                    }
+                    d
+                })
+                .collect(),
+        )
+    }
+
     fn dict_of(&self, t: &Ty) -> String {
         let d = self.dict_of_own(t);
         let wrap = match t {
@@ -5973,7 +6027,13 @@ impl<'a> Codegen<'a> {
                     .filter_map(|&i| Some((i, self.dict_of(args.get(i)?))))
                     .collect();
                 let view = class_view(self.class(n), args, &stored);
-                self.static_view(n, args, view)
+                let view = self.static_view(n, args, view);
+                // (With its arguments' classes, for consts that read them: `tparam_consts`.)
+                if self.tparam_consts.keys().any(|(t, _)| t == n) && !args.is_empty() {
+                    let ds: Vec<String> = args.iter().map(|a| self.dict_of(a)).collect();
+                    return format!("κσ.$tv({view}, [{}])", ds.join(", "));
+                }
+                view
             }
             Ty::Param(p) if self.dict_scope.contains(p) => format!("${p}"),
             // (A trait default's copy in `$ext$i32`: `Self` is `i32`, so its `self / two`
@@ -6053,7 +6113,15 @@ impl<'a> Codegen<'a> {
             Ty::Coll(k, view) => {
                 use crate::ty::Coll;
                 let k = match k {
-                    Coll::FixedArray(_) => return self.dict_of_own(view),
+                    // (A `Vec`'s, whose `default()` makes `n` default elements: `Self::Seed::default()`
+                    // with `type Seed = [u8; 4]`.)
+                    Coll::FixedArray(n) => {
+                        let elem = match view.as_ref() {
+                            Ty::Vec(e) => self.dict_of(e),
+                            _ => "undefined".into(),
+                        };
+                        return format!("κσ.$arrT({n}, {elem})");
+                    }
                     Coll::VecDeque => "Deque",
                     Coll::BinaryHeap => "Heap",
                     Coll::BTreeMap => "BTreeMap",
@@ -6286,14 +6354,9 @@ impl<'a> Codegen<'a> {
                 return (out.at(self.off(c.syntax())), ty);
             }
             // (`T::select::<u8>(x)`: the classes and formatters its impls' bodies need.)
-            if let Some(tys) = self
-                .types
-                .dict_args
-                .get(&self.range_of(c.syntax()))
-                .cloned()
-            {
-                for t in &tys {
-                    args.push(Frag::text(self.dict_of(t)));
+            if let Some(ds) = self.dict_args_at(self.range_of(c.syntax())) {
+                for d in ds {
+                    args.push(Frag::text(d));
                 }
             }
             args.extend(self.dbg_arg_frags(c.syntax()));
@@ -6326,7 +6389,13 @@ impl<'a> Codegen<'a> {
                     return (f, ty);
                 }
                 Some(crate::adt::Conv::Ext { key }) if !q.receiver => {
-                    let args = self.emit_args(c.arg_list(), &[]);
+                    let mut args = self.emit_args(c.arg_list(), &[]);
+                    // (`<Vec<u16> as Codec>::name()`: the classes its body needs.)
+                    if let Some(ds) = self.dict_args_at(self.range_of(c.syntax())) {
+                        for d in ds {
+                            args.push(Frag::text(d));
+                        }
+                    }
                     let mut out = Frag::mapped(
                         self.off(c.syntax()),
                         format!("$ext${key}.{}(", adt_gen::prop(&self.twin_key(c.syntax(), &q.method))),
@@ -6571,7 +6640,13 @@ impl<'a> Codegen<'a> {
                 let sig = self.types.adts.method(&key, f).cloned();
                 let params = sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
                 let ret = sig.map(|s| s.ret).unwrap_or(Ty::Unknown);
-                let args = self.emit_args(c.arg_list(), &params);
+                let mut args = self.emit_args(c.arg_list(), &params);
+                // (The classes its body needs: `T::name()` in `impl<T> Tr for Vec<T>`.)
+                if let Some(ds) = self.dict_args_at(self.range_of(c.syntax())) {
+                    for d in ds {
+                        args.push(Frag::text(d));
+                    }
+                }
                 let mut out = Frag::mapped(
                     self.off(c.syntax()),
                     format!("$ext${key}.{}(", adt_gen::prop(&self.twin_key(c.syntax(), f))),
@@ -6810,14 +6885,9 @@ impl<'a> Codegen<'a> {
         let mut args = self.emit_args(m.arg_list(), &[]);
         // The classes for the method's own type parameters (`t.visit::<u8>()`, `E::kind()` in
         // the impl or the trait's default).
-        if let Some(tys) = self
-            .types
-            .dict_args
-            .get(&self.range_of(m.syntax()))
-            .cloned()
-        {
-            for t in &tys {
-                args.push(Frag::text(self.dict_of(t)));
+        if let Some(ds) = self.dict_args_at(self.range_of(m.syntax())) {
+            for d in ds {
+                args.push(Frag::text(d));
             }
         }
         args.extend(self.dbg_arg_frags(m.syntax()));
@@ -7007,7 +7077,12 @@ impl<'a> Codegen<'a> {
         if !matches!(local.ty, Ty::Param(_)) {
             return None;
         }
-        local.js.strip_suffix("[0]").map(str::to_string)
+        // (A writer taken by value, `mut w: W`: a cell over the local.)
+        Some(match local.js.strip_suffix("[0]") {
+            Some(cell) => cell.to_string(),
+            None if local.js != "this" => format!("κσ.$cell(() => {0}, ($v) => {{ {0} = $v; }})", local.js),
+            None => return None,
+        })
     }
 
     /// `v[a..b].sort()` and the other in-place slice methods on a range of a Vec.

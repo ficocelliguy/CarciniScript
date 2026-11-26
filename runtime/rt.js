@@ -345,6 +345,7 @@
       return typeof this.v === "number" ? fmtF(this.v) : String(this.v);
     }
     $dbg() {
+      if (this.k === "$own") return rt.$dbgAny(this.v);
       return this.k === "f32" || this.k === "f64" ? dbgF(this.v) : String(this.v);
     }
   }
@@ -3037,7 +3038,7 @@
       // (Through a cell over its value, written back.)
       if (x instanceof DynNum) {
         const cell = [x.v];
-        const r = rt.$dcallMutT(regs, { kind: x.k }, cell, name, ...args);
+        const r = rt.$dcallMutT(regs, { kind: x.k, own: x.k === "$own" }, cell, name, ...args);
         x.v = cell[0];
         return r;
       }
@@ -3065,7 +3066,7 @@
       return rt.$dcall(regs, x, name, ...args);
     },
     $dcall(regs, x, name, ...args) {
-      if (x instanceof DynNum) return rt.$dcallT(regs, { kind: x.k }, x.v, name, ...args);
+      if (x instanceof DynNum) return rt.$dcallT(regs, { kind: x.k, own: x.k === "$own" }, x.v, name, ...args);
       // (A range value is an `Iter` over a `RangeIt`: your `Range` impls before its own methods.)
       if (x instanceof Iter && x.it instanceof RangeIt) {
         for (const r of regs.kinds[x.it.kind] ?? []) {
@@ -4222,6 +4223,17 @@
       if (w !== null && typeof w === "object" && typeof w[method] === "function") return w[method](s);
       return rt.$write(w, s, false);
     },
+    // A `String` or `Formatter` as a `&mut dyn fmt::Write` (a struct field, a closure's
+    // parameter, a `Box`): a writer whose methods write into the cell `c` over it.
+    $fmtWriter(c) {
+      const put = (s) => rt.$fmtWriteCall(c, "", s);
+      return {
+        write_str: put,
+        write_char: put,
+        write_fmt: put,
+        __write_str: put,
+      };
+    },
     // Awaiting a hand-written future (`impl Future for X`, whose class's `then` calls this):
     // poll it with a context from `mkCx` (the task prelude's `__task_context`), and after each
     // `Pending` wait until its waker is woken (a future that never wakes it never finishes).
@@ -5032,6 +5044,13 @@
       rt.$replace(a, value);
       return old;
     },
+    // A generic type's class with its type arguments' classes (`W::<f64>` as `T`): its consts that
+    // read them (`const ZERO: Self = W(T::ZERO);`) read `this.$targs`.
+    $tv(cls, targs) {
+      const view = Object.create(cls);
+      view.$targs = targs;
+      return view;
+    },
     // A struct's class with its const generic arguments (`Buf::<4>` as `T`, or for
     // `Default::default()`): its associated functions read them as `this.$cargs`.
     $cv(cls, args) {
@@ -5095,6 +5114,11 @@
         }),
       ),
     },
+    // A fixed-size array's class (`[u8; 4]`): a `Vec`'s, whose `default()` has `n` elements.
+    $arrT(n, elem) {
+      const d = elem === undefined ? rt.$prims.vec : rt.$withElem(rt.$prims.vec, elem);
+      return { ...d, len: n, default: () => Array.from({ length: n }, () => elem?.default?.()) };
+    },
     // A `Vec<T>`'s or `Option<T>`'s class with `T`'s (`impl<T> S<Vec<T>>` reads it as `.elem`).
     $withElem(prim, elem) {
       return { ...prim, elem };
@@ -5117,6 +5141,48 @@
       }
       return o;
     },
+    // A reference's (or box's) class passed for a `T` (`g(&x)` for `fn g<T: Tr>(t: T)`), whose
+    // trait has an impl for `&T` that does more than `T`'s: `wrap` is `ref`, `refmut` or `box`,
+    // `elem` the referent's class. Its associated functions are the `&T` impl's (handed the
+    // referent's class where `$wrapReg` says), else the referent's.
+    $wrapT(regs, kind, inner) {
+      const o = Object.create(inner ?? null);
+      o.wrap = kind;
+      o.elem = inner;
+      for (const { cls, statics } of regs.wraps?.[kind] ?? []) {
+        for (const [k, n] of Object.entries(statics)) {
+          o[k] = (...a) => {
+            const out = a.slice(0, n);
+            out.push(inner);
+            return cls[k](...out);
+          };
+        }
+      }
+      return o;
+    },
+    $wrapReg(regs, kind, cls, statics) {
+      ((regs.wraps ??= {})[kind] ??= []).push({ cls, statics: statics ?? {} });
+    },
+    // `x.f()` through a reference's class: the `&T` impl's method, handed the referent's class
+    // (`(**self).f()` in it goes by that), else the referent's impl.
+    $wrapCall(regs, cls, x, name, args) {
+      const w = (regs.wraps?.[cls.wrap] ?? []).find((r) => typeof r.cls.prototype[name] === "function");
+      if (w) return rt.$callElem(cls.elem, w.cls.prototype[name], x, ...args);
+      return rt.$dcallT(regs, cls.elem, x, name, ...args);
+    },
+    // An owned `String`'s or `Vec<T>`'s class `d` passed for a `T` whose trait also has a `str` /
+    // `[T]` impl (one type in JS): `own` makes `$dcallT` take the owned impl's methods (`m$own`),
+    // and its associated functions are the owned impl's (`T::tag()`).
+    $ownT(d) {
+      const o = { ...d, own: true };
+      for (const k of Object.keys(d)) if (k.endsWith("$own")) o[k.slice(0, -4)] = d[k];
+      return o;
+    },
+    // The registered impl with an owned twin of `name` (`name$own`) for the string or array `x`.
+    $ownImpl(regs, x, name) {
+      const kind = Array.isArray(x) ? "array" : typeof x;
+      return (regs.kinds[kind] ?? []).find((r) => typeof r.cls.prototype[name + "$own"] === "function") ?? null;
+    },
     // A tuple's class: its length, and its elements' classes as `elem` (for a tuple impl's
     // methods, see `$dcallT`).
     $tupT(elem) {
@@ -5135,6 +5201,22 @@
         }
       }
       return name;
+    },
+    // Several impls of one generic trait for one type (`Scale<f64>` and `Scale<Feet>` for
+    // `Meters`), whose methods are `name`, `name$1`, ..: `P[name]` becomes a dispatcher to the
+    // impl whose parameter classes (`table()`: `[key, [class or null per parameter]]`) the
+    // arguments fit, for calls through a type parameter or `dyn` (a whole number reaches an
+    // integer impl before a float one, as in `$tupAlt`).
+    $altDispatch(P, name, table) {
+      const first = P[name];
+      let t = null;
+      P[name] = function (...a) {
+        t ??= table().map(([k, ds]) => [k === name ? first : P[k], ds]);
+        for (const strict of [true, false]) {
+          for (const [f, ds] of t) if (ds.every((d, i) => rt.$valueFits(d, a[i], strict))) return f.call(this, ...a);
+        }
+        return (first ?? t[0][0]).call(this, ...a);
+      };
     },
     // Whether an impl's element class `d` (`null`: a type parameter) is the class `c` passed for
     // the element (`undefined` when the caller had none).
@@ -5197,6 +5279,11 @@
     // class says which impl (a whole `f64` would otherwise reach the integer impl).
     // The same for a `&mut self` method, with the receiver's cell `c` (`$dcallMut`).
     $dcallMutT(regs, cls, c, name, ...args) {
+      if (cls?.wrap) return rt.$wrapCall(regs, cls, c[0], name, args);
+      if (cls?.own) {
+        const r = rt.$ownImpl(regs, c[0], name);
+        if (r) return r.cls.prototype[name + "$own"].call(r.cls.$mut?.has(name + "$own") ? c : c[0], ...args);
+      }
       const kind = cls?.kind;
       const x = c[0];
       const arr = rt.$arrayImpl(regs, cls, name);
@@ -5214,6 +5301,11 @@
       return rt.$dcallMut(regs, c, name, ...args);
     },
     $dcallT(regs, cls, x, name, ...args) {
+      if (cls?.wrap) return rt.$wrapCall(regs, cls, x, name, args);
+      if (cls?.own) {
+        const r = rt.$ownImpl(regs, x, name);
+        if (r) return r.cls.prototype[name + "$own"].call(x, ...args);
+      }
       // (An `Option`'s class: its impl, whatever the value, handed the element's class.)
       if (cls?.opt) {
         for (const r of regs.kinds.option ?? []) {

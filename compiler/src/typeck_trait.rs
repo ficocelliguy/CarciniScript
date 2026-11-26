@@ -1106,6 +1106,9 @@ impl Checker<'_> {
         args: &[ast::Expr],
     ) -> Ty {
         let mut sub: HashMap<String, Ty> = [("Self".to_string(), self_ty.clone())].into();
+        if let Some(extra) = self.where_sub.take() {
+            sub.extend(extra);
+        }
         // Through `S: Shape` / `C: Convert<String>`: `Shape::Unit` is `S::Unit` (or the bound's
         // `Unit = f64`), `Convert::T` the bound's argument.
         if let Ty::Param(p) = &self_ty
@@ -1116,7 +1119,7 @@ impl Checker<'_> {
         if let Some(name) = m.name_ref()
             && let Some((owner, _)) = self.trait_method_of(tr, name.text().as_ref())
         {
-            self.twin_generic_call(m.syntax(), &owner, name.text().as_ref());
+            self.twin_generic_call(m.syntax(), &owner, name.text().as_ref(), &self_ty);
         }
         let sig = subst_method(&sig, &sub);
         // The method's own type parameters (`fn fold_with<F>`): fresh at each call.
