@@ -602,7 +602,9 @@ pub fn disjoint_args(a: &Ty, b: &Ty) -> bool {
 /// `[String, i64]`), matched against a receiver's.
 pub fn ext_args(t: &Ty) -> Vec<Ty> {
     match t {
-        Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Range(e, _) => vec![(**e).clone()],
+        Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Range(e, _)
+        // (`impl<T: Tr> Tr for Cell<T>` / `RefCell<T>`.)
+        | Ty::RefCell(e) => vec![(**e).clone()],
         Ty::Map(k, v) | Ty::Result(k, v) => vec![(**k).clone(), (**v).clone()],
         Ty::Coll(_, view) => ext_args(view),
         Ty::Tuple(es) => es.clone(),

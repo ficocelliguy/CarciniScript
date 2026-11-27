@@ -651,6 +651,7 @@ impl Checker<'_> {
                 self.record_bound_args(&name, &lists);
             }
         }
+        self.record_concrete_borrow_bounds(f.where_clause());
         self.note_where_projections(f.where_clause());
         params
     }
@@ -738,7 +739,7 @@ impl Checker<'_> {
                 {
                     let x = self.lower_type(&t);
                     if tr == "Borrow" {
-                        self.borrow_args.insert(name.to_string(), x);
+                        self.borrow_args.push((Ty::Param(name.to_string()), x));
                     } else if tr == "From" {
                         self.from_args.insert(name.to_string(), x);
                     } else {
@@ -750,6 +751,34 @@ impl Checker<'_> {
                             .push(x);
                         self.lenient_projs.insert(format!("{name}::Error"));
                     }
+                }
+            }
+        }
+    }
+
+    /// `where String: Borrow<Q>` (a concrete type, not a parameter, as the subject): a map of
+    /// `String` keys is looked up by a `&Q` (`self.map.get(q)`).
+    pub(super) fn record_concrete_borrow_bounds(&mut self, wc: Option<ast::WhereClause>) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        for pred in wc.into_iter().flat_map(|w| w.predicates()) {
+            let Some(subject) = pred.ty() else { continue };
+            if let ast::Type::PathType(pt) = &subject
+                && let Some(n) = pt.path().and_then(|p| p.as_single_name_ref())
+                && matches!(self.generics.get(&n.text().to_string()), Some(Ty::Param(_)))
+            {
+                continue;
+            }
+            for b in pred.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
+                if let Some(ast::Type::PathType(pt)) = b.ty()
+                    && let Some(seg) = pt.path().and_then(|p| p.segment())
+                    && seg.name_ref().is_some_and(|n| n.text() == "Borrow")
+                    && let Some(ast::GenericArg::TypeArg(ta)) =
+                        seg.generic_arg_list().and_then(|l| l.generic_args().next())
+                    && let Some(t) = ta.ty()
+                {
+                    let k = self.lower_type(&subject);
+                    let q = self.lower_type(&t);
+                    self.borrow_args.push((k, q));
                 }
             }
         }
@@ -1426,15 +1455,19 @@ impl Checker<'_> {
                     .any(|k| self.adts.inherent_alts.contains(&format!("{k}::{}", tm.name)))
             })
         });
-        // And with a generic `impl<T: Tr> Tr for Vec<T>`: its methods may need `T`'s class, which
-        // only a caller that knows the `Vec`'s type has (`κσ.$callElem`).
-        let generic_vec = self.adts.traits.get(b).is_some_and(|d| {
-            d.methods.iter().any(|tm| {
-                self.adts.method("Vec", &tm.name).is_some_and(|s| {
-                    s.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+        // And with a generic `impl<T: Tr> Tr for Vec<T>` (or `Cell<T>` / `RefCell<T>`): its
+        // methods may need `T`'s class, which only a caller that knows the value's type has
+        // (`κσ.$callElem`).
+        let generic_vec = ["Vec", "RefCell"].iter().any(|k| {
+            has(k)
+                && self.adts.traits.get(b).is_some_and(|d| {
+                    d.methods.iter().any(|tm| {
+                        self.adts.method(k, &tm.name).is_some_and(|s| {
+                            s.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                        })
+                    })
                 })
-            })
-        }) && has("Vec");
+        });
         let arrays = array_impls || tuple_alts || generic_vec;
         // And with impls on `str` and `String` (or `[T]` and `Vec<T>`) that differ: one type in JS.
         let twins = self.twin_trait(b);

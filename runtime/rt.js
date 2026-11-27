@@ -5603,6 +5603,7 @@
       char: { default: () => "\0", from_str: (s) => rt.$parseChar(s), dbg: (c) => rt.$dbgChar(c) },
       vec: { default: () => [], from_iter: (it) => Array.from(it), vec: true },
       option: { default: () => null, opt: true },
+      refcell: { refcell: true },
       unit: { default: () => undefined },
       // (Collections: `C::default()`, and `collect()` into a `C: FromIterator<T>`.)
       ...Object.fromEntries(
@@ -5826,6 +5827,13 @@
       // (An `Option`'s class: its impl, whatever the value, handed the element's class.)
       if (cls?.opt) {
         for (const r of regs.kinds.option ?? []) {
+          const f = r.cls.prototype[name];
+          if (typeof f === "function") return r.cls.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
+        }
+      }
+      // (A `Cell<T>`'s or `RefCell<T>`'s: its impl, handed the element's class.)
+      if (cls?.refcell && x instanceof RefCell) {
+        for (const r of regs.kinds.refcell ?? []) {
           const f = r.cls.prototype[name];
           if (typeof f === "function") return r.cls.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
         }

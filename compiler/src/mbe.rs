@@ -1298,7 +1298,14 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
             Some("=") => matches!(before(2), Some("=" | "!" | "<" | ">")),
             b => matches!(b, Some("<" | ">" | "&" | "|" | "in" | "if" | "while" | "match")),
         };
-        ty && !compared
+        // A loop's, `if`'s or `match`'s block (`for i in 0..$len { arr[i] = 1; }`): no struct
+        // literal stands bare in those heads.
+        let in_head = t[..j]
+            .iter()
+            .rev()
+            .take_while(|x| text(x) != Some(";") && !matches!(x, Tpl::Group(o, ..) if o == "{"))
+            .any(|x| matches!(text(x), Some("in" | "if" | "while" | "match")));
+        ty && !compared && !in_head
     }
     fn rename(t: &[Tpl], names: &[String], n: usize, braces: bool, fields: bool) -> Vec<Tpl> {
         let mut out = Vec::with_capacity(t.len());
@@ -1310,7 +1317,7 @@ fn hygienic(t: &[Tpl], n: usize) -> Vec<Tpl> {
                 && fields
                 && names.contains(s)
                 && matches!(prev, None | Some(","))
-                && matches!(next, None | Some(","))
+                && (i + 1 == t.len() || next == Some(","))
             {
                 out.push(x.clone());
                 out.push(Tpl::Tok(":".into(), false));
@@ -2624,6 +2631,10 @@ pub fn preprocess_with(
     if crate::alias::has_aliases(&text) {
         crate::alias::expand(&mut text, &mut map);
         changed = true;
+    }
+    // (Before `<S as Tr>::ID` becomes `S::ID`: an inherent `ID` beside the trait's is `ID__self`.)
+    if crate::const_shadow::has_shadowed_consts(&text) {
+        changed |= crate::const_shadow::expand(&mut text, &mut map);
     }
     // (`<u8>::max(a, b)` is `u8::max(a, b)`, for the next one.)
     if crate::ufcs::has_type_anchors(&text) {

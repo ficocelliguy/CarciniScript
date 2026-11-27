@@ -31,6 +31,7 @@ mod modclash;
 mod modflat;
 mod moves;
 mod nav;
+mod const_shadow;
 mod inst_consts;
 mod nested;
 mod opmethods;

@@ -893,7 +893,9 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
                 && konst.chars().any(|ch| ch.is_ascii_uppercase())
                 && konst.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
                 && !matches!(at(kc + 1), "(" | "::" | "!" | ":");
-            let path_like = toks[i + 1].kind() == SyntaxKind::IDENT
+            // (`<Self as Tr>::ID` too: the trait's const, as `Self::ID` reads it.)
+            let path_like = (toks[i + 1].kind() == SyntaxKind::IDENT
+                || (at(i + 1) == "Self" && a == i + 2))
                 && !(i + 1..a).any(|k| matches!(at(k), "!" | "(" | "[" | "&"));
             if !const_like || !path_like {
                 i += 1;

@@ -354,6 +354,9 @@ pub fn expand_use_renames(text: &mut String, map: &mut OffsetMap) -> bool {
                 || path.len() < 2
                 || path.last() == Some(&r)
                 || !matches!(path[0].as_str(), "std" | "core" | "alloc")
+                // (`use std::fmt::Write as FmtWrite;`: the bundled renames already wrote its
+                // uses as the prelude's `FmtWrite`.)
+                || crate::bundled::renamed_item(&path).is_some()
             {
                 continue;
             }

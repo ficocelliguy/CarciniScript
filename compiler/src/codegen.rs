@@ -4567,7 +4567,15 @@ impl<'a> Codegen<'a> {
         // `i32::ZERO`, `Tr::ZERO`: off `Self`'s class.
         if let Some((t, k)) = self.types.const_paths.get(&self.range_of(p.syntax())).cloned() {
             let ty = self.ty_of(p.syntax()).unwrap_or(Ty::Unknown);
-            let d = self.dict_of(&t);
+            let mut d = self.dict_of(&t);
+            // (`Vec::<u8>::SIZE`, `<Cell<u8> as Tr>::SIZE`: off the impl class, `$ext$Vec`.)
+            if d == "undefined"
+                && let [.., owner, _] = segs.as_slice()
+                && let Some(key) = crate::adt::ext_key(owner)
+                    .filter(|key| self.types.adts.ext_types.contains(*key))
+            {
+                d = format!("$ext${key}");
+            }
             return (Frag::text(format!("{d}.{}", escape_ident(&k))), ty);
         }
         if !self.type_errors {
@@ -6108,8 +6116,13 @@ impl<'a> Codegen<'a> {
                 }
             }
             // (With the element's class when it has one, for `impl<T> S<Vec<T>>`.)
-            Ty::Vec(e) | Ty::Option(e) => {
-                let prim = if matches!(t, Ty::Vec(_)) { "vec" } else { "option" };
+            // (And a `Cell<T>`'s / `RefCell<T>`'s, for `impl<T: Tr> Tr for Cell<T>`.)
+            Ty::Vec(e) | Ty::Option(e) | Ty::RefCell(e) => {
+                let prim = match t {
+                    Ty::Vec(_) => "vec",
+                    Ty::Option(_) => "option",
+                    _ => "refcell",
+                };
                 let d = match self.dict_of(e) {
                     d if d == "undefined" => format!("κσ.$prims.{prim}"),
                     d => format!("κσ.$withElem(κσ.$prims.{prim}, {d})"),
@@ -6134,7 +6147,17 @@ impl<'a> Codegen<'a> {
             // (`()`: `N::default()` for `Graph::<(), u32>::from_edges`'s new nodes.)
             Ty::Unit => "κσ.$prims.unit".into(),
             // (Collections: `C::default()`, and `collect()` into a `C: FromIterator<T>`.)
-            Ty::Map(..) => "κσ.$prims.Map".into(),
+            // (With your impls' associated functions and consts, handed the key's and value's
+            // classes: `K::name()` in `impl<K, V> Tr for HashMap<K, V>`, called through `T`.)
+            Ty::Map(k, v) => match crate::adt::ext_key_of(t)
+                .filter(|key| self.types.adts.ext_types.contains(*key))
+            {
+                Some(key) => {
+                    let view = format!("κσ.$withStatics(κσ.$prims.Map, $ext${key})");
+                    self.static_view(key, &[(**k).clone(), (**v).clone()], view)
+                }
+                None => "κσ.$prims.Map".into(),
+            },
             Ty::Set(_) => "κσ.$prims.Set".into(),
             Ty::Coll(k, view) => {
                 use crate::ty::Coll;
@@ -7605,7 +7628,7 @@ impl<'a> Codegen<'a> {
             // `Vec`'s or tuple's alike.)
             let elem = if self.types.elem_methods.contains(&format!("{key}::{method}")) {
                 match &rt {
-                    Ty::Option(e) | Ty::Vec(e) => Some(self.dict_of(e)),
+                    Ty::Option(e) | Ty::Vec(e) | Ty::RefCell(e) => Some(self.dict_of(e)),
                     Ty::Tuple(es) => Some(format!(
                         "[{}]",
                         es.iter().map(|e| self.dict_of(e)).collect::<Vec<_>>().join(", ")

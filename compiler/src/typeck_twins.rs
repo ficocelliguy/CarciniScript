@@ -732,9 +732,8 @@ impl Checker<'_> {
             return;
         };
         let elems: Vec<Ty> = match self_ty {
-            Ty::Vec(e) | Ty::Option(e) => vec![(**e).clone()],
-            Ty::Tuple(es) => es.clone(),
-            _ => Vec::new(),
+            // (`Vec`, `Option`, tuples, `Cell` / `RefCell`, maps.)
+            t => crate::adt::ext_args(t),
         };
         let mut targs: Vec<Ty> = Vec::new();
         for (j, n) in names.iter().enumerate() {

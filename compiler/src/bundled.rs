@@ -3665,3 +3665,16 @@ fn chrono_tz_zones(file: &SourceFile, edits: &mut Vec<(TextRange, String)>) {
         }
     }
 }
+
+/// The prelude's name for a renamed std or crate item a `use` path names (`std::fmt::Write` is
+/// `FmtWrite`, `std::io::Write` `IoWrite`).
+pub(crate) fn renamed_item(path: &[String]) -> Option<&'static str> {
+    let (last, prefix) = path.split_last()?;
+    let prefix = prefix.join("::");
+    ALL_RENAMES
+        .iter()
+        .filter(|r| r.roots.iter().any(|root| root.trim_start_matches("::") == prefix))
+        .flat_map(|r| r.names.iter())
+        .find(|(from, _)| from == last)
+        .map(|(_, to)| *to)
+}

@@ -365,22 +365,20 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   `Iter` type. The known JS-representation limit, now with the shapes libraries actually write.
   Probes `agentB/c5d_*.rs`, `c6b_*.rs`, `c1c_*.rs`, `c11b_*.rs`, `c3_*.rs`, `c7_*.rs`, `c8_*.rs`,
   `agentD/q9c_box_rc_static.rs`. About 45 files, 7 flips. Importance: medium.
-- [ ] **An inherent `const` with the same name as a trait-impl `const` on the same type is a
-  "duplicate definitions".** Both are static getters on the one JS class, so one needs another
-  name that `S::ID` (the inherent one) and `<S as Tr>::ID` / `T::ID` (the trait's) resolve to.
-  Same-named methods work in either order since 2026-11-27 (`fixtures/inherent_shadows_trait.rs`).
-  Probes `agentB/c12b_inherent_shadow_simple.rs`, `mine/m13_inherent_shadow.rs` (methods, now
-  OK). Part of 5 files (icu_locale_core, gimli, jiff-core). Importance: low to medium.
-- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** `T::f()` inside
-  `impl<T: Tr> Tr for Cell<T>` / `RefCell<T>` / `HashMap<K, V, S>` and blanket `impl<Z: Tr> Tr2
-  for Z` (10 files; `Vec<T>` / `Option<T>` / `Box<T>` work); `where &'a I: IntoIterator` and
-  `for<'a> &'a I: BitAnd<&'a I>` bounds (strsim, num-integer); bounds placed in a method's `where`
-  on the impl's params plus `L::IntoIter` in the return type (either, 21 errors); `H::Item:
-  IntoIterator` (itertools, 3 files); `T::clone(x)` by path; `Trait::f(args)` with `Self`
+- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** `K::f()` in a
+  method with `self` of `impl<K: Tr, V: Tr> Tr for HashMap<K, V>` (rejected; associated functions,
+  and `Cell<T>` / `RefCell<T>` impls in both, work since 2026-11-27:
+  `fixtures/cell_impl_param_calls.rs`); a blanket `impl<Z: Tr> Tr2 for Z` reached through
+  `<Cell<u8>>::f()` ("no function .. found for struct `Cell`"; `<Vec<u8>>::f()` works); `const
+  SIZE: usize = T::SIZE` in an impl for a built-in generic type (`Vec<T>`, `Cell<T>`: "cannot
+  find value `T::SIZE`"); `<Rc<u8>>::f()` / `<Box<u8>>::f()` with `impl<T: Tr> Tr for Rc<T>`;
+  `where &'a I: IntoIterator` and `for<'a> &'a I: BitAnd<&'a I>` bounds (strsim, num-integer);
+  bounds placed in a method's `where` on the impl's params plus `L::IntoIter` in the return
+  type (either, 21 errors);
+  `H::Item: IntoIterator` (itertools, 3 files); `T::clone(x)` by path; `Trait::f(args)` with `Self`
   inferred from the expected type (3 files); `>>` on the param of a blanket impl; `where
   Concrete: Add<A>` and `where Ident: PartialEq<I>` (syn, 3 flips); `where Self: PartialEq` on a
-  trait default method; bounds on projections (`<T as Shr<u32>>::Output: PartialEq<T>`); `use
-  std::fmt::Write as FmtWrite` then `W: FmtWrite` ("bound not supported on type parameters");
+  trait default method; bounds on projections (`<T as Shr<u32>>::Output: PartialEq<T>`);
   `.fmt(f)` / `.len()` through a std supertrait of a same-file trait. Probes in `agentD/q6*`,
   `q9*`, `q10*`, `q12*`, `q15*`, `q19*`, `q20*` and `agentC/q15`, `q19`–`q22`. About 30 files, 8
   flips. Importance: medium; each shape is small, the family is large.
@@ -390,8 +388,7 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   derive bounded on it, `TypeId` fields are `Copy` / `Hash` / `Ord`, `dyn Any` is `Debug`; and
   `#[cfg_attr(not(feature = "x"), derive(..))]` applies, with features off, as rustc builds a lone
   file (`fixtures/cfg_attr_derives.rs`). A file or two. Importance: low.
-- [ ] **Indexing user types and range values.** A user `impl Index<Range<usize>>` /
-  `Index<RangeFrom<usize>>` can't be used as `x[i..]`; a `Range` reaching `[..]` through a tuple
+- [ ] **Indexing user types and range values.** A `Range` reaching `[..]` through a tuple
   pattern, a `Vec<Range>` loop or `Range::from(..)` fails on `str` / `[u8]` (the message prints
   the range as `std::slice::Iter<'_, usize>`); `impl<T, I: SliceIndex<[T]>> Index<I>` with
   `type Output = I::Output` (smallvec, thin-vec, bumpalo); `Index<usize>` beside a generic
@@ -399,20 +396,18 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   `q27_sliceindex.rs`, `q24_*.rs`, `q23_*.rs`. About 15 files, 1 flip. Importance: low to
   medium.
 - [ ] **Inference shapes.** `B: Into<Vec<u8>>` pins `B` to `Vec<u8>` and `T: AsRef<str>` pins `T` to
-  `String` instead of inferring from the argument; `map.get(q)` under `K: Borrow<Q>` with a `&Q`
-  (11 files, hashbrown/indexmap/serde_json); `Box::new(t)` to `Box<dyn Tr>` when `Tr` has a
+  `String` instead of inferring from the argument; `Box::new(t)` to `Box<dyn Tr>` when `Tr` has a
   blanket impl (3 files); a closure using `?` with no return annotation takes its error type from
   the operand; unsuffixed integer locals default to `i32` before a later `with_capacity(c)` pins
   them (1 flip); `.into()` whose target is only known later stays `String` (1 flip); `impl<A>
   Tr1<A> for S where Self: Tr0<A>` forwarding (1 flip); `o.unwrap_or_default()` on an `Option`
   whose type isn't known yet. Probes `agentE/q26*`, `q7*`, `q13*`, `q17*`, `q20*`, `q4*`, `q28*`,
-  `q22*`. About 18 files, 2 flips (an `Option` as `impl IntoIterator`, the other 2, landed
-  2026-11-27: `fixtures/option_into_iter_args.rs`).
+  `q22*`. About 7 files, 2 flips (an `Option` as `impl IntoIterator`, the other 2, landed
+  2026-11-27: `fixtures/option_into_iter_args.rs`; `map.get(q)` under `K: Borrow<Q>` or `String:
+  Borrow<Q>` with a `&Q`, 11 files, too: `fixtures/borrow_q_lookup.rs`).
   Importance: low to medium.
-- [ ] **Smaller confirmed items.** `for i in 0..$len { arr[i] = .. }` inside a
-  `macro_rules!` body is a parse error (`expected ;`; miniz_oxide; `{ x = i; }` parses).
-  Two `PartialEq` impls on one type (`PartialEq<str>` and `PartialEq<Self>`) type the second's
-  `rhs` as `&Self`. An inherent `as_ref` beside `impl AsRef<..>` is checked against the trait's
+- [ ] **Smaller confirmed items.** Two `PartialEq` impls on one type (`PartialEq<str>` and
+  `PartialEq<Self>`) type the second's `rhs` as `&Self`. An inherent `as_ref` beside `impl AsRef<..>` is checked against the trait's
   signature. A local type named `OsStr`, or a user fn named `Ok`, captures names inside
   injected std code. The io prelude and the chrono_tz shim load on raw text, so a doc comment
   mentioning `io::Write` or `chrono_tz` changes type checking (borsh nostd_io.rs; chrono-tz
@@ -445,6 +440,11 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
 Found in passing and not fixed yet (checked against the current tree, 2026-11-26). Gaps that are
 by design or long-standing differences from rustc are in `RUST_GAPS.md`.
 
+- [ ] **`Self::f()` in a method with `self` of `impl<T: Tr> Tr for Vec<T>` passes no class for
+  `T`.** `fn d(&self) -> String { Self::declaration() }` with `fn declaration() -> String {
+  T::declaration() }` compiles to `$ext$Vec.declaration(undefined)` and throws at run time
+  (rustc accepts it; `T::declaration()` in the same method works, by `$callElem`). The same in a
+  `HashMap<K, V>` impl. Found 2026-11-27 writing `fixtures/cell_impl_param_calls.rs`.
 - [ ] **A trait path with generic arguments as a callee.** `Borrow::<str>::borrow(&w)` with your
   `impl Borrow<str> for W` is "the standard library function `Borrow::<str>::borrow` is not
   supported" (rustc accepts it); `let b: &str = w.borrow();` works. Found 2026-11-27 writing

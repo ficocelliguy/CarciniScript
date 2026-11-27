@@ -1605,7 +1605,18 @@ impl Checker<'_> {
         bt: &Ty,
         index: &ast::Expr,
     ) -> Ty {
-        let it = self.infer(index, None);
+        // (`s[i..]` with `impl Index<RangeFrom<usize>> for S`: the range as a value.)
+        let expected = match crate::typeck::strip_parens(index) {
+            ast::Expr::RangeExpr(r) => {
+                use ra_ap_syntax::ast::RangeItem;
+                let inclusive = r.op_kind() == Some(ast::RangeOp::Inclusive);
+                let kind =
+                    crate::ty::RangeKind::of(r.start().is_some(), r.end().is_some(), inclusive);
+                Some(Ty::Range(Box::new(self.fresh(VarKind::General)), kind))
+            }
+            _ => None,
+        };
+        let it = self.infer(index, expected.as_ref());
         let impls: Vec<crate::adt::OpImpl> = self
             .adts
             .op_impls

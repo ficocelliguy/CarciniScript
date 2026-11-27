@@ -865,6 +865,8 @@ impl Checker<'_> {
             self.param_bounds.get_mut(&n).unwrap().extend(extra);
             self.record_bound_args(&n, &lists);
         }
+        // (`where String: Borrow<Q>`: a map of `String`s looked up by a `&Q`.)
+        self.record_concrete_borrow_bounds(f.where_clause());
         // `x: impl Display`: an anonymous parameter of the method's, after the written ones.
         for (name, bounds, key) in super::generic::impl_arg_params(f) {
             self.generics.insert(key, Ty::Param(name.clone()));

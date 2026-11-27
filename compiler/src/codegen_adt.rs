@@ -924,6 +924,7 @@ impl Codegen<'_> {
         let elem_key = match &self_ty {
             Ty::Option(_) => Some("Option"),
             Ty::Vec(_) => Some("Vec"),
+            Ty::RefCell(_) => Some("RefCell"),
             Ty::Tuple(es) => crate::adt::tuple_key(es.len()),
             // (A `&T` impl's methods: `T`'s.)
             Ty::Param(_) if self.ext_class.as_deref().is_some_and(crate::adt::is_wrapper_key) => {
@@ -1077,6 +1078,7 @@ impl Codegen<'_> {
             "Result" => Ty::Result(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
             "HashMap" => Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
             "HashSet" => Ty::Set(Box::new(Ty::Unknown)),
+            "RefCell" => Ty::RefCell(Box::new(Ty::Unknown)),
             "BTreeMap" => Ty::Coll(
                 crate::ty::Coll::BTreeMap,
                 Box::new(Ty::Map(Box::new(Ty::Unknown), Box::new(Ty::Unknown))),

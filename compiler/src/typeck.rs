@@ -490,7 +490,7 @@ impl<'a> Checker<'a> {
             const_tys: HashMap::new(),
             from_args: HashMap::new(),
             try_from_args: HashMap::new(),
-            borrow_args: HashMap::new(),
+            borrow_args: Vec::new(),
             const_needs: Default::default(),
             const_derivable: Default::default(),
             const_lits: Vec::new(),
@@ -1158,8 +1158,8 @@ struct Checker<'a> {
     pub(super) from_args: HashMap<String, Ty>,
     /// `T: TryFrom<X>` bounds in scope: each `X` by parameter.
     pub(super) try_from_args: HashMap<String, Vec<Ty>>,
-    /// `K: Borrow<Q>` bounds in scope: `Q` by parameter, the key a map of `K`s is looked up by.
-    pub(super) borrow_args: HashMap<String, Ty>,
+    /// `K: Borrow<Q>` bounds in scope: `Q` by key type (a parameter, or a concrete `String` in `where String: Borrow<Q>`), the key a map of `K`s is looked up by.
+    pub(super) borrow_args: Vec<(Ty, Ty)>,
     /// The const generic parameters in scope (`const N: usize`), with their types.
     pub(super) const_tys: HashMap<String, Ty>,
     /// (function, const parameter) pairs: each is passed like a class (`$N`)...
@@ -5266,8 +5266,8 @@ impl<'a> Checker<'a> {
             ast::Expr::RefExpr(r) => r.expr().map(|e| strip_parens(&e)).unwrap_or(a),
             _ => a,
         });
-        if let Ty::Param(kn) = self.shallow(k)
-            && let Some(q) = self.borrow_args.get(&kn)
+        let kt = self.shallow(k);
+        if let Some((_, q)) = self.borrow_args.iter().find(|(b, _)| self.shallow(b) == kt)
             && let Some(ast::Expr::PathExpr(p)) = inner
             && let Some(n) = p.path().and_then(|p| p.as_single_name_ref())
             && let Some(local) = self.lookup(n.text())
@@ -7117,8 +7117,8 @@ impl<'a> Checker<'a> {
                         .and_then(|a| a.ty())
                         .map(|t| self.lower_type(&t));
                     let elems: Vec<Ty> = match written {
-                        Some(Ty::Vec(e) | Ty::Option(e)) => vec![*e],
-                        Some(Ty::Tuple(es)) => es,
+                        // (`<Cell<u8> as Tr>::name()`, `<HashMap<K, V>>::name()` alike.)
+                        Some(t) if !crate::adt::ext_args(&t).is_empty() => crate::adt::ext_args(&t),
                         // (`Vec::<u16>::name()`.)
                         _ => qseg
                             .and_then(|s| s.generic_arg_list())
@@ -11464,7 +11464,10 @@ impl Checker<'_> {
         let Some((ty, m)) = f.split_once("::") else {
             return false;
         };
-        if ty != "Vec" && crate::adt::tuple_arity(ty).is_none() && !crate::adt::is_wrapper_key(ty) {
+        if !matches!(ty, "Vec" | "RefCell")
+            && crate::adt::tuple_arity(ty).is_none()
+            && !crate::adt::is_wrapper_key(ty)
+        {
             return false;
         }
         let bare = self.adts.method(ty, m).is_some_and(|s| {
