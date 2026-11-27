@@ -294,6 +294,9 @@ pub struct Adts {
     /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
     /// arguments, not by a trait.
     pub inherent_alts: std::collections::HashSet<String>,
+    /// The `"Type::method"`s of inherent methods: an `impl AsRef<..>` beside an inherent `as_ref`
+    /// puts its method under `AsRef$as_ref`.
+    pub inherent_methods: std::collections::HashSet<String>,
     /// Traits with an impl for a reference to a concrete built-in type (`impl Inv for &f32`,
     /// see `concrete_ref_impl`): a reference passed for a type parameter bounded by one carries
     /// its class (`κσ.$wrapT`), as for a `&T` wrapper impl.
@@ -307,6 +310,10 @@ pub struct Adts {
     /// whose `R` is another type: `a.eq(&b)` with a `b` of `a`'s own type takes the derived or
     /// std comparison instead.
     pub foreign_cmp: std::collections::HashSet<String>,
+    /// The `"Type::method"`s whose plain key holds such a method (the comparison with another
+    /// type came first), with the absolute offset of its name: a later `impl PartialEq for Type`
+    /// moves it to a key of its own.
+    pub foreign_cmp_base: HashMap<String, usize>,
     /// The `"Type::method"`s of an `impl Tr for Type` whose trait isn't known (from another
     /// file or crate): registered so calls still type, and an inherent method of the name wins.
     pub unknown_trait_methods: std::collections::HashSet<String>,

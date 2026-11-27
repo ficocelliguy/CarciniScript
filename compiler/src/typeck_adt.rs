@@ -17,6 +17,32 @@ use crate::adt::{
 use crate::ty::{RangeKind, Ty};
 
 impl Checker<'_> {
+    /// The type a path qualifier names with its arguments written out: `<W<u8>>` (also `<W<u8>
+    /// as Tr>`) or `W::<u8>`, when it is `adt` with type arguments.
+    fn qualifier_adt(&mut self, q: &ast::Path, adt: &str) -> Option<Ty> {
+        let seg = q.segment()?;
+        let t = match seg.type_anchor().and_then(|a| a.ty()) {
+            Some(t) => self.lower_type(&t),
+            None if seg.name_ref().is_some_and(|n| n.text() == adt) => {
+                let args: Vec<Ty> = seg
+                    .generic_arg_list()?
+                    .generic_args()
+                    .filter_map(|g| match g {
+                        ast::GenericArg::TypeArg(ta) => ta.ty(),
+                        _ => None,
+                    })
+                    .map(|t| self.lower_type(&t))
+                    .collect();
+                Ty::Adt(adt.to_string(), args)
+            }
+            None => return None,
+        };
+        match &t {
+            Ty::Adt(a, args) if a == adt && !args.is_empty() => Some(t),
+            _ => None,
+        }
+    }
+
     // ------------------------------------------------------------ items
 
     /// Declare every struct and enum, lower their fields, then read `impl` signatures. Runs
@@ -1065,6 +1091,8 @@ impl Checker<'_> {
             }
         }
         self.note_where_projections(imp.where_clause());
+        // (`where TextSize: Add<A, Output = TextSize>`: a `TextSize + a` with an `a: A`.)
+        self.record_concrete_borrow_bounds(imp.where_clause());
         match imp.self_ty() {
             Some(t) => self.lower_type(&t),
             None => Ty::Adt(type_name.to_string(), vec![]),
@@ -1116,11 +1144,12 @@ impl Checker<'_> {
                             && super::is_ptr_type(&t)
                         {
                             self.ptrs.fields.insert(name.clone());
+                            // A pointer to a number, string or bool holds a slot over the
+                            // place (or null), as a `&mut i32` field does.
                             if self.cellable(&ty) {
-                                self.error(
-                                    t.syntax(),
-                                    "a raw pointer to a number, string or bool in a struct isn't supported yet (point at a struct holding it)",
-                                );
+                                self.mut_ref_fields
+                                    .insert((variant_name.to_string(), name.clone()));
+                                self.ptrs.cell_fields.insert(name.clone());
                             }
                         }
                         Field {
@@ -1978,6 +2007,38 @@ impl Checker<'_> {
                     .insert(key, method);
                 continue;
             }
+            // (`impl PartialEq<str> for T` before `impl PartialEq for T`: the comparison with `str`
+            // moves to a key of its own, and this one takes the plain key, as if written first.)
+            let base = format!("{type_name}::{}", name.text());
+            if foreign_cmp {
+                self.adts
+                    .foreign_cmp_base
+                    .insert(base.clone(), self.range(name.syntax()).0);
+            } else if matches!(trait_name.as_deref(), Some("PartialEq" | "PartialOrd"))
+                && let Some(at0) = self.adts.foreign_cmp_base.remove(&base)
+                && let Some(prev) = self
+                    .adts
+                    .methods
+                    .get_mut(&type_name)
+                    .and_then(|ms| ms.remove(name.text().to_string().as_str()))
+            {
+                let n = name.text().to_string();
+                let alts = self
+                    .adts
+                    .method_alts
+                    .entry(base.clone())
+                    .or_insert_with(|| vec![n.clone()]);
+                let key = format!("{n}${}", alts.len());
+                alts.push(key.clone());
+                self.adts.foreign_cmp.remove(&base);
+                self.adts.foreign_cmp.insert(format!("{type_name}::{key}"));
+                self.adts.alt_keys_at.insert(at0, key.clone());
+                self.adts
+                    .methods
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(key, prev);
+            }
             if let Some(w) = written {
                 self.adts
                     .alt_arg_refs
@@ -2033,7 +2094,12 @@ impl Checker<'_> {
             // has: under `Trait$method`, what `Trait::method(&x)` calls (the plain name stays
             // the first one's, or the inherent one's).
             if let Some(tr) = trait_name.as_deref()
-                && self.adts.traits.contains_key(tr)
+                && (self.adts.traits.contains_key(tr)
+                    || (matches!(tr, "AsRef" | "AsMut" | "Borrow" | "BorrowMut")
+                        && self
+                            .adts
+                            .inherent_methods
+                            .contains(&format!("{type_name}::{}", name.text()))))
                 && self
                     .adts
                     .methods
@@ -2130,9 +2196,13 @@ impl Checker<'_> {
                 continue;
             }
             if foreign_cmp {
-                self.adts.foreign_cmp.insert(key);
+                self.adts.foreign_cmp.insert(key.clone());
             }
             // Trait methods (`fmt`, `default`) live alongside inherent ones under their own name.
+            if trait_name.is_none() {
+                self.adts.inherent_methods.insert(key);
+            }
+            let methods = self.adts.methods.entry(type_name.clone()).or_default();
             methods.insert(name.text().to_string(), method);
         }
         self.self_ty = saved;
@@ -2210,6 +2280,11 @@ impl Checker<'_> {
             .is_some_and(|t| super::written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Unknown));
         let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::written_mut_ref(&t));
         let ret_slot = self.ret_slot_kind(f, &ret);
+        if f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::is_ptr_type(&t))
+            && let Some(n) = f.name()
+        {
+            self.ptrs.ret_fns.insert(n.text().to_string());
+        }
         if let Some(Ty::Adt(adt, _)) = self.self_ty.clone()
             && let Some(n) = f.name()
         {
@@ -2509,6 +2584,13 @@ impl Checker<'_> {
                     self.array_reads.insert(r);
                 }
                 let t = self.adts.assoc_consts[&adt][&m].clone();
+                // (`<W<u8>>::SIZE` / `W::<u8>::SIZE`: the qualifier's type, whose class view a
+                // const reading the impl's type parameters is read through.)
+                if let Some(q) = p.path().and_then(|p| p.qualifier())
+                    && let Some(qt) = self.qualifier_adt(&q, &adt)
+                {
+                    self.record(q.syntax(), qt);
+                }
                 // (A generic impl's `const ZERO: Self`: `W<T>` with `T` fresh, or as written,
                 // `W::<f64>::ZERO`.)
                 let mut ps = Vec::new();
@@ -2945,7 +3027,11 @@ impl Checker<'_> {
                             .mut_ref_fields
                             .contains(&(adt.clone(), fname.text().to_string()))
                         {
-                            self.keep_slot(&e);
+                            if self.ptrs.cell_fields.contains(fname.text().to_string().as_str()) {
+                                self.keep_ptr_slot(&e);
+                            } else {
+                                self.keep_slot(&e);
+                            }
                         }
                     } else if let Some(local) =
                         self.lookup(fname.text().to_string().as_str()).cloned()

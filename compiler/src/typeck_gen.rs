@@ -73,6 +73,9 @@ pub(super) const KNOWN_BOUNDS: &[&str] = &[
     "FromIterator",
     // (`T: Any`: `&T as &dyn Any` checks the value by its shape, as concrete ones do.)
     "Any",
+    // (`C: Index<Ix, Output = E>`: `c[ix]` indexes by what the value is, at run time.)
+    "Index",
+    "IndexMut",
 ];
 
 /// A type parameter with the names of its bounds (`T: PartialOrd + Copy` → `["PartialOrd", "Copy"]`).
@@ -762,6 +765,14 @@ impl Checker<'_> {
         use ra_ap_syntax::ast::HasGenericArgs;
         for pred in wc.into_iter().flat_map(|w| w.predicates()) {
             let Some(subject) = pred.ty() else { continue };
+            // (Your struct or enum, for the comparison and operator bounds below.)
+            let own_adt = match &subject {
+                ast::Type::PathType(pt) => pt
+                    .path()
+                    .and_then(|p| p.as_single_name_ref())
+                    .is_some_and(|n| self.adts.defs.contains_key(&n.text().to_string())),
+                _ => false,
+            };
             if let ast::Type::PathType(pt) = &subject
                 && let Some(n) = pt.path().and_then(|p| p.as_single_name_ref())
                 && matches!(self.generics.get(&n.text().to_string()), Some(Ty::Param(_)))
@@ -769,6 +780,47 @@ impl Checker<'_> {
                 continue;
             }
             for b in pred.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
+                // (`where Ident: PartialEq<I>`: `id == i` with an `id: Ident`, as for a parameter.)
+                if let Some(ast::Type::PathType(pt)) = b.ty()
+                    && let Some(seg) = pt.path().and_then(|p| p.segment())
+                    && let Some(tr) = seg.name_ref().map(|n| n.text().to_string())
+                    && matches!(tr.as_str(), "PartialEq" | "PartialOrd")
+                    && own_adt
+                    && let Ty::Adt(n, _) = self.lower_type(&subject)
+                {
+                    self.record_cmp_bound(&n, &tr, &seg);
+                    continue;
+                }
+                // (`where TextSize: Add<A, Output = TextSize>`: `TextSize + a` with an `a: A` calls
+                // the type's operator, picked at run time by the operand.)
+                if let Some(ast::Type::PathType(pt)) = b.ty()
+                    && let Some(seg) = pt.path().and_then(|p| p.segment())
+                    && let Some(tr) = seg.name_ref().map(|n| n.text().to_string())
+                    && crate::adt::op_method(&tr).is_some()
+                    && own_adt
+                    && let Ty::Adt(n, _) = self.lower_type(&subject)
+                {
+                    for g in seg.generic_arg_list().into_iter().flat_map(|l| l.generic_args()) {
+                        match g {
+                            ast::GenericArg::TypeArg(ta) => {
+                                if let Some(t) = ta.ty() {
+                                    let t = self.lower_type(&t);
+                                    self.op_args.insert((n.clone(), tr.clone()), t);
+                                }
+                            }
+                            ast::GenericArg::AssocTypeArg(a)
+                                if a.name_ref().is_some_and(|x| x.text() == "Output") =>
+                            {
+                                if let Some(t) = a.ty() {
+                                    let t = self.lower_type(&t);
+                                    self.op_args.insert((n.clone(), format!("{tr}$out")), t);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 if let Some(ast::Type::PathType(pt)) = b.ty()
                     && let Some(seg) = pt.path().and_then(|p| p.segment())
                     && seg.name_ref().is_some_and(|n| n.text() == "Borrow")
@@ -851,9 +903,15 @@ impl Checker<'_> {
     /// `PartialEq<R>` / `PartialOrd<R>`: whether `b` is that `R` (then unified). A `PartialOrd<R>`
     /// bound serves `==` too: its supertrait is `PartialEq<R>`. Not when `b` is an `a` already.
     pub(super) fn cmp_bound_fits(&mut self, lt: &Ty, rt: &Ty, tr: &str) -> bool {
-        let Ty::Param(n) = self.shallow(lt) else {
+        let (Ty::Param(n) | Ty::Adt(n, _)) = self.shallow(lt) else {
             return false;
         };
+        // (A struct or enum by a concrete `where Ident: PartialEq<I>`.)
+        if matches!(self.shallow(lt), Ty::Adt(..))
+            && !self.cmp_args.keys().any(|(k, _)| *k == n)
+        {
+            return false;
+        }
         // (Two type parameters are one type only by name; `could_be` takes any two.)
         let fits = |c: &Self, x: &Ty| match (c.shallow(x), c.shallow(rt)) {
             (Ty::Param(a), Ty::Param(b)) => a == b,
@@ -1249,6 +1307,17 @@ impl Checker<'_> {
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
+            // `C: Index<Ix>` / `IndexMut<Ix>`: a Vec, deque or map, or your type with the impl.
+            "Index" | "IndexMut" if !self.adts.traits.contains_key(b) => match t {
+                Ty::Vec(_) | Ty::Map(..) => true,
+                Ty::Coll(k, _) => matches!(
+                    k,
+                    crate::ty::Coll::VecDeque | crate::ty::Coll::FixedArray(_)
+                ) || (b == "Index" && *k == crate::ty::Coll::BTreeMap),
+                Ty::Adt(n, _) => self.has_op_impl(n, b),
+                Ty::Param(n) => self.param_has(n, b),
+                _ => false,
+            },
             "Error" if !self.adts.traits.contains_key(b) => match t {
                 Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| d.implements("Error")),
                 Ty::Extern(n) => super::is_std_error(n),
@@ -1610,7 +1679,32 @@ impl Checker<'_> {
             crate::adt::ext_key(owner).filter(|k| self.adts.ext_types.contains(*k))
         {
             let t = self.adts.assoc_consts.get(key)?.get(konst)?.clone();
-            (Ty::from_name(owner), t)
+            // (`<Vec<u8>>::SIZE` / `Vec::<u8>::SIZE`: with the element, whose class a const of
+            // `impl<T> Tr for Vec<T>` reads.)
+            let seg = ast::PathExpr::cast(node.clone())
+                .and_then(|p| p.path())
+                .and_then(|p| p.qualifier())
+                .and_then(|q| q.segment());
+            let written = match seg.as_ref().and_then(|s| s.type_anchor()).and_then(|a| a.ty()) {
+                Some(t) => Some(self.lower_type(&t)),
+                None => {
+                    let arg = seg
+                        .and_then(|s| s.generic_arg_list())
+                        .and_then(|l| l.generic_args().next())
+                        .and_then(|g| match g {
+                            ast::GenericArg::TypeArg(ta) => ta.ty(),
+                            _ => None,
+                        })
+                        .map(|t| Box::new(self.lower_type(&t)));
+                    match (owner, arg) {
+                        ("Vec", Some(a)) => Some(Ty::Vec(a)),
+                        ("Option", Some(a)) => Some(Ty::Option(a)),
+                        ("RefCell", Some(a)) => Some(Ty::RefCell(a)),
+                        _ => None,
+                    }
+                }
+            };
+            (written.unwrap_or_else(|| Ty::from_name(owner)), t)
         } else if let Some(d) = self.adts.traits.get(owner) {
             let t = d.const_tys.get(konst)?.clone();
             (self.fresh(VarKind::General), t)

@@ -61,13 +61,15 @@ pub(crate) fn with_prelude(
 ) -> Option<String> {
     // (The program's own types don't ask for a prelude: `mod read; use read::IoRead;` and
     // `struct IoRead` are its `IoRead`, not the io prelude's.)
+    // (Nor do its comments: a doc comment naming `io::Write`.)
     let full = text;
-    let masked = mask_own_types(text);
+    let code = crate::lineindex::blank_comments(text);
+    let masked = mask_own_types(&code);
     let text: &str = &masked;
     let declares = |name: &str| {
         ["struct", "enum", "type", "trait", "union"]
             .iter()
-            .any(|kw| has_word(full, &format!("{kw} {name}")))
+            .any(|kw| has_word(&code, &format!("{kw} {name}")))
     };
     let mut out: Vec<&'static str> = Vec::new();
     // (After the rewrite: `chrono::NaiveDate` is `ChronoNaiveDate`, ..; its `TimeDelta::to_std`
@@ -504,4 +506,24 @@ fn mask_own_types(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     out.into()
+}
+
+/// Where the Rust-source preludes compiled in after the program start in `text` (its first
+/// `// (.. prelude)` marker line), or its length.
+pub(crate) fn prelude_start(text: &str) -> usize {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let l = line.trim_end();
+        if l.starts_with("// (") && l.ends_with(" prelude)") {
+            return at;
+        }
+        at += line.len();
+    }
+    text.len()
+}
+
+/// Whether the program's own `fn Ok` / `fn Err` is what a bare `Ok(..)` at `node` calls: not
+/// inside the preludes, whose `Ok(..)` is std's.
+pub(crate) fn user_ctor_fn_at(text: &str, node: &ra_ap_syntax::SyntaxNode) -> bool {
+    usize::from(node.text_range().start()) < prelude_start(text)
 }

@@ -1201,8 +1201,49 @@ impl Codegen<'_> {
                 .filter(|t| !t.syntax().text().to_string().contains("Self"))
                 .map(|t| self.lower_type(&t))
                 .or_else(|| Some(self_ty.clone()).filter(|_| !key.ends_with("$all")));
-            let (f, _) = self.emit_expr(&body, ty.as_ref());
             let name = escape_ident(n.text());
+            // `impl<T: Tr> Tr for Vec<T> { const SIZE: usize = 8 * T::SIZE; }`: a getter
+            // reading the element's class off the class it's read through (`$withStatics` of
+            // `$withElem(.., cls)`: `this.elem`), not cached.
+            let elem_params: Vec<String> = match key {
+                "Vec" | "Option" | "RefCell" => k
+                    .syntax()
+                    .ancestors()
+                    .find_map(ast::Impl::cast)
+                    .map(|imp| {
+                        let mut ps: Vec<String> = Vec::new();
+                        for p in body.syntax().descendants().filter_map(ast::Path::cast) {
+                            if let Some(first) = p.first_segment().and_then(|s| s.name_ref())
+                                && p.qualifier().is_some()
+                                && crate::adt::impl_type_param_pos(&imp, first.text().as_ref())
+                                    == Some(0)
+                                && !ps.contains(&first.text().to_string())
+                            {
+                                ps.push(first.text().to_string());
+                            }
+                        }
+                        ps
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            if !elem_params.is_empty() {
+                let saved_consts = super::set_const_scope(None);
+                for p in &elem_params {
+                    super::CONST_SCOPE
+                        .with(|s| s.borrow_mut().insert(p.clone(), "this.elem".to_string()));
+                }
+                let (f, _) = self.emit_expr(&body, ty.as_ref());
+                super::set_const_scope(Some(saved_consts));
+                let mut line = Frag::mapped(
+                    self.off(k.syntax()),
+                    format!("static get {name}() {{ return "),
+                );
+                line.append(f).push("; }");
+                self.line(line);
+                continue;
+            }
+            let (f, _) = self.emit_expr(&body, ty.as_ref());
             let mut line = Frag::mapped(
                 self.off(k.syntax()),
                 format!("static get {name}() {{ const v = "),
@@ -2362,9 +2403,13 @@ impl Codegen<'_> {
                 let ty = self.types.adts.assoc_consts[&adt][&m].clone();
                 // A const reading the impl's type parameters: through a class view carrying their
                 // classes (`W::<f64>::ZERO` → `κσ.$tv(W, [..]).ZERO`), by the value's type.
+                // (Or by the qualifier's, `<W<u8>>::SIZE`, for a const of another type.)
                 if self.tparam_consts.contains_key(&(adt.clone(), m.clone()))
-                    && let Some(Ty::Adt(a, targs)) =
-                        path.and_then(|p| p.syntax().parent()).and_then(|e| self.ty_of(&e))
+                    && let Some(Ty::Adt(a, targs)) = path
+                        .and_then(|p| p.syntax().parent())
+                        .and_then(|e| self.ty_of(&e))
+                        .filter(|t| matches!(t, Ty::Adt(a, _) if *a == adt))
+                        .or_else(|| path.and_then(|p| p.qualifier()).and_then(|q| self.ty_of(q.syntax())))
                     && a == adt
                 {
                     let d = self.dict_of(&Ty::Adt(a, targs));

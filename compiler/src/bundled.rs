@@ -39,13 +39,15 @@ pub type Error = (usize, usize, String);
 /// Rewrite every use in `text`; returns whether anything changed.
 pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>> {
     let file = crate::macros::parse_tree(text);
-    let thiserror = text.contains("thiserror");
-    let rayon_used = text.contains("rayon");
-    let json_used = text.contains("serde_json");
-    let tokio_used = text.contains("tokio::");
+    // (What picks a crate or a rewrite below is code, not a doc comment naming `chrono_tz`.)
+    let code = crate::lineindex::blank_comments(text).into_owned();
+    let thiserror = code.contains("thiserror");
+    let rayon_used = code.contains("rayon");
+    let json_used = code.contains("serde_json");
+    let tokio_used = code.contains("tokio::");
     // (Not where `regex` is the file's own module.)
     let regex_used =
-        (text.contains("regex::") || text.contains("use regex")) && !text.contains("mod regex");
+        (code.contains("regex::") || code.contains("use regex")) && !code.contains("mod regex");
     let json_map_imported = json_used
         && crate::typeck::crates::crate_imports(text)
             .get("Map")
@@ -53,7 +55,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     let mut edits: Vec<(TextRange, String)> = Vec::new();
     let mut select_arities: std::collections::BTreeSet<usize> = Default::default();
     let mut errors: Vec<(TextRange, String)> = Vec::new();
-    rename_crate_items(&file, text, &mut edits);
+    rename_crate_items(&file, &code, &mut edits);
     if text.contains("petgraph") && !text.contains("mod petgraph") {
         petgraph_edits(&file, &mut edits);
     }
@@ -68,7 +70,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> Result<bool, Vec<Error>
     if text.contains("indexmap!") || text.contains("indexset!") {
         indexmap_macros(&file, &mut edits);
     }
-    if text.contains("chrono_tz") {
+    if code.contains("chrono_tz") {
         chrono_tz_zones(&file, &mut edits);
     }
     // `#[derive(Parser)]` and the other clap derives.

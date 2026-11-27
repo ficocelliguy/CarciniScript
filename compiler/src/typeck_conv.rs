@@ -1147,7 +1147,8 @@ impl Checker<'_> {
         if let Ty::Adt(n, _) = self.shallow(&t)
             && !matches!(&target, Ty::Adt(tn, _) if self.adts.from_impls.contains_key(tn))
         {
-            for m in ["as_ref", "borrow"] {
+            // (Under `AsRef$as_ref` beside an inherent `as_ref`.)
+            for m in ["AsRef$as_ref", "as_ref", "Borrow$borrow", "borrow"] {
                 if let Some(sig) = self.adts.method(&n, m)
                     && self.could_be(&sig.ret.clone(), p)
                 {
@@ -1476,7 +1477,9 @@ impl Checker<'_> {
         if let Ty::Adt(_, targs) = self.shallow(lt) {
             for i in &mut impls {
                 if let Some(sig) = self.adts.method(adt, &i.key).cloned()
-                    && sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                    && (sig.impl_args.iter().any(|a| matches!(a, Ty::Param(_)))
+                        // (`impl<A> AddAssign<A> for TextSize`: `A` too.)
+                        || sig.params.first().is_some_and(|p| matches!(p, Ty::Param(_))))
                 {
                     // (`impl<L, R> Add<Complex<R>> for Complex<L>`: `R`, which only the right
                     // operand names, is a fresh variable.)
@@ -1575,6 +1578,26 @@ impl Checker<'_> {
                 .map(|m| m.ret.clone())
                 .unwrap_or(Ty::Unknown);
         }
+        // `*self + rhs` with `rhs: A` under `where TextSize: Add<A, Output = TextSize>`: the type's
+        // operator, picked by the operand at run time (`$op$add`).
+        if let Ty::Param(p) = self.shallow(&rt)
+            && self
+                .op_args
+                .get(&(adt.to_string(), tr.clone()))
+                .is_some_and(|x| matches!(self.shallow(x), Ty::Param(q) if q == p))
+            && let Some(m) = crate::adt::op_method(&tr)
+        {
+            let key = format!("$op${m}");
+            self.record_conv(node, Conv::Method { key });
+            if assign {
+                return Ty::Unit;
+            }
+            return self
+                .op_args
+                .get(&(adt.to_string(), format!("{tr}$out")))
+                .cloned()
+                .unwrap_or_else(|| lt.clone());
+        }
         let (l, r) = (self.describe(lt), self.describe(&rt));
         let sym = format!("{op}{}", if assign { "=" } else { "" });
         let msg = if impls.is_empty() {
@@ -1647,6 +1670,13 @@ impl Checker<'_> {
             .iter()
             .filter(|i| self.could_be(&i.rhs, &it))
             .collect();
+        // (`impl Index<usize>` beside `impl<U: Id> Index<U>`: a concrete index type wins over the
+        // type parameter.)
+        let mut fits = fits;
+        let open = |c: &Self, t: &Ty| matches!(c.shallow(t), Ty::Param(_) | Ty::Var(_));
+        if fits.len() > 1 && fits.iter().any(|i| !open(self, &i.rhs)) {
+            fits.retain(|i| !open(self, &i.rhs));
+        }
         let [one] = fits.as_slice() else {
             let msg = format!(
                 "the type `{}` cannot be indexed by `{}` (add `impl Index<{}> for {adt}` from `std::ops`)",

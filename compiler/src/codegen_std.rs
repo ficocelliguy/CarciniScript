@@ -882,8 +882,8 @@ impl Codegen<'_> {
             ["ptr", "eq" | "addr_eq"] => {
                 let a = self.emit_expr(args.first()?, None).0;
                 let b = self.emit_expr(args.get(1)?, None).0;
-                let mut f = Frag::mapped(start, "(");
-                f.append(a).push(" === ").append(b).push(")");
+                let mut f = Frag::mapped(start, "κσ.$ptrEq(");
+                f.append(a).push(", ").append(b).push(")");
                 f
             }
             ["ptr", "read"] => {

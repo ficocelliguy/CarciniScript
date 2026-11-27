@@ -327,6 +327,8 @@ pub fn has_prim_paths(text: &str) -> bool {
                 .any(|m| text.contains(&format!("{m}{c}")))
         })
         || text.contains("Ordering::is_")
+        // (`T::clone(x)` on a type parameter.)
+        || text.contains("::clone(")
         || OP_TRAITS.iter().any(|(t, ..)| {
             text.contains(&format!("{t}::"))
                 || text.contains(&format!("as {t}"))
@@ -382,6 +384,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         .filter(|&k| matches!(toks[k - 1].kind(), SyntaxKind::STRUCT_KW | SyntaxKind::ENUM_KW | SyntaxKind::TYPE_KW | SyntaxKind::UNION_KW))
         .map(at)
         .collect();
+    // The file's own functions: with a `fn Ok` (anyhow has one), `Result::Ok(..)` stays written
+    // out, as a bare `Ok(..)` would call it.
+    let own_fns: Vec<String> = (1..toks.len())
+        .filter(|&k| toks[k - 1].kind() == SyntaxKind::FN_KW)
+        .map(at)
+        .collect();
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0;
     while i + 3 < toks.len() {
@@ -390,6 +398,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         // type settles it).
         if let Some((first, variant, generics)) = variant_path(&toks, i)
             && !skip(&toks[i])
+            && !own_fns.contains(&at(variant))
         {
             match generics {
                 // `Result::<A, B>::Ok(1)` is `Ok::<A, B>(1)`.
@@ -562,7 +571,18 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             i = m + 1;
             continue;
         }
-        let prim = at(i);
+        // `T::clone(x)` with `T` a type parameter in scope: `Clone::clone(x)`, that is `(x).clone()`.
+        let prim = if at(i + 1) == "::"
+            && at(i + 2) == "clone"
+            && at(i + 3) == "("
+            && toks[i].kind() == SyntaxKind::IDENT
+            && (i == 0 || !matches!(at(i - 1).as_str(), "::" | "." | "<" | "as"))
+            && type_param_in_scope(&toks[i])
+        {
+            "Clone".to_string()
+        } else {
+            at(i)
+        };
         // `u64` `:` `:` `pow` (a `::` is one token in paths but two in token trees)
         let (sep_len, ok) = if at(i + 1) == "::" {
             (1, true)
@@ -951,6 +971,29 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
         map.replace(a, b, new.len());
     }
     changed
+}
+
+/// Whether `tok` names a generic type parameter of a fn, impl or trait around it.
+fn type_param_in_scope(tok: &SyntaxToken) -> bool {
+    use ra_ap_syntax::ast::HasGenericParams;
+    let name = tok.text();
+    tok.parent_ancestors().any(|a| {
+        let list = if let Some(f) = ast::Fn::cast(a.clone()) {
+            f.generic_param_list()
+        } else if let Some(i) = ast::Impl::cast(a.clone()) {
+            i.generic_param_list()
+        } else if let Some(t) = ast::Trait::cast(a) {
+            t.generic_param_list()
+        } else {
+            None
+        };
+        list.is_some_and(|l| {
+            l.type_or_const_params().any(|p| match p {
+                ast::TypeOrConstParam::Type(tp) => tp.name().is_some_and(|n| n.text() == name),
+                ast::TypeOrConstParam::Const(_) => false,
+            })
+        })
+    })
 }
 
 /// `Option::Some` / `Result::Err` at `toks[i]`, with an optional `std::option::` / `core::result::`

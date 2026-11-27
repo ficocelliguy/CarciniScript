@@ -209,6 +209,10 @@ impl Checker<'_> {
     /// `T` counts too in your own functions and inherent methods (`generic_slot_fn`).
     pub(super) fn ret_slot_kind(&self, f: &ast::Fn, ret: &Ty) -> Option<bool> {
         let w = f.ret_type()?.ty()?;
+        // `-> *mut i32` / `-> *const i32`: the slot over the place, as `-> &mut i32` returns.
+        if super::is_ptr_type(&w) {
+            return self.cellable(ret).then_some(false);
+        }
         if !super::written_mut_ref(&w) {
             return None;
         }
@@ -359,7 +363,7 @@ impl Checker<'_> {
         let e = strip_parens(e);
         match &e {
             ast::Expr::RefExpr(r) => {
-                if r.mut_token().is_none() {
+                if r.mut_token().is_none() && !self.shared_slot_ok {
                     return false;
                 }
                 let Some(inner) = r.expr() else { return false };
@@ -943,6 +947,8 @@ impl Checker<'_> {
 
     /// The shape of what an `Option` of an item holds: `it.next()`, `.nth(n)`, `.last()`, ..
     pub(super) fn option_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
+        // (`unsafe { p.as_mut() }` of a raw pointer: the call.)
+        let e = &super::ptr::unsafe_tail(e);
         // A local that holds one (`let big = it.find(..);`).
         if let ast::Expr::PathExpr(p) = strip_parens(e) {
             let n = p.path()?.as_single_name_ref()?.text().to_string();

@@ -17,8 +17,8 @@ pub fn result_variant(path: Option<ast::Path>) -> Option<usize> {
         .map(|n| n.text().to_string())
         .collect();
     match names.join("::").as_str() {
-        "Ok" | "Result::Ok" | "std::result::Result::Ok" => Some(0),
-        "Err" | "Result::Err" | "std::result::Result::Err" => Some(1),
+        "Ok" | "Result::Ok" | "std::result::Result::Ok" | "core::result::Result::Ok" => Some(0),
+        "Err" | "Result::Err" | "std::result::Result::Err" | "core::result::Result::Err" => Some(1),
         _ => None,
     }
 }
@@ -29,6 +29,18 @@ pub fn result_ctor_call(c: &ast::CallExpr) -> Option<usize> {
         return None;
     };
     result_variant(p.path())
+}
+
+/// `"Ok"` or `"Err"` at a `result_ctor_call` written bare: the name a program's own `fn Ok` /
+/// `fn Err` (or a local) would shadow. (`Result::Ok(..)` is the variant whatever the file has.)
+pub fn ctor_name(c: &ast::CallExpr) -> Option<&'static str> {
+    let ast::Expr::PathExpr(p) = c.expr()? else {
+        return None;
+    };
+    if p.path()?.qualifier().is_some() {
+        return None;
+    }
+    Some(if result_ctor_call(c) == Some(1) { "Err" } else { "Ok" })
 }
 
 /// The error type of `str::parse::<T>()`.

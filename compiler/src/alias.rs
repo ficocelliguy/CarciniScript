@@ -15,6 +15,8 @@ use crate::mbe::OffsetMap;
 struct Alias {
     name: String,
     params: Vec<String>,
+    /// Each parameter's default (`E = Error`), for a use that leaves it out.
+    defaults: Vec<Option<String>>,
     body: ast::Type,
     item: SyntaxNode,
     /// Where it can be used: the file, or the block it's declared in.
@@ -53,6 +55,19 @@ fn aliases(file: &SourceFile) -> Vec<Alias> {
                     .collect()
             })
             .unwrap_or_default();
+        let defaults = t
+            .generic_param_list()
+            .map(|l| {
+                l.type_or_const_params()
+                    .filter_map(|p| match p {
+                        ast::TypeOrConstParam::Type(tp) => tp
+                            .name()
+                            .map(|_| tp.default_type().map(|d| d.syntax().text().to_string())),
+                        ast::TypeOrConstParam::Const(cp) => cp.name().map(|_| None),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let scope = match t.syntax().parent() {
             Some(p) if p.kind() == SyntaxKind::STMT_LIST => p.text_range(),
             _ => file.syntax().text_range(),
@@ -60,6 +75,7 @@ fn aliases(file: &SourceFile) -> Vec<Alias> {
         out.push(Alias {
             name: name.text().to_string(),
             params,
+            defaults,
             body,
             item: t.syntax().clone(),
             scope,
@@ -94,7 +110,11 @@ fn instantiate(a: &Alias, args: &[String]) -> String {
         .then(|| a.params.iter().position(|p| p == t.text()))
         .flatten();
         match param {
-            Some(i) => out.push_str(args.get(i).map(String::as_str).unwrap_or("_")),
+            Some(i) => out.push_str(
+                args.get(i)
+                    .or_else(|| a.defaults.get(i)?.as_ref())
+                    .map_or("_", String::as_str),
+            ),
             None => out.push_str(t.text()),
         }
     }

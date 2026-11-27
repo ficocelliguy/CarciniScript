@@ -1225,11 +1225,9 @@ const rejected = [
   ["a reference cast to a pointer to another struct", "}\nstruct A {\n    n: u32,\n}\nstruct B {\n    n: u32,\n}\nfn g(a: &A) -> &B {\n    unsafe { &*(a as *const A as *const B) }", "10:17 casting a pointer to `A` to a pointer to `B` isn't supported"],
   ["transmute between sizes", "let x: u64 = unsafe { std::mem::transmute(1u32) };", "2:27 cannot transmute between types of different sizes"],
   ["transmute of a Vec", "let x: u64 = unsafe { std::mem::transmute(vec![1u8]) };", "2:27 `transmute` from `Vec<u8>` to `u64` isn't supported"],
-  ["a pointer to a number in a struct", "}\nstruct S {\n    p: *mut i32,\n}\nfn g() {", "4:8 a raw pointer to a number, string or bool in a struct isn't supported"],
   ["reference counts", "let r = std::rc::Rc::new(1);\n    let n = std::rc::Rc::strong_count(&r);","3:13 `Rc::strong_count` isn't supported"],
   ["a mismatch inside `u32::pow(..)`", "let x = u32::pow(2, \"a\");", "2:25 mismatched types: expected `u32`, found `&str`"],
   ["unzip of non-pairs","let v: (Vec<i32>, Vec<i32>) = vec![1, 2].into_iter().unzip();", "2:35 `unzip` needs an iterator of pairs"],
-  ["returning a pointer to a number", "}\nfn g(p: *mut i32) -> *mut i32 {\n    p", "3:22 returning a raw pointer to a number, string or bool isn't supported"],
   // Language gaps (PLAN): byte readers, const generics on traits.
   [
     "a blanket impl of another file's trait",

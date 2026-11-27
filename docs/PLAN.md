@@ -309,29 +309,13 @@ survey file; for those the count is files using the construct, and none would fl
 - [ ] **`js` crate:** `requestIdleCallback` / `cancelIdleCallback`, and `crypto.subtle.digest` as
   an `async fn` returning `Vec<u8>`. Estimate: 1 hour in `bindings/js.rs`. Importance: low.
   Corpus: 0 files (no web-sys / js-sys caller of either).
-- [ ] **Raw pointers to numbers, strings or bools in struct fields and return values, and
-  `as_mut()` on one.** A pointer to one of these is already a cell (`[0]` / `[1]` read and write
-  it, `$cell` / `$placeSlot` in `rt.js`), the object `&mut i32` fields and `-> &mut i32` returns
-  use (`mut_ref_fields`, `fixtures/mut_prim_refs.rs`); the two cases are refused on purpose
-  (`typeck_adt.rs`, "in a struct", and `typeck.rs`, "returning"). Plan:
-  1. Fields: drop the error and treat a `*mut T` / `*const T` field of a cellable `T` like a
-     `&mut T` field: it holds the cell, `*s.p` reads and writes `[0]`, `ptr::null_mut()` is
-     `null`, a copy shares the cell (Rust's aliasing).
-  2. Returns: `-> *mut i32` returns the cell, as `-> &mut i32` does.
-  3. `p.as_mut()` / `as_ref()` on one: the cell as the `&mut` / `&` (`None` for null), so `if let
-     Some(n) = p.as_mut() { *n += 1 }` writes through.
-  4. Sources: besides locals, `&mut s.field as *mut _` and `&mut v[i] as *mut _` (the slot code
-     beside the "here" / "from here" errors in `typeck_ptr.rs`), and `Box::into_raw(Box::new(5))`
-     as a fresh cell.
-  5. A differential fixture (`fixtures/ptr_prim_fields.rs`) covering each, plus FEATURES.md's
-     raw-pointer row.
-  Optional later: arithmetic inside one buffer. A slot is already (array, index), so `p.add(n)` /
-  `sub` / `offset` make a slot at index + n, `offset_from` subtracts indexes, and `as_ptr()` /
-  `as_mut_ptr()` of a Vec or slice is the slot at 0, with `read` / `write` bounds-checked. About
-  1–2 days more. Casts between pointee types, integer/pointer casts and `transmute` stay not
-  planned. Estimate: half a day for 1–5. Importance: low. Corpus: 136 files with these errors
-  (115 "in a struct", 29 "from here", 8 "returning"), 0 flips: each also casts pointers or hits
-  another gap.
+- [ ] **Raw pointer arithmetic inside one buffer.** Pointers to numbers in fields, returns and
+  `as_mut()` landed 2026-11-27 (`fixtures/ptr_prim_fields.rs`); left: a slot is already (array,
+  index), so `p.add(n)` / `sub` / `offset` could make a slot at index + n, `offset_from` subtract
+  indexes, and `as_ptr()` / `as_mut_ptr()` of a Vec or slice be the slot at 0, with `read` /
+  `write` bounds-checked. Casts between pointee types, integer/pointer casts and `transmute` stay
+  not planned. Estimate: 1–2 days. Importance: low. Corpus: the 136 files with pointer errors
+  also cast pointers or hit another gap.
 
 ## Corpus gaps by files affected (2026-11-27)
 
@@ -370,31 +354,42 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   and `Cell<T>` / `RefCell<T>` impls in both, work since 2026-11-27:
   `fixtures/cell_impl_param_calls.rs`); a blanket `impl<Z: Tr> Tr2 for Z` reached through
   `<Cell<u8>>::f()` ("no function .. found for struct `Cell`"; `<Vec<u8>>::f()` works); `const
-  SIZE: usize = T::SIZE` in an impl for a built-in generic type (`Vec<T>`, `Cell<T>`: "cannot
-  find value `T::SIZE`"); `<Rc<u8>>::f()` / `<Box<u8>>::f()` with `impl<T: Tr> Tr for Rc<T>`;
-  `where &'a I: IntoIterator` and `for<'a> &'a I: BitAnd<&'a I>` bounds (strsim, num-integer);
+  SIZE: usize = T::SIZE` in an impl for `Cell<T>` ("cannot find value `T::SIZE`"; `Vec<T>`,
+  `Option<T>` and `RefCell<T>` work); `<Rc<u8>>::f()` / `<Box<u8>>::f()` with `impl<T: Tr> Tr
+  for Rc<T>`; `where &'a I: IntoIterator` and `for<'a> &'a I: BitAnd<&'a I>` bounds (strsim, num-integer);
   bounds placed in a method's `where` on the impl's params plus `L::IntoIter` in the return
   type (either, 21 errors);
-  `H::Item: IntoIterator` (itertools, 3 files); `T::clone(x)` by path; `Trait::f(args)` with `Self`
-  inferred from the expected type (3 files); `>>` on the param of a blanket impl; `where
-  Concrete: Add<A>` and `where Ident: PartialEq<I>` (syn, 3 flips); `where Self: PartialEq` on a
-  trait default method; bounds on projections (`<T as Shr<u32>>::Output: PartialEq<T>`);
-  `.fmt(f)` / `.len()` through a std supertrait of a same-file trait. Probes in `agentD/q6*`,
-  `q9*`, `q10*`, `q12*`, `q15*`, `q19*`, `q20*` and `agentC/q15`, `q19`–`q22`. About 30 files, 8
-  flips. Importance: medium; each shape is small, the family is large.
+  `H::Item: IntoIterator` (itertools, 3 files); `T::clone(b)` with `b: &Bx<T>` reaching `T`
+  through `Deref` (`T::clone(x)` with `x: &T` works); `Trait::f(args)` with `Self` inferred from
+  the expected type (3 files); `>>` / `&` / `|` / `^` on the param of a blanket impl (`impl<I>
+  Half for I where I: Shr<usize, Output = I>`: the method needs `I`'s class, which a call on a
+  number would have to pass); bounds on projections (`<T as Shr<u32>>::Output: PartialEq<T>`);
+  `.fmt(f)` / `.len()` through a std supertrait of a same-file trait. Landed
+  2026-11-27 (`fixtures/concrete_where_bounds.rs`): `T::clone(x)` by path, `where Self:
+  PartialEq` on a trait default method, and `where` clauses whose subject is your concrete type
+  (`where Ident: PartialEq<I>` for `id == i`, `where TextSize: Add<A, Output = TextSize>` for
+  `*self + rhs`, picked by the operand at run time), with `impl<A> AddAssign<A> for TextSize`
+  taking any operand its `where` allows (syn's 3 flips); and (`fixtures/impl_param_consts_sum.rs`)
+  consts reading the impl's parameter in `impl<T> Tr for Vec<T>` / `Option<T>` (`const SIZE:
+  usize = 8 * T::SIZE`), `<W<u8>>::SIZE` of a struct's such const (it read `NaN`), and
+  `iter.sum::<S>()` of other items under `impl<A> Sum<A> for S where S: Add<A, Output = S>`.
+  Probes in `agentD/q6*`, `q9*`, `q10*`, `q12*`, `q15*`, `q20*` and `agentC/q15`, `q19`, `q21`.
+  About 23 files. Importance: medium; each shape is small, the family is large.
 - [ ] **Derives over std types: `NonZero<char>` fields are not `Copy`** (it maps to `String`). The
   rest of the row landed 2026-11-27 (`fixtures/derive_std_fields.rs`): `slice::IterMut` fields
   (and `Enumerate` of one) derive `Debug`, a field typed by an `Fn`-bounded parameter leaves the
   derive bounded on it, `TypeId` fields are `Copy` / `Hash` / `Ord`, `dyn Any` is `Debug`; and
   `#[cfg_attr(not(feature = "x"), derive(..))]` applies, with features off, as rustc builds a lone
   file (`fixtures/cfg_attr_derives.rs`). A file or two. Importance: low.
-- [ ] **Indexing user types and range values.** A `Range` reaching `[..]` through a tuple
-  pattern, a `Vec<Range>` loop or `Range::from(..)` fails on `str` / `[u8]` (the message prints
-  the range as `std::slice::Iter<'_, usize>`); `impl<T, I: SliceIndex<[T]>> Index<I>` with
-  `type Output = I::Output` (smallvec, thin-vec, bumpalo); `Index<usize>` beside a generic
-  `Index<U>`; a generic `C: IndexMut<Ix>` bound. Probes `agentC/q16d_*.rs`, `q18b_*.rs`,
-  `q27_sliceindex.rs`, `q24_*.rs`, `q23_*.rs`. About 15 files, 1 flip. Importance: low to
-  medium.
+- [ ] **Indexing user types and range values, remaining shapes.** `impl<T, I: SliceIndex<[T]>>
+  Index<I>` with `type Output = I::Output` (smallvec, thin-vec, bumpalo: the result is an element
+  or a slice by the index's type); `c[ix] = e` / `c[ix] += 1` through a `C: IndexMut<Ix>` bound
+  (rejected: no place to write; a field of the element or `&mut c[ix]` works). `Range::from(1..3)`
+  and `c[ix]` reads through `C: Index<Ix, Output = E>` / `IndexMut` (a Vec, a deque or your
+  type's `index`, picked at run time) landed 2026-11-27 (`fixtures/index_param_bounds.rs`).
+  Ranges as tuple or array elements (`let (r, n) = (1..3, 0)`, an `if` of such tuples, `[0..2, 4..6]`, `vec![0..1, 3..5]`) and `Index<usize>`
+  beside a generic `impl<U: Id> Index<U>` landed 2026-11-27 (`fixtures/index_values.rs`).
+  Probe `agentC/q27_sliceindex.rs`. About 10 files. Importance: low to medium.
 - [ ] **Inference shapes.** `B: Into<Vec<u8>>` pins `B` to `Vec<u8>` and `T: AsRef<str>` pins `T` to
   `String` instead of inferring from the argument; `Box::new(t)` to `Box<dyn Tr>` when `Tr` has a
   blanket impl (3 files); a closure using `?` with no return annotation takes its error type from
@@ -406,15 +401,6 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   2026-11-27: `fixtures/option_into_iter_args.rs`; `map.get(q)` under `K: Borrow<Q>` or `String:
   Borrow<Q>` with a `&Q`, 11 files, too: `fixtures/borrow_q_lookup.rs`).
   Importance: low to medium.
-- [ ] **Smaller confirmed items.** Two `PartialEq` impls on one type (`PartialEq<str>` and
-  `PartialEq<Self>`) type the second's `rhs` as `&Self`. An inherent `as_ref` beside `impl AsRef<..>` is checked against the trait's
-  signature. A local type named `OsStr`, or a user fn named `Ok`, captures names inside
-  injected std code. The io prelude and the chrono_tz shim load on raw text, so a doc comment
-  mentioning `io::Write` or `chrono_tz` changes type checking (borsh nostd_io.rs; chrono-tz
-  timezones.rs, 553 errors). `.min()` / `.max()` on an unknown value
-  resolves to `f64` and fans one upstream error into about 340 "expected `f64`" mismatches.
-  Probes `mine/m3`, `m9b`, `agentC/q17d`, `agentE/q19`, `q16`, `q6`, `q10f`,
-  `q24c`.
 
 ### Survey tooling notes
 
@@ -445,10 +431,12 @@ by design or long-standing differences from rustc are in `RUST_GAPS.md`.
   T::declaration() }` compiles to `$ext$Vec.declaration(undefined)` and throws at run time
   (rustc accepts it; `T::declaration()` in the same method works, by `$callElem`). The same in a
   `HashMap<K, V>` impl. Found 2026-11-27 writing `fixtures/cell_impl_param_calls.rs`.
-- [ ] **A trait path with generic arguments as a callee.** `Borrow::<str>::borrow(&w)` with your
-  `impl Borrow<str> for W` is "the standard library function `Borrow::<str>::borrow` is not
-  supported" (rustc accepts it); `let b: &str = w.borrow();` works. Found 2026-11-27 writing
-  `fixtures/std_impl_bodies.rs`.
+- [ ] **A std conversion trait's method by path on your type.** `Borrow::<str>::borrow(&w)` with
+  your `impl Borrow<str> for W` is "the standard library function `Borrow::<str>::borrow` is not
+  supported", and `AsRef::as_ref(&n)` / `<Name as AsRef<str>>::as_ref(&n)` with `impl AsRef<str>
+  for Name` are "cannot find function" (rustc accepts all three); `let b: &str = w.borrow();`
+  works. Found 2026-11-27 writing `fixtures/std_impl_bodies.rs` and
+  `fixtures/std_name_captures.rs`.
 - [ ] **`Cow<str>` against a `&str`.** `let t: &str = &c;` with `c: Cow<str>` is "expected `&str`,
   found `Cow<String>`" (as an argument `&c` works), and `c == "x"` is "expected `Cow<String>`,
   found `&str`" (std has `impl PartialEq<&str> for Cow<str>`). Found 2026-11-27 writing

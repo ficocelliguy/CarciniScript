@@ -54,6 +54,15 @@ pub fn utf16_len(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blanks_doc_comments() {
+        let s = "/// use chrono_tz::Tz;\npub fn z() {} // io::Write\n// (io prelude)\n";
+        let b = super::blank_comments(s);
+        assert!(!b.contains("chrono_tz"), "{b}");
+        assert!(!b.contains("io::Write"), "{b}");
+        assert!(b.contains("// (io prelude)"), "{b}");
+        assert_eq!(b.len(), s.len());
+    }
 
     #[test]
     fn maps_offsets_across_lines_and_wide_chars() {
@@ -192,4 +201,42 @@ pub fn string_value(s: &ra_ap_syntax::ast::String) -> Option<String> {
 pub fn crlf_only_error(message: &str, src: &str) -> bool {
     message == "Character must be escaped: `\r`"
         && src.match_indices('\r').all(|(k, _)| src[k + 1..].starts_with('\n'))
+}
+
+/// `src` with its comments blanked to spaces (line breaks kept, so offsets and lines match),
+/// for the scans that pick bundled crates and preludes from raw text: a doc comment naming
+/// `io::Write` or `chrono_tz` shouldn't load them. The `// (.. prelude)` markers a compiled-in
+/// prelude starts with stay.
+pub fn blank_comments(src: &str) -> std::borrow::Cow<'_, str> {
+    use ra_ap_syntax::SyntaxKind;
+    if !src.contains("//") && !src.contains("/*") {
+        return src.into();
+    }
+    let lexed = ra_ap_parser::LexedStr::new(crate::macros::EDITION, src);
+    let mut out = src.as_bytes().to_vec();
+    let mut changed = false;
+    for i in 0..lexed.len() {
+        if !matches!(
+            lexed.kind(i),
+            SyntaxKind::COMMENT | SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT
+        ) {
+            continue;
+        }
+        let t = lexed.text(i);
+        if t.starts_with("// (") && t.trim_end().ends_with(" prelude)") {
+            continue;
+        }
+        let r = lexed.text_range(i);
+        for b in &mut out[r] {
+            if *b != b'\n' && *b != b'\r' {
+                *b = b' ';
+            }
+        }
+        changed = true;
+    }
+    if !changed {
+        return src.into();
+    }
+    // (Whole comments were blanked, so what's left is still UTF-8.)
+    String::from_utf8(out).unwrap().into()
 }

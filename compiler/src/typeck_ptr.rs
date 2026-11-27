@@ -30,6 +30,11 @@ pub struct Ptrs {
     pub methods: HashMap<(usize, usize), bool>,
     /// Assignments `p = q` to a pointer that holds a cell: they re-point it, by the `=`'s range.
     pub repoints: HashSet<(usize, usize)>,
+    /// Struct fields holding a pointer to a number, string or bool: a slot over the place, or
+    /// null (also in `mut_ref_fields`).
+    pub cell_fields: HashSet<String>,
+    /// Functions and methods declared `-> *mut T` / `-> *const T`, by name.
+    pub ret_fns: HashSet<String>,
 }
 
 /// Whether a type is a raw pointer (`*const T` / `*mut T`).
@@ -132,9 +137,46 @@ impl Checker<'_> {
             ast::Expr::FieldExpr(f) => f
                 .name_ref()
                 .is_some_and(|n| self.ptrs.fields.contains(n.text().to_string().as_str())),
-            ast::Expr::CallExpr(c) => ptr_fn(&c).is_some(),
+            ast::Expr::CallExpr(c) => ptr_fn(&c).is_some() || self.ptr_ret_call(&c),
+            ast::Expr::MethodCallExpr(m) => m
+                .name_ref()
+                .is_some_and(|n| self.ptrs.ret_fns.contains(n.text().to_string().as_str())),
             _ => false,
         }
+    }
+
+    /// The value of a raw pointer field holding a number, string or bool (`Counter { p: &mut x
+    /// }`, `p: &s`, `p: q`, `p: ptr::null()`, `p: Box::into_raw(..)`): kept as a slot over the
+    /// place, as for a `&mut i32` field (`&s` too, and a pointer local's cell).
+    pub(super) fn keep_ptr_slot(&mut self, e: &ast::Expr) {
+        let e = unsafe_tail(e);
+        let e = match &e {
+            ast::Expr::CastExpr(c) => match c.expr() {
+                Some(x) => unsafe_tail(&x),
+                None => return,
+            },
+            _ => e,
+        };
+        if let ast::Expr::CallExpr(c) = &e
+            && ptr_fn(c).is_some()
+        {
+            return;
+        }
+        self.shared_slot_ok = true;
+        self.keep_slot(&e);
+        self.shared_slot_ok = false;
+    }
+
+    /// A call of one of your functions declared `-> *mut T` / `-> *const T` (by its last path
+    /// segment: `f()`, `S::f()`).
+    fn ptr_ret_call(&self, c: &ast::CallExpr) -> bool {
+        let Some(ast::Expr::PathExpr(p)) = c.expr() else {
+            return false;
+        };
+        p.path()
+            .and_then(|p| p.segment())
+            .and_then(|s| s.name_ref())
+            .is_some_and(|n| self.ptrs.ret_fns.contains(n.text().to_string().as_str()))
     }
 
     /// `e`, a pointer to a number, string, bool or Option, is passed around as its cell: mark
@@ -198,6 +240,12 @@ impl Checker<'_> {
                 }
             }
             ast::Expr::CallExpr(c) if ptr_fn(&c).is_some() => {}
+            // A call of your `-> *mut i32` (it returns the slot), a pointer field (it holds one).
+            ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_) | ast::Expr::FieldExpr(_)
+                if self.is_ptr(e) =>
+            {
+                self.keep_slot(e);
+            }
             // `unsafe { &mut *q }`
             ast::Expr::BlockExpr(b) => {
                 if let Some(tail) = b.stmt_list().and_then(|s| s.tail_expr()) {
@@ -234,11 +282,27 @@ impl Checker<'_> {
         self.ptrs.locals.insert(d);
         if self.cellable(ty) {
             self.ptrs.cells.insert(d);
+            // (`let q = h.count_ptr();`: the slot it returns is the cell, read through `[0]`.)
+            self.slot_bindings.remove(&d);
             if let Some(init) = &init {
                 self.ptr_cell(init);
             }
         }
         true
+    }
+
+    /// `c.p = &mut y` with `p: *mut i32`: the field takes the new slot (after both sides are
+    /// checked).
+    pub(super) fn ptr_assign_field(&mut self, b: &ast::BinExpr) {
+        if let (Some(ast::Expr::FieldExpr(f)), Some(rhs)) = (b.lhs(), b.rhs())
+            && f
+                .name_ref()
+                .is_some_and(|n| self.ptrs.cell_fields.contains(n.text().to_string().as_str()))
+        {
+            let r = self.range(f.syntax());
+            self.slot_keeps.insert(r);
+            self.keep_ptr_slot(&rhs);
+        }
     }
 
     /// `p = q` with `p` a pointer local holding a cell: re-point it.
@@ -282,11 +346,11 @@ impl Checker<'_> {
                         "`as_ref()` on a pointer to an `Option` isn't supported (`Option<Option<T>>` has no JS representation)",
                     );
                 }
+                // `if let Some(n) = p.as_mut()` of a number, string or bool: `n` binds a slot
+                // over the place (`κσ.$ptrSlot`), so writes through `*n` reach it.
                 if method == "as_mut" && in_cell {
-                    self.error(
-                        m.syntax(),
-                        "`as_mut()` on a pointer to a number, string or bool isn't supported yet; write through the pointer (`*p = ..`)",
-                    );
+                    let r = self.range(m.syntax());
+                    self.slot_calls.insert(r);
                 }
                 Ty::Option(Box::new(t))
             }

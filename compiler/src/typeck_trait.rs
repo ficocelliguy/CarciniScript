@@ -705,6 +705,20 @@ impl Checker<'_> {
                 self.impl_assoc = saved_assoc;
                 let saved = self.self_ty.replace(Ty::Param("Self".into()));
                 self.param_bounds.insert("Self".into(), vec![tr.clone()]);
+                // (And the method's own `where Self: PartialEq`.)
+                let mut self_bounds = vec![tr.clone()];
+                for p in f.where_clause().into_iter().flat_map(|w| w.predicates()) {
+                    if p.ty().is_some_and(|t| t.syntax().text() == "Self") {
+                        for b in p.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
+                            if let Some(ast::Type::PathType(pt)) = b.ty()
+                                && let Some(n) = pt.path().and_then(|p| p.segment()?.name_ref())
+                            {
+                                self_bounds.push(n.text().to_string());
+                            }
+                        }
+                    }
+                }
+                self.param_bounds.insert("Self".into(), self_bounds);
                 // (`trait Stats: Iterator`: `self` is an iterator, of items unchecked here.)
                 let self_ty = if def.supers.iter().any(|s| {
                     matches!(

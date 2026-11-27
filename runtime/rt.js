@@ -3719,6 +3719,8 @@
     // `[1]` reads and writes it too.
     $cellSlot(c) {
       return {
+        // (The box itself, for `ptr::eq`.)
+        $base: c.$base ?? c,
         get 0() {
           return c[0];
         },
@@ -4480,6 +4482,26 @@
     // `p.as_ref()` on a raw pointer to a cell: the value, or `None` for a null pointer.
     $ptrGet(cell) {
       return cell == null ? null : cell[0];
+    },
+    // `c[i]` with `c` of a type parameter bounded `Index<Ix>`: a Vec's (or deque's) element, or
+    // your type's `index`.
+    $indexAny(c, i, loc) {
+      if (Array.isArray(c) || c instanceof Deque) {
+        if (!(i >= 0 && i < c.length)) rt.$oob(c, i, loc);
+        return c instanceof Deque ? c.b[c.$p(i)] : c[i];
+      }
+      const f = c.index ?? c.index$0;
+      if (typeof f === "function") return f.call(c, i);
+      throw new TypeError(`${loc}: this value can't be indexed`);
+    },
+    // `ptr::eq(a, b)`: the same object, or slots over the same box.
+    $ptrEq(a, b) {
+      return a === b || (a != null && b != null && (a.$base ?? a) === (b.$base ?? b));
+    },
+    // `p.as_mut()` of a pointer to a number, string or bool: null, or a slot (`[1]` too) over
+    // the place its cell or slot reads and writes.
+    $ptrSlot(cell) {
+      return cell == null ? null : rt.$cellSlot(cell);
     },
     // `mem::transmute::<From, To>(x)` between same-size numbers (and `char`, `bool`): the bytes
     // reinterpreted. 64-bit integers are JS numbers, 128-bit ones BigInts.
@@ -5635,8 +5657,14 @@
         if (k === "prototype" || ((k === "name" || k === "length") && typeof ext[k] !== "function")) continue;
         const desc = Object.getOwnPropertyDescriptor(ext, k);
         if (!desc.get && typeof desc.value === "function") o[k] = ext[k].bind(ext);
-        // (Associated consts, `T::SIZE`: read off the impl class.)
-        else if (k[0] !== "$") Object.defineProperty(o, k, { get: () => ext[k], enumerable: true });
+        // (Associated consts, `T::SIZE`: read off the impl class, with this class as `this`, so
+        // a const of `impl<T> Tr for Vec<T>` reads `T`'s class as `this.elem`.)
+        else if (k[0] !== "$")
+          Object.defineProperty(o, k, {
+            get: () => (desc.get ? desc.get.call(o) : ext[k]),
+            enumerable: true,
+            configurable: true,
+          });
       }
       return o;
     },

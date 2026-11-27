@@ -4050,8 +4050,11 @@ impl<'a> Codegen<'a> {
             ast::Expr::CastExpr(c) => self.emit_cast(c),
             ast::Expr::CallExpr(c)
                 if crate::typeck::result_ctor_call(c).is_some()
-                    && self.lookup("Ok").is_none()
-                    && !self.fns.contains_key("Ok") =>
+                    && !crate::typeck::ctor_name(c).is_some_and(|n| {
+                        self.lookup(n).is_some()
+                            || (self.fns.contains_key(n)
+                                && crate::stdtime::user_ctor_fn_at(self.src, c.syntax()))
+                    }) =>
             {
                 self.emit_result_ctor(c, crate::typeck::result_ctor_call(c).unwrap())
             }
@@ -6777,6 +6780,18 @@ impl<'a> Codegen<'a> {
                 };
                 (f, ty)
             }
+            // `Range::from(1..3)`: the range itself.
+            [kind, "from"]
+                if crate::ty::RangeKind::from_name(kind).is_some()
+                    && matches!(self.conv_of(c.syntax()), Some(crate::adt::Conv::Identity)) =>
+            {
+                let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
+                let Some(arg) = c.arg_list().and_then(|l| l.args().next()) else {
+                    return (Frag::text("undefined"), ty);
+                };
+                let (f, _) = self.emit_expr(&arg, Some(&ty));
+                (f, ty)
+            }
             ["String", "from"] => {
                 let a = self.emit_args(c.arg_list(), &[Ty::Str]);
                 let a = a.into_iter().next().unwrap_or_else(|| Frag::text("\"\""));
@@ -7414,7 +7429,8 @@ impl<'a> Codegen<'a> {
             let ty = self.ty_of(&node).unwrap_or(Ty::Unknown);
             let f = match (method.as_str(), in_cell) {
                 ("is_null", _) => rf.wrap("(", " == null)"),
-                ("as_ref" | "as_mut", true) => rf.wrap("κσ.$ptrGet(", ")"),
+                ("as_mut", true) => rf.wrap("κσ.$ptrSlot(", ")"),
+                ("as_ref", true) => rf.wrap("κσ.$ptrGet(", ")"),
                 ("read", true) => rf.wrap("(", ")[0]"),
                 ("write", true) => {
                     let v = match m.arg_list().and_then(|a| a.args().next()) {
@@ -9461,6 +9477,17 @@ impl<'a> Codegen<'a> {
             return (Frag::text("undefined"), Ty::Unknown);
         };
         let base = self.same_vec_call(&base).unwrap_or(base);
+        // `c[ix]` with `C: Index<Ix>`: by what `c` is at run time.
+        if self.types.param_indexes.contains(&self.range_of(ix.syntax())) {
+            let (bf, _) = self.receiver(&base);
+            let (f, t) = self.emit_expr(&index, None);
+            let f = self.by_value(&index, f, &t);
+            let ty = self.ty_of(ix.syntax()).unwrap_or(Ty::Unknown);
+            let loc = js_string(&self.location(ix.syntax()));
+            let mut out = Frag::mapped(self.off(ix.syntax()), "κσ.$indexAny(");
+            out.append(bf).push(", ").append(f).push(format!(", {loc})"));
+            return (out, ty);
+        }
         // `grid[i]` with an `impl Index`: `grid.index$0(i)`.
         if let Some(crate::adt::Conv::Method { key }) = self.conv_of(ix.syntax()) {
             let (bf, _) = self.receiver(&base);

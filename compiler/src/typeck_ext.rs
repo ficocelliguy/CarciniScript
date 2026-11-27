@@ -1268,7 +1268,11 @@ impl Checker<'_> {
                     .turbofish(m)
                     .or_else(|| expected.cloned())
                     .unwrap_or_else(|| e.clone());
-                if !self.unify(&target, &e) {
+                // `impl<A> Sum<A> for Size where Size: Add<A, Output = Size>`: your impl takes
+                // items of any type its `where` allows (its `sum` folds them).
+                let any_items = matches!(self.zonk(&target), Ty::Adt(n, _)
+                    if self.adts.method(&n, method).is_some_and(|m| !m.trait_params.is_empty()));
+                if !any_items && !self.unify(&target, &e) {
                     let msg = format!(
                         "`{}` can't be the {method} of `{}` items",
                         self.describe(&target),

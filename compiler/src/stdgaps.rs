@@ -709,7 +709,7 @@ pub(crate) fn expand(
             i += 1;
             continue;
         }
-        if std_module(&name).is_none() || txt(i + 1) == "!" || declares(text, &name) {
+        if std_module(&name).is_none() || txt(i + 1) == "!" {
             i += 1;
             continue;
         }
@@ -717,6 +717,12 @@ pub(crate) fn expand(
         let (q, std_path) = qualifier_start(&toks, i);
         let module = std_module(&name).unwrap_or_default();
         let qualified = q < i;
+        // (The file's own `struct OsStr` is what a bare `OsStr` names; `std::ffi::OsStr` is
+        // still std's.)
+        if !(qualified && std_path) && declares(text, &name) {
+            i += 1;
+            continue;
+        }
         let ok = if qualified {
             std_path
                 && toks[q..i]

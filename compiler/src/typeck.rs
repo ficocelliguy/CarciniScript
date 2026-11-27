@@ -70,7 +70,7 @@ pub use modules::{
 };
 pub use ptr::{Ptrs, cellable as ptr_cellable, is_ptr_type, transmute_name};
 pub use quote::QuoteTok;
-pub use res::{is_std_error, result_ctor_call, result_variant};
+pub use res::{ctor_name, is_std_error, result_ctor_call, result_variant};
 
 use ra_ap_syntax::{
     AstNode, SyntaxNode,
@@ -139,6 +139,9 @@ pub struct Types {
     pub slot_calls: std::collections::HashSet<(usize, usize)>,
     /// Bindings of such a slot (`Some(x)` in `if let`/`match`): `x` reads and writes `x[1]`.
     pub slot_bindings: std::collections::HashSet<(usize, usize)>,
+    /// `c[ix]` with `c` of a type parameter bounded `Index<Ix>` / `IndexMut<Ix>`: indexed at run
+    /// time by what the value is (`κσ.$indexAny`).
+    pub param_indexes: std::collections::HashSet<(usize, usize)>,
     /// `for x in v` iterables naming a `&mut` collection (`v: &mut [T]`): looped by index like
     /// `for x in &mut v`, so `*x = ..` writes the element.
     pub mut_ref_loops: std::collections::HashSet<(usize, usize)>,
@@ -420,6 +423,7 @@ impl<'a> Checker<'a> {
             into_args: Default::default(),
             slot_calls: Default::default(),
             slot_bindings: Default::default(),
+            param_indexes: Default::default(),
             mut_ref_loops: Default::default(),
             copy_arrays: Default::default(),
             copy_array_consts: Default::default(),
@@ -465,6 +469,7 @@ impl<'a> Checker<'a> {
             slot_wraps: Default::default(),
             ret_item_slots: Default::default(),
             ret_slot_param: false,
+            shared_slot_ok: false,
             slot_param_ok: false,
             slot_keeps: Default::default(),
             slot_assigns: Default::default(),
@@ -594,15 +599,6 @@ impl<'a> Checker<'a> {
                     .and_then(|r| r.ty())
                     .map(|t| self.lower_ret_type(&t))
                     .unwrap_or(Ty::Unit);
-                if let Some(t) = f.ret_type().and_then(|r| r.ty())
-                    && is_ptr_type(&t)
-                    && self.cellable(&ret)
-                {
-                    self.error(
-                        t.syntax(),
-                        "returning a raw pointer to a number, string or bool isn't supported yet",
-                    );
-                }
                 let mut bound_args: Vec<(String, String, Vec<Ty>)> = self
                     .param_trait_args
                     .iter()
@@ -623,6 +619,9 @@ impl<'a> Checker<'a> {
                 });
                 let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t));
                 let ret_slot = self.ret_slot_kind(f, &ret);
+                if f.ret_type().and_then(|r| r.ty()).is_some_and(|t| is_ptr_type(&t)) {
+                    self.ptrs.ret_fns.insert(name.text().to_string());
+                }
                 let opt_slot_params = self.opt_slot_params(f, &params);
                 let tuple_slot_params = f
                     .param_list()
@@ -817,6 +816,7 @@ pub fn check(
     let into_args = std::mem::take(&mut c.into_args);
     let slot_calls = std::mem::take(&mut c.slot_calls);
     let slot_bindings = std::mem::take(&mut c.slot_bindings);
+    let param_indexes = std::mem::take(&mut c.param_indexes);
     let mut_ref_loops = std::mem::take(&mut c.mut_ref_loops);
     let array_reads = std::mem::take(&mut c.array_reads);
     let iter_of_args = std::mem::take(&mut c.iter_of_args);
@@ -876,6 +876,7 @@ pub fn check(
             into_args,
             slot_calls,
             slot_bindings,
+            param_indexes,
             mut_ref_loops,
             array_reads,
             iter_of_args,
@@ -1025,6 +1026,7 @@ struct Checker<'a> {
     into_args: std::collections::HashSet<(usize, usize)>,
     slot_calls: std::collections::HashSet<(usize, usize)>,
     slot_bindings: std::collections::HashSet<(usize, usize)>,
+    param_indexes: std::collections::HashSet<(usize, usize)>,
     mut_ref_loops: std::collections::HashSet<(usize, usize)>,
     /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
     copy_arrays: std::collections::HashSet<(usize, usize)>,
@@ -1104,6 +1106,9 @@ struct Checker<'a> {
     /// The function being checked is declared `-> &mut T` / `-> Option<&mut T>` with `T` a type
     /// parameter (`ret_slot` is set): it returns a slot on every path (`keep_generic_ret`).
     ret_slot_param: bool,
+    /// While keeping the value of a raw pointer field (`p: &x` of `p: *const i32`): a shared
+    /// `&place` makes a slot too.
+    pub(super) shared_slot_ok: bool,
     /// While marking what a function declared `-> &mut T` returns: a type parameter `T` counts
     /// as a slot referent (`slot_elem`).
     slot_param_ok: bool,
@@ -5470,8 +5475,11 @@ impl<'a> Checker<'a> {
             }
             ast::Expr::CallExpr(c)
                 if result_ctor_call(c).is_some()
-                    && self.lookup("Ok").is_none()
-                    && !self.fns.contains_key("Ok") =>
+                    && !ctor_name(c).is_some_and(|n| {
+                        self.lookup(n).is_some()
+                            || (self.fns.contains_key(n)
+                                && crate::stdtime::user_ctor_fn_at(self.src, c.syntax()))
+                    }) =>
             {
                 self.result_ctor(c, result_ctor_call(c).unwrap(), expected)
             }
@@ -5698,8 +5706,18 @@ impl<'a> Checker<'a> {
                                 && l.initializer().is_some_and(|i| i.syntax() == r.syntax())
                                 && matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
                         });
+                // (`let (r, n) = (1..3, 0);`, `vec![0..2, 4..6]`: a tuple's or an array's element is a
+                // value too, which `&s[r]` slices by.)
+                let element = r.start().is_some()
+                    && r.syntax().parent().is_some_and(|p| {
+                        matches!(
+                            p.kind(),
+                            ra_ap_syntax::SyntaxKind::TUPLE_EXPR | ra_ap_syntax::SyntaxKind::ARRAY_EXPR
+                        )
+                    });
                 if wanted
                     || bound
+                    || element
                     || self.range_ext_value(r, kind)
                     || range_conv_value(r)
                     || expected.is_some_and(|t| self.range_bound_arg(t, kind))
@@ -6435,6 +6453,13 @@ impl<'a> Checker<'a> {
                 self.slice_views.insert(r);
             }
         }
+        // `*c.p += 1` / `*h.count_ptr() = 0`: a write through a raw pointer needs no `mut`.
+        if let ast::Expr::PrefixExpr(pe) = strip_parens(e)
+            && pe.op_kind() == Some(UnaryOp::Deref)
+            && pe.expr().is_some_and(|x| self.is_ptr(&x))
+        {
+            return;
+        }
         // `*w.n += 1` with `n: &mut i32`, `*s.at(i) = 0`: a write through the reference.
         if self.through_slot(e) {
             return;
@@ -6583,6 +6608,7 @@ impl<'a> Checker<'a> {
                     }
                     None => {
                         self.check(&rhs, &lt);
+                        self.ptr_assign_field(b);
                     }
                 }
                 // `r = &mut other;` / `r = s.at(1);` with `r` a `&mut i32` local: rebind its
@@ -7184,6 +7210,22 @@ impl<'a> Checker<'a> {
                     self.check(a, &Ty::Str);
                 }
                 Ty::Str
+            }
+            // `Range::from(1..3)` / `RangeInclusive::from(a..=b)`: std's `impl<T> From<T> for T`,
+            // the range itself.
+            [kind, "from"] if args.len() == 1 && crate::ty::RangeKind::from_name(kind).is_some() => {
+                let t = self.infer(&args[0], expected);
+                if !matches!(self.shallow(&t), Ty::Range(_, k) if Some(k) == crate::ty::RangeKind::from_name(kind))
+                {
+                    let msg = format!(
+                        "mismatched types: expected `{kind}`, found `{}`",
+                        self.describe(&t)
+                    );
+                    self.error(args[0].syntax(), msg);
+                }
+                let r = self.range(c.syntax());
+                self.conversions.insert(r, crate::adt::Conv::Identity);
+                t
             }
             ["Vec" | "vec", ctor @ ("new" | "with_capacity" | "default")] => {
                 self.arg_count(
@@ -8531,6 +8573,22 @@ impl<'a> Checker<'a> {
             ret
         };
 
+        // `.min(n)` / `.max(n)` / `.clamp(a, b)` on a value whose type isn't known (an error
+        // upstream, or not settled yet): integers have them too, so the arguments decide. (An `f64`
+        // guess turned one unresolved name into a mismatch at every use of the result.)
+        if matches!(resolved, Ty::Unknown | Ty::Var(_))
+            && matches!(method.as_str(), "min" | "max" | "clamp")
+            && let Some((first, rest)) = args.split_first()
+        {
+            let at = self.infer(first, None);
+            for a in rest {
+                self.check(a, &at);
+            }
+            if matches!(resolved, Ty::Var(_)) && !matches!(self.shallow(&at), Ty::Unknown) {
+                self.unify(&rt, &at);
+            }
+            return at;
+        }
         let receiver_ty = match resolved {
             Ty::Unknown | Ty::Var(_) if is_float_method(&method) => Ty::Float { f32: false },
             Ty::Extern(name) => return self.extern_method(m, &name, &method, &args),
@@ -9278,6 +9336,49 @@ impl<'a> Checker<'a> {
         if let Ty::Adt(n, _) = self.shallow(&bt) {
             return self.index_overload(ix, &n, &bt, &index);
         }
+        // `c[ix]` with `C: IndexMut<Ix, Output = Entry>`: by what `c` is at run time (a Vec's
+        // element, your type's `index`).
+        if let Ty::Param(p) = self.shallow(&bt)
+            && (self.param_has(&p, "Index") || self.param_has(&p, "IndexMut"))
+        {
+            let want = self
+                .op_args
+                .get(&(p.clone(), "Index".to_string()))
+                .or_else(|| self.op_args.get(&(p.clone(), "IndexMut".to_string())))
+                .cloned();
+            match want {
+                Some(w) => {
+                    self.check(&index, &w);
+                }
+                None => {
+                    self.infer(&index, None);
+                }
+            }
+            let out = self
+                .generics
+                .get(&format!("{p}::Output"))
+                .cloned()
+                .filter(|t| *t != Ty::Param(p.clone()))
+                .unwrap_or(Ty::Unknown);
+            // (A whole element replaced, `c[ix] = e` / `c[ix] += 1`: no place to write.)
+            if ix
+                .syntax()
+                .parent()
+                .and_then(ast::BinExpr::cast)
+                .is_some_and(|b| {
+                    matches!(b.op_kind(), Some(BinaryOp::Assignment { .. }))
+                        && b.lhs().is_some_and(|l| l.syntax() == ix.syntax())
+                })
+            {
+                self.error(
+                    ix.syntax(),
+                    format!("assigning to `{}` through a type parameter's `IndexMut` isn't supported yet (write to a field of the element, or take `&mut` of it)", ix.syntax().text()),
+                );
+            }
+            let r = self.range(ix.syntax());
+            self.param_indexes.insert(r);
+            return out;
+        }
         // `map[0]` / `set[1]` by position, `map[&k] = v` (indexmap's `Index` / `IndexMut`).
         if let Ty::Coll(kind @ (crate::ty::Coll::IndexMap | crate::ty::Coll::IndexSet), view) =
             self.shallow(&bt)
@@ -9608,7 +9709,19 @@ impl<'a> Checker<'a> {
                 self.macro_arg(&value, Some(&elem));
                 self.macro_arg(&count, Some(&USIZE));
             } else {
-                for a in macros::split_args(self.src, self.base, mc) {
+                let args = macros::split_args(self.src, self.base, mc);
+                // (`vec![0..2, 4..6]`: ranges as values, which `&s[r]` slices by, not iterators.)
+                if let Some((Some(ast::Expr::RangeExpr(r)), _)) = args.first().map(macros::parse_arg)
+                    && r.start().is_some()
+                    && matches!(self.shallow(&elem), Ty::Var(_))
+                {
+                    use ra_ap_syntax::ast::RangeItem;
+                    let inclusive = r.op_kind() == Some(ast::RangeOp::Inclusive);
+                    let kind = RangeKind::of(true, r.end().is_some(), inclusive);
+                    let e = self.fresh(VarKind::General);
+                    self.unify(&elem, &Ty::Range(Box::new(e), kind));
+                }
+                for a in args {
                     self.macro_arg(&a, Some(&elem));
                 }
             }

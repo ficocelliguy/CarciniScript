@@ -237,8 +237,6 @@ There is one JS thread, and scripts share it with the game.
   instead of being undefined behavior. A null pointer read throws a JS `TypeError`, not a
   segfault.
 - **`*const` writes aren't rejected.** Writing through a `*const T` is accepted.
-- **Pointers to numbers stay in locals and parameters.** Such a pointer in a struct field or as a
-  function's return value is an error (a pointer to a struct can go anywhere).
 - **`{:p}` prints a made-up address** (`0x10000` and up): the same for one object each time,
   but a number or string gets a new one each time it's formatted, and two references to one
   number variable don't print the same address. A function pointer's `{:?}` (a derived `Debug`
