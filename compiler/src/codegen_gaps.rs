@@ -52,7 +52,7 @@ impl Codegen<'_> {
     }
 
     /// A range argument's `lo, hi, inclusive` (`hi` is `null` for `lo..`).
-    fn gap_range(&mut self, a: Option<&ast::Expr>) -> Option<Frag> {
+    pub(super) fn gap_range(&mut self, a: Option<&ast::Expr>) -> Option<Frag> {
         use ra_ap_syntax::ast::{RangeItem, RangeOp};
         let Some(ast::Expr::RangeExpr(r)) = a else {
             return None;
@@ -231,6 +231,45 @@ impl Codegen<'_> {
             (Ty::Vec(_), "strip_suffix") => {
                 helper("vecStrip", vec![self.gap_arg(a0), Frag::text("true")])
             }
+            (Ty::Vec(_), "split_at_checked" | "split_at_mut_checked") => {
+                let mid = self.gap_arg(a0);
+                let mutable = method == "split_at_mut_checked";
+                helper("splitAtChecked", vec![mid, Frag::text(format!("{mutable}, {loc}"))])
+            }
+            (Ty::Vec(_), "split_first_mut" | "split_last_mut") => {
+                let last = method == "split_last_mut";
+                helper("splitEndMut", vec![Frag::text(format!("{last}, {loc}"))])
+            }
+            (Ty::Vec(_), "partition_point") => helper("partitionPoint", vec![self.gap_arg(a0)]),
+            (Ty::Vec(_), "is_sorted_by") => helper("sliceIsSortedBy", vec![self.gap_arg(a0)]),
+            (Ty::Vec(_), "is_sorted_by_key") => {
+                helper("sliceIsSortedByKey", vec![self.gap_arg(a0)])
+            }
+            (Ty::Vec(_), "dedup_by") => helper("dedupBy", vec![self.gap_arg(a0)]),
+            (Ty::Vec(_), "split" | "split_inclusive" | "rsplit") => {
+                let mode = match method {
+                    "split" => "0",
+                    "split_inclusive" => "1",
+                    _ => "2",
+                };
+                helper("sliceSplit", vec![self.gap_arg(a0), Frag::text(mode)])
+            }
+            (Ty::Vec(_), "try_reserve" | "try_reserve_exact") => {
+                let mut f = Frag::text("(void (");
+                f.append(self.gap_arg(a0)).push("), κσ.$okOf(undefined))");
+                f
+            }
+            (Ty::Vec(_), "first_chunk" | "last_chunk" | "first_chunk_mut" | "last_chunk_mut") => {
+                use ra_ap_syntax::ast::HasGenericArgs;
+                let n = match m.generic_arg_list()?.generic_args().next()? {
+                    ast::GenericArg::ConstArg(c) => self.gap_arg(c.expr().as_ref()),
+                    ast::GenericArg::TypeArg(t) => Frag::text(t.syntax().text().to_string()),
+                    _ => return None,
+                };
+                let last = method.starts_with("last");
+                let mutable = method.ends_with("_mut");
+                helper("firstChunk", vec![n, Frag::text(format!("{last}, {mutable}, {loc}"))])
+            }
             (Ty::Vec(_), "is_ascii") => helper("isAscii", vec![]),
             (Ty::Vec(_), "eq_ignore_ascii_case") => {
                 helper("bytesEqIgnoreCase", vec![self.gap_arg(a0)])
@@ -253,6 +292,10 @@ impl Codegen<'_> {
                     "toBytes",
                     vec![Frag::text(format!("{}, {little}", k.bits()))],
                 )
+            }
+            (Ty::Float { f32 }, "to_le_bytes" | "to_be_bytes" | "to_ne_bytes") => {
+                let little = method != "to_be_bytes";
+                helper("floatToBytes", vec![Frag::text(format!("{f32}, {little}"))])
             }
             (Ty::Int(k), "unsigned_abs") => {
                 let _ = k;
@@ -355,6 +398,12 @@ impl Codegen<'_> {
             f
         };
         let f = match tail {
+            ["Option", "from"] => call("some", vec![self.gap_arg(a0)]),
+            ["slice", "from_ref"] => {
+                let mut f = Frag::mapped(start, "[");
+                f.append(self.gap_arg(a0)).push("]");
+                f
+            }
             [
                 int,
                 m @ ("from_le_bytes" | "from_be_bytes" | "from_ne_bytes"),
@@ -373,6 +422,14 @@ impl Codegen<'_> {
                             k.is_big()
                         )),
                     ],
+                )
+            }
+            [float @ ("f32" | "f64"), m @ ("from_le_bytes" | "from_be_bytes" | "from_ne_bytes")] => {
+                let b = self.gap_arg(a0);
+                let little = *m != "from_be_bytes";
+                call(
+                    "floatFromBytes",
+                    vec![b, Frag::text(format!("{}, {little}", *float == "f32"))],
                 )
             }
             [int, "__nz_new"] if IntKind::from_name(int).is_some() => {

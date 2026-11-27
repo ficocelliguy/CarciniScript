@@ -103,7 +103,8 @@ impl Codegen<'_> {
             (Coll::VecDeque, "pop_front") => "shift",
             (
                 Coll::VecDeque,
-                "front" | "back" | "insert" | "remove" | "make_contiguous" | "append" | "clone",
+                "front" | "back" | "insert" | "remove" | "make_contiguous" | "append" | "clone"
+                | "split_off" | "as_slices" | "as_mut_slices",
             ) => method,
             (
                 Coll::BinaryHeap,
@@ -163,6 +164,15 @@ impl Codegen<'_> {
             (Coll::VecDeque, "make_contiguous") => method_call("$arr", vec![]),
             (Coll::VecDeque, "append") => call("append", vec![arg(0)]),
             (Coll::VecDeque, "clone") => method_call("$clone", vec![]),
+            (Coll::VecDeque, "split_off") => {
+                let name_off = m.name_ref().map(|n| self.off(n.syntax())).unwrap_or(0);
+                let loc = super::js_string(&self.location_at(name_off));
+                call("splitOff", vec![arg(0), Frag::text(loc)])
+            }
+            // (Its contents as one contiguous array, and an empty second half.)
+            (Coll::VecDeque, "as_slices" | "as_mut_slices") => {
+                method_call("$arr", vec![]).wrap("[", ", []]")
+            }
             (Coll::BinaryHeap, "push") => call("heapPush", vec![arg(0)]),
             (Coll::BinaryHeap, "pop") => call("heapPop", vec![]),
             (Coll::BinaryHeap, "peek") => rf.clone().wrap("(", "[0] ?? null)"),

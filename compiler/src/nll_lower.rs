@@ -1535,7 +1535,11 @@ impl<'e, 'a> Lower<'e, 'a> {
         let op = self.operand(&ex);
         let cur = self.body.locals[result.idx()].rty.clone();
         if !cur.has_regions() && ex.rty.has_regions() {
-            self.body.locals[result.idx()].rty = ex.rty.clone();
+            // (With fresh regions, so a later branch need not outlive this one: `if c { a } else
+            // { b }` with `a: &mut T` and `b: &mut T` of different lifetimes is a third `&mut T`.)
+            let fresh = ex.rty.map_regions(&mut |_| self.body.new_region());
+            self.body.locals[result.idx()].rty = fresh.clone();
+            self.env.relate(&mut self.body, &ex.rty, &fresh, span);
         } else {
             self.env.relate(&mut self.body, &ex.rty, &cur, span);
         }

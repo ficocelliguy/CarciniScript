@@ -764,6 +764,17 @@
     $containsKey(k) {
       return this.m.has(key(k));
     }
+    // `get_key_value(&k)` / `remove_entry(&k)`: the stored key with its value.
+    $getKeyValue(k) {
+      const slot = this.m.get(key(k));
+      return slot ? [slot[0], slot[1]] : null;
+    }
+    $removeEntry(k) {
+      const slot = this.m.get(key(k));
+      if (!slot) return null;
+      this.$remove(k);
+      return [slot[0], slot[1]];
+    }
     $remove(k) {
       const kk = key(k);
       const slot = this.m.get(kk);
@@ -957,6 +968,10 @@
       if (i >= this.a.length || (this.exact && end > this.a.length)) return DONE;
       this.i += this.step;
       return { value: this.a.slice(i, end), done: false };
+    }
+    // `chunks_exact(n).remainder()`: the elements past the last whole chunk.
+    remainder() {
+      return this.a.slice(this.a.length - (this.a.length % this.n));
     }
   }
   class StepByIt extends AdapterIt {
@@ -1360,6 +1375,9 @@
       if (eqOnly) return eq(a, b) ? 0 : 1;
       return cmp(a, b);
     }
+    $remainder() {
+      return this.it.remainder();
+    }
     $isSorted() {
       return this.$isSortedBy((a, b) => cmp(a, b) <= 0);
     }
@@ -1732,7 +1750,10 @@
     "TryFromIntError:PosOverflow": "number too large to fit in target type",
     "TryFromIntError:NegOverflow": "number too small to fit in target type",
     "TryFromSliceError:": "could not convert slice to array",
+    "FromUtf16Error:LoneSurrogate": "invalid utf-16: lone surrogate found",
     "CharTryFromError:": "converted integer out of range for `char`",
+    "TryFromCharError:": "unicode code point out of range",
+    "TryReserveError:": "memory allocation failed because the computed capacity exceeded the collection's maximum",
     "Error:": "an error occurred when formatting an argument",
     "BorrowError:": "RefCell already mutably borrowed",
     "BorrowMutError:": "RefCell already borrowed",
@@ -1747,7 +1768,7 @@
     }
     $dbg() {
       if (this.type === "TryFromIntError") return `TryFromIntError(${this.kind})`;
-      if (this.type === "TryFromSliceError" || this.type === "CharTryFromError") return `${this.type}(())`;
+      if (this.type === "TryFromSliceError" || this.type === "CharTryFromError" || this.type === "TryFromCharError") return `${this.type}(())`;
       return this.kind ? `${this.type} { kind: ${this.kind} }` : this.type;
     }
     toString() {
@@ -2907,6 +2928,69 @@
       for (let i = 0; i < p.length; i++) if (!eq(v[at + i], p[i])) return null;
       return suffix ? v.slice(0, at) : v.slice(p.length);
     },
+    // `v.split_at_checked(mid)` (`mut`: views, so writes through either half reach `v`).
+    $splitAtChecked(v, mid, mut, location) {
+      if (mid > v.length) return null;
+      if (mut) return [rt.$sliceMut(v, 0, mid, false, location), rt.$sliceMut(v, mid, null, false, location)];
+      v = arr(v);
+      return [v.slice(0, mid), v.slice(mid)];
+    },
+    // `v.split_first_mut()` / `split_last_mut()` of JS objects: the element and a view of the rest.
+    $splitEndMut(v, last, location) {
+      const n = v.length;
+      if (n === 0) return null;
+      return last
+        ? [arr(v)[n - 1], rt.$sliceMut(v, 0, n - 1, false, location)]
+        : [arr(v)[0], rt.$sliceMut(v, 1, null, false, location)];
+    },
+    // `v.partition_point(pred)`: the first index where `pred` is false (std's binary search).
+    $partitionPoint(v, pred) {
+      return rt.$binarySearchBy(v, (x) => (pred(x) ? -1 : 1))[0];
+    },
+    $sliceIsSortedBy(v, le) {
+      v = arr(v);
+      for (let i = 1; i < v.length; i++) if (!le(v[i - 1], v[i])) return false;
+      return true;
+    },
+    $sliceIsSortedByKey(v, f) {
+      v = arr(v);
+      let prev;
+      for (let i = 0; i < v.length; i++) {
+        const k = f(v[i]);
+        if (i > 0 && cmp(prev, k) > 0) return false;
+        prev = k;
+      }
+      return true;
+    },
+    // `v.dedup_by(|a, b| ..)`: `a` is the later element, `b` the last one kept.
+    $dedupBy(v, same) {
+      const a = arr(v);
+      if (a.length === 0) return;
+      let j = 1;
+      for (let i = 1; i < a.length; i++) if (!same(a[i], a[j - 1])) a[j++] = a[i];
+      a.length = j;
+      if (a !== v) v.$sync();
+    },
+    // `v.split(pred)` (`mode` 0), `split_inclusive` (1), `rsplit` (2): the runs between matches.
+    $sliceSplit(v, pred, mode) {
+      v = arr(v);
+      const out = [];
+      let lo = 0;
+      for (let i = 0; i < v.length; i++) {
+        if (!pred(v[i])) continue;
+        out.push(v.slice(lo, mode === 1 ? i + 1 : i));
+        lo = i + 1;
+      }
+      if (mode !== 1 || lo < v.length) out.push(v.slice(lo));
+      if (mode === 2) out.reverse();
+      return new Iter(out[Symbol.iterator]());
+    },
+    // `v.first_chunk::<n>()` / `last_chunk` (`mut`: a view, so writes reach `v`).
+    $firstChunk(v, n, last, mut, location) {
+      if (n > v.length) return null;
+      const lo = last ? v.length - n : 0;
+      return mut ? rt.$sliceMut(v, lo, lo + n, false, location) : arr(v).slice(lo, lo + n);
+    },
     // `s.is_ascii()` on a string or a byte slice.
     $isAscii(v) {
       if (typeof v === "string") return /^[\0-\x7f]*$/.test(v);
@@ -2948,6 +3032,121 @@
       return /^(?:\p{Grapheme_Extend}|[\p{C}\p{Z}])$/u.test(c) && c !== " " ? uni : c;
     },
     // `x.to_le_bytes()` / `to_be_bytes()`: the two's complement bytes of a `bits`-wide integer.
+    // `x.rotate_left(n)` / `rotate_right(n)`: the bits of `x` at the type's width, rotated.
+    $rotateBits(x, left, bits, signed, n) {
+      const B = BigInt(bits);
+      const v = BigInt.asUintN(bits, BigInt(x));
+      const s = BigInt(n) % B;
+      const k = left ? s : (B - s) % B;
+      const r = BigInt.asUintN(bits, (v << k) | (v >> (B - k)));
+      return Number(signed ? BigInt.asIntN(bits, r) : r);
+    },
+    // `x.swap_bytes()` / `to_be()` / `from_be()`: the bytes in the other order.
+    $swapBytes(x, bits, signed) {
+      let v = BigInt.asUintN(bits, BigInt(x));
+      let r = 0n;
+      for (let i = 0; i < bits / 8; i++) {
+        r = (r << 8n) | (v & 0xffn);
+        v >>= 8n;
+      }
+      return Number(signed ? BigInt.asIntN(bits, r) : r);
+    },
+    $reverseBits(x, bits, signed) {
+      let v = BigInt.asUintN(bits, BigInt(x));
+      let r = 0n;
+      for (let i = 0; i < bits; i++) {
+        r = (r << 1n) | (v & 1n);
+        v >>= 1n;
+      }
+      return Number(signed ? BigInt.asIntN(bits, r) : r);
+    },
+    // `wrapping_shl` / `checked_shr` / `overflowing_shl`: a shift by `n` taken modulo the width;
+    // `checked_*` is `None` and `overflowing_*` reports when `n` is the width or more.
+    $intShift(x, name, bits, signed, n) {
+      const over = n >= bits;
+      const [kind, op] = name.split("_");
+      if (kind === "checked" && over) return null;
+      const s = BigInt(n % bits);
+      const v = BigInt(x);
+      let r = op === "shl" ? v << s : (signed ? v : BigInt.asUintN(bits, v)) >> s;
+      r = signed ? BigInt.asIntN(bits, r) : BigInt.asUintN(bits, r);
+      return kind === "overflowing" ? [Number(r), over] : Number(r);
+    },
+    $checkedEuclid(x, op, y) {
+      if (y === 0) return null;
+      return op === "div" ? rt.$divEuclid(x, y) : rt.$remEuclid(x, y);
+    },
+    // `x.overflowing_add(y)` and the like: `[wrapped, overflowed]`.
+    $overflowing(x, op, bits, signed, y) {
+      const a = BigInt(x);
+      const b = op === "neg" || op === "abs" ? 0n : BigInt(y);
+      const wrap = (v) => (signed ? BigInt.asIntN(bits, v) : BigInt.asUintN(bits, v));
+      let r;
+      switch (op) {
+        case "add": r = a + b; break;
+        case "sub": r = a - b; break;
+        case "mul": r = a * b; break;
+        case "div":
+          if (b === 0n) throw new CarciniPanic("attempt to divide by zero", "<std>");
+          r = a / b;
+          break;
+        case "rem":
+          if (b === 0n) throw new CarciniPanic("attempt to calculate the remainder with a divisor of zero", "<std>");
+          r = a % b;
+          break;
+        case "pow": {
+          // (Exponent by exponent, so a huge `y` can't build a huge BigInt.)
+          let acc = 1n;
+          let base = a;
+          let over = false;
+          for (let e = b; e > 0n; e >>= 1n) {
+            if (e & 1n) {
+              acc *= base;
+              if (wrap(acc) !== acc) over = true;
+              acc = wrap(acc);
+            }
+            if (e > 1n) {
+              base *= base;
+              if (wrap(base) !== base) over = true;
+              base = wrap(base);
+            }
+          }
+          return [Number(acc), over];
+        }
+        case "neg": r = -a; break;
+        default: r = a < 0n ? -a : a;
+      }
+      const w = wrap(r);
+      return [Number(w), w !== r];
+    },
+    $divCeil(x, y) {
+      if (y === 0) throw new CarciniPanic("attempt to divide by zero", "<std>");
+      const r = x % y;
+      const q = (x - r) / y;
+      return r !== 0 && r > 0 === y > 0 ? q + 1 : q;
+    },
+    $nextMultipleOf(x, checked, y) {
+      if (y === 0) {
+        if (checked) return null;
+        throw new CarciniPanic("attempt to calculate the remainder with a divisor of zero", "<std>");
+      }
+      const r = x % y;
+      return r === 0 ? x : x + (y - r);
+    },
+    $u8EqIgnoreCase(a, b) {
+      const lower = (c) => (c >= 65 && c <= 90 ? c + 32 : c);
+      return lower(a) === lower(b);
+    },
+    $floatToBytes(x, f32, little) {
+      const dv = new DataView(new ArrayBuffer(f32 ? 4 : 8));
+      if (f32) dv.setFloat32(0, x, little);
+      else dv.setFloat64(0, x, little);
+      return Array.from(new Uint8Array(dv.buffer));
+    },
+    $floatFromBytes(bytes, f32, little) {
+      const dv = new DataView(Uint8Array.from(bytes).buffer);
+      return f32 ? dv.getFloat32(0, little) : dv.getFloat64(0, little);
+    },
     $toBytes(x, bits, little) {
       let v = BigInt.asUintN(bits, BigInt(x));
       const out = [];
@@ -3200,15 +3399,46 @@
         }
         return r;
       };
-      const m = /^(checked|saturating|wrapping)_(.*)$/.exec(name);
+      const euclid = (nm, a, y) => {
+        const r = a % y;
+        const fix = r < 0n;
+        if (nm === "rem_euclid") return fix ? r + (y < 0n ? -y : y) : r;
+        const q = a / y;
+        return fix ? (y > 0n ? q - 1n : q + 1n) : q;
+      };
+      const nextMultiple = (a, y) => {
+        const r = a % y;
+        return r === 0n ? a : a + (y - r);
+      };
+      const m = /^(checked|saturating|wrapping|overflowing)_(.*)$/.exec(name);
       if (m) {
         const [, kind, op] = m;
         const b = op === "neg" || op === "abs" ? 0n : arg(0);
+        if (op === "shl" || op === "shr") {
+          const over = b >= B;
+          if (kind === "checked" && over) return null;
+          const s = b % B;
+          const r = op === "shl" ? wrap(x << s) : wrap((signed ? x : BigInt.asUintN(bits, x)) >> s);
+          return kind === "overflowing" ? [r, over] : r;
+        }
+        if (op === "div_euclid" || op === "rem_euclid" || op === "next_multiple_of") {
+          if (b === 0n) {
+            if (kind === "checked") return null;
+            panic(op === "div_euclid" ? "attempt to divide by zero" : "attempt to calculate the remainder with a divisor of zero");
+          }
+          const r = op === "next_multiple_of" ? nextMultiple(x, b) : euclid(op, x, b);
+          const ok = r >= min && r <= max;
+          return kind === "checked" ? (ok ? r : null) : wrap(r);
+        }
         if ((op === "div" || op === "rem") && b === 0n) {
           if (kind === "checked") return null;
           panic(op === "div" ? "attempt to divide by zero" : "attempt to calculate the remainder with a divisor of zero");
         }
         if (op === "pow" && kind === "wrapping") return powWrap(x, b);
+        if (op === "pow" && kind === "overflowing") {
+          const r = powExact(x, b);
+          return [powWrap(x, b), !(r >= min && r <= max)];
+        }
         if (op === "rem" && signed && x === min && b === -1n) return kind === "checked" ? null : 0n;
         const r =
           op === "add" || op === "add_signed" ? x + b
@@ -3220,6 +3450,7 @@
           : op === "neg" ? -x
           : x < 0n ? -x : x;
         const ok = r >= min && r <= max;
+        if (kind === "overflowing") return [wrap(r), !ok];
         if (kind === "checked") return ok ? r : null;
         if (kind === "saturating") return ok ? r : r < min ? min : max;
         return wrap(r);
@@ -3291,6 +3522,51 @@
         case "ilog10":
           if (x <= 0n) panic("argument of integer logarithm must be positive");
           return x.toString(name === "ilog2" ? 2 : 10).length - 1;
+        case "rotate_left":
+        case "rotate_right": {
+          const s = arg(0) % B;
+          const k = name === "rotate_left" ? s : (B - s) % B;
+          return wrap((u << k) | (u >> (B - k)));
+        }
+        case "reverse_bits": {
+          let v = u;
+          let r = 0n;
+          for (let i = 0; i < bits; i++) {
+            r = (r << 1n) | (v & 1n);
+            v >>= 1n;
+          }
+          return wrap(r);
+        }
+        case "swap_bytes":
+        case "to_be":
+        case "from_be": {
+          let v = u;
+          let r = 0n;
+          for (let i = 0; i < bits / 8; i++) {
+            r = (r << 8n) | (v & 0xffn);
+            v >>= 8n;
+          }
+          return wrap(r);
+        }
+        case "to_le":
+        case "from_le":
+          return x;
+        case "div_ceil": {
+          const y = arg(0);
+          if (y === 0n) panic("attempt to divide by zero");
+          const r = x % y;
+          const q = (x - r) / y;
+          return r !== 0n && r > 0n === y > 0n ? q + 1n : q;
+        }
+        case "next_multiple_of": {
+          const y = arg(0);
+          if (y === 0n) panic("attempt to calculate the remainder with a divisor of zero");
+          return nextMultiple(x, y);
+        }
+        case "cast_signed":
+          return BigInt.asIntN(bits, x);
+        case "cast_unsigned":
+          return BigInt.asUintN(bits, x);
         case "to_string":
           return x.toString();
         default:
@@ -3798,6 +4074,11 @@
       const max = (signed ? 1n << (b - 1n) : 1n << b) - 1n;
       if (v < min || v > max) return new Res(1, new ParseError("TryFromIntError", v < min ? "NegOverflow" : "PosOverflow"));
       return new Res(0, big ? v : Number(v));
+    },
+    // `u8::try_from(c)`: `Err` past U+00FF.
+    $tryU8Char(c) {
+      const v = c.codePointAt(0);
+      return v > 255 ? new Res(1, new ParseError("TryFromCharError", "")) : new Res(0, v);
     },
     // `char::try_from(n)`: `Err` past U+10FFFF and for surrogates.
     $tryChar(n) {
@@ -4413,6 +4694,13 @@
     $resOrElseRes(r, f) {
       return r.$tag ? f(r[0]) : r;
     },
+    // `r.or(other)` / `r.and(other)`.
+    $resOr2(r, o) {
+      return r.$tag ? o : r;
+    },
+    $resAnd2(r, o) {
+      return r.$tag ? r : o;
+    },
     $resIsOkAnd(r, f) {
       return !r.$tag && f(r[0]);
     },
@@ -4868,6 +5156,143 @@
       const c = String.fromCodePoint(s.codePointAt(u));
       return [c, s.slice(0, u) + s.slice(u + c.length)];
     },
+
+    // `s.retain(f)`: the chars `f` keeps.
+    $strRetain(s, f) {
+      let out = "";
+      for (const c of s) if (f(c)) out += c;
+      return out;
+    },
+    // `s.replace_range(range, x)`, with slicing's panics.
+    $strReplaceRange(s, lo, hi, inclusive, x, location) {
+      rt.$strSlice(s, lo, hi, inclusive, location);
+      const end = hi === null ? null : inclusive ? hi + 1 : hi;
+      return rt.$strSlice(s, 0, lo, false, location) + x + (end === null ? "" : rt.$strSlice(s, end, null, false, location));
+    },
+    // `s.drain(range)`: [the range's chars, the string without them].
+    $strDrain(s, lo, hi, inclusive, location) {
+      const mid = rt.$strSlice(s, lo, hi, inclusive, location);
+      const end = hi === null ? null : inclusive ? hi + 1 : hi;
+      const rest = rt.$strSlice(s, 0, lo, false, location) + (end === null ? "" : rt.$strSlice(s, end, null, false, location));
+      return [new Iter(Array.from(mid)[Symbol.iterator]()), rest];
+    },
+    // `s.split_off(at)`: [the tail, the head].
+    $strSplitOff(s, at, location) {
+      const u = rt.$unitOf(s, at);
+      if (u < 0) throw new CarciniPanic("assertion failed: self.is_char_boundary(at)", location);
+      return [s.slice(u), s.slice(0, u)];
+    },
+    // `s.match_indices(p)` / `rmatch_indices(p)`: (byte offset, matched text), non-overlapping.
+    $matchIndices(s, p, rev) {
+      const out = [];
+      let u = 0;
+      let b = 0;
+      const bytesTo = (to) => {
+        // Advance the byte count from UTF-16 offset `u` to `to`.
+        b += utf8Len(s.slice(u, to));
+        u = to;
+        return b;
+      };
+      if (typeof p === "function") {
+        for (const c of s) {
+          if (p(c)) out.push([bytesTo(u), c]);
+          bytesTo(u + c.length);
+        }
+      } else if (p === "") {
+        for (const c of s) {
+          out.push([bytesTo(u), ""]);
+          bytesTo(u + c.length);
+        }
+        out.push([bytesTo(s.length), ""]);
+      } else if (rev) {
+        // From the end, as std's searcher does (matters for overlapping patterns like "aa").
+        const at = [];
+        let i = s.length;
+        while (i >= p.length) {
+          const k = s.lastIndexOf(p, i - p.length);
+          if (k < 0) break;
+          at.push(k);
+          i = k;
+        }
+        for (const k of at.reverse()) out.push([bytesTo(k), p]);
+      } else {
+        let i = 0;
+        for (;;) {
+          const k = s.indexOf(p, i);
+          if (k < 0) break;
+          out.push([bytesTo(k), p]);
+          i = k + p.length;
+        }
+      }
+      return new Iter((rev ? out.reverse() : out)[Symbol.iterator]());
+    },
+    // `s.split_inclusive(p)`: the pieces, each ending with its match; no empty last piece.
+    $splitInclusive(s, p) {
+      const out = [];
+      let cur = "";
+      if (typeof p === "function") {
+        for (const c of s) {
+          cur += c;
+          if (p(c)) {
+            out.push(cur);
+            cur = "";
+          }
+        }
+      } else if (p === "") {
+        for (const c of s) out.push(c);
+      } else {
+        let i = 0;
+        for (;;) {
+          const k = s.indexOf(p, i);
+          if (k < 0) break;
+          out.push(s.slice(i, k + p.length));
+          i = k + p.length;
+        }
+        cur = s.slice(i);
+      }
+      if (cur !== "") out.push(cur);
+      return new Iter(out[Symbol.iterator]());
+    },
+    $splitAsciiWhitespace(s) {
+      return new Iter(s.split(/[ \t\n\f\r]+/).filter((w) => w !== "")[Symbol.iterator]());
+    },
+    $encodeUtf16(s) {
+      return Iter.of(function* () {
+        for (let i = 0; i < s.length; i++) yield s.charCodeAt(i);
+      });
+    },
+    // `s.escape_debug()` / `escape_default()` / `escape_unicode()`, as a string. (Debug escapes
+    // grapheme extenders only at the start.)
+    $strEscape(s, how) {
+      let out = "";
+      let first = true;
+      for (const c of s) {
+        out += how === "debug" && !first && /^\p{Grapheme_Extend}$/u.test(c) ? c : rt.$escapeChar(c, how);
+        first = false;
+      }
+      return out;
+    },
+    // `String::from_utf16(&units)`: an error on a lone surrogate.
+    $fromUtf16(units) {
+      for (let i = 0; i < units.length; i++) {
+        const u = units[i];
+        if (u >= 0xd800 && u <= 0xdbff && i + 1 < units.length && units[i + 1] >= 0xdc00 && units[i + 1] <= 0xdfff) i++;
+        else if (u >= 0xd800 && u <= 0xdfff) return new Res(1, new ParseError("FromUtf16Error", "LoneSurrogate"));
+      }
+      return new Res(0, rt.$fromUtf16Lossy(units));
+    },
+    $fromUtf16Lossy(units) {
+      let out = "";
+      for (let i = 0; i < units.length; i++) {
+        const u = units[i];
+        if (u >= 0xd800 && u <= 0xdbff && i + 1 < units.length && units[i + 1] >= 0xdc00 && units[i + 1] <= 0xdfff) {
+          out += String.fromCharCode(u, units[i + 1]);
+          i++;
+        } else out += u >= 0xd800 && u <= 0xdfff ? "�" : String.fromCharCode(u);
+      }
+      return out;
+    },
+
 
     // ---- std surface: numbers
     $checked(r, min, max) {

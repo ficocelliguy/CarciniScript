@@ -123,6 +123,14 @@ impl Codegen<'_> {
                 let f = arg(self, 0);
                 helper("resOrElseRes", vec![f])
             }
+            "or" => {
+                let o = arg(self, 0);
+                helper("resOr2", vec![o])
+            }
+            "and" => {
+                let o = arg(self, 0);
+                helper("resAnd2", vec![o])
+            }
             "is_ok_and" => {
                 let f = arg(self, 0);
                 helper("resIsOkAnd", vec![f])

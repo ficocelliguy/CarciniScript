@@ -87,6 +87,9 @@ fn export_type_extras(c: &Checker, out: &mut Exports, name: &str) {
     if let Some(t) = a.iter_items.get(name) {
         out.adts.iter_items.insert(name.to_string(), c.zonk(t));
     }
+    if a.iter_mut_items.contains(name) {
+        out.adts.iter_mut_items.insert(name.to_string());
+    }
     if a.into_iters.contains(name) {
         out.adts.into_iters.insert(name.to_string());
     }
@@ -834,6 +837,7 @@ impl Checker<'_> {
         self.adts.deref_targets.extend(ex.adts.deref_targets);
         self.adts.deref_mut.extend(ex.adts.deref_mut);
         self.adts.iter_items.extend(ex.adts.iter_items);
+        self.adts.iter_mut_items.extend(ex.adts.iter_mut_items);
         self.adts.into_iters.extend(ex.adts.into_iters);
         self.adts.future_outputs.extend(ex.adts.future_outputs);
         self.adts.const_params.extend(ex.adts.const_params);

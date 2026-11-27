@@ -819,3 +819,152 @@ fn elem_type(t: &ast::Type) -> Option<ast::Type> {
         _ => None,
     }
 }
+
+impl Checker<'_> {
+    /// `ty` as the exhaustiveness check sees the value `e`: arrays inside an `Option`, a
+    /// `Result` or a tuple get their lengths from the type the file declares for `e` (`self.0`
+    /// with `struct E<T>(Option<[T; 2]>)`) or from `<[T; N]>::try_from(..)`.
+    pub(super) fn with_decl_dims(&self, ty: &Ty, e: &ast::Expr) -> Ty {
+        if let ast::Expr::CallExpr(c) = super::strip_parens(e)
+            && let Some(ast::Expr::PathExpr(p)) = c.expr()
+            && let Some(n) = p.path().and_then(|p| array_try_from_len(&p))
+            && let Ty::Result(t, err) = self.zonk(ty)
+        {
+            return Ty::Result(Box::new(self.with_dims(&t, &[n])), err);
+        }
+        let adt_of = |r: &ast::Expr| match self.raw.get(&self.range(r.syntax())).map(|t| self.zonk(t)) {
+            Some(Ty::Adt(n, _)) => Some(n),
+            _ => None,
+        };
+        match expr_decl_type(e, &adt_of) {
+            Some(aty) => self.with_type_dims(ty, &aty),
+            None => self.zonk(ty),
+        }
+    }
+
+    /// `ty` with the array lengths written in `aty`, its declared type.
+    fn with_type_dims(&self, ty: &Ty, aty: &ast::Type) -> Ty {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let ty = self.zonk(ty);
+        let args = |p: &ast::PathType| -> Option<(String, Vec<ast::Type>)> {
+            let seg = p.path()?.segment()?;
+            let name = seg.name_ref()?.text().to_string();
+            let args = seg
+                .generic_arg_list()
+                .into_iter()
+                .flat_map(|l| l.generic_args())
+                .filter_map(|a| match a {
+                    ast::GenericArg::TypeArg(t) => t.ty(),
+                    _ => None,
+                })
+                .collect();
+            Some((name, args))
+        };
+        match (aty, ty) {
+            (ast::Type::RefType(r), ty) => match r.ty() {
+                Some(t) => self.with_type_dims(&ty, &t),
+                None => ty,
+            },
+            (ast::Type::ParenType(p), ty) => match p.ty() {
+                Some(t) => self.with_type_dims(&ty, &t),
+                None => ty,
+            },
+            (ast::Type::ArrayType(a), Ty::Vec(e)) => {
+                match array_type_dims(aty).first() {
+                    Some(&n) => {
+                        let inner = match a.ty() {
+                            Some(t) => self.with_type_dims(&e, &t),
+                            None => *e,
+                        };
+                        Ty::Coll(
+                            crate::ty::Coll::FixedArray(n),
+                            Box::new(Ty::Vec(Box::new(inner))),
+                        )
+                    }
+                    None => Ty::Vec(e),
+                }
+            }
+            (ast::Type::TupleType(tt), Ty::Tuple(es)) => {
+                let fields: Vec<ast::Type> = tt.fields().collect();
+                if fields.len() != es.len() {
+                    return Ty::Tuple(es);
+                }
+                Ty::Tuple(
+                    es.iter()
+                        .zip(&fields)
+                        .map(|(e, f)| self.with_type_dims(e, f))
+                        .collect(),
+                )
+            }
+            (ast::Type::PathType(p), Ty::Option(i)) => match args(p) {
+                Some((n, a)) if n == "Option" && a.len() == 1 => {
+                    Ty::Option(Box::new(self.with_type_dims(&i, &a[0])))
+                }
+                _ => Ty::Option(i),
+            },
+            (ast::Type::PathType(p), Ty::Result(t, e)) => match args(p) {
+                Some((n, a)) if n == "Result" && a.len() == 2 => Ty::Result(
+                    Box::new(self.with_type_dims(&t, &a[0])),
+                    Box::new(self.with_type_dims(&e, &a[1])),
+                ),
+                _ => Ty::Result(t, e),
+            },
+            (_, ty) => ty,
+        }
+    }
+}
+
+/// The type the file declares for `e`: a local's or parameter's annotation, or a field's type
+/// in the struct its receiver's declared type (or `self`'s impl) names.
+fn expr_decl_type(
+    e: &ast::Expr,
+    adt_of: &dyn Fn(&ast::Expr) -> Option<String>,
+) -> Option<ast::Type> {
+    use ast::HasName;
+    match super::strip_parens(e) {
+        ast::Expr::PathExpr(p) => {
+            let path = p.path()?;
+            if path.as_single_segment().is_some_and(|s| s.self_token().is_some()) {
+                let imp = e.syntax().ancestors().find_map(ast::Impl::cast)?;
+                return imp.self_ty();
+            }
+            match decl_of(e)? {
+                Decl::Let(ty, _) | Decl::Param(ty) => ty,
+            }
+        }
+        ast::Expr::RefExpr(r) => expr_decl_type(&r.expr()?, adt_of),
+        ast::Expr::FieldExpr(fe) => {
+            let recv = fe.expr()?;
+            let name = match expr_decl_type(&recv, adt_of).and_then(|t| struct_name(&t)) {
+                Some(n) => n,
+                None => adt_of(&recv)?,
+            };
+            let root = e.syntax().ancestors().last()?;
+            let st = root
+                .descendants()
+                .filter_map(ast::Struct::cast)
+                .find(|s| s.name().is_some_and(|n| n.text() == name.as_str()))?;
+            let field = fe.name_ref()?.text().to_string();
+            match st.field_list()? {
+                ast::FieldList::RecordFieldList(l) => l
+                    .fields()
+                    .find(|f| f.name().is_some_and(|n| n.text() == field.as_str()))?
+                    .ty(),
+                ast::FieldList::TupleFieldList(l) => {
+                    l.fields().nth(field.parse::<usize>().ok()?)?.ty()
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The name a struct type is written with (`&E<T>` → `E`).
+fn struct_name(t: &ast::Type) -> Option<String> {
+    match t {
+        ast::Type::RefType(r) => struct_name(&r.ty()?),
+        ast::Type::ParenType(p) => struct_name(&p.ty()?),
+        ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+        _ => None,
+    }
+}

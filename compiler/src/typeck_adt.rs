@@ -322,12 +322,15 @@ impl Checker<'_> {
                 _ => None,
             })
             .collect();
-        // (And an impl for `String` / `Vec<T>` after one for `str` / `[T]`: see `own_twins`.)
+        // (And an impl for `String` / `Vec<T>` after one for `str` / `[T]`: see `own_twins`. And
+        // inherent impls before trait impls: a trait method an inherent one shares its name with
+        // goes under `Trait$method`, whichever is written first.)
         impls.sort_by_key(|imp| {
             (
                 !imp.trait_()
                     .is_some_and(|t| t.syntax().text().to_string().ends_with("Deref")),
                 crate::adt::twin_side(imp) == Some(true),
+                imp.trait_().is_some(),
             )
         });
         for imp in &impls {
@@ -1705,6 +1708,23 @@ impl Checker<'_> {
         if is_iter {
             let item = output.clone().unwrap_or(Ty::Unknown);
             self.adts.iter_items.insert(type_name.clone(), item);
+            // `type Item = &'a mut T;`: what the loop variable holds is a `&mut`.
+            let mut_item = imp
+                .assoc_item_list()
+                .into_iter()
+                .flat_map(|l| l.assoc_items())
+                .any(|i| match i {
+                    ast::AssocItem::TypeAlias(ta) => {
+                        ta.name().is_some_and(|n| n.text() == "Item")
+                            && ta.ty().is_some_and(|t| {
+                                matches!(t, ast::Type::RefType(r) if r.mut_token().is_some())
+                            })
+                    }
+                    _ => false,
+                });
+            if mut_item {
+                self.adts.iter_mut_items.insert(type_name.clone());
+            }
         }
         if is_future {
             let out = output.clone().unwrap_or(Ty::Unknown);
@@ -2256,6 +2276,18 @@ impl Checker<'_> {
                             | "Sum"
                             | "Product"
                             | "DerefMut"
+                            // (Their methods are ordinary ones: checked like the rest.)
+                            | "Deref"
+                            | "AsRef"
+                            | "AsMut"
+                            | "Borrow"
+                            | "BorrowMut"
+                            | "Drop"
+                            | "DoubleEndedIterator"
+                            | "ExactSizeIterator"
+                            | "IntoIterator"
+                            | "Hasher"
+                            | "BuildHasher"
                     ) && crate::adt::op_method(t).is_none()
                         && !self.adts.traits.contains_key(t)
                 })

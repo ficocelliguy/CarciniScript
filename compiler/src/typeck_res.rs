@@ -55,7 +55,10 @@ pub fn is_std_error(name: &str) -> bool {
             | "TryFromIntError"
             | "CharTryFromError"
             | "TryFromSliceError"
+            | "TryFromCharError"
+            | "TryReserveError"
             | "Utf8Error"
+            | "FromUtf16Error"
             | "BorrowError"
             | "BorrowMutError"
             | "serde_json::Error"
@@ -240,6 +243,23 @@ impl Checker<'_> {
                 let f = self.fresh(VarKind::General);
                 self.closure_arg(a0, vec![e], res(t.clone(), f.clone()));
                 res(t, f)
+            }
+            // `r.or(other)` / `r.and(other)`: the other `Result`, already evaluated.
+            "or" => {
+                count(self, 1);
+                let f = self.fresh(VarKind::General);
+                if let Some(a) = a0 {
+                    self.check(a, &res(t.clone(), f.clone()));
+                }
+                res(t, f)
+            }
+            "and" => {
+                count(self, 1);
+                let u = self.fresh(VarKind::General);
+                if let Some(a) = a0 {
+                    self.check(a, &res(u.clone(), e.clone()));
+                }
+                res(u, e)
             }
             "is_ok_and" => {
                 count(self, 1);

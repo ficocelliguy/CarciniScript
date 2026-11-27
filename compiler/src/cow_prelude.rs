@@ -88,3 +88,15 @@ impl<'a, T: Clone> From<Vec<T>> for Cow<'a, [T]> {
         Cow::Owned(v)
     }
 }
+
+impl<'a> From<Cow<'a, str>> for String {
+    fn from(c: Cow<'a, str>) -> String {
+        c.into_owned()
+    }
+}
+
+impl<'a, T: Clone> From<Cow<'a, [T]>> for Vec<T> {
+    fn from(c: Cow<'a, [T]>) -> Vec<T> {
+        c.into_owned()
+    }
+}

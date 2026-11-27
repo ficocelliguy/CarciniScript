@@ -82,6 +82,13 @@ impl From<String> for PathBuf {
     }
 }
 
+// (`OsString` is `String`: `path.into_os_string()` as `.into()`.)
+impl From<PathBuf> for String {
+    fn from(p: PathBuf) -> String {
+        p.__s
+    }
+}
+
 impl std::str::FromStr for PathBuf {
     type Err = Infallible;
     fn from_str(s: &str) -> Result<PathBuf, Infallible> {

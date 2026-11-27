@@ -82,11 +82,38 @@ impl MacroArg {
     }
 }
 
+/// Std's macros (`write!`, `vec!`, `assert_eq!`, ..), which the compiler implements itself.
+const STD_MACROS: &[&str] = &[
+    "format_args", "include", "include_bytes", "include_str", "concat", "env", "option_env",
+    "cfg", "compile_error", "stringify", "line", "column", "file", "module_path", "matches",
+    "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+    "write", "writeln", "print", "println", "eprint", "eprintln", "format", "panic",
+    "unreachable", "todo", "unimplemented", "vec", "dbg", "thread_local", "addr_of",
+    "addr_of_mut", "offset_of",
+];
+
+/// The macro's name: its last path segment (`std::println!` is `println`). A std macro's name
+/// called through another crate's path (`defmt::write!`, `crate::panic!`) is the whole path,
+/// since that crate's macro isn't std's (defmt's `write!` takes `{=u8}`), so it stays external.
+/// (The file's own `macro_rules!` are expanded before anything asks.)
 pub fn macro_name(mc: &ast::MacroCall) -> Option<String> {
-    mc.path()
-        .and_then(|p| p.segment())
-        .and_then(|s| s.name_ref())
-        .map(|n| n.text().to_string())
+    let path = mc.path()?;
+    let name = path.segment()?.name_ref()?.text().to_string();
+    if let Some(q) = path.qualifier()
+        && STD_MACROS.contains(&name.as_str())
+    {
+        let mut first = q;
+        while let Some(up) = first.qualifier() {
+            first = up;
+        }
+        let head = first.syntax().text().to_string();
+        let head = head.trim_start_matches(':');
+        if !matches!(head, "std" | "core" | "alloc" | "$crate") && !head.starts_with("__") {
+            let full: String = path.syntax().text().to_string().split_whitespace().collect();
+            return Some(full);
+        }
+    }
+    Some(name)
 }
 
 /// Non-trivia elements between the token tree's delimiters.
@@ -753,6 +780,24 @@ fn cfg_key(node: &ra_ap_syntax::SyntaxNode) -> Option<String> {
             ast::Item::Module(x) => named("mod", x.name()),
             ast::Item::MacroRules(x) => named("macro", x.name()),
             ast::Item::MacroDef(x) => named("macro", x.name()),
+            // A `macro_rules!` call among the items (`imp!(A);`): its text, so a `#[cfg]`'d
+            // copy next to a plain one gives way instead of defining everything twice.
+            ast::Item::MacroCall(x) => Some(format!(
+                "macro-call {}",
+                x.syntax()
+                    .children_with_tokens()
+                    .filter(|e| {
+                        !matches!(
+                            e.kind(),
+                            SyntaxKind::ATTR | SyntaxKind::COMMENT | SyntaxKind::WHITESPACE
+                        )
+                    })
+                    .map(|e| e.to_string())
+                    .collect::<String>()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            )),
             ast::Item::Impl(x) => {
                 // The header, without attributes, comments and whitespace.
                 let header: String = x
@@ -887,6 +932,103 @@ fn matchers_take_attrs(body: &ast::TokenTree) -> bool {
     })
 }
 
+/// The groups of a `#[cfg_attr(pred, attr, ..)]`'s tokens, split at its top-level commas: the
+/// predicate's tokens first, then one group per attribute. `None` for any other attribute.
+fn cfg_attr_groups(attr: &ast::Attr) -> Option<Vec<Vec<SyntaxToken>>> {
+    if attr.excl_token().is_some() {
+        return None;
+    }
+    let toks: Vec<SyntaxToken> = attr
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    let n = toks.len();
+    let text = |k: usize| toks[k].text();
+    if n < 6
+        || text(0) != "#"
+        || text(1) != "["
+        || text(2) != "cfg_attr"
+        || text(3) != "("
+        || text(n - 2) != ")"
+        || text(n - 1) != "]"
+    {
+        return None;
+    }
+    let mut groups: Vec<Vec<SyntaxToken>> = vec![Vec::new()];
+    let mut depth = 0i32;
+    for t in &toks[4..n - 2] {
+        match t.text() {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth -= 1,
+            "," if depth == 0 => {
+                groups.push(Vec::new());
+                continue;
+            }
+            _ => {}
+        }
+        groups.last_mut().unwrap().push(t.clone());
+    }
+    // (A trailing comma.)
+    if groups.last().is_some_and(|g| g.is_empty()) {
+        groups.pop();
+    }
+    (groups.len() >= 2).then_some(groups)
+}
+
+/// Rewrites every outer `#[cfg_attr(pred, attr, ..)]` in place, padded with spaces so offsets
+/// stay put: `#[attr] ..` when `pred` holds with every feature off (a script has none, and that
+/// is how rustc builds a lone file: `not(feature = "x")`, `debug_assertions`, `test`), blank
+/// otherwise (`feature = "serde"`, `docsrs`). Unlike `strip_cfg`'s items, a feature-gated
+/// attribute isn't kept: dropping `derive(Debug)` leaves what the file had without the attribute,
+/// while applying `derive(Serialize)` would want a crate the script hasn't got. Whether anything
+/// changed.
+fn expand_cfg_attrs(text: &mut String) -> bool {
+    if !text.contains("cfg_attr") {
+        return false;
+    }
+    let file = parse_tree(text);
+    let debug = crate::codegen::overflow_checks();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for attr in file.syntax().descendants().filter_map(ast::Attr::cast) {
+        let Some(groups) = cfg_attr_groups(&attr) else {
+            continue;
+        };
+        let pred: Vec<String> = groups[0].iter().map(|t| t.text().to_string()).collect();
+        let mut i = 0;
+        let apply = match cfg_pred3(&pred, &mut i, debug, false) {
+            Ok(Some(v)) if i == pred.len() => v,
+            // Malformed: left as written.
+            _ => continue,
+        };
+        let r = attr.syntax().text_range();
+        let (a, b) = (usize::from(r.start()), usize::from(r.end()));
+        let mut out = String::new();
+        if apply {
+            for g in &groups[1..] {
+                let (Some(first), Some(last)) = (g.first(), g.last()) else {
+                    continue;
+                };
+                let s = &text
+                    [usize::from(first.text_range().start())..usize::from(last.text_range().end())];
+                let piece = format!("#[{s}]");
+                // (Shorter than the original, unless the attributes are many and short.)
+                if out.len() + piece.len() > b - a {
+                    break;
+                }
+                out.push_str(&piece);
+            }
+        }
+        out.push_str(&" ".repeat((b - a).saturating_sub(out.len())));
+        edits.push((a, b, out));
+    }
+    for (a, b, s) in &edits {
+        text.replace_range(*a..*b, s);
+    }
+    !edits.is_empty()
+}
+
 /// Blanks out (with spaces, so offsets stay put) every item, statement, field, variant, match
 /// arm or expression under a `#[cfg(..)]` that's off for a script, so `#[cfg(windows)] fn x`
 /// next to `#[cfg(not(windows))] fn x` leaves one `x`. Features count as unknown here (such
@@ -896,8 +1038,9 @@ fn matchers_take_attrs(body: &ast::TokenTree) -> bool {
 /// `any(not(feature = "std"), feature = "ffi")`, or three `fn now()`s each under another
 /// combination of features.
 pub fn strip_cfg(text: &mut String) -> bool {
+    let attrs = expand_cfg_attrs(text);
     if !text.contains("cfg(") {
-        return false;
+        return attrs;
     }
     let file = crate::macros::parse_tree(text);
     let debug = crate::codegen::overflow_checks();
@@ -920,6 +1063,24 @@ pub fn strip_cfg(text: &mut String) -> bool {
         if node.kind() == SyntaxKind::SOURCE_FILE {
             continue;
         }
+        // A feature-gated `#[cfg]` on a block's tail expression is decided with every feature
+        // off, as a script has none: kept, `let x = { #[cfg(feature = "x")] { 5u8 } };` would be
+        // a `u8` where rustc has `()`. (A gated item stays, since the file's other code may use
+        // it; nothing names a tail expression.)
+        let off = off
+            || (undecided
+                && node
+                    .parent()
+                    .and_then(ast::StmtList::cast)
+                    .and_then(|l| l.tail_expr())
+                    .is_some_and(|t| *t.syntax() == node)
+                && {
+                    let mut j = 0;
+                    !matches!(
+                        cfg_pred3(&toks, &mut j, debug, false),
+                        Ok(Some(true)) if j == toks.len()
+                    )
+                });
         if !off {
             let Some(scope) = node.parent().filter(|_| undecided) else {
                 continue;
@@ -1067,7 +1228,7 @@ pub fn strip_cfg(text: &mut String) -> bool {
         }
     }
     if cuts.is_empty() {
-        return false;
+        return attrs;
     }
     cuts.sort();
     let mut end = 0;

@@ -191,6 +191,73 @@ impl Codegen<'_> {
                 f
             }
 
+            // `String`'s other editing methods (see `reassign`).
+            (Ty::Str, "reserve" | "reserve_exact" | "shrink_to") => {
+                let a = self.arg_frags(m);
+                let mut f = Frag::text("void (");
+                f.append(Frag::join(a, ", ")).push(")");
+                f
+            }
+            (Ty::Str, "shrink_to_fit") => Frag::text("undefined"),
+            (Ty::Str, "make_ascii_lowercase") => {
+                let v = helper("asciiLower", vec![]);
+                self.reassign(m, rf, v)
+            }
+            (Ty::Str, "make_ascii_uppercase") => {
+                let v = helper("asciiUpper", vec![]);
+                self.reassign(m, rf, v)
+            }
+            (Ty::Str, "retain") => {
+                let v = helper("strRetain", self.arg_frags(m));
+                self.reassign(m, rf, v)
+            }
+            (Ty::Str, "replace_range") => {
+                let a0 = m.arg_list().and_then(|a| a.args().next());
+                let r = self.gap_range(a0.as_ref())?;
+                let x = self.arg_frags(m).into_iter().nth(1)?;
+                let v = helper("strReplaceRange", vec![r, x, Frag::text(loc.clone())]);
+                self.reassign(m, rf, v)
+            }
+            (Ty::Str, "split_off" | "drain") => {
+                // `[taken, rest]`, then the receiver takes the rest.
+                let call = if method == "drain" {
+                    let a0 = m.arg_list().and_then(|a| a.args().next());
+                    let r = self.gap_range(a0.as_ref())?;
+                    helper("strDrain", vec![r, Frag::text(loc.clone())])
+                } else {
+                    let a = self.arg_frags(m);
+                    helper("strSplitOff", [a, vec![Frag::text(loc.clone())]].concat())
+                };
+                if !m.receiver().is_some_and(|r| self.place_receiver(&r)) {
+                    self.unsupported(
+                        m.syntax(),
+                        &format!("`String::{method}` on this expression"),
+                    );
+                }
+                let mut f = Frag::text("(($r) => (");
+                f.append(rf.clone())
+                    .push(" = $r[1], $r[0]))(")
+                    .append(call)
+                    .push(")");
+                f
+            }
+            (Ty::Str, "match_indices" | "rmatch_indices") => {
+                let a = self.arg_frags(m);
+                helper(
+                    "matchIndices",
+                    [a, vec![Frag::text((method == "rmatch_indices").to_string())]].concat(),
+                )
+            }
+            (Ty::Str, "split_inclusive") => helper("splitInclusive", self.arg_frags(m)),
+            (Ty::Str, "split_ascii_whitespace") => helper("splitAsciiWhitespace", vec![]),
+            (Ty::Str, "encode_utf16") => helper("encodeUtf16", vec![]),
+            (Ty::Str, "escape_debug" | "escape_default" | "escape_unicode") => {
+                let how = method.trim_start_matches("escape_");
+                helper("strEscape", vec![Frag::text(format!("\"{how}\""))])
+            }
+            (Ty::Str, "into_boxed_bytes") => helper("utf8", vec![]),
+
+
             (Ty::Str | Ty::Vec(_) | Ty::Dyn(_, _), "as_ref" | "borrow")
             | (Ty::Vec(_), "as_mut" | "borrow_mut") => rf.clone(),
             (Ty::Int(_), "is_multiple_of") => helper("isMultipleOf", self.arg_frags(m)),
@@ -216,6 +283,7 @@ impl Codegen<'_> {
                     && (m2.starts_with("checked_")
                         || m2.starts_with("saturating_")
                         || m2.starts_with("wrapping_")
+                        || m2.starts_with("overflowing_")
                         || matches!(
                             m2,
                             "unchecked_add"
@@ -233,6 +301,18 @@ impl Codegen<'_> {
                                 | "ilog10"
                                 | "is_positive"
                                 | "is_negative"
+                                | "rotate_left"
+                                | "rotate_right"
+                                | "reverse_bits"
+                                | "swap_bytes"
+                                | "to_le"
+                                | "to_be"
+                                | "from_le"
+                                | "from_be"
+                                | "div_ceil"
+                                | "next_multiple_of"
+                                | "cast_signed"
+                                | "cast_unsigned"
                         )) =>
             {
                 let mut all = vec![
@@ -244,6 +324,80 @@ impl Codegen<'_> {
                 let mut f = Frag::mapped(name_off, "κσ.$big(");
                 f.append(Frag::join(all, ", ")).push(")");
                 f
+            }
+            // Shifts by a `u32` amount, at the type's width.
+            (
+                Ty::Int(k),
+                m2 @ ("wrapping_shl"
+                | "wrapping_shr"
+                | "checked_shl"
+                | "checked_shr"
+                | "overflowing_shl"
+                | "overflowing_shr"),
+            ) => {
+                let mut rest = vec![Frag::text(format!(
+                    "{}, {}, {}",
+                    js_string(m2),
+                    k.bits(),
+                    k.is_signed()
+                ))];
+                rest.extend(self.arg_frags(m));
+                helper("intShift", rest)
+            }
+            (Ty::Int(_), "checked_div_euclid" | "checked_rem_euclid") => {
+                let which = if method == "checked_div_euclid" { "div" } else { "rem" };
+                let mut rest = vec![Frag::text(js_string(which))];
+                rest.extend(self.arg_frags(m));
+                helper("checkedEuclid", rest)
+            }
+            (Ty::Int(_), "next_multiple_of" | "checked_next_multiple_of") => {
+                let mut rest = vec![Frag::text(method.starts_with("checked").to_string())];
+                rest.extend(self.arg_frags(m));
+                helper("nextMultipleOf", rest)
+            }
+            // `x.overflowing_add(y)`: `[wrapped, overflowed]`.
+            (Ty::Int(k), m2) if m2.starts_with("overflowing_") => {
+                let op = &m2["overflowing_".len()..];
+                let mut rest = vec![Frag::text(format!(
+                    "{}, {}, {}",
+                    js_string(op),
+                    k.bits(),
+                    k.is_signed()
+                ))];
+                rest.extend(self.arg_frags(m));
+                helper("overflowing", rest)
+            }
+            (Ty::Int(k), "rotate_left" | "rotate_right") => {
+                let mut rest = vec![Frag::text(format!(
+                    "{}, {}, {}",
+                    method == "rotate_left",
+                    k.bits(),
+                    k.is_signed()
+                ))];
+                rest.extend(self.arg_frags(m));
+                helper("rotateBits", rest)
+            }
+            // (JS numbers have no byte order; `to_le` is the value.)
+            (Ty::Int(_), "to_le" | "from_le") => rf.clone(),
+            (Ty::Int(k), "to_be" | "from_be" | "swap_bytes") => helper(
+                "swapBytes",
+                vec![Frag::text(format!("{}, {}", k.bits(), k.is_signed()))],
+            ),
+            (Ty::Int(k), "reverse_bits") => helper(
+                "reverseBits",
+                vec![Frag::text(format!("{}, {}", k.bits(), k.is_signed()))],
+            ),
+            (Ty::Int(_), "div_ceil") => helper("divCeil", self.arg_frags(m)),
+            // `x.cast_signed()`: the same bits as the other kind of the width (`as`).
+            (Ty::Int(k), "cast_signed" | "cast_unsigned") => {
+                let target = flip_sign(*k);
+                match target.wrap_parts() {
+                    Some((pre, post)) => rf.clone().wrap(pre, post),
+                    None => rf.clone(),
+                }
+            }
+            (Ty::Int(IntKind::U8), "eq_ignore_ascii_case") => {
+                helper("u8EqIgnoreCase", self.arg_frags(m))
             }
             // (`unchecked_*` wraps, as `wrapping_*`.)
             (Ty::Int(k), m2)
@@ -562,6 +716,13 @@ impl Codegen<'_> {
                 let n = emit(self, 0);
                 call("fromU32", vec![n])
             }
+            ["char", "from_u32_unchecked"] => {
+                let n = emit(self, 0);
+                Frag::mapped(start, "String.fromCodePoint(")
+                    .append(n)
+                    .push(")")
+                    .clone()
+            }
             ["char", "from"] => {
                 let n = emit(self, 0);
                 Frag::mapped(start, "String.fromCharCode(")
@@ -598,6 +759,14 @@ impl Codegen<'_> {
             ["String", "from_utf8"] => {
                 let b = emit(self, 0);
                 call("fromUtf8", vec![b, Frag::text("true")])
+            }
+            ["String", "from_utf16"] => {
+                let b = emit(self, 0);
+                call("fromUtf16", vec![b])
+            }
+            ["String", "from_utf16_lossy"] => {
+                let b = emit(self, 0);
+                call("fromUtf16Lossy", vec![b])
             }
             ["String", "from_utf8_lossy"] => {
                 let b = emit(self, 0);
@@ -651,14 +820,21 @@ impl Codegen<'_> {
                 let Ty::Int(k) = Ty::from_name(t) else {
                     return None;
                 };
+                let from_char = args
+                    .first()
+                    .is_some_and(|a| matches!(self.ty_of(a.syntax()), Some(Ty::Char)));
                 let v = emit(self, 0);
-                call(
-                    "tryInt",
-                    vec![
-                        v,
-                        Frag::text(format!("{}, {}, {}", k.bits(), k.is_signed(), k.is_big())),
-                    ],
-                )
+                if from_char {
+                    call("tryU8Char", vec![v])
+                } else {
+                    call(
+                        "tryInt",
+                        vec![
+                            v,
+                            Frag::text(format!("{}, {}, {}", k.bits(), k.is_signed(), k.is_big())),
+                        ],
+                    )
+                }
             }
             [t, "default"] if Ty::from_name(t) != Ty::Unknown => Frag::mapped(
                 start,
@@ -1101,5 +1277,23 @@ fn int_bits(k: IntKind) -> u32 {
         IntKind::I16 | IntKind::U16 => 16,
         IntKind::I32 | IntKind::U32 => 32,
         _ => 64,
+    }
+}
+
+/// The other signedness of the same width (`u32::cast_signed` gives `i32`).
+fn flip_sign(k: IntKind) -> IntKind {
+    match k {
+        IntKind::I8 => IntKind::U8,
+        IntKind::I16 => IntKind::U16,
+        IntKind::I32 => IntKind::U32,
+        IntKind::I64 => IntKind::U64,
+        IntKind::I128 => IntKind::U128,
+        IntKind::Isize => IntKind::Usize,
+        IntKind::U8 => IntKind::I8,
+        IntKind::U16 => IntKind::I16,
+        IntKind::U32 => IntKind::I32,
+        IntKind::U64 => IntKind::I64,
+        IntKind::U128 => IntKind::I128,
+        IntKind::Usize => IntKind::Isize,
     }
 }

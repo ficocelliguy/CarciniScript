@@ -52,7 +52,8 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
     match (prim, method) {
         (
             "Vec",
-            "len" | "is_empty" | "iter" | "first" | "last" | "to_vec" | "into_iter" | "clone",
+            "len" | "is_empty" | "iter" | "first" | "last" | "to_vec" | "into_iter" | "clone"
+            | "as_slice" | "as_mut_slice",
         ) => return Some(0),
         ("Vec", "contains") => return Some(1),
         ("Option", "is_some" | "is_none" | "unwrap" | "unwrap_or_default" | "flatten") => {
@@ -81,6 +82,7 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
         if method.starts_with("checked_")
             || method.starts_with("wrapping_")
             || method.starts_with("saturating_")
+            || method.starts_with("overflowing_")
         {
             let unary = method.ends_with("_neg")
                 || method.ends_with("_abs")
@@ -90,9 +92,12 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
         return Some(match method {
             "abs" | "signum" | "to_string" | "count_ones" | "count_zeros" | "leading_zeros"
             | "trailing_zeros" | "is_power_of_two" | "ilog2" | "ilog10" | "isqrt"
-            | "is_positive" | "is_negative" | "next_power_of_two" => 0,
+            | "is_positive" | "is_negative" | "next_power_of_two" | "to_le_bytes" | "to_be_bytes"
+            | "to_ne_bytes" | "to_le" | "to_be" | "from_le" | "from_be" | "swap_bytes" | "reverse_bits"
+            | "cast_signed" | "cast_unsigned" | "unsigned_abs" => 0,
             "pow" | "min" | "max" | "rem_euclid" | "div_euclid" | "abs_diff" | "cmp"
-            | "partial_cmp" => 1,
+            | "partial_cmp" | "rotate_left" | "rotate_right" | "div_ceil" | "next_multiple_of"
+            | "eq_ignore_ascii_case" => 1,
             "clamp" => 2,
             _ if float => match method {
                 "sqrt" | "cbrt" | "floor" | "ceil" | "round" | "trunc" | "fract" | "exp"
@@ -314,6 +319,13 @@ pub fn has_prim_paths(text: &str) -> bool {
         || text.contains("from_iter")
         || text.contains("::from)")
         || text.contains("::from,")
+        // (`.map(Box::new)`, `.unwrap_or_else(Vec::new)`, `.map(Rc::clone)`, see `std_value_path`.)
+        || [")", ","].iter().any(|c| {
+            ["::new", "::default", "::reverse", "::clone", "::as_ref", "::as_mut"]
+                .iter()
+                .any(|m| text.contains(&format!("{m}{c}")))
+        })
+        || text.contains("Ordering::is_")
         || OP_TRAITS.iter().any(|(t, ..)| {
             text.contains(&format!("{t}::"))
                 || text.contains(&format!("as {t}"))
@@ -364,6 +376,11 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         .map(at)
         .collect();
     let op_types = op_impl_types(&file, &traits);
+    // The file's own types (a `struct Cell` isn't `std::cell::Cell`).
+    let own_types: Vec<String> = (1..toks.len())
+        .filter(|&k| matches!(toks[k - 1].kind(), SyntaxKind::STRUCT_KW | SyntaxKind::ENUM_KW | SyntaxKind::TYPE_KW | SyntaxKind::UNION_KW))
+        .map(at)
+        .collect();
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0;
     while i + 3 < toks.len() {
@@ -514,6 +531,27 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                 continue;
             }
         }
+        // `.map(Box::new)`, `.unwrap_or_else(Vec::new)`, `.map(Ordering::reverse)`: a closure.
+        if let Some((first, m, kind)) = std_value_path(&toks, i, &own_types)
+            && !skip(&toks[i])
+        {
+            match kind {
+                StdValue::Ctor1 => {
+                    edits.push((start(first), start(first), "(|__ufcs0| ".to_string()));
+                    edits.push((end(m), end(m), "(__ufcs0))".to_string()));
+                }
+                StdValue::Ctor0 => {
+                    edits.push((start(first), start(first), "(|| ".to_string()));
+                    edits.push((end(m), end(m), "())".to_string()));
+                }
+                StdValue::Method(name) => {
+                    edits.push((start(first), end(m), format!("(|__ufcs0| __ufcs0.{name}())")));
+                }
+                StdValue::Body(body) => edits.push((start(first), end(m), body)),
+            }
+            i = m + 1;
+            continue;
+        }
         // `.map(PathBuf::from)`, `.map(Id::from)`, `.map(f64::from)`: a closure calling it.
         if let Some((first, m)) = from_value_path(&toks, i)
             && !skip(&toks[i])
@@ -588,6 +626,17 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             continue;
         }
         let method = at(m);
+        // `usize::max_value()` / `i128::min_value()`: the constants.
+        if PRIMS.contains(&prim.as_str())
+            && matches!(method.as_str(), "max_value" | "min_value")
+            && at(m + 1) == "("
+            && at(m + 2) == ")"
+        {
+            let c = if method == "max_value" { "MAX" } else { "MIN" };
+            edits.push((start(m), end(m + 2), c.to_string()));
+            i = m + 3;
+            continue;
+        }
         let Some(n_args) = arity(&prim, &method) else {
             i += 1;
             continue;
@@ -1125,6 +1174,83 @@ fn from_iter_item(ty: &str) -> Option<String> {
         (_, [e, ..]) if !e.is_empty() => e.to_string(),
         _ => return None,
     })
+}
+
+/// What a std constructor or method named as a value is written as (see `std_value_path`).
+enum StdValue {
+    /// `Box::new`: `(|x| Box::new(x))`.
+    Ctor1,
+    /// `String::new`, `Default::default`: `(|| String::new())`.
+    Ctor0,
+    /// `Ordering::reverse`, `Rc::clone`: `(|x| x.reverse())`.
+    Method(String),
+    /// A closure written out.
+    Body(String),
+}
+
+/// A std constructor or method named as an argument (`.map(Box::new)`,
+/// `.unwrap_or_else(Vec::new)`, `.map(Ordering::reverse)`, `.map(Rc::clone)`), with any `std::..`
+/// path before it: its first token, its last, and what it's written as. Not a type the file
+/// defines (`own`).
+fn std_value_path(toks: &[SyntaxToken], i: usize, own: &[String]) -> Option<(usize, usize, StdValue)> {
+    let at = |k: usize| toks.get(k).map(|t| t.text().to_string()).unwrap_or_default();
+    let sep = |k: usize| {
+        if at(k) == "::" {
+            Some(1)
+        } else if at(k) == ":" && at(k + 1) == ":" {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    if toks[i].kind() != SyntaxKind::IDENT {
+        return None;
+    }
+    let name = at(i);
+    let m = i + 1 + sep(i + 1)?;
+    if toks.get(m).map(|t| t.kind()) != Some(SyntaxKind::IDENT)
+        || !matches!(at(m + 1).as_str(), ")" | ",")
+        || own.contains(&name)
+    {
+        return None;
+    }
+    let method = at(m);
+    const COLLS: &[&str] = &[
+        "String", "Vec", "VecDeque", "BTreeMap", "BTreeSet", "HashMap", "HashSet", "BinaryHeap",
+    ];
+    let kind = match (name.as_str(), method.as_str()) {
+        ("Box" | "Rc" | "Arc" | "Cell" | "RefCell" | "Mutex" | "RwLock" | "Reverse" | "Wrapping", "new") => {
+            StdValue::Ctor1
+        }
+        (c, "new" | "default") if COLLS.contains(&c) => StdValue::Ctor0,
+        ("Default", "default") => StdValue::Ctor0,
+        (
+            "Ordering",
+            "reverse" | "is_eq" | "is_ne" | "is_lt" | "is_gt" | "is_le" | "is_ge",
+        )
+        | ("Rc" | "Arc", "clone" | "as_ref") => StdValue::Method(method),
+        // (A `Box` is its value here, so `x.as_ref()` would be the value's own `as_ref`.)
+        ("Box", "as_ref") => StdValue::Body("(|__ufcs0| &**__ufcs0)".into()),
+        ("Box", "as_mut") => StdValue::Body("(|__ufcs0| &mut **__ufcs0)".into()),
+        _ => return None,
+    };
+    // `std::rc::` before it.
+    let mut first = i;
+    loop {
+        let back = if first >= 2 && at(first - 1) == "::" {
+            2
+        } else if first >= 3 && at(first - 1) == ":" && at(first - 2) == ":" {
+            3
+        } else {
+            break;
+        };
+        if toks[first - back].kind() != SyntaxKind::IDENT {
+            break;
+        }
+        first -= back;
+    }
+    // An argument: after `(` or `,`.
+    (first > 0 && matches!(at(first - 1).as_str(), "(" | ",")).then_some((first, m, kind))
 }
 
 /// `Type::from` named as a value at `toks[i]` (an argument: `.map(PathBuf::from)`,

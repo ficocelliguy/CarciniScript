@@ -1082,6 +1082,8 @@ const rejected = [
   ["Box<dyn Trait> of a type without the impl", "}\ntrait T { fn a(&self) -> i32; fn b(&self) -> i32 { 1 } }\nstruct S;\nfn f() {\n    let d: Box<dyn T> = Box::new(S);", "6:34 the trait bound `S: T` is not satisfied"],
   ["calling a function the bound doesn't have", "}\ntrait M { fn make() -> Self; }\nfn g<T: M>() -> T {\n    T::build()\n}\nfn f() {", "5:5 no function or associated item named `build` found for type parameter `T`"],
   ["non-exhaustive slice match names the missing length", "let v = vec![1];\n    match v.as_slice() { [] => {}, [x] => {} }", "3:11 non-exhaustive patterns: `[_, _, ..]` not covered"],
+  ["non-exhaustive array match inside an Option, its length from the annotation", "let o: Option<[u8; 2]> = None;\n    match o { None => {}, Some([0, _]) => {} }", "3:11 non-exhaustive patterns: `Some([1_u8..=u8::MAX, _])` not covered"],
+  ["a Result whose error type has values still needs an Err arm", "let r: Result<[u8; 1], u8> = Ok([1]);\n    match r { Ok([_]) => {} }", "3:11 non-exhaustive patterns: `Err(_)` not covered"],
   ["non-exhaustive match on an array names the missing value", "match [true, false] { [true, _] => {} }", "2:11 non-exhaustive patterns: `[false, true]` not covered"],
   ["array pattern of the wrong length", "match [1, 2, 3] { [a, b] => {} }", "2:11 non-exhaustive patterns: `[_, _, _]` not covered"],
   ["refutable array pattern in let", "let [a, 1] = [1, 2];", "2:9 refutable pattern in local binding"],

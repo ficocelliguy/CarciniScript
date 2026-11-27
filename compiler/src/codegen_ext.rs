@@ -880,6 +880,7 @@ impl Codegen<'_> {
                 "is_sorted" => "isSorted",
                 "is_sorted_by_key" => "isSortedByKey",
                 "is_sorted_by" => "isSortedBy",
+                "remainder" => "remainder",
                 _ => "",
             }
         };

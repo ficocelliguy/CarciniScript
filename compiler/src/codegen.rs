@@ -895,6 +895,7 @@ fn compile_files(src: &str, filename: &str, resolver: typeck::Resolver) -> Compi
         || src.contains("include_str!")
         || src.contains("include_bytes!")
         || src.contains("cfg(")
+        || src.contains("cfg_attr(")
         || crate::stdgaps::has_rewrites(src)
         // (`mac::show!(..)`, `#[derive(mac::Show)]`: a proc-macro crate, maybe)
         || src.contains("::")
@@ -8152,7 +8153,7 @@ impl<'a> Codegen<'a> {
         // `if let Some(n) = self.timer.as_mut()`: the `Option` is the place's value, so match on
         // the place (no temporary), and `n` aliases it (see `mark_mut_ref_bindings`).
         if let ast::Expr::MethodCallExpr(m) = strip_parens_expr(e)
-            && m.name_ref().is_some_and(|n| n.text() == "as_mut")
+            && m.name_ref().is_some_and(|n| matches!(n.text(), "as_mut" | "as_deref_mut"))
             && let Some(r) = m.receiver()
             && is_pure(&r)
             && matches!(self.ty_of(r.syntax()), Some(Ty::Option(_) | Ty::Result(..)))
@@ -8804,11 +8805,15 @@ impl<'a> Codegen<'a> {
             "take" => (swap(self, Frag::text("null")), opt),
             "replace" => (swap(self, a(0)), opt),
             // `*self.timer.as_mut().unwrap() += 1`: a slot over the place (null for `None`).
-            "as_mut" if self.types.slot_calls.contains(&self.range_of(m.syntax())) => {
+            "as_mut" | "as_deref_mut"
+                if self.types.slot_calls.contains(&self.range_of(m.syntax())) =>
+            {
                 let f = self.opt_slot(recv).unwrap_or(rf);
                 (f, opt)
             }
-            "as_ref" | "as_mut" | "as_deref" | "cloned" | "copied" | "upgrade" => (rf, opt),
+            "as_ref" | "as_mut" | "as_deref" | "as_deref_mut" | "cloned" | "copied" | "upgrade" => {
+                (rf, opt)
+            }
             "flatten" => (
                 rf.wrap("κσ.$unsome(", ")"),
                 self.ty_of(m.syntax()).unwrap_or(Ty::Unknown),
@@ -9166,6 +9171,11 @@ impl<'a> Codegen<'a> {
             "get" | "get_mut" => (call("get", vec![a(0)]), opt),
             "remove" => (call("remove", vec![a(0)]), opt),
             "contains_key" => (call("containsKey", vec![a(0)]), Ty::Bool),
+            "get_key_value" | "remove_entry" => {
+                let js = if method == "remove_entry" { "removeEntry" } else { "getKeyValue" };
+                let pair = Ty::Tuple(vec![k.clone(), v.clone()]);
+                (call(js, vec![a(0)]), Ty::Option(Box::new(pair)))
+            }
             "len" => (call("len", vec![]), Ty::Int(IntKind::Usize)),
             "is_empty" => (call("len", vec![]).wrap("(", " === 0)"), Ty::Bool),
             "clear" => (call("clear", vec![]), Ty::Unit),
@@ -9783,11 +9793,7 @@ impl<'a> Codegen<'a> {
     }
 
     fn emit_macro(&mut self, mc: &ast::MacroCall) -> (Frag, Ty) {
-        let name = mc
-            .path()
-            .and_then(|p| p.segment())
-            .and_then(|s| s.name_ref())
-            .map(|n| n.text().to_string());
+        let name = macros::macro_name(mc);
         let Some(name) = name else {
             return (Frag::text("undefined"), Ty::Unknown);
         };
@@ -10089,7 +10095,9 @@ impl<'a> Codegen<'a> {
                 (f, fmt_result)
             }
             _ => {
-                self.unsupported(mc.syntax(), &format!("macro `{name}!` (`macro_rules!`)"));
+                // (`defmt::write!`: another crate's macro named like std's, see `macro_name`.)
+                let what = if name.contains("::") { "another crate's" } else { "`macro_rules!`" };
+                self.unsupported(mc.syntax(), &format!("macro `{name}!` ({what})"));
                 (Frag::text("undefined"), Ty::Unknown)
             }
         }

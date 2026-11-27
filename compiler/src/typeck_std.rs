@@ -21,6 +21,7 @@ fn iter_of(elem: Ty) -> Ty {
 /// The unsigned type of the same width (`i32::abs_diff` returns `u32`).
 fn unsigned(k: IntKind) -> IntKind {
     match k {
+        IntKind::I128 => IntKind::U128,
         IntKind::I8 => IntKind::U8,
         IntKind::I16 => IntKind::U16,
         IntKind::I32 => IntKind::U32,
@@ -217,6 +218,84 @@ impl Checker<'_> {
                 }
             }
 
+            // `String`'s other editing methods; each reassigns the receiver.
+            (Ty::Str, "reserve" | "reserve_exact" | "shrink_to") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &USIZE);
+                }
+                Ty::Unit
+            }
+            (Ty::Str, "shrink_to_fit" | "make_ascii_lowercase" | "make_ascii_uppercase") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 0);
+                Ty::Unit
+            }
+            (Ty::Str, "split_off") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &USIZE);
+                }
+                Ty::Str
+            }
+            (Ty::Str, "drain" | "replace_range") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, if method == "drain" { 1 } else { 2 });
+                if let Some(ast::Expr::RangeExpr(r)) = a0 {
+                    use ra_ap_syntax::ast::RangeItem;
+                    for b in [r.start(), r.end()].into_iter().flatten() {
+                        self.check(&b, &USIZE);
+                    }
+                } else if let Some(a) = a0 {
+                    let msg = format!("`{method}` takes a range: `s.{method}(1..3)`, `s.{method}(..n)`");
+                    self.error(a.syntax(), msg);
+                }
+                if method == "drain" {
+                    iter(Ty::Char)
+                } else {
+                    if let Some(a) = a1 {
+                        self.check(a, &Ty::Str);
+                    }
+                    Ty::Unit
+                }
+            }
+            (Ty::Str, "retain") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 1);
+                self.closure_arg(a0, vec![Ty::Char], Ty::Bool);
+                Ty::Unit
+            }
+            (Ty::Str, "match_indices" | "rmatch_indices") => {
+                count(self, 1);
+                self.str_pattern(a0);
+                iter(Ty::Tuple(vec![USIZE, Ty::Str]))
+            }
+            (Ty::Str, "split_inclusive") => {
+                count(self, 1);
+                self.str_pattern(a0);
+                iter(Ty::Str)
+            }
+            (Ty::Str, "split_ascii_whitespace") => {
+                count(self, 0);
+                iter(Ty::Str)
+            }
+            (Ty::Str, "encode_utf16") => {
+                count(self, 0);
+                iter(Ty::Int(IntKind::U16))
+            }
+            // (An iterator of chars in std; here the escaped string, which is what `Display`,
+            // `to_string()` and `format!` make of it.)
+            (Ty::Str, "escape_debug" | "escape_default" | "escape_unicode") => {
+                count(self, 0);
+                Ty::Str
+            }
+            (Ty::Str, "into_boxed_bytes") => {
+                count(self, 0);
+                Ty::Vec(Box::new(Ty::Int(IntKind::U8)))
+            }
+
             // `s.as_ref()` / `v.borrow()` (`AsRef<str>`, `AsRef<[T]>`): the value itself.
             (Ty::Str | Ty::Vec(_) | Ty::Dyn(_, _), "as_ref" | "borrow") => {
                 count(self, 0);
@@ -250,6 +329,19 @@ impl Checker<'_> {
                         }
                     }
                     "neg" | "abs" => count(self, 0),
+                    // `x.wrapping_shl(n)` / `x.checked_shr(n)`: the shift amount is a `u32`.
+                    "shl" | "shr" => {
+                        count(self, 1);
+                        if let Some(a) = a0 {
+                            self.check(a, &U32);
+                        }
+                    }
+                    "div_euclid" | "rem_euclid" | "next_multiple_of" => {
+                        count(self, 1);
+                        if let Some(a) = a0 {
+                            self.check(a, &Ty::Int(k));
+                        }
+                    }
                     // `index.checked_add_signed(-1)`: the signed kind of the same width.
                     "add_signed" | "sub_signed" if !k.is_signed() => {
                         count(self, 1);
@@ -264,6 +356,61 @@ impl Checker<'_> {
                 } else {
                     Ty::Int(k)
                 }
+            }
+            // `x.overflowing_add(y)`: the wrapped result and whether it overflowed.
+            (Ty::Int(k), m2) if m2.starts_with("overflowing_") => {
+                let op = &m2["overflowing_".len()..];
+                match op {
+                    "add" | "sub" | "mul" | "div" | "rem" => {
+                        count(self, 1);
+                        if let Some(a) = a0 {
+                            self.check(a, &Ty::Int(k));
+                        }
+                    }
+                    "pow" | "shl" | "shr" => {
+                        count(self, 1);
+                        if let Some(a) = a0 {
+                            self.check(a, &U32);
+                        }
+                    }
+                    "neg" | "abs" => count(self, 0),
+                    _ => return None,
+                }
+                Ty::Tuple(vec![Ty::Int(k), Ty::Bool])
+            }
+            (Ty::Int(k), "rotate_left" | "rotate_right") => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &U32);
+                }
+                Ty::Int(k)
+            }
+            // (`from_le` / `from_be` are `u32::from_be(x)`, written as a method by the pre-pass.)
+            (Ty::Int(k), "to_le" | "to_be" | "from_le" | "from_be" | "swap_bytes" | "reverse_bits") => {
+                count(self, 0);
+                Ty::Int(k)
+            }
+            (Ty::Int(k), "div_ceil" | "next_multiple_of") => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Int(k));
+                }
+                Ty::Int(k)
+            }
+            (Ty::Int(k), "cast_signed") if !k.is_signed() => {
+                count(self, 0);
+                Ty::Int(signed_of(k))
+            }
+            (Ty::Int(k), "cast_unsigned") if k.is_signed() => {
+                count(self, 0);
+                Ty::Int(unsigned(k))
+            }
+            (Ty::Int(IntKind::U8), "eq_ignore_ascii_case") => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Int(IntKind::U8));
+                }
+                Ty::Bool
             }
             (Ty::Int(k), "abs_diff") => {
                 count(self, 1);
@@ -531,6 +678,14 @@ impl Checker<'_> {
                 }
                 Ty::Option(Box::new(Ty::Char))
             }
+            // (`unsafe`; here an invalid code point is whatever JS makes of it.)
+            ["char", "from_u32_unchecked"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &U32);
+                }
+                Ty::Char
+            }
             ["char", "from"] => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -559,6 +714,18 @@ impl Checker<'_> {
                     self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
                 }
                 Ty::Result(Box::new(Ty::Str), Box::new(Ty::Extern("Utf8Error".into())))
+            }
+            // `String::from_utf16(&units)` / `from_utf16_lossy(&units)`
+            ["String", m2 @ ("from_utf16" | "from_utf16_lossy")] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U16))));
+                }
+                if *m2 == "from_utf16" {
+                    Ty::Result(Box::new(Ty::Str), Box::new(Ty::Extern("FromUtf16Error".into())))
+                } else {
+                    Ty::Str
+                }
             }
             ["String", "from_utf8_lossy"] => {
                 count(self, 1);
@@ -651,21 +818,32 @@ impl Checker<'_> {
             }
             [t, "try_from"] if matches!(Ty::from_name(t), Ty::Int(_)) => {
                 count(self, 1);
+                let target = Ty::from_name(t);
+                let mut err = Ty::Extern("TryFromIntError".into());
                 if let Some(a) = a0 {
                     let s = self.infer(a, None);
-                    let ok = matches!(self.shallow(&s), Ty::Int(_) | Ty::Unknown | Ty::Var(_));
-                    if !ok {
-                        let msg = format!(
-                            "the trait bound `{t}: TryFrom<{}>` is not satisfied",
-                            self.describe(&s)
-                        );
-                        self.error(a.syntax(), msg);
+                    match self.shallow(&s) {
+                        // `u8::try_from('é')`: `Err(TryFromCharError(()))` past U+00FF.
+                        Ty::Char if *t == "u8" => err = Ty::Extern("TryFromCharError".into()),
+                        // `u32::try_from(x)` of a `u32` / `u16` cannot fail: std's error is
+                        // `Infallible` (when the program names it, so the marker prelude is in).
+                        Ty::Int(k)
+                            if self.lossless(&Ty::Int(k), &target)
+                                && self.adts.defs.contains_key("Infallible") =>
+                        {
+                            err = Ty::Adt("Infallible".into(), vec![]);
+                        }
+                        Ty::Int(_) | Ty::Unknown | Ty::Var(_) => {}
+                        _ => {
+                            let msg = format!(
+                                "the trait bound `{t}: TryFrom<{}>` is not satisfied",
+                                self.describe(&s)
+                            );
+                            self.error(a.syntax(), msg);
+                        }
                     }
                 }
-                Ty::Result(
-                    Box::new(Ty::from_name(t)),
-                    Box::new(Ty::Extern("TryFromIntError".into())),
-                )
+                Ty::Result(Box::new(target), Box::new(err))
             }
             // `u32::default()`, `String::default()`
             [t, "default"] if Ty::from_name(t) != Ty::Unknown => {

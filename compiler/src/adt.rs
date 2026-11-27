@@ -330,6 +330,8 @@ pub struct Adts {
     pub debug_fmt: HashMap<String, usize>,
     /// `impl Iterator for T { type Item = X; .. }`: `X`, by `T`. Also `impl IntoIterator`.
     pub iter_items: HashMap<String, Ty>,
+    /// The iterators among them whose `type Item` is a `&mut T`.
+    pub iter_mut_items: std::collections::HashSet<String>,
     /// Types with `impl IntoIterator` (iterated through their `into_iter()`, not `next()`).
     pub into_iters: std::collections::HashSet<String>,
     /// `impl Future for T { type Output = X; .. }`: `X`, by `T`. Such a value is awaited (and

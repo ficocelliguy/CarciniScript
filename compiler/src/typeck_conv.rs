@@ -1300,6 +1300,43 @@ impl Checker<'_> {
                         js: "Array.from".into(),
                     })
                 }
+                // `b.into()` as a `char` (from a `u8` only, as std has it).
+                (Ty::Int(IntKind::U8), Ty::Char) => Some(Conv::Wrap {
+                    js: "String.fromCharCode".into(),
+                }),
+                // `c.into()` as a `u32` / `u64` / `u128`: the code point.
+                (Ty::Char, Ty::Int(k @ (IntKind::U32 | IntKind::U64 | IntKind::U128))) => {
+                    Some(Conv::Wrap {
+                        js: if k.is_big() {
+                            "((c) => BigInt(c.codePointAt(0)))"
+                        } else {
+                            "((c) => c.codePointAt(0))"
+                        }
+                        .into(),
+                    })
+                }
+                // `c.into()` as a `String`: a `char` is its one-character string already.
+                (Ty::Char, Ty::Str) => Some(Conv::Identity),
+                // `x.into()` as an `Option<T>`: `Some(x)`.
+                (_, Ty::Option(inner))
+                    if !matches!(s, Ty::Option(_) | Ty::Var(_) | Ty::Unknown)
+                        && self.could_be(&s, inner) =>
+                {
+                    let inner = (**inner).clone();
+                    self.unify(&s, &inner);
+                    Some(Conv::Wrap { js: "κσ.$some".into() })
+                }
+                // `x.into()` as a `Cell<T>` / `RefCell<T>` (one type here).
+                (_, Ty::RefCell(inner))
+                    if !matches!(s, Ty::RefCell(_) | Ty::Var(_) | Ty::Unknown)
+                        && self.could_be(&s, inner) =>
+                {
+                    let inner = (**inner).clone();
+                    self.unify(&s, &inner);
+                    Some(Conv::Wrap {
+                        js: "((x) => new κσ.RefCell(x, \"Cell\"))".into(),
+                    })
+                }
                 // `let one: i16 = true.into()`: 1 or 0.
                 (Ty::Bool, Ty::Int(k)) => Some(Conv::Wrap {
                     js: if k.is_big() { "BigInt" } else { "Number" }.into(),
@@ -1329,7 +1366,7 @@ impl Checker<'_> {
 
     /// Std conversions that are the identity in JS: `&str` → `String`, and lossless numeric
     /// widenings (`i32` → `i64`, `u8` → `u32`, `i32` → `f64`, ..).
-    fn lossless(&mut self, s: &Ty, t: &Ty) -> bool {
+    pub(super) fn lossless(&mut self, s: &Ty, t: &Ty) -> bool {
         use IntKind::*;
         let bits = |k: IntKind| match k {
             I8 | U8 => 8,

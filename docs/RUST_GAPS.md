@@ -295,7 +295,11 @@ There is one JS thread, and scripts share it with the game.
   alternatives of one name would both stay: then the one on with every feature off is kept, or
   the first written when none is (so a file that rustc builds only with some feature compiles
   as with the first such feature set). `#[cfg]`s inside macro arguments (`vec![#[cfg(x)] 1]`)
-  aren't evaluated. `compile_error!` under a target `#[cfg]` fires as it would on wasm:
+  aren't evaluated. `#[cfg_attr(..)]` and a `#[cfg]` on a block's tail expression take features as
+  off, like `cfg_if!`: `#[cfg_attr(feature = "serde", derive(Serialize))]` is dropped and
+  `#[cfg_attr(not(feature = "std"), derive(Debug))]` applied, where rustc with the feature on
+  would do the opposite (keeping a gated attribute would want a crate the script hasn't got, and
+  a kept tail would change the block's type). `compile_error!` under a target `#[cfg]` fires as it would on wasm:
   `#[cfg(not(any(unix, windows)))] compile_error!(..)` is an error here.
 - **`Instant` has the browser's resolution**: `performance.now()` is microseconds or coarser
   (browsers round it), and it counts from page load, so `{:?}` of an `Instant` isn't rustc's.
@@ -448,6 +452,10 @@ There is one JS thread, and scripts share it with the game.
 - **`for x in &mut v` needs a stable name for `v`.** The loop variable aliases `v[i]`. When `v` is
   a more complex expression, it's evaluated once into a temporary first.
 - **`windows` / `chunks` yield copies.** Rust yields borrowed slices; reading them is identical.
+- **`split_first_mut` / `split_last_mut` need elements that are JS objects** (structs, tuples,
+  collections): over numbers, strings or bools they're rejected, since the element would be a
+  copy. `first_chunk` / `last_chunk` (and their `_mut`) need the length written,
+  `v.first_chunk::<2>()`, as lengths aren't in the types.
 
 ## Collections
 
@@ -465,6 +473,11 @@ There is one JS thread, and scripts share it with the game.
   and the `Vec` methods it shares run on its contents made contiguous (`make_contiguous()` is that
   array).
 - **`VecDeque::insert` past the end appends instead of panicking.**
+- **`VecDeque::as_slices()` is its contents and an empty slice**, where std's split depends on
+  where the ring buffer wraps; `capacity()` is its length, as a `Vec`'s is.
+- **`Cow::from(&path)` is `Owned`.** `Path` and `PathBuf` are one type here, so a `Cow<Path>` made
+  from either holds its own `PathBuf`. `x.into()` as a `Cell<T>` or `RefCell<T>` (one type here)
+  makes one whose `{:?}` says `Cell`.
 - **`HashMap::with_hasher(..)` ignores the hasher**: keys compare by value.
 - **Every `RandomState` hashes alike.** std seeds each one randomly, so two `RandomState`s give
   different `hash_one` values for one key; here they give the same (a `DefaultHasher`'s).

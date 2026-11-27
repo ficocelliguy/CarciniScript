@@ -515,7 +515,7 @@ impl Checker<'_> {
             ast::Expr::PathExpr(_) => self.option_slot_shape(&e).is_some(),
             ast::Expr::MethodCallExpr(m) => {
                 let name = m.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
-                if name == "as_mut" && self.as_mut_of_place(&e) {
+                if matches!(name.as_str(), "as_mut" | "as_deref_mut") && self.as_mut_of_place(&e) {
                     return self.mark_as_mut_slot_kept(m);
                 }
                 // `v.first_mut()` of a `Vec<T>` returned from a generic `-> Option<&mut T>`.
@@ -790,6 +790,13 @@ impl Checker<'_> {
                 };
                 self.ret_item_slots.get(&key).cloned()
             }
+            // Your own iterator with `type Item = &'a mut T` (`for w in self.words_mut()`): its
+            // `next()` hands on the slots of the `iter_mut()` it wraps.
+            Ty::Adt(n, targs) if self.adts.iter_mut_items.contains(&n) => {
+                let map = self.adt_subst(&n, &targs);
+                let item = super::generic::subst(&self.adts.iter_items[&n], &map);
+                self.prim(&item).then_some(SlotShape::Slot)
+            }
             _ => None,
         }
     }
@@ -955,7 +962,7 @@ impl Checker<'_> {
             }
             // `v.get_mut(i)` / `map.get_mut(k)` / `self.timer.as_mut()` of numbers, strings or
             // bools where a slot stands in for the result (`slot_calls`).
-            "get_mut" | "first_mut" | "last_mut" | "as_mut" | "node_weight_mut"
+            "get_mut" | "first_mut" | "last_mut" | "as_mut" | "as_deref_mut" | "node_weight_mut"
             | "edge_weight_mut" | "peek_mut"
                 if self.slot_calls.contains(&self.range(m.syntax())) =>
             {
@@ -972,11 +979,13 @@ impl Checker<'_> {
 
     /// An item itself: `it.next().unwrap()`.
     fn value_slot_shape(&self, e: &ast::Expr) -> Option<SlotShape> {
-        let ast::Expr::MethodCallExpr(m) = strip_parens(e) else {
-            return None;
-        };
-        match m.name_ref()?.text().to_string().as_str() {
-            "unwrap" | "expect" | "unwrap_or" => self.option_slot_shape(&m.receiver()?),
+        match strip_parens(e) {
+            // `let s = o?;` of an `Option<&mut String>` parameter: the slot too.
+            ast::Expr::TryExpr(t) => self.option_slot_shape(&t.expr()?),
+            ast::Expr::MethodCallExpr(m) => match m.name_ref()?.text().to_string().as_str() {
+                "unwrap" | "expect" | "unwrap_or" => self.option_slot_shape(&m.receiver()?),
+                _ => None,
+            },
             _ => None,
         }
     }

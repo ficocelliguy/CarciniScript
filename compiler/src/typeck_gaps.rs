@@ -4,7 +4,7 @@
 
 use ra_ap_syntax::{
     AstNode,
-    ast::{self, HasName},
+    ast::{self, HasGenericArgs, HasName},
 };
 
 use super::{Checker, Mutation, USIZE, VarKind};
@@ -297,6 +297,85 @@ impl Checker<'_> {
                 }
                 Ty::Bool
             }
+            (Ty::Vec(e), "split_at_checked" | "split_at_mut_checked") => {
+                if method == "split_at_mut_checked" {
+                    self.check_mutable(recv, Mutation::Borrow);
+                }
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &USIZE);
+                }
+                opt(Ty::Tuple(vec![Ty::Vec(e.clone()), Ty::Vec(e)]))
+            }
+            (Ty::Vec(e), "split_first_mut" | "split_last_mut") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 0);
+                let el = self.zonk(&e);
+                if self.prim(&el) {
+                    self.error(
+                        m.syntax(),
+                        format!("`{method}` over numbers, strings or bools is not supported; index the slice instead"),
+                    );
+                }
+                opt(Ty::Tuple(vec![(*e).clone(), Ty::Vec(e)]))
+            }
+            (Ty::Vec(e), "partition_point") => {
+                count(self, 1);
+                self.closure_arg(a0, vec![*e], Ty::Bool);
+                USIZE
+            }
+            (Ty::Vec(e), "is_sorted_by") => {
+                count(self, 1);
+                self.closure_arg(a0, vec![(*e).clone(), *e], Ty::Bool);
+                Ty::Bool
+            }
+            (Ty::Vec(e), "is_sorted_by_key") => {
+                count(self, 1);
+                let k = self.fresh(VarKind::General);
+                self.closure_arg(a0, vec![*e], k);
+                Ty::Bool
+            }
+            (Ty::Vec(e), "dedup_by") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 1);
+                self.closure_arg(a0, vec![(*e).clone(), *e], Ty::Bool);
+                Ty::Unit
+            }
+            // `v.split(|x| ..)` / `split_inclusive` / `rsplit`: the runs between matches.
+            (Ty::Vec(e), "split" | "split_inclusive" | "rsplit") => {
+                count(self, 1);
+                self.closure_arg(a0, vec![(*e).clone()], Ty::Bool);
+                Ty::Iter {
+                    elem: Box::new(Ty::Vec(e)),
+                    mutable: false,
+                }
+            }
+            (Ty::Vec(_), "try_reserve" | "try_reserve_exact") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &USIZE);
+                }
+                Ty::Result(
+                    Box::new(Ty::Unit),
+                    Box::new(Ty::Extern("TryReserveError".into())),
+                )
+            }
+            // `v.first_chunk::<N>()` / `last_chunk` / `first_chunk_mut`: the first `N`, if
+            // there are that many (an array is a `Vec` here).
+            (Ty::Vec(e), "first_chunk" | "last_chunk" | "first_chunk_mut" | "last_chunk_mut") => {
+                if method.ends_with("_mut") {
+                    self.check_mutable(recv, Mutation::Borrow);
+                }
+                count(self, 0);
+                if m.generic_arg_list().is_none() {
+                    self.error(
+                        m.syntax(),
+                        format!("`{method}` needs its length written: `{method}::<N>()`"),
+                    );
+                }
+                opt(Ty::Vec(e))
+            }
             // ---- char
             (Ty::Char, "len_utf8" | "len_utf16") => {
                 count(self, 0);
@@ -323,6 +402,12 @@ impl Checker<'_> {
                     IntKind::I128 | IntKind::U128 => 16,
                     _ => 8,
                 };
+                self.std_array_dims.insert(m.syntax().text_range(), vec![bytes]);
+                u8s()
+            }
+            (Ty::Float { f32 }, "to_le_bytes" | "to_be_bytes" | "to_ne_bytes") => {
+                count(self, 0);
+                let bytes = if f32 { 4 } else { 8 };
                 self.std_array_dims.insert(m.syntax().text_range(), vec![bytes]);
                 u8s()
             }
@@ -455,6 +540,24 @@ impl Checker<'_> {
         let a0 = args.first();
         let a1 = args.get(1);
         Some(match tail {
+            // `Option::from(x)`: `Some(x)`.
+            ["Option", "from"] => {
+                count(self, 1);
+                let t = match a0 {
+                    Some(a) => self.infer(a, None),
+                    None => Ty::Unknown,
+                };
+                Ty::Option(Box::new(t))
+            }
+            // `slice::from_ref(&x)`: a one-element slice.
+            ["slice", "from_ref"] => {
+                count(self, 1);
+                let t = match a0 {
+                    Some(a) => self.infer(a, None),
+                    None => Ty::Unknown,
+                };
+                Ty::Vec(Box::new(t))
+            }
             [int, "from_le_bytes" | "from_be_bytes" | "from_ne_bytes"]
                 if IntKind::from_name(int).is_some() =>
             {
@@ -463,6 +566,14 @@ impl Checker<'_> {
                     self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
                 }
                 Ty::Int(IntKind::from_name(int)?)
+            }
+            // `f64::from_le_bytes(bytes)`
+            [float @ ("f32" | "f64"), "from_le_bytes" | "from_be_bytes" | "from_ne_bytes"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
+                }
+                Ty::Float { f32: *float == "f32" }
             }
             [int, "__nz_new"] if IntKind::from_name(int).is_some() => {
                 count(self, 1);

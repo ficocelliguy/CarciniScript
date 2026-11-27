@@ -21,6 +21,21 @@ const CONTROL_FLOW: &str = include_str!("control_flow_prelude.rs");
 const BOUND: &str = include_str!("bound_prelude.rs");
 const UNWIND: &str = include_str!("unwind_prelude.rs");
 const RANDOM_STATE: &str = include_str!("random_state_prelude.rs");
+/// `Cow<Path>` conversions, for a program with both the path and the Cow preludes. (`&Path` is
+/// a `PathBuf` too, so `Cow::from(&path)` is `Owned`.)
+const COW_PATH: &str = "// (cow path prelude)
+impl<'a> From<PathBuf> for Cow<'a, PathBuf> {
+    fn from(p: PathBuf) -> Cow<'a, PathBuf> {
+        Cow::Owned(p)
+    }
+}
+
+impl<'a> From<Cow<'a, PathBuf>> for PathBuf {
+    fn from(c: Cow<'a, PathBuf>) -> PathBuf {
+        c.into_owned()
+    }
+}
+";
 
 /// Whether `ty` is declared in `text` (so a std name of that spelling isn't std's).
 /// (`struct Reader` doesn't declare `Read`.)
@@ -54,6 +69,9 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     }
     if path {
         out.push(PATH);
+        if crate::stdtime::has_word(text, "Cow") && !text.contains("// (cow path prelude)") {
+            out.push(COW_PATH);
+        }
     }
     if text.contains("Wrapping")
         && !text.contains("// (wrapping prelude)")

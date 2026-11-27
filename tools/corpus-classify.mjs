@@ -166,6 +166,8 @@ function classify(m, lineText, file) {
   }
   if (/^macro `[^`]*!`/.test(m)) {
     const mb = n.replace(/!$/, "").split("::").pop();
+    // (`defmt::write!`: a qualified std name from another crate; the compiler keeps the path.)
+    if (/::/.test(n) && !/^(::)?(std|core|alloc)::/.test(n)) return ["EXT", "macro"];
     if (mb === "thread_local") return ["THREAD", mb];
     return STD_MACROS.has(mb) ? ["STD", "macro " + mb + "!"] : ["EXT", "macro"];
   }

@@ -1244,6 +1244,11 @@ impl Checker<'_> {
                 count(self, 0);
                 USIZE
             }
+            // `v.chunks_exact(n).remainder()`: the leftover elements.
+            "remainder" if matches!(self.shallow(&e), Ty::Vec(_)) => {
+                count(self, 0);
+                e
+            }
             // `chars.as_str()` (the rest), `c.to_uppercase().to_string()`.
             "as_str" | "to_string" if self.shallow(&e) == Ty::Char => {
                 count(self, 0);

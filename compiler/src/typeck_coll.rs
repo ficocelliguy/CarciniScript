@@ -62,6 +62,12 @@ fn shared(kind: Coll, method: &str) -> bool {
                 | "swap"
                 | "get"
                 | "drain"
+                | "reserve"
+                | "reserve_exact"
+                | "shrink_to_fit"
+                | "capacity"
+                | "resize"
+                | "resize_with"
         ),
         Coll::BinaryHeap => matches!(method, "len" | "is_empty" | "iter" | "clear"),
         // (Never a value's type: see `Coll::FixedArray`.)
@@ -70,6 +76,8 @@ fn shared(kind: Coll, method: &str) -> bool {
             method,
             "insert"
                 | "get"
+                | "get_key_value"
+                | "remove_entry"
                 | "get_mut"
                 | "remove"
                 | "contains_key"
@@ -506,6 +514,8 @@ impl Checker<'_> {
         }
         Some(match (kind, method) {
             (_, "clone") => sig(self, &[], this),
+            // `deque.into()` as a `Vec` (see `resolve_intos`).
+            (_, "into") if args.is_empty() => self.conv_into_call(m, this),
             (_, "append") => {
                 if let Some(a) = args.first() {
                     self.check_mutable(a, Mutation::Borrow);
@@ -525,6 +535,16 @@ impl Checker<'_> {
             (Coll::VecDeque, "insert") => sig(self, &[USIZE, elem], Ty::Unit),
             (Coll::VecDeque, "remove") => sig(self, &[USIZE], opt(elem)),
             (Coll::VecDeque, "make_contiguous") => sig(self, &[], view.clone()),
+            (Coll::VecDeque, "split_off") => {
+                self.check_mutable(recv, Mutation::Borrow);
+                sig(self, &[USIZE], this)
+            }
+            (Coll::VecDeque, "as_slices" | "as_mut_slices") => {
+                if method == "as_mut_slices" {
+                    self.check_mutable(recv, Mutation::Borrow);
+                }
+                sig(self, &[], Ty::Tuple(vec![view.clone(), view.clone()]))
+            }
             (Coll::BinaryHeap, "push") => {
                 self.require_ord(m.syntax(), &elem, "sort");
                 sig(self, &[elem], Ty::Unit)

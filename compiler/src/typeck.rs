@@ -433,6 +433,7 @@ impl<'a> Checker<'a> {
             io_writes: Default::default(),
             slot_item_calls: Default::default(),
             lock_results: Default::default(),
+            mut_ref_opts: Default::default(),
             any_strs: Default::default(),
             any_checks: Default::default(),
             crate_name: String::new(),
@@ -1056,6 +1057,9 @@ struct Checker<'a> {
     /// Locals holding an unwrapped `m.lock()` (`let r = m.lock();`): matched later, the `Ok`
     /// binding aliases the lock's value, as with the call itself.
     lock_results: std::collections::HashSet<String>,
+    /// Locals and parameters written `Option<&mut T>` (`T` not a slot type), or holding a
+    /// `get_mut(..)`: matched or `?`d, the bindings write through.
+    mut_ref_opts: std::collections::HashSet<String>,
     any_strs: HashMap<(usize, usize), String>,
     any_checks: HashMap<(usize, usize), Ty>,
     /// The crate's name (the file's stem), which `type_name` puts before a struct's name.
@@ -2838,6 +2842,7 @@ impl<'a> Checker<'a> {
         self.in_async = is_async;
         self.scopes = vec![HashMap::new()];
         self.slot_locals.clear();
+        self.mut_ref_opts.clear();
         self.slot_options.clear();
         self.slot_results.clear();
         self.slot_items.clear();
@@ -2873,6 +2878,16 @@ impl<'a> Checker<'a> {
                     && let Some(n) = ip.name()
                 {
                     let reference = p.ty().as_ref().and_then(Self::ref_kind);
+                    // `o: Option<&mut Vec<u8>>`: `if let Some(s) = o { s.push(..) }` and
+                    // `let s = o?;` write through `s` without `mut`. (Of a number, string, bool
+                    // or `Option`, `o` is a slot instead, see `opt_slot`.)
+                    if opt_slot.get(i) != Some(&true)
+                        && p.ty().is_some_and(|t| {
+                            matches!(t, ast::Type::PathType(_)) && written_mut_ref(&t)
+                        })
+                    {
+                        self.mut_ref_opts.insert(n.text().to_string());
+                    }
                     // `o: Option<&mut i32>`: `null` or a slot; `if let Some(n) = o` binds the slot.
                     if opt_slot.get(i) == Some(&true) {
                         self.slot_options
@@ -3390,6 +3405,10 @@ impl<'a> Checker<'a> {
             Some(e) if self.unwrapped_mut_ref_call(&e) => Some(true),
             // `let g = net.get_mut(0);` / `let s = find(&mut v, "a").unwrap();` with your own
             // `fn get_mut(&mut self, ..) -> &mut Srv` / `-> Option<&mut Srv>`.
+            // `let t = v;` with `v: &mut Vec<u8>`, `let t = if c { a } else { b };` of two
+            // `&mut`s, `let t = o?;` of an `Option<&mut T>`, `let t = v.as_mut_slice();`: the
+            // `&mut` is rebound, and `t` writes through without `mut`.
+            Some(e) if self.mut_ref_expr(&e) => Some(true),
             Some(e) if self.user_mut_ref_call(&e) => Some(true),
             _ => None,
         };
@@ -3406,6 +3425,16 @@ impl<'a> Checker<'a> {
                 self.lock_results.insert(name.text().to_string());
             } else {
                 self.lock_results.remove(&*name.text());
+            }
+            // `let o: Option<&mut Vec<u8>> = ..;` / `let o = v.get_mut(0);` (not unwrapped): `if
+            // let Some(s) = o` writes through `s`.
+            if l.ty().is_some_and(|t| matches!(t, ast::Type::PathType(_)) && written_mut_ref(&t))
+                || (l.initializer().is_some_and(|i| self.mut_ref_call(&i))
+                    && init_ty.as_ref().is_some_and(|t| matches!(self.zonk(t), Ty::Option(_))))
+            {
+                self.mut_ref_opts.insert(name.text().to_string());
+            } else {
+                self.mut_ref_opts.remove(&*name.text());
             }
             // `let mut refs: Vec<&mut i32> = Vec::new();` / `let tagged: Vec<(usize, &mut i32)> =
             // vec![(0, &mut c)];`: a Vec of slots, filled by `push` or the literal.
@@ -3525,8 +3554,7 @@ impl<'a> Checker<'a> {
         // `let Some(s) = net.find_mut("a") else { return };` (or `v.get_mut(0)`, `&mut pair`,
         // `self.timer.as_mut()`): `s` is a `&mut` into the place, written through without `mut`.
         if (through_mut
-            || l.let_else().is_some()
-                && l.initializer().as_ref().is_some_and(|i| self.mut_ref_call(i)))
+            || l.initializer().as_ref().is_some_and(|i| self.mut_ref_expr(i)))
             && let Some(scope) = self.scopes.last_mut()
         {
             for ip in pat.syntax().descendants().filter_map(ast::IdentPat::cast) {
@@ -3635,6 +3663,87 @@ impl<'a> Checker<'a> {
                 .is_some_and(|v| v.field("__c").is_some())
     }
 
+    /// Whether `e` hands on a `&mut` the code already holds, so a binding of it is written
+    /// through without `mut`: a local or parameter holding one (`let t = v;` with `v: &mut
+    /// Vec<u8>`, `o?` with `o: Option<&mut T>`), `&mut x`, a `&mut`-returning call
+    /// (`mut_ref_call`, also through `?` / `.unwrap()`), or an `if` / `match` / block each of
+    /// whose branches does (`if c { a } else { b }`, `match o { Some(t) => t, None => return }`).
+    fn mut_ref_expr(&self, e: &ast::Expr) -> bool {
+        match strip_parens(e) {
+            ast::Expr::PathExpr(p) => {
+                p.path().and_then(|p| p.as_single_name_ref()).is_some_and(|n| {
+                    let n = n.text().to_string();
+                    self.lookup(&n).is_some_and(|l| l.reference == Some(true))
+                        || self.mut_ref_opts.contains(&n)
+                })
+            }
+            ast::Expr::RefExpr(r) => r.mut_token().is_some(),
+            ast::Expr::IfExpr(i) => {
+                i.then_branch().is_some_and(|b| self.block_tail_mut_ref(&b))
+                    && match i.else_branch() {
+                        Some(ast::ElseBranch::Block(b)) => self.block_tail_mut_ref(&b),
+                        Some(ast::ElseBranch::IfExpr(e)) => {
+                            self.mut_ref_expr(&ast::Expr::IfExpr(e))
+                        }
+                        None => false,
+                    }
+            }
+            ast::Expr::MatchExpr(m) => {
+                let arms: Vec<ast::MatchArm> =
+                    m.match_arm_list().map(|l| l.arms().collect()).unwrap_or_default();
+                // (Matched through a `&mut` (`match o { Some(t) => t, .. }` with `o: &mut
+                // Option<T>`), an arm's own binding is one too; its scope is gone by now.)
+                let through_mut = m.expr().is_some_and(|e| self.mut_ref_expr(&e));
+                !arms.is_empty()
+                    && arms.iter().all(|a| {
+                        a.expr().is_some_and(|e| {
+                            let diverges = self
+                                .raw
+                                .get(&self.range(e.syntax()))
+                                .is_some_and(|t| matches!(self.zonk(t), Ty::Never));
+                            let own_binding = through_mut
+                                && match strip_parens(&e) {
+                                    ast::Expr::PathExpr(p) => p
+                                        .path()
+                                        .and_then(|p| p.as_single_name_ref())
+                                        .is_some_and(|n| {
+                                            a.pat().is_some_and(|pat| {
+                                                pat.syntax()
+                                                    .descendants()
+                                                    .filter_map(ast::IdentPat::cast)
+                                                    .any(|ip| {
+                                                        ip.name().is_some_and(|m| {
+                                                            m.text() == n.text()
+                                                        })
+                                                    })
+                                            })
+                                        }),
+                                    _ => false,
+                                };
+                            diverges || own_binding || self.mut_ref_expr(&e)
+                        })
+                    })
+            }
+            ast::Expr::BlockExpr(b) => self.block_tail_mut_ref(&b),
+            e => {
+                // (`v.iter_mut()` yields `&mut`s but isn't one: a local holding it is an iterator,
+                // not a `&mut Vec`.)
+                let is_iter = self
+                    .raw
+                    .get(&self.range(e.syntax()))
+                    .is_some_and(|t| matches!(self.zonk(t), Ty::Iter { .. }));
+                let (inner, unwrapped) = strip_unwraps(&e);
+                !is_iter && ((unwrapped && self.mut_ref_expr(&inner)) || self.mut_ref_call(&e))
+            }
+        }
+    }
+
+    fn block_tail_mut_ref(&self, b: &ast::BlockExpr) -> bool {
+        b.stmt_list()
+            .and_then(|l| l.tail_expr())
+            .is_some_and(|t| self.mut_ref_expr(&t))
+    }
+
     fn mut_ref_call(&self, e: &ast::Expr) -> bool {
         (match ptr::unsafe_tail(e) {
             ast::Expr::RefExpr(r) => r.mut_token().is_some(),
@@ -3652,8 +3761,13 @@ impl<'a> Checker<'a> {
                             | "values_mut"
                             | "iter_mut"
                             | "split_at_mut"
+                            | "split_at_mut_checked"
+                            | "as_deref_mut"
                             | "downcast_mut"
                             | "peek_mut"
+                            | "split_first_mut"
+                            | "split_last_mut"
+                            | "as_mut_slice"
                     )
                 }) || mut_element(&ast::Expr::MethodCallExpr(m.clone()), &|e| {
                     self.typed_mut_iter(e)
@@ -3709,7 +3823,7 @@ impl<'a> Checker<'a> {
             return false;
         };
         let Some(r) = m.receiver() else { return false };
-        m.name_ref().is_some_and(|n| n.text() == "as_mut")
+        m.name_ref().is_some_and(|n| matches!(n.text(), "as_mut" | "as_deref_mut"))
             && m.arg_list().is_none_or(|l| l.args().next().is_none())
             && is_place_expr(&strip_parens(&r))
             && self
@@ -3904,7 +4018,7 @@ impl<'a> Checker<'a> {
     /// the like hold `&mut` references, so they can be mutated through without `mut`.
     fn mark_mut_ref_bindings(&mut self, scrutinee: Option<&ast::Expr>, pat: &ast::Pat) {
         let through_place = self.alias_place_bindings(scrutinee, pat);
-        let mut_source = through_place || scrutinee.is_some_and(|e| self.mut_ref_call(e));
+        let mut_source = through_place || scrutinee.is_some_and(|e| self.mut_ref_expr(e));
         // `Some(x)` against a slot (`map.get_mut(..)` of numbers): `x` aliases the slot's value.
         if let Some(ast::Expr::MethodCallExpr(m)) = scrutinee.map(strip_parens)
             && self.slot_calls.contains(&self.range(m.syntax()))
@@ -4327,7 +4441,11 @@ impl<'a> Checker<'a> {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let st = self.with_dims(st, &dims);
+        let st = match m.expr() {
+            // (Arrays inside an `Option`, `Result` or tuple: from the declared type.)
+            Some(e) if dims.is_empty() => self.with_decl_dims(st, &e),
+            _ => self.with_dims(st, &dims),
+        };
         self.missing_steps.set(0);
         if let Some(witness) = self.missing(&rows, std::slice::from_ref(&st)) {
             let node = m
@@ -4722,6 +4840,10 @@ impl<'a> Checker<'a> {
             return if rows.is_empty() { Some(vec![]) } else { None };
         };
         let rest = &tys[1..];
+        // No value to miss (`match e {}` on `Infallible`, a variant-less enum, `!`).
+        if self.uninhabited(ty) {
+            return None;
+        }
         // The constructor family of this column: from its type, or from its patterns when the type
         // is unknown.
         let head_kind = rows
@@ -8162,7 +8284,7 @@ impl<'a> Checker<'a> {
                 let map = self.adt_subst(&n, &targs);
                 Ty::Iter {
                     elem: Box::new(crate::typeck::generic::subst(&item, &map)),
-                    mutable: false,
+                    mutable: self.adts.iter_mut_items.contains(&n),
                 }
             }
             // A range value: `contains`, `start()` / `end()`, `is_empty`, `len`, `clone`, else
@@ -8813,7 +8935,7 @@ impl<'a> Checker<'a> {
                         }
                         sig(self, &[], inner)
                     }
-                    "as_mut" => {
+                    "as_mut" | "as_deref_mut" => {
                         self.mark_as_mut_slot(m, &inner);
                         sig(self, &[], t)
                     }
@@ -8868,7 +8990,7 @@ impl<'a> Checker<'a> {
                 if matches!(
                     m2,
                     "insert" | "remove" | "clear" | "entry" | "get_mut" | "values_mut" | "iter_mut"
-                        | "drain"
+                        | "drain" | "remove_entry"
                 ) {
                     self.check_mutable(&recv, Mutation::Borrow);
                 }
@@ -8886,6 +9008,10 @@ impl<'a> Checker<'a> {
                     "contains_key" => {
                         let key = self.lookup_key(&k, args.first());
                         sig(self, &[key], Ty::Bool)
+                    }
+                    "get_key_value" | "remove_entry" => {
+                        let key = self.lookup_key(&k, args.first());
+                        sig(self, &[key], opt(Ty::Tuple(vec![k.clone(), v.clone()])))
                     }
                     "get_mut" => {
                         let resolved = self.zonk(&v);
@@ -9300,7 +9426,7 @@ impl<'a> Checker<'a> {
                                 &self.adts.iter_items[&n],
                                 &map,
                             )),
-                            mutable: false,
+                            mutable: self.adts.iter_mut_items.contains(&n),
                         }
                     }
                     other => other,
@@ -9337,6 +9463,39 @@ impl<'a> Checker<'a> {
             if let Some(scope) = self.scopes.last_mut() {
                 for local in scope.values_mut() {
                     local.reference = reference;
+                }
+            }
+            // `for (a, b) in xs.iter().zip(ys.iter_mut())` / `.zip(dst.chunks_mut(n))`: each side
+            // of the pair is its own kind of reference.
+            if let ast::Pat::TuplePat(tp) = &pat
+                && let ast::Expr::MethodCallExpr(m) = strip_parens(&iterable)
+                && m.name_ref().is_some_and(|n| n.text() == "zip")
+                && let (Some(recv), Some(arg)) =
+                    (m.receiver(), m.arg_list().and_then(|l| l.args().next()))
+            {
+                let fields: Vec<ast::Pat> = tp.fields().collect();
+                for (side, field) in [recv, arg].iter().zip(fields.iter()) {
+                    let kind = match self.raw.get(&self.range(side.syntax())).map(|t| self.zonk(t))
+                    {
+                        Some(Ty::Iter { mutable, .. }) => Some(mutable),
+                        _ if self.mut_ref_call(side) => Some(true),
+                        _ => continue,
+                    };
+                    for ip in field.syntax().descendants().filter_map(ast::IdentPat::cast) {
+                        let Some(n) = ip.name() else { continue };
+                        // (A number, string, bool or `Option` gets a slot instead.)
+                        if kind == Some(true)
+                            && let Some(ty) = self.lookup(n.text()).map(|l| l.ty.clone())
+                            && self.cellable(&ty)
+                        {
+                            continue;
+                        }
+                        if let Some(local) =
+                            self.scopes.last_mut().and_then(|s| s.get_mut(n.text()))
+                        {
+                            local.reference = kind;
+                        }
+                    }
                 }
             }
             // Over slots (`for r in refs`, a collected `Vec<&mut i32>`): `r` reads `r[1]`.
@@ -10347,8 +10506,11 @@ impl Checker<'_> {
 
 /// `RefCell::new(x)` / `Cell::new(x)`.
 pub fn is_cell_new(c: &ast::CallExpr) -> bool {
-    path_names(c).ends_with(&["RefCell".to_string(), "new".to_string()])
-        || path_names(c).ends_with(&["Cell".to_string(), "new".to_string()])
+    let n = path_names(c);
+    matches!(
+        n.iter().map(String::as_str).collect::<Vec<_>>().as_slice(),
+        [.., "RefCell" | "Cell", "new" | "from"]
+    )
 }
 
 /// `Rc::new(x)` / `Rc::clone(&x)` (and `Arc`): `x` itself.
