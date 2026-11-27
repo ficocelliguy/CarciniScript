@@ -682,6 +682,14 @@ There is one JS thread, and scripts share it with the game.
   as a reference (`&x`, an `r: &f32` local or parameter) for a method taking `self` by value, as
   rustc's probe does; a reference that isn't written as one (a field, a closure parameter) reaches
   the type's own impl.
+- **Impls for types that are one type in JS** (`[u8; 1]` and `[u8; 2]`, `[T; N]` and `[T]`, `X`
+  and `&X`, `&T` and `&mut T`, `Rc<T>` and `Box<T>`, `dyn Tr` and `dyn Tr + Send`) conflict
+  unless they do the same thing or hand calls on to one another (then one serves, so `(&mut
+  x).f()` reaches the same body as `(&x).f()` even where rustc's probe would pick the `&mut T`
+  impl). Impls for two instantiations of one type (`W<u8>` and `W<u16>`, `Cell<u8>` and
+  `Cell<u16>`) are picked by the type arguments, and through a type parameter by the class the
+  caller passes; through `dyn`, or a `T` no caller passes a class for, the first impl's method
+  runs.
 - **Arrays and slices share `Vec`'s impls**: `impl Tr for [u8; 4]` and `impl Tr for Vec<u8>` would
   collide. Slice impls for different element types (`[u8]` and `[u16]`, or `[u8]` next to
   `impl<T: Tr> Tr for [T]`) are picked by the element type, and through a type parameter by the

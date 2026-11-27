@@ -142,6 +142,9 @@ pub struct Types {
     /// `c[ix]` with `c` of a type parameter bounded `Index<Ix>` / `IndexMut<Ix>`: indexed at run
     /// time by what the value is (`κσ.$indexAny`).
     pub param_indexes: std::collections::HashSet<(usize, usize)>,
+    /// `slice[i]` with `i` of a type parameter bounded `SliceIndex<[T]>` (and `Index::index(slice,
+    /// i)`): an element or a part by what `i` is at run time (`κσ.$sliceIndex`).
+    pub slice_param_indexes: std::collections::HashSet<(usize, usize)>,
     /// `for x in v` iterables naming a `&mut` collection (`v: &mut [T]`): looped by index like
     /// `for x in &mut v`, so `*x = ..` writes the element.
     pub mut_ref_loops: std::collections::HashSet<(usize, usize)>,
@@ -424,6 +427,7 @@ impl<'a> Checker<'a> {
             slot_calls: Default::default(),
             slot_bindings: Default::default(),
             param_indexes: Default::default(),
+            slice_param_indexes: Default::default(),
             mut_ref_loops: Default::default(),
             copy_arrays: Default::default(),
             copy_array_consts: Default::default(),
@@ -539,6 +543,7 @@ impl<'a> Checker<'a> {
             op_args: HashMap::new(),
             cmp_args: HashMap::new(),
             lenient_projs: Default::default(),
+            slice_index_params: HashMap::new(),
             pending_projections: Vec::new(),
             pending_trait_args: Vec::new(),
             file_trait_names: Default::default(),
@@ -817,6 +822,7 @@ pub fn check(
     let slot_calls = std::mem::take(&mut c.slot_calls);
     let slot_bindings = std::mem::take(&mut c.slot_bindings);
     let param_indexes = std::mem::take(&mut c.param_indexes);
+    let slice_param_indexes = std::mem::take(&mut c.slice_param_indexes);
     let mut_ref_loops = std::mem::take(&mut c.mut_ref_loops);
     let array_reads = std::mem::take(&mut c.array_reads);
     let iter_of_args = std::mem::take(&mut c.iter_of_args);
@@ -877,6 +883,7 @@ pub fn check(
             slot_calls,
             slot_bindings,
             param_indexes,
+            slice_param_indexes,
             mut_ref_loops,
             array_reads,
             iter_of_args,
@@ -1027,6 +1034,7 @@ struct Checker<'a> {
     slot_calls: std::collections::HashSet<(usize, usize)>,
     slot_bindings: std::collections::HashSet<(usize, usize)>,
     param_indexes: std::collections::HashSet<(usize, usize)>,
+    slice_param_indexes: std::collections::HashSet<(usize, usize)>,
     mut_ref_loops: std::collections::HashSet<(usize, usize)>,
     /// Locals and parameters that are fixed-size arrays of `Copy` values, by declaration.
     copy_arrays: std::collections::HashSet<(usize, usize)>,
@@ -1249,6 +1257,8 @@ struct Checker<'a> {
     pub(super) cmp_args: HashMap<(String, String), ast::Type>,
     /// Projections a `where` clause constrains (`where I::Item: PartialEq<T>`): unchecked.
     pub(super) lenient_projs: std::collections::HashSet<String>,
+    /// `I: SliceIndex<[T]>` (`Output = O` when written): `T`, and `O`; `I::Output` is unchecked.
+    pub(super) slice_index_params: HashMap<String, (Ty, Option<Ty>)>,
     /// Generic calls' projections waiting for their type argument: (`S`'s variable, trait,
     /// associated type, the projection's variable).
     pub(super) pending_projections: Vec<(Ty, String, String, Ty)>,
@@ -3185,6 +3195,13 @@ impl<'a> Checker<'a> {
                     }),
                 };
                 if let Some(conv) = conv {
+                    // (`let v: Vec<u32> = Decode::decode(d)` of `impl<T: Decode> Decode for
+                    // Vec<T>`: `u32`'s class for its `T`.)
+                    if matches!(conv, crate::adt::Conv::Ext { .. })
+                        && let Some(cc) = ast::CallExpr::cast(node.clone())
+                    {
+                        self.note_ext_static_dicts(&cc, &t, &q.method);
+                    }
                     self.conversions.insert(r, conv);
                     continue;
                 }
@@ -3196,6 +3213,18 @@ impl<'a> Checker<'a> {
                 && local_trait
                 && (unconstrained || matches!(t, Ty::Param(_)))
             {
+                // (`v.push(Decode::decode(data))` in `impl<T: Decode> Decode for Vec<T>`, `Self`
+                // settled as `T` after the call: as `T::decode(data)`, by `T`'s class.)
+                if let Ty::Param(p) = &t
+                    && p != "Self"
+                    && self.param_bounds.contains_key(p)
+                    && self.bound_traits(p).contains(&q.trait_name)
+                {
+                    self.qualified_calls.remove(&r);
+                    self.note_dict(p, &node);
+                    self.param_paths.insert(r, p.clone());
+                    continue;
+                }
                 if let Ty::Param(p) = &t {
                     self.error(
                         &node,
@@ -3358,6 +3387,14 @@ impl<'a> Checker<'a> {
                 s
             });
         let init_ty = l.initializer().map(|init| {
+            // `let r: &T = b;` with `b: &Bx<T>` and `impl Deref for Bx<T>`: deref coercion, as
+            // at an argument.
+            if let Some(d) = &declared
+                && matches!(l.ty(), Some(ast::Type::RefType(_)))
+                && matches!(self.shallow(d), Ty::Param(_))
+            {
+                return self.check(&init, d);
+            }
             let t = self.infer(&init, declared.as_ref());
             if let Some(d) = &declared {
                 self.expect(init.syntax(), &t, d);
@@ -6145,6 +6182,10 @@ impl<'a> Checker<'a> {
             return false;
         };
         let name = name.text().to_string();
+        // (`*this = Bx { .. }` with `this: &mut Self`: the reference's place.)
+        if self.lookup(&name).is_some_and(|l| l.reference == Some(true)) {
+            return true;
+        }
         for anc in p.syntax().ancestors() {
             let Some(cl) = ast::ClosureExpr::cast(anc) else {
                 continue;
@@ -7142,6 +7183,14 @@ impl<'a> Checker<'a> {
                         .and_then(|s| s.type_anchor())
                         .and_then(|a| a.ty())
                         .map(|t| self.lower_type(&t));
+                    // (`Self::name()` in the impl's own methods: its `Vec<T>`.)
+                    let written = written.or_else(|| {
+                        let q = path.qualifier()?;
+                        (q.syntax().text() == "Self").then_some(())?;
+                        self.self_ty
+                            .clone()
+                            .filter(|t| crate::adt::ext_key_of(t) == Some(key))
+                    });
                     let elems: Vec<Ty> = match written {
                         // (`<Cell<u8> as Tr>::name()`, `<HashMap<K, V>>::name()` alike.)
                         Some(t) if !crate::adt::ext_args(&t).is_empty() => crate::adt::ext_args(&t),
@@ -7210,6 +7259,55 @@ impl<'a> Checker<'a> {
                     self.check(a, &Ty::Str);
                 }
                 Ty::Str
+            }
+            // `Index::index(&**self, index)` / `IndexMut::index_mut(&mut **self, index)` of a
+            // slice or a string (bumpalo's `Vec` and `String`): `(**self)[index]`, with `index`
+            // a number, a range, or of `I: SliceIndex<[T]>`.
+            [.., tr @ "Index", "index"] | [.., tr @ "IndexMut", "index_mut"]
+                if args.len() == 2
+                    && !self.adts.traits.contains_key(*tr)
+                    && !self.adts.defs.contains_key(*tr) =>
+            {
+                let bt = self.infer(&args[0], None);
+                let it = match strip_parens(&args[1]) {
+                    // (`Index::index(s, 1..)`: the range as a value.)
+                    ast::Expr::RangeExpr(r) => {
+                        use ra_ap_syntax::ast::RangeItem;
+                        let inclusive = r.op_kind() == Some(ast::RangeOp::Inclusive);
+                        let kind = RangeKind::of(r.start().is_some(), r.end().is_some(), inclusive);
+                        let want = Ty::Range(Box::new(self.fresh(VarKind::General)), kind);
+                        self.infer(&args[1], Some(&want))
+                    }
+                    _ if self.slice_index_arg(&args[1]) => self.infer(&args[1], None),
+                    _ => self.infer(&args[1], Some(&USIZE)),
+                };
+                if let Some(t) = self.slice_param_index(c.syntax(), &bt, &it) {
+                    return t;
+                }
+                let part = matches!(self.shallow(&it), Ty::Range(..));
+                let out = match self.shallow(&bt) {
+                    Ty::Vec(_) | Ty::Str if part => Some(self.shallow(&bt)),
+                    Ty::Vec(e) if self.unify(&it, &USIZE) => Some(*e),
+                    _ => None,
+                };
+                match out {
+                    Some(t) => {
+                        if let Ty::Range(e, _) = self.shallow(&it) {
+                            self.unify(&e, &USIZE);
+                        }
+                        let r = self.range(c.syntax());
+                        self.slice_param_indexes.insert(r);
+                        t
+                    }
+                    None => {
+                        let msg = format!(
+                            "the standard library function `{}` is not supported yet",
+                            callee.syntax().text()
+                        );
+                        self.error(c.syntax(), msg);
+                        Ty::Unknown
+                    }
+                }
             }
             // `Range::from(1..3)` / `RangeInclusive::from(a..=b)`: std's `impl<T> From<T> for T`,
             // the range itself.
@@ -8058,6 +8156,11 @@ impl<'a> Checker<'a> {
                 Ty::Unknown => true,
                 z @ Ty::Adt(..) => self.implements(&z, "Default"),
                 Ty::Extern(n) => self.iface_has_default(&n),
+                // (`map_or_else(|| Default::default(), ..)` of a `V: Default`.)
+                Ty::Param(p) if !p.contains("::") && self.param_has(&p, "Default") => {
+                    self.note_dict(&p, &node);
+                    true
+                }
                 other => other.has_default(),
             };
             if !ok {
@@ -8247,7 +8350,8 @@ impl<'a> Checker<'a> {
                     t @ Ty::Tuple(_) => crate::adt::ext_args(&t),
                     // (A slice's element: `[u8]` next to `[T]`.)
                     t @ Ty::Vec(_) => crate::adt::ext_args(&t),
-                    _ => Vec::new(),
+                    // (And another instantiation's: `Cell<u16>` next to `Cell<u8>`.)
+                    t => crate::adt::ext_args(&t),
                 };
                 self.pick_method_alt(m, key, &targs, &method, &args, expected)
                     .unwrap_or(method)
@@ -8970,7 +9074,14 @@ impl<'a> Checker<'a> {
                     }
                     "unwrap_or_default" => {
                         let resolved = self.zonk(&inner);
-                        if !resolved.has_default() {
+                        // (A `T: Default`: by `T`'s class. Not a projection's, `I::Item`, whose
+                        // class no caller hands over.)
+                        if let Ty::Param(p) = &resolved
+                            && !p.contains("::")
+                            && self.param_has(p, "Default")
+                        {
+                            self.note_dict(p, m.syntax());
+                        } else if !resolved.has_default() {
                             let msg = format!(
                                 "the trait bound `{}: Default` is not satisfied",
                                 self.describe(&inner)
@@ -9320,13 +9431,14 @@ impl<'a> Checker<'a> {
             }
             None => {}
         }
-        // `stack[i]` through `impl Deref` (when the type has no `Index` of its own).
+        // `stack[i]` through `impl Deref` (when the type has no `Index` of its own, or only
+        // smallvec's `impl<I: SliceIndex<[T]>> Index<I>`, which indexes the same slice).
         if let Some((n, target)) = self.deref_target(&bt)
             && !self
                 .adts
                 .op_impls
                 .get(&n)
-                .is_some_and(|v| v.iter().any(|i| i.trait_name == "Index"))
+                .is_some_and(|v| v.iter().any(|i| i.trait_name == "Index" && i.slice_index.is_none()))
         {
             self.auto_deref(&base, &n, &target);
             self.record(base.syntax(), target.clone());
@@ -9360,7 +9472,8 @@ impl<'a> Checker<'a> {
                 .cloned()
                 .filter(|t| *t != Ty::Param(p.clone()))
                 .unwrap_or(Ty::Unknown);
-            // (A whole element replaced, `c[ix] = e` / `c[ix] += 1`: no place to write.)
+            // (A whole element replaced, `c[ix] = e` / `c[ix] += 1`: through a cell over the
+            // place, `κσ.$indexAnyMut(c, ix, loc)[0]`.)
             if ix
                 .syntax()
                 .parent()
@@ -9370,10 +9483,15 @@ impl<'a> Checker<'a> {
                         && b.lhs().is_some_and(|l| l.syntax() == ix.syntax())
                 })
             {
-                self.error(
-                    ix.syntax(),
-                    format!("assigning to `{}` through a type parameter's `IndexMut` isn't supported yet (write to a field of the element, or take `&mut` of it)", ix.syntax().text()),
-                );
+                if self.param_has(&p, "IndexMut") {
+                    let r = self.range(ix.syntax());
+                    self.index_places.insert(r);
+                } else {
+                    self.error(
+                        ix.syntax(),
+                        format!("cannot assign to data in an index of `{p}` (add an `IndexMut` bound: `{p}: IndexMut<..>`)"),
+                    );
+                }
             }
             let r = self.range(ix.syntax());
             self.param_indexes.insert(r);
@@ -9416,6 +9534,10 @@ impl<'a> Checker<'a> {
             };
         }
         let it = self.infer(&index, Some(&USIZE));
+        // `(**self)[index]` with `index: I` of `I: SliceIndex<[T]>`: an element or a part.
+        if let Some(t) = self.slice_param_index(ix.syntax(), &bt, &it) {
+            return t;
+        }
         // `v[r]` / `&s[r]` with a `Range<usize>` value.
         if let Ty::Range(e, _) = self.shallow(&it) {
             self.unify(&e, &USIZE);
@@ -9571,6 +9693,10 @@ impl<'a> Checker<'a> {
                     Ty::Range(e, _) => (*e, Some(false)),
                     Ty::IntoIter(e) => (*e, None),
                     Ty::Unknown | Ty::Var(_) => (Ty::Unknown, None),
+                    // (`for x in a` with `where &'a I: IntoIterator<Item = E>`.)
+                    p @ Ty::Param(_) if by_ref != Some(true) && self.iter_elem(&p).is_some() => {
+                        (self.iter_elem(&p).unwrap_or(Ty::Unknown), None)
+                    }
                     other_ty => {
                         let msg = format!("`{}` is not an iterator", self.describe(&other_ty));
                         self.error(iterable.syntax(), msg);
@@ -10851,8 +10977,25 @@ pub(super) fn proj_qual(path: &ast::Path) -> Option<String> {
     if q.qualifier().is_some() {
         return None;
     }
-    match q.segment()?.type_anchor()?.ty()? {
-        ast::Type::PathType(pt) => Some(pt.path()?.as_single_name_ref()?.text().to_string()),
+    // (`<&L as IntoIterator>::IntoIter` too: `L`'s, iterating a reference being iterating the
+    // value in JS; and `<H::Item as IntoIterator>::Item`, on the projection `H::Item`.)
+    let anchor = match q.segment()?.type_anchor()?.ty()? {
+        ast::Type::RefType(r) => r.ty()?,
+        t => t,
+    };
+    match anchor {
+        ast::Type::PathType(pt) => {
+            let p = pt.path()?;
+            if let Some(n) = p.as_single_name_ref() {
+                return Some(n.text().to_string());
+            }
+            // (`<<I as IntoIterator>::Item as IntoIterator>::Item`: on `I::Item`.)
+            if p.segment()?.generic_arg_list().is_some() {
+                return None;
+            }
+            let inner = proj_qual(&p)?;
+            Some(format!("{inner}::{}", p.segment()?.name_ref()?.text()))
+        }
         _ => None,
     }
 }
@@ -11574,10 +11717,16 @@ impl Checker<'_> {
         let Some(f) = self.cur_fn.clone() else {
             return false;
         };
+        self.elem_class_of(&f, param)
+    }
+
+    /// `elem_class` for the function `f`.
+    pub(super) fn elem_class_of(&mut self, f: &str, param: &str) -> bool {
+        let f = f.to_string();
         let Some((ty, m)) = f.split_once("::") else {
             return false;
         };
-        if !matches!(ty, "Vec" | "RefCell")
+        if !matches!(ty, "Vec" | "RefCell" | "HashMap" | "HashSet")
             && crate::adt::tuple_arity(ty).is_none()
             && !crate::adt::is_wrapper_key(ty)
         {
@@ -12348,6 +12497,10 @@ impl Checker<'_> {
                     grew |= needs.insert((f, p));
                 } else if stored && let Some(k) = self.stored_pos(&f, &p) {
                     grew |= self.stored_uses.insert(k);
+                } else if stored && !self.elem_methods.contains(&f) && self.elem_class_of(&f, &p) {
+                    // (`Self::declaration()` in a method with `self` of `impl<T: Tr> Tr for
+                    // Vec<T>`: `T`'s class, handed over by the caller, `κσ.$callElem`.)
+                    grew = true;
                 }
             }
             if !grew {

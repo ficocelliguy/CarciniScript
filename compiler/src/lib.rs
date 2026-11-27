@@ -5,6 +5,7 @@
 
 mod adt;
 mod diag_help;
+mod erased_twins;
 mod alias;
 mod assocbounds;
 mod bindings;

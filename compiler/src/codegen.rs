@@ -1002,6 +1002,7 @@ fn compile_text(
         tparam_consts: HashMap::new(),
         extra_consts: Vec::new(),
         ext_class: None,
+        ext_alt_self: None,
         in_trait_default: false,
         default_trait: String::new(),
         loop_dests: Vec::new(),
@@ -1211,6 +1212,9 @@ struct Codegen<'a> {
     pub(super) extra_consts: Vec<(String, String, Ty)>,
     /// Emitting the class of your trait impls for a built-in type (`$ext$i32`): its key.
     pub(super) ext_class: Option<String>,
+    /// In a default method's copy for one of several instantiations (`Cell<u16>` next to
+    /// `Cell<u8>`): what `Self::` is, reading that impl's consts (`κσ.$altT`).
+    pub(super) ext_alt_self: Option<String>,
     /// Emitting a trait's default methods: `Self::f()` is `this` (static) or `this.constructor`.
     in_trait_default: bool,
     /// The trait whose default methods are being emitted (`Tr::m` keys their classes).
@@ -3562,7 +3566,15 @@ impl<'a> Codegen<'a> {
         let Some(inner) = inner else { return };
         let (source, mut by_mut_ref) = match &inner {
             ast::Expr::RefExpr(r) => (r.expr(), r.mut_token().is_some()),
-            e if is_call(e, &["iter", "iter_mut", "into_iter"]) && !self.own_iter_call(e) => {
+            // (Not `x.into_iter()` of an `L: IntoIterator` parameter: the call makes the
+            // iterator.)
+            e if is_call(e, &["iter", "iter_mut", "into_iter"])
+                && !self.own_iter_call(e)
+                && !matches!(
+                    receiver(e).and_then(|r| self.ty_of(r.syntax())),
+                    Some(Ty::Param(_))
+                ) =>
+            {
                 let mutable = matches!(e, ast::Expr::MethodCallExpr(m) if m.name_ref().is_some_and(|n| n.text() == "iter_mut"));
                 (receiver(e), mutable)
             }
@@ -3586,6 +3598,11 @@ impl<'a> Codegen<'a> {
                 elem: e,
                 mutable: false,
             },
+            // (And one kept a parameter, which the loop makes one of: see below.)
+            Ty::Param(_) if !by_mut_ref => Ty::Iter {
+                elem: Box::new(Ty::Unknown),
+                mutable: false,
+            },
             other => other,
         };
         let source = match source_ty {
@@ -3606,6 +3623,17 @@ impl<'a> Codegen<'a> {
             self.slice_view = true;
         }
         let (sf, st) = self.emit_expr(&source, None);
+        // (`for x in a` with `where &'a I: IntoIterator`: whatever `a` is, as an iterator.)
+        let (sf, st) = match st {
+            Ty::Param(_) => (
+                sf.wrap("κσ.$intoIter(", ")"),
+                Ty::Iter {
+                    elem: Box::new(Ty::Unknown),
+                    mutable: false,
+                },
+            ),
+            st => (sf, st),
+        };
         self.slice_view = false;
         let custom_iter =
             matches!(&st, Ty::Adt(n, _) if self.types.adts.iter_items.contains_key(n));
@@ -3939,6 +3967,17 @@ impl<'a> Codegen<'a> {
                 let Some(inner) = r.expr() else {
                     return (Frag::text("undefined"), Ty::Unknown);
                 };
+                // `&mut (&mut **self)[index]` with `index: I` of `I: SliceIndex<[T]>`: a cell
+                // over the element, or a view of the part.
+                if let ast::Expr::IndexExpr(ix) = strip_parens_expr(&inner)
+                    && self
+                        .types
+                        .slice_param_indexes
+                        .contains(&self.range_of(ix.syntax()))
+                    && let (Some(base), Some(index)) = (ix.base(), ix.index())
+                {
+                    return self.emit_slice_param_index(ix.syntax(), &base, &index, true);
+                }
                 let (pf, t) = self.emit_expr(&inner, expected);
                 let mut f = Frag::text("κσ.$cell(() => ");
                 // `&mut *map.get_mut(k).unwrap()`: the entry, written with `insert`.
@@ -4048,6 +4087,21 @@ impl<'a> Codegen<'a> {
             ast::Expr::PrefixExpr(p) => self.emit_prefix(p, expected),
             ast::Expr::BinExpr(b) => self.emit_bin(b, expected),
             ast::Expr::CastExpr(c) => self.emit_cast(c),
+            // `Index::index(&**self, index)` / `IndexMut::index_mut(..)` with `index: I` of
+            // `I: SliceIndex<[T]>`.
+            ast::Expr::CallExpr(c)
+                if self
+                    .types
+                    .slice_param_indexes
+                    .contains(&self.range_of(c.syntax())) =>
+            {
+                let args: Vec<ast::Expr> = c.arg_list().into_iter().flat_map(|l| l.args()).collect();
+                let mutable = c.expr().is_some_and(|f| f.syntax().text().to_string().ends_with("index_mut"));
+                match args.as_slice() {
+                    [base, index] => self.emit_slice_param_index(c.syntax(), base, index, mutable),
+                    _ => (Frag::text("undefined"), Ty::Unknown),
+                }
+            }
             ast::Expr::CallExpr(c)
                 if crate::typeck::result_ctor_call(c).is_some()
                     && !crate::typeck::ctor_name(c).is_some_and(|n| {
@@ -5828,7 +5882,7 @@ impl<'a> Codegen<'a> {
             && let Some(k) = &self.ext_class
         {
             return Some(if self.lookup("self").is_some() {
-                format!("$ext${k}")
+                self.ext_alt_self.clone().unwrap_or_else(|| format!("$ext${k}"))
             } else {
                 "this".into()
             });
@@ -5994,6 +6048,13 @@ impl<'a> Codegen<'a> {
     /// (`κσ.$sv(W, {mk: [0, [A]]})`): the generic caller's `$T.mk()` doesn't know them. Each
     /// entry is the function's parameter count and its class arguments in order, `null` for one
     /// of its own type parameters (which the caller passes).
+    /// Whether some method with `self` of your impls for the built-in type `key` takes its type
+    /// arguments' classes (`κσ.$takeElem`).
+    fn has_elem_methods(&self, key: &str) -> bool {
+        let prefix = format!("{key}::");
+        self.types.elem_methods.iter().any(|m| m.starts_with(&prefix))
+    }
+
     fn static_view(&self, n: &str, args: &[Ty], view: String) -> String {
         if args.is_empty() {
             return view;
@@ -6065,6 +6126,8 @@ impl<'a> Codegen<'a> {
                     .collect();
                 let view = class_view(self.class(n), args, &stored);
                 let view = self.static_view(n, args, view);
+                // (`W<u16>` with impls of its own next to `W<u8>`'s: by their names.)
+                let view = self.alt_view(n, args, view);
                 // (With its arguments' classes, for consts that read them: `tparam_consts`.)
                 if self.tparam_consts.keys().any(|(t, _)| t == n) && !args.is_empty() {
                     let ds: Vec<String> = args.iter().map(|a| self.dict_of(a)).collect();
@@ -6137,7 +6200,9 @@ impl<'a> Codegen<'a> {
                         // (Which hand the element's class on: `T::decode(..)` in `impl<T> Decode
                         // for Vec<T>`.)
                         let view = format!("κσ.$withStatics({d}, $ext${key})");
-                        self.static_view(key, std::slice::from_ref(e.as_ref()), view)
+                        let view = self.static_view(key, std::slice::from_ref(e.as_ref()), view);
+                        // (`Cell<u16>` with impls of its own next to `Cell<u8>`'s: their consts.)
+                        self.alt_view(key, std::slice::from_ref(e.as_ref()), view)
                     }
                     None => d,
                 }
@@ -6156,12 +6221,36 @@ impl<'a> Codegen<'a> {
                 .filter(|key| self.types.adts.ext_types.contains(*key))
             {
                 Some(key) => {
-                    let view = format!("κσ.$withStatics(κσ.$prims.Map, $ext${key})");
+                    // (And with the key's and value's classes as `elem`, for its methods with
+                    // `self`: see `κσ.$dcallT`.)
+                    let d = if self.has_elem_methods(key) {
+                        format!(
+                            "κσ.$withElem(κσ.$prims.Map, [{}, {}])",
+                            self.dict_of(k),
+                            self.dict_of(v)
+                        )
+                    } else {
+                        "κσ.$prims.Map".into()
+                    };
+                    let view = format!("κσ.$withStatics({d}, $ext${key})");
                     self.static_view(key, &[(**k).clone(), (**v).clone()], view)
                 }
                 None => "κσ.$prims.Map".into(),
             },
-            Ty::Set(_) => "κσ.$prims.Set".into(),
+            Ty::Set(e) => match crate::adt::ext_key_of(t)
+                .filter(|key| self.types.adts.ext_types.contains(*key))
+            {
+                Some(key) => {
+                    let d = if self.has_elem_methods(key) {
+                        format!("κσ.$withElem(κσ.$prims.Set, {})", self.dict_of(e))
+                    } else {
+                        "κσ.$prims.Set".into()
+                    };
+                    let view = format!("κσ.$withStatics({d}, $ext${key})");
+                    self.static_view(key, std::slice::from_ref(e.as_ref()), view)
+                }
+                None => "κσ.$prims.Set".into(),
+            },
             Ty::Coll(k, view) => {
                 use crate::ty::Coll;
                 let k = match k {
@@ -7592,6 +7681,7 @@ impl<'a> Codegen<'a> {
                 // that impl's, by `self`'s elements.)
                 None => match self.lookup("self").map(|l| l.ty.clone()) {
                     Some(Ty::Tuple(es)) => self.tuple_alt_key(&key, &method, &es),
+                    Some(Ty::RefCell(e)) => self.tuple_alt_key(&key, &method, &[*e]),
                     _ => method,
                 },
             };
@@ -7644,7 +7734,10 @@ impl<'a> Codegen<'a> {
             // `Vec`'s or tuple's alike.)
             let elem = if self.types.elem_methods.contains(&format!("{key}::{method}")) {
                 match &rt {
-                    Ty::Option(e) | Ty::Vec(e) | Ty::RefCell(e) => Some(self.dict_of(e)),
+                    Ty::Option(e) | Ty::Vec(e) | Ty::RefCell(e) | Ty::Set(e) => {
+                        Some(self.dict_of(e))
+                    }
+                    Ty::Map(k, v) => Some(format!("[{}, {}]", self.dict_of(k), self.dict_of(v))),
                     Ty::Tuple(es) => Some(format!(
                         "[{}]",
                         es.iter().map(|e| self.dict_of(e)).collect::<Vec<_>>().join(", ")
@@ -7905,6 +7998,16 @@ impl<'a> Codegen<'a> {
                 _ => rf.clone(),
             };
             return (f, ret);
+        }
+        // `x.into_iter()` on an `L: IntoIterator` kept a parameter: whatever iterable it is, as
+        // the runtime's iterator.
+        if let Ty::Param(_) = &rt
+            && method == "into_iter"
+            && matches!(self.ty_of(m.syntax()), Some(Ty::Iter { .. }))
+        {
+            let mut f = Frag::mapped(self.off(name.syntax()), "κσ.$intoIter(");
+            f.append(rf.clone()).push(")");
+            return (f, self.ty_of(m.syntax()).unwrap_or(Ty::Unknown));
         }
         // `c.extend(xs)` on a `C: Extend<T>`: by what `c` is at run time; a string's new value
         // is written back (`c = κσ.$extendAny(c, xs)`).
@@ -8867,6 +8970,14 @@ impl<'a> Codegen<'a> {
             "is_none" => (rf.clone().wrap("(", " == null)"), Ty::Bool),
             // (`Option<Option<T>>`: what the `Some` holds.)
             "unwrap_or" if nested => (helper("unwrapOr", vec![a(0)], None), inner.clone()),
+            // (A `T: Default`'s: its class's.)
+            "unwrap_or_default" if nested && matches!(inner, Ty::Param(_)) => {
+                let d = match self.dict_of(inner) {
+                    d if d == "undefined" => "null".to_string(),
+                    d => format!("{d}.default()"),
+                };
+                (helper("unwrapOr", vec![Frag::text(d)], None), inner.clone())
+            }
             "unwrap_or_default" if nested => (
                 helper("unwrapOr", vec![Frag::text("null")], None),
                 inner.clone(),
@@ -9470,6 +9581,26 @@ impl<'a> Codegen<'a> {
         .then_some(r)
     }
 
+    /// `slice[i]` (at `node`) with `i: I` of `I: SliceIndex<[T]>`: `κσ.$sliceIndex(slice, i,
+    /// loc)`, an element or a copy of a part; `κσ.$sliceIndexMut` (`mutable`), a cell over the
+    /// element or a view of the part.
+    fn emit_slice_param_index(
+        &mut self,
+        node: &SyntaxNode,
+        base: &ast::Expr,
+        index: &ast::Expr,
+        mutable: bool,
+    ) -> (Frag, Ty) {
+        let (bf, _) = self.receiver(base);
+        let (f, _) = self.emit_expr(index, None);
+        let ty = self.ty_of(node).unwrap_or(Ty::Unknown);
+        let loc = js_string(&self.location(node));
+        let name = if mutable { "$sliceIndexMut" } else { "$sliceIndex" };
+        let mut out = Frag::mapped(self.off(node), format!("κσ.{name}("));
+        out.append(bf).push(", ").append(f).push(format!(", {loc})"));
+        (out, ty)
+    }
+
     /// `v[i]` with Rust's bounds check: `v[κσ.$ix(v, i, loc)]`, which stays assignable. When `v`
     /// isn't safe to evaluate twice, reads go through `κσ.$get` instead.
     fn emit_index(&mut self, ix: &ast::IndexExpr) -> (Frag, Ty) {
@@ -9477,6 +9608,15 @@ impl<'a> Codegen<'a> {
             return (Frag::text("undefined"), Ty::Unknown);
         };
         let base = self.same_vec_call(&base).unwrap_or(base);
+        // `(**self)[index]` with `index: I` of `I: SliceIndex<[T]>`: an element or a part, by
+        // what `index` is at run time.
+        if self
+            .types
+            .slice_param_indexes
+            .contains(&self.range_of(ix.syntax()))
+        {
+            return self.emit_slice_param_index(ix.syntax(), &base, &index, false);
+        }
         // `c[ix]` with `C: Index<Ix>`: by what `c` is at run time.
         if self.types.param_indexes.contains(&self.range_of(ix.syntax())) {
             let (bf, _) = self.receiver(&base);
@@ -9484,8 +9624,17 @@ impl<'a> Codegen<'a> {
             let f = self.by_value(&index, f, &t);
             let ty = self.ty_of(ix.syntax()).unwrap_or(Ty::Unknown);
             let loc = js_string(&self.location(ix.syntax()));
-            let mut out = Frag::mapped(self.off(ix.syntax()), "κσ.$indexAny(");
+            // (Assigned, `c[ix] = e` / `c[ix] += 1`: a cell over the place.)
+            let place = self
+                .types
+                .index_places
+                .contains(&self.range_of(ix.syntax()));
+            let name = if place { "$indexAnyMut" } else { "$indexAny" };
+            let mut out = Frag::mapped(self.off(ix.syntax()), format!("κσ.{name}("));
             out.append(bf).push(", ").append(f).push(format!(", {loc})"));
+            if place {
+                out.push("[0]");
+            }
             return (out, ty);
         }
         // `grid[i]` with an `impl Index`: `grid.index$0(i)`.

@@ -859,8 +859,14 @@ impl Checker<'_> {
         }
         // `fn log(&self) where T: Display` on `impl<T> Value<T>`: the impl's `T`, bounded
         // further in this method.
+        let wcs: Vec<ast::WhereClause> = f.where_clause().into_iter().collect();
         for pred in f.where_clause().into_iter().flat_map(|w| w.predicates()) {
-            let Some(ast::Type::PathType(pt)) = pred.ty() else {
+            // (`for<'a> &'a L: IntoIterator`: on `L`, as `note_ref_into_iter_bounds` has it.)
+            let (subject, by_ref) = match pred.ty() {
+                Some(ast::Type::RefType(r)) => (r.ty(), true),
+                t => (t, false),
+            };
+            let Some(ast::Type::PathType(pt)) = subject else {
                 continue;
             };
             let Some(n) = pt.path().and_then(|p| p.as_single_name_ref()) else {
@@ -871,17 +877,27 @@ impl Checker<'_> {
                 continue;
             }
             let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+            // (`where L: IntoIterator`: `self.0.into_iter()`, `-> L::IntoIter`.)
+            let into = lists
+                .iter()
+                .any(|l| super::bounds_into_iter_item(l).is_some());
+            if by_ref && !into {
+                continue;
+            }
             // (`where K: Borrow<Q>`: `self.map.get(k)` with a `&Q`.)
-            self.record_from_bound(&n, &lists, true);
+            if !by_ref {
+                self.record_from_bound(&n, &lists, true);
+            }
             let extra: Vec<String> = super::generic::bound_names(&lists)
                 .into_iter()
                 .map(|(b, _)| b)
                 .filter(|b| {
-                    super::generic::KNOWN_BOUNDS.contains(&b.as_str())
-                        || self.adts.traits.contains_key(b)
+                    !by_ref
+                        && (super::generic::KNOWN_BOUNDS.contains(&b.as_str())
+                            || self.adts.traits.contains_key(b))
                 })
                 .collect();
-            if extra.is_empty() {
+            if extra.is_empty() && !into {
                 continue;
             }
             let before = self.param_bounds[&n].clone();
@@ -889,7 +905,12 @@ impl Checker<'_> {
                 self.method_where.push((n.clone(), before));
             }
             self.param_bounds.get_mut(&n).unwrap().extend(extra);
-            self.record_bound_args(&n, &lists);
+            if into {
+                self.note_into_iter_param(&n, &lists, &wcs);
+            }
+            if !by_ref {
+                self.record_bound_args(&n, &lists);
+            }
         }
         // (`where String: Borrow<Q>`: a map of `String`s looked up by a `&Q`.)
         self.record_concrete_borrow_bounds(f.where_clause());
@@ -923,6 +944,7 @@ impl Checker<'_> {
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
+        self.slice_index_params.clear();
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
@@ -1063,6 +1085,9 @@ impl Checker<'_> {
             }
             self.record_op_bounds(&n, &lists);
             self.record_bound_args(&n, &lists);
+            // `impl<L: IntoIterator> W<L>`: `self.0.into_iter()`, `-> L::IntoIter`.
+            let wcs: Vec<ast::WhereClause> = imp.where_clause().into_iter().collect();
+            self.note_into_iter_param(&n, &lists, &wcs);
             // `impl<F, T> Memo<F, T> where F: Fn(u64) -> T`: `F` is a closure type (once every
             // parameter it names is declared).
             if let Some(closure) = lists.iter().find_map(|l| self.lower_fn_bounds(l)) {
@@ -1091,6 +1116,9 @@ impl Checker<'_> {
             }
         }
         self.note_where_projections(imp.where_clause());
+        // (`impl<I> .. where for<'a> &'a I: IntoIterator`.)
+        let wcs: Vec<ast::WhereClause> = imp.where_clause().into_iter().collect();
+        self.note_ref_into_iter_bounds(&wcs);
         // (`where TextSize: Add<A, Output = TextSize>`: a `TextSize + a` with an `a: A`.)
         self.record_concrete_borrow_bounds(imp.where_clause());
         match imp.self_ty() {
@@ -1746,6 +1774,12 @@ impl Checker<'_> {
                 }
                 _ => None,
             })
+            // (`impl IndexMut`'s `Self::Output`: the `type Output` of the `impl Index` beside it.)
+            .or_else(|| {
+                (op.is_some() && trait_name.as_deref() == Some("IndexMut"))
+                    .then(|| sibling_index_output(imp))
+                    .flatten()
+            })
             .map(|t| self.lower_type(&t));
         if into_iter {
             self.adts.into_iters.insert(type_name.clone());
@@ -1824,6 +1858,20 @@ impl Checker<'_> {
                     if self.copy_array(ann.as_ref(), None, &ty) {
                         self.copy_array_assoc.insert((type_name.clone(), n.text().to_string()));
                     }
+                    // (`ZERO__1`: this instantiation's `ZERO`, see `inst_consts`.)
+                    if let Some(def) = trait_name.as_deref().and_then(|t| self.adts.traits.get(t))
+                        && !impl_args.is_empty()
+                    {
+                        let base = crate::inst_consts::trait_const_base(n.text().as_ref(), &def.consts)
+                            .to_string();
+                        if base != n.text() {
+                            self.adts.alt_consts.entry(type_name.clone()).or_default().push((
+                                impl_args.clone(),
+                                base,
+                                n.text().to_string(),
+                            ));
+                        }
+                    }
                     let consts = self.adts.assoc_consts.entry(type_name.clone()).or_default();
                     if consts.insert(n.text().to_string(), ty).is_some() {
                         self.error(
@@ -1865,6 +1913,12 @@ impl Checker<'_> {
                 && name.text() == op
             {
                 let at = self.range(name.syntax()).0;
+                let slice_index = match rhs {
+                    Ty::Param(p) if matches!(trait_name.as_deref(), Some("Index" | "IndexMut")) => {
+                        self.slice_index_params.get(p).map(|(elem, _)| elem.clone())
+                    }
+                    _ => None,
+                };
                 let impls = self.adts.op_impls.entry(type_name.clone()).or_default();
                 let key = format!("{op}${}", impls.len());
                 impls.push(crate::adt::OpImpl {
@@ -1872,6 +1926,7 @@ impl Checker<'_> {
                     rhs: rhs.clone(),
                     key: key.clone(),
                     at,
+                    slice_index,
                 });
                 self.adts
                     .methods
@@ -2047,8 +2102,11 @@ impl Checker<'_> {
             // One trait for another tuple of this length (`impl Show for (String, String)` next to
             // `impl Show for (u8, u8)`): its methods under keys of their own, picked by the
             // receiver's element types (and at run time by the elements' classes or values).
+            // (Likewise another instantiation of a struct or built-in type, `impl Get for W<u16>`
+            // next to `impl Get for W<u8>`, `Cell<u16>` next to `Cell<u8>`: by the receiver's
+            // type arguments.)
             if let Some(tr) = trait_name.as_deref()
-                && crate::adt::array_alts_key(&type_name)
+                && (crate::adt::array_alts_key(&type_name) || !impl_args.is_empty())
                 && self.adts.traits.contains_key(tr)
                 && let Some(existing) = self.adts.methods.get(&type_name)
                 && existing.contains_key(name.text().to_string().as_str())
@@ -2215,6 +2273,7 @@ impl Checker<'_> {
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
+        self.slice_index_params.clear();
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
@@ -2510,6 +2569,7 @@ impl Checker<'_> {
             self.op_args.clear();
             self.cmp_args.clear();
             self.lenient_projs.clear();
+            self.slice_index_params.clear();
             self.const_tys.clear();
             self.from_args.clear();
             self.try_from_args.clear();
@@ -4198,4 +4258,40 @@ fn bare_path_name(t: &ast::Type) -> Option<String> {
         return None;
     }
     Some(seg.name_ref()?.text().to_string())
+}
+
+/// The `type Output = ..;` of the `impl Index<..> for X` next to `imp` (an `impl IndexMut<..> for
+/// X`, whose `Self::Output` it is).
+fn sibling_index_output(imp: &ast::Impl) -> Option<ast::Type> {
+    let self_text = |i: &ast::Impl| {
+        i.self_ty().map(|t| {
+            t.syntax()
+                .text()
+                .to_string()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        })
+    };
+    let own = self_text(imp)?;
+    imp.syntax()
+        .parent()?
+        .children()
+        .filter_map(ast::Impl::cast)
+        .filter(|i| {
+            matches!(i.trait_(), Some(ast::Type::PathType(p))
+                if p.path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.name_ref())
+                    .is_some_and(|n| n.text() == "Index"))
+                && self_text(i).as_deref() == Some(own.as_str())
+        })
+        .find_map(|i| {
+            i.assoc_item_list()?.assoc_items().find_map(|a| match a {
+                ast::AssocItem::TypeAlias(ta) if ta.name().is_some_and(|n| n.text() == "Output") => {
+                    ta.ty()
+                }
+                _ => None,
+            })
+        })
 }

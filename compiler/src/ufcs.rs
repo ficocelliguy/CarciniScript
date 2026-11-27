@@ -572,13 +572,15 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             continue;
         }
         // `T::clone(x)` with `T` a type parameter in scope: `Clone::clone(x)`, that is `(x).clone()`.
-        let prim = if at(i + 1) == "::"
+        // (Through a `let` of a `&T`, which an `x: &Bx<T>` reaches by `Deref`.)
+        let clone_of = (at(i + 1) == "::"
             && at(i + 2) == "clone"
             && at(i + 3) == "("
             && toks[i].kind() == SyntaxKind::IDENT
             && (i == 0 || !matches!(at(i - 1).as_str(), "::" | "." | "<" | "as"))
-            && type_param_in_scope(&toks[i])
-        {
+            && type_param_in_scope(&toks[i]))
+        .then(|| at(i));
+        let prim = if clone_of.is_some() {
             "Clone".to_string()
         } else {
             at(i)
@@ -719,6 +721,20 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                 continue;
             }
             let last = j - 1;
+            // (`T::clone(x)` of an `x` that isn't a `&..` written out.)
+            if let Some(t) = &clone_of
+                && at(j) == ")"
+                && drop_to.is_none()
+            {
+                edits.push((
+                    start(first_tok),
+                    end(open),
+                    format!("({{ let __ufcs_r: &{t} = "),
+                ));
+                edits.push((end(last), end(last), "; __ufcs_r }).clone(".to_string()));
+                i = j;
+                continue;
+            }
             edits.push((start(first_tok), end(open), "(".to_string()));
             if let Some(to) = drop_to {
                 edits.push((end(open), to, String::new()));

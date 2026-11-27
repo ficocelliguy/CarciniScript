@@ -424,6 +424,31 @@ pub(super) fn bound_names(lists: &[ast::TypeBoundList]) -> Vec<(String, SyntaxNo
     out
 }
 
+/// The parameter or projection a `where` predicate's subject names: `I::Item` for `I::Item`,
+/// `<I as IntoIterator>::Item` and `<I::Item as IntoIterator>::Item` alike (`I::Item::Item`).
+fn where_subject(t: &ast::Type) -> Option<String> {
+    let ast::Type::PathType(pt) = t else {
+        return None;
+    };
+    let p = pt.path()?;
+    if let Some(n) = p.as_single_name_ref() {
+        return Some(n.text().to_string());
+    }
+    let q = super::proj_qual(&p)?;
+    Some(format!("{q}::{}", p.segment()?.name_ref()?.text()))
+}
+
+/// What iterating a std value by `into_iter()` yields: a `Vec<T>`'s `T`, a map's `(K, V)`.
+fn std_into_iter_item(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Vec(e) | Ty::Set(e) | Ty::Option(e) | Ty::IntoIter(e) | Ty::Iter { elem: e, .. } => {
+            Some((**e).clone())
+        }
+        Ty::Map(k, v) => Some(Ty::Tuple(vec![(**k).clone(), (**v).clone()])),
+        _ => None,
+    }
+}
+
 /// Replace type parameters per `m`.
 pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
     let s = |x: &Ty| Box::new(subst(x, m));
@@ -438,7 +463,22 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
                 Some(Ty::Iter { elem, .. } | Ty::IntoIter(elem)) if assoc == "Item" => {
                     (**elem).clone()
                 }
-                Some(_) => Ty::Unknown,
+                // (`L::Item` / `L::IntoIter` of an `L: IntoIterator` that's a `Vec<u32>`, and
+                // `H::Item::Item` of an iterator of `Vec`s.)
+                Some(b) => {
+                    let mut cur = b.clone();
+                    for a in assoc.split("::") {
+                        cur = match (a, std_into_iter_item(&cur)) {
+                            ("Item", Some(item)) => item,
+                            ("IntoIter", Some(item)) => Ty::Iter {
+                                elem: Box::new(item),
+                                mutable: false,
+                            },
+                            _ => return Ty::Unknown,
+                        };
+                    }
+                    cur
+                }
                 None => t.clone(),
             }
         }
@@ -492,6 +532,7 @@ impl Checker<'_> {
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
+        self.slice_index_params.clear();
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
@@ -579,6 +620,14 @@ impl Checker<'_> {
                     Some(t) => self.lower_type(&t),
                     None => self.item_param(f, &name, report, &mut params),
                 };
+                // (`-> I::IntoIter`: the runtime's iterator it makes.)
+                self.generics.insert(
+                    format!("{name}::IntoIter"),
+                    Ty::Iter {
+                        elem: Box::new(elem.clone()),
+                        mutable: false,
+                    },
+                );
                 self.generics.insert(name, Ty::IntoIter(Box::new(elem)));
                 continue;
             }
@@ -656,6 +705,16 @@ impl Checker<'_> {
         }
         self.record_concrete_borrow_bounds(f.where_clause());
         self.note_where_projections(f.where_clause());
+        // (`where &'a I: IntoIterator<Item = E>`: `a.into_iter()` with an `a: &I`.)
+        let wcs: Vec<ast::WhereClause> = f.where_clause().into_iter().collect();
+        self.note_ref_into_iter_bounds(&wcs);
+        for (n, bounds) in params.iter_mut() {
+            if let Some(b) = self.param_bounds.get(n.as_str())
+                && b.len() > bounds.len()
+            {
+                *bounds = b.clone();
+            }
+        }
         params
     }
 
@@ -672,7 +731,7 @@ impl Checker<'_> {
         let mut lists = Vec::new();
         for pred in f.where_clause().into_iter().flat_map(|w| w.predicates()) {
             if let Some(t) = pred.ty()
-                && t.syntax().text() == item.as_str()
+                && where_subject(&t).as_deref() == Some(item.as_str())
                 && let Some(l) = pred.type_bound_list()
             {
                 lists.push(l);
@@ -689,6 +748,8 @@ impl Checker<'_> {
         for (b, bnode) in bound_names(&lists) {
             if KNOWN_BOUNDS.contains(&b.as_str()) || self.adts.traits.contains_key(&b) {
                 bounds.push(b);
+            } else if b == "IntoIterator" {
+                // (`where H::Item: IntoIterator`: see below.)
             } else if report {
                 self.error(
                     &bnode,
@@ -700,8 +761,99 @@ impl Checker<'_> {
         self.param_bounds.insert(item.clone(), bounds.clone());
         // (`where I::Item: Tr<E>`: `E`, for `Tr::E` in its methods.)
         self.record_bound_args(&item, &lists);
+        // (`where H::Item: IntoIterator`: `it.into_iter()` on each item.)
+        let wcs: Vec<ast::WhereClause> = f.where_clause().into_iter().collect();
+        self.note_into_iter_param(&item, &lists, &wcs);
+        let bounds = self.param_bounds[&item].clone();
         params.push((item.clone(), bounds));
         Ty::Param(item)
+    }
+
+    /// `L: IntoIterator` on a type parameter that stays one (the impl's, bounded inline, in its
+    /// `where` or in a method's; `where &'a I: IntoIterator`; `where H::Item: IntoIterator`):
+    /// `x.into_iter()` makes the runtime's iterator of `L::Item` (`κσ.$intoIter`), and `L::Item`
+    /// / `L::IntoIter` name its items and that iterator. `wcs` are the `where` clauses in scope,
+    /// for `where L::Item: Clone`.
+    pub(super) fn note_into_iter_param(
+        &mut self,
+        name: &str,
+        lists: &[ast::TypeBoundList],
+        wcs: &[ast::WhereClause],
+    ) -> bool {
+        let Some(item) = lists.iter().find_map(super::bounds_into_iter_item) else {
+            return false;
+        };
+        let key = format!("{name}::Item");
+        let elem = match item {
+            Some(t) => self.lower_type(&t),
+            None => match self.generics.get(&key) {
+                Some(t) => t.clone(),
+                None => {
+                    let item_lists: Vec<ast::TypeBoundList> = wcs
+                        .iter()
+                        .flat_map(|w| w.predicates())
+                        .filter(|pr| {
+                            pr.ty()
+                                .is_some_and(|t| where_subject(&t).as_deref() == Some(key.as_str()))
+                        })
+                        .filter_map(|pr| pr.type_bound_list())
+                        .collect();
+                    // (`where <I::Item as IntoIterator>::Item: Into<usize>`.)
+                    if let Some(target) = item_lists.iter().find_map(super::conversion_target) {
+                        let t = self.lower_type(&target);
+                        if matches!(t, Ty::Int(_) | Ty::Float { .. }) {
+                            self.into_targets.insert(key.clone(), t);
+                        }
+                    }
+                    let bounds: Vec<String> = bound_names(&item_lists)
+                        .into_iter()
+                        .map(|(b, _)| b)
+                        .filter(|b| {
+                            KNOWN_BOUNDS.contains(&b.as_str()) || self.adts.traits.contains_key(b)
+                        })
+                        .collect();
+                    self.param_bounds.insert(key.clone(), bounds);
+                    self.record_bound_args(&key, &item_lists);
+                    Ty::Param(key.clone())
+                }
+            },
+        };
+        self.generics.insert(key, elem.clone());
+        self.generics.insert(
+            format!("{name}::IntoIter"),
+            Ty::Iter {
+                elem: Box::new(elem),
+                mutable: false,
+            },
+        );
+        let b = self.param_bounds.entry(name.to_string()).or_default();
+        if !b.iter().any(|x| x == "IntoIterator") {
+            b.push("IntoIterator".into());
+        }
+        true
+    }
+
+    /// `where &'a I: IntoIterator<Item = E>` / `for<'a> &'a L: IntoIterator` (a reference to a
+    /// type parameter as the subject): iterating `&I` is iterating `I` in JS, so `I` takes the
+    /// bound (`note_into_iter_param`).
+    pub(super) fn note_ref_into_iter_bounds(&mut self, wcs: &[ast::WhereClause]) {
+        for pred in wcs.iter().flat_map(|w| w.predicates()) {
+            let Some(ast::Type::RefType(r)) = pred.ty() else {
+                continue;
+            };
+            let Some(ast::Type::PathType(pt)) = r.ty() else {
+                continue;
+            };
+            let Some(n) = pt.path().and_then(|p| p.as_single_name_ref()) else {
+                continue;
+            };
+            let n = n.text().to_string();
+            if self.generics.get(&n) != Some(&Ty::Param(n.clone())) {
+                continue;
+            }
+            let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+            self.note_into_iter_param(&n, &lists, wcs);
+        }
     }
 
     /// The associated types of each type parameter's bounds, in order: (parameter, trait,
@@ -720,6 +872,87 @@ impl Checker<'_> {
         out
     }
 
+    /// `I: SliceIndex<[T]>` (smallvec's, thin-vec's `impl<T, I: SliceIndex<[T]>> Index<I>`):
+    /// `slice[i]` is an element or a part by what `i` is, and `I::Output` is left unchecked
+    /// (`Output = [T]` when written: a part).
+    pub(super) fn record_slice_index_bound(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        if self.adts.traits.contains_key("SliceIndex") {
+            return;
+        }
+        for b in lists.iter().flat_map(|l| l.bounds()) {
+            let Some(ast::Type::PathType(pt)) = b.ty() else {
+                continue;
+            };
+            let Some(seg) = pt.path().and_then(|p| p.segment()) else {
+                continue;
+            };
+            if !seg.name_ref().is_some_and(|n| n.text() == "SliceIndex") {
+                continue;
+            }
+            let mut elem = None;
+            let mut out = None;
+            for g in seg
+                .generic_arg_list()
+                .into_iter()
+                .flat_map(|l| l.generic_args())
+            {
+                match g {
+                    ast::GenericArg::TypeArg(ta) => {
+                        if let Some(ast::Type::SliceType(st)) = ta.ty()
+                            && let Some(t) = st.ty()
+                        {
+                            elem = Some(self.lower_type(&t));
+                        }
+                    }
+                    ast::GenericArg::AssocTypeArg(a)
+                        if a.name_ref().is_some_and(|n| n.text() == "Output") =>
+                    {
+                        out = a.ty().map(|t| self.lower_type(&t));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(elem) = elem {
+                self.lenient_projs.insert(format!("{name}::Output"));
+                self.slice_index_params.insert(name.to_string(), (elem, out));
+            }
+        }
+    }
+
+    /// Whether `e` names a local of a type parameter bounded `SliceIndex<[T]>`.
+    pub(super) fn slice_index_arg(&self, e: &ast::Expr) -> bool {
+        let ast::Expr::PathExpr(p) = super::strip_parens(e) else {
+            return false;
+        };
+        p.path()
+            .and_then(|p| p.as_single_name_ref())
+            .and_then(|n| self.lookup(&n.text().to_string()))
+            .is_some_and(|l| {
+                matches!(self.shallow(&l.ty), Ty::Param(p) if self.slice_index_params.contains_key(&p))
+            })
+    }
+
+    /// `slice[i]` (or `Index::index(slice, i)`, at `node`) of a `bt` slice by an `it` of a type
+    /// parameter bounded `SliceIndex<[T]>`: `I::Output` (or the bound's `Output = ..`), indexed
+    /// at run time by what `i` is (`κσ.$sliceIndex`). None for other indexes.
+    pub(super) fn slice_param_index(&mut self, node: &SyntaxNode, bt: &Ty, it: &Ty) -> Option<Ty> {
+        let Ty::Param(p) = self.shallow(it) else {
+            return None;
+        };
+        let (elem, out) = self.slice_index_params.get(&p).cloned()?;
+        match self.shallow(bt) {
+            Ty::Vec(e) => {
+                self.unify(&e, &elem);
+            }
+            Ty::Unknown | Ty::Var(_) => {}
+            _ => return None,
+        }
+        let r = self.range(node);
+        self.slice_param_indexes.insert(r);
+        Some(out.unwrap_or(Ty::Param(format!("{p}::Output"))))
+    }
+
     /// `T: From<X>`: `X`, for `T::from(x)` (and `T: Borrow<X>`, for a map lookup by `X`; only that
     /// one with `borrow_only`, for a method's `where` clause on its impl's parameter).
     pub(super) fn record_from_bound(
@@ -729,6 +962,9 @@ impl Checker<'_> {
         borrow_only: bool,
     ) {
         use ra_ap_syntax::ast::HasGenericArgs;
+        if !borrow_only && matches!(self.generics.get(name), Some(Ty::Param(_))) {
+            self.record_slice_index_bound(name, lists);
+        }
         for l in lists {
             for b in l.bounds() {
                 if let Some(ast::Type::PathType(pt)) = b.ty()
@@ -844,6 +1080,7 @@ impl Checker<'_> {
         if !matches!(self.generics.get(name), Some(Ty::Param(_))) {
             return;
         }
+        self.record_slice_index_bound(name, lists);
         for b in lists.iter().flat_map(|l| l.bounds()) {
             let Some(ast::Type::PathType(pt)) = b.ty() else {
                 continue;
@@ -1014,6 +1251,7 @@ impl Checker<'_> {
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
+        self.slice_index_params.clear();
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
@@ -1324,6 +1562,13 @@ impl Checker<'_> {
                 Ty::Param(n) => self.param_has(n, b),
                 _ => false,
             },
+            // (`H::Item: IntoIterator` of a parameter kept as one: collections, iterators and
+            // your iterable types; `κσ.$intoIter` iterates whatever it is.)
+            "IntoIterator" if !self.adts.traits.contains_key(b) => match t {
+                Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => false,
+                Ty::Param(n) => self.param_has(n, b),
+                _ => true,
+            },
             "Sum" | "Product" => match t {
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } => true,
                 Ty::Adt(n, _) => self.adts.method(n, &b.to_lowercase()).is_some(),
@@ -1527,7 +1772,7 @@ impl Checker<'_> {
         // And with a generic `impl<T: Tr> Tr for Vec<T>` (or `Cell<T>` / `RefCell<T>`): its
         // methods may need `T`'s class, which only a caller that knows the value's type has
         // (`κσ.$callElem`).
-        let generic_vec = ["Vec", "RefCell"].iter().any(|k| {
+        let generic_vec = ["Vec", "RefCell", "HashMap", "HashSet"].iter().any(|k| {
             has(k)
                 && self.adts.traits.get(b).is_some_and(|d| {
                     d.methods.iter().any(|tm| {
@@ -1537,13 +1782,24 @@ impl Checker<'_> {
                     })
                 })
         });
+        // And with impls for two instantiations of one struct (`W<u8>`, `W<u16>`): only the class
+        // passed for `T` (`κσ.$altT`) tells them apart.
+        let inst_alts = self.adts.traits.get(b).is_some_and(|d| {
+            d.methods.iter().any(|tm| {
+                self.adts.inherent_alts.iter().any(|k| {
+                    k.rsplit_once("::").is_some_and(|(ty, m)| {
+                        m == tm.name && (self.adts.defs.contains_key(ty) || ty == "RefCell") && crate::adt::tuple_arity(ty).is_none()
+                    })
+                })
+            })
+        });
         let arrays = array_impls || tuple_alts || generic_vec;
         // And with impls on `str` and `String` (or `[T]` and `Vec<T>`) that differ: one type in JS.
         let twins = self.twin_trait(b);
         // And with an impl for `&T` (`Box<T>`) that does more than `T`'s: a reference passed for
         // `T` reaches it by its class (`κσ.$wrapT`).
         let wraps = self.wrapper_trait(b);
-        (numeric_impls >= 2 || option_impl || arrays || twins || wraps)
+        (numeric_impls >= 2 || option_impl || arrays || twins || wraps || inst_alts)
             && (self.try_note_dict(name) || (arrays || wraps) && self.elem_class(name))
     }
 
@@ -1640,6 +1896,24 @@ impl Checker<'_> {
                     self.infer(a, None);
                 }
                 Ty::Unit
+            }
+            // An `L: IntoIterator` kept a parameter (the impl's, or `where &'a I: IntoIterator`):
+            // the runtime's iterator over whatever it is (`κσ.$intoIter`).
+            "into_iter" if self.param_has(name, "IntoIterator") => {
+                let key = format!("{name}::Item");
+                let elem = self
+                    .generics
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(Ty::Param(key));
+                sig(
+                    self,
+                    &[],
+                    Ty::Iter {
+                        elem: Box::new(elem),
+                        mutable: false,
+                    },
+                )
             }
             // An `S: BuildHasher` (a `RandomState`, or your own): `x.hash(&mut h)` feeds the
             // hasher it builds.

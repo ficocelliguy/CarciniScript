@@ -41,16 +41,43 @@ pub(crate) fn has_instantiation_consts(text: &str) -> bool {
 }
 
 /// An inherent impl's self type as (type name, its type arguments without whitespace).
+/// (Also a trait impl's, `impl Word for Wrapping<u64>` next to `impl Word for Wrapping<u32>`:
+/// see `trait_of`.)
 fn self_inst(imp: &ast::Impl) -> Option<(String, String)> {
-    if imp.trait_().is_some() {
-        return None;
-    }
     let ast::Type::PathType(p) = imp.self_ty()? else {
         return None;
     };
     let seg = p.path()?.segment()?;
     let args = seg.generic_arg_list()?;
     Some((seg.name_ref()?.text().to_string(), squash(&args.syntax().text().to_string())))
+}
+
+/// The trait an impl implements (its last segment, without arguments), or "" for an inherent
+/// impl. A trait impl's consts are renamed per instantiation too; the checker reads `MIN__1` as
+/// the trait's `MIN` (`trait_const_base`).
+fn trait_of(imp: &ast::Impl) -> String {
+    match imp.trait_() {
+        Some(ast::Type::PathType(p)) => p
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|s| s.name_ref())
+            .map(|n| n.text().to_string())
+            .unwrap_or_default(),
+        Some(_) => "?".into(),
+        None => String::new(),
+    }
+}
+
+/// `MIN__1` as the trait const it stands for (`MIN`), when `consts` (the trait's) has it.
+pub(crate) fn trait_const_base<'a>(name: &'a str, consts: &[String]) -> &'a str {
+    if let Some((base, n)) = name.rsplit_once("__")
+        && !n.is_empty()
+        && n.chars().all(|c| c.is_ascii_digit())
+        && consts.iter().any(|c| c == base)
+    {
+        return base;
+    }
+    name
 }
 
 fn squash(s: &str) -> String {
@@ -64,8 +91,8 @@ fn squash(s: &str) -> String {
 pub(crate) fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
     let file = crate::macros::parse_tree(text);
     // (type, const) → the impls declaring it: (type arguments, impl range, const name range).
-    let mut decls: HashMap<(String, String), Vec<(String, TextRange, TextRange)>> = HashMap::new();
-    let mut order: Vec<(String, String)> = Vec::new();
+    let mut decls: HashMap<(String, String, String), Vec<(String, TextRange, TextRange)>> = HashMap::new();
+    let mut order: Vec<(String, String, String)> = Vec::new();
     for imp in file.syntax().descendants().filter_map(ast::Impl::cast) {
         let Some((ty, args)) = self_inst(&imp) else {
             continue;
@@ -73,7 +100,7 @@ pub(crate) fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         for item in imp.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()) {
             let ast::AssocItem::Const(k) = item else { continue };
             let Some(n) = k.name() else { continue };
-            let key = (ty.clone(), n.text().to_string());
+            let key = (ty.clone(), trait_of(&imp), n.text().to_string());
             if !decls.contains_key(&key) {
                 order.push(key.clone());
             }
@@ -90,7 +117,7 @@ pub(crate) fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for key in order {
         let impls = &decls[&key];
-        let (ty, name) = key;
+        let (ty, _, name) = key;
         let mut k = 0;
         for (i, (args, imp, at)) in impls.iter().enumerate() {
             // (The first impl with these arguments keeps the name; a repeat is rustc's error.)

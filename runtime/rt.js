@@ -1635,6 +1635,25 @@
     }
   }
 
+  // A class's `std::ops` method by trait method name (`index_mut`): its key is numbered among
+  // the type's operator impls (`index_mut$1`), so found by prefix once per class.
+  const OP_FNS = new WeakMap();
+  function opFn(c, name) {
+    const proto = c == null ? null : Object.getPrototypeOf(c);
+    if (proto == null || typeof proto !== "object") return undefined;
+    let fns = OP_FNS.get(proto);
+    if (!fns) OP_FNS.set(proto, (fns = {}));
+    if (!(name in fns)) {
+      let found;
+      for (let p = proto; p && p !== Object.prototype && !found; p = Object.getPrototypeOf(p)) {
+        const k = Object.getOwnPropertyNames(p).find((k) => k === name || k.startsWith(name + "$"));
+        if (k && typeof p[k] === "function") found = p[k];
+      }
+      fns[name] = found;
+    }
+    return fns[name];
+  }
+
   const NUM_TYPES = {};
   const NUM_EXT = new WeakMap();
   // `{:p}`'s made-up addresses: one per object, a new one per formatting of anything else.
@@ -4490,9 +4509,49 @@
         if (!(i >= 0 && i < c.length)) rt.$oob(c, i, loc);
         return c instanceof Deque ? c.b[c.$p(i)] : c[i];
       }
-      const f = c.index ?? c.index$0;
+      const f = opFn(c, "index");
       if (typeof f === "function") return f.call(c, i);
       throw new TypeError(`${loc}: this value can't be indexed`);
+    },
+    // `c[i] = v` / `c[i] += 1` with `c` of a type parameter bounded `IndexMut<Ix>`: a cell over
+    // the Vec's (or deque's) element, or what your type's `index_mut` hands out.
+    $indexAnyMut(c, i, loc) {
+      if (Array.isArray(c) || c instanceof Deque) {
+        if (!(i >= 0 && i < c.length)) rt.$oob(c, i, loc);
+        if (c instanceof Deque) {
+          const k = c.$p(i);
+          return rt.$cell(() => c.b[k], ($v) => {
+            c.b[k] = $v;
+          });
+        }
+        return rt.$cell(() => c[i], ($v) => {
+          c[i] = $v;
+        });
+      }
+      const f = opFn(c, "index_mut");
+      if (typeof f === "function") return f.call(c, i);
+      throw new TypeError(`${loc}: this value can't be indexed`);
+    },
+    // `slice[i]` with `i: I` of `I: SliceIndex<[T]>` (smallvec's `impl<I: SliceIndex<[T]>>
+    // Index<I>`, also `Index::index(s, r)` of a string): an element for a number, a copy of that
+    // part for a range.
+    $sliceIndex(v, i, loc) {
+      if (i instanceof Iter && i.it instanceof RangeIt) {
+        return rt.$sliceBy(typeof v === "string" ? "$strSlice" : "$slice", v, i, loc);
+      }
+      return rt.$get(v, i, loc);
+    },
+    // `&mut slice[i]` of the same: a cell over the element, a view of that part for a range (a
+    // string's part is a copy: JS strings are values).
+    $sliceIndexMut(v, i, loc) {
+      if (i instanceof Iter && i.it instanceof RangeIt) {
+        return rt.$sliceBy(typeof v === "string" ? "$strSlice" : "$sliceMut", v, i, loc);
+      }
+      const a = arr(v);
+      const k = rt.$ix(v, i, loc);
+      return rt.$cell(() => a[k], ($v) => {
+        a[k] = $v;
+      });
     },
     // `ptr::eq(a, b)`: the same object, or slots over the same box.
     $ptrEq(a, b) {
@@ -5616,6 +5675,41 @@
       // Default functions without `self`: on the class itself.
       if (statics) into(cls, statics);
     },
+    // Impls of one trait for other instantiations of a class (`impl Get for W<u16>` next to
+    // `impl Get for W<u8>`), whose methods are `name$1`, ..: each map (`{get: "get$1", twice:
+    // "twice$1"}`) gives the default methods that impl inherits under its keys, called on a view
+    // of `self` whose method names go to that impl's.
+    $altMixin(cls, defaults, maps) {
+      for (const map of maps) {
+        for (const [name, key] of Object.entries(map)) {
+          if (Object.prototype.hasOwnProperty.call(cls.prototype, key) || typeof defaults[name] !== "function") continue;
+          const f = defaults[name];
+          cls.prototype[key] = function (...a) {
+            return f.call(rt.$altSelf(this, map), ...a);
+          };
+        }
+      }
+    },
+    // The class of `W<u16>` passed for a type parameter where `W<u8>` has impls of the same
+    // traits: `cls` reading the names in `map` (`T::make`, `T::ZERO`) as that impl's, and
+    // `$dcallT` calling its methods.
+    $altT(cls, map) {
+      return new Proxy(cls, {
+        get(t, k, r) {
+          if (k === "$altMap") return map;
+          return Reflect.get(t, Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k, r);
+        },
+      });
+    },
+    $altSelf(x, map) {
+      return new Proxy(x, {
+        get(t, k) {
+          // (`Self::K` in a default: `this.constructor.K`, that impl's.)
+          if (k === "constructor") return rt.$altT(t.constructor, map);
+          return Reflect.get(t, Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k);
+        },
+      });
+    },
     // Stand-ins for a built-in type's class, passed for `T::default()` and friends.
     $prims: {
       num: { default: () => 0, dbg: String },
@@ -5825,6 +5919,7 @@
     // class says which impl (a whole `f64` would otherwise reach the integer impl).
     // The same for a `&mut self` method, with the receiver's cell `c` (`$dcallMut`).
     $dcallMutT(regs, cls, c, name, ...args) {
+      if (cls?.$altMap && c[0] !== null && typeof c[0] === "object") return rt.$dcallT(regs, cls, c[0], name, ...args);
       if (cls?.wrap) return rt.$wrapCall(regs, cls, c[0], name, args);
       if (cls?.own) {
         const r = rt.$ownImpl(regs, c[0], name);
@@ -5847,6 +5942,11 @@
       return rt.$dcallMut(regs, c, name, ...args);
     },
     $dcallT(regs, cls, x, name, ...args) {
+      // (`W<u16>`'s class with impls of its own next to `W<u8>`'s: that impl's method.)
+      const alt = cls?.$altMap;
+      if (alt && Object.prototype.hasOwnProperty.call(alt, name) && x !== null && typeof x === "object" && typeof x[alt[name]] === "function") {
+        return x[alt[name]](...args);
+      }
       if (cls?.wrap) return rt.$wrapCall(regs, cls, x, name, args);
       if (cls?.own) {
         const r = rt.$ownImpl(regs, x, name);
@@ -5862,7 +5962,9 @@
       // (A `Cell<T>`'s or `RefCell<T>`'s: its impl, handed the element's class.)
       if (cls?.refcell && x instanceof RefCell) {
         for (const r of regs.kinds.refcell ?? []) {
-          const f = r.cls.prototype[name];
+          if (typeof r.cls.prototype[name] !== "function") continue;
+          // (Impls for two instantiations, `Cell<u8>` and `Cell<u16>`: by the element's class.)
+          const f = r.cls.prototype[r.cls.$alts ? rt.$tupAlt(r.cls, name, x, cls.elem ?? null) : name];
           if (typeof f === "function") return r.cls.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
         }
       }
@@ -5871,6 +5973,14 @@
       if (arr) {
         const f = arr.prototype[arr.$alts ? rt.$tupAlt(arr, name, x, cls.elem) : name];
         return arr.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
+      }
+      // (A `HashMap<K, V>`'s or `HashSet<T>`'s: its impl, handed the key's and value's classes
+      // or the element's.)
+      if (cls?.elem !== undefined && (x instanceof HashMap ? !(x instanceof BTreeMap) : x instanceof HashSet && !(x instanceof BTreeSet))) {
+        for (const r of regs.kinds[x instanceof HashMap ? "map" : "set"] ?? []) {
+          const f = r.cls.prototype[name];
+          if (typeof f === "function") return r.cls.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
+        }
       }
       const kind = cls?.kind;
       if (kind !== undefined) {

@@ -325,7 +325,11 @@ impl Checker<'_> {
             .into_iter()
             .flat_map(|l| l.assoc_items())
             .filter_map(|i| match i {
-                ast::AssocItem::Const(k) => Some(k.name()?.text().to_string()),
+                // (`MIN__1`: this instantiation's `MIN`, see `inst_consts`.)
+                ast::AssocItem::Const(k) => Some(
+                    crate::inst_consts::trait_const_base(k.name()?.text().as_ref(), &def.consts)
+                        .to_string(),
+                ),
                 _ => None,
             })
             .collect();
@@ -505,12 +509,13 @@ impl Checker<'_> {
         // (`impl Tr for (u8, u8)` next to `impl Tr for (String, String)`: one class whose
         // methods are picked by the elements, see `typeck_adt.rs`.)
         // (And `impl Tr for [u8]` next to `impl<T: Tr> Tr for [T]`.)
-        let other_tuple = crate::adt::array_alts_key(type_name)
+        let other_tuple = (crate::adt::array_alts_key(type_name) || !self_args.is_empty())
             && !before.is_empty()
             && before
                 .iter()
                 .all(|(sa, _)| crate::adt::separable_args(&self.adts, tr, type_name, sa, &self_args));
-        let tuple_args = crate::adt::array_alts_key(type_name).then(|| self_args.clone());
+        let tuple_args =
+            (crate::adt::array_alts_key(type_name) || !self_args.is_empty()).then(|| self_args.clone());
         self.adts
             .impl_heads
             .entry(pair)
@@ -604,6 +609,12 @@ impl Checker<'_> {
             .entry(type_name.to_string())
             .or_default();
         let seen = impls.iter().any(|t| t == tr) && (!ref_trait || plain_before);
+        // (A marker trait, `impl Marker for Cow<str>` next to `impl Marker for Cow<[T]>`: nothing
+        // to tell apart.)
+        let marker = def.methods.is_empty() && def.consts.is_empty() && def.assoc_types.is_empty();
+        if seen && marker {
+            return;
+        }
         if seen && !is_ref && def.type_params.is_empty() && !other_tuple {
             let node = imp
                 .trait_()
@@ -637,7 +648,7 @@ impl Checker<'_> {
                 format!(
                     "conflicting implementations of trait `{tr}` for type `{type_name}` ({same} are one type in JS)"
                 )
-            } else if let Some(args) = tuple_args {
+            } else if let Some(args) = tuple_args.filter(|_| crate::adt::tuple_arity(type_name).is_some()) {
                 // (Impls for tuples whose elements don't overlap are each their own.)
                 format!(
                     "conflicting implementations of trait `{tr}` for type `{}`",
@@ -986,6 +997,8 @@ impl Checker<'_> {
             "Option" => Ty::Option(arg(0)),
             "HashMap" => Ty::Map(arg(0), arg(1)),
             "HashSet" => Ty::Set(arg(0)),
+            // (`<Cell<u8>>::f()`: a `Cell`'s class carries `u8`'s, as a `Vec`'s does.)
+            "Cell" | "RefCell" if !self.adts.defs.contains_key(t) => Ty::RefCell(arg(0)),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
             n if crate::adt::ext_key(n).is_some() && Ty::from_name(n).is_numeric() => {

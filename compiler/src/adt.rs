@@ -294,6 +294,11 @@ pub struct Adts {
     /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
     /// arguments, not by a trait.
     pub inherent_alts: std::collections::HashSet<String>,
+    /// A trait impl's consts renamed per instantiation (`impl Word for Wrapping<u64> { const
+    /// ZERO }` next to `Wrapping<u32>`'s, see `inst_consts`), by type: (the impl's self type
+    /// arguments, the trait's name `ZERO`, this impl's `ZERO__1`). The class passed for such a
+    /// type parameter reads them by the trait's name (`κσ.$altT`).
+    pub alt_consts: HashMap<String, Vec<(Vec<Ty>, String, String)>>,
     /// The `"Type::method"`s of inherent methods: an `impl AsRef<..>` beside an inherent `as_ref`
     /// puts its method under `AsRef$as_ref`.
     pub inherent_methods: std::collections::HashSet<String>,
@@ -745,6 +750,10 @@ pub struct OpImpl {
     pub key: String,
     /// Absolute offset of the method's name.
     pub at: usize,
+    /// `impl<T, I: SliceIndex<[T]>> Index<I>` (smallvec, thin-vec): the slice's element type
+    /// (`T`, in the impl's parameters). `v[i]` is a `T`, `v[a..b]` a `[T]`; with `impl Deref`,
+    /// they index what the type derefs to.
+    pub slice_index: Option<Ty>,
 }
 
 /// The method of a `std::ops` trait, for the traits CarciniScript overloads.
@@ -1245,7 +1254,7 @@ fn wrapper_new(e: Option<ast::Expr>) -> Option<()> {
 
 /// `e` through parentheses, `&`, `*` and the views of a `String` or `Vec` that are the same
 /// value in JS (`self.as_str()`, `(*self).as_ref()`, `&self[..]`).
-fn strip_views(mut e: ast::Expr) -> Option<ast::Expr> {
+pub(crate) fn strip_views(mut e: ast::Expr) -> Option<ast::Expr> {
     use ra_ap_syntax::ast::HasArgList;
     loop {
         e = match e {
@@ -1308,6 +1317,8 @@ fn strip_views(mut e: ast::Expr) -> Option<ast::Expr> {
             {
                 i.base()?
             }
+            // (`self as &[_]`: an array as its slice, the same value.)
+            ast::Expr::CastExpr(c) if matches!(c.ty(), Some(ast::Type::RefType(_))) => c.expr()?,
             other => return Some(other),
         };
     }
@@ -1346,7 +1357,7 @@ fn body_shape(f: &ast::Fn) -> Option<String> {
 
 /// Whether `f`'s body is just the same method of what `self` points at, with `f`'s parameters:
 /// `(**self).f(a, b)`, `T::f(self, a)`, `Tr::f(&**self, a)`.
-fn forwards(f: &ast::Fn) -> bool {
+pub(crate) fn forwards(f: &ast::Fn) -> bool {
     use ra_ap_syntax::ast::HasArgList;
     let path_name = |e: ast::Expr| -> Option<String> {
         match strip_views(e)? {
@@ -1656,6 +1667,9 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
                 _ => true,
             })
             .collect();
+        // Impls for types that are one type in JS (`[T; N]` and `[T]`, `X` and `&X`) that repeat or
+        // hand on to another impl of their trait: that one serves.
+        let items = crate::erased_twins::drop_erased_twins(items);
         *last.borrow_mut() = Some((file.syntax().clone(), items.clone()));
         items
     })

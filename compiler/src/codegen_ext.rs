@@ -321,6 +321,8 @@ impl Codegen<'_> {
         match t {
             Ty::Map(..) => f.wrap("", ".$entries()"),
             Ty::Option(_) => f.wrap("κσ.$optIter(", ")"),
+            // (An `I: IntoIterator` kept a parameter: whatever it is.)
+            Ty::Param(_) => f.wrap("κσ.$intoIter(", ")"),
             _ => f,
         }
     }

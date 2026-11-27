@@ -319,6 +319,11 @@ impl Checker<'_> {
             Ty::Iter { elem, .. } | Ty::IntoIter(elem) | Ty::Range(elem, _) => Some(*elem),
             Ty::Map(k, v) => Some(Ty::Tuple(vec![*k, *v])),
             Ty::Unknown => Some(Ty::Unknown),
+            // (An `L: IntoIterator` kept a parameter, or `where &'a I: IntoIterator`.)
+            Ty::Param(n) if self.param_has(&n, "IntoIterator") => {
+                let key = format!("{n}::Item");
+                Some(self.generics.get(&key).cloned().unwrap_or(Ty::Param(key)))
+            }
             _ => None,
         }
     }

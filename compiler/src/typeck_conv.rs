@@ -1702,6 +1702,27 @@ impl Checker<'_> {
             },
             None => Ty::Unknown,
         };
+        // (`impl<T, I: SliceIndex<[T]>> Index<I> for V<T>`: a `T` for a number, a `[T]` for a
+        // range, in the base's type arguments.)
+        let ret = match one.slice_index.clone() {
+            Some(elem) => {
+                let t = if matches!(self.shallow(&it), Ty::Range(..)) {
+                    Ty::Vec(Box::new(elem))
+                } else {
+                    elem
+                };
+                match (self.adts.method(adt, &key).cloned(), self.shallow(bt)) {
+                    (Some(mut sig), Ty::Adt(_, targs)) => {
+                        sig.ret = t;
+                        let sig = self.method_inst(&sig, Some(&targs));
+                        self.last_type_args.clear();
+                        sig.ret
+                    }
+                    _ => t,
+                }
+            }
+            None => ret,
+        };
         // (Also `v["a"]["b"] = x`: Rust takes every index of an assigned place with `IndexMut`.)
         let mut place = ix.syntax().clone();
         while let Some(outer) = place.parent().and_then(ast::IndexExpr::cast)

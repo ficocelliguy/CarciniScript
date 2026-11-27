@@ -925,6 +925,9 @@ impl Codegen<'_> {
             Ty::Option(_) => Some("Option"),
             Ty::Vec(_) => Some("Vec"),
             Ty::RefCell(_) => Some("RefCell"),
+            // (`impl<K, V> Tr for HashMap<K, V>`: the key's and value's, in an array.)
+            Ty::Map(..) => Some("HashMap"),
+            Ty::Set(_) => Some("HashSet"),
             Ty::Tuple(es) => crate::adt::tuple_key(es.len()),
             // (A `&T` impl's methods: `T`'s.)
             Ty::Param(_) if self.ext_class.as_deref().is_some_and(crate::adt::is_wrapper_key) => {
@@ -938,7 +941,7 @@ impl Codegen<'_> {
                 js_name.clone().unwrap_or_else(|| name.text().to_string())
             ))
         {
-            let tuple = matches!(self_ty, Ty::Tuple(_));
+            let tuple = matches!(self_ty, Ty::Tuple(_) | Ty::Map(..));
             for (i, a) in sig.impl_args.iter().enumerate() {
                 if let Ty::Param(p) = a {
                     let js = if tuple { format!("$elem?.[{i}]") } else { "$elem".into() };
@@ -1311,14 +1314,21 @@ impl Codegen<'_> {
                 .adts
                 .method_alts
                 .get(&format!("{key}::{}", n.text()))
-                .filter(|_| crate::adt::tuple_arity(key).is_some())
+                .filter(|_| crate::adt::tuple_arity(key).is_some() || key == "RefCell")
                 .cloned();
             if let Some(alts) = alts {
                 for k in alts {
                     if let Some(sig) = self.types.adts.method(key, &k).cloned() {
-                        let own = Ty::Tuple(sig.impl_args.clone());
+                        let own = match (key, sig.impl_args.as_slice()) {
+                            // (`Cell<u16>` next to `Cell<u8>`: a copy for each too.)
+                            ("RefCell", [e]) => Ty::RefCell(Box::new(e.clone())),
+                            _ => Ty::Tuple(sig.impl_args.clone()),
+                        };
                         let k = (k != n.text()).then_some(k);
+                        let alt_self = self.alt_view(key, &sig.impl_args.clone(), format!("$ext${key}"));
+                        let saved = self.ext_alt_self.replace(alt_self);
                         self.emit_method_fn(&f, sig, own, "}", k);
+                        self.ext_alt_self = saved;
                     }
                 }
             } else if let Some(sig) = self.types.adts.method(key, n.text()).cloned() {
@@ -1371,7 +1381,8 @@ impl Codegen<'_> {
         // method's keys with the impl's element classes, which `κσ.$dcall` / `$dcallT` match
         // against the elements' classes or values. (A function: those classes may come later.)
         // A slice's too (`[u8]` next to `[T]`), by the element's.
-        if crate::adt::array_alts_key(key) {
+        // (And another instantiation's: `Cell<u16>` next to `Cell<u8>`, by the element's class.)
+        if crate::adt::array_alts_key(key) || key == "RefCell" {
             let mut alts: Vec<String> = Vec::new();
             let mut names: Vec<&String> = self
                 .types
@@ -1682,7 +1693,11 @@ impl Codegen<'_> {
             .trait_impls
             .iter()
             .filter(|(adt, _)| self.local_adts.contains(*adt))
-            .map(|(a, ts)| (a.clone(), ts.clone()))
+            .map(|(a, ts)| {
+                // (A trait implemented for several instantiations is listed once per impl.)
+                let mut seen = std::collections::HashSet::new();
+                (a.clone(), ts.iter().filter(|t| seen.insert(t.as_str())).cloned().collect())
+            })
             .collect();
         impls.sort();
         for (adt, traits) in impls {
@@ -1708,8 +1723,118 @@ impl Codegen<'_> {
                     "κσ.$mixin({cls}, {prefix}$defaults{call}, {}, {prefix}$statics{call});",
                     super::js_string(&tr)
                 )));
+                // (Impls of the trait for other instantiations, `W<u16>` next to `W<u8>`: their
+                // inherited defaults under their keys, with `self`'s calls going to that impl's
+                // methods, see `κσ.$altMixin`.)
+                if call.is_empty() {
+                    let maps = self.alt_impl_maps(&adt, &tr);
+                    if !maps.is_empty() {
+                        self.line(Frag::text(format!(
+                            "κσ.$altMixin({cls}, {prefix}$defaults, [{}]);",
+                            maps.join(", ")
+                        )));
+                    }
+                }
             }
         }
+    }
+
+    /// The class `view` of `adt` passed for a type parameter, as `adt<args>` (`W<u16>`) when that
+    /// instantiation has impls of its own next to another's (`impl Get for W<u8>`): its methods,
+    /// associated functions and consts by the trait's names (`κσ.$altT(W, {get: "get$1"})`).
+    pub(super) fn alt_view(&self, adt: &str, args: &[Ty], view: String) -> String {
+        let adts = &self.types.adts;
+        let open = |ts: &[Ty]| {
+            let mut o = false;
+            for t in ts {
+                t.walk(&mut |x| o |= matches!(x, Ty::Param(_) | Ty::Var(_) | Ty::Unknown | Ty::IntLit));
+            }
+            o
+        };
+        if args.is_empty() || open(args) {
+            return view;
+        }
+        let fits = |ia: &[Ty]| {
+            ia.len() == args.len() && !ia.iter().zip(args).any(|(a, b)| crate::adt::disjoint_args(a, b))
+        };
+        let mut map: Vec<(String, String)> = Vec::new();
+        let prefix = format!("{adt}::");
+        // (A built-in type's methods are picked by its element's class instead: `$alts`.)
+        let mut names: Vec<&String> = adts
+            .method_alts
+            .keys()
+            .filter(|k| k.starts_with(&prefix) && adts.inherent_alts.contains(*k) && adts.defs.contains_key(adt))
+            .collect();
+        names.sort();
+        for k in names {
+            let m = &k[prefix.len()..];
+            if let Some(key) = adts.method_alts[k]
+                .iter()
+                .find(|alt| adts.method(adt, alt).is_some_and(|s| fits(&s.impl_args)))
+                && key != m
+            {
+                map.push((m.to_string(), key.clone()));
+            }
+        }
+        for (ia, base, renamed) in adts.alt_consts.get(adt).into_iter().flatten() {
+            if fits(ia) {
+                map.push((base.clone(), renamed.clone()));
+            }
+        }
+        if map.is_empty() {
+            return view;
+        }
+        let es: Vec<String> = map
+            .iter()
+            .map(|(n, k)| format!("{}: {}", super::js_string(&prop(n)), super::js_string(&prop(k))))
+            .collect();
+        format!("κσ.$altT({view}, {{ {} }})", es.join(", "))
+    }
+
+    /// For the impls of trait `tr` for several instantiations of `adt` (`impl Get for W<u8>`,
+    /// `impl Get for W<u16>`): each later impl's method keys by name (`{get: "get$1", twice:
+    /// "twice$1"}`), as JS object literals.
+    fn alt_impl_maps(&self, adt: &str, tr: &str) -> Vec<String> {
+        let adts = &self.types.adts;
+        let Some(def) = adts.traits.get(tr) else {
+            return Vec::new();
+        };
+        let mut groups: Vec<(Vec<Ty>, Vec<(String, String)>)> = Vec::new();
+        for tm in &def.methods {
+            let k = format!("{adt}::{}", tm.name);
+            if !adts.inherent_alts.contains(&k) {
+                continue;
+            }
+            for key in adts.method_alts.get(&k).into_iter().flatten() {
+                if *key == tm.name {
+                    continue;
+                }
+                let Some(sig) = adts.method(adt, key) else { continue };
+                match groups.iter_mut().find(|(a, _)| *a == sig.impl_args) {
+                    Some((_, m)) => m.push((tm.name.clone(), key.clone())),
+                    None => groups.push((sig.impl_args.clone(), vec![(tm.name.clone(), key.clone())])),
+                }
+            }
+        }
+        // (And its consts, which `Self::K` in a default reads off `self.constructor`.)
+        for (ia, base, renamed) in adts.alt_consts.get(adt).into_iter().flatten() {
+            if !def.consts.contains(base) {
+                continue;
+            }
+            if let Some((_, m)) = groups.iter_mut().find(|(a, _)| a == ia) {
+                m.push((base.clone(), renamed.clone()));
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(_, m)| {
+                let es: Vec<String> = m
+                    .iter()
+                    .map(|(n, k)| format!("{}: {}", super::js_string(&prop(n)), super::js_string(&prop(k))))
+                    .collect();
+                format!("{{ {} }}", es.join(", "))
+            })
+            .collect()
     }
 
     /// For each impl of a trait with const parameters, the JS accessors of its const arguments
