@@ -63,6 +63,7 @@ const STD_MACROS = set(`format_args include include_bytes include_str concat env
   debug_assert_ne write writeln print println eprint eprintln format panic unreachable todo unimplemented vec dbg
   is_x86_feature_detected is_aarch64_feature_detected concat_idents trace_macros log_syntax const_format_args
   addr_of addr_of_mut offset_of`);
+const PRIMS = set("u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64 bool char str");
 const isGenericParam = n => /^[A-Z][A-Z0-9]?$/.test(n);
 const base = n => n.replace(/<.*$/s, "").replace(/^(&|\*const |\*mut |mut |dyn |impl )+/, "").split("::").pop().trim();
 const firstName = m => (m.match(/`([^`]*)`/) || [])[1] || "";
@@ -112,6 +113,13 @@ function classify(m, lineText, file) {
   if (/^`#\[derive\(/.test(m)) return ["EXT", "derive " + n];
   if (/^cannot find (function|value)/.test(m)) {
     if (thr(b)) return ["THREAD", b];
+    // `u16::to_be_bytes(x)` / `usize::max_value()` is a std gap, `T::SIZE` stays generic, and a
+    // trait method used as a value (`.map(Source::count)`) a language gap when the trait is here.
+    const first = n.includes("::") ? n.split("::")[0] : "";
+    if (PRIMS.has(first)) return ["STD", "function " + n];
+    // (`T::SIZE`: the report decides from the signature whether the bound is from elsewhere.)
+    if (isGenericParam(first)) return ["GENERIC", "associated item on a type parameter"];
+    if (file.traits.has(first)) return ["LANG", "trait method used as a value"];
     if (/^(alloc|dealloc|realloc|alloc_zeroed|handle_alloc_error|copy_nonoverlapping|copy|from_raw_parts|from_raw_parts_mut|transmute|unreachable_unchecked|null|null_mut|write_bytes|read_volatile|write_volatile|size_of|align_of|zeroed|uninitialized|forget|catch_unwind)$/.test(b)) return ["LANG", "unsafe/memory: " + b];
     return ["EXT", "name"];
   }
@@ -239,6 +247,7 @@ function classifyFile(f) {
     uses: [...src.matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/gm)].map(m => m[1].replace(/\s+/g, " ")),
     fns: new Set([...src.matchAll(/\bfn\s+(\w+)/g)].map(m => m[1])),
     types: new Set([...src.matchAll(/\b(?:struct|enum|union)\s+(\w+)/g)].map(m => m[1])),
+    traits: new Set([...src.matchAll(/\btrait\s+(\w+)/g)].map(m => m[1])),
   };
   const errs = (r.diagnostics||[]).filter(d=>d.severity==="error").map(d => {
     let i = d.line-1, depth = 0;

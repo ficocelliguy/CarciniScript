@@ -3800,6 +3800,23 @@ impl<'a> Checker<'a> {
             None => false,
         };
         if through_place {
+            // `if let Some(n) = &mut o` / `o.as_mut()` / `match &mut x { n => .. }` of a local
+            // number, string, bool or `Option`: the local lives in a cell, so `n` aliases `o[0]`
+            // and `bump(n)` hands that cell on.
+            let root = match scrutinee.map(strip_parens) {
+                Some(ast::Expr::RefExpr(r)) => r.expr(),
+                Some(ast::Expr::MethodCallExpr(m)) if self.as_mut_of_place(&ast::Expr::MethodCallExpr(m.clone())) => m.receiver(),
+                _ => None,
+            };
+            if let Some(ast::Expr::PathExpr(p)) = root.map(|r| strip_parens(&r))
+                && let Some(name) = p.path().and_then(|p| p.as_single_name_ref())
+                && let Some(local) = self.lookup(name.text().to_string().as_str()).cloned()
+                && local.reference != Some(true)
+                && self.cellable(&local.ty)
+                && let Some(d) = local.decl
+            {
+                self.boxed.insert(d);
+            }
             for ip in pat
                 .syntax()
                 .descendants_with_tokens()

@@ -946,6 +946,49 @@ fn ext_names(n: &SyntaxNode, scope: &Scope) -> Vec<String> {
             out.push(first.clone());
         }
     }
+    // Inside a macro's arguments (`matches!(k, other::Kind::A)`) there are no PATH nodes, only
+    // tokens: `a::b::C` and lone capitalized identifiers there are judged the same way.
+    let trees: Vec<SyntaxNode> = if n.kind() == TOKEN_TREE {
+        vec![n.clone()]
+    } else {
+        n.descendants()
+            .filter(|d| d.kind() == TOKEN_TREE && !parent_is(d, TOKEN_TREE))
+            .collect()
+    };
+    for tt in trees {
+        let toks: Vec<_> = tt
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !matches!(t.kind(), WHITESPACE | COMMENT))
+            .collect();
+        for (i, t) in toks.iter().enumerate() {
+            if i > 0 && toks[i - 1].kind() == COLON2 {
+                continue;
+            }
+            let more = toks.get(i + 1).is_some_and(|x| x.kind() == COLON2);
+            if matches!(t.kind(), CRATE_KW | SUPER_KW) && more {
+                out.push(format!("{}::..", t.text()));
+                continue;
+            }
+            if t.kind() != IDENT || toks.get(i + 1).is_some_and(|x| x.kind() == BANG) {
+                continue;
+            }
+            let first = t.text().to_string();
+            if matches!(first.as_str(), "std" | "core" | "alloc") {
+                continue;
+            }
+            let module_path = more
+                && first.starts_with(|c: char| c.is_ascii_lowercase())
+                && !scope.local.contains(&first);
+            let foreign = scope.foreign.contains(&first)
+                || first.starts_with(|c: char| c.is_ascii_uppercase())
+                    && !scope.local.contains(&first)
+                || module_path;
+            if foreign && !out.contains(&first) {
+                out.push(first);
+            }
+        }
+    }
     out.truncate(4);
     out
 }

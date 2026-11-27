@@ -203,8 +203,8 @@ its files into "uncategorized" (it has happened twice, moving 800 and 1,000 file
 uncategorized count jumps, check the report's top messages before reading anything else into
 the numbers.
 
-The last run (2026-11-26) had language features all supported in 83.8% of files (4,551 of
-5,428; 72.1% counting std gaps). Most failing files that have only fixable gaps fail on names
+The last run (2026-11-27) had language features all supported in 84.1% of files (4,684 of
+5,568; 71.5% counting std gaps). Most failing files that have only fixable gaps fail on names
 from another file or crate, not on a language feature; the language gaps left are in "Gaps
 from the feature chart" below.
 
@@ -299,21 +299,191 @@ with a small probe, in order of how often a script would hit it.
   Errors today, where the local and collection cases work. Estimate: half a day. Importance: low,
   next to the not-planned pointer arithmetic.
 
+## Corpus gaps by files affected (2026-11-27)
+
+The 2026-11-27 survey (HEAD `f758cc2`, clean worktree) left 1,766 files not language-OK. 967 of
+them need memory, FFI, the filesystem, threads or unions and are out of scope; of the other 799,
+the three biggest buckets (`.into()` inference, `.0` on an unknown type, `matches!` on an enum)
+are still almost entirely types or impls from another file. Everything else was triaged with
+single-file probes that rustc accepts and the compiler rejects (about 150 of them, in
+`%TEMP%\carciniscript-probes-2026-11-27\`, folders `agentA..E` and `mine`; `probe.mjs` there runs
+rustc and then the compiler over a file). "Files" is how many corpus files hit the gap, "flips"
+how many it is the only blocker in; both skip browser-impossible files. Ordered by files.
+
+### Language gaps
+
+- [ ] **A `&mut` rebound to a plain local is treated as owned.** `fn f(v: &mut Vec<u8>) { let t =
+  v; t.push(1); }` is "cannot borrow `t` as mutable, as it is not declared as mutable". Same for
+  `if let Some(s) = o { s.push(..) }` on an `Option<&mut T>`, `let t = if c { a } else { b }`,
+  tuple destructuring (`let (last, rest) = v.split_last_mut()?`), a `&mut` after `?`, a `&mut`
+  copied out of a field, `as_mut()` / `as_mut_slice()` results. Only an explicit `&mut *v` or a
+  function returning `&mut` works. A related false positive: `&mut` items of a user iterator
+  (`type Item = &'a mut T`) or of `.zip(&mut v)` / `.zip(dst.chunks_mut(n))` are "behind a `&`
+  reference" (4 files). Probes `agentC/q10_matrix.rs`, `q7_rebind.rs`, `q3b_iflet.rs`,
+  `q11_iter_mut_items.rs`, `mine/m10_rebind_mut.rs`. 44 files, 8 flips. Importance: high; the
+  shape is basic and rustc accepts it, so a script author gets a wrong error.
+- [ ] **Impls that differ only in the self type's generic argument, array length or reference
+  conflict.** `impl Tr for W<u8>` + `impl Tr for W<u16>` (also `Cell<u8>` / `Cell<u16>`,
+  `HashMap<K, V, S1>` / `HashMap<K, V, S2>`, macro-stamped `UniformInt<$ty>`), `[u8; 1]` vs
+  `[u8; 2]`, `[T; N]` vs `[T]`, `Cow<str>` vs `Cow<[T]>`, `X` vs `&X`, `&T` vs `&mut T`, `Rc<T>`
+  vs `Box<T>`, `Cell<T>` vs `RefCell<T>`, `Cow<str>` vs `&Cow<str>`, `PathBuf` vs `&Path`, fn
+  pointers of different arity, `dyn Tr` vs `dyn Tr + Send`; all "conflicting implementations"
+  or "duplicate definitions". Also `vec::IntoIter`, `array::IntoIter` and `vec::Drain` share one
+  `Iter` type. The known JS-representation limit, now with the shapes libraries actually write.
+  Probes `agentB/c5d_*.rs`, `c6b_*.rs`, `c1c_*.rs`, `c11b_*.rs`, `c3_*.rs`, `c7_*.rs`, `c8_*.rs`,
+  `agentD/q9c_box_rc_static.rs`. About 45 files, 7 flips. Importance: medium.
+- [ ] **An inherent item with the same name as a trait-impl item on the same type is a
+  "duplicate definition".** `impl Named for S { fn name(..) }` plus `impl S { pub fn name(..) }`,
+  and inherent consts next to trait consts. Ordinary Rust; icu_locale_core, gimli and jiff-core
+  do it. Probes `agentB/c12b_inherent_shadow_simple.rs`, `mine/m13_inherent_shadow.rs`. 5 files,
+  1 flip. Importance: medium (a wrong error on legal code).
+- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** `T::f()` inside
+  `impl<T: Tr> Tr for Cell<T>` / `RefCell<T>` / `HashMap<K, V, S>` and blanket `impl<Z: Tr> Tr2
+  for Z` (10 files; `Vec<T>` / `Option<T>` / `Box<T>` work); `where &'a I: IntoIterator` and
+  `for<'a> &'a I: BitAnd<&'a I>` bounds (strsim, num-integer); bounds placed in a method's `where`
+  on the impl's params plus `L::IntoIter` in the return type (either, 21 errors); `H::Item:
+  IntoIterator` (itertools, 3 files); `T::clone(x)` by path; `Trait::f(args)` with `Self`
+  inferred from the expected type (3 files); `>>` on the param of a blanket impl; `where
+  Concrete: Add<A>` and `where Ident: PartialEq<I>` (syn, 3 flips); `where Self: PartialEq` on a
+  trait default method; bounds on projections (`<T as Shr<u32>>::Output: PartialEq<T>`); `use
+  std::fmt::Write as FmtWrite` then `W: FmtWrite` ("bound not supported on type parameters");
+  `.fmt(f)` / `.len()` through a std supertrait of a same-file trait. Probes in `agentD/q6*`,
+  `q9*`, `q10*`, `q12*`, `q15*`, `q19*`, `q20*` and `agentC/q15`, `q19`–`q22`. About 30 files, 8
+  flips. Importance: medium; each shape is small, the family is large.
+- [ ] **Derives over std types and `cfg_attr`.** `#[derive(Debug)]` with a `std::slice::IterMut`
+  field (10 files, 2 flips); `#[cfg_attr(not(feature = "x"), derive(Debug, Clone))]` is never
+  applied, whatever the predicate (2 files, both flips, and a common idiom); a field whose type
+  parameter is bounded by an `Fn` trait blocks `Debug` / `Clone` / `Copy` (6 files); `TypeId`
+  and `NonZero<char>` fields are not `Copy` (they map to `String`); `Option<Box<dyn Any>>` has no
+  `Debug`. Probes `agentB/q28_itermut_debug.rs`, `q29c_cfg_attr_only.rs`,
+  `q25_drainfilter_debug.rs`, `q23_typeid_copy.rs`, `mine/m12_cfgattr_derive.rs`. About 20
+  files, 5 flips. Importance: medium (the `cfg_attr` one is high for scripts).
+- [ ] **Empty-enum matches and nested array patterns.** `match x {}` on `Infallible`, a local
+  `enum Void {}`, `match *never {}`, or a defaulted `V = Infallible` variant is "non-exhaustive
+  patterns: `_` not covered" (14 files, 1 flip); `Some([a, b])` on `Option<[T; 2]>` and
+  `Ok([x])` on `<[_; 1]>::try_from(v)` are "`Some([])` not covered" (3 files, 2 flips; a bare
+  `[a, b]` match works). Probes `agentB/q1_infallible.rs`, `q3_array_pat.rs`,
+  `mine/m14_empty_enum_match.rs`. Importance: medium.
+- [ ] **Indexing user types and range values.** A user `impl Index<Range<usize>>` /
+  `Index<RangeFrom<usize>>` can't be used as `x[i..]`; a `Range` reaching `[..]` through a tuple
+  pattern, a `Vec<Range>` loop or `Range::from(..)` fails on `str` / `[u8]` (the message prints
+  the range as `std::slice::Iter<'_, usize>`); `impl<T, I: SliceIndex<[T]>> Index<I>` with
+  `type Output = I::Output` (smallvec, thin-vec, bumpalo); `Index<usize>` beside a generic
+  `Index<U>`; a generic `C: IndexMut<Ix>` bound. Probes `agentC/q16d_*.rs`, `q18b_*.rs`,
+  `q27_sliceindex.rs`, `q24_*.rs`, `q23_*.rs`. About 15 files, 1 flip. Importance: low to
+  medium.
+- [ ] **Tuple fields lose their type inside impls of some std traits.** In the body of an
+  `impl Deref` / `AsRef` / `AsMut` / `Borrow` / `Drop` / `DoubleEndedIterator` /
+  `ExactSizeIterator` / `IntoIterator` / `Hasher`, a tuple carried in a generic (`opt.unwrap().0`,
+  `.map(|p| p.0)`, even with `|p: (u8, u16)|`) is "fields of this type is not supported"; the same
+  code works in free fns, inherent impls and `Iterator` / `Clone` / `DerefMut` impls, and named
+  fields work everywhere. Probes `agentA/q2h_which_impls.rs`, `q14_unicase_deref.rs`. 8 files
+  (phf, syn, litemap, unicase), 2 flips. Importance: medium (it depends on the trait, not the
+  code, so it is hard for an author to understand).
+- [ ] **`#[cfg(..)]` is ignored on a block in tail position and on a `macro_rules!`
+  invocation.** `let x = { #[cfg(feature = "x")] { 5u8 } };` keeps the gated block (rustc: `()`),
+  and `#[cfg(feature = "x")] my_macro!(..)` expands anyway, which then shows up as a duplicate
+  definition. Probes `agentE/q8b_cfg_tail_expr.rs`, `q8_cfg_variant_field.rs`,
+  `agentB/c13_cfg_macro_invocation.rs`. 9 files, 3 flips (bitflags parser.rs, serde and
+  serde_core de/value.rs). Importance: medium.
+- [ ] **Inference shapes.** An `Option` passed as `impl IntoIterator` / `I: IntoIterator` (a Vec
+  is fine; 2 flips); `B: Into<Vec<u8>>` pins `B` to `Vec<u8>` and `T: AsRef<str>` pins `T` to
+  `String` instead of inferring from the argument; `map.get(q)` under `K: Borrow<Q>` with a `&Q`
+  (11 files, hashbrown/indexmap/serde_json); `Box::new(t)` to `Box<dyn Tr>` when `Tr` has a
+  blanket impl (3 files); a closure using `?` with no return annotation takes its error type from
+  the operand; unsuffixed integer locals default to `i32` before a later `with_capacity(c)` pins
+  them (1 flip); `.into()` whose target is only known later stays `String` (1 flip); `impl<A>
+  Tr1<A> for S where Self: Tr0<A>` forwarding (1 flip). Probes `agentE/q26*`, `q7*`, `q13*`,
+  `q17*`, `q20*`, `q4*`, `q28*`, `q22*`, `mine/m18_option_intoiter.rs`. About 20 files, 4 flips.
+  Importance: low to medium.
+- [ ] **`for<'a> fn(..)` pointer types** ("`for<'a> fn(&'a [u8]) -> ..` types are not
+  supported"), in struct fields, parameters and return types. Probe `mine/m2_hrtb_fnptr.rs`. 5
+  files (ring, bitvec, yoke), 2 flips. Importance: low.
+- [ ] **Smaller confirmed items.** `defmt::write!` (and `crate::write!`) is expanded as std's
+  `write!`, so defmt's `{=u8:02}` is an "invalid format string" (11 files, 6 flips; a
+  path-qualified macro from another crate should stay external). `for i in 0..$len { arr[i] =
+  .. }` inside a `macro_rules!` body is a parse error (`expected ;`; miniz_oxide; `{ x = i; }`
+  parses). Two `PartialEq` impls on one type (`PartialEq<str>` and `PartialEq<Self>`) type the
+  second's `rhs` as `&Self`. An inherent `as_ref` beside `impl AsRef<..>` is checked against the
+  trait's signature. A local type named `OsStr`, or a user fn named `Ok`, captures names inside
+  injected std code. The io prelude and the chrono_tz shim load on raw text, so a doc comment
+  mentioning `io::Write` or `chrono_tz` changes type checking (borsh nostd_io.rs; chrono-tz
+  timezones.rs, 553 errors). An unresolvable sibling operator impl (`impl Add<TimeDelta>` with
+  `TimeDelta` elsewhere) stops the resolvable `impl Add<Duration>` next to it from resolving
+  (every `X + Duration` error in chrono, jiff, time). `.min()` / `.max()` on an unknown value
+  resolves to `f64` and fans one upstream error into about 340 "expected `f64`" mismatches.
+  `str::from_utf8(..).unwrap()` is typed `String` (3 flips, base64) and `from_utf8_lossy` returns
+  `String` rather than `Cow<str>` (5 files). Probes `mine/m1`, `m3`, `m9b`, `m17`,
+  `agentC/q17d`, `q14_poison.rs`, `agentE/q19`, `q16`, `q6`, `q10f`, `q24c`, `q29`, `q21`.
+
+### Std surface (browser-feasible, by files)
+
+Not language features, but these block more files than most rows above.
+
+- [ ] **Integer and float methods:** `rotate_left` / `rotate_right`, `to_le` / `to_be`,
+  `div_ceil`, `overflowing_add` / `sub` / `mul` / `neg` / `shl`, `wrapping_shl`, `checked_shl` /
+  `checked_shr`, `checked_div_euclid` / `checked_rem_euclid`, `cast_signed` / `cast_unsigned`,
+  `next_multiple_of`, `reverse_bits`, `u8::eq_ignore_ascii_case`, `f32::to_le_bytes`,
+  `f64::classify` (and `FpCategory`). Probe `agentD/q1_int_methods.rs`. 80 files, 12 flips.
+- [ ] **Primitive methods called by path:** `u16::to_be_bytes(x)`, `u64::to_le_bytes(x)`,
+  `usize::max_value()`, `i128::max_value()`, `char::decode_utf16(..)`, `usize::rotate_left(x,
+  3)` ("cannot find function `u16::to_be_bytes`"; the method-call forms of `to_*_bytes` work).
+  Probe `agentD/q5_prim_path_calls.rs`. About 35 files, 4 flips. Until 2026-11-27 the classifier
+  filed these as external names, so they never showed in the counts.
+- [ ] **`VecDeque`, map, `Option` and `Result` methods:** `VecDeque::split_off` / `as_slices` /
+  `reserve_exact` / `capacity` / `resize`, `BTreeMap::get_key_value` / `remove_entry`,
+  `HashMap::get_key_value`, `Option::as_deref_mut`, `Result::or`, `Option::unwrap_or_default`
+  (through an unknown receiver). Probe `agentD/q2_std_coll_methods.rs`. 33 files, 2 flips.
+- [ ] **Std constructors and methods as function values:** `.map(Box::new)`,
+  `unwrap_or_else(String::new)`, `Vec::new`, `BTreeMap::new`, `VecDeque::new`, `Rc::new`,
+  `Ordering::reverse`, `Box::as_ref`, `Vec::as_slice` ("no variant or associated item named `new`
+  found for struct `Box`"; `String::len` works). Probe `agentD/q18_std_fn_values.rs`. 28 files, 4
+  flips.
+- [ ] **`String` / `str` methods:** `reserve`, `split_off`, `drain`, `match_indices`,
+  `replace_range`, `split_inclusive`, `retain`, `make_ascii_lowercase`, `split_ascii_whitespace`,
+  `encode_utf16`, `escape_debug` / `escape_default`, `into_boxed_bytes`, `String::from_utf16`.
+  Probe `agentD/q2_std_coll_methods.rs`. 27 files, 8 flips.
+- [ ] **Slice and `Vec` methods:** `split_at_checked` / `split_at_mut_checked`, `partition_point`,
+  `is_sorted_by` / `is_sorted_by_key`, `dedup_by`, `split(pred)`, `split_inclusive`,
+  `split_last_mut`, `try_reserve_exact`, `first_chunk_mut`, `chunks_exact(..).remainder()` (15
+  files on its own), `core::slice::from_ref`. 26 files, 2 flips.
+- [ ] **Missing `From` / `TryFrom` impls:** `Option<T>: From<T>`, `String` / `Vec<u8>` / `PathBuf`
+  from `Cow`, `Cow<Path>` from `PathBuf` / `&Path`, `Cell<T>: From<T>`, `char: From<u8>` through
+  `.into()` (`char::from` works), `u8: TryFrom<char>`, `u32: From<char>`, `String: From<char>`,
+  `Vec<T>` from `VecDeque<T>`; `u32::try_from(u32)` returns `TryFromIntError` where rustc has
+  `Infallible`. Messages print std types by their JS representation (`Cow<str>` as
+  `Cow<String>`, `Cell` as `RefCell`, `OsString` as `String`), which hides what is missing. Probes
+  `agentA/q7_std_from.rs`, `q8_cell_asref.rs`, `agentE/q23_*.rs`. 22 files, 1 flip.
+- [ ] **Smaller:** `.fmt(f)` on `&dyn Display` / `Box<dyn Error>` (2 flips), `downcast_ref` on
+  `dyn Error`, `Deref::deref(x)` by path (10 files, 6 flips, mostly cross-file), `try_into()` on a
+  slice inside `impl Hasher { fn write }` (the parameter arrives as `Vec<u8>`; 3 files),
+  `IntErrorKind`, `std::string::Drain`, `Pin::get_unchecked_mut`.
+
+### Survey tooling notes
+
+- 84.1% language-OK (4,684 of 5,568; the registry gained 140 files since 11-26). The std figure
+  fell from 72.5% to 71.5% because the classifier fixes below moved 63 files with primitive
+  path calls from "external names" to "std gap"; the uncategorized hits fell from 953 to 846. The flip counts above say what each fix buys in the corpus; the
+  shapes say what a script author hits.
+- Classifier blind spots fixed on 2026-11-27: `u16::to_be_bytes(x)` / `usize::max_value()` and
+  `T::SIZE` were filed as external names (`cannot find function`), as was a same-file
+  `Trait::method` used as a value; `matches!` and other macro arguments recorded no external
+  names (there are no path nodes inside a token tree), so about 96 files with cross-crate enum
+  patterns looked in-file; "defined multiple times" errors with no source position are the
+  bundled preludes (itertools, regex-automata, syn, proc-macro2) colliding with the crate they
+  emulate and are now filed as external. An unresolved `T::item` on a type parameter stays a
+  generic error, so the report decides from the signature whether its bound is from elsewhere
+  (filing it as a language gap moved 170 cross-file files into "generics in this position").
+- Still open in the survey itself: `cfg(feature = ..)` is off for every file (rustc too, so
+  the cfg'd `compile_error!` files are a feature artifact, not a gap); `TypeId::of::<T>()` /
+  `type_name::<T>()` (36 files) are by design.
+
 ## Known bugs
 
 Found in passing and not fixed yet (checked against the current tree, 2026-11-26). Gaps that are
 by design or long-standing differences from rustc are in `RUST_GAPS.md`.
 
-- [ ] `if let Some(n) = o.as_mut() { bump(n) }` (and `match o.as_mut() { Some(n) => bump(n), .. }`)
-  on a *local* `Option<i32>`: `n` reaches the `&mut i32` parameter as the bare number, so `bump`
-  writes `n[0]` on a number and throws `TypeError: Cannot create property '0' on number '5'`. The
-  same on a struct field (`s.t.as_mut()`) gets a `κσ.$cell` and works, and so do
-  `o.as_mut().map(bump)` and `*o.as_mut().unwrap() += 1`. Found 2026-11-26 while checking
-  FEATURES.md (the `ref mut` / `as_mut()` row).
-- [ ] `for x in &mut buf[..n] { *x = 1; }` (and `for x in &mut v[2..]`) writes into a copy: the
-  range lowers to `κσ.$slice(..)` rather than the view RUST_GAPS promises for `&mut v[a..b]`, so
-  `v` doesn't change. Indexed writes (`buf[i] = 1`) and `v[1..].iter_mut()` work. Found
-  2026-11-26 while testing `read_vectored`.
+None open.
 
 ## Risks
 

@@ -246,6 +246,7 @@ for await (const line of rl) {
     if (e.cat !== "GENERIC") continue;
     if (/^no rules of/.test(e.m)) continue;
     if (/defined multiple times|^duplicate definitions/.test(e.m) && e.node?.cfg) continue;
+    if (/defined multiple times|^duplicate definitions/.test(e.m) && !e.node) continue; // bundled-prelude collision (see the report)
     if (e.node?.feat && missing(e.node.feat)) continue;
     if (e.ext?.length || e.ctx_ext?.length || /\{unknown\}/.test(e.m)) continue;
     const old = `${e.why}  @ ${e.node ? e.node.feat || e.node.kinds[0] : "?"}`;

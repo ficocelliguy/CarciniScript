@@ -3592,7 +3592,15 @@ impl<'a> Codegen<'a> {
             }
             _ => source,
         };
+        // `for x in &mut v[a..b]`: loop over a view of that part of `v`, so writes reach `v`.
+        if by_mut_ref
+            && matches!(&inner, ast::Expr::RefExpr(_))
+            && matches!(&source, ast::Expr::IndexExpr(ix) if matches!(ix.index(), Some(ast::Expr::RangeExpr(_))))
+        {
+            self.slice_view = true;
+        }
         let (sf, st) = self.emit_expr(&source, None);
+        self.slice_view = false;
         let custom_iter =
             matches!(&st, Ty::Adt(n, _) if self.types.adts.iter_items.contains_key(n));
         // (`for x in &mut c` of your iterator loops over `c` itself, advancing it: not by index.)

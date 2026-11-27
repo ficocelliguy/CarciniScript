@@ -34,6 +34,9 @@ for (const line of fs.readFileSync(input, "utf8").split("\n").filter(Boolean)) {
     // a type the compiler couldn't resolve) is downstream of that name; one in a feature whose
     // probe fails is that feature's gap.
     if (/defined multiple times|^duplicate definitions/.test(e.m) && e.node?.cfg) { e.cat = "LANG"; e.why = "same item under alternative #[cfg]s"; }
+    // A duplicate with no source position is injected code: a bundled prelude (itertools, regex,
+    // syn, ..) compiled against the very crate it emulates.
+    else if (/defined multiple times|^duplicate definitions/.test(e.m) && !e.node) { e.cat = "EXT"; e.why = "collides with a bundled prelude of this crate"; }
     else if (e.node?.feat && missing(e.node.feat)) { e.cat = "LANG"; e.why = "feature: " + probes.get(e.node.feat).label; }
     else if (e.ext?.length || e.ctx_ext?.length || /\{unknown\}/.test(e.m)) { e.cat = "EXT"; e.why = "downstream of an external name"; }
   }
