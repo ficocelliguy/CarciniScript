@@ -21,6 +21,8 @@ const CONTROL_FLOW: &str = include_str!("control_flow_prelude.rs");
 const BOUND: &str = include_str!("bound_prelude.rs");
 const UNWIND: &str = include_str!("unwind_prelude.rs");
 const RANDOM_STATE: &str = include_str!("random_state_prelude.rs");
+const INT_ERROR_KIND: &str = include_str!("int_error_kind_prelude.rs");
+const FP_CATEGORY: &str = include_str!("fp_category_prelude.rs");
 /// `Cow<Path>` conversions, for a program with both the path and the Cow preludes. (`&Path` is
 /// a `PathBuf` too, so `Cow::from(&path)` is `Owned`.)
 const COW_PATH: &str = "// (cow path prelude)
@@ -122,6 +124,19 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
         && !declares(text, "RandomState")
     {
         out.push(RANDOM_STATE);
+    }
+    if crate::stdtime::has_word(text, "IntErrorKind")
+        && !text.contains("// (int error kind prelude)")
+        && !declares(text, "IntErrorKind")
+    {
+        out.push(INT_ERROR_KIND);
+    }
+    if (crate::stdtime::has_word(text, "FpCategory") || text.contains(".classify()")
+        || text.contains("::classify("))
+        && !text.contains("// (fp category prelude)")
+        && !declares(text, "FpCategory")
+    {
+        out.push(FP_CATEGORY);
     }
     out
 }

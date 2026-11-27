@@ -41,6 +41,10 @@ const BORROWCK: &[&str] = &[
 fn phase(d: &Diagnostic) -> (u8, u8) {
     match d.lint.as_deref() {
         Some("unused_imports" | "while_true" | "unused_parens" | "non_camel_case_types") => (0, 0),
+        // (A path's in the stability pass, items before the impls' and traits' functions; a
+        // method's or field's while type checking, after it.)
+        Some("deprecated") if d.message.starts_with("use of deprecated method") || d.message.starts_with("use of deprecated field") => (1, 3),
+        Some("deprecated") => (1, 1),
         Some("unreachable_code") => (2, 0),
         Some("unreachable_patterns") => (3, 0),
         Some("unused_mut") => (3, 2),
@@ -88,6 +92,17 @@ fn order(src: &str, diags: &mut Vec<Diagnostic>) {
             (usize::from(r.start()), usize::from(r.end()))
         })
         .collect();
+    // The functions of impls and traits.
+    let assoc: Vec<(usize, usize)> = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .filter(|f| f.syntax().parent().is_some_and(|p| p.kind() == ra_ap_syntax::SyntaxKind::ASSOC_ITEM_LIST))
+        .map(|f| {
+            let r = f.syntax().text_range();
+            (usize::from(r.start()), usize::from(r.end()))
+        })
+        .collect();
     let body = |at: usize| {
         fns.iter()
             .filter(|(s, e)| *s <= at && at < *e)
@@ -96,7 +111,10 @@ fn order(src: &str, diags: &mut Vec<Diagnostic>) {
             .unwrap_or(0)
     };
     diags.sort_by_cached_key(|d| {
-        let (p, step) = phase(d);
+        let (p, mut step) = phase(d);
+        if (p, step) == (1, 1) && assoc.iter().any(|(s, e)| *s <= d.start && d.start < *e) {
+            step = 2;
+        }
         let f = if p == 3 { body(d.start) } else { 0 };
         (p, f, step, d.start)
     });
@@ -108,7 +126,7 @@ fn lint_group(lint: &str) -> Option<&'static str> {
         "non_snake_case" | "non_camel_case_types" | "non_upper_case_globals" => {
             Some("nonstandard_style")
         }
-        "while_true" | "inexact_64bit" => None,
+        "while_true" | "inexact_64bit" | "deprecated" => None,
         _ => Some("unused"),
     }
 }

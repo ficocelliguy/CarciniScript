@@ -350,7 +350,16 @@ impl Flattener {
         }
         match m.uses.get(name) {
             Some(Target::Item(p, n)) => {
-                return self.lookup(p, n, depth + 1).or_else(|| Some(mangle(p, n)));
+                if let Some(x) = self.lookup(p, n, depth + 1) {
+                    return Some(x);
+                }
+                // `use prelude::Point;` with `mod prelude { pub use crate::geo::Point; }` (an
+                // item of a `mod` file, or of std): that `use` is hoisted out with the module's
+                // items, so the name alone is it.
+                if self.modules.get(p).is_some_and(|m| m.external.contains(n)) {
+                    return Some(n.clone());
+                }
+                return Some(mangle(p, n));
             }
             Some(Target::Module(_)) => return None,
             None => {}

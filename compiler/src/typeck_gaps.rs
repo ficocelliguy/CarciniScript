@@ -133,6 +133,15 @@ impl Checker<'_> {
             {
                 t
             }
+            // `Pin<&mut S>` / `Pin<Box<S>>` (erased) of a program that names `Pin`:
+            // `p.get_unchecked_mut()`, `b.as_mut()` and the like are the value.
+            (t @ Ty::Adt(..), m2)
+                if pin_identity(m2)
+                    && args.is_empty()
+                    && crate::stdtime::has_word(self.src, "Pin") =>
+            {
+                t
+            }
             (Ty::Future(t), "poll") => {
                 count(self, 1);
                 if let Some(a) = a0 {

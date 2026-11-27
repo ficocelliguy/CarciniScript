@@ -1235,12 +1235,12 @@
     }
     // A range value: `{:?}` (`0..5`, `1..=3`) and `==`. Another iterator shows what's left, as
     // `slice::Iter` does (`Iter([1, 2])`); like `$clone`, it reads the source once.
-    $dbg(f = rt.$dbg) {
+    $dbg(f = rt.$dbg, name = "Iter") {
       const r = this.it;
       if (!(r instanceof RangeIt)) {
         const all = Array.from(iterable(r));
         this.it = all[Symbol.iterator]();
-        return `Iter([${all.map((x) => f(x)).join(", ")}])`;
+        return `${name}([${all.map((x) => f(x)).join(", ")}])`;
       }
       return `${r.open ? "" : f(r.i)}${r.incl ? "..=" : ".."}${r.hi === null ? "" : f(r.hi)}`;
     }
@@ -1834,6 +1834,23 @@
       return this.error_len === null
         ? `incomplete utf-8 byte sequence from index ${this.valid_up_to}`
         : `invalid utf-8 sequence of ${this.error_len} bytes from index ${this.valid_up_to}`;
+    }
+  }
+
+  // `char::decode_utf16`'s error: the unpaired surrogate (`unpaired_surrogate()`).
+  class DecodeUtf16Error {
+    constructor(code) {
+      this.type = "DecodeUtf16Error";
+      this.code = code;
+    }
+    $eq(o) {
+      return this.code === o.code;
+    }
+    $dbg() {
+      return `DecodeUtf16Error { code: ${this.code} }`;
+    }
+    toString() {
+      return `unpaired surrogate found: ${this.code.toString(16)}`;
     }
   }
 
@@ -2624,6 +2641,13 @@
     },
     $isSignNegative(x) {
       return x < 0 || Object.is(x, -0);
+    },
+    // `x.classify()`: the `FpCategory` variant's name (`f32`: its own subnormal range).
+    $fpClass(x, f32) {
+      if (Number.isNaN(x)) return "Nan";
+      if (!Number.isFinite(x)) return "Infinite";
+      if (x === 0) return "Zero";
+      return Math.abs(x) < (f32 ? 1.1754943508222875e-38 : 2.2250738585072014e-308) ? "Subnormal" : "Normal";
     },
     $isNormal(x) {
       return Number.isFinite(x) && Math.abs(x) >= 2.2250738585072014e-308;
@@ -3840,6 +3864,8 @@
         set 1(v) {
           a[j] = v;
         },
+        // (What `$slotElem` looks for: a generic `IterMut`'s `{:?}` reads the element.)
+        $slot: true,
         // (`max()` / `min()` of slots compare the elements.)
         $cmp(o) {
           return cmp(a[j], o[1]);
@@ -3857,6 +3883,10 @@
       if (shape.o !== undefined) return x == null ? null : rt.$readSlots(x, shape.o);
       if (Array.isArray(shape)) return x.map((f, i) => (shape[i] ? rt.$readSlots(f, shape[i]) : f));
       return Array.from(x, (e) => rt.$readSlots(e, shape.e));
+    },
+    // An item of a `slice::IterMut` whose element type is generic: a slot's element, else itself.
+    $slotElem(x) {
+      return x !== null && typeof x === "object" && x.$slot === true ? x[1] : x;
     },
     // `v.iter_mut()` of numbers, strings or bools outside a loop by index: each item is a slot
     // whose `[1]` reads and writes the element.
@@ -4780,13 +4810,22 @@
     // (`owned`: `String::from_utf8`, whose error is a `FromUtf8Error` holding the bytes.)
     $fromUtf8(bytes, owned) {
       try {
-        return new Res(0, new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)));
+        return new Res(0, new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(bytes)));
       } catch {
         return new Res(1, new Utf8Error(bytes, owned));
       }
     },
     $fromUtf8Lossy(bytes) {
-      return new TextDecoder("utf-8").decode(Uint8Array.from(bytes));
+      return new TextDecoder("utf-8", { ignoreBOM: true }).decode(Uint8Array.from(bytes));
+    },
+    // `String::from_utf8_lossy` as a `Cow<str>`: `mk(owned, s)` builds `Owned` when a byte was replaced.
+    $fromUtf8LossyCow(bytes, mk) {
+      const u = Uint8Array.from(bytes);
+      try {
+        return mk(false, new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(u));
+      } catch {
+        return mk(true, new TextDecoder("utf-8", { ignoreBOM: true }).decode(u));
+      }
     },
     $parseFloat(s) {
       const err = (kind) => new Res(1, new ParseError("ParseFloatError", kind));
@@ -5271,6 +5310,40 @@
         first = false;
       }
       return out;
+    },
+    // `char::decode_utf16(units)`: `Ok` of each character, `Err` of each unpaired surrogate (a
+    // high one's next unit is read again).
+    $decodeUtf16(units) {
+      const it = rt.$iter(units)[Symbol.iterator]();
+      return Iter.of(function* () {
+        let held = null;
+        for (;;) {
+          let u;
+          if (held !== null) {
+            u = held;
+            held = null;
+          } else {
+            const r = it.next();
+            if (r.done) return;
+            u = r.value;
+          }
+          if (u < 0xd800 || u > 0xdfff) yield new Res(0, String.fromCharCode(u));
+          else if (u >= 0xdc00) yield new Res(1, new DecodeUtf16Error(u));
+          else {
+            const r = it.next();
+            if (r.done) {
+              yield new Res(1, new DecodeUtf16Error(u));
+              return;
+            }
+            const lo = r.value;
+            if (lo >= 0xdc00 && lo <= 0xdfff) yield new Res(0, String.fromCharCode(u, lo));
+            else {
+              held = lo;
+              yield new Res(1, new DecodeUtf16Error(u));
+            }
+          }
+        }
+      });
     },
     // `String::from_utf16(&units)`: an error on a lone surrogate.
     $fromUtf16(units) {

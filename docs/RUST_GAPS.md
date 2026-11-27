@@ -413,7 +413,7 @@ There is one JS thread, and scripts share it with the game.
 - **Warnings rustc gives that are missing.** The lints lean towards silence, so a warning may be
   missing but one rustc doesn't give shouldn't appear. Not given: a tuple struct's field never
   read, a trait's method never used, `unused_macros`, `unused_labels`, `unused_braces`,
-  `unused_doc_comments`, `deprecated`, and the other lints `lints.rs` doesn't list. Dead code
+  `unused_doc_comments`, and the other lints `lints.rs` doesn't list. Dead code
   goes by name: a function, method or field is used when anything live uses one of that name
   (a field read through a value of unknown type counts for every struct). A module file's
   `pub` items are never reported (they may be used by the script's other files), and a test
@@ -423,7 +423,10 @@ There is one JS thread, and scripts share it with the game.
   unreachable pattern is found when one earlier arm covers it or the earlier arms cover every
   variant of an `Option`, `Result`, `bool` or the file's enum; overlapping ranges, slices and
   arms with `..` in a tuple aren't compared. `unused_must_use` knows `Result`, `write!`, the
-  iterator adapters and futures, not `#[must_use]` functions.
+  iterator adapters, futures and the file's own `#[must_use]` items, and `deprecated` the file's
+  own `#[deprecated]` items, found by name: a name declared twice, or a value whose type shares
+  its name with another crate's (`::other::Tool`), doesn't warn, nor a call inside a block's
+  tail (`{ calc() };`) or a deprecated variant's fields in a pattern.
 - **Messages rustc never gives.** What this compiler doesn't support is an error with a plain
   message (`the standard library type `UnsafeCell<i32>` is not supported`); rustc would compile
   it. The editor's `help` says why.
@@ -500,8 +503,9 @@ There is one JS thread, and scripts share it with the game.
 - **`peek` works on any iterator**, not only one from `peekable()`: the lookahead is added on the
   first `peek` / `next_if`. Cloning an iterator collects what's left (so the two go on
   independently, as in Rust).
-- **`{:?}` of any shared iterator is `slice::Iter`'s** (`Iter([2, 3])`, what's left): Rust
-  writes each iterator its own way (`IntoIter([..])`, `Chars(['a'])`, `Map { iter: Iter([..]) }`).
+- **`{:?}` of any shared iterator is `slice::Iter`'s** (`Iter([2, 3])`, what's left), and of any
+  mutable one `IterMut`'s: Rust writes each iterator its own way (`IntoIter([..])`, `Chars(['a'])`,
+  `Map { iter: Iter([..]) }`, `Enumerate { iter: IterMut([..]), count: 0 }`).
   Like cloning, it collects what's left, so an endless iterator never finishes printing.
 - **`size_hint()` on std's iterators is exact** (what's left is counted, through a copy): Rust
   gives `(0, Some(n))` after a `filter`. A custom iterator's comes from its own `size_hint`, or

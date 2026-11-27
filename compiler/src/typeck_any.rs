@@ -289,13 +289,17 @@ impl Checker<'_> {
             }
             return Some(Ty::Str);
         }
+        // (`dyn Error` has the same three, and `is`.)
+        let dyn_ty = self.shallow(rt);
+        let is_error = matches!(&dyn_ty, Ty::Dyn(t, _) if t.split('+').next() == Some("Error"));
+        let is_any = is_any || is_error;
         if !is_any {
             return None;
         }
         let ret = |t: Ty| match method {
             "is" => Ty::Bool,
             "downcast_ref" | "downcast_mut" => Ty::Option(Box::new(t)),
-            _ => Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into(), Vec::new()))),
+            _ => Ty::Result(Box::new(t), Box::new(dyn_ty.clone())),
         };
         if !matches!(method, "is" | "downcast_ref" | "downcast_mut" | "downcast") {
             return None;

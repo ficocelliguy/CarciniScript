@@ -489,6 +489,11 @@ impl Checker<'_> {
                 count(self, 0);
                 Ty::Bool
             }
+            // (The fp category prelude's `FpCategory`.)
+            (Ty::Float { .. }, "classify") if self.adts.defs.contains_key("FpCategory") => {
+                count(self, 0);
+                Ty::Adt("FpCategory".into(), Vec::new())
+            }
             (Ty::Float { f32 }, "total_cmp") => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -686,6 +691,20 @@ impl Checker<'_> {
                 }
                 Ty::Char
             }
+            // `char::decode_utf16(units)`: an iterator of `Result<char, DecodeUtf16Error>`.
+            ["char", "decode_utf16"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::IntoIter(Box::new(Ty::Int(IntKind::U16))));
+                }
+                Ty::Iter {
+                    elem: Box::new(Ty::Result(
+                        Box::new(Ty::Char),
+                        Box::new(Ty::Extern("DecodeUtf16Error".into())),
+                    )),
+                    mutable: false,
+                }
+            }
             ["char", "from"] => {
                 count(self, 1);
                 if let Some(a) = a0 {
@@ -727,12 +746,18 @@ impl Checker<'_> {
                     Ty::Str
                 }
             }
+            // (A `Cow<str>` where the program has `Cow`, to match on or name; a `String`
+            // otherwise, which every use of one through `Deref` accepts.)
             ["String", "from_utf8_lossy"] => {
                 count(self, 1);
                 if let Some(a) = a0 {
                     self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
                 }
-                Ty::Str
+                if self.adts.defs.contains_key("Cow") {
+                    Ty::Adt("Cow".into(), vec![Ty::Str])
+                } else {
+                    Ty::Str
+                }
             }
             // (Valid UTF-8 is the caller's promise; invalid bytes decode as `from_utf8_lossy`.)
             ["str" | "String", "from_utf8_unchecked"] => {

@@ -664,6 +664,9 @@ pub fn std_const(tail: &[&str]) -> Option<(&'static str, Ty)> {
     if let ["fmt", "Error"] = tail {
         return Some(("κσ.$fmtError", Ty::Extern("fmt::Error".into())));
     }
+    if let ["char", "REPLACEMENT_CHARACTER"] = tail {
+        return Some(("\"\\u{fffd}\"", Ty::Char));
+    }
     if let [ty_name, konst] = tail {
         if let Ty::Int(k) = Ty::from_name(ty_name) {
             // `i128` / `u128` are BigInts; the 64-bit kinds are JS numbers, so their `MIN` /

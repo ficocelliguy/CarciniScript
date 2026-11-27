@@ -137,6 +137,13 @@ impl Codegen<'_> {
             // ---- Futures (`Pin` is erased): `fut.as_mut()`, and `fut.poll(cx)` on an async fn's
             // future (a promise) or a hand-written one passed as an `F: Future`.
             (Ty::Future(_), m2) if crate::typeck::pin_identity(m2) && args.is_empty() => rf.clone(),
+            (Ty::Adt(n, _), m2)
+                if crate::typeck::pin_identity(m2)
+                    && args.is_empty()
+                    && self.types.adts.method(n, m2).is_none() =>
+            {
+                rf.clone()
+            }
             (Ty::Future(_), "poll") => {
                 let cx = self.gap_arg(a0);
                 helper(

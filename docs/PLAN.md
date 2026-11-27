@@ -209,7 +209,8 @@ from another file or crate, not on a language feature; the language gaps left ar
 from the feature chart" below.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
-`set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
+`set_len`) beyond the ones planned in "Gaps from the feature chart", casts between pointer types
+or to and from integers, `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
 proc-macro API outside a proc-macro crate, `asm!`, `is_x86_feature_detected!`. JS values have no
 memory layout. Also not planned: `super::` at the top of a module file (each file compiles on its
 own, and a `#[path]` file can have several parents; `#[path]` covers the shared-folder layout,
@@ -269,35 +270,68 @@ node's `--cpu-prof`, which keeps the wasm's function names.
 What FEATURES.md still marks ⬜ or calls out as missing, each confirmed against the current tree
 with a small probe, in order of how often a script would hit it.
 
-- [ ] **`Into<String>` from a `char`.** `fn f(s: impl Into<String>)` given `'c'` is "mismatched
-  types", and `let s: String = 'x'.into()` is "the trait bound `String: From<char>` is not
-  satisfied"; `&str` and `String` sources work. Audit the other std `From` impls that aren't the
-  identity at the same time. Estimate: 1–2 hours in the std `From` table. Importance: medium.
-- [ ] **Re-exporting a `mod` file's item from an inline module.** `mod prelude { pub use
-  crate::geo::Point; }` then `use prelude::Point;` fails with "cannot find struct
-  `prelude__Point`": the flattener renames the `use` target instead of resolving it to
-  `geo::Point`. Estimate: 2–3 hours in `modflat`. Importance: medium (the `prelude` module idiom).
+"Corpus" on each item estimates how many of the 5,568 registry files it touches (2026-11-27
+survey, `f758cc2`). It comes from the survey's error messages plus source patterns over the same
+files (comments and strings stripped; `gapscan.mjs` and `msgq.mjs` in the 2026-11-27 session
+scratchpad). Most of these items skip a check rather than reject a program, so they can't fail a
+survey file; for those the count is files using the construct, and none would flip.
+
+- [ ] **A `char` passed to an `impl Into<String>` parameter.** `fn f(s: impl Into<String>)`
+  given `'c'` is "mismatched types"; `&str` and `String` arguments work, and so do `let s: String
+  = 'x'.into()` and `u8::try_from(c)` (fixed with the std `From` / `TryFrom` impls in `2ada847`).
+  Estimate: 1 hour where an `impl Into<X>` argument is checked. Importance: low to medium.
+  Corpus: 0–1 files. Only smol_str's tests turn a char literal into a `String`, and 20 files
+  take `impl Into<String>` (an upper bound).
 - [ ] **tokio: `time::interval`, `sync::oneshot`, `broadcast`, `watch`, `Notify`, and
   `#[tokio::test]`.** None are in `tokio_prelude.rs`; `oneshot` and `interval` are what a script
   reaches for, and the test build skips `#[tokio::test]` functions. Estimate: half a day for the
   primitives (the prelude already has timers and queues), 1 hour for `#[tokio::test]` (a `#[test]`
   whose body is awaited). Importance: medium.
-- [ ] **`#[must_use]` and `#[deprecated]` on the program's own items.** `calc();` with
-  `#[must_use] fn calc()` (or a `#[must_use]` struct) doesn't warn `unused_must_use`, and calling
-  a `#[deprecated]` function doesn't warn `deprecated`; std's `Result`, `write!` and the iterator
-  adapters do warn. Estimate: 1–2 hours in `lints.rs`. Importance: low to medium.
+  Corpus: about 1 file (webpki-roots' `#[tokio::test]`); the registry has no tokio sources, and
+  futures-util's 3 `oneshot` files use futures' own channel.
 - [ ] **Proc-macro API edges.** `syn::Expr` / `syn::Type` matched as enums (they are token lists
   here), `Span` values beyond `call_site()`, `ParseStream::step` / `cursor`. Estimate: 1 day for a
   token-list-backed `Expr` enum with the common variants; the rest as needed. Importance: low.
+  Corpus: about 50 files (proc-macro crates and syn itself): 37 match `Expr::` / `Type::`
+  variants, 12 use `Span` beyond `call_site()`, 6 use `step` / `cursor`. None fail on it in the
+  survey, since `syn` names count as another crate there (133 files report `Expr` / `Type` as
+  unresolved).
 - [ ] **Smaller checks the compiler skips:** `pub(in crate::..)` visibility (the `super` forms are
   checked); `T::Error` of a `TryFrom<X>` bound; `#[cfg(..)]` on an element inside a macro's
   arguments (`vec![#[cfg(..)] x]`); exhaustiveness of a `match` on an enum from another crate.
   Each an hour or two. Importance: low (none changes what runs).
+  Corpus (none fail, as the checks are skipped): `pub(in ..)` 31 files (mostly ring); `T::Error`
+  of a `TryFrom` bound 2 (http `header/map.rs`, serde_json issue845); `#[cfg]` on a `vec!`
+  element 3, about 20 counting `assert_eq!` / `format!` / `concat!` arguments (cfg'd items
+  passed to the program's own `macro_rules!` work); a `match` on an enum from outside the file
+  roughly 640 by a pattern proxy (arms naming a non-std enum the file doesn't define), an upper
+  bound on the matches that would go unchecked.
 - [ ] **`js` crate:** `requestIdleCallback` / `cancelIdleCallback`, and `crypto.subtle.digest` as
   an `async fn` returning `Vec<u8>`. Estimate: 1 hour in `bindings/js.rs`. Importance: low.
-- [ ] **Raw pointers to numbers in struct fields or as return values, and `as_mut()` on one.**
-  Errors today, where the local and collection cases work. Estimate: half a day. Importance: low,
-  next to the not-planned pointer arithmetic.
+  Corpus: 0 files (no web-sys / js-sys caller of either).
+- [ ] **Raw pointers to numbers, strings or bools in struct fields and return values, and
+  `as_mut()` on one.** A pointer to one of these is already a cell (`[0]` / `[1]` read and write
+  it, `$cell` / `$placeSlot` in `rt.js`), the object `&mut i32` fields and `-> &mut i32` returns
+  use (`mut_ref_fields`, `fixtures/mut_prim_refs.rs`); the two cases are refused on purpose
+  (`typeck_adt.rs`, "in a struct", and `typeck.rs`, "returning"). Plan:
+  1. Fields: drop the error and treat a `*mut T` / `*const T` field of a cellable `T` like a
+     `&mut T` field: it holds the cell, `*s.p` reads and writes `[0]`, `ptr::null_mut()` is
+     `null`, a copy shares the cell (Rust's aliasing).
+  2. Returns: `-> *mut i32` returns the cell, as `-> &mut i32` does.
+  3. `p.as_mut()` / `as_ref()` on one: the cell as the `&mut` / `&` (`None` for null), so `if let
+     Some(n) = p.as_mut() { *n += 1 }` writes through.
+  4. Sources: besides locals, `&mut s.field as *mut _` and `&mut v[i] as *mut _` (the slot code
+     beside the "here" / "from here" errors in `typeck_ptr.rs`), and `Box::into_raw(Box::new(5))`
+     as a fresh cell.
+  5. A differential fixture (`fixtures/ptr_prim_fields.rs`) covering each, plus FEATURES.md's
+     raw-pointer row.
+  Optional later: arithmetic inside one buffer. A slot is already (array, index), so `p.add(n)` /
+  `sub` / `offset` make a slot at index + n, `offset_from` subtracts indexes, and `as_ptr()` /
+  `as_mut_ptr()` of a Vec or slice is the slot at 0, with `read` / `write` bounds-checked. About
+  1–2 days more. Casts between pointee types, integer/pointer casts and `transmute` stay not
+  planned. Estimate: half a day for 1–5. Importance: low. Corpus: 136 files with these errors
+  (115 "in a struct", 29 "from here", 8 "returning"), 0 flips: each also casts pointers or hits
+  another gap.
 
 ## Corpus gaps by files affected (2026-11-27)
 
@@ -350,14 +384,12 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   `.fmt(f)` / `.len()` through a std supertrait of a same-file trait. Probes in `agentD/q6*`,
   `q9*`, `q10*`, `q12*`, `q15*`, `q19*`, `q20*` and `agentC/q15`, `q19`–`q22`. About 30 files, 8
   flips. Importance: medium; each shape is small, the family is large.
-- [ ] **Derives over std types.** `#[derive(Debug)]` with a `std::slice::IterMut` field (10
-  files, 2 flips); a field whose type parameter is bounded by an `Fn` trait blocks `Debug` /
-  `Clone` / `Copy` (6 files); `TypeId` and `NonZero<char>` fields are not `Copy` (they map to
-  `String`); `Option<Box<dyn Any>>` has no `Debug`. (`#[cfg_attr(not(feature = "x"),
-  derive(..))]` applies since 2026-11-27, with features off, as rustc builds a lone file; a
-  `cfg_attr` under `feature = "serde"` or `docsrs` is dropped. `fixtures/cfg_attr_derives.rs`.)
-  Probes `agentB/q28_itermut_debug.rs`, `q25_drainfilter_debug.rs`, `q23_typeid_copy.rs`.
-  About 18 files, 3 flips. Importance: medium.
+- [ ] **Derives over std types: `NonZero<char>` fields are not `Copy`** (it maps to `String`). The
+  rest of the row landed 2026-11-27 (`fixtures/derive_std_fields.rs`): `slice::IterMut` fields
+  (and `Enumerate` of one) derive `Debug`, a field typed by an `Fn`-bounded parameter leaves the
+  derive bounded on it, `TypeId` fields are `Copy` / `Hash` / `Ord`, `dyn Any` is `Debug`; and
+  `#[cfg_attr(not(feature = "x"), derive(..))]` applies, with features off, as rustc builds a lone
+  file (`fixtures/cfg_attr_derives.rs`). A file or two. Importance: low.
 - [ ] **Indexing user types and range values.** A user `impl Index<Range<usize>>` /
   `Index<RangeFrom<usize>>` can't be used as `x[i..]`; a `Range` reaching `[..]` through a tuple
   pattern, a `Vec<Range>` loop or `Range::from(..)` fails on `str` / `[u8]` (the message prints
@@ -366,8 +398,7 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   `Index<U>`; a generic `C: IndexMut<Ix>` bound. Probes `agentC/q16d_*.rs`, `q18b_*.rs`,
   `q27_sliceindex.rs`, `q24_*.rs`, `q23_*.rs`. About 15 files, 1 flip. Importance: low to
   medium.
-- [ ] **Inference shapes.** An `Option` passed as `impl IntoIterator` / `I: IntoIterator` (a Vec
-  is fine; 2 flips); `B: Into<Vec<u8>>` pins `B` to `Vec<u8>` and `T: AsRef<str>` pins `T` to
+- [ ] **Inference shapes.** `B: Into<Vec<u8>>` pins `B` to `Vec<u8>` and `T: AsRef<str>` pins `T` to
   `String` instead of inferring from the argument; `map.get(q)` under `K: Borrow<Q>` with a `&Q`
   (11 files, hashbrown/indexmap/serde_json); `Box::new(t)` to `Box<dyn Tr>` when `Tr` has a
   blanket impl (3 files); a closure using `?` with no return annotation takes its error type from
@@ -375,11 +406,9 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   them (1 flip); `.into()` whose target is only known later stays `String` (1 flip); `impl<A>
   Tr1<A> for S where Self: Tr0<A>` forwarding (1 flip); `o.unwrap_or_default()` on an `Option`
   whose type isn't known yet. Probes `agentE/q26*`, `q7*`, `q13*`, `q17*`, `q20*`, `q4*`, `q28*`,
-  `q22*`, `mine/m18_option_intoiter.rs`. About 20 files, 4 flips.
+  `q22*`. About 18 files, 2 flips (an `Option` as `impl IntoIterator`, the other 2, landed
+  2026-11-27: `fixtures/option_into_iter_args.rs`).
   Importance: low to medium.
-- [ ] **`for<'a> fn(..)` pointer types** ("`for<'a> fn(&'a [u8]) -> ..` types are not
-  supported"), in struct fields, parameters and return types. Probe `mine/m2_hrtb_fnptr.rs`. 5
-  files (ring, bitvec, yoke), 2 flips. Importance: low.
 - [ ] **Smaller confirmed items.** `for i in 0..$len { arr[i] = .. }` inside a
   `macro_rules!` body is a parse error (`expected ;`; miniz_oxide; `{ x = i; }` parses).
   Two `PartialEq` impls on one type (`PartialEq<str>` and `PartialEq<Self>`) type the second's
@@ -387,31 +416,10 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   signature. A local type named `OsStr`, or a user fn named `Ok`, captures names inside
   injected std code. The io prelude and the chrono_tz shim load on raw text, so a doc comment
   mentioning `io::Write` or `chrono_tz` changes type checking (borsh nostd_io.rs; chrono-tz
-  timezones.rs, 553 errors). An unresolvable sibling operator impl (`impl Add<TimeDelta>` with
-  `TimeDelta` elsewhere) stops the resolvable `impl Add<Duration>` next to it from resolving
-  (every `X + Duration` error in chrono, jiff, time). `.min()` / `.max()` on an unknown value
+  timezones.rs, 553 errors). `.min()` / `.max()` on an unknown value
   resolves to `f64` and fans one upstream error into about 340 "expected `f64`" mismatches.
-  `str::from_utf8(..).unwrap()` is typed `String` (3 flips, base64) and `from_utf8_lossy` returns
-  `String` rather than `Cow<str>` (5 files). Probes `mine/m3`, `m9b`, `m17`,
-  `agentC/q17d`, `q14_poison.rs`, `agentE/q19`, `q16`, `q6`, `q10f`, `q24c`, `q29`, `q21`.
-
-### Std surface (browser-feasible, by files)
-
-Not language features, but these block more files than most rows above.
-
-- [ ] **`f64::classify` and `FpCategory`**, and **`char::decode_utf16(..)`** (an iterator of
-  `Result<char, DecodeUtf16Error>`). The rest of the integer-method row landed 2026-11-27
-  (`fixtures/int_bit_methods.rs`): `rotate_left` / `rotate_right`, `to_le` / `to_be` /
-  `swap_bytes`, `div_ceil`, `next_multiple_of`, `overflowing_*`, `wrapping_shl` / `shr`,
-  `checked_shl` / `shr`, `checked_div_euclid` / `checked_rem_euclid`, `cast_signed` /
-  `cast_unsigned`, `reverse_bits`, `u8::eq_ignore_ascii_case`, `f32` / `f64` byte conversions,
-  also on `u128` / `i128`; and by path: `u16::to_be_bytes(x)`, `usize::rotate_left(x, 3)`,
-  `usize::max_value()` / `min_value()` (the constants), `char::from_u32_unchecked`. Probes
-  `agentD/q1_int_methods.rs`, `q5_prim_path_calls.rs`. A few files each.
-- [ ] **Smaller:** `.fmt(f)` on `&dyn Display` / `Box<dyn Error>` (2 flips), `downcast_ref` on
-  `dyn Error`, `Deref::deref(x)` by path (10 files, 6 flips, mostly cross-file), `try_into()` on a
-  slice inside `impl Hasher { fn write }` (the parameter arrives as `Vec<u8>`; 3 files),
-  `IntErrorKind`, `std::string::Drain`, `Pin::get_unchecked_mut`.
+  Probes `mine/m3`, `m9b`, `agentC/q17d`, `agentE/q19`, `q16`, `q6`, `q10f`,
+  `q24c`.
 
 ### Survey tooling notes
 
@@ -441,6 +449,10 @@ by design or long-standing differences from rustc are in `RUST_GAPS.md`.
   `impl Borrow<str> for W` is "the standard library function `Borrow::<str>::borrow` is not
   supported" (rustc accepts it); `let b: &str = w.borrow();` works. Found 2026-11-27 writing
   `fixtures/std_impl_bodies.rs`.
+- [ ] **`Cow<str>` against a `&str`.** `let t: &str = &c;` with `c: Cow<str>` is "expected `&str`,
+  found `Cow<String>`" (as an argument `&c` works), and `c == "x"` is "expected `Cow<String>`,
+  found `&str`" (std has `impl PartialEq<&str> for Cow<str>`). Found 2026-11-27 writing
+  `fixtures/utf8_str_cow.rs`.
 
 ## Risks
 

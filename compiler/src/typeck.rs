@@ -148,6 +148,9 @@ pub struct Types {
     /// Values of your own iterator type given where an `I: Iterator` / `impl Iterator` is
     /// expected (`total(Count { n: 0 })`): the runtime's iterator over it (`κσ.$iterOf`).
     pub iter_of_args: std::collections::HashSet<(usize, usize)>,
+    /// `Option` values given where an `impl IntoIterator<Item = T>` is expected (`extend_all(v, o)`):
+    /// iterated as zero or one items (`κσ.$optIter`), since `Some(x)` is `x` at run time.
+    pub opt_iter_args: std::collections::HashSet<(usize, usize)>,
     /// Bindings (by name range) that a mutation needed declared `mut`: an assignment, a `&mut`
     /// borrow or a `&mut self` method call rooted at them (rustc's `unused_mut` reads it).
     pub mut_roots: std::collections::HashSet<(usize, usize)>,
@@ -445,6 +448,7 @@ impl<'a> Checker<'a> {
             fn_ptr_fields: Default::default(),
             array_reads: Default::default(),
             iter_of_args: Default::default(),
+            opt_iter_args: Default::default(),
             mut_roots: Default::default(),
             cell_returns: Default::default(),
             index_places: Default::default(),
@@ -875,6 +879,7 @@ pub fn check(
             mut_ref_loops,
             array_reads,
             iter_of_args,
+            opt_iter_args: std::mem::take(&mut c.opt_iter_args),
             mut_roots: std::mem::take(&mut c.mut_roots),
             cell_returns,
             index_places,
@@ -1080,6 +1085,7 @@ struct Checker<'a> {
     pub(super) fn_ptr_fields: std::collections::HashSet<(String, String)>,
     array_reads: std::collections::HashSet<(usize, usize)>,
     iter_of_args: std::collections::HashSet<(usize, usize)>,
+    opt_iter_args: std::collections::HashSet<(usize, usize)>,
     mut_roots: std::collections::HashSet<(usize, usize)>,
     cell_returns: std::collections::HashSet<(usize, usize)>,
     index_places: std::collections::HashSet<(usize, usize)>,
@@ -1850,6 +1856,21 @@ impl<'a> Checker<'a> {
             self.error(n, msg);
             return;
         }
+        // An `Option` (or `&Option`) as an `impl IntoIterator<Item = T>`: zero or one items.
+        if let (Ty::IntoIter(e), Ty::Option(x)) = (self.shallow(expected), self.shallow(found)) {
+            if self.unify(&x, &e) {
+                let r = self.range(n);
+                self.opt_iter_args.insert(r);
+            } else {
+                let msg = format!(
+                    "mismatched types: expected `{}`, found `{}`",
+                    self.describe(expected),
+                    self.describe(found)
+                );
+                self.error(n, msg);
+            }
+            return;
+        }
         self.note_iter_of(n, found, expected);
         if !self.unify(found, expected) && !self.iface_coerces(found, expected) {
             let hint = match (self.shallow(expected), self.var_kind(found)) {
@@ -1919,6 +1940,8 @@ impl<'a> Checker<'a> {
             ast::Type::RefType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::PtrType(r) => r.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::ParenType(p) => p.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
+            // `for<'a> fn(&'a [u8]) -> &'a u8`: lifetimes are erased, so the pointer type itself.
+            ast::Type::ForType(f) => f.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
             ast::Type::TupleType(tt) if tt.fields().next().is_none() => Ty::Unit,
             ast::Type::TupleType(tt) => {
                 Ty::Tuple(tt.fields().map(|t| self.lower_type(&t)).collect())
@@ -7349,6 +7372,15 @@ impl<'a> Checker<'a> {
         method: &str,
         args: &[ast::Expr],
     ) -> Ty {
+        // `e.kind()` on a `ParseIntError`: the int error kind prelude's `IntErrorKind`.
+        if name == "ParseIntError" && method == "kind" && self.adts.defs.contains_key("IntErrorKind") {
+            self.arg_count(m.syntax(), "method", 0, args.len());
+            return Ty::Adt("IntErrorKind".into(), Vec::new());
+        }
+        if name == "DecodeUtf16Error" && method == "unpaired_surrogate" {
+            self.arg_count(m.syntax(), "method", 0, args.len());
+            return Ty::Int(IntKind::U16);
+        }
         let b = self.bindings.clone();
         let loose = |c: &mut Self| {
             for a in args {
@@ -10036,7 +10068,7 @@ impl Checker<'_> {
             // `{}` of `c.to_uppercase()`: its chars.
             Ty::Iter { elem, .. } if !debug && self.shallow(elem) == Ty::Char => false,
             // `{:?}` of a slice iterator: what's left (`Iter([1, 2])`).
-            Ty::Iter { mutable: false, elem } if debug => self.lacks_fmt(&self.shallow(elem), true),
+            Ty::Iter { elem, .. } if debug => self.lacks_fmt(&self.shallow(elem), true),
             Ty::Iter { .. } | Ty::Future(_) | Ty::Fn => true,
             Ty::Range(..) => !debug,
             Ty::Extern(_) => !debug,
@@ -12448,6 +12480,15 @@ impl Checker<'_> {
                 match args.as_slice() {
                     [t] => iter(t.clone(), false),
                     [k, v] => iter(Ty::Tuple(vec![k.clone(), v.clone()]), false),
+                    // (`string::Drain<'_>`: the chars taken out.)
+                    [] if name == "Drain"
+                        && seg
+                            .and_then(|s| s.parent_path().qualifier())
+                            .and_then(|q| q.segment())
+                            .is_some_and(|s| s.syntax().text() == "string") =>
+                    {
+                        iter(Ty::Char, false)
+                    }
                     _ => return None,
                 }
             }
@@ -12582,6 +12623,7 @@ pub(super) fn written_owned(t: &ast::Type) -> bool {
             | ast::Type::ImplTraitType(_)
             | ast::Type::DynTraitType(_)
             | ast::Type::FnPtrType(_)
+            | ast::Type::ForType(_)
             | ast::Type::InferType(_)
     ) {
         return false;

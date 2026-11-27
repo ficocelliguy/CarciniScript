@@ -1635,6 +1635,15 @@ impl Checker<'_> {
                 self.record_ext(m.syntax(), &key);
                 sig.ret
             }
+            // `self.0.fmt(f)` on a `dyn Display` / `dyn Debug` / `dyn Error` (or a trait with one as a
+            // supertrait): the value formatted with `f`'s spec.
+            _ if method == "fmt"
+                && args.len() == 1
+                && ["Display", "Debug"].iter().any(|t| self.implements(&Ty::Dyn(tr.to_string(), Vec::new()), t)) =>
+            {
+                self.check(&args[0], &Ty::Formatter);
+                super::gaps::fmt_result()
+            }
             // `ToString` through `Display` (a supertrait, or `impl Display for Box<dyn Tr>`).
             _ if method == "to_string"
                 && args.is_empty()

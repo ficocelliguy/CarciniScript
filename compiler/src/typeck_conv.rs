@@ -82,6 +82,12 @@ pub(super) fn expr_ref_hint(e: &ast::Expr) -> Option<ArgRef> {
                 return None;
             };
             let f = p.path()?.segment()?.name_ref()?;
+            // (`str::from_utf8(b)` borrows `b`: a `&str`, where `String::from_utf8(v)` owns.)
+            if f.text().starts_with("from_utf8")
+                && p.path()?.qualifier().and_then(|q| q.segment()?.name_ref()).is_some_and(|q| q.text() == "str")
+            {
+                return Some(ArgRef::Slice);
+            }
             matches!(
                 f.text().to_string().as_str(),
                 "from" | "new" | "with_capacity" | "from_utf8" | "from_utf8_lossy"
@@ -1536,6 +1542,14 @@ impl Checker<'_> {
                 .iter()
                 .filter(|i| self.iface_coerces(&rt, &i.rhs))
                 .collect();
+        }
+        // `impl Add<TimeDelta> for T` with `TimeDelta` from another file (an unknown operand)
+        // next to `impl Add<Duration> for T`: a `T + Duration` takes the impl that names it.
+        if fits.len() > 1
+            && !matches!(self.shallow(&rt), Ty::Unknown)
+            && fits.iter().any(|i| !matches!(self.shallow(&i.rhs), Ty::Unknown))
+        {
+            fits.retain(|i| !matches!(self.shallow(&i.rhs), Ty::Unknown));
         }
         // References are erased, so `impl Add for V` and `impl Add<&V> for &V` (or `Add<&V>
         // for V`) are the same operation here: the first one serves.

@@ -387,7 +387,10 @@ impl<'a> Env<'a> {
                     self.mark_variance(&inner, inv, def, inv_l, inv_t);
                 }
             }
-            ast::Type::FnPtrType(_) | ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_) => {
+            ast::Type::FnPtrType(_)
+            | ast::Type::ForType(_)
+            | ast::Type::ImplTraitType(_)
+            | ast::Type::DynTraitType(_) => {
                 // Function types are contravariant in their arguments: treat every lifetime and
                 // parameter they name as invariant.
                 for n in t.syntax().descendants_with_tokens() {

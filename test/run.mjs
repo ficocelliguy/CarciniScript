@@ -1461,6 +1461,24 @@ for (const [label, files, want] of rejectedFiles) {
     fail(name, `want: ${want}\ngot:\n${msgs.join("\n") || "(no diagnostics)"}`);
   } else pass(name);
 }
+// An operator impl whose operand type can't be resolved (`TimeDelta` from another crate) leaves
+// its resolvable siblings usable: only the unresolved name is an error.
+{
+  const name = "rejects only the unknown operand of a sibling operator impl";
+  const src = [
+    "use std::time::Duration;",
+    "#[derive(Clone, Copy)]",
+    "pub struct Ts(u64);",
+    "impl std::ops::Add<TimeDelta> for Ts { type Output = Ts; fn add(self, _r: TimeDelta) -> Ts { self } }",
+    "impl std::ops::Add<Duration> for Ts { type Output = Ts; fn add(self, r: Duration) -> Ts { Ts(self.0 + r.as_secs()) } }",
+    "impl std::ops::AddAssign<Duration> for Ts { fn add_assign(&mut self, rhs: Duration) { *self = *self + rhs; } }",
+    "fn main() { let t = Ts(1) + Duration::from_secs(2); println!(\"{}\", t.0); }",
+    "",
+  ].join("\n");
+  const msgs = compile(src, "ops.rs").diagnostics.filter((d) => d.severity === "error").map((d) => `${d.line}:${d.column} ${oneLine(d)}`);
+  if (!msgs.length || msgs.some((m) => !m.includes("cannot find type `TimeDelta`"))) fail(name, msgs.join("\n") || "(no diagnostics)");
+  else pass(name);
+}
 
 // --- language service: hover and completions (no NS bindings needed for these)
 {

@@ -636,6 +636,7 @@ pub fn impl_self_name(imp: &ast::Impl) -> Option<String> {
         // `impl Tr for fn() -> i32`: a function pointer's impls (any signature) are one class, found
         // by `typeof x === "function"`.
         ast::Type::FnPtrType(_) => Some("FnPtr".into()),
+        ast::Type::ForType(f) if matches!(f.ty(), Some(ast::Type::FnPtrType(_))) => Some("FnPtr".into()),
         _ => None,
     }
 }

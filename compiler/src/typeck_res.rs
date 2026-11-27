@@ -59,6 +59,7 @@ pub fn is_std_error(name: &str) -> bool {
             | "TryReserveError"
             | "Utf8Error"
             | "FromUtf16Error"
+            | "DecodeUtf16Error"
             | "BorrowError"
             | "BorrowMutError"
             | "serde_json::Error"

@@ -1215,6 +1215,7 @@ impl Checker<'_> {
             {
                 continue;
             }
+            let written = written_field_types(node);
             // Derived impls require the trait of the type parameters (`impl<T: Clone> Clone for ..`),
             // so a field of type `T` is fine.
             let unknowns: HashMap<String, Ty> = def
@@ -1248,9 +1249,21 @@ impl Checker<'_> {
                         && self
                             .fn_ptr_fields
                             .contains(&(v.name.clone(), f.name.clone()));
+                    let wt = written.get(&(v.name.clone(), f.name.clone()));
+                    // `pred: F` with `F: FnMut(..)`: the derived impl is bounded `F: Debug` (as
+                    // for any parameter), so the derive itself stands, whatever `F` lowers to.
+                    let bare_param = wt.is_some_and(|t| {
+                        bare_path_name(t).is_some_and(|n| def.type_params.contains(&n))
+                    });
+                    // `std::any::TypeId` (a string in JS) is `Copy`, `Hash` and `Ord`.
+                    let type_id = d != "Default"
+                        && wt.and_then(bare_path_name).as_deref() == Some("TypeId")
+                        && !self.adts.defs.contains_key("TypeId");
                     if !copy_array
                         && !shared_ref
                         && !fn_ptr
+                        && !bare_param
+                        && !type_id
                         && !rc
                         && !param_array
                         && !self.implements(&subst(&f.ty, &unknowns), d)
@@ -1376,14 +1389,16 @@ impl Checker<'_> {
             }
             // (An iterator clones what's left: `κσ.Iter.$clone`.)
             Ty::Iter { mutable: false, .. } if t == "Clone" => true,
-            // (`{:?}` shows what's left, as `slice::Iter` does: `Iter([1, 2])`.)
-            Ty::Iter { mutable: false, elem } if t == "Debug" => self.implements(elem, t),
+            // (`{:?}` shows what's left, as `slice::Iter` and `IterMut` do: `Iter([1, 2])`.)
+            Ty::Iter { elem, .. } if t == "Debug" => self.implements(elem, t),
             Ty::Closure { .. } | Ty::Iter { .. } | Ty::Future(_) | Ty::Entry(..) => false,
             Ty::Param(n) => self.param_has(n, t),
             // (`std::error::Error`'s supertraits: `Box<dyn Error>` fields derive `Debug`.)
             Ty::Dyn(tr, _) if tr == "Error" && !self.adts.traits.contains_key("Error") => {
                 matches!(t, "Debug" | "Display" | "Error")
             }
+            // (`dyn Any` is `Debug`: `Any { .. }`.)
+            Ty::Dyn(tr, _) if tr == "Any" && !self.adts.traits.contains_key("Any") => t == "Debug",
             // (Or `impl Clone for Box<dyn Tr>`.)
             Ty::Dyn(tr, _) => {
                 self.trait_includes(tr, t)
@@ -3696,6 +3711,7 @@ fn shared_ref_type(t: &ast::Type) -> bool {
 fn fn_ptr_type(t: &ast::Type) -> bool {
     match t {
         ast::Type::FnPtrType(_) => true,
+        ast::Type::ForType(f) => f.ty().is_some_and(|t| fn_ptr_type(&t)),
         ast::Type::ParenType(p) => p.ty().is_some_and(|t| fn_ptr_type(&t)),
         ast::Type::PathType(p) => p
             .path()
@@ -4047,4 +4063,51 @@ pub(super) fn join_or(items: &[String]) -> String {
         [one] => one.clone(),
         [init @ .., last] => format!("{} or {last}", init.join(", ")),
     }
+}
+
+/// The written type of each field of a struct or enum, by (variant, field) as `lower_variant`
+/// names them (a struct's one variant is the struct's name; tuple fields are `0`, `1`, ..).
+fn written_field_types(node: &SyntaxNode) -> HashMap<(String, String), ast::Type> {
+    let mut out = HashMap::new();
+    let mut add = |variant: String, fields: Option<ast::FieldList>| match fields {
+        Some(ast::FieldList::RecordFieldList(l)) => {
+            for f in l.fields() {
+                if let (Some(n), Some(t)) = (f.name(), f.ty()) {
+                    out.insert((variant.clone(), n.text().to_string()), t);
+                }
+            }
+        }
+        Some(ast::FieldList::TupleFieldList(l)) => {
+            for (i, f) in l.fields().enumerate() {
+                if let Some(t) = f.ty() {
+                    out.insert((variant.clone(), i.to_string()), t);
+                }
+            }
+        }
+        None => {}
+    };
+    if let Some(s) = ast::Struct::cast(node.clone()) {
+        if let Some(n) = s.name() {
+            add(n.text().to_string(), s.field_list());
+        }
+    } else if let Some(e) = ast::Enum::cast(node.clone()) {
+        for v in e.variant_list().into_iter().flat_map(|l| l.variants()) {
+            if let Some(n) = v.name() {
+                add(n.text().to_string(), v.field_list());
+            }
+        }
+    }
+    out
+}
+
+/// `F` or `std::any::TypeId`: the last segment's name of a path type with no generic arguments.
+fn bare_path_name(t: &ast::Type) -> Option<String> {
+    let ast::Type::PathType(p) = t else {
+        return None;
+    };
+    let seg = p.path()?.segment()?;
+    if seg.generic_arg_list().is_some() {
+        return None;
+    }
+    Some(seg.name_ref()?.text().to_string())
 }

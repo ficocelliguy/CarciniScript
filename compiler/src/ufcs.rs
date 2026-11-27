@@ -20,7 +20,7 @@ const PRIMS: &[&str] = &[
 /// Other types and std traits whose methods are named by path (`Vec::len`,
 /// `std::error::Error::source`); their receivers' types aren't written into the closures.
 const OTHERS: &[&str] = &[
-    "Vec", "Option", "Result", "Into", "From", "Clone", "ToString", "Error",
+    "Vec", "Option", "Result", "Into", "From", "Clone", "ToString", "Error", "Deref", "DerefMut",
 ];
 
 /// The `std::ops` / `std::cmp` traits whose methods are an operator: `Add::add(a, b)`,
@@ -69,7 +69,8 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
         ("From", "from") => return Some(0),
         ("Into", "into") | ("Clone", "clone") | ("ToString", "to_string") => return Some(0),
         ("Error", "source" | "description") => return Some(0),
-        ("Vec" | "Option" | "Result" | "Into" | "From" | "Clone" | "ToString" | "Error", _) => {
+        ("Deref", "deref") | ("DerefMut", "deref_mut") => return Some(0),
+        ("Vec" | "Option" | "Result" | "Into" | "From" | "Clone" | "ToString" | "Error" | "Deref" | "DerefMut", _) => {
             return None;
         }
         // `u64::from_str(s)` is `s.parse::<u64>()`, see `emitted`.
@@ -104,7 +105,7 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
                 | "exp2" | "exp_m1" | "ln" | "ln_1p" | "log10" | "log2" | "sin" | "cos" | "tan"
                 | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
                 | "atanh" | "recip" | "to_radians" | "to_degrees" | "is_nan" | "is_finite"
-                | "is_infinite" | "is_sign_negative" | "is_sign_positive" | "to_bits" => 0,
+                | "is_infinite" | "is_sign_negative" | "is_sign_positive" | "to_bits" | "classify" => 0,
                 "powi" | "powf" | "atan2" | "hypot" | "copysign" | "log" | "total_cmp" => 1,
                 "mul_add" => 2,
                 _ => return None,
@@ -590,6 +591,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                             | "clone"
                             | "string"
                             | "result"
+                            | "ops"
                     )
             };
             loop {
@@ -868,6 +870,23 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
         if let Some(a) = as_at {
             // (In a macro's tokens `::` is two `:`.)
             let kc = if at(c + 1) == "::" { c + 2 } else { c + 3 };
+            // `<W as Clone>::clone(&w)`, `<W as Deref>::deref(&w)`: a std trait whose methods are
+            // the receiver's (`expand` writes `Clone::clone(&w)` as `(w).clone()`), so the path
+            // from the trait on.
+            let tr = (a + 1..c).filter(|&k| toks[k].kind() == SyntaxKind::IDENT).last();
+            if let Some(t) = tr
+                && matches!(at(t), "Clone" | "ToString" | "Deref" | "DerefMut")
+                && t + 1 == c
+                && (a + 1..t).all(|k| matches!(at(k), "std" | "core" | "alloc" | "ops" | "clone" | "string" | "::" | ":"))
+                && colons(c + 1)
+                && toks.get(kc).is_some_and(|t| t.kind() == SyntaxKind::IDENT)
+                && at(kc + 1) == "("
+            {
+                edits.push((start(i), end(a), String::new()));
+                edits.push((start(c), end(c), String::new()));
+                i = c + 1;
+                continue;
+            }
             let konst = at(kc);
             let const_like = colons(c + 1)
                 && toks.get(kc).is_some_and(|t| t.kind() == SyntaxKind::IDENT)

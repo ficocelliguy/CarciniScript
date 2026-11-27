@@ -1778,6 +1778,8 @@ impl<'a> Codegen<'a> {
         }
         // (Each item starts from the globals: its names are undone after it.)
         self.name_log.clear();
+        // The names `pub use` exported (one each: a prelude's re-export may repeat one).
+        let mut exported: std::collections::HashSet<String> = Default::default();
         for item in crate::adt::all_items(file) {
             match &item {
                 ast::Item::Fn(f) => {
@@ -1882,6 +1884,9 @@ impl<'a> Codegen<'a> {
                             }
                             _ => continue,
                         };
+                        if !exported.insert(line.split(" from ").next().unwrap_or_default().to_string()) {
+                            continue;
+                        }
                         self.line(Frag::mapped(self.item_start(u.syntax()), line));
                     }
                 }
@@ -3755,6 +3760,18 @@ impl<'a> Codegen<'a> {
                 mutable: false,
             };
             return (f.at(start), it);
+        }
+        // An `Option` as an `impl IntoIterator`: an iterator of zero or one items.
+        if self.types.opt_iter_args.contains(&r) {
+            let elem = match ty.view() {
+                Ty::Option(e) => *e,
+                _ => Ty::Unknown,
+            };
+            let it = Ty::Iter {
+                elem: Box::new(elem),
+                mutable: false,
+            };
+            return (frag.wrap("κσ.$optIter(", ")").at(start), it);
         }
         // A slot-valued argument (`bump(s.at(0))`) to a `&mut i32` parameter: as a cell.
         if self.types.slot_cell_args.contains(&r) {
@@ -7689,6 +7706,21 @@ impl<'a> Codegen<'a> {
             f.push(if object { ")" } else { ", undefined)" });
             return (f, Ty::Unit);
         }
+        // `e.kind()` on a `ParseIntError`: its kind's variant by name (`IntErrorKind.Empty`).
+        if matches!(&rt, Ty::Extern(n) if n == "ParseIntError")
+            && method == "kind"
+            && self.types.adts.defs.contains_key("IntErrorKind")
+        {
+            let mut f = Frag::mapped(self.off(name.syntax()), format!("{}[", self.class("IntErrorKind")));
+            f.append(rf.clone()).push(".kind]");
+            return (f, Ty::Adt("IntErrorKind".into(), Vec::new()));
+        }
+        // `e.unpaired_surrogate()` on a `DecodeUtf16Error`: the unit it holds.
+        if matches!(&rt, Ty::Extern(n) if n == "DecodeUtf16Error") && method == "unpaired_surrogate" {
+            let mut f = rf.clone();
+            f.push(".code");
+            return (f, Ty::Int(IntKind::U16));
+        }
         if let Ty::Extern(type_name) = &rt {
             let b = bindings::current();
             let sig = b
@@ -7884,6 +7916,19 @@ impl<'a> Codegen<'a> {
                 _ => self.dyn_call(m, &rf, &method, name_off),
             };
             return (f, ret);
+        }
+        // `self.0.fmt(f)` on a `dyn Display` / `dyn Error` (no trait method of that name): the
+        // value formatted with `f`'s spec, as through a type parameter.
+        if let Ty::Dyn(tr, _) = &rt
+            && method == "fmt"
+            && args_len(m) == 1
+            && !self.types.adts.traits.get(tr).is_some_and(|t| t.methods.iter().any(|x| x.name == "fmt"))
+            && let Some(a) = m.arg_list().and_then(|a| a.args().next())
+        {
+            let arg = self.emit_expr(&a, None).0;
+            let debug = crate::typeck::delegated_fmt_is_debug(m.syntax(), true, true);
+            let f = self.fmt_delegate(rf.clone(), &rt, arg, debug);
+            return (f, self.ty_of(m.syntax()).unwrap_or(Ty::Unknown));
         }
         if let Ty::Dyn(_, _) = &rt {
             // `dyn Trait`: dynamic dispatch.
@@ -10557,11 +10602,26 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
         Ty::Dyn(tr, _) if let Some(m) = dyn_fmt(tr, true) => {
             Some(format!("((v) => κσ.$fmtVia(v, {m}))"))
         }
+        // `Box<dyn Any>`: rustc prints no contents.
+        Ty::Dyn(tr, _) if tr == "Any" => Some("(() => \"Any { .. }\")".into()),
         // (A `Box<dyn Error>` may hold a string, whose `{:?}` is quoted.)
         Ty::Dyn(_, _) => Some("κσ.$dbgAny".into()),
         Ty::Ordering => Some("κσ.$dbgOrdering".into()),
         // (A `fn(..)` pointer field: an address, as rustc prints it; see `{:p}`.)
         Ty::Closure { .. } => Some("((f) => κσ.$fmtPtr(f))".into()),
+        // `slice::IterMut`: what's left; over numbers, strings and bools its items are slots.
+        Ty::Iter { elem, mutable: true } => {
+            let inner = debug_fn(elem).unwrap_or_else(|| "String".into());
+            let inner = if crate::typeck::ptr_cellable(elem) {
+                format!("((s) => {inner}(s[1]))")
+            } else if matches!(elem.as_ref(), Ty::Param(_) | Ty::Unknown) {
+                // (A generic element may be a number behind a slot or an object.)
+                format!("((s) => {inner}(κσ.$slotElem(s)))")
+            } else {
+                inner
+            };
+            Some(format!("((r) => r.$dbg({inner}, \"IterMut\"))"))
+        }
         // (Only a range value is `Debug`: `0..5`.)
         Ty::Iter { elem, .. } | Ty::Range(elem, _) => {
             let inner = debug_fn(elem).unwrap_or_else(|| "String".into());

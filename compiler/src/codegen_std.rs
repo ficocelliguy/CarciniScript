@@ -595,6 +595,12 @@ impl Codegen<'_> {
             }
             (Ty::Float { .. }, "is_infinite") => rf.clone().wrap("(Math.abs(", ") === Infinity)"),
             (Ty::Float { .. }, "is_normal") => helper("isNormal", vec![]),
+            // `x.classify()`: the variant the runtime names (`FpCategory["Normal"]`).
+            (Ty::Float { f32 }, "classify") if self.types.adts.defs.contains_key("FpCategory") => {
+                let mut f = Frag::text(format!("{}[", self.class("FpCategory")));
+                f.append(helper("fpClass", vec![Frag::text(f32.to_string())])).push("]");
+                f
+            }
 
             // ---- Vec
             (Ty::Vec(_), "binary_search") => {
@@ -716,6 +722,10 @@ impl Codegen<'_> {
                 let n = emit(self, 0);
                 call("fromU32", vec![n])
             }
+            ["char", "decode_utf16"] => {
+                let u = emit(self, 0);
+                call("decodeUtf16", vec![u])
+            }
             ["char", "from_u32_unchecked"] => {
                 let n = emit(self, 0);
                 Frag::mapped(start, "String.fromCodePoint(")
@@ -770,7 +780,16 @@ impl Codegen<'_> {
             }
             ["String", "from_utf8_lossy"] => {
                 let b = emit(self, 0);
-                call("fromUtf8Lossy", vec![b])
+                if self.types.adts.defs.contains_key("Cow") {
+                    // (As the checker types it.) `Cow::Borrowed` when the bytes were valid UTF-8.
+                    let w = self.dict_of(&Ty::Str);
+                    let mk = Frag::text(format!(
+                        "(o, s) => o ? Cow.Owned(s, {w}) : Cow.Borrowed(s, {w})"
+                    ));
+                    call("fromUtf8LossyCow", vec![b, mk])
+                } else {
+                    call("fromUtf8Lossy", vec![b])
+                }
             }
             ["str" | "String", "from_utf8_unchecked"] => {
                 let b = emit(self, 0);

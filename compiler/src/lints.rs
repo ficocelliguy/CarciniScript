@@ -1,6 +1,6 @@
 //! rustc's warnings: the lints a Rust user sees from `cargo build` (`unused_variables`,
 //! `unused_mut`, `unused_imports`, `dead_code`, `unused_assignments`, `unused_must_use`,
-//! `unreachable_code`, `unreachable_patterns`, the naming lints, `unused_parens`, `while_true`),
+//! `unreachable_code`, `unreachable_patterns`, the naming lints, `unused_parens`, `while_true`, `deprecated`),
 //! plus `inexact_64bit`, which is this compiler's own: 64-bit integers are exact to 2^53 here.
 //!
 //! They read the file as written (not the expanded text the checker sees), so their positions
@@ -26,6 +26,8 @@ use crate::ty::{IntKind, Ty};
 
 type Range = (usize, usize);
 
+mod own_attrs;
+
 /// What the lints need from the rest of the compile.
 pub struct Cx<'a> {
     /// The checker's types, by range in the text it checked (`map` takes source offsets there).
@@ -48,6 +50,7 @@ pub fn check(src: &str, cx: &Cx) -> Vec<Diagnostic> {
         out: Vec::new(),
         own_mut_methods: HashSet::new(),
         never_fns: HashSet::new(),
+        own: Default::default(),
     };
     l.run();
     l.out
@@ -69,7 +72,7 @@ fn group_of(lint: &str) -> Option<&'static str> {
         "non_snake_case" | "non_camel_case_types" | "non_upper_case_globals" => {
             Some("nonstandard_style")
         }
-        "while_true" | "inexact_64bit" => None,
+        "while_true" | "inexact_64bit" | "deprecated" => None,
         _ => Some("unused"),
     }
 }
@@ -95,10 +98,13 @@ struct Linter<'a> {
     own_mut_methods: HashSet<String>,
     /// The file's functions declared `-> !`.
     never_fns: HashSet<String>,
+    /// The file's own `#[deprecated]` and `#[must_use]` items.
+    own: own_attrs::Own,
 }
 
 impl<'a> Linter<'a> {
     fn run(&mut self) {
+        self.own = own_attrs::Own::collect(self);
         for f in self.file.syntax().descendants().filter_map(ast::Fn::cast) {
             let Some(name) = f.name().map(|n| n.text().to_string()) else { continue };
             if f.param_list().and_then(|p| p.self_param()).is_some_and(|s| {
@@ -116,6 +122,7 @@ impl<'a> Linter<'a> {
         self.unused_imports();
         self.while_true();
         self.unused_parens();
+        self.deprecated();
         self.camel_case();
         self.unreachable_code();
         self.unreachable_patterns();
@@ -2127,7 +2134,7 @@ struct DeadItem {
 
 /// Attributes that don't make an item used by something rustc can't see.
 const PLAIN_ATTRS: &[&str] = &[
-    "doc", "allow", "warn", "deny", "forbid", "expect", "cfg", "derive", "inline", "must_use",
+    "doc", "allow", "warn", "deny", "forbid", "expect", "cfg", "derive", "inline", "must_use", "deprecated",
     "rustfmt", "cold", "track_caller", "non_exhaustive", "repr", "default",
 ];
 
@@ -2857,30 +2864,33 @@ impl Linter<'_> {
             }
             let Some(e) = es.expr() else { continue };
             let r = range(e.syntax());
-            let (what, note) = match &e {
+            let (msg, note): (String, Option<String>) = match &e {
                 ast::Expr::MacroExpr(m) => {
                     let name = m.macro_call().and_then(|mc| crate::macros::macro_name(&mc)).unwrap_or_default();
                     if !matches!(name.as_str(), "write" | "writeln") {
                         continue;
                     }
-                    ("Result".to_string(), "this `Result` may be an `Err` variant, which should be handled")
+                    ("unused `Result` that must be used".to_string(), Some("this `Result` may be an `Err` variant, which should be handled".to_string()))
                 }
                 ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_) => match self.ty(r) {
                     Some(Ty::Result(..)) => {
-                        ("Result".to_string(), "this `Result` may be an `Err` variant, which should be handled")
+                        ("unused `Result` that must be used".to_string(), Some("this `Result` may be an `Err` variant, which should be handled".to_string()))
                     }
                     Some(Ty::Iter { .. }) => {
                         let ast::Expr::MethodCallExpr(m) = &e else { continue };
                         let name = m.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
                         let Some((_, adapter)) = ADAPTERS.iter().find(|(a, _)| *a == name) else { continue };
-                        (adapter.to_string(), "iterators are lazy and do nothing unless consumed")
+                        (format!("unused `{adapter}` that must be used"), Some("iterators are lazy and do nothing unless consumed".to_string()))
                     }
-                    _ => continue,
+                    _ => match self.own_must_use(&e) {
+                        Some(x) => x,
+                        None => continue,
+                    },
                 },
                 _ => continue,
             };
-            let mut d = self.diag(r.0, r.1, format!("unused `{what}` that must be used"));
-            d.notes.push(note.into());
+            let mut d = self.diag(r.0, r.1, msg);
+            d.notes.extend(note);
             d.children.push(self.edit_child("use `let _ = ...` to ignore the resulting value", &[(r.0, r.0, "let _ = ")]));
             found.push(d);
         }
@@ -2997,6 +3007,7 @@ pub fn adopt(src: &str, diags: &mut Vec<Diagnostic>) {
         out: Vec::new(),
         own_mut_methods: HashSet::new(),
         never_fns: HashSet::new(),
+        own: Default::default(),
     };
     diags.retain_mut(|d| {
         let lint = match d.message.as_str() {
