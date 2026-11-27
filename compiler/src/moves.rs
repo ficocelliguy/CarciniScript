@@ -393,7 +393,7 @@ impl Walker<'_> {
             | Ty::Map(..)
             | Ty::Coll(..)
             | Ty::RefCell(_)
-            | Ty::Dyn(_)
+            | Ty::Dyn(_, _)
             | Ty::Iter { .. } => true,
             Ty::Adt(n, _) => self.adts.defs.get(n).is_some_and(|d| !d.derives("Copy")),
             Ty::Option(x) => self.moves(x),

@@ -908,6 +908,8 @@ const rejected = [
   ["assign to immutable", "let x = 1;\n    x = 2;", "3:5 cannot assign twice to immutable variable `x`"],
   ["one trait for one tuple type twice", "}\ntrait K { fn k(&self) -> u8; }\nimpl K for (u8, u8) { fn k(&self) -> u8 { 1 } }\nimpl K for (u8, u8) { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `(u8, u8)`"],
   ["one trait for a generic tuple and a concrete one", "}\ntrait K { fn k(&self) -> u8; }\nimpl<A, B> K for (A, B) { fn k(&self) -> u8 { 1 } }\nimpl K for (u8, String) { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `(u8, String)`"],
+  // (Beside `impl<T: K> K for [T]` it would be fine: `u8` doesn't implement `K`.)
+  ["one trait for an unbounded generic slice and `[u8]`", "}\ntrait K { fn k(&self) -> u8; }\nimpl<T> K for [T] { fn k(&self) -> u8 { 1 } }\nimpl K for [u8] { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `Vec`"],
   ["unsupported construct", "let v = vec![1];\n    let r = v.as_ptr();", "3:15 no method named `as_ptr` found for struct `Vec<{integer}>` in the current scope: method not found in `Vec<{integer}>`"],
   ["an unknown type", "let x: Foo = 1;", "2:12 cannot find type `Foo` in this scope"],
   ["a misspelled type", "}\nstruct Stack { n: i32 }\nfn f() {\n    let s: Stak = Stack { n: 1 };", "5:12 cannot find type `Stak` in this scope: not found in this scope (a struct with a similar name exists: `Stack`)"],
@@ -1301,9 +1303,9 @@ for (const [label, body, want, wantHelp] of rejected) {
 // Modules: each case is a set of files; the first is compiled.
 const rejectedFiles = [
   [
-    "a generic trait implemented twice, called through a type parameter",
-    { "main.rs": "trait Conv<T> {\n    fn conv(&self) -> T;\n}\nimpl Conv<u8> for u32 {\n    fn conv(&self) -> u8 {\n        1\n    }\n}\nimpl Conv<u16> for u32 {\n    fn conv(&self) -> u16 {\n        2\n    }\n}\nfn go<X: Conv<u16>>(x: X) -> u16 {\n    x.conv()\n}\nfn main() {\n    println!(\"{}\", go(5u32));\n}\n" },
-    "15:5 `conv` comes from a generic trait implemented more than once for one type",
+    "a call through two bounds of one generic trait that fits neither",
+    { "main.rs": "trait Conv<T> {\n    fn conv(&self) -> T;\n}\nimpl Conv<u8> for u32 {\n    fn conv(&self) -> u8 {\n        1\n    }\n}\nimpl Conv<u16> for u32 {\n    fn conv(&self) -> u16 {\n        2\n    }\n}\nfn go<X: Conv<u8> + Conv<u16>>(x: X) -> u32 {\n    x.conv()\n}\nfn main() {\n    println!(\"{}\", go(5u32));\n}\n" },
+    "15:7 the trait bound `X: Conv<u32>` is not satisfied",
   ],
   [
     "importing a missing item through a nested module file",

@@ -2069,7 +2069,7 @@ impl Linter<'_> {
         }
         Some(match t {
             Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Unit | Ty::Never => false,
-            Ty::Vec(_) | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) | Ty::Dyn(_) | Ty::RefCell(_) => true,
+            Ty::Vec(_) | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) | Ty::Dyn(_, _) | Ty::RefCell(_) => true,
             // (Inside another type, more likely a `String` than a `&str`.)
             Ty::Str if depth > 0 => true,
             Ty::Option(x) => self.needs_drop(x, depth + 1)?,

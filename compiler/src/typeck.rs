@@ -392,6 +392,7 @@ impl<'a> Checker<'a> {
             pending_parses: Vec::new(),
             pending_defaults: Vec::new(),
             missing_steps: std::cell::Cell::new(0),
+            std_array_dims: HashMap::new(),
             crate_uses: Default::default(),
             consts: HashMap::new(),
             const_vals: HashMap::new(),
@@ -523,6 +524,8 @@ impl<'a> Checker<'a> {
             assoc_output: None,
             impl_assoc: HashMap::new(),
             param_trait_args: HashMap::new(),
+            param_trait_alts: HashMap::new(),
+            pending_bound_picks: Vec::new(),
             op_args: HashMap::new(),
             cmp_args: HashMap::new(),
             lenient_projs: Default::default(),
@@ -611,7 +614,7 @@ impl<'a> Checker<'a> {
                     .map(|pl| pl.params().map(|p| p.ty().as_ref().and_then(written_ref)).collect())
                     .unwrap_or_default();
                 let ret_owned = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| {
-                    written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown)
+                    written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Unknown)
                 });
                 let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| written_mut_ref(&t));
                 let ret_slot = self.ret_slot_kind(f, &ret);
@@ -960,6 +963,9 @@ struct Checker<'a> {
     pending_defaults: Vec<(Ty, SyntaxNode)>,
     /// Work done by the current exhaustiveness check.
     missing_steps: std::cell::Cell<usize>,
+    /// Arrays of known length that std methods return (`x.to_le_bytes()`), by the call's range:
+    /// their dimensions, for `let [a, b] = ..` refutability.
+    std_array_dims: HashMap<ra_ap_syntax::TextRange, Vec<usize>>,
     /// `uses_crate`'s answers, by crate name (the source doesn't change during a check).
     crate_uses: std::cell::RefCell<HashMap<String, bool>>,
     /// `const` and `static` items.
@@ -1214,6 +1220,12 @@ struct Checker<'a> {
     pub(super) impl_assoc: HashMap<String, Ty>,
     /// Each type parameter's user-trait bounds with their arguments: (positional, `Unit = X`).
     pub(super) param_trait_args: HashMap<String, BoundArgs>,
+    /// A type parameter bounded by one generic trait more than once (`C: Conv<u8> + Conv<u16>`):
+    /// each bound's positional arguments, by (parameter, trait). `param_trait_args` keeps one.
+    pub(super) param_trait_alts: HashMap<(String, String), Vec<Vec<Ty>>>,
+    /// Calls through such a parameter: `C: Conv` (for the message), the trait arguments' variables, each bound's arguments
+    /// and the call, settled once the body is checked (`resolve_bound_picks`).
+    pub(super) pending_bound_picks: Vec<(String, Vec<Ty>, Vec<Vec<Ty>>, SyntaxNode)>,
     /// The right-hand sides of std operator bounds, by (parameter, trait): `L: Add<R>` is
     /// (`L`, `Add`) → `R`.
     pub(super) op_args: HashMap<(String, String), Ty>,
@@ -1277,6 +1289,22 @@ impl<'a> Checker<'a> {
             self.base + usize::from(r.start()),
             self.base + usize::from(r.end()),
         )
+    }
+
+    /// The `fn` `n` is in, also for a node of a macro's re-parsed arguments (`format!("{}",
+    /// m.scale(r))`), found in the file by its offset.
+    pub(super) fn enclosing_fn(&self, n: &SyntaxNode) -> Option<ast::Fn> {
+        if let Some(f) = n.ancestors().find_map(ast::Fn::cast) {
+            return Some(f);
+        }
+        let at = ra_ap_syntax::TextSize::try_from(self.range(n).0).ok()?;
+        self.root_file
+            .as_ref()?
+            .syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .filter(|f| f.syntax().text_range().contains(at))
+            .last()
     }
 
     /// An endless loop that never yields: in Bitburner, the game freezes.
@@ -1481,6 +1509,7 @@ impl<'a> Checker<'a> {
             Ty::RefCell(t) => Ty::RefCell(Box::new(self.zonk(&t))),
             Ty::MutRef(t) => Ty::MutRef(Box::new(self.zonk(&t))),
             Ty::Adt(n, args) => Ty::Adt(n, args.iter().map(|a| self.zonk(a)).collect()),
+            Ty::Dyn(n, args) => Ty::Dyn(n, args.iter().map(|a| self.zonk(a)).collect()),
             Ty::Result(t, e) => Ty::Result(Box::new(self.zonk(&t)), Box::new(self.zonk(&e))),
             Ty::Closure { params, ret } => Ty::Closure {
                 params: params.iter().map(|p| self.zonk(p)).collect(),
@@ -1595,18 +1624,18 @@ impl<'a> Checker<'a> {
             (Ty::Var(v), t) | (t, Ty::Var(v)) if self.occurs(*v, t) => true,
             // An unsuffixed literal into a `dyn Trait` (`Box::new(10.0)`, `&123` as `&dyn Any`):
             // rustc's fallback type, `f64` or `i32`.
-            (Ty::Var(v), Ty::Dyn(tr)) | (Ty::Dyn(tr), Ty::Var(v)) => {
+            (Ty::Var(v), d @ Ty::Dyn(..)) | (d @ Ty::Dyn(..), Ty::Var(v)) => {
                 let lit = match self.var_kind(&Ty::Var(*v)) {
                     Some(VarKind::Int) => Ty::Int(IntKind::I32),
                     Some(VarKind::Float) => Ty::Float { f32: false },
                     _ => {
-                        self.vars[*v as usize] = VarState::Bound(Ty::Dyn(tr.clone()));
+                        self.vars[*v as usize] = VarState::Bound(d.clone());
                         return true;
                     }
                 };
-                let tr = tr.clone();
+                let d = d.clone();
                 self.vars[*v as usize] = VarState::Bound(lit.clone());
-                self.unify(&lit, &Ty::Dyn(tr))
+                self.unify(&lit, &d)
             }
             (Ty::Var(v), t) | (t, Ty::Var(v)) => {
                 let ok = match self.var_kind(&Ty::Var(*v)).unwrap() {
@@ -1657,16 +1686,16 @@ impl<'a> Checker<'a> {
                 xs.iter().zip(ys.iter()).all(|(x, y)| self.unify(x, y))
             }
             // Anything is a `dyn Any`.
-            (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr)) if tr == "Any" && !matches!(t, Ty::Dyn(_)) => true,
+            (Ty::Dyn(tr, _), t) | (t, Ty::Dyn(tr, _)) if tr == "Any" && !matches!(t, Ty::Dyn(_, _)) => true,
             // Any type with std's `Display` (..) is a `dyn Display` / `impl Debug`.
-            (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr))
-                if generic::is_std_dyn(tr) && !matches!(t, Ty::Dyn(_)) =>
+            (Ty::Dyn(tr, _), t) | (t, Ty::Dyn(tr, _))
+                if generic::is_std_dyn(tr) && !matches!(t, Ty::Dyn(_, _)) =>
             {
                 let (tr, t) = (tr.clone(), t.clone());
                 tr.split('+').all(|b| self.implements(&t, b))
             }
             // A struct or enum coerces to a `dyn Trait` it implements.
-            (Ty::Dyn(tr), Ty::Adt(..)) | (Ty::Adt(..), Ty::Dyn(tr)) => {
+            (Ty::Dyn(tr, _), Ty::Adt(..)) | (Ty::Adt(..), Ty::Dyn(tr, _)) => {
                 let adt = if matches!(a, Ty::Adt(..)) {
                     a.clone()
                 } else {
@@ -1677,7 +1706,7 @@ impl<'a> Checker<'a> {
             }
             // A type parameter bounded by the trait (`Box::new(val)` as a `Box<dyn Tr>` with `T:
             // Tr`): its values carry their impls as a struct's do.
-            (Ty::Dyn(tr), Ty::Param(p)) | (Ty::Param(p), Ty::Dyn(tr))
+            (Ty::Dyn(tr, _), Ty::Param(p)) | (Ty::Param(p), Ty::Dyn(tr, _))
                 if tr.split('+').all(|b| {
                     matches!(b.trim(), "Send" | "Sync" | "'static") || self.param_has(p, b.trim())
                 }) =>
@@ -1686,7 +1715,7 @@ impl<'a> Checker<'a> {
             }
             // A built-in type with your impl of the trait (`Box<dyn io::Write>` holding a
             // `Vec<u8>`, `Box<dyn Money>` an `f64`).
-            (Ty::Dyn(tr), t) | (t, Ty::Dyn(tr))
+            (Ty::Dyn(tr, _), t) | (t, Ty::Dyn(tr, _))
                 if crate::adt::ext_key_of(t).is_some_and(|k| self.adts.ext_types.contains(k)) =>
             {
                 let (tr, t) = (tr.clone(), t.clone());
@@ -1706,7 +1735,7 @@ impl<'a> Checker<'a> {
                 self.unify(&x, &out)
             }
             // A std error (`ParseIntError`) is a `dyn Error`.
-            (Ty::Dyn(tr), Ty::Extern(n)) | (Ty::Extern(n), Ty::Dyn(tr))
+            (Ty::Dyn(tr, _), Ty::Extern(n)) | (Ty::Extern(n), Ty::Dyn(tr, _))
                 if tr == "Error" && is_std_error(n) =>
             {
                 true
@@ -1786,7 +1815,7 @@ impl<'a> Checker<'a> {
 
     /// Unify `found` with `expected`, reporting rustc's "mismatched types" on failure.
     fn expect(&mut self, n: &SyntaxNode, found: &Ty, expected: &Ty) {
-        if let Ty::Dyn(tr) = self.shallow(expected)
+        if let Ty::Dyn(tr, _) = self.shallow(expected)
             && matches!(
                 self.shallow(found),
                 Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Var(_)
@@ -1795,19 +1824,19 @@ impl<'a> Checker<'a> {
             let r = self.range(n);
             self.dyn_num_coercions.push((r, found.clone(), tr));
         }
-        if let Ty::Dyn(tr) = self.shallow(expected) {
+        if let Ty::Dyn(tr, _) = self.shallow(expected) {
             self.note_dyn_twin(n, found, &tr);
         }
         // A `String` or a `Formatter` into a `&mut dyn fmt::Write` (a struct field, a closure's
         // parameter, a `Box`): a writer object over the place (`κσ.$fmtWriter`).
-        if matches!(self.shallow(expected), Ty::Dyn(tr) if tr == "FmtWrite")
+        if matches!(self.shallow(expected), Ty::Dyn(tr, _) if tr == "FmtWrite")
             && matches!(self.shallow(found), Ty::Str | Ty::Formatter)
         {
             let r = self.range(n);
             self.str_writers.insert(r);
             return;
         }
-        if let (Ty::Dyn(tr), Ty::Adt(adt, _)) = (self.shallow(expected), self.shallow(found))
+        if let (Ty::Dyn(tr, _), Ty::Adt(adt, _)) = (self.shallow(expected), self.shallow(found))
             && tr != "Any"
             && !self.unify(found, expected)
         {
@@ -1973,7 +2002,8 @@ impl<'a> Checker<'a> {
             ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_)
                 if self.user_trait_type(t).is_some() =>
             {
-                Ty::Dyn(self.user_trait_type(t).unwrap())
+                let args = self.user_trait_args(t);
+                Ty::Dyn(self.user_trait_type(t).unwrap(), args)
             }
             // `x: impl Display` (an anonymous type parameter: see `generic::impl_arg_params`).
             ast::Type::ImplTraitType(_)
@@ -1986,7 +2016,7 @@ impl<'a> Checker<'a> {
             ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_)
                 if generic::std_impl_bounds(t).is_some() =>
             {
-                Ty::Dyn(generic::std_impl_bounds(t).unwrap().join("+"))
+                Ty::Dyn(generic::std_impl_bounds(t).unwrap().join("+"), Vec::new())
             }
             // `dyn Any` (`&dyn Any`, `Box<dyn Any + Send>`): any value, tested by `is::<T>()`.
             ast::Type::DynTraitType(d)
@@ -1998,11 +2028,11 @@ impl<'a> Checker<'a> {
                     })
                 }) =>
             {
-                Ty::Dyn("Any".into())
+                Ty::Dyn("Any".into(), Vec::new())
             }
             // `Box<dyn Error>`: any error value (they all display themselves).
             ast::Type::ImplTraitType(_) | ast::Type::DynTraitType(_) if names_std_error(t) => {
-                Ty::Dyn("Error".into())
+                Ty::Dyn("Error".into(), Vec::new())
             }
             ast::Type::SliceType(s) => Ty::Vec(Box::new(
                 s.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown),
@@ -2729,7 +2759,7 @@ impl<'a> Checker<'a> {
         let found = self.zonk(&found);
         if matches!(
             found,
-            Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_) | Ty::Closure { .. } | Ty::Fn | Ty::Never
+            Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_, _) | Ty::Closure { .. } | Ty::Fn | Ty::Never
         ) {
             return;
         }
@@ -2864,7 +2894,7 @@ impl<'a> Checker<'a> {
                     // reference: a type parameter, `impl Trait`).
                     let owned = reference.is_none()
                         && p.ty().is_some_and(|t| written_owned(&t))
-                        && !matches!(ty, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown | Ty::Closure { .. });
+                        && !matches!(ty, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Unknown | Ty::Closure { .. });
                     let local = Local {
                         ty,
                         mutable: ip.mut_token().is_some(),
@@ -2955,6 +2985,7 @@ impl<'a> Checker<'a> {
         self.resolve_try_intos();
         self.resolve_collects();
         self.resolve_parses();
+        self.resolve_bound_picks();
         self.resolve_defaults();
         self.resolve_tries();
         self.resolve_string_froms();
@@ -3048,11 +3079,13 @@ impl<'a> Checker<'a> {
                 }
                 _ => None,
             };
-            let alias = adt.is_some() || (local_trait && matches!(t, Ty::Param(_) | Ty::Dyn(_)));
+            // (Not for impls the trait arguments pick: those share the method's dispatcher.)
+            let alias = (adt.is_some() || (local_trait && matches!(t, Ty::Param(_) | Ty::Dyn(_, _))))
+                && !self.adts.picked_by_trait_args(&q.trait_name, &q.method);
             let on_self = !q.receiver && t == Ty::Param("Self".into());
             // `Shout::shout(&5)` / `<f64 as Money>::money(&x)`: your impl's method on a
             // built-in type, or a blanket impl's (on any type without its own).
-            if q.receiver && !matches!(t, Ty::Param(_) | Ty::Dyn(_) | Ty::Var(_) | Ty::Unknown) {
+            if q.receiver && !matches!(t, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Var(_) | Ty::Unknown) {
                 let own = adt
                     .as_ref()
                     .is_some_and(|n| self.adts.method(n, &q.method).is_some());
@@ -3090,7 +3123,7 @@ impl<'a> Checker<'a> {
             }
             // `<i32 as Make>::make()` / `let x: String = Make::make();`: your impl for the
             // built-in type, or a blanket impl's.
-            if adt.is_none() && !q.receiver && !matches!(t, Ty::Param(_) | Ty::Dyn(_) | Ty::Var(_))
+            if adt.is_none() && !q.receiver && !matches!(t, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Var(_))
             {
                 let ext = crate::adt::ext_key_of(&t).filter(|k| {
                     self.adts.ext_types.contains(*k)
@@ -3398,7 +3431,7 @@ impl<'a> Checker<'a> {
             // `let s: String = ..` / `let s = String::from(..)`: the binding owns its value.
             let js = l.initializer().is_some_and(|i| self.certainly_js(&i));
             let owned = reference.is_none()
-                && !matches!(ty, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown | Ty::Closure { .. })
+                && !matches!(ty, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Unknown | Ty::Closure { .. })
                 && (l.ty().is_some_and(|t| written_owned(&t))
                     || l.initializer().is_some_and(|i| self.certainly_owned(&i)));
             let local = Local {
@@ -4216,7 +4249,7 @@ impl<'a> Checker<'a> {
         // Error>`): each is checked against it, rather than against the first arm's type.
         let to_dyn = expected.filter(|t| {
             let mut dyn_ = false;
-            self.zonk(t).walk(&mut |t| dyn_ |= matches!(t, Ty::Dyn(_)));
+            self.zonk(t).walk(&mut |t| dyn_ |= matches!(t, Ty::Dyn(_, _)));
             dyn_
         });
         for arm in &arms {
@@ -5230,7 +5263,7 @@ impl<'a> Checker<'a> {
                         );
                     } else if (!self.could_be(&t, &to)
                         || matches!((self.shallow(&t), self.shallow(&to)), (Ty::Param(a), Ty::Param(b)) if a != b))
-                        && !matches!(self.shallow(&to), Ty::Dyn(_))
+                        && !matches!(self.shallow(&to), Ty::Dyn(_, _))
                     {
                         // `s as *const str as *const Name`, `self as *const Self as *const u8`.
                         let msg = format!(
@@ -5263,7 +5296,7 @@ impl<'a> Checker<'a> {
             ast::Expr::CastExpr(c) => {
                 let to = c.ty().map(|t| self.lower_type(&t)).unwrap_or(Ty::Unknown);
                 // `x as Box<dyn Trait>`: a coercion, checked like one.
-                let coerce = matches!(self.shallow(&to), Ty::Dyn(_) | Ty::Closure { .. });
+                let coerce = matches!(self.shallow(&to), Ty::Dyn(_, _) | Ty::Closure { .. });
                 if let Some(inner) = c.expr() {
                     if coerce {
                         self.check(&inner, &to);
@@ -5303,7 +5336,7 @@ impl<'a> Checker<'a> {
                 if let Some(named) = box_from_call(c)
                     && let Some(tr) =
                         named.or_else(|| match expected.map(|e| self.shallow(e)) {
-                            Some(Ty::Dyn(tr)) => Some(tr),
+                            Some(Ty::Dyn(tr, _)) => Some(tr),
                             _ => None,
                         })
                     && self.adts.from_impls.contains_key(&format!("dyn${tr}")) =>
@@ -5311,7 +5344,7 @@ impl<'a> Checker<'a> {
                 let args: Vec<ast::Expr> =
                     c.arg_list().map(|a| a.args().collect()).unwrap_or_default();
                 self.conv_from_call(c, &format!("dyn${tr}"), &args);
-                Ty::Dyn(tr)
+                Ty::Dyn(tr, Vec::new())
             }
             ast::Expr::CallExpr(c)
                 if is_box_new(c)
@@ -7516,7 +7549,7 @@ impl<'a> Checker<'a> {
                     self.check_into_arg(a, p);
                 }
                 // `impl Read` given bytes (`&[u8]`): read through a `Cursor` (`byte_reader`).
-                Some(p @ Ty::Dyn(tr)) if tr == "IoRead" || tr == "IoBufRead" => {
+                Some(p @ Ty::Dyn(tr, _)) if tr == "IoRead" || tr == "IoBufRead" => {
                     let t = self.infer(a, None);
                     if !self.is_bytes(&t) {
                         self.expect(a.syntax(), &t, p);
@@ -7614,7 +7647,7 @@ impl<'a> Checker<'a> {
         };
         match self.shallow(t) {
             // (`r: impl RangeBounds<u8>`.)
-            Ty::Dyn(b) => implemented(&b),
+            Ty::Dyn(b, _) => implemented(&b),
             t @ Ty::Var(_) => self
                 .pending_bounds
                 .iter()
@@ -7761,6 +7794,33 @@ impl<'a> Checker<'a> {
         for (i, a) in args.iter().enumerate() {
             if opt_slot_params.get(i) == Some(&true) {
                 self.keep_opt_slot(a);
+            }
+        }
+    }
+
+    /// Calls through `C: Conv<u8> + Conv<u16>`: the bound whose arguments fit what the call's
+    /// trait arguments became (`let a: u8 = c.conv()`, an integer literal), else the first, as
+    /// a later use can't change which impl runs.
+    fn resolve_bound_picks(&mut self) {
+        for (label, vars, alts, node) in std::mem::take(&mut self.pending_bound_picks) {
+            let fits = |c: &Self, alt: &[Ty]| {
+                vars.iter().zip(alt).all(|(v, a)| match c.var_kind(v) {
+                    Some(VarKind::Int) => matches!(a, Ty::Int(_)),
+                    Some(VarKind::Float) => matches!(a, Ty::Float { .. }),
+                    Some(VarKind::General) => true,
+                    None => c.zonk(v) == *a,
+                })
+            };
+            let Some(alt) = alts.iter().find(|a| fits(self, a)).cloned() else {
+                let got: Vec<String> = vars.iter().map(|v| self.zonk(v).describe()).collect();
+                self.error(
+                    &node,
+                    format!("the trait bound `{label}<{}>` is not satisfied", got.join(", ")),
+                );
+                continue;
+            };
+            for (v, a) in vars.iter().zip(&alt) {
+                self.unify(v, a);
             }
         }
     }
@@ -7972,6 +8032,8 @@ impl<'a> Checker<'a> {
             Some(key) => {
                 let targs = match self.shallow(&rt) {
                     t @ Ty::Tuple(_) => crate::adt::ext_args(&t),
+                    // (A slice's element: `[u8]` next to `[T]`.)
+                    t @ Ty::Vec(_) => crate::adt::ext_args(&t),
                     _ => Vec::new(),
                 };
                 self.pick_method_alt(m, key, &targs, &method, &args, expected)
@@ -7979,6 +8041,8 @@ impl<'a> Checker<'a> {
             }
             None => method,
         };
+        // (`impl Inv for &f32` next to `impl Inv for f32`: by how the receiver is written.)
+        let method = self.pick_ref_impl(m, &recv, &rt, method);
         if let Some(key) = crate::adt::ext_key_of(&self.shallow(&rt))
             && self.adts.ext_types.contains(key)
             && let Some(sig) = self.adts.method(key, &method).cloned()
@@ -8001,11 +8065,32 @@ impl<'a> Checker<'a> {
                     self.unify(ra, ia);
                 }
             }
+            let dicts = sig.dict_names().len();
             let sig = if !recv_args.is_empty() && recv_args.len() == sig.impl_args.len() {
                 self.method_inst(&sig, Some(&recv_args))
             } else {
                 self.method_inst(&sig, None)
             };
+            // (The method's own type parameters' classes and those of its impl's that only the
+            // trait's arguments name, for `E::default()` in its body.)
+            if dicts > 0 {
+                let own = std::mem::take(&mut self.last_type_args);
+                if let Some(gal) = m.generic_arg_list() {
+                    let given: Vec<Ty> = gal
+                        .generic_args()
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .filter_map(|g| self.generic_arg_ty(g))
+                        .collect();
+                    for (v, t) in own.iter().zip(given) {
+                        self.unify(v, &t);
+                    }
+                }
+                let r = self.range(m.syntax());
+                let caller = self.cur_fn.clone().unwrap_or_default();
+                self.generic_calls
+                    .push((r, caller, format!("{key}::{method}"), own));
+            }
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());
             for (i, (a, p)) in args.iter().zip(&sig.params).enumerate() {
                 // (`&mut String`: `bytes.read_to_string(&mut text)`.)
@@ -8286,16 +8371,20 @@ impl<'a> Checker<'a> {
             }
             // (A method that several impls of one generic trait give a type: told apart at run
             // time by its arguments when their types differ there, see `alt_dispatch`.)
-            Ty::Param(_) | Ty::Dyn(_)
+            // (Through a type parameter the trait's arguments' classes come with the call and
+            // pick it, see `alt_trait_args`; through `dyn Scale<f64>` its written arguments do.)
+            Ty::Param(_) | Ty::Dyn(_, _)
                 if self.adts.method_alts.keys().any(|k| {
                     k.strip_suffix(&format!("::{method}")).is_some_and(|ty| {
                         !self.adts.inherent_alts.contains(k)
                             && self.adts.alt_dispatch(ty, &method).is_none()
+                            && (matches!(&resolved, Ty::Dyn(_, a) if a.is_empty())
+                                || self.adts.alt_trait_args(ty, &method).is_none())
                     })
                 }) =>
             {
                 let msg = format!(
-                    "`{method}` comes from a generic trait implemented more than once for one type; through a type parameter or `dyn` the impl is picked by the arguments at run time, and these impls take arguments that look alike in JS (two number types, or `str` and `char`): call it on the concrete type"
+                    "`{method}` comes from a generic trait implemented more than once for one type; through `dyn` the impl is picked by the arguments at run time, and these impls take arguments that look alike in JS (two number types, or `str` and `char`): call it on the concrete type or through a type parameter"
                 );
                 self.error(m.syntax(), msg);
                 for a in &args {
@@ -8304,7 +8393,7 @@ impl<'a> Checker<'a> {
                 return Ty::Unknown;
             }
             Ty::Param(name) => return self.param_method(m, &recv, &name, &method, &args),
-            Ty::Dyn(tr) => return self.dyn_method(m, &recv, &tr, &method, &args),
+            Ty::Dyn(tr, targs) => return self.dyn_method(m, &recv, &tr, &targs, &method, &args),
             Ty::RefCell(inner) => {
                 let inner = *inner;
                 return match method.as_str() {
@@ -9428,7 +9517,7 @@ impl<'a> Checker<'a> {
                 // Into a `fmt::Write` of your own, or a `W: fmt::Write` (a `String`, a `Formatter`
                 // or your own writer): its `write_str` of the text.
                 if self.adts.traits.contains_key("FmtWrite")
-                    && (matches!(self.zonk(&tt), Ty::Dyn(t) if t == "FmtWrite")
+                    && (matches!(self.zonk(&tt), Ty::Dyn(t, _) if t == "FmtWrite")
                         || matches!(self.zonk(&tt), Ty::Adt(..) | Ty::Param(_))
                             && self.implements_user_trait(&tt, "FmtWrite"))
                 {
@@ -9740,9 +9829,9 @@ impl Checker<'_> {
             Ty::Formatter => true,
             Ty::RefCell(_) => !debug,
             Ty::Param(n) => !self.param_has(n, if debug { "Debug" } else { "Display" }),
-            Ty::Dyn(tr) if tr == "Error" => false,
+            Ty::Dyn(tr, _) if tr == "Error" => false,
             // (Or `impl Debug for Box<dyn Tr>`.)
-            Ty::Dyn(_) => !self.implements(resolved, if debug { "Debug" } else { "Display" }),
+            Ty::Dyn(_, _) => !self.implements(resolved, if debug { "Debug" } else { "Display" }),
             // (A JS type prints with `{}` when it declares `to_string`: `Date`, `Url`, ..)
             Ty::Extern(n)
                 if is_std_error(n)
@@ -10845,8 +10934,8 @@ impl Checker<'_> {
             return None;
         }
         let seg = q.segment()?;
-        // `<T as Trait>` or `Trait`.
-        let (trait_name, anchor_ty) = match seg.type_anchor() {
+        // `<T as Trait>` or `Trait`, and the trait's segment where its arguments are written.
+        let (trait_name, anchor_ty, trait_seg) = match seg.type_anchor() {
             // (Both are `PATH_TYPE`s: the type, then the trait.)
             Some(a) if a.as_token().is_some() => {
                 let mut tys = a.syntax().children().filter_map(ast::Type::cast);
@@ -10854,8 +10943,9 @@ impl Checker<'_> {
                 let Some(ast::Type::PathType(tp)) = tys.next() else {
                     return None;
                 };
-                let tr = tp.path()?.segment()?.name_ref()?.text().to_string();
-                (tr, ty)
+                let ts = tp.path()?.segment()?;
+                let tr = ts.name_ref()?.text().to_string();
+                (tr, ty, Some(ts))
             }
             Some(_) => return None,
             None => {
@@ -10875,7 +10965,10 @@ impl Checker<'_> {
                         })
                     })
                     .flatten();
-                (bound.unwrap_or(n), None)
+                match bound {
+                    Some(b) => (b, None, None),
+                    None => (n, None, Some(seg.clone())),
+                }
             }
         };
         // `<T as Bounded>::min_value()`, or `Bounded::min_value()` where a `T` is expected, with
@@ -10952,6 +11045,10 @@ impl Checker<'_> {
             _ => self.fresh(VarKind::General),
         };
         let mut sub: HashMap<String, Ty> = [("Self".to_string(), self_ty.clone())].into();
+        let trait_args = self.qualified_trait_args(c, &trait_name, &def, trait_seg.as_ref(), &self_ty);
+        for (tp, a) in def.type_params.iter().zip(&trait_args) {
+            sub.insert(format!("{trait_name}::{tp}"), a.clone());
+        }
         // (The method's own type parameters, `fn custom<T: Display>(msg: T)`: fresh.)
         for p in &tm.sig.type_params {
             sub.insert(p.clone(), self.fresh(VarKind::General));
@@ -10991,6 +11088,13 @@ impl Checker<'_> {
         }
         let local_trait = def.module.is_none();
         let r = self.range(c.syntax());
+        // (Several impls of a generic trait for one type, `Conv<u8>` and `Conv<u16>`: the trait
+        // arguments' classes pick one, as in a method call.)
+        if !trait_args.is_empty() && !self.trait_arg_names(&trait_name, &method).is_empty() {
+            let caller = self.cur_fn.clone().unwrap_or_default();
+            self.generic_calls
+                .push((r, caller, format!("{trait_name}::{method}"), trait_args.clone()));
+        }
         // `T::money(&x)` on a `T` whose impls JS can't tell apart: by `T`'s class, as `x.money()`.
         if receiver
             && let Ty::Param(p) = self.shallow(&self_ty)
@@ -11482,6 +11586,26 @@ impl Checker<'_> {
         }
     }
 
+    /// A generic trait's method with `self` some impl of which takes a class for a parameter
+    /// only the trait's arguments name (`impl<E: Default> Tr<E> for (Ix, Ix)`): a call through
+    /// a bound hands the trait's arguments' classes too, after the method's own, by position.
+    pub(super) fn trait_arg_names(&self, tr: &str, m: &str) -> Vec<String> {
+        let Some(def) = self.adts.traits.get(tr) else {
+            return Vec::new();
+        };
+        let takes = def.methods.iter().any(|t| t.name == m && t.sig.receiver.is_some())
+            && self.adts.trait_impls.iter().any(|(ty, trs)| {
+                trs.iter().any(|t| t == tr)
+                    && self.adts.method(ty, m).is_some_and(|s| !s.trait_params.is_empty())
+                    // (Or several impls of it for one type, told apart by those classes.)
+                    || trs.iter().any(|t| t == tr) && self.adts.alt_trait_args(ty, m).is_some()
+            });
+        if !takes {
+            return Vec::new();
+        }
+        def.type_params.iter().map(|tp| format!("{tr}::{tp}")).collect()
+    }
+
     fn need_names(&self, f: &str) -> Vec<String> {
         match f.split_once("::") {
             // A method: `Type::name`.
@@ -11498,7 +11622,9 @@ impl Checker<'_> {
                         .methods
                         .iter()
                         .find(|t| t.name == m)?;
-                    Some(tm.sig.dict_names())
+                    let mut names = tm.sig.dict_names();
+                    names.extend(self.trait_arg_names(ty, m));
+                    Some(names)
                 })
                 .unwrap_or_default(),
             // A function: its type parameters, then their projections (`S::Unit`), in the
@@ -11819,6 +11945,43 @@ impl Checker<'_> {
                     all.push((format!("{tr}::{}", tm.name), tm.sig.type_params.clone()));
                     for i in 0..tm.sig.type_params.len() {
                         let needed = all.iter().any(|(k, ps)| {
+                            ps.get(i).is_some_and(|n| needs.contains(&(k.clone(), n.clone())))
+                        });
+                        if needed {
+                            for (k, ps) in &all {
+                                if let Some(n) = ps.get(i) {
+                                    uses.push((k.clone(), n.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // And a generic trait's method's trait-argument classes (see `trait_arg_names`):
+            // each impl takes them after its own, as its parameters the arguments name.
+            for (tr, def) in &self.adts.traits {
+                for tm in &def.methods {
+                    let at = self.trait_arg_names(tr, &tm.name);
+                    if at.is_empty() {
+                        continue;
+                    }
+                    let own = tm.sig.type_params.len();
+                    let mut all: Vec<(String, Vec<String>)> = self
+                        .adts
+                        .trait_impls
+                        .iter()
+                        .filter(|(_, trs)| trs.iter().any(|t| t == tr))
+                        .filter_map(|(ty, _)| {
+                            let s = self.adts.method(ty, &tm.name)?;
+                            Some((format!("{ty}::{}", tm.name), s.dict_names()))
+                        })
+                        .collect();
+                    all.push((format!("{tr}::{}", tm.name), param_names(self, &format!("{tr}::{}", tm.name))));
+                    let alts = self.adts.trait_impls.iter().any(|(ty, trs)| {
+                        trs.iter().any(|t| t == tr) && self.adts.alt_trait_args(ty, &tm.name).is_some()
+                    });
+                    for i in own..own + at.len() {
+                        let needed = alts || all.iter().any(|(k, ps)| {
                             ps.get(i).is_some_and(|n| needs.contains(&(k.clone(), n.clone())))
                         });
                         if needed {

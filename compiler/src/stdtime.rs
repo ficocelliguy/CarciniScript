@@ -183,7 +183,7 @@ pub(crate) fn with_prelude(
     }
     // (After the rewrite: `io::Error` is `IoError`, `io::stdout()` `__io_stdout()`, ..)
     let io_names = [
-        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoCursor", "IoSeek", "FmtWrite", "FmtAlignment",
+        "IoError", "IoWrite", "__io_std", "IoStd", "IoBuf", "IoRead", "IoIoSlice", "IoCursor", "IoSeek", "FmtWrite", "FmtAlignment",
     ];
     // (After the rewrite: `std::fs::File` is `FsFile`, `process::Command` `ProcCommand`, ..)
     let os_names = [

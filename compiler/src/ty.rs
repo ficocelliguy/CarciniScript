@@ -304,7 +304,7 @@ pub enum Ty {
     /// A const generic argument (`3` in `Buf<3>`, or a `const` item's name), as written in Rust.
     ConstVal(String),
     /// `dyn Trait` / `impl Trait` / `Box<dyn Trait>`: any value whose type implements the trait.
-    Dyn(String),
+    Dyn(String, Vec<Ty>),
     /// `RefCell<T>` / `Cell<T>`: a `κσ.RefCell` holding the value at `.v`. (`Rc<T>` is erased.)
     RefCell(Box<Ty>),
     /// An `I: IntoIterator<Item = T>` parameter (or `impl IntoIterator<Item = T>`): any iterable
@@ -480,7 +480,7 @@ impl Ty {
                 vec![(**k).clone(), (**v).clone()]
             }
             Ty::Closure { params, ret } => [params.clone(), vec![(**ret).clone()]].concat(),
-            Ty::Adt(_, args) => args.clone(),
+            Ty::Adt(_, args) | Ty::Dyn(_, args) => args.clone(),
             // The elements, not the view: a `BTreeMap`'s keys need `Ord`, not `Hash`.
             Ty::Coll(_, view) => view.inner_types(),
             _ => vec![],
@@ -585,7 +585,11 @@ impl Ty {
             Ty::Rng => "ThreadRng".into(),
             Ty::Param(n) => n.clone(),
             Ty::ConstVal(v) => v.clone(),
-            Ty::Dyn(n) => format!("dyn {n}"),
+            Ty::Dyn(n, args) if args.is_empty() => format!("dyn {n}"),
+            Ty::Dyn(n, args) => format!(
+                "dyn {n}<{}>",
+                args.iter().map(Ty::describe).collect::<Vec<_>>().join(", ")
+            ),
             Ty::RefCell(t) => format!("RefCell<{}>", t.describe()),
             Ty::Iter {
                 elem,

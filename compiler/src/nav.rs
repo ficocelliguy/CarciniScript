@@ -301,7 +301,7 @@ impl Ctx<'_> {
     fn owner(&self, e: &SyntaxNode) -> Option<String> {
         match type_at(&self.an.types, e)? {
             Ty::Adt(n, _) => Some(n),
-            Ty::Dyn(n) => Some(n),
+            Ty::Dyn(n, _) => Some(n),
             _ => None,
         }
     }

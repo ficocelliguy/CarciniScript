@@ -202,6 +202,46 @@ impl std::ops::Deref for IoIoSlice {
     }
 }
 
+/// `std::io::IoSliceMut`: a buffer for `read_vectored`, the caller's own bytes.
+#[derive(Debug)]
+pub struct IoIoSliceMut<'a> {
+    __b: &'a mut [u8],
+}
+
+impl<'a> IoIoSliceMut<'a> {
+    pub fn new(buf: &'a mut [u8]) -> IoIoSliceMut<'a> {
+        IoIoSliceMut { __b: buf }
+    }
+}
+
+impl std::ops::Deref for IoIoSliceMut<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.__b
+    }
+}
+
+impl std::ops::DerefMut for IoIoSliceMut<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.__b
+    }
+}
+
+/// `read_vectored` for the readers std fills buffer after buffer (`&[u8]`, `Cursor`,
+/// `BufReader`): until a read comes up short.
+fn __io_read_each<R: IoRead + ?Sized>(r: &mut R, bufs: &mut [IoIoSliceMut<'_>]) -> Result<usize, IoError> {
+    let mut total = 0;
+    for b in bufs.iter_mut() {
+        let want = b.__b.len();
+        let n = r.read(b.__b)?;
+        total += n;
+        if n < want {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// A `Vec<u8>` is a writer: the bytes are appended.
 impl IoWrite for Vec<u8> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
@@ -437,6 +477,9 @@ impl<R: IoRead> IoRead for IoBufReader<R> {
         self.__pos += n;
         Ok(n)
     }
+    fn read_vectored(&mut self, bufs: &mut [IoIoSliceMut<'_>]) -> Result<usize, IoError> {
+        __io_read_each(self, bufs)
+    }
 }
 
 impl<R: IoRead> IoBufRead for IoBufReader<R> {
@@ -466,6 +509,9 @@ impl IoRead for Vec<u8> {
         self.drain(..n);
         Ok(n)
     }
+    fn read_vectored(&mut self, bufs: &mut [IoIoSliceMut<'_>]) -> Result<usize, IoError> {
+        __io_read_each(self, bufs)
+    }
 }
 
 impl IoRead for IoStdin {
@@ -489,6 +535,18 @@ pub fn __io_stdin() -> IoStdin {
 /// `std::io::Read`.
 pub trait IoRead {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError>;
+    // (std's default: the first buffer that isn't empty.)
+    fn read_vectored(&mut self, bufs: &mut [IoIoSliceMut<'_>]) -> Result<usize, IoError> {
+        for b in bufs.iter_mut() {
+            if !b.__b.is_empty() {
+                return self.read(b.__b);
+            }
+        }
+        Ok(0)
+    }
+    fn is_read_vectored(&self) -> bool {
+        false
+    }
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize, IoError> {
         let mut chunk = vec![0u8; 512];
         let mut total = 0;
@@ -701,6 +759,9 @@ impl<T> IoRead for IoCursor<T> {
         }
         self.pos += n as u64;
         Ok(n)
+    }
+    fn read_vectored(&mut self, bufs: &mut [IoIoSliceMut<'_>]) -> Result<usize, IoError> {
+        __io_read_each(self, bufs)
     }
 }
 

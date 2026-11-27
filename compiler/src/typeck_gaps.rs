@@ -314,8 +314,16 @@ impl Checker<'_> {
                 Ty::Str
             }
             // ---- integers
-            (Ty::Int(_), "to_le_bytes" | "to_be_bytes" | "to_ne_bytes") => {
+            (Ty::Int(k), "to_le_bytes" | "to_be_bytes" | "to_ne_bytes") => {
                 count(self, 0);
+                let bytes = match k {
+                    IntKind::I8 | IntKind::U8 => 1,
+                    IntKind::I16 | IntKind::U16 => 2,
+                    IntKind::I32 | IntKind::U32 => 4,
+                    IntKind::I128 | IntKind::U128 => 16,
+                    _ => 8,
+                };
+                self.std_array_dims.insert(m.syntax().text_range(), vec![bytes]);
                 u8s()
             }
             (Ty::Int(k), "unsigned_abs") => {

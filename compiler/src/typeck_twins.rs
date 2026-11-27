@@ -278,7 +278,7 @@ impl Checker<'_> {
             return;
         }
         match self_ty {
-            crate::ty::Ty::Dyn(_) => return,
+            crate::ty::Ty::Dyn(_, _) => return,
             crate::ty::Ty::Param(p) if self.try_note_dict(p) => {
                 let r = self.range(node);
                 self.class_dispatch.insert(r);
@@ -430,6 +430,7 @@ impl Checker<'_> {
         ["ref", "refmut", "box"]
             .iter()
             .any(|k| self.adts.ext_types.contains(&format!("{tr}${k}")))
+            || self.adts.ref_impl_traits.contains(tr)
     }
 
     /// A generic call `r`: for each type parameter bounded by a twin trait (`T: Enc` with
@@ -448,6 +449,7 @@ impl Checker<'_> {
     ) {
         if self.adts.twin_borrowed.is_empty()
             && !self.adts.ext_types.iter().any(|k| crate::adt::is_wrapper_key(k))
+            && self.adts.ref_impl_traits.is_empty()
         {
             return;
         }
@@ -786,5 +788,84 @@ impl Checker<'_> {
             .collect();
         let r = self.range(c.syntax());
         self.generic_calls.push((r, caller, format!("{key}::{method}"), targs));
+    }
+}
+
+impl Checker<'_> {
+    /// `x.inv()` where `impl Inv for &f32` sits next to `impl Inv for f32` (one type in JS; see
+    /// `adt::concrete_ref_impl`): the reference's impl (`inv$ref`) when the receiver is written
+    /// as such a reference and the method takes `self` by value, which is where rustc's probe
+    /// finds it first, or when the type has no impl of its own. Recorded for codegen.
+    pub(super) fn pick_ref_impl(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        recv: &ast::Expr,
+        rt: &crate::ty::Ty,
+        method: String,
+    ) -> String {
+        let Some(key) = crate::adt::ext_key_of(&self.shallow(rt)) else {
+            return method;
+        };
+        for kind in ["refmut", "ref"] {
+            let k = format!("{method}${kind}");
+            let Some(sig) = self.adts.method(key, &k) else {
+                continue;
+            };
+            let take = self.adts.method(key, &method).is_none()
+                || sig.receiver == Some(crate::adt::Receiver::Value)
+                    && self.written_ref(recv) == Some(kind == "refmut");
+            if take {
+                let r = self.range(m.syntax());
+                self.method_keys.insert(r, k.clone());
+                return k;
+            }
+        }
+        method
+    }
+
+    /// Whether `e` is written as a reference: `&x` / `&mut x`, or a local or parameter declared
+    /// as one (`r: &f32`, `let r = &mut s;`). Some(true) for `&mut`; None when it isn't one.
+    fn written_ref(&self, e: &ast::Expr) -> Option<bool> {
+    match e {
+        ast::Expr::ParenExpr(p) => self.written_ref(&p.expr()?),
+        ast::Expr::RefExpr(r) => Some(r.mut_token().is_some()),
+        ast::Expr::PathExpr(p) => {
+            let n = p.path()?.as_single_name_ref()?.text().to_string();
+            // (In a macro's re-parsed arguments, by the offset in the file.)
+            let (f, at) = match e.syntax().ancestors().find_map(ast::Fn::cast) {
+                Some(f) => (f, e.syntax().text_range().start()),
+                None => (
+                    self.enclosing_fn(e.syntax())?,
+                    TextSize::try_from(self.range(e.syntax()).0).ok()?,
+                ),
+            };
+            let named = |pat: Option<ast::Pat>| {
+                matches!(pat, Some(ast::Pat::IdentPat(ip)) if ip.name().is_some_and(|x| x.text() == n.as_str()))
+            };
+            let of_type = |t: Option<ast::Type>| match t {
+                Some(ast::Type::RefType(r)) => Some(r.mut_token().is_some()),
+                _ => None,
+            };
+            // (The last `let` of that name before the use, else a parameter.)
+            let mut found = None;
+            for l in f.syntax().descendants().filter_map(ast::LetStmt::cast) {
+                if l.syntax().text_range().start() >= at || !named(l.pat()) {
+                    continue;
+                }
+                found = Some(of_type(l.ty()).or_else(|| match l.initializer() {
+                    Some(ast::Expr::RefExpr(r)) => Some(r.mut_token().is_some()),
+                    _ => None,
+                }));
+            }
+            if let Some(f) = found {
+                return f;
+            }
+            f.param_list()?
+                .params()
+                .find(|p| named(p.pat()))
+                .and_then(|p| of_type(p.ty()))
+        }
+        _ => None,
+    }
     }
 }

@@ -244,7 +244,7 @@ impl Checker<'_> {
                 match (&a, &b) {
                     (Ty::Int(x), Ty::Int(y)) => x == y,
                     (Ty::Float { f32: x }, Ty::Float { f32: y }) => x == y,
-                    (Ty::Dyn(x), Ty::Dyn(y)) | (Ty::Extern(x), Ty::Extern(y)) => x == y,
+                    (Ty::Dyn(x, _), Ty::Dyn(y, _)) | (Ty::Extern(x), Ty::Extern(y)) => x == y,
                     (Ty::Range(x, k1), Ty::Range(y, k2)) => k1 == k2 && self.could_be(x, y),
                     _ => {
                         ia.len() == ib.len() && ia.iter().zip(&ib).all(|(p, q)| self.could_be(p, q))
@@ -422,7 +422,7 @@ impl Checker<'_> {
         if !matches!(self_ty, Ty::Adt(..) | Ty::Str | Ty::Char | Ty::Bool | Ty::Int(_) | Ty::Float { .. } | Ty::Vec(_)) {
             return None;
         }
-        let f = m.syntax().ancestors().find_map(ast::Fn::cast)?;
+        let f = self.enclosing_fn(m.syntax())?;
         let preds: Vec<ast::WherePred> = f.where_clause()?.predicates().collect();
         for pred in preds {
             let Some(lhs) = pred.ty() else { continue };
@@ -579,7 +579,29 @@ impl Checker<'_> {
             })
             .cloned()
             .collect();
-        if fits.is_empty() { keys } else { fits }
+        if fits.is_empty() {
+            return keys;
+        }
+        // (`[u8]` next to `[T]` for a settled `u8` receiver: the concrete impl, as
+        // specialization would.)
+        let open = |ts: &[Ty]| {
+            let mut o = false;
+            for t in ts {
+                t.walk(&mut |x| o |= matches!(x, Ty::Param(_) | Ty::Var(_) | Ty::Unknown | Ty::IntLit));
+            }
+            o
+        };
+        if fits.len() > 1 && !open(&targs) {
+            let concrete: Vec<String> = fits
+                .iter()
+                .filter(|k| self.adts.method(ty, k).is_some_and(|s| !open(&s.impl_args)))
+                .cloned()
+                .collect();
+            if !concrete.is_empty() {
+                return concrete;
+            }
+        }
+        fits
     }
 
     /// `t` with its settled variables filled in; an integer literal's still open variable is
@@ -1155,7 +1177,7 @@ impl Checker<'_> {
                     continue;
                 }
                 // `sq.into()` as a `Box<dyn Shape>` through your `impl From<Sq> for Box<dyn Shape>`.
-                (_, Ty::Dyn(tr)) if self.adts.from_impls.contains_key(&format!("dyn${tr}")) => {
+                (_, Ty::Dyn(tr, _)) if self.adts.from_impls.contains_key(&format!("dyn${tr}")) => {
                     let adt = format!("dyn${tr}");
                     self.pick_from(&adt, &s).map(|key| Conv::From { adt, key })
                 }
@@ -1180,14 +1202,14 @@ impl Checker<'_> {
                 }
                 // `"x".into()` / `format!(..).into()` as a `Box<dyn Error>`: the string itself (its
                 // `{}` is the text and its `{:?}` the quoted text, like std's string error's).
-                (Ty::Str, Ty::Dyn(tr))
+                (Ty::Str, Ty::Dyn(tr, _))
                     if tr == "Error" && !self.adts.traits.contains_key("Error") =>
                 {
                     Some(Conv::Identity)
                 }
                 // `MyError.into()` as a `Box<dyn Error>`, with `impl Error for MyError`: unchanged,
                 // as `?` converts it.
-                (_, Ty::Dyn(tr))
+                (_, Ty::Dyn(tr, _))
                     if tr == "Error"
                         && !self.adts.traits.contains_key("Error")
                         && self.boxes_as_dyn_error(&s) =>
@@ -1736,7 +1758,7 @@ impl Checker<'_> {
                 .defs
                 .get(&n)
                 .is_some_and(|d| d.implements("Error")),
-            Ty::Dyn(tr) => tr == "Error",
+            Ty::Dyn(tr, _) => tr == "Error",
             _ => false,
         }
     }
@@ -1751,7 +1773,7 @@ impl Checker<'_> {
                     .defs
                     .get(&n)
                     .is_some_and(|d| d.implements("Error")),
-                Ty::Dyn(tr) => tr == "Error",
+                Ty::Dyn(tr, _) => tr == "Error",
                 _ => false,
             };
             if ok && self.shallow(e) != super::crates::anyhow_error() {
@@ -1767,12 +1789,12 @@ impl Checker<'_> {
             }
         }
         // Into `Box<dyn Error>`: std errors and your `impl Error` types, unchanged.
-        if self.shallow(re) == Ty::Dyn("Error".into()) && self.boxes_as_dyn_error(e) {
+        if self.shallow(re) == Ty::Dyn("Error".into(), Vec::new()) && self.boxes_as_dyn_error(e) {
             return true;
         }
         // `Err("usage")?` / `Err(format!(..))?` into `Box<dyn Error>`: the string itself, as
         // `"x".into()`.
-        if self.shallow(re) == Ty::Dyn("Error".into())
+        if self.shallow(re) == Ty::Dyn("Error".into(), Vec::new())
             && self.shallow(e) == Ty::Str
             && !self.adts.traits.contains_key("Error")
         {

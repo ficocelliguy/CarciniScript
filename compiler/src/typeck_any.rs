@@ -275,7 +275,7 @@ impl Checker<'_> {
         method: &str,
         args: &[ast::Expr],
     ) -> Option<Ty> {
-        let is_any = matches!(self.shallow(rt), Ty::Dyn(t) if t == "Any");
+        let is_any = matches!(self.shallow(rt), Ty::Dyn(t, _) if t == "Any");
         let range = self.range(m.syntax());
         if method == "type_id" && args.is_empty() {
             if is_any {
@@ -295,7 +295,7 @@ impl Checker<'_> {
         let ret = |t: Ty| match method {
             "is" => Ty::Bool,
             "downcast_ref" | "downcast_mut" => Ty::Option(Box::new(t)),
-            _ => Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into()))),
+            _ => Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into(), Vec::new()))),
         };
         if !matches!(method, "is" | "downcast_ref" | "downcast_mut" | "downcast") {
             return None;

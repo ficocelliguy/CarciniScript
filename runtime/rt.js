@@ -5168,6 +5168,12 @@
     $wrapCall(regs, cls, x, name, args) {
       const w = (regs.wraps?.[cls.wrap] ?? []).find((r) => typeof r.cls.prototype[name] === "function");
       if (w) return rt.$callElem(cls.elem, w.cls.prototype[name], x, ...args);
+      // (`impl Inv for &f32` next to `impl Inv for f32`: the referent's class's `inv$ref`.)
+      const kind = cls.elem?.kind;
+      const r = (regs.kinds[Array.isArray(x) ? "array" : typeof x] ?? []).find(
+        (r) => typeof r.cls.prototype[`${name}$${cls.wrap}`] === "function" && (kind === undefined || r.cls.name === "$ext$" + kind),
+      );
+      if (r) return r.cls.prototype[`${name}$${cls.wrap}`].call(x, ...args);
       return rt.$dcallT(regs, cls.elem, x, name, ...args);
     },
     // An owned `String`'s or `Vec<T>`'s class `d` passed for a `T` whose trait also has a `str` /
@@ -5193,8 +5199,12 @@
     // caller passed them, else the values of the tuple `x` (a whole number reaches an integer
     // impl before a float one, as in `$dcall`).
     $tupAlt(cls, name, x, elem) {
-      const alts = (cls.$altsV ??= cls.$alts())[name];
+      // (Concrete impls before generic ones, as specialization: `[u8]` before `[T]`.)
+      const nulls = (ds) => ds.filter((d) => d == null).length;
+      const alts = (cls.$altsV ??= Object.fromEntries(Object.entries(cls.$alts()).map(([n, es]) => [n, es.sort((a, b) => nulls(a[1]) - nulls(b[1]))])))[name];
       if (!alts) return name;
+      // (A `Vec`'s element class, against `[T]`'s one parameter.)
+      if (elem != null && !Array.isArray(elem)) elem = [elem];
       for (const strict of [true, false]) {
         for (const [k, ds] of alts) {
           if (ds.every((d, i) => (elem ? rt.$classFits(d, elem[i]) : rt.$valueFits(d, x?.[i], strict)))) return k;
@@ -5211,7 +5221,16 @@
       const first = P[name];
       let t = null;
       P[name] = function (...a) {
-        t ??= table().map(([k, ds]) => [k === name ? first : P[k], ds]);
+        t ??= table().map(([k, ds, ts, own]) => [k === name ? first : P[k], ds, ts ?? [], own ?? 0]);
+        // (Called through a bound: the trait arguments' classes come after the arguments and
+        // `own` classes of the method's own type parameters, and pick the impl where the values
+        // can't, `Scale<f64>` against `Scale<i32>`.)
+        for (const [f, ds, ts, own] of t) {
+          const at = ds.length + own;
+          if (!ts.length || a.length < at + ts.length) continue;
+          const cs = a.slice(at, at + ts.length);
+          if (cs.some((c) => c != null) && ts.every((d, i) => rt.$classFits(d, cs[i]))) return f.call(this, ...a);
+        }
         for (const strict of [true, false]) {
           for (const [f, ds] of t) if (ds.every((d, i) => rt.$valueFits(d, a[i], strict))) return f.call(this, ...a);
         }

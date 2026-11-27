@@ -272,13 +272,13 @@ impl Checker<'_> {
             return Some(t);
         }
         // A `dyn Error`'s `to_string()` and `source()` (the next error in its chain).
-        if matches!(resolved, Ty::Dyn(tr) if tr == "Error")
+        if matches!(resolved, Ty::Dyn(tr, _) if tr == "Error")
             && matches!(method, "to_string" | "source")
         {
             self.arg_count(m.syntax(), "method", 0, args.len());
             if method == "source" {
                 self.note_crate(m.syntax(), "err.source", vec![]);
-                return Some(Ty::Option(Box::new(Ty::Dyn("Error".into()))));
+                return Some(Ty::Option(Box::new(Ty::Dyn("Error".into(), Vec::new()))));
             }
             self.note_crate(m.syntax(), "err.toString", vec![]);
             return Some(Ty::Str);
@@ -291,7 +291,7 @@ impl Checker<'_> {
         {
             self.arg_count(m.syntax(), "method", 0, args.len());
             self.note_crate(m.syntax(), "err.source", vec![]);
-            return Some(Ty::Option(Box::new(Ty::Dyn("Error".into()))));
+            return Some(Ty::Option(Box::new(Ty::Dyn("Error".into(), Vec::new()))));
         }
         // `serde_json::Error`: where it failed, and what kind of failure.
         if matches!(resolved, Ty::Extern(n) if n == "serde_json::Error") {
@@ -1280,14 +1280,14 @@ impl Checker<'_> {
                         (
                             "anyhow.chain",
                             Ty::Iter {
-                                elem: Box::new(Ty::Dyn("Error".into())),
+                                elem: Box::new(Ty::Dyn("Error".into(), Vec::new())),
                                 mutable: false,
                             },
                         )
                     }
                     "root_cause" => {
                         self.arg_count(m.syntax(), "method", 0, args.len());
-                        ("anyhow.rootCause", Ty::Dyn("Error".into()))
+                        ("anyhow.rootCause", Ty::Dyn("Error".into(), Vec::new()))
                     }
                     _ => return None,
                 };

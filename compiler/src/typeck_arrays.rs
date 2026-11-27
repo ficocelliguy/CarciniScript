@@ -265,7 +265,7 @@ impl Checker<'_> {
         let len = l
             .ty()
             .and_then(|t| array_type_len(&t))
-            .or_else(|| l.initializer().and_then(|e| array_len_in_file(&e, 0)));
+            .or_else(|| l.initializer().and_then(|e| self.expr_dims(&e).first().copied()));
         let Some(len) = len else {
             return false;
         };
@@ -295,7 +295,7 @@ impl Checker<'_> {
         let len = l
             .ty()
             .and_then(|t| array_type_len(&t))
-            .or_else(|| l.initializer().and_then(|e| array_len_in_file(&e, 0)))?;
+            .or_else(|| l.initializer().and_then(|e| self.expr_dims(&e).first().copied()))?;
         let is_rest = |p: &ast::Pat| match p {
             ast::Pat::RestPat(_) => true,
             ast::Pat::IdentPat(ip) => matches!(ip.pat(), Some(ast::Pat::RestPat(_))),
@@ -320,9 +320,17 @@ impl Checker<'_> {
         if !dims.is_empty() {
             return dims;
         }
-        l.initializer()
-            .map(|e| array_dims_in_file(&e, 0))
-            .unwrap_or_default()
+        l.initializer().map(|e| self.expr_dims(&e)).unwrap_or_default()
+    }
+
+    /// `array_dims_in_file`, or the length of the array a std method returned there
+    /// (`x.to_le_bytes()`).
+    fn expr_dims(&self, e: &ast::Expr) -> Vec<usize> {
+        let inner = super::strip_parens(e);
+        if let Some(d) = self.std_array_dims.get(&inner.syntax().text_range()) {
+            return d.clone();
+        }
+        array_dims_in_file(e, 0)
     }
 
     /// The dimensions of the items a `for` loop takes from `iterable` (`for [k, v] in pairs`,
@@ -341,8 +349,24 @@ impl Checker<'_> {
             }
             other => Some(other),
         };
-        let dims = inner.map(|e| array_dims_in_file(&e, 0)).unwrap_or_default();
-        dims.get(1..).map(<[usize]>::to_vec).unwrap_or_default()
+        let Some(inner) = inner else {
+            return Vec::new();
+        };
+        // (`&rows` / `&mut rows`: the local itself.)
+        let inner = match super::strip_parens(&inner) {
+            ast::Expr::RefExpr(r) => r.expr().unwrap_or(inner),
+            _ => inner,
+        };
+        let dims = self.expr_dims(&inner);
+        if !dims.is_empty() {
+            return dims[1..].to_vec();
+        }
+        // `rows: Vec<[i32; 2]>` (or `&[[i32; 2]]`, `VecDeque<..>`): the element type's.
+        let elem = |t: Option<ast::Type>| t.and_then(|t| elem_type(&t)).map(|t| array_type_dims(&t));
+        match decl_of(&inner) {
+            Some(Decl::Let(ty, _)) | Some(Decl::Param(ty)) => elem(ty).unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// `ty` as the exhaustiveness check sees an array of dimensions `dims`: its length known at
@@ -472,12 +496,6 @@ impl Checker<'_> {
     }
 }
 
-/// `array_expr_len`, also through what the file declares: a local's `let`, a parameter's type,
-/// a function's or method's return type, a field's type, a `const`.
-pub fn array_len_in_file(e: &ast::Expr, depth: usize) -> Option<usize> {
-    array_dims_in_file(e, depth).first().copied()
-}
-
 /// The nested lengths of an array type (`[[u8; 2]; 3]` → `[3, 2]`), as far as they're written
 /// with literals or a `const` of the file set to one.
 pub fn array_type_dims(t: &ast::Type) -> Vec<usize> {
@@ -514,7 +532,9 @@ fn const_len(a: &ast::ArrayType) -> Option<usize> {
         .ok()
 }
 
-/// `array_len_in_file` with the lengths of nested arrays too (`[[1, 2], [3, 4]]` → `[2, 2]`).
+/// `array_expr_len`, also through what the file declares (a local's `let`, a parameter's type,
+/// a function's or method's return type, a field's type, a `const`), with the lengths of nested
+/// arrays too (`[[1, 2], [3, 4]]` → `[2, 2]`).
 pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
     if depth > 4 {
         return array_expr_len(e).into_iter().collect();
@@ -567,10 +587,22 @@ pub fn array_dims_in_file(e: &ast::Expr, depth: usize) -> Vec<usize> {
                 .unwrap_or_default(),
             _ => Vec::new(),
         },
-        ast::Expr::MethodCallExpr(m) => m
-            .name_ref()
-            .map(|n| fn_ret_dims(&root, n.text()))
-            .unwrap_or_default(),
+        ast::Expr::MethodCallExpr(m) => {
+            let Some(name) = m.name_ref() else {
+                return Vec::new();
+            };
+            let dims = fn_ret_dims(&root, name.text());
+            if !dims.is_empty() {
+                return dims;
+            }
+            // `arr.map(f)` keeps the length (not the elements'); `arr.clone()` keeps it all.
+            let recv = || m.receiver().map(|r| array_dims_in_file(&r, depth + 1)).unwrap_or_default();
+            match &*name.text() {
+                "map" => recv().into_iter().take(1).collect(),
+                "clone" => recv(),
+                _ => Vec::new(),
+            }
+        }
         ast::Expr::FieldExpr(fe) => {
             let Some(field) = fe.name_ref().map(|n| n.text().to_string()) else {
                 return Vec::new();
@@ -762,3 +794,28 @@ fn expr_shape(e: &ast::Expr) -> PatShape {
     }
 }
 
+
+/// The element type of a sequence type: `Vec<T>`, `VecDeque<T>`, `Box<[T]>`, `[T]`, `[T; N]`,
+/// through references.
+fn elem_type(t: &ast::Type) -> Option<ast::Type> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    match t {
+        ast::Type::RefType(r) => elem_type(&r.ty()?),
+        ast::Type::ParenType(p) => elem_type(&p.ty()?),
+        ast::Type::SliceType(s) => s.ty(),
+        ast::Type::ArrayType(a) => a.ty(),
+        ast::Type::PathType(p) => {
+            let seg = p.path()?.segment()?;
+            let arg = match seg.generic_arg_list()?.generic_args().next()? {
+                ast::GenericArg::TypeArg(a) => a.ty()?,
+                _ => return None,
+            };
+            match &*seg.name_ref()?.text() {
+                "Vec" | "VecDeque" => Some(arg),
+                "Box" | "Rc" | "Arc" => elem_type(&arg),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}

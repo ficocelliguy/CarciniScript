@@ -160,6 +160,13 @@ impl Method {
                 }
             }
         }
+        // (`E` of `impl<E: Default> Tr<E> for (Ix, Ix)`: the call knows it from the trait's
+        // arguments.)
+        for p in &self.trait_params {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
         out
     }
 }
@@ -287,6 +294,15 @@ pub struct Adts {
     /// (`impl W<i32> { fn get }`, `impl W<String> { fn get }`): picked by the receiver's type
     /// arguments, not by a trait.
     pub inherent_alts: std::collections::HashSet<String>,
+    /// Traits with an impl for a reference to a concrete built-in type (`impl Inv for &f32`,
+    /// see `concrete_ref_impl`): a reference passed for a type parameter bounded by one carries
+    /// its class (`κσ.$wrapT`), as for a `&T` wrapper impl.
+    pub ref_impl_traits: std::collections::HashSet<String>,
+    /// (type, trait) pairs with an impl that isn't `concrete_ref_impl`: a second one conflicts.
+    pub plain_impl_pairs: std::collections::HashSet<(String, String)>,
+    /// Impls of a trait for a tuple or slice whose type parameters are all bounded by that trait
+    /// (`impl<T: Enc> Enc for [T]`), by `self_bounded_key`: see `separable_args`.
+    pub self_bounded: std::collections::HashSet<String>,
     /// The `"Type::key"`s of methods from an `impl PartialEq<R> for Type` (or `PartialOrd<R>`)
     /// whose `R` is another type: `a.eq(&b)` with a `b` of `a`'s own type takes the derived or
     /// std comparison instead.
@@ -447,6 +463,87 @@ pub fn const_pat_segs(path: ast::Path) -> Vec<String> {
 
 /// Whether two impls' type arguments can never be the same type (`i32` and `String`, `1` and
 /// `2`, `Vec<u8>` and `Vec<u16>`); a type parameter could be anything.
+/// Whether impls of trait `tr` for a tuple or slice (`ty`) with self type arguments `a` and `b`
+/// can each be picked per call: their arguments are disjoint (`(u8, u8)`, `(String, String)`), or
+/// one is concrete where the other is generic and the generic impl's parameters are bounded by
+/// `tr` itself, which the concrete arguments don't implement (`impl Enc for [u8]` next to
+/// `impl<T: Enc> Enc for [T]`: rustc's coherence reasoning about a local trait; picked as
+/// specialization would).
+pub fn separable_args(adts: &Adts, tr: &str, ty: &str, a: &[Ty], b: &[Ty]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.iter().zip(b).any(|(x, y)| disjoint_args(x, y)) {
+        return true;
+    }
+    let generic = |xs: &[Ty]| {
+        let mut g = false;
+        for x in xs {
+            x.walk(&mut |t| g |= matches!(t, Ty::Param(_)));
+        }
+        g
+    };
+    let (g, c) = match (generic(a), generic(b)) {
+        (true, false) => (a, b),
+        (false, true) => (b, a),
+        _ => return false,
+    };
+    adts.self_bounded.contains(&self_bounded_key(ty, tr, g))
+        && g.iter().zip(c).all(|(x, y)| {
+            !matches!(x, Ty::Param(_)) || {
+                let k = match y {
+                    Ty::Adt(n, _) => Some(n.as_str()),
+                    t => ext_key_of(t),
+                };
+                !k.and_then(|k| adts.trait_impls.get(k)).is_some_and(|ts| ts.iter().any(|t| t == tr))
+            }
+        })
+}
+
+/// The key of an impl in `Adts::self_bounded`.
+pub fn self_bounded_key(ty: &str, tr: &str, args: &[Ty]) -> String {
+    format!("{ty}|{tr}|{args:?}")
+}
+
+/// Whether every type parameter of `imp` is bounded by the trait it implements, `tr` (`impl<T:
+/// Enc> Enc for [T]`, also in a `where` clause).
+pub fn self_bounded_impl(imp: &ast::Impl, tr: &str) -> bool {
+    let Some(gl) = imp.generic_param_list() else {
+        return false;
+    };
+    let names = |l: Option<ast::TypeBoundList>| -> Vec<String> {
+        l.into_iter()
+            .flat_map(|l| l.bounds())
+            .filter_map(|b| match b.ty()? {
+                ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut any = false;
+    for p in gl.type_or_const_params() {
+        let ast::TypeOrConstParam::Type(tp) = p else { continue };
+        let Some(n) = tp.name().map(|n| n.text().to_string()) else { continue };
+        any = true;
+        let mut bs = names(tp.type_bound_list());
+        for pred in imp.where_clause().into_iter().flat_map(|w| w.predicates()) {
+            if pred.ty().is_some_and(|t| t.syntax().text() == n.as_str()) {
+                bs.extend(names(pred.type_bound_list()));
+            }
+        }
+        if !bs.iter().any(|b| b == tr) {
+            return false;
+        }
+    }
+    any
+}
+
+/// The keys an array's impls are picked among per call: a tuple's, and a slice's (`[u8]` next
+/// to `[T]`).
+pub fn array_alts_key(key: &str) -> bool {
+    tuple_arity(key).is_some() || key == "Vec"
+}
+
 pub fn disjoint_args(a: &Ty, b: &Ty) -> bool {
     let both = |x: &[&Ty], y: &[&Ty]| {
         x.len() != y.len() || x.iter().zip(y).any(|(p, q)| disjoint_args(p, q))
@@ -911,9 +1008,10 @@ pub fn impl_parts(imp: &ast::Impl) -> (Option<String>, Option<String>) {
         {
             boxed_named(&p, imp).or_else(|| name_of(Some(ast::Type::PathType(p))))
         }
-        // `impl Debug for dyn Shape`: as `Box<dyn Shape>`'s.
+        // `impl Debug for dyn Shape`: as `Box<dyn Shape>`'s. So are the methods of `impl dyn Shape`.
         Some(ast::Type::DynTraitType(d))
-            if name_of(imp.trait_()).is_some_and(|t| DYN_IMPL_TRAITS.contains(&t.as_str())) =>
+            if imp.trait_().is_none()
+                || name_of(imp.trait_()).is_some_and(|t| DYN_IMPL_TRAITS.contains(&t.as_str())) =>
         {
             dyn_key(&d)
         }
@@ -1681,6 +1779,29 @@ pub fn wrapper_impl(imp: &ast::Impl) -> Option<(String, String)> {
     Some((format!("{tr}${kind}"), p))
 }
 
+/// `impl Inv for &f32` / `impl Target for &mut String`: a trait impl for a reference to a concrete
+/// built-in type (not a wrapper of a type parameter, see `wrapper_impl`), which is that type in
+/// JS. Its methods go under `m$ref` / `m$refmut` next to the type's own impl's (see
+/// `Checker::pick_ref_impl`). "ref" or "refmut".
+pub fn concrete_ref_impl(imp: &ast::Impl) -> Option<&'static str> {
+    imp.trait_()?;
+    let ast::Type::RefType(r) = imp.self_ty()? else {
+        return None;
+    };
+    if wrapped_param(imp).is_some() {
+        return None;
+    }
+    let ast::Type::PathType(p) = r.ty()? else {
+        return None;
+    };
+    let n = p.path()?.segment()?.name_ref()?.text().to_string();
+    // (`impl Tr for &str` is `str`'s impl.)
+    if n == "str" || !matches!(ext_key(&n)?, "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "i128" | "u128" | "f32" | "f64" | "bool" | "char" | "String") {
+        return None;
+    }
+    Some(if r.mut_token().is_some() { "refmut" } else { "ref" })
+}
+
 /// Whether `key` is a `wrapper_impl`'s class key.
 pub fn is_wrapper_key(key: &str) -> bool {
     key.ends_with("$ref") || key.ends_with("$refmut") || key.ends_with("$box")
@@ -1730,6 +1851,43 @@ impl Adts {
     /// differ in a parameter whose values tell them apart at run time (a struct's class, a
     /// number against a string, a tuple's length): a call through a type parameter or `dyn`
     /// then reaches the right one through `κσ.$argAlt`. None otherwise.
+    /// For a method that several impls of one generic trait give `ty`: each impl's key,
+    /// parameter types and trait arguments (`Scale<f64>`'s `[f64]`), when the trait's impls for
+    /// `ty` line up one to one with the keys. A call through a bound hands the trait arguments'
+    /// classes (`trait_arg_names`), which pick the impl where the arguments' values can't
+    /// (`Scale<f64>` against `Scale<i32>`, `Conv<u8>` against `Conv<u16>`).
+    pub fn alt_trait_args(&self, ty: &str, method: &str) -> Option<Vec<(String, Vec<Ty>, Vec<Ty>)>> {
+        let k = format!("{ty}::{method}");
+        if self.inherent_alts.contains(&k) || tuple_arity(ty).is_some() {
+            return None;
+        }
+        let keys = self.method_alts.get(&k)?;
+        let (tr, _) = self.traits.iter().find(|(n, d)| {
+            !d.type_params.is_empty()
+                && d.methods.iter().any(|t| t.name == method)
+                && self.impl_heads.contains_key(&(ty.to_string(), n.to_string()))
+        })?;
+        let heads = self.impl_heads.get(&(ty.to_string(), tr.clone()))?;
+        if heads.len() != keys.len() {
+            return None;
+        }
+        keys.iter()
+            .zip(heads)
+            .map(|(alt, (_, ta))| Some((alt.clone(), self.method(ty, alt)?.params.clone(), ta.clone())))
+            .collect()
+    }
+
+    /// Whether some type has several impls of the generic trait `tr` whose `method` the trait
+    /// arguments' classes pick (`alt_trait_args`): `Tr::method(x)` then goes through the
+    /// method's dispatcher, not `Tr$method` (one name for all of them).
+    pub fn picked_by_trait_args(&self, tr: &str, method: &str) -> bool {
+        self.trait_impls.iter().any(|(ty, trs)| {
+            trs.iter().any(|t| t == tr)
+                && self.impl_heads.get(&(ty.clone(), tr.to_string())).is_some_and(|h| h.len() > 1)
+                && self.alt_trait_args(ty, method).is_some()
+        })
+    }
+
     pub fn alt_dispatch(&self, ty: &str, method: &str) -> Option<Vec<(String, Vec<Ty>)>> {
         let k = format!("{ty}::{method}");
         if self.inherent_alts.contains(&k) || tuple_arity(ty).is_some() {

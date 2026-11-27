@@ -218,7 +218,7 @@ impl Checker<'_> {
             }
 
             // `s.as_ref()` / `v.borrow()` (`AsRef<str>`, `AsRef<[T]>`): the value itself.
-            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow") => {
+            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_, _), "as_ref" | "borrow") => {
                 count(self, 0);
                 rt.clone()
             }
@@ -589,7 +589,14 @@ impl Checker<'_> {
                 // Lossless numeric conversion: `u64::from(x)`, `f64::from(x)`.
                 count(self, 1);
                 if let Some(a) = a0 {
-                    self.infer(a, None);
+                    let at = self.infer(a, None);
+                    // (Or your `impl From<S> for u8`.)
+                    if matches!(self.shallow(&at), Ty::Adt(..))
+                        && self.adts.from_impls.contains_key(*t)
+                    {
+                        let args: Vec<ast::Expr> = a0.into_iter().cloned().collect();
+                        self.conv_from_call(c, t, &args);
+                    }
                 }
                 Ty::from_name(t)
             }
@@ -741,7 +748,7 @@ impl Checker<'_> {
                     },
                     _ => Ty::Unknown,
                 };
-                Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into())))
+                Ty::Result(Box::new(t), Box::new(Ty::Dyn("Any".into(), Vec::new())))
             }
             // `drop(x)`: `x` is dropped now.
             ["drop"] | ["mem", "drop"] => {

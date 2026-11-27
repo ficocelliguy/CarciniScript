@@ -450,6 +450,7 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
         Ty::Result(k, v) => Ty::Result(s(k), s(v)),
         Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst(e, m)).collect()),
         Ty::Adt(n, args) => Ty::Adt(n.clone(), args.iter().map(|a| subst(a, m)).collect()),
+        Ty::Dyn(n, args) => Ty::Dyn(n.clone(), args.iter().map(|a| subst(a, m)).collect()),
         Ty::RefCell(x) => Ty::RefCell(s(x)),
         Ty::MutRef(x) => Ty::MutRef(s(x)),
         Ty::Iter { elem, mutable } => Ty::Iter {
@@ -484,6 +485,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.param_trait_alts.clear();
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
@@ -692,6 +694,8 @@ impl Checker<'_> {
         }
         self.generics.insert(item.clone(), Ty::Param(item.clone()));
         self.param_bounds.insert(item.clone(), bounds.clone());
+        // (`where I::Item: Tr<E>`: `E`, for `Tr::E` in its methods.)
+        self.record_bound_args(&item, &lists);
         params.push((item.clone(), bounds));
         Ty::Param(item)
     }
@@ -862,7 +866,7 @@ impl Checker<'_> {
     /// Record `name`'s user-trait bounds with their arguments.
     pub(super) fn record_bound_args(&mut self, name: &str, lists: &[ast::TypeBoundList]) {
         use ra_ap_syntax::ast::HasGenericArgs;
-        let mut per = HashMap::new();
+        let mut per: super::BoundArgs = HashMap::new();
         for l in lists {
             for b in l.bounds() {
                 let Some(ast::Type::PathType(pt)) = b.ty() else {
@@ -898,6 +902,15 @@ impl Checker<'_> {
                         _ => {}
                     }
                 }
+                // (`C: Conv<u8> + Conv<u16>`: each, for the calls to pick from.)
+                if let Some((first, _)) = per.get(&tr) {
+                    let alts = self
+                        .param_trait_alts
+                        .entry((name.to_string(), tr.clone()))
+                        .or_insert_with(|| vec![first.clone()]);
+                    alts.push(pos);
+                    continue;
+                }
                 per.insert(tr, (pos, named));
             }
         }
@@ -910,6 +923,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.param_trait_alts.clear();
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
@@ -1153,7 +1167,7 @@ impl Checker<'_> {
                     .type_params
                     .iter()
                     .any(|(x, bs)| x == n && bs.iter().any(|b| b == "IoRead" || b == "IoBufRead")),
-                Ty::Dyn(tr) => tr == "IoRead" || tr == "IoBufRead",
+                Ty::Dyn(tr, _) => tr == "IoRead" || tr == "IoBufRead",
                 _ => false,
             })
             .map(|(i, _)| i)
@@ -1167,7 +1181,7 @@ impl Checker<'_> {
             if let (Some(ast::Expr::RefExpr(r)), Some(t)) = (args.get(i), inst.get(i))
                 && r.mut_token().is_some()
                 && (self.is_bytes(t)
-                    || matches!(t, Ty::Dyn(_)) && arg_ty(self, r).is_some_and(|a| self.is_bytes(&a)))
+                    || matches!(t, Ty::Dyn(_, _)) && arg_ty(self, r).is_some_and(|a| self.is_bytes(&a)))
                 // (`r: &mut R` given `&mut s`, `s: &[u8]`: it reads `s`'s own copy in place.)
                 && !(mut_ref_params.get(i) == Some(&true)
                     && self.slice_ref_muts.contains(&self.range(r.syntax())))
@@ -1513,7 +1527,7 @@ impl Checker<'_> {
             "source" if self.param_has(name, "Error") => {
                 self.arg_count(m.syntax(), "method", 0, args.len());
                 self.note_crate(m.syntax(), "err.source", vec![]);
-                Ty::Option(Box::new(Ty::Dyn("Error".into())))
+                Ty::Option(Box::new(Ty::Dyn("Error".into(), Vec::new())))
             }
             // A `C: Extend<T>`: by what the value is at run time (a `Vec`, map, set, string or
             // your own `impl Extend`).

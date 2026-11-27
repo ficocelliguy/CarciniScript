@@ -61,6 +61,13 @@ pub(crate) fn preludes(text: &str, paths: bool) -> Vec<&'static str> {
     {
         out.push(WRAPPING);
     }
+    if text.contains("NonZero")
+        && !text.contains("// (nonzero prelude)")
+        && !declares(text, "NonZeroU8")
+        && nonzero_newtypes(&crate::macros::parse_tree(text))
+    {
+        out.push(nonzero_prelude());
+    }
     if (crate::stdtime::has_word(text, "CStr") || crate::stdtime::has_word(text, "CString"))
         && !text.contains("// (cstr prelude)")
         && !declares(text, "CStr")
@@ -205,6 +212,234 @@ fn nonzero_int(name: &str) -> Option<String> {
     crate::ty::IntKind::from_name(&int).map(|_| int)
 }
 
+/// `NonZeroU8` for `u8`.
+fn nonzero_name(int: &str) -> String {
+    let mut cs = int.chars();
+    let first = cs.next().map(|c| c.to_ascii_uppercase()).unwrap_or_default();
+    format!("NonZero{first}{}", cs.as_str())
+}
+
+/// The integer of an impl's self type when it is one (`u8`) or its `NonZero*` (`NonZeroU8`,
+/// `NonZero<u8>`, `std::num::NonZeroU8`), with whether it is the `NonZero*`.
+fn impl_int(t: &ast::Type) -> Option<(String, bool)> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let ast::Type::PathType(p) = t else {
+        return None;
+    };
+    let seg = p.path()?.segment()?;
+    let name = seg.name_ref()?.text().to_string();
+    if crate::ty::IntKind::from_name(&name).is_some() {
+        return Some((name, false));
+    }
+    if name == "NonZero" {
+        let arg = seg.generic_arg_list()?.generic_args().next()?.syntax().text().to_string();
+        crate::ty::IntKind::from_name(&arg)?;
+        return Some((arg, true));
+    }
+    nonzero_int(&name).map(|i| (i, true))
+}
+
+/// Whether the file implements one trait for both an integer and its `NonZero*` (`impl Tr for
+/// u8` and `impl Tr for NonZeroU8`). Elsewhere a `NonZeroU8` is its `u8` (no call could tell the
+/// impls apart); in such a file the `NonZero*` types are the nonzero prelude's, each a struct of
+/// its own, which calls tell apart by class (directly, through `T: Tr` and through `dyn Tr`).
+pub(crate) fn nonzero_newtypes(file: &SourceFile) -> bool {
+    let mut seen: Vec<(String, String, bool)> = Vec::new();
+    for imp in file.syntax().descendants().filter_map(ast::Impl::cast) {
+        let (Some(tr), Some(st)) = (imp.trait_(), imp.self_ty()) else {
+            continue;
+        };
+        let Some((int, nz)) = impl_int(&st) else {
+            continue;
+        };
+        let tr = tr.syntax().text().to_string();
+        if seen.iter().any(|(t, i, z)| *t == tr && *i == int && *z != nz) {
+            return true;
+        }
+        seen.push((tr, int, nz));
+    }
+    false
+}
+
+/// In a file with the nonzero prelude's types (`nonzero_newtypes`): `NonZero<u8>` and
+/// `NonZero::<u8>::` as `NonZeroU8`, and `std::num::NonZeroU8` as the prelude's `NonZeroU8`.
+fn rewrite_nonzero_newtype(
+    toks: &[Tok],
+    q: usize,
+    i: usize,
+    edits: &mut Vec<(usize, usize, String)>,
+) -> Option<usize> {
+    let name = toks[i].text.as_str();
+    let txt = |k: usize| toks.get(k).map(|t| t.text.as_str()).unwrap_or_default();
+    if name == "NonZero" {
+        let (int, close, next) = match (txt(i + 1), txt(i + 2)) {
+            ("<", int) if txt(i + 3) == ">" => (int, i + 3, i + 4),
+            ("::", "<") if txt(i + 4) == ">" => (txt(i + 3), i + 4, i + 5),
+            _ => return Some(i + 1),
+        };
+        crate::ty::IntKind::from_name(int)?;
+        edits.push((toks[q].start, toks[close].end, nonzero_name(int)));
+        return Some(next);
+    }
+    nonzero_int(name)?;
+    if q < i {
+        edits.push((toks[q].start, toks[i].start, String::new()));
+    }
+    Some(i + 1)
+}
+
+/// The nonzero prelude: `NonZeroU8` and the rest as structs over their integer (see
+/// `nonzero_newtypes`), with std's methods a script uses.
+fn nonzero_prelude() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let mut out = String::from("// (nonzero prelude)\n");
+        for int in [
+            "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        ] {
+            let signed = int.starts_with('i');
+            let mut t = NONZERO.to_string();
+            t.push_str(if signed { NONZERO_SIGNED } else { NONZERO_UNSIGNED });
+            let min = if signed { "INT::MIN" } else { "1" };
+            let bits = match int.trim_start_matches(['i', 'u']) {
+                "size" => "64",
+                b => b,
+            };
+            out.push_str(
+                &t.replace("NZ", &nonzero_name(int))
+                    .replace("MIN_VALUE", min)
+                    .replace("BITS_VALUE", bits)
+                    .replace("INT", int),
+            );
+        }
+        out
+    })
+}
+
+/// One `NonZero*` of the nonzero prelude: `NZ` over `INT`.
+const NONZERO: &str = r#"
+/// `std::num::NZ`: an `INT` that is never zero.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NZ(INT);
+
+impl NZ {
+    pub const MIN: NZ = NZ(MIN_VALUE);
+    pub const MAX: NZ = NZ(INT::MAX);
+    pub const BITS: u32 = BITS_VALUE;
+    pub const fn new(n: INT) -> Option<NZ> {
+        if n == 0 { None } else { Some(NZ(n)) }
+    }
+    pub const unsafe fn new_unchecked(n: INT) -> NZ {
+        NZ(n)
+    }
+    pub const fn get(self) -> INT {
+        self.0
+    }
+    pub fn leading_zeros(self) -> u32 {
+        self.0.leading_zeros()
+    }
+    pub fn trailing_zeros(self) -> u32 {
+        self.0.trailing_zeros()
+    }
+    pub fn count_ones(self) -> u32 {
+        self.0.count_ones()
+    }
+    pub fn checked_mul(self, o: NZ) -> Option<NZ> {
+        self.0.checked_mul(o.0).map(NZ)
+    }
+    pub fn saturating_mul(self, o: NZ) -> NZ {
+        NZ(self.0.saturating_mul(o.0))
+    }
+    pub fn checked_pow(self, e: u32) -> Option<NZ> {
+        self.0.checked_pow(e).map(NZ)
+    }
+    pub fn saturating_pow(self, e: u32) -> NZ {
+        NZ(self.0.saturating_pow(e))
+    }
+}
+
+impl std::fmt::Display for NZ {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for NZ {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl From<NZ> for INT {
+    fn from(n: NZ) -> INT {
+        n.0
+    }
+}
+
+impl std::ops::BitOr for NZ {
+    type Output = NZ;
+    fn bitor(self, o: NZ) -> NZ {
+        NZ(self.0 | o.0)
+    }
+}
+
+impl std::ops::BitOr<INT> for NZ {
+    type Output = NZ;
+    fn bitor(self, o: INT) -> NZ {
+        NZ(self.0 | o)
+    }
+}
+"#;
+
+/// The unsigned `NonZero*`'s own methods.
+const NONZERO_UNSIGNED: &str = r#"
+impl NZ {
+    pub fn checked_add(self, o: INT) -> Option<NZ> {
+        self.0.checked_add(o).map(NZ)
+    }
+    pub fn saturating_add(self, o: INT) -> NZ {
+        NZ(self.0.saturating_add(o))
+    }
+    pub fn is_power_of_two(self) -> bool {
+        self.0.is_power_of_two()
+    }
+    pub fn ilog2(self) -> u32 {
+        self.0.ilog2()
+    }
+    pub fn ilog10(self) -> u32 {
+        self.0.ilog10()
+    }
+}
+"#;
+
+/// The signed `NonZero*`'s own methods.
+const NONZERO_SIGNED: &str = r#"
+impl NZ {
+    pub fn is_positive(self) -> bool {
+        self.0 > 0
+    }
+    pub fn is_negative(self) -> bool {
+        self.0 < 0
+    }
+    pub fn abs(self) -> NZ {
+        NZ(self.0.abs())
+    }
+    pub fn checked_abs(self) -> Option<NZ> {
+        self.0.checked_abs().map(NZ)
+    }
+    pub fn checked_neg(self) -> Option<NZ> {
+        self.0.checked_neg().map(NZ)
+    }
+}
+
+impl std::ops::Neg for NZ {
+    type Output = NZ;
+    fn neg(self) -> NZ {
+        NZ(-self.0)
+    }
+}
+"#;
+
 /// The std names `use` items bring in: `Path` after `use std::path::{Path, PathBuf};`, all of a
 /// module's after `use std::path::*;`.
 fn std_imports(file: &SourceFile) -> Vec<String> {
@@ -295,6 +530,7 @@ pub(crate) fn expand(
         .map(|u| u.syntax().text_range())
         .collect();
     let toks = tokens(&file, &uses);
+    let newtypes = text.contains("NonZero") && nonzero_newtypes(&file);
     let mut edits: Vec<(usize, usize, String)> = write_fmt_calls(&file);
     edits.extend(writer_params(&file));
     edits.extend(c_string_literals(&file));
@@ -460,6 +696,13 @@ pub(crate) fn expand(
         };
         if !ok {
             i += 1;
+            continue;
+        }
+        // (`impl Tr for NonZeroU8` next to `impl Tr for u8`: the nonzero prelude's types.)
+        if newtypes
+            && let Some(next) = rewrite_nonzero_newtype(&toks, q, i, &mut edits)
+        {
+            i = next;
             continue;
         }
         if let Some(next) = rewrite_other(&toks, q, i, &mut edits) {

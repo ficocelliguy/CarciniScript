@@ -65,7 +65,7 @@ fn clone_of(dyn_clones: &[(Ty, String)], ty: &Ty, e: &str) -> String {
 /// The `clone` of `impl Clone for Box<dyn Tr>` when `ty` is that `dyn Tr` (it typically calls
 /// `self.clone_box()`), as a JS function taking the value as `this`.
 pub(super) fn dyn_clone(adts: &crate::adt::Adts, ty: &Ty) -> Option<String> {
-    let Ty::Dyn(tr) = ty else {
+    let Ty::Dyn(tr, _) = ty else {
         return None;
     };
     let key = format!("dyn${tr}");
@@ -78,7 +78,7 @@ fn dyn_clones(adts: &crate::adt::Adts) -> Vec<(Ty, String)> {
     adts.ext_types
         .iter()
         .filter_map(|k| {
-            let t = Ty::Dyn(k.strip_prefix("dyn$")?.to_string());
+            let t = Ty::Dyn(k.strip_prefix("dyn$")?.to_string(), Vec::new());
             Some((t.clone(), dyn_clone(adts, &t)?))
         })
         .collect()
@@ -99,7 +99,7 @@ fn eq_of(adts: &crate::adt::Adts, ty: &Ty, a: &str, b: &str) -> String {
 /// field by field); `None` when `ty` holds no such `dyn`.
 pub(super) fn dyn_eq_fn(adts: &crate::adt::Adts, ty: &Ty) -> Option<String> {
     match ty {
-        Ty::Dyn(tr) => {
+        Ty::Dyn(tr, _) => {
             let key = format!("dyn${tr}");
             adts.method(&key, "eq")?;
             Some(format!("((a, b) => $ext${key}.prototype.eq.call(a, b))"))
@@ -132,7 +132,7 @@ pub(super) fn ext_self_ty(key: &str) -> Ty {
         "Option" => Ty::Option(Box::new(Ty::Unknown)),
         "bool" => Ty::Bool,
         "char" => Ty::Char,
-        k if let Some(tr) = k.strip_prefix("dyn$") => Ty::Dyn(tr.to_string()),
+        k if let Some(tr) = k.strip_prefix("dyn$") => Ty::Dyn(tr.to_string(), Vec::new()),
         k => Ty::from_name(k),
     }
 }
@@ -397,6 +397,8 @@ impl Codegen<'_> {
                         )
                         // (Stored as `Trait$method` already: emitted under that name below.)
                         && key != js(&n)
+                        // (Impls the trait arguments pick share the dispatcher instead.)
+                        && !self.types.adts.picked_by_trait_args(&tr, n.text().as_ref())
                         && let Some(sig) = self.types.adts.method(&def.name, &key).cloned()
                     {
                         let js = js(&n);
@@ -609,29 +611,49 @@ impl Codegen<'_> {
             .collect();
         names.sort();
         for m in names {
-            let Some(sigs) = self.types.adts.alt_dispatch(key, &m) else {
-                continue;
-            };
+            // (Through a bound the trait arguments' classes come too, which tell apart the impls
+            // whose arguments look alike: `Scale<f64>` and `Scale<i32>`.)
+            let by_class = self.types.adts.alt_trait_args(key, &m);
+            let sigs: Vec<(String, Vec<Ty>, Vec<Ty>)> =
+                match (self.types.adts.alt_dispatch(key, &m), by_class) {
+                    (_, Some(s)) => s,
+                    (Some(s), None) => s.into_iter().map(|(k, ps)| (k, ps, Vec::new())).collect(),
+                    (None, None) => continue,
+                };
             let statik = self
                 .types
                 .adts
                 .method(key, &m)
                 .is_some_and(|s| s.receiver.is_none());
+            let class = |p: &Ty| {
+                let mut generic = false;
+                p.walk(&mut |t| generic |= matches!(t, Ty::Param(_)));
+                match self.dict_of(p) {
+                    d if generic || d == "undefined" => "null".to_string(),
+                    d => d,
+                }
+            };
+            // (Those classes follow the arguments and the classes of the method's own type
+            // parameters that the call passes: `Tr::m`'s.)
+            let own = self
+                .types
+                .adts
+                .traits
+                .iter()
+                .filter(|(_, d)| !d.type_params.is_empty() && d.methods.iter().any(|t| t.name == m))
+                .find_map(|(n, _)| self.types.dict_params.get(&format!("{n}::{m}")))
+                .map_or(0, |l| l.iter().filter(|x| !x.contains("::")).count());
             let entries: Vec<String> = sigs
                 .iter()
-                .map(|(k, ps)| {
-                    let ds: Vec<String> = ps
-                        .iter()
-                        .map(|p| {
-                            let mut generic = false;
-                            p.walk(&mut |t| generic |= matches!(t, Ty::Param(_)));
-                            match self.dict_of(p) {
-                                d if generic || d == "undefined" => "null".to_string(),
-                                d => d,
-                            }
-                        })
-                        .collect();
-                    format!("[{}, [{}]]", super::js_string(&prop(k)), ds.join(", "))
+                .map(|(k, ps, ts)| {
+                    let ds: Vec<String> = ps.iter().map(class).collect();
+                    let ts: Vec<String> = ts.iter().map(class).collect();
+                    format!(
+                        "[{}, [{}], [{}], {own}]",
+                        super::js_string(&prop(k)),
+                        ds.join(", "),
+                        ts.join(", ")
+                    )
                 })
                 .collect();
             let target = if statik {
@@ -1067,7 +1089,7 @@ impl Codegen<'_> {
             k if crate::ty::RangeKind::from_name(k).is_some() => ext_self_ty(k),
             "bool" => Ty::Bool,
             "char" => Ty::Char,
-            k if let Some(tr) = k.strip_prefix("dyn$") => Ty::Dyn(tr.to_string()),
+            k if let Some(tr) = k.strip_prefix("dyn$") => Ty::Dyn(tr.to_string(), Vec::new()),
             k => Ty::from_name(k),
         };
         // (`Self::make()` in its methods is the class's own function.)
@@ -1305,7 +1327,8 @@ impl Codegen<'_> {
         // Impls of one trait for two tuples of this length (`(u8, u8)`, `(String, String)`): each
         // method's keys with the impl's element classes, which `κσ.$dcall` / `$dcallT` match
         // against the elements' classes or values. (A function: those classes may come later.)
-        if crate::adt::tuple_arity(key).is_some() {
+        // A slice's too (`[u8]` next to `[T]`), by the element's.
+        if crate::adt::array_alts_key(key) {
             let mut alts: Vec<String> = Vec::new();
             let mut names: Vec<&String> = self
                 .types

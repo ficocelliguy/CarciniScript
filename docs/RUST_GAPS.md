@@ -431,8 +431,10 @@ There is one JS thread, and scripts share it with the game.
   local, parameter, field or row into a new place; a copy made through a type parameter or a
   closure capture isn't tracked. `[T; N]::map` and slice `strip_prefix` also work on a `Vec`.
 - **An array's length is known only where it's written.** `let [a, b] = arr;` is accepted when
-  `arr`'s length shows in the `let` (an annotation, an array literal, `<[T; N]>::try_from(..)`);
-  an array from a function call needs the annotation (`let [a, b]: [f64; 2] = f();`). The same
+  `arr`'s length shows in the `let` (an annotation, an array literal, `<[T; N]>::try_from(..)`,
+  `x.to_le_bytes()` and its kin, `arr.map(..)`), and `for [a, b] in rows` when `rows` is an
+  array or a `Vec<[T; N]>` / `&[[T; N]]` local or parameter; an array from a function call needs
+  the annotation (`let [a, b]: [f64; 2] = f();`). The same
   goes for `Default` of `[T; N]` (a `#[derive(Default)]` field or a `let` annotation).
 - **A range of a Vec is a copy, unless borrowed `&mut`.** `v[1..4].sort()` and the other in-place
   slice methods copy the range, change it and write it back; `&mut v[a..b]` is a view (a JS
@@ -550,7 +552,11 @@ There is one JS thread, and scripts share it with the game.
   object's contents in place** (`κσ.$replace`), since JS can't rebind the caller's variable. The
   result is the same as Rust's.
 - **`NonZeroU32` (and the other widths) is a `u32`**: arithmetic on it type-checks and nothing
-  stops a 0 that isn't made through `new`. `NonZeroU32::MIN` is `u32::MIN`.
+  stops a 0 that isn't made through `new`. `NonZeroU32::MIN` is `u32::MIN`. A file that
+  implements one trait for both `u8` and `NonZeroU8` gets struct `NonZero*` types instead (so
+  the impls stay apart): those check as rustc does, but are objects in JS, so a value made there
+  and handed to another file that uses the plain number (or the other way round) misbehaves, and
+  they lack the hex and binary formatting traits and `FromStr`.
 
 ## Generics
 
@@ -656,10 +662,16 @@ There is one JS thread, and scripts share it with the game.
   `dyn` an owned value is tagged where it's coerced; a `T` no caller passes a class for (a function
   value) reaches the borrowed impl. So is an owned impl that leaves the trait's default methods to the
   default (whose `self.f()` can't tell the two apart). `Path` and `PathBuf` keep the older rule
-  (the owned impl must hand each call on to the borrowed one or do the same), and impls for both
-  `u8` and `NonZeroU8` (one number in JS) are a conflict.
-- **Arrays and slices share `Vec`'s impls**: `impl Tr for [u8; 4]` and `impl Tr for Vec<u8>` (or
-  `[u16]`) would collide, and the element type isn't checked.
+  (the owned impl must hand each call on to the borrowed one or do the same). A concrete reference impl next to its
+  type's (`impl Inv for &f32` and `impl Inv for f32`) is picked by whether the receiver is written
+  as a reference (`&x`, an `r: &f32` local or parameter) for a method taking `self` by value, as
+  rustc's probe does; a reference that isn't written as one (a field, a closure parameter) reaches
+  the type's own impl.
+- **Arrays and slices share `Vec`'s impls**: `impl Tr for [u8; 4]` and `impl Tr for Vec<u8>` would
+  collide. Slice impls for different element types (`[u8]` and `[u16]`, or `[u8]` next to
+  `impl<T: Tr> Tr for [T]`) are picked by the element type, and through a type parameter by the
+  element's class; without one (`dyn`) by the first element's value, which can't tell `u8` from another
+  integer type.
 - **`impl Tr for &T` / `&mut T` / `Box<T>` is reached only through a type parameter.** References
   and boxes are erased, so `&x` is `x` and its methods are `T`'s: an impl whose methods each call
   `T`'s (`(**self).f(a)`, `T::f(self, a)`, `<T as Tr>::f(*self, a)`, `self.as_ref().f(a)`,
@@ -688,10 +700,11 @@ There is one JS thread, and scripts share it with the game.
   closure's parameter, a `Box`) is a writer object over the place it came from, so what's
   written lands there, but `Any` downcasts of it don't see a `String`.
 - **A generic trait implemented several times for one type, called through a type parameter,
-  `dyn` or a `where Meters: Scale<R>` clause, picks its impl by the arguments' values at run
-  time** (a struct's class, number, string, tuple length), where rustc picks it at compile
-  time. Impls whose arguments look alike in JS (`f64` and `i32`, `str` and `char`) are an error
-  there; call the method on the concrete type.
+  `dyn` or a `where Meters: Scale<R>` clause, picks its impl at run time**, where rustc picks it
+  at compile time: by the trait arguments' classes the call hands over (a bound's, a `dyn`'s,
+  written ones), else by the arguments' values (a struct's class, number, string, tuple length).
+  Through two bounds of the trait on one parameter (`C: Conv<u8> + Conv<u16>`), a call no use
+  settles takes the first bound, where rustc asks for an annotation.
 - **A trait's methods need the trait in scope, as in rustc, with two leniencies.** A `use`
   inside a function body counts for its whole module, and a module with a macro call among its
   items (which might write a `use`) isn't checked. A `mod` file's trait that isn't imported
@@ -738,7 +751,9 @@ There is one JS thread, and scripts share it with the game.
 ## std::io
 
 - **`write_vectored` writes every buffer** (as a `Vec<u8>` does in Rust; std's default, and
-  Windows' stdout, write only the first).
+  Windows' stdout, write only the first). `read_vectored` reads into the first non-empty buffer
+  (std's default) for your own readers, and buffer after buffer until a short read for
+  `&[u8]`, `Cursor` and `BufReader`.
 - **`Read` / `BufRead` / `Seek` are the io prelude's traits.** `BufRead::fill_buf` gives a copy of the
   buffer (a `Vec<u8>`), and `lines()` / `split()` / `bytes()` read everything up front rather
   than lazily. `Cursor::new(Vec::new())` is a `Cursor<Vec<u8>>` (as its

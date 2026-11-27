@@ -191,7 +191,7 @@ impl Codegen<'_> {
                 f
             }
 
-            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_), "as_ref" | "borrow")
+            (Ty::Str | Ty::Vec(_) | Ty::Dyn(_, _), "as_ref" | "borrow")
             | (Ty::Vec(_), "as_mut" | "borrow_mut") => rf.clone(),
             (Ty::Int(_), "is_multiple_of") => helper("isMultipleOf", self.arg_frags(m)),
             // ---- integers
@@ -619,8 +619,15 @@ impl Codegen<'_> {
             [t, "from"] if matches!(Ty::from_name(t), Ty::Int(_) | Ty::Float { .. }) => {
                 let bool_arg = args.first().is_some_and(|a| self.ty_of(a.syntax()) == Some(Ty::Bool));
                 let x = emit(self, 0);
-                // `i16::from(true)`: 1.
-                if bool_arg { x.wrap("Number(", ")") } else { x }
+                // (Through your `impl From<S> for u8`.)
+                if let Some(conv @ crate::adt::Conv::From { .. }) = self.conv_of(c.syntax()) {
+                    self.convert(conv, x)
+                } else if bool_arg {
+                    // `i16::from(true)`: 1.
+                    x.wrap("Number(", ")")
+                } else {
+                    x
+                }
             }
             ["hint", "black_box"] => emit(self, 0),
             ["Rc" | "Arc", "downgrade"] => self.emit_expr(args.first()?, None).0,

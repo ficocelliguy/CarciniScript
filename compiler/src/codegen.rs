@@ -4988,7 +4988,7 @@ impl<'a> Codegen<'a> {
                 }
                 // `a < b` on a `dyn Tr` with `impl PartialOrd for Box<dyn Tr>`: its `partial_cmp`
                 // (`None` makes every comparison false).
-                if let (Ty::Dyn(tr), CmpOp::Ord { .. }) = (&lt, op)
+                if let (Ty::Dyn(tr, _), CmpOp::Ord { .. }) = (&lt, op)
                     && let key = format!("dyn${tr}")
                     && self.types.adts.method(&key, "partial_cmp").is_some()
                 {
@@ -5354,7 +5354,7 @@ impl<'a> Codegen<'a> {
         }
         // The type checker's type knows trait objects and closure types (`Box<dyn Score>`).
         let to = match self.ty_of(c.syntax()) {
-            Some(t @ (Ty::Dyn(_) | Ty::Closure { .. })) => t,
+            Some(t @ (Ty::Dyn(_, _) | Ty::Closure { .. })) => t,
             _ => self.lower_type(&target),
         };
         let (f, from) = self.operand(&inner, None);
@@ -5415,7 +5415,7 @@ impl<'a> Codegen<'a> {
             (Ty::Int(_) | Ty::Float { .. } | Ty::Unknown, Ty::Float { f32: false }) => f,
             (a, b) if a == b => f,
             // `as Box<dyn Trait>` / `as Box<dyn Fn(..)>`: the same JS value.
-            (_, Ty::Dyn(_) | Ty::Closure { .. }) => f,
+            (_, Ty::Dyn(_, _) | Ty::Closure { .. }) => f,
             (a, b) => {
                 self.error(
                     c.syntax(),
@@ -6510,6 +6510,10 @@ impl<'a> Codegen<'a> {
                 let (f, t) = self.emit_expr(a, None);
                 rest.push(self.by_value(a, f, &t));
             }
+            // (A generic trait's arguments' classes, `Conv::<u8>::conv(x)`: as in a method call.)
+            if let Some(ds) = self.dict_args_at(self.range_of(c.syntax())) {
+                rest.extend(ds.into_iter().map(Frag::text));
+            }
             head.push(member(&key))
                 .push("(")
                 .append(Frag::join(rest, ", "))
@@ -7331,7 +7335,7 @@ impl<'a> Codegen<'a> {
             return out;
         }
         // `boxed.as_ref()` of a `dyn Trait`: the value (boxes are erased).
-        if matches!(self.ty_of(recv.syntax()), Some(Ty::Dyn(_)))
+        if matches!(self.ty_of(recv.syntax()), Some(Ty::Dyn(_, _)))
             && matches!(method.as_str(), "as_ref" | "as_mut" | "borrow")
             && m.arg_list().is_none_or(|l| l.args().next().is_none())
         {
@@ -7563,6 +7567,9 @@ impl<'a> Codegen<'a> {
             };
             let params = sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
             let mut args = self.emit_args(m.arg_list(), &params);
+            if let Some(ds) = self.dict_args_at(self.range_of(m.syntax())) {
+                args.extend(ds.into_iter().map(Frag::text));
+            }
             // A blanket impl's method takes the receiver's `{:?}` formatter.
             if key.ends_with("$all") {
                 let d = debug_fn(&rt).unwrap_or_else(|| "String".into());
@@ -7750,7 +7757,7 @@ impl<'a> Codegen<'a> {
             return r;
         }
         // `shape.to_string()`: through `impl Display for Box<dyn Shape>`, or the value's own.
-        if let Ty::Dyn(tr) = &rt
+        if let Ty::Dyn(tr, _) = &rt
             && method == "to_string"
             && self.types.adts.method(&format!("dyn${tr}"), "to_string").is_none()
             && !self.types.adts.traits.get(tr).is_some_and(|t| t.methods.iter().any(|m| m.name == "to_string"))
@@ -7869,7 +7876,7 @@ impl<'a> Codegen<'a> {
             };
             return (f, ret);
         }
-        if let Ty::Dyn(_) = &rt {
+        if let Ty::Dyn(_, _) = &rt {
             // `dyn Trait`: dynamic dispatch.
             let name_off = self.off(name.syntax());
             let f = self.dyn_call(m, &rf, &method, name_off);
@@ -10041,7 +10048,7 @@ impl<'a> Codegen<'a> {
                 if self.types.io_writes.contains(&target.start) {
                     let mut f = Frag::mapped(start, "");
                     // (Also a `&mut dyn Write` field or local: the value decides at run time.)
-                    if crate::adt::ext_key_of(&tt).is_some() || matches!(tt, Ty::Param(_) | Ty::Dyn(_)) {
+                    if crate::adt::ext_key_of(&tt).is_some() || matches!(tt, Ty::Param(_) | Ty::Dyn(_, _)) {
                         f.push("κσ.$dcall($extRegs, ")
                             .append(tf)
                             .push(format!(", {}, ", js_string(&adt_gen::prop("__write_str"))))
@@ -10531,11 +10538,11 @@ fn debug_fn_in(ty: &Ty, params: &HashMap<String, String>) -> Option<String> {
         }
         Ty::Unknown | Ty::Extern(_) => Some("κσ.$dbg".into()),
         // `impl Debug for Box<dyn Tr>`: that `fmt`, not the boxed value's.
-        Ty::Dyn(tr) if let Some(m) = dyn_fmt(tr, true) => {
+        Ty::Dyn(tr, _) if let Some(m) = dyn_fmt(tr, true) => {
             Some(format!("((v) => κσ.$fmtVia(v, {m}))"))
         }
         // (A `Box<dyn Error>` may hold a string, whose `{:?}` is quoted.)
-        Ty::Dyn(_) => Some("κσ.$dbgAny".into()),
+        Ty::Dyn(_, _) => Some("κσ.$dbgAny".into()),
         Ty::Ordering => Some("κσ.$dbgOrdering".into()),
         // (A `fn(..)` pointer field: an address, as rustc prints it; see `{:p}`.)
         Ty::Closure { .. } => Some("((f) => κσ.$fmtPtr(f))".into()),
@@ -10698,13 +10705,13 @@ fn format_value(
     }
     // `impl Display for Box<dyn Tr>`: that `fmt`, not the boxed value's.
     if !spec.debug
-        && let Ty::Dyn(tr) = ty
+        && let Ty::Dyn(tr, _) = ty
         && let Some(m) = dyn_fmt(tr, false)
     {
         return call("κσ.$fmtVia", f, &format!(", {m}"));
     }
     // A generic value or trait object: decided at run time.
-    let f = if !spec.debug && matches!(ty, Ty::Param(_) | Ty::Dyn(_)) {
+    let f = if !spec.debug && matches!(ty, Ty::Param(_) | Ty::Dyn(_, _)) {
         call("κσ.$disp", f, "")
     } else {
         f

@@ -2278,6 +2278,7 @@ const IO_RENAMES: Renames = Renames {
         ("BufWriter", "IoBufWriter"),
         ("BufReader", "IoBufReader"),
         ("IoSlice", "IoIoSlice"),
+        ("IoSliceMut", "IoIoSliceMut"),
         ("SeekFrom", "IoSeekFrom"),
         ("Seek", "IoSeek"),
     ],

@@ -205,42 +205,8 @@ the numbers.
 
 The last run (2026-11-26) had language features all supported in 83.8% of files (4,551 of
 5,428; 72.1% counting std gaps). Most failing files that have only fixable gaps fail on names
-from another file or crate, not on a language feature: `.into()` with no annotation, `.0` / `.1`
-on a value of unknown type, a crate's own std-named type declared in another file, `matches!` on
-another file's enum and `include!` of sibling files all compile in every same-file shape probed.
-The long tail of real gaps is below.
-
-**Open items.** One plain-words sentence, a time estimate and an importance rating for each.
-Importance weighs how often a Bitburner script would hit the shape over how many registry files
-do.
-
-1. **Impls for types that share a JS value, beyond `str` / `String` and `[T]` / `Vec<T>`.**
-   `NonZeroU8` and `Wrapping<u8>` next to `u8`, a `&T` impl next to `T`'s for a concrete type
-   (num-traits' `Inv for &f32`, form_urlencoded's `&mut String`), and a specialization-like
-   `[u8]` impl next to `[T]`'s (wasm-encoder) are still conflicts. Each call could pick its impl
-   by how its receiver is written, as the `str` / `String` pairs do. Estimate: 1 day.
-   Importance: low; library shapes.
-2. **Taking apart a fixed-size list that came from a standard function.** A pattern like
-   `let [a, b] = x.to_le_bytes()` or `for [a, b] in rows` is reported as refutable, because the
-   length is lost through the std return or the slice iteration (4 files: zerovec, ring,
-   wasm-bindgen-cli-support, itertools). Estimate: 2–4 hours. Importance: low to medium;
-   `for [a, b] in rows` reads naturally in grid code.
-3. **One generic trait implemented several times for one type, where the impls differ only by
-   number type or by return type, called generically.** Through a type parameter or `dyn` the
-   impl is picked by the arguments' values at run time, which can't tell `Scale<f64>` from
-   `Scale<i32>`, nor `Conv<u8>` from `Conv<u16>` when only the result differs. Closing it means
-   passing the trait argument's class with the call (the `finish_needs` machinery) and keying
-   the impl on it. Estimate: 1 day. Importance: low.
-4. **A trait's type parameter that only its arguments name.** `impl<E: Default> Tr<E> for (Ix,
-   Ix)` (petgraph) has no class for `E` where `E::default()` needs one. Estimate: half a day.
-   Importance: low.
-5. **Methods written directly on a trait-object type.** Methods declared in an `impl dyn Tr`
-   block are not found (walrus). Estimate: 2–3 hours. Importance: low.
-6. **`R: Read`'s `read_vectored`** (`IoSliceMut`; tiny_http, futures-util). Estimate: 1–2 hours.
-   Importance: low.
-
-Of the "no method on a type parameter" files left, the bound's trait lives in another file
-(hashbrown's `Equivalent`, rayon's `Consumer`, serde_json's `Read`): downstream, not a gap.
+from another file or crate, not on a language feature; the language gaps left are in "Gaps
+from the feature chart" below.
 
 **Not planned:** raw pointers and their methods (`as_ptr`, `as_mut_ptr`, `get_unchecked`,
 `set_len`), `transmute`, `MaybeUninit`, `alloc`, `union`, `extern` blocks and their items, the
@@ -301,8 +267,7 @@ node's `--cpu-prof`, which keeps the wasm's function names.
 ## Gaps from the feature chart (2026-11-26)
 
 What FEATURES.md still marks ⬜ or calls out as missing, each confirmed against the current tree
-with a small probe, in order of how often a script would hit it. Gaps the survey's open items
-above already carry are referenced, not repeated.
+with a small probe, in order of how often a script would hit it.
 
 - [ ] **`Into<String>` from a `char`.** `fn f(s: impl Into<String>)` given `'c'` is "mismatched
   types", and `let s: String = 'x'.into()` is "the trait bound `String: From<char>` is not
@@ -345,6 +310,10 @@ by design or long-standing differences from rustc are in `RUST_GAPS.md`.
   same on a struct field (`s.t.as_mut()`) gets a `κσ.$cell` and works, and so do
   `o.as_mut().map(bump)` and `*o.as_mut().unwrap() += 1`. Found 2026-11-26 while checking
   FEATURES.md (the `ref mut` / `as_mut()` row).
+- [ ] `for x in &mut buf[..n] { *x = 1; }` (and `for x in &mut v[2..]`) writes into a copy: the
+  range lowers to `κσ.$slice(..)` rather than the view RUST_GAPS promises for `&mut v[a..b]`, so
+  `v` doesn't change. Indexed writes (`buf[i] = 1`) and `v[1..].iter_mut()` work. Found
+  2026-11-26 while testing `read_vectored`.
 
 ## Risks
 

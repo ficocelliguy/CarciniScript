@@ -930,7 +930,7 @@ fn members(t: &Ty, types: &Types) -> Vec<Completion> {
                 }
             }
         }
-        Ty::Dyn(tr) => {
+        Ty::Dyn(tr, _) => {
             let mut todo = vec![tr.clone()];
             let mut seen = Vec::new();
             while let Some(t) = todo.pop() {

@@ -166,7 +166,7 @@ impl Codegen<'_> {
                     .push(format!(", {schema}, {})", *f == "to_writer_pretty"));
                 let write = js_string(&super::adt_gen::prop("__write_str"));
                 let mut out = Frag::mapped(start, "κσ.$sjIo(");
-                if crate::adt::ext_key_of(&wt).is_some() || matches!(wt, Ty::Param(_) | Ty::Dyn(_)) {
+                if crate::adt::ext_key_of(&wt).is_some() || matches!(wt, Ty::Param(_) | Ty::Dyn(_, _)) {
                     out.push("κσ.$dcall($extRegs, ")
                         .append(wf)
                         .push(format!(", {write}, "))
@@ -198,7 +198,7 @@ impl Codegen<'_> {
                 } else {
                     let read = super::adt_gen::prop("read_to_end");
                     let mut out = Frag::mapped(start, "κσ.$sjFromReader((b) => ");
-                    if crate::adt::ext_key_of(&rt).is_some() || matches!(rt, Ty::Param(_) | Ty::Dyn(_)) {
+                    if crate::adt::ext_key_of(&rt).is_some() || matches!(rt, Ty::Param(_) | Ty::Dyn(_, _)) {
                         out.push("κσ.$dcall($extRegs, ")
                             .append(r)
                             .push(format!(", {}, b)", js_string(&read)));

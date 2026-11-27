@@ -663,10 +663,18 @@ impl Checker<'_> {
         // `impl<A, B, C, D> Equivalent<(C, D)> for (A, B)`, `impl<T: PartialEq<U>, U>
         // PartialEq<U> for Sp<T>`: impl parameters only the trait's arguments name are fresh per
         // call (unless the call is in that impl, where they're in scope).
+        // (They follow the other dict names in `last_type_args`.)
         for p in &m.trait_params {
+            if m.type_params.contains(p) || m.receiver.is_none() && m.impl_args.contains(&Ty::Param(p.clone())) {
+                continue;
+            }
             if !map.contains_key(p) && !self.generics.contains_key(p) {
                 let v = self.fresh(VarKind::General);
+                self.last_type_args.push(v.clone());
                 map.insert(p.clone(), v);
+            } else {
+                let t = map.get(p).cloned().unwrap_or_else(|| Ty::Param(p.clone()));
+                self.last_type_args.push(t);
             }
         }
         if map.is_empty() {
@@ -880,6 +888,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.param_trait_alts.clear();
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
@@ -1369,11 +1378,11 @@ impl Checker<'_> {
             Ty::Closure { .. } | Ty::Iter { .. } | Ty::Future(_) | Ty::Entry(..) => false,
             Ty::Param(n) => self.param_has(n, t),
             // (`std::error::Error`'s supertraits: `Box<dyn Error>` fields derive `Debug`.)
-            Ty::Dyn(tr) if tr == "Error" && !self.adts.traits.contains_key("Error") => {
+            Ty::Dyn(tr, _) if tr == "Error" && !self.adts.traits.contains_key("Error") => {
                 matches!(t, "Debug" | "Display" | "Error")
             }
             // (Or `impl Clone for Box<dyn Tr>`.)
-            Ty::Dyn(tr) => {
+            Ty::Dyn(tr, _) => {
                 self.trait_includes(tr, t)
                     || self
                         .adts
@@ -1430,12 +1439,12 @@ impl Checker<'_> {
         // `impl From<Sq> for Box<dyn Shape>`).
         if !self.adts.defs.contains_key(&type_name)
             && let Some(key) = crate::adt::ext_key_any(&type_name)
-            && trait_name.as_deref().is_some_and(|t| {
-                self.adts.traits.contains_key(t)
-                    || matches!(t, "From" | "PartialEq" | "PartialOrd")
-                    || crate::adt::op_method(t).is_some()
-                    || key.starts_with("dyn$")
-            })
+            && (key.starts_with("dyn$")
+                || trait_name.as_deref().is_some_and(|t| {
+                    self.adts.traits.contains_key(t)
+                        || matches!(t, "From" | "PartialEq" | "PartialOrd")
+                        || crate::adt::op_method(t).is_some()
+                }))
         {
             // (`impl Clone for Box<dyn Tr>`: what `implements` asks of `dyn Tr`.)
             if key.starts_with("dyn$")
@@ -1770,6 +1779,22 @@ impl Checker<'_> {
             // `this`: see `codegen_adt::cell_self`.)
             method.impl_args = impl_args.clone();
             method.trait_params = trait_only_params(imp);
+            // `impl Inv for &f32` (next to `impl Inv for f32`, one type in JS): under `inv$ref`,
+            // picked per call (`pick_ref_impl`).
+            if let Some(kind) = crate::adt::concrete_ref_impl(imp) {
+                let key = format!("{}${kind}", name.text());
+                let at = self.range(name.syntax()).0;
+                self.adts.alt_keys_at.insert(at, key.clone());
+                if let Some(tr) = &trait_name {
+                    self.adts.ref_impl_traits.insert(tr.clone());
+                }
+                self.adts
+                    .methods
+                    .entry(type_name.clone())
+                    .or_default()
+                    .insert(key, method);
+                continue;
+            }
             if let (Some(op), Some(rhs)) = (op, &op_rhs)
                 && name.text() == op
             {
@@ -1925,7 +1950,7 @@ impl Checker<'_> {
             // `impl Show for (u8, u8)`): its methods under keys of their own, picked by the
             // receiver's element types (and at run time by the elements' classes or values).
             if let Some(tr) = trait_name.as_deref()
-                && crate::adt::tuple_arity(&type_name).is_some()
+                && crate::adt::array_alts_key(&type_name)
                 && self.adts.traits.contains_key(tr)
                 && let Some(existing) = self.adts.methods.get(&type_name)
                 && existing.contains_key(name.text().to_string().as_str())
@@ -1937,13 +1962,14 @@ impl Checker<'_> {
                     .get(&format!("{type_name}::{n}"))
                     .cloned()
                     .unwrap_or_else(|| vec![n.clone()]);
+                if crate::adt::self_bounded_impl(imp, tr) {
+                    let k = crate::adt::self_bounded_key(&type_name, tr, &impl_args);
+                    self.adts.self_bounded.insert(k);
+                }
+                let existing = self.adts.methods.get(&type_name).cloned().unwrap_or_default();
                 let disjoint = keys.iter().all(|k| {
                     existing.get(k).is_some_and(|m| {
-                        m.impl_args.len() == impl_args.len()
-                            && m.impl_args
-                                .iter()
-                                .zip(&impl_args)
-                                .any(|(a, b)| crate::adt::disjoint_args(a, b))
+                        crate::adt::separable_args(&self.adts, tr, &type_name, &m.impl_args, &impl_args)
                     })
                 });
                 if disjoint {
@@ -2078,6 +2104,7 @@ impl Checker<'_> {
         self.generics.clear();
         self.param_bounds.clear();
         self.param_trait_args.clear();
+        self.param_trait_alts.clear();
         self.op_args.clear();
         self.cmp_args.clear();
         self.lenient_projs.clear();
@@ -2143,7 +2170,7 @@ impl Checker<'_> {
         let ret_owned = f
             .ret_type()
             .and_then(|r| r.ty())
-            .is_some_and(|t| super::written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown));
+            .is_some_and(|t| super::written_owned(&t) && !matches!(ret, Ty::Param(_) | Ty::Dyn(_, _) | Ty::Unknown));
         let ret_mut_ref = f.ret_type().and_then(|r| r.ty()).is_some_and(|t| super::written_mut_ref(&t));
         let ret_slot = self.ret_slot_kind(f, &ret);
         if let Some(Ty::Adt(adt, _)) = self.self_ty.clone()
@@ -2355,6 +2382,7 @@ impl Checker<'_> {
             self.generics.clear();
             self.param_bounds.clear();
             self.param_trait_args.clear();
+            self.param_trait_alts.clear();
             self.op_args.clear();
             self.cmp_args.clear();
             self.lenient_projs.clear();
@@ -2995,7 +3023,7 @@ impl Checker<'_> {
             && sig.receiver.is_some()
         {
             self.note_trait_call(m, adt, method, &Ty::Adt(adt.to_string(), targs.to_vec()));
-            let own_params = sig.type_params.len();
+            let own_params = sig.dict_names().len();
             let declared = sig.ret.clone();
             let raw_params = sig.params.clone();
             let sig = self.method_inst(&sig, Some(targs));
@@ -3831,8 +3859,11 @@ fn const_eval(file: &ast::SourceFile, e: &ast::Expr, _depth: u32) -> Option<i128
     }
 }
 
-/// The type parameters of `imp` that its trait's arguments name and its self type doesn't
-/// (`U` of `impl<T: PartialEq<U>, U> PartialEq<U> for Sp<T>`).
+/// The impl's type parameters only its trait's arguments name. Where some trait argument is
+/// just one of them (`E` of `impl<E: Default> Tr<E> for (Ix, Ix)`), they come first, one per
+/// trait argument up to the last such, a `_{i}` placeholder for the others: a call through a
+/// bound hands the trait arguments' classes by position (see `finish_needs`). Then the rest
+/// (`C` and `D` of `Equivalent<(C, D)>`).
 fn trait_only_params(imp: &ast::Impl) -> Vec<String> {
     let (Some(tr), Some(own)) = (imp.trait_(), imp.self_ty()) else {
         return Vec::new();
@@ -3844,7 +3875,8 @@ fn trait_only_params(imp: &ast::Impl) -> Vec<String> {
             .collect()
     };
     let (in_trait, in_own) = (names(tr.syntax()), names(own.syntax()));
-    imp.generic_param_list()
+    let only: Vec<String> = imp
+        .generic_param_list()
         .into_iter()
         .flat_map(|l| l.type_or_const_params())
         .filter_map(|p| match p {
@@ -3852,7 +3884,47 @@ fn trait_only_params(imp: &ast::Impl) -> Vec<String> {
             ast::TypeOrConstParam::Const(_) => None,
         })
         .filter(|n| in_trait.contains(n) && !in_own.contains(n))
-        .collect()
+        .collect();
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let targs: Vec<Option<String>> = match &tr {
+        ast::Type::PathType(p) => p
+            .path()
+            .and_then(|p| p.segment())
+            .and_then(|s| s.generic_arg_list())
+            .into_iter()
+            .flat_map(|l| l.generic_args())
+            .filter_map(|g| match g {
+                ast::GenericArg::TypeArg(t) => Some(match t.ty() {
+                    Some(ast::Type::PathType(p)) => p
+                        .path()
+                        .filter(|p| p.qualifier().is_none())
+                        .and_then(|p| p.segment())
+                        .filter(|s| s.generic_arg_list().is_none())
+                        .and_then(|s| s.name_ref())
+                        .map(|n| n.text().to_string())
+                        .filter(|n| only.contains(n)),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let last = targs.iter().rposition(Option::is_some);
+    let mut out: Vec<String> = match last {
+        Some(l) => targs[..=l]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| n.clone().unwrap_or_else(|| format!("_{i}")))
+            .collect(),
+        None => Vec::new(),
+    };
+    for n in only {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
 }
 
 /// Whether an `impl PartialEq<R> for T` (or `PartialOrd<R>`) compares `T` with another type:

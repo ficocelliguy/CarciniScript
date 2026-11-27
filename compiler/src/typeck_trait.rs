@@ -496,24 +496,26 @@ impl Checker<'_> {
             None => Vec::new(),
         };
         self.diags.truncate(n_diags);
-        let heads = self
-            .adts
-            .impl_heads
-            .entry((type_name.to_string(), tr.to_string()))
-            .or_default();
+        if crate::adt::array_alts_key(type_name) && crate::adt::self_bounded_impl(imp, tr) {
+            let k = crate::adt::self_bounded_key(type_name, tr, &self_args);
+            self.adts.self_bounded.insert(k);
+        }
+        let pair = (type_name.to_string(), tr.to_string());
+        let before = self.adts.impl_heads.get(&pair).cloned().unwrap_or_default();
         // (`impl Tr for (u8, u8)` next to `impl Tr for (String, String)`: one class whose
         // methods are picked by the elements, see `typeck_adt.rs`.)
-        let other_tuple = crate::adt::tuple_arity(type_name).is_some()
-            && !heads.is_empty()
-            && heads.iter().all(|(sa, _)| {
-                sa.len() == self_args.len()
-                    && sa
-                        .iter()
-                        .zip(&self_args)
-                        .any(|(a, b)| crate::adt::disjoint_args(a, b))
-            });
-        let tuple_args = crate::adt::tuple_arity(type_name).map(|_| self_args.clone());
-        heads.push((self_args, head_args));
+        // (And `impl Tr for [u8]` next to `impl<T: Tr> Tr for [T]`.)
+        let other_tuple = crate::adt::array_alts_key(type_name)
+            && !before.is_empty()
+            && before
+                .iter()
+                .all(|(sa, _)| crate::adt::separable_args(&self.adts, tr, type_name, sa, &self_args));
+        let tuple_args = crate::adt::array_alts_key(type_name).then(|| self_args.clone());
+        self.adts
+            .impl_heads
+            .entry(pair)
+            .or_default()
+            .push((self_args, head_args));
         for tm in def
             .methods
             .iter()
@@ -585,12 +587,24 @@ impl Checker<'_> {
             }
             return;
         }
+        // (`impl Inv for &f32` is `f32`'s value too, but its methods have keys of their own.)
+        let is_ref = crate::adt::concrete_ref_impl(imp).is_some();
+        let pair = (type_name.to_string(), tr.to_string());
+        if is_ref {
+            self.adts.ref_impl_traits.insert(tr.to_string());
+        }
+        let plain_before = self.adts.plain_impl_pairs.contains(&pair);
+        let ref_trait = self.adts.ref_impl_traits.contains(tr);
+        if !is_ref {
+            self.adts.plain_impl_pairs.insert(pair);
+        }
         let impls = self
             .adts
             .trait_impls
             .entry(type_name.to_string())
             .or_default();
-        if impls.iter().any(|t| t == tr) && def.type_params.is_empty() && !other_tuple {
+        let seen = impls.iter().any(|t| t == tr) && (!ref_trait || plain_before);
+        if seen && !is_ref && def.type_params.is_empty() && !other_tuple {
             let node = imp
                 .trait_()
                 .map(|t| t.syntax().clone())
@@ -809,7 +823,7 @@ impl Checker<'_> {
     /// of that name itself and meets the impl's bounds.
     pub(super) fn blanket_method(&self, rt: &Ty, method: &str) -> Option<(String, Method)> {
         let rt = self.zonk(rt);
-        if matches!(rt, Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_)) {
+        if matches!(rt, Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_, _)) {
             return None;
         }
         if let Ty::Adt(n, _) = &rt
@@ -878,7 +892,7 @@ impl Checker<'_> {
     /// meets the impl's bounds.
     pub(super) fn blanket_static(&self, ty: &Ty, f: &str) -> Option<(String, Method)> {
         let ty = self.zonk(ty);
-        if matches!(ty, Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_)) {
+        if matches!(ty, Ty::Unknown | Ty::Var(_) | Ty::Param(_) | Ty::Dyn(_, _)) {
             return None;
         }
         let own = match &ty {
@@ -1051,7 +1065,7 @@ impl Checker<'_> {
     pub(super) fn implements_user_trait(&self, ty: &Ty, tr: &str) -> bool {
         // A blanket impl: whatever meets its bounds (a bound on the trait itself can't help).
         if let Some(bounds) = self.adts.blankets.get(tr)
-            && !matches!(self.zonk(ty), Ty::Param(_) | Ty::Dyn(_) | Ty::Unknown)
+            && !matches!(self.zonk(ty), Ty::Param(_) | Ty::Dyn(_, _) | Ty::Unknown)
             && bounds.iter().all(|b| b != tr && self.meets_bound(ty, b))
         {
             return true;
@@ -1076,7 +1090,7 @@ impl Checker<'_> {
                 .trait_impls
                 .get(&n)
                 .is_some_and(|ts| ts.iter().any(|t| self.trait_includes(t, tr))),
-            Ty::Dyn(t) => self.trait_includes(&t, tr),
+            Ty::Dyn(t, _) => self.trait_includes(&t, tr),
             // `impl Money for f64`
             t if crate::adt::ext_key_of(&t).is_some_and(|k| self.adts.ext_types.contains(k)) => {
                 let k = crate::adt::ext_key_of(&t).unwrap_or_default();
@@ -1115,13 +1129,57 @@ impl Checker<'_> {
             && p != "Self"
         {
             sub.extend(self.bound_subst(p));
+            // (`C: Conv<u8> + Conv<u16>`: `Conv::T` follows the call's use, see
+            // `pick_among_bounds`.)
+            let owner = m
+                .name_ref()
+                .and_then(|n| self.trait_method_of(tr, n.text().as_ref()))
+                .map_or_else(|| tr.to_string(), |(o, _)| o);
+            let at = m.name_ref().map_or_else(|| m.syntax().clone(), |n| n.syntax().clone());
+            if let Some(vars) = self.pick_among_bounds(p, &owner, &at)
+                && let Some(def) = self.adts.traits.get(&owner)
+            {
+                for (tp, v) in def.type_params.iter().zip(&vars) {
+                    sub.insert(format!("{owner}::{tp}"), v.clone());
+                }
+            }
+        }
+        // Through `dyn Scale<f64>`: `Scale::R` is `f64`.
+        if let Ty::Dyn(d, targs) = &self_ty
+            && let Some(def) = self.adts.traits.get(d)
+        {
+            for (tp, a) in def.type_params.iter().zip(targs) {
+                sub.insert(format!("{d}::{tp}"), a.clone());
+            }
         }
         if let Some(name) = m.name_ref()
             && let Some((owner, _)) = self.trait_method_of(tr, name.text().as_ref())
         {
             self.twin_generic_call(m.syntax(), &owner, name.text().as_ref(), &self_ty);
         }
+        // (A generic trait's arguments' classes, for an impl's `E::default()`: after the own.)
+        let trait_args: Vec<Ty> = m
+            .name_ref()
+            .and_then(|n| self.trait_method_of(tr, n.text().as_ref()))
+            .map(|(owner, _)| {
+                let name = m.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
+                self.trait_arg_names(&owner, &name)
+                    .iter()
+                    .map(|k| sub.get(k).cloned().unwrap_or(Ty::Unknown))
+                    .collect()
+            })
+            .unwrap_or_default();
         let sig = subst_method(&sig, &sub);
+        if sig.type_params.is_empty()
+            && !trait_args.is_empty()
+            && let Some(name) = m.name_ref()
+            && let Some((owner, _)) = self.trait_method_of(tr, name.text().as_ref())
+        {
+            let r = self.range(m.syntax());
+            let caller = self.cur_fn.clone().unwrap_or_default();
+            self.generic_calls
+                .push((r, caller, format!("{owner}::{}", name.text()), trait_args.clone()));
+        }
         // The method's own type parameters (`fn fold_with<F>`): fresh at each call.
         let sig = if sig.type_params.is_empty() {
             sig
@@ -1148,7 +1206,7 @@ impl Checker<'_> {
                 let r = self.range(m.syntax());
                 let caller = self.cur_fn.clone().unwrap_or_default();
                 self.generic_calls
-                    .push((r, caller, format!("{owner}::{}", name.text()), own));
+                    .push((r, caller, format!("{owner}::{}", name.text()), [own, trait_args].concat()));
             }
             inst
         };
@@ -1449,23 +1507,119 @@ impl Checker<'_> {
         })
     }
 
+    /// `dyn Scale<f64>` / `impl Scale<f64>` naming the file's trait: its lowered type arguments
+    /// (`[f64]`), which pick the impl where several impls of the trait serve one type.
+    pub(super) fn user_trait_args(&mut self, t: &ast::Type) -> Vec<Ty> {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let Some(tr) = self.user_trait_type(t) else {
+            return Vec::new();
+        };
+        let list = match t {
+            ast::Type::ImplTraitType(i) => i.type_bound_list(),
+            ast::Type::DynTraitType(d) => d.type_bound_list(),
+            _ => None,
+        };
+        let seg = list.into_iter().flat_map(|l| l.bounds()).find_map(|b| match b.ty()? {
+            ast::Type::PathType(p) => {
+                let seg = p.path()?.segment()?;
+                (seg.name_ref()?.text() == tr.as_str()).then_some(seg)
+            }
+            _ => None,
+        });
+        let args: Vec<ast::Type> = seg
+            .and_then(|s| s.generic_arg_list())
+            .into_iter()
+            .flat_map(|l| l.generic_args())
+            .filter_map(|g| match g {
+                ast::GenericArg::TypeArg(ta) => ta.ty(),
+                _ => None,
+            })
+            .collect();
+        args.iter().map(|a| self.lower_type(a)).collect()
+    }
+
+    /// A call of `tr`'s method through a type parameter `p` bounded by `tr` more than once
+    /// (`C: Conv<u8> + Conv<u16>`): fresh variables for `tr`'s arguments, which the call's use
+    /// settles to one bound's at the end of the body (`resolve_bound_picks`). None for one bound.
+    pub(super) fn pick_among_bounds(
+        &mut self,
+        p: &str,
+        tr: &str,
+        node: &ra_ap_syntax::SyntaxNode,
+    ) -> Option<Vec<Ty>> {
+        let alts = self.param_trait_alts.get(&(p.to_string(), tr.to_string()))?.clone();
+        let n = self.adts.traits.get(tr)?.type_params.len();
+        let vars: Vec<Ty> = (0..n).map(|_| self.fresh(super::VarKind::General)).collect();
+        self.pending_bound_picks
+            .push((format!("{p}: {tr}"), vars.clone(), alts, node.clone()));
+        Some(vars)
+    }
+
+    /// The trait arguments of a qualified call of a generic trait's method: as written
+    /// (`Conv::<u8>::conv(x)`, `<C as Conv<u16>>::conv(x)`), else a `dyn`'s, a bound's (one of
+    /// several by the call's use), or fresh variables for inference. Empty for other traits.
+    pub(super) fn qualified_trait_args(
+        &mut self,
+        c: &ast::CallExpr,
+        tr: &str,
+        def: &TraitDef,
+        seg: Option<&ast::PathSegment>,
+        self_ty: &Ty,
+    ) -> Vec<Ty> {
+        use ra_ap_syntax::ast::HasGenericArgs;
+        let n = def.type_params.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let written: Vec<ast::Type> = seg
+            .and_then(|s| s.generic_arg_list())
+            .into_iter()
+            .flat_map(|l| l.generic_args())
+            .filter_map(|g| match g {
+                ast::GenericArg::TypeArg(ta) => ta.ty(),
+                _ => None,
+            })
+            .collect();
+        if written.len() == n {
+            return written.iter().map(|t| self.lower_type(t)).collect();
+        }
+        match self.shallow(self_ty) {
+            Ty::Dyn(d, args) if d == tr && args.len() == n => args,
+            Ty::Param(p) if p != "Self" => {
+                if let Some(vars) = self.pick_among_bounds(&p, tr, c.syntax()) {
+                    return vars;
+                }
+                let sub = self.bound_subst(&p);
+                def.type_params
+                    .iter()
+                    .map(|tp| match sub.get(&format!("{tr}::{tp}")) {
+                        Some(t) if *t != Ty::Unknown => t.clone(),
+                        _ => self.fresh(super::VarKind::General),
+                    })
+                    .collect()
+            }
+            _ => (0..n).map(|_| self.fresh(super::VarKind::General)).collect(),
+        }
+    }
+
     /// Methods on a `dyn Trait` value.
     pub(super) fn dyn_method(
         &mut self,
         m: &ast::MethodCallExpr,
         recv: &ast::Expr,
         tr: &str,
+        targs: &[Ty],
         method: &str,
         args: &[ast::Expr],
     ) -> Ty {
         match self.trait_method(tr, method) {
             Some(sig) if sig.receiver.is_some() => {
                 self.note_split_method(m, tr, method);
-                self.call_trait_method(m, recv, tr, sig, Ty::Dyn(tr.to_string()), args)
+                self.call_trait_method(m, recv, tr, sig, Ty::Dyn(tr.to_string(), targs.to_vec()), args)
             }
             // `boxed.as_ref()`: the `dyn` value itself (boxes are erased).
             _ if matches!(method, "as_ref" | "as_mut" | "borrow") && args.is_empty() => {
-                Ty::Dyn(tr.to_string())
+                Ty::Dyn(tr.to_string(), targs.to_vec())
             }
             // A method of an impl for `Box<dyn Tr>` (`a.eq(&b)` with `impl PartialEq for
             // Box<dyn Shape>`).
@@ -1484,7 +1638,7 @@ impl Checker<'_> {
             // `ToString` through `Display` (a supertrait, or `impl Display for Box<dyn Tr>`).
             _ if method == "to_string"
                 && args.is_empty()
-                && self.implements(&Ty::Dyn(tr.to_string()), "Display") =>
+                && self.implements(&Ty::Dyn(tr.to_string(), Vec::new()), "Display") =>
             {
                 Ty::Str
             }
