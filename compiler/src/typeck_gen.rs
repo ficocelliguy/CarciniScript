@@ -180,6 +180,32 @@ pub(super) fn impl_arg_params(f: &ast::Fn) -> Vec<(String, Vec<String>, String)>
     out
 }
 
+/// The type parameter a `where` predicate bounds: `T` of `where T: ..`, and of `where &'a T:
+/// Add<T>` when every bound is a value operator (operators on references are on the values
+/// here, so they are `T`'s).
+pub(super) fn where_param_subject(pred: &ast::WherePred) -> Option<String> {
+    let single = |t: Option<ast::Type>| match t {
+        Some(ast::Type::PathType(pt)) => pt.path()?.as_single_name_ref().map(|n| n.text().to_string()),
+        _ => None,
+    };
+    match pred.ty()? {
+        ast::Type::RefType(r) => {
+            let ops = pred.type_bound_list()?.bounds().all(|b| match b.ty() {
+                Some(ast::Type::PathType(bt)) => bt
+                    .path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.name_ref())
+                    .is_some_and(|n| {
+                        crate::adt::op_method(&n.text()).is_some() && !n.text().starts_with("Index")
+                    }),
+                _ => false,
+            });
+            if ops { single(r.ty()) } else { None }
+        }
+        t => single(Some(t)),
+    }
+}
+
 /// Every type parameter of `f` with its bound lists (inline and from `where`).
 fn type_params(f: &ast::Fn) -> Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)> {
     let mut out: Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)> = Vec::new();
@@ -198,13 +224,7 @@ fn type_params(f: &ast::Fn) -> Vec<(String, Vec<ast::TypeBoundList>, SyntaxNode)
     }
     if let Some(wc) = f.where_clause() {
         for pred in wc.predicates() {
-            let name = match pred.ty() {
-                Some(ast::Type::PathType(pt)) => pt
-                    .path()
-                    .and_then(|p| p.as_single_name_ref())
-                    .map(|n| n.text().to_string()),
-                _ => None,
-            };
+            let name = where_param_subject(&pred);
             if let (Some(n), Some(b)) = (name, pred.type_bound_list())
                 && let Some(entry) = out.iter_mut().find(|(x, _, _)| *x == n)
             {
@@ -1070,6 +1090,19 @@ impl Checker<'_> {
                 continue;
             }
             for b in pred.type_bound_list().into_iter().flat_map(|l| l.bounds()) {
+                // (`where u8: TryFrom<<T as BitAnd>::Output>`: `u8::try_from(x & m)` with a `T`.)
+                if let Some(ast::Type::PathType(pt)) = b.ty()
+                    && let Some(seg) = pt.path().and_then(|p| p.segment())
+                    && seg.name_ref().is_some_and(|n| n.text() == "TryFrom")
+                    && let Some(ast::GenericArg::TypeArg(ta)) =
+                        seg.generic_arg_list().and_then(|l| l.generic_args().next())
+                    && let Some(src) = ta.ty()
+                    && let Ty::Int(_) = self.lower_type(&subject)
+                {
+                    let src = self.lower_type(&src);
+                    self.op_args.insert((subject.syntax().text().to_string(), "TryFrom".into()), src);
+                    continue;
+                }
                 // (`where Ident: PartialEq<I>`: `id == i` with an `id: Ident`, as for a parameter.)
                 if let Some(ast::Type::PathType(pt)) = b.ty()
                     && let Some(seg) = pt.path().and_then(|p| p.segment())

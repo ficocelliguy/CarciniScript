@@ -236,6 +236,10 @@ impl crypto {
     /// `n` random bytes.
     #[js = "κσ.$randomBytes"]
     pub fn random_bytes(n: usize) -> Vec<u8>;
+    /// The hash of `data` (`.await` it) by `crypto.subtle.digest`: `algorithm` is `"SHA-1"`,
+    /// `"SHA-256"`, `"SHA-384"` or `"SHA-512"`. Hash a string with `s.as_bytes()`.
+    #[js = "κσ.$digest"]
+    pub async fn digest(algorithm: &str, data: &[u8]) -> Vec<u8>;
 }
 
 // ---- timers and dialogs
@@ -258,6 +262,12 @@ pub fn clear_interval(id: f64);
 pub fn request_animation_frame(handler: impl Fn(f64)) -> f64;
 #[js = "globalThis.cancelAnimationFrame"]
 pub fn cancel_animation_frame(id: f64);
+/// Run `handler` when the browser is idle, or after `timeout` milliseconds at the latest; it
+/// gets an `IdleDeadline` saying how long it may run. Returns an id for `cancel_idle_callback`.
+#[js = "κσ.$requestIdle"]
+pub fn request_idle_callback(handler: impl Fn(IdleDeadline), #[optional] timeout: f64) -> f64;
+#[js = "globalThis.cancelIdleCallback"]
+pub fn cancel_idle_callback(id: f64);
 /// Run `handler` once the current script step finishes.
 #[js = "globalThis.queueMicrotask"]
 pub fn queue_microtask(handler: impl Fn());
@@ -836,6 +846,20 @@ impl Window {
     pub fn add_event_listener(&self, event: &str, handler: impl Fn(Event));
     #[js = "requestAnimationFrame"]
     pub fn request_animation_frame(&self, handler: impl Fn(f64)) -> f64;
+}
+
+/// What a `request_idle_callback` handler gets: how long it may still run.
+pub struct IdleDeadline {
+    /// Whether the handler runs because its timeout passed rather than because the browser is
+    /// idle.
+    #[js = "didTimeout"]
+    pub did_timeout: bool,
+}
+
+impl IdleDeadline {
+    /// Milliseconds left in this idle period (0 once it is over).
+    #[js = "timeRemaining"]
+    pub fn time_remaining(&self) -> f64;
 }
 
 pub struct MediaQueryList {

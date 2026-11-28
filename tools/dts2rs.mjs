@@ -47,7 +47,14 @@
 //   anything else (`any`, generics, inline types in parameters) → JsValue (untyped; a `JsValue`
 //   parameter takes any value)
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
 import ts from "typescript";
+
+// TypeScript 7 (the native compiler) has no JS API; this needs TypeScript 5 or 6.
+const needTs5 = () => {
+  if (typeof ts?.createSourceFile !== "function")
+    throw new Error(`dts2rs needs the JS API of TypeScript 5 or 6 (npm install -D typescript@6); found typescript ${ts?.version ?? "without one"}`);
+};
 
 const RUST_KEYWORDS = new Set(
   ("as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref " +
@@ -179,6 +186,7 @@ function textOf(node) {
 }
 
 export function dtsToRust(text) {
+  needTs5();
   const sf = ts.createSourceFile("NetscriptDefinitions.d.ts", text, ts.ScriptTarget.Latest, true);
   const interfaces = new Map(); // name -> InterfaceDeclaration[] (declaration merging)
   const aliases = new Map(); // name -> TypeAliasDeclaration
@@ -917,7 +925,7 @@ export function dtsToRust(text) {
   return header + emitted.join("\n");
 }
 
-if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/").replace(/^\//, "")}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [input, output] = process.argv.slice(2);
   if (!input) {
     console.error("usage: node tools/dts2rs.mjs <NetscriptDefinitions.d.ts> [out.rs]");

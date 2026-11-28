@@ -13,14 +13,20 @@
 CarciniScript compiles **Rust to JavaScript, in the browser, at runtime**, with source maps back
 to the original Rust.
 
-The compiler is a ~700 KB WebAssembly module. Hand it a `.rs` file and it returns an ES module
-plus a v3 source map, synchronously, in milliseconds. There is nothing to install and no Rust
+The compiler is a WebAssembly module. Hand it a `.rs` file and it
+returns an ES module plus a v3 source map, synchronously, in milliseconds. There is no Rust
 toolchain or build step involved, so you can add Rust as a language to any web app: a
 playground, a scripting or plugin system, a game whose players write code, or a teaching tool.
 Because every compiled module carries a source map, the browser's debugger, stack traces and
 panic messages all point at Rust lines, not generated JavaScript.
 
 **Try it online: https://ficocelliguy.github.io/CarciniScript/**
+
+```sh
+npm install carciniscript
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for what each release adds.
 
 ## What it looks like
 
@@ -83,7 +89,7 @@ small runtime (`κσ`).
 - **Error messages like rustc's.** Compile errors and warnings look like the ones `rustc` prints
   (`error[E0308]: mismatched types`, with the code underlined). Many also come with a short
   explanation in JavaScript terms, for people who are new to Rust.
-- **Editor support.** Al anguage service that provides support for hover for types and docs, 
+- **Editor support.** A language service with hover for types and docs,
   autocomplete, parameter hints, go to definition, find references, and rename, all working on
   code with syntax errors, ready to plug into Monaco or a similar editor.
 - **Typed host APIs.** Describe the JavaScript API your app exposes to user code as Rust
@@ -220,10 +226,9 @@ compiler itself.
 
 ### How it works
 
-The compiler is written in Rust (using rust-analyzer's parser) and built to WebAssembly
-(~700 KB). It compiles synchronously, at runtime, to ES modules with v3 source maps. The
-generated code calls a small set of runtime helpers that are installed once on
-`globalThis.κσ`.
+The compiler is written in Rust (using rust-analyzer's parser) and built to WebAssembly. It compiles
+synchronously, at runtime, to ES modules with v3 source maps. The generated code calls a small set 
+of runtime helpers that are installed once on `globalThis.κσ`.
 
 | Path | What |
 |---|---|
@@ -249,6 +254,13 @@ setNsBindings(hostApiBindingsText); // optional: typed host API
 const { code, sourceMap, diagnostics, rendered, dependencies } =
   compile(source, "main.rs", (path) => files.get(path));
 ```
+
+The same code works in Node, where `initCarciniScript()` reads the wasm from disk. For CommonJS
+(or jest), `require("carciniscript/node")` gives the same API with the wasm already loaded (the
+`init` functions do nothing). The package's entry points are `carciniscript` (browsers, bundlers
+and Node), `carciniscript/node` (CommonJS), `carciniscript/runtime` and `carciniscript/dts2rs`,
+all typed. `carciniscript/dts2rs` (`dtsToRust(text)`) needs TypeScript 5 or 6 installed;
+TypeScript 7 has no JS API.
 
 - `code` and `sourceMap` are `null` when there are errors. To get Rust in devtools and stack
   traces, append the map to the module (`//# sourceMappingURL=data:...`) before importing it
@@ -330,3 +342,7 @@ Other tools:
   rustc, runs both and shows where their output differs.
 - `cargo run --example compile -- file.rs` (from `compiler/`) prints the generated JS or
   diagnostics without building wasm.
+
+## License
+
+MIT. See [LICENSE.md](LICENSE.md).

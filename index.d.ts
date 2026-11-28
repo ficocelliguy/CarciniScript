@@ -83,8 +83,16 @@ export interface CompileOutput {
   dependencies: string[];
 }
 
+/**
+ * Load the compiler. Call once at startup; `compile` is synchronous afterwards. With no argument it
+ * loads the package's own wasm (fetched next to the module in browsers, read from disk in Node).
+ */
 export function initCarciniScript(moduleOrPath?: string | URL | Request | BufferSource | WebAssembly.Module): Promise<void>;
-export function initCarciniScriptSync(module: BufferSource | WebAssembly.Module): void;
+/**
+ * Load the compiler synchronously from wasm bytes or a compiled module. In Node the argument may be
+ * left out to read the package's own wasm; elsewhere it is required.
+ */
+export function initCarciniScriptSync(module?: BufferSource | WebAssembly.Module): void;
 /**
  * Compile Rust to an ES module. `resolve(path)` returns the source of another file, for `mod name;`
  * (which reads `name.rs` next to `filename`, or the file a `#[path]` names, from the directory of

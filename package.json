@@ -2,29 +2,64 @@
   "name": "carciniscript",
   "version": "0.1.0",
   "description": "Compile a subset of Rust to ES modules with source maps, in the browser, at runtime.",
+  "keywords": [
+    "rust",
+    "compiler",
+    "transpiler",
+    "wasm",
+    "webassembly",
+    "javascript",
+    "source-maps",
+    "repl",
+    "playground",
+    "scripting"
+  ],
+  "homepage": "https://ficocelliguy.github.io/CarciniScript/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ficocelliguy/CarciniScript.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ficocelliguy/CarciniScript/issues"
+  },
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
+  "sideEffects": [
+    "./runtime/rt.js"
+  ],
   "exports": {
     ".": {
+      "node": {
+        "types": "./index.d.ts",
+        "default": "./node.mjs"
+      },
       "types": "./index.d.ts",
       "default": "./index.js"
     },
     "./node": {
-      "types": "./index.d.ts",
+      "types": "./index.d.cts",
       "default": "./node.cjs"
     },
     "./runtime": "./runtime/rt.js",
-    "./dts2rs": "./tools/dts2rs.mjs"
+    "./dts2rs": {
+      "types": "./tools/dts2rs.d.mts",
+      "default": "./tools/dts2rs.mjs"
+    }
   },
   "files": [
     "index.js",
     "index.d.ts",
+    "index.d.cts",
+    "node.mjs",
     "node.cjs",
     "pkg/",
     "pkg-node/",
     "runtime/",
-    "tools/dts2rs.mjs"
+    "tools/dts2rs.mjs",
+    "tools/dts2rs.d.mts",
+    "CHANGELOG.md",
+    "LICENSE.md"
   ],
   "scripts": {
     "build": "node tools/build.mjs",
@@ -35,10 +70,22 @@
     "record-native": "node tools/record-native.mjs",
     "sweep": "cd compiler && cargo run --release --example sweep --",
     "corpus": "node tools/corpus-classify.mjs && cd compiler && cargo run --release --example corpus_ast && cd .. && node tools/corpus-report.mjs",
-    "bindings": "node tools/dts2rs.mjs ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts bindings/ns.rs"
+    "bindings": "node tools/dts2rs.mjs ../bitoxidizer-src/src/ScriptEditor/NetscriptDefinitions.d.ts bindings/ns.rs",
+    "prepublishOnly": "node tools/build.mjs"
   },
   "license": "MIT",
+  "peerDependencies": {
+    "typescript": "^5 || ^6"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

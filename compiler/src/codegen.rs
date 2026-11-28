@@ -10592,16 +10592,43 @@ impl<'a> Codegen<'a> {
             .copied()
             .chain(args[1..].iter().filter(|a| a.name.is_some()))
             .collect();
+        let trivial = |a: &MacroArg| matches!(a.text.trim(), t if t.starts_with('"') || t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.'));
+        // Rust evaluates the explicit arguments in order and reads the `{name}` captures after
+        // them; the template's holes run in their own order. When the two differ (`{1} {0}`,
+        // `{n} {}` with `f(&mut n)`), the arguments with effects go into temps first.
+        let out_of_order = all.iter().any(|a| !trivial(a)) && {
+            let rank = |r: &Ref| r.0.unwrap_or(all.len());
+            let mut last = 0;
+            let mut seen = std::collections::HashSet::new();
+            resolved.iter().any(|(v, w, p, _)| {
+                let refs: Vec<&Ref> = [p.as_ref(), w.as_ref(), Some(v)].into_iter().flatten().collect();
+                // (Within one hole the order is the formatter's: several values there go first.)
+                refs.len() > 1 && refs.iter().any(|r| r.0.is_some_and(|i| !trivial(all[i.min(all.len() - 1)])))
+                    || refs.into_iter().any(|r| {
+                        let k = rank(r);
+                        if r.0.is_some() && !seen.insert(k) {
+                            return false;
+                        }
+                        let bad = k < last;
+                        last = last.max(k);
+                        bad
+                    })
+            })
+        };
         let mut lowered: Vec<(Frag, Ty)> = Vec::new();
+        let mut assigns: Vec<Frag> = Vec::new();
         for (i, a) in all.iter().enumerate() {
             let (f, t) = self.emit_macro_arg(a, None);
             let t = t.default_lit();
-            let trivial = matches!(a.text.trim(), t if t.starts_with('"') || t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.'));
-            if uses.get(&i).copied().unwrap_or(0) > 1 && !trivial {
+            let trivial = trivial(a);
+            if (uses.get(&i).copied().unwrap_or(0) > 1 || out_of_order) && !trivial {
+                // (Assigned where the macro is, not on a line before it: it may sit on the right
+                // of `&&` or in a loop condition.)
                 let tmp = self.temp();
-                let mut decl = Frag::text(format!("const {tmp} = "));
-                decl.append(f).push(";");
-                self.line(decl);
+                self.line(Frag::text(format!("let {tmp};")));
+                let mut set = Frag::text(format!("{tmp} = "));
+                set.append(f).push(", ");
+                assigns.push(set);
                 lowered.push((Frag::text(tmp), t));
             } else {
                 lowered.push((f, t));
@@ -10701,7 +10728,15 @@ impl<'a> Codegen<'a> {
                 .collect();
             return Frag::text(js_string(&lit));
         }
-        out
+        if assigns.is_empty() {
+            return out;
+        }
+        let mut seq = Frag::text("(");
+        for a in assigns {
+            seq.append(a);
+        }
+        seq.append(out).push(")");
+        seq
     }
 }
 

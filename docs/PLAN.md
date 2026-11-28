@@ -283,9 +283,6 @@ survey file; for those the count is files using the construct, and none would fl
   variants, 12 use `Span` beyond `call_site()`, 6 use `step` / `cursor`. None fail on it in the
   survey, since `syn` names count as another crate there (133 files report `Expr` / `Type` as
   unresolved).
-- [ ] **`js` crate:** `requestIdleCallback` / `cancelIdleCallback`, and `crypto.subtle.digest` as
-  an `async fn` returning `Vec<u8>`. Estimate: 1 hour in `bindings/js.rs`. Importance: low.
-  Corpus: 0 files (no web-sys / js-sys caller of either).
 
 ## Corpus gaps by files affected (2026-11-27)
 
@@ -322,9 +319,7 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   marker traits for such types (`Cow<str>` / `Cow<[T]>`). Conflict errors are gone from about a
   dozen corpus files (bitvec, log, miow, quote, rand, regex, ring, stable_deref_trait), most
   with other errors left. Importance: low to medium.
-- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** Bounds on
-  projections (`<T as Shr<u32>>::Output: PartialEq<T>`, `u8: TryFrom<<T as BitAnd>::Output>`,
-  `where &'a T: Add<T>` with `<&'a T as Add<T>>::Output`); a `&mut self` method of a HashMap/HashSet impl
+- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** A `&mut self` method of a HashMap/HashSet impl
   reached through `$dcallMutT` doesn't get the map class's `elem`. Landed 2026-11-27
   (`fixtures/into_iter_param_bounds.rs`): `IntoIterator` bounds on a parameter that stays one
   (inline, impl or method `where`, `for<'a> &'a L: IntoIterator`, `where &'a I: IntoIterator`,
@@ -346,7 +341,10 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   IntoIterator` (itertools' `concat`), its class handed over like a type parameter's; and
   (`fixtures/hasher_param_default.rs`) `S::default()` / `Default::default()` for the hasher of
   an impl for `HashMap<K, V, S>` / `HashSet<T, S>` (winnow's `Accumulate`). And 2026-11-28 (`fixtures/method_iter_item.rs`): a method's own `I: Iterator` / `I:
-  IntoIterator` with `-> Option<I::Item>` / `-> Vec<I::Item>` / `where I::Item: ..`. Probes in `agentD/q9*`, `q12*`, `q15*` and
+  IntoIterator` with `-> Option<I::Item>` / `-> Vec<I::Item>` / `where I::Item: ..`. And 2026-11-28 (`fixtures/projection_op_bounds.rs`): bounds on operator
+  projections (`where <T as Shr<u32>>::Output: PartialEq<T>`, `u8: TryFrom<<T as
+  BitAnd>::Output>`) and `where &'a T: Add<T>` with `<&'a T as Add<T>>::Output`, in functions
+  and impl methods. Probes in `agentD/q9*`, `q12*`, `q15*` and
   `agentC/q19`, `q21`. Fewer than the 23 files the entry started with. Importance: low to medium.
 - [ ] **Indexing user types, remaining shapes.** `I: SliceIndex<str>`; with no
   `Deref`, `&mut v[a..b]` through your `index_mut` is a view only inside its body (a use site
@@ -381,10 +379,7 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
 Found in passing and not fixed yet (checked against the current tree, 2026-11-26). Gaps that are
 by design or long-standing differences from rustc are in `RUST_GAPS.md`.
 
-- [ ] **Format arguments don't hold their borrows.** `println!("{} {}", n, f(&mut n))` (or a
-  block argument that calls `s.push('a')` after `s`) compiles and prints the changed value; rustc
-  rejects it with E0502, since the earlier arguments stay borrowed until the call. Found
-  2026-11-28 writing `fixtures/dyn_mut_value_types.rs`.
+None open.
 
 ## Risks
 

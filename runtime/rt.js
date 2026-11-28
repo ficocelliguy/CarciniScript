@@ -7907,6 +7907,12 @@
   };
   rt.$randomBytes = (n) => Array.from(globalThis.crypto.getRandomValues(new Uint8Array(n)));
   rt.$sleep = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+  // `js::crypto::digest`: `crypto.subtle.digest` over a byte slice, as a `Vec<u8>`.
+  rt.$digest = async (algorithm, data) =>
+    Array.from(new Uint8Array(await globalThis.crypto.subtle.digest(algorithm, Uint8Array.from(data))));
+  // `js::request_idle_callback(handler, timeout?)`: the timeout goes in the options object.
+  rt.$requestIdle = (handler, timeout) =>
+    globalThis.requestIdleCallback(handler, timeout === undefined ? undefined : { timeout });
   // `js::structured_clone`: a deep copy. Rust values copy by their `Clone` (keeping their
   // classes), JS values (NS objects, parsed JSON) by the browser's `structuredClone`.
   rt.$structuredClone = (v) => {

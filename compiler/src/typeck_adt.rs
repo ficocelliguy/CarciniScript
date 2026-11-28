@@ -882,8 +882,9 @@ impl Checker<'_> {
         let wcs: Vec<ast::WhereClause> = f.where_clause().into_iter().collect();
         for pred in f.where_clause().into_iter().flat_map(|w| w.predicates()) {
             // (`for<'a> &'a L: IntoIterator`: on `L`, as `note_ref_into_iter_bounds` has it.)
+            // (`where &'a T: Add<T>` is `T`'s operator, as for the function's own parameters.)
             let (subject, by_ref) = match pred.ty() {
-                Some(ast::Type::RefType(r)) => (r.ty(), true),
+                Some(ast::Type::RefType(r)) => (r.ty(), super::generic::where_param_subject(&pred).is_none()),
                 t => (t, false),
             };
             let Some(ast::Type::PathType(pt)) = subject else {
@@ -4125,13 +4126,7 @@ fn where_clause_bounds(wc: Option<ast::WhereClause>, name: &str) -> Vec<ast::Typ
         return Vec::new();
     };
     wc.predicates()
-        .filter(|p| match p.ty() {
-            Some(ast::Type::PathType(pt)) => pt
-                .path()
-                .and_then(|p| p.as_single_name_ref())
-                .is_some_and(|n| n.text() == name),
-            _ => false,
-        })
+        .filter(|p| super::generic::where_param_subject(p).as_deref() == Some(name))
         .filter_map(|p| p.type_bound_list())
         .collect()
 }

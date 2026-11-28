@@ -2422,8 +2422,9 @@ impl<'e, 'a> Lower<'e, 'a> {
                 let diverges = matches!(name.as_str(), "panic" | "unreachable" | "todo" | "unimplemented" | "bail");
                 let mut ops = Vec::new();
                 let mut activate = Vec::new();
-                // The arguments are evaluated first, then all of them borrowed (as
-                // `format_args!` does): (place, type, span).
+                // Each argument is borrowed as soon as it is evaluated (`format_args!` builds
+                // `(&a, &b, ..)`), so a later argument can't change an earlier one; the format
+                // string's `{name}` captures come after the explicit arguments: (place, type, span).
                 let mut borrows: Vec<(Place, RTy, Span)> = Vec::new();
                 let mut rest = args.as_slice();
                 // `write!(dest, ..)`: the destination is borrowed mutably.
@@ -2482,7 +2483,9 @@ impl<'e, 'a> Lower<'e, 'a> {
                     // A format argument is taken by reference.
                     let ex = self.place_of(&e, false, Ctx::default());
                     self.base = saved;
-                    borrows.push((ex.place, ex.rty, ex.span));
+                    let region = self.fresh();
+                    let t = self.borrow(region, false, ex.place, ex.rty, ex.span, false);
+                    ops.push(Operand { place: Place::local(t), moves: false, span: ex.span });
                 }
                 for (place, rty, bspan) in borrows {
                     let region = self.fresh();

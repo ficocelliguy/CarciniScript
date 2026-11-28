@@ -336,7 +336,11 @@ for (const dir of fs.readdirSync(path.join(here, "procmacro"))) {
 }
 
 // --- JS globals with no native counterpart (timers, URLs, crypto): test/js-node/*.rs under
-// Node, against the expected output in the matching .out file.
+// Node, against the expected output in the matching .out file. (Node has no
+// `requestIdleCallback`: a stand-in runs the handler on a timer, idle for 50ms.)
+globalThis.requestIdleCallback ??= (cb, o) =>
+  setTimeout(() => cb({ didTimeout: o?.timeout !== undefined, timeRemaining: () => 50 }), 1);
+globalThis.cancelIdleCallback ??= (id) => clearTimeout(id);
 for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsWith(".rs"))) {
   const name = `js-node ${f}`;
   if (!wanted(name)) continue;
@@ -1920,6 +1924,9 @@ const borrowRejected = [
   ["returning a reference to a local", "}\nfn f() -> &'static str {\n    let s = String::from(\"a\");\n    &s", "5:5 cannot return reference to local variable `s`"],
   ["returning a reference to a local, elided", "}\nfn pick(a: &str) -> &str {\n    let s = a.to_string();\n    &s", "5:5 cannot return reference to local variable `s`"],
   ["a temporary dropped while borrowed", "let r = String::from(\"a\").as_str();\n    println!(\"{}\", r);", "2:13 temporary value dropped while borrowed"],
+  // `format_args!` borrows each argument as it goes, so a later one can't change an earlier one.
+  ["a format argument changing an earlier one", "let mut n = 1;\n    println!(\"{} {}\", n, { n += 1; n });", "3:28 cannot assign to `n` because it is borrowed"],
+  ["a format argument pushing to an earlier one", "let mut s = String::from(\"x\");\n    let t = format!(\"{} {}\", s, { s.push('a'); 1 });\n    println!(\"{}\", t);", "3:35 cannot borrow `s` as mutable because it is also borrowed as immutable"],
 ];
 for (const [label, body, want] of warned) {
   const name = `warns: ${label}`;

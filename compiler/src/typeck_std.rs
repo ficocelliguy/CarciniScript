@@ -863,6 +863,9 @@ impl Checker<'_> {
                             err = Ty::Adt("Infallible".into(), vec![]);
                         }
                         Ty::Int(_) | Ty::Unknown | Ty::Var(_) => {}
+                        // (`where u8: TryFrom<T>` for this parameter's values.)
+                        p @ Ty::Param(_)
+                            if self.op_args.get(&(t.to_string(), "TryFrom".into())).is_some_and(|x| self.shallow(x) == p) => {}
                         _ => {
                             let msg = format!(
                                 "the trait bound `{t}: TryFrom<{}>` is not satisfied",

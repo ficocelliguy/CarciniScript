@@ -2509,6 +2509,19 @@ impl<'a> Checker<'a> {
                 {
                     return Ty::Unknown;
                 }
+                // `<T as Shr<u32>>::Output` / `<&'a T as Add<T>>::Output`: what the operator on
+                // a `T` yields here, `T` itself (or the bound's `Output = X`).
+                if name == "Output"
+                    && let Some((anchor, tr)) = p.path().and_then(|p| op_projection(&p))
+                {
+                    let l = self.lower_type(&anchor);
+                    if let Ty::Param(n) | Ty::Adt(n, _) = &l
+                        && let Some(o) = self.op_args.get(&(n.clone(), format!("{tr}$out")))
+                    {
+                        return o.clone();
+                    }
+                    return l;
+                }
                 // `I::Item` of an `I: IntoIterator` (its own type parameter).
                 if let Some(qn) = p.path().and_then(|p| proj_qual(&p))
                     && let Some(t) = self.generics.get(&format!("{qn}::{name}"))
@@ -11303,6 +11316,23 @@ pub(super) fn bounds_into_iter_item(list: &ast::TypeBoundList) -> Option<Option<
 }
 
 /// The type parameter a projection path is on: `T` of `T::Item` and of `<T as Tr>::Item`.
+/// `<X as Op<..>>::Output` with `Op` a std operator trait (`Add`, `Shr`, `BitAnd`, `Neg`, ..):
+/// `X` and the trait's name.
+pub(super) fn op_projection(path: &ast::Path) -> Option<(ast::Type, String)> {
+    let q = path.qualifier()?;
+    if q.qualifier().is_some() {
+        return None;
+    }
+    let anchor = q.segment()?.type_anchor()?;
+    let mut tys = anchor.syntax().children().filter_map(ast::Type::cast);
+    let ty = tys.next()?;
+    let Some(ast::Type::PathType(tp)) = tys.next() else {
+        return None;
+    };
+    let tr = tp.path()?.segment()?.name_ref()?.text().to_string();
+    (crate::adt::op_method(&tr).is_some() && !tr.starts_with("Index") && !tr.ends_with("Assign")).then_some((ty, tr))
+}
+
 pub(super) fn proj_qual(path: &ast::Path) -> Option<String> {
     let q = path.qualifier()?;
     if let Some(n) = q.as_single_name_ref() {

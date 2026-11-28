@@ -1,5 +1,5 @@
 // The `js` crate's browser-free globals under Node: Math, performance, crypto, base64, URI
-// components, URLs, globals, `structured_clone`, timers and `Promise::all` / `race`.
+// components, URLs, globals, `structured_clone`, timers, idle callbacks and `Promise::all` / `race`.
 use std::collections::HashMap;
 
 use js::{JSON, JsValue, Math, Promise, Url, UrlSearchParams, crypto, performance};
@@ -30,6 +30,13 @@ pub async fn main() {
     println!("uuid: {} chars, dashes at {:?}, version {}", id.len(), dashes, &id[14..15]);
     let bytes = crypto::random_bytes(16);
     println!("bytes: {}", bytes.len());
+    let hash = crypto::digest("SHA-256", "abc".as_bytes()).await;
+    let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+    println!("sha-256: {} bytes, {}", hash.len(), hex);
+    let data: Vec<u8> = (0..10).collect();
+    let part = crypto::digest("SHA-1", &data[2..5]).await;
+    let whole = crypto::digest("SHA-1", &[2, 3, 4]).await;
+    println!("sha-1 of a slice: {} bytes, same: {}", part.len(), part == whole);
 
     // base64 and URI components
     let b = btoa("hello, world");
@@ -85,6 +92,10 @@ pub async fn main() {
     js::clear_timeout(cancelled);
     js::queue_microtask(|| println!("microtask"));
     println!("before sleep");
+    let idle = js::request_idle_callback(|d| println!("idle: timed out {}, time left {}", d.did_timeout, d.time_remaining() > 0.0), 20.0);
+    let dropped = js::request_idle_callback(|_| println!("cancelled idle fired"));
+    js::cancel_idle_callback(dropped);
+    let _ = idle;
     js::sleep(30.0).await;
     println!("after sleep, {}ms+ passed: {}", 30, performance::now() - t0 >= 29.0);
 

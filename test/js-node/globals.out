@@ -2,6 +2,8 @@ random in [0, 1): true
 now >= 0: true, origin > 1.7e12: true
 uuid: 36 chars, dashes at [8, 13, 18, 23], version 4
 bytes: 16
+sha-256: 32 bytes, ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+sha-1 of a slice: 20 bytes, same: true
 aGVsbG8sIHdvcmxk -> hello, world
 a%20b%26c%3Dd%2F%C3%A9 -> a b&c=d/é
 https: example.com 8080 /a/b ?x=1&y=two&x=3 #frag
@@ -19,6 +21,7 @@ Team { name: "a", scores: [1, 2] } Team { name: "ab", scores: [1, 2, 3] }
 {"a":{"b":[1,2]}} {"a":{"b":[1,2]}}
 before sleep
 microtask
+idle: timed out true, time left true
 timeout fired
 after sleep, 30ms+ passed: true
 all: [1, 2, 3]

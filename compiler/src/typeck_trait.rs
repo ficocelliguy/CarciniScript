@@ -1434,6 +1434,22 @@ impl Checker<'_> {
                 )
             {
                 let proj = format!("{qn}::{}", n.text());
+                // (`where <T as Shr<u32>>::Output: PartialEq<T>`: an operator's result on a `T` is
+                // a `T` here, so the bounds are `T`'s: `(x >> 1) == y`.)
+                if super::op_projection(&path).is_some() && self.param_bounds.contains_key(qn.as_str()) {
+                    let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+                    let names: Vec<String> = super::generic::bound_names(&lists).into_iter().map(|(b, _)| b).collect();
+                    self.param_bounds.entry(qn.clone()).or_default().extend(names);
+                    for b in lists.iter().flat_map(|l| l.bounds()) {
+                        if let Some(ast::Type::PathType(bt)) = b.ty()
+                            && let Some(seg) = bt.path().and_then(|p| p.segment())
+                            && let Some(tr) = seg.name_ref().map(|n| n.text().to_string())
+                            && matches!(tr.as_str(), "PartialEq" | "PartialOrd")
+                        {
+                            self.record_cmp_bound(&qn, &tr, &seg);
+                        }
+                    }
+                }
                 // (`where T::Error: Debug` of a `T: TryFrom<X>`: kept for `{:?}` / `unwrap()`.)
                 if n.text() == "Error" {
                     let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
