@@ -525,6 +525,10 @@ impl Checker<'_> {
                 self.closure_arg(a1, vec![*e], k);
                 Ty::Result(Box::new(USIZE), Box::new(USIZE))
             }
+            (Ty::Vec(e), "as_ptr" | "as_mut_ptr") => {
+                count(self, 0);
+                return self.buf_ptr(m, *e);
+            }
             (Ty::Vec(e), "as_slice" | "as_mut_slice") => {
                 count(self, 0);
                 Ty::Vec(e)

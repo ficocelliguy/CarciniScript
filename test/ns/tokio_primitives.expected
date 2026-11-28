@@ -1,0 +1,12 @@
+oneshot Ok(42)
+dropped: channel closed RecvError(())
+Err(Empty)
+true Err(9)
+Ok(3)
+watch [10, 20, 30] latest 30 Err(RecvError(()))
+Err(RecvError(()))
+true true
+permit used
+after one [0]
+after all [0, 1, 2]
+ticks [0, 1, 2, 3] 50ms Delay

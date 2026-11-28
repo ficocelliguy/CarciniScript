@@ -140,6 +140,10 @@ impl Checker<'_> {
             if iter_ext {
                 assoc_tys.entry("Item".into()).or_insert(Ty::Unknown);
             }
+            // (`trait A1<X>: A0<X>`: `Self::Output` is `A0`'s, whatever each impl of it says.)
+            for (s, a) in self.super_assoc_types(&n) {
+                assoc_tys.entry(a.clone()).or_insert(Ty::Param(format!("{s}::{a}")));
+            }
             let saved_assoc = std::mem::replace(&mut self.impl_assoc, assoc_tys);
             self.generics.clear();
             self.enter_trait_const_params(t);
@@ -1266,6 +1270,7 @@ impl Checker<'_> {
             for a in &def.assoc_types {
                 let t = given
                     .and_then(|(_, named)| named.get(a).cloned())
+                    .or_else(|| self.sub_binding(p, a))
                     .or_else(|| self.assoc_iter_proj(p, &tr, a))
                     .unwrap_or_else(|| Ty::Param(format!("{p}::{a}")));
                 sub.insert(format!("{tr}::{a}"), t);
@@ -1278,6 +1283,39 @@ impl Checker<'_> {
             }
         }
         sub
+    }
+
+    /// `Unit = X` given on any of `p`'s bounds: `S: Solid<Unit = f64>` binds the `Unit` that
+    /// `Solid`'s supertrait `Shape` declares.
+    fn sub_binding(&self, p: &str, assoc: &str) -> Option<Ty> {
+        self.param_trait_args
+            .get(p)?
+            .values()
+            .find_map(|(_, named)| named.get(assoc).cloned())
+    }
+
+    /// The associated types `tr`'s supertraits declare (transitively, not `tr`'s own), each with
+    /// the trait declaring it.
+    pub(super) fn super_assoc_types(&self, tr: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut seen = vec![tr.to_string()];
+        let mut todo: Vec<String> = self
+            .adts
+            .traits
+            .get(tr)
+            .map(|d| d.supers.clone())
+            .unwrap_or_default();
+        while let Some(s) = todo.pop() {
+            if seen.contains(&s) {
+                continue;
+            }
+            seen.push(s.clone());
+            if let Some(d) = self.adts.traits.get(&s) {
+                out.extend(d.assoc_types.iter().map(|a| (s.clone(), a.clone())));
+                todo.extend(d.supers.iter().cloned());
+            }
+        }
+        out
     }
 
     /// `p::Unit` for a type parameter `p` whose bounds declare `type Unit`: the bound's `Unit =
@@ -1314,6 +1352,7 @@ impl Checker<'_> {
             .and_then(|(_, named)| named.get(assoc).cloned());
         Some(
             given
+                .or_else(|| self.sub_binding(p, assoc))
                 .or_else(|| self.assoc_iter_proj(p, &tr, assoc))
                 .unwrap_or_else(|| Ty::Param(format!("{p}::{assoc}"))),
         )
@@ -1390,6 +1429,12 @@ impl Checker<'_> {
                 )
             {
                 let proj = format!("{qn}::{}", n.text());
+                // (`where T::Error: Debug` of a `T: TryFrom<X>`: kept for `{:?}` / `unwrap()`.)
+                if n.text() == "Error" {
+                    let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();
+                    let names = super::generic::bound_names(&lists).into_iter().map(|(b, _)| b);
+                    self.try_error_bounds.entry(proj.clone()).or_default().extend(names);
+                }
                 // (`where <T as Factory>::Parser: Typed<Value = T>`: `T::parser().map(..)`
                 // through the file's trait.)
                 let lists: Vec<ast::TypeBoundList> = pred.type_bound_list().into_iter().collect();

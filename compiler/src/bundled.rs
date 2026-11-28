@@ -2457,6 +2457,64 @@ const TOKIO_MPSC_RENAMES: Renames = Renames {
     result_err: None,
 };
 
+// `tokio::sync::oneshot`: the tokio prelude's one-value channel.
+const TOKIO_ONESHOT_RENAMES: Renames = Renames {
+    roots: &[
+        "oneshot",
+        "tokio::sync::oneshot",
+        "oneshot::error",
+        "tokio::sync::oneshot::error",
+    ],
+    names: &[
+        ("Sender", "TokioOneshotSender"),
+        ("Receiver", "TokioOneshotReceiver"),
+        ("channel", "__tokio_oneshot_channel"),
+        ("RecvError", "TokioRecvError"),
+        ("TryRecvError", "TokioOneshotTryRecvError"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
+// `tokio::sync::watch`: the tokio prelude's latest-value channel.
+const TOKIO_WATCH_RENAMES: Renames = Renames {
+    roots: &[
+        "watch",
+        "tokio::sync::watch",
+        "watch::error",
+        "tokio::sync::watch::error",
+    ],
+    names: &[
+        ("Sender", "TokioWatchSender"),
+        ("Receiver", "TokioWatchReceiver"),
+        ("channel", "__tokio_watch_channel"),
+        ("RecvError", "TokioRecvError"),
+        ("SendError", "TokioSendError"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
+// `tokio::sync::broadcast`: the tokio prelude's many-receiver channel.
+const TOKIO_BROADCAST_RENAMES: Renames = Renames {
+    roots: &[
+        "broadcast",
+        "tokio::sync::broadcast",
+        "broadcast::error",
+        "tokio::sync::broadcast::error",
+    ],
+    names: &[
+        ("Sender", "TokioBroadcastSender"),
+        ("Receiver", "TokioBroadcastReceiver"),
+        ("channel", "__tokio_broadcast_channel"),
+        ("RecvError", "TokioBroadcastRecvError"),
+        ("TryRecvError", "TokioBroadcastTryRecvError"),
+        ("SendError", "TokioBroadcastSendError"),
+    ],
+    star: &[],
+    result_err: None,
+};
+
 // `std::thread::LocalKey` (what `thread_local!` declares).
 const THREAD_RENAMES: Renames = Renames {
     roots: &["thread", "std::thread", "::std::thread"],
@@ -2603,6 +2661,12 @@ const TOKIO_RENAMES: Renames = Renames {
         ("TryLockError", "TokioTryLockError"),
         ("timeout", "__tokio_timeout"),
         ("Elapsed", "TokioElapsed"),
+        ("interval", "__tokio_interval"),
+        ("interval_at", "__tokio_interval_at"),
+        ("Interval", "TokioInterval"),
+        ("MissedTickBehavior", "TokioMissedTickBehavior"),
+        ("Notify", "TokioNotify"),
+        ("Notified", "TokioNotified"),
     ],
     star: &[],
     result_err: None,
@@ -3068,6 +3132,9 @@ const ALL_RENAMES: &[&Renames] = &[
         &ATOMIC_RENAMES,
         &MPSC_RENAMES,
         &TOKIO_MPSC_RENAMES,
+        &TOKIO_ONESHOT_RENAMES,
+        &TOKIO_WATCH_RENAMES,
+        &TOKIO_BROADCAST_RENAMES,
         &THREAD_RENAMES,
         &NET_RENAMES,
         &RUSTC_HASH_RENAMES,
@@ -3351,7 +3418,9 @@ fn tokio_rewrite(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, St
             t == "tokio::main" || t == "tokio::test"
         })
     {
-        edits.push((a.syntax().text_range(), String::new()));
+        // (`#[tokio::test]` is a test whose body the test build awaits.)
+        let test = a.path().is_some_and(|p| p.syntax().text() == "tokio::test");
+        edits.push((a.syntax().text_range(), if test { "#[test]" } else { "" }.into()));
         return;
     }
     let Some(call) = ast::CallExpr::cast(node.clone()) else {
@@ -3369,9 +3438,16 @@ fn tokio_rewrite(node: &ra_ap_syntax::SyntaxNode, edits: &mut Vec<(TextRange, St
     };
     // (Its argument may hold its own rewrites: inserts around it keep them.)
     let r = arg.syntax().text_range();
+    // (`tokio::spawn(fut);` as a statement drops its handle, which rustc doesn't lint: the
+    // block is bound to `_`, so it isn't an unused future.)
+    let stmt = call
+        .syntax()
+        .parent()
+        .and_then(ast::ExprStmt::cast)
+        .is_some_and(|s| s.semicolon_token().is_some());
     edits.push((
         TextRange::new(call.syntax().text_range().start(), r.start()),
-        "async { Ok::<_, TokioJoinError>((".into(),
+        format!("{}async {{ Ok::<_, TokioJoinError>((", if stmt { "let _ = " } else { "" }),
     ));
     edits.push((
         TextRange::new(r.end(), call.syntax().text_range().end()),

@@ -429,7 +429,14 @@ impl Checker<'_> {
             return None;
         }
         let f = self.enclosing_fn(m.syntax())?;
-        let preds: Vec<ast::WherePred> = f.where_clause()?.predicates().collect();
+        // (And the impl's: `impl<A> FnMut1<A> for S where Self: FnOnce1<A>`.)
+        let imp = f.syntax().ancestors().find_map(ast::Impl::cast);
+        let preds: Vec<ast::WherePred> = f
+            .where_clause()
+            .into_iter()
+            .chain(imp.and_then(|i| i.where_clause()))
+            .flat_map(|w| w.predicates())
+            .collect();
         for pred in preds {
             let Some(lhs) = pred.ty() else { continue };
             let same = match (self.lower_type(&lhs), self_ty) {
@@ -946,6 +953,18 @@ impl Checker<'_> {
             return None;
         };
         let f = m.syntax().ancestors().find_map(ast::Fn::cast);
+        // A function's own `S: AsRef<X>` that stayed a parameter (`-> Wrap<S>`, `&[S]`): the
+        // caller's value as it is, a string, bytes or your type with `impl AsRef<X>`.
+        let own = f
+            .as_ref()
+            .and_then(|f| param_into_target(&p, tr, f.generic_param_list(), f.where_clause()));
+        if let Some(x) = own {
+            let t = self.lower_type(&x);
+            let bytes = matches!(&t, Ty::Vec(e) if **e == Ty::Int(IntKind::U8));
+            let js = if bytes { "κσ.$asRefBytes" } else { "κσ.$asRefAny" };
+            self.record_conv(m.syntax(), Conv::Wrap { js: js.into() });
+            return Some(t);
+        }
         let x = f
             .as_ref()
             .and_then(|f| param_into_target(&p, tr, f.generic_param_list(), f.where_clause()))
@@ -976,7 +995,13 @@ impl Checker<'_> {
         // `Host` here already, and the bound says that's what it converts to.
         if let Some(x) = into_bound_target(m, "Into") {
             let t = self.lower_type(&x);
-            // (`P: Into<i64>` stays a parameter, so it may be any narrower number or a `bool`.)
+            // (`P: Into<i64>` stays a parameter, so it may be any narrower number or a `bool`;
+            // so does a `B: Into<Vec<u8>>` that `-> Wrap<B>` names, which may be a string.)
+            let kept = matches!(self.shallow(&recv), Ty::Param(p) if self.generics.get(&p) == Some(&Ty::Param(p.clone())));
+            if kept && matches!(&t, Ty::Vec(e) if **e == Ty::Int(IntKind::U8)) {
+                self.record_conv(m.syntax(), Conv::Wrap { js: "κσ.$asRefBytes".into() });
+                return t;
+            }
             self.record_conv(m.syntax(), into_number_conv(&t));
             return t;
         }
@@ -1107,10 +1132,15 @@ impl Checker<'_> {
         let str_bytes = matches!(target, Ty::Vec(_))
             && matches!(crate::typeck::strip_parens(a), ast::Expr::Literal(l)
                 if matches!(l.kind(), ast::LiteralKind::String(_)));
+        // (A char literal for an `impl Into<String>` is `String::from(c)`.)
+        let char_str = matches!(target, Ty::Str)
+            && matches!(crate::typeck::strip_parens(a), ast::Expr::Literal(l)
+                if matches!(l.kind(), ast::LiteralKind::Char(_)));
         // (Literals, closures and the like take the parameter's type as written.)
         if !from_target
             && !suffixed
             && !str_bytes
+            && !char_str
             && !matches!(
                 crate::typeck::strip_parens(a),
                 ast::Expr::PathExpr(_)
@@ -1730,6 +1760,10 @@ impl Checker<'_> {
         {
             place = outer.syntax().clone();
         }
+        // (`(v[i]) = x`, as `*v.index_mut(i) = x` is written.)
+        while let Some(p) = place.parent().filter(|p| ast::ParenExpr::can_cast(p.kind())) {
+            place = p;
+        }
         let assigned = place
             .parent()
             .and_then(ast::BinExpr::cast)
@@ -1911,6 +1945,26 @@ impl Checker<'_> {
             && self.shallow(e) == Ty::Str
             && !self.adts.traits.contains_key("Error")
         {
+            return true;
+        }
+        // Into a type parameter with a `From<X>` bound (`fn f<E: From<E1>>() -> Result<_, E>`):
+        // `E::from(e)`, by the class the caller hands over.
+        // (Not `could_be`: it takes two type parameters as the same.)
+        if let Ty::Param(p) = self.shallow(re)
+            && self.zonk(e) != Ty::Param(p.clone())
+            && self.param_has(&p, "From")
+            && let Some(x) = self
+                .from_args
+                .get(&p)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|x| self.could_be(e, x))
+        {
+            self.unify(e, &x);
+            let src = self.zonk(&x).describe();
+            self.record_conv(t.syntax(), Conv::ParamFrom { param: p.clone(), src });
+            self.note_dict(&p, t.syntax());
             return true;
         }
         // (`impl From<MyErr> for String`: a std type's `From` impl.)

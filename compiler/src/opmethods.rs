@@ -1,6 +1,6 @@
 //! Operator traits' methods called by name, as a pre-pass over the syntax tree (after macro
 //! expansion): `a.add(b)` is written as `(a + (b))`, `n.not()` as `(!n)`, `x.add_assign(y)` as
-//! `x += (y)`, and `s.deref()` as `(&*s)`, so they take the operators' checking and code. The
+//! `x += (y)`, `s.deref()` as `(&*s)` and `v.index(i)` as `(&v[i])` (`(v[i])` before a `.`), so they take the operators' checking and code. The
 //! receiver and arguments keep their text (and positions); only the `.add(` and the closing `)`
 //! are rewritten. A name the file declares as a function of its own (an inherent `fn add`, a
 //! trait's) outside an impl of the operator's trait is left alone, and so is anything in `unsafe`
@@ -40,6 +40,8 @@ const METHODS: &[(&str, &str, usize, &str, &str, &str)] = &[
     ("not", "Not", 0, "(!", "", ")"),
     ("deref", "Deref", 0, "(&*", "", ")"),
     ("deref_mut", "DerefMut", 0, "(&mut *", "", ")"),
+    ("index", "Index", 1, "(&", "[", "])"),
+    ("index_mut", "IndexMut", 1, "(&mut ", "[", "])"),
 ];
 
 /// Whether `text` may call one.
@@ -47,6 +49,7 @@ pub fn has_op_methods(text: &str) -> bool {
     METHODS
         .iter()
         .any(|(m, ..)| text.contains(&format!(".{m}(")))
+        || text.contains("Index::index")
 }
 
 /// Rewrite the calls; whether anything changed.
@@ -73,9 +76,12 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     calls(file.syntax(), 0, false, &own, &mut edits);
     let changed = !edits.is_empty();
-    // (Last first, so earlier offsets stay put; insertions at one place keep their order.)
-    edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
-    for (a, b, new) in edits {
+    // (Last first, so earlier offsets stay put. Of the insertions at one place, which come outer
+    // call first, the inner goes in first, so the outer ends up leftmost: `a.add(b).neg()` is
+    // `(-(a + (b)))`.)
+    let mut edits: Vec<(usize, (usize, usize, String))> = edits.into_iter().enumerate().collect();
+    edits.sort_by_key(|(i, e)| std::cmp::Reverse((e.0, e.1, *i)));
+    for (_, (a, b, new)) in edits {
         text.replace_range(a..b, &new);
         map.replace(a, b, new.len());
     }
@@ -128,6 +134,20 @@ fn calls(
         let (dot_start, _) = at(&dot);
         let (_, open_end) = at(&open);
         let (close_start, close_end) = at(&close);
+        // (`v.index_mut(i).name.push(..)` / `v.index(1..3).len()`: `(v[i])`, as auto-deref has it.)
+        let place = matches!(n.as_str(), "index" | "index_mut")
+            && call.syntax().parent().is_some_and(|p| {
+                ast::FieldExpr::cast(p.clone()).is_some()
+                    || ast::MethodCallExpr::cast(p)
+                        .and_then(|m| m.receiver())
+                        .is_some_and(|r| r.syntax() == call.syntax())
+            });
+        let star = if matches!(n.as_str(), "index" | "index_mut") { deref_star(call.syntax()) } else { None };
+        if let Some(s) = star {
+            let a = (base + usize::from(s.start()) as isize) as usize;
+            edits.push((a, a + 1, String::new()));
+        }
+        let prefix = if place || star.is_some() { "(" } else { prefix };
         if !prefix.is_empty() {
             edits.push((recv_start, recv_start, prefix.to_string()));
         }
@@ -137,6 +157,71 @@ fn calls(
             edits.push((dot_start, open_end, middle.to_string()));
             edits.push((close_start, close_end, suffix.to_string()));
         }
+    }
+    // `Index::index(&v, i)` / `IndexMut::index_mut(&mut v, i)` (also through `ops::` /
+    // `std::ops::`) as `(&(v)[i])` / `(&mut (v)[i])`, when the first argument is written
+    // `&v` / `&mut v`. (`Index::index(&**self, i)` keeps its own handling: a slice's index.)
+    for call in node.descendants().filter_map(ast::CallExpr::cast) {
+        let Some(ast::Expr::PathExpr(pe)) = call.expr() else { continue };
+        let Some(path) = pe.path() else { continue };
+        let segs: Vec<String> = path
+            .syntax()
+            .text()
+            .to_string()
+            .split("::")
+            .map(|s| s.trim().to_string())
+            .collect();
+        let (tr, m) = match segs.as_slice() {
+            [.., a, b] => (a.as_str(), b.as_str()),
+            _ => continue,
+        };
+        let prefix = match (tr, m) {
+            ("Index", "index") => "(&(",
+            ("IndexMut", "index_mut") => "(&mut (",
+            _ => continue,
+        };
+        if !matches!(&segs[..segs.len() - 2], [] | [_] | [_, _])
+            || segs.len() > 2 && segs[segs.len() - 3] != "ops"
+            || own.contains(&m.to_string())
+            || in_unsafe
+            || is_unsafe(call.syntax())
+        {
+            continue;
+        }
+        let Some(list) = call.arg_list() else { continue };
+        let args: Vec<ast::Expr> = list.args().collect();
+        let [ast::Expr::RefExpr(r), _] = args.as_slice() else { continue };
+        if (r.mut_token().is_some()) != (m == "index_mut")
+            || r.expr().is_none_or(|e| matches!(e, ast::Expr::PrefixExpr(_)))
+        {
+            continue;
+        }
+        let comma = list
+            .syntax()
+            .children_with_tokens()
+            .find(|t| t.kind() == ra_ap_syntax::SyntaxKind::COMMA);
+        let (Some(inner), Some(comma), Some(close)) =
+            (r.expr(), comma, list.r_paren_token())
+        else {
+            continue;
+        };
+        let off = |x: ra_ap_syntax::TextSize| (base + usize::from(x) as isize) as usize;
+        let start = off(call.syntax().text_range().start());
+        let prefix = match deref_star(call.syntax()) {
+            Some(s) => {
+                let a = off(s.start());
+                edits.push((a, a + 1, String::new()));
+                "(("
+            }
+            None => prefix,
+        };
+        edits.push((start, off(inner.syntax().text_range().start()), prefix.to_string()));
+        edits.push((
+            off(inner.syntax().text_range().end()),
+            off(comma.text_range().end()),
+            ")[".to_string(),
+        ));
+        edits.push((off(close.text_range().start()), off(close.text_range().end()), "])".to_string()));
     }
     for mc in node.descendants().filter_map(ast::MacroCall::cast) {
         let name = mc
@@ -170,6 +255,13 @@ fn calls(
             edits,
         );
     }
+}
+
+/// The `*` of a `*call` (`*v.index_mut(i) = x`): its range, so the call can be written as the place
+/// itself (`(v[i]) = x`).
+fn deref_star(call: &SyntaxNode) -> Option<ra_ap_syntax::TextRange> {
+    let p = ast::PrefixExpr::cast(call.parent()?)?;
+    (p.op_kind() == Some(ast::UnaryOp::Deref)).then_some(p.op_token()?.text_range())
 }
 
 /// What a macro's arguments are wrapped in to parse them.

@@ -476,6 +476,51 @@ for (const f of fs.readdirSync(path.join(here, "js-node")).filter((f) => f.endsW
   }
 }
 
+// `#[tokio::test]`: an `async fn` test the test build awaits (a `Result` one fails on `Err`); a
+// normal build leaves it out.
+{
+  const name = "libtest tokio::test";
+  try {
+    const src = [
+      "use tokio::sync::oneshot;",
+      "use tokio::time::{sleep, Duration};",
+      "",
+      "async fn later(x: u32) -> u32 {",
+      "    sleep(Duration::from_millis(5)).await;",
+      "    x + 1",
+      "}",
+      "",
+      "#[tokio::test]",
+      "async fn adds() {",
+      "    let (tx, rx) = oneshot::channel();",
+      "    tokio::spawn(async move { tx.send(later(1).await).unwrap(); });",
+      "    assert_eq!(rx.await.unwrap(), 2);",
+      "}",
+      "",
+      '#[tokio::test(flavor = "multi_thread")]',
+      "async fn fails() -> Result<(), String> {",
+      '    if later(0).await == 1 { Err("late".into()) } else { Ok(()) }',
+      "}",
+      "",
+    ].join("\n");
+    const out = compileTests(src, "lib.rs");
+    if (out.code === null) throw new Error(out.diagnostics.map((d) => `${d.line}:${d.column} ${oneLine(d)}`).join("\n"));
+    const jsPath = path.join(outDir, "libtest-tokio.mjs");
+    fs.writeFileSync(jsPath, out.code);
+    const printed = [];
+    const ns = { args: [], tprintf: (fmt, s) => printed.push(s) };
+    await (await import(pathToFileURL(jsPath).href)).main(ns);
+    const report = printed.join("\n");
+    const normal = compile(src, "lib.rs");
+    if (!report.includes("test adds ... ok") || !report.includes("test fails ... FAILED") || !report.includes('Error: "late"'))
+      fail(name, report);
+    else if ((normal.code ?? "").includes("adds")) fail(name, `normal build:\n${normal.code}`);
+    else pass(name);
+  } catch (e) {
+    fail(name, e.message);
+  }
+}
+
 // rustc's error for a test that takes arguments.
 {
   const name = "libtest arguments";
@@ -910,7 +955,7 @@ const rejected = [
   ["one trait for a generic tuple and a concrete one", "}\ntrait K { fn k(&self) -> u8; }\nimpl<A, B> K for (A, B) { fn k(&self) -> u8 { 1 } }\nimpl K for (u8, String) { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `(u8, String)`"],
   // (Beside `impl<T: K> K for [T]` it would be fine: `u8` doesn't implement `K`.)
   ["one trait for an unbounded generic slice and `[u8]`", "}\ntrait K { fn k(&self) -> u8; }\nimpl<T> K for [T] { fn k(&self) -> u8 { 1 } }\nimpl K for [u8] { fn k(&self) -> u8 { 2 } }\nfn g() {", "5:6 conflicting implementations of trait `K` for type `Vec`"],
-  ["unsupported construct", "let v = vec![1];\n    let r = v.as_ptr();", "3:15 no method named `as_ptr` found for struct `Vec<{integer}>` in the current scope: method not found in `Vec<{integer}>`"],
+  ["unsupported construct", "let v = vec![1];\n    let r = v.as_ptr_range();", "3:15 no method named `as_ptr_range` found for struct `Vec<{integer}>` in the current scope: method not found in `Vec<{integer}>`"],
   ["an unknown type", "let x: Foo = 1;", "2:12 cannot find type `Foo` in this scope"],
   ["a misspelled type", "}\nstruct Stack { n: i32 }\nfn f() {\n    let s: Stak = Stack { n: 1 };", "5:12 cannot find type `Stak` in this scope: not found in this scope (a struct with a similar name exists: `Stack`)"],
   ["a misspelled std type", "let s: Strng = String::new();", "2:12 cannot find type `Strng` in this scope: not found in this scope (a type with a similar name exists: `String`)"],
@@ -1180,6 +1225,10 @@ const rejected = [
   ["assigning to an immutable static", "}\nstatic LIMIT: u32 = 3;\nfn f() {\n    LIMIT = 4;", "5:5 cannot assign to immutable static item `LIMIT`"],
   ["a trait's static function without its type", "}\ntrait Named {\n    fn name() -> String;\n}\nfn f() {\n    let n = Named::name();", "7:13 cannot call associated function on trait without specifying the corresponding `impl` type"],
   ["a `pub(super)` function used from further away", "}\nmod a {\n    pub mod b {\n        pub(super) fn f() {}\n    }\n}\nfn g() {\n    a::b::f();", "9:5 `f` is private to module `a::b`"],
+  ["a `pub(in crate::a::b)` function used from its parent", "}\nmod a {\n    pub mod b {\n        pub(in crate::a::b) fn g() -> u8 { 2 }\n    }\n    pub fn h() -> u8 { b::g() }\n}\nfn z() {", "7:24 `g` is private to module `a::b`"],
+  ["`T::Error` of a `TryFrom` bound unwrapped without `Debug`", "}\nfn conv<T: TryFrom<i64>>(x: i64) -> T {\n    T::try_from(x).unwrap()\n}\nfn z() {", "4:5 `T::Error` doesn't implement `std::fmt::Debug`"],
+  ["`T::Error` of a `TryFrom` bound printed without `Debug`", "}\nfn conv<T: TryFrom<i64>>(x: i64) -> String {\n    match T::try_from(x) {\n        Err(e) => format!(\"{:?}\", e),\n        Ok(_) => String::new(),\n    }\n}\nfn z() {", "5:35 `T::Error` doesn't implement `std::fmt::Debug`"],
+  ["a type parameter error unwrapped without `Debug`", "}\nfn f<E>(r: Result<u8, E>) -> u8 {\n    r.unwrap()\n}\nfn z() {", "4:5 `E` doesn't implement `std::fmt::Debug`"],
   ["a macro's own `let` isn't the caller's", "}\nmacro_rules! def {\n    () => {\n        let hidden = 1;\n    };\n}\nfn f() {\n    def!();\n    let y = hidden;", "10:13 cannot find value `hidden` in this scope"],
   ["calling a private function of an inline module", "}\nmod geo {\n    fn secret() {}\n}\nfn f() {\n    geo::secret();", "7:5 `secret` is private to module `geo`"],
   ["importing a private item of an inline module", "}\nmod geo {\n    struct Hidden;\n}\nuse geo::Hidden;\nfn f() {", "6:1 `Hidden` is private to module `geo`"],
@@ -1187,7 +1236,7 @@ const rejected = [
   ["a missing item named inside a macro", "}\nmod geo {\n    pub const UNIT: &str = \"m\";\n}\nfn f() {\n    println!(\"{}\", geo::UNITS);", "7:20 cannot find `UNITS` in module `geo`"],
   ["reaching into a private nested module", "}\nmod a {\n    mod b {\n        pub fn f() {}\n    }\n}\nfn g() {\n    a::b::f();", "9:5 module `b` is private"],
   ["a `super::` path to a missing item", "}\nmod a {\n    pub mod b {\n        pub fn f() -> i32 {\n            super::missing()\n        }\n    }\n}\nfn g() {", "6:13 cannot find `missing` in module `a`"],
-  ["pointer arithmetic", "let v = [1, 2];\n    let p: *const i32 = &v[0];\n    let q = unsafe { p.add(1) };", "4:22 `add()` on a raw pointer isn't supported"],
+  ["pointer arithmetic on a struct pointer", "let v = vec![String::new()];\n    let p: *const Vec<String> = &v;\n    let _q = unsafe { p.add(1) };", "4:23 `add()` on a raw pointer to a struct or collection isn't supported"],
   ["JSON of a closure", "let f = |x: i32| x + 1;\n    let s = js::JSON::stringify(&f);", "3:33 the trait bound `impl Fn(i32) -> i32: Serialize` is not satisfied"],
   ["JSON::parse without a target type", "let v = js::JSON::parse(\"1\");", "2:13 type annotations needed (say what to parse into, e.g. `JSON::parse::<Config>(..)`)"],
   ["a misspelled Date method", "let d = js::Date::new();\n    let h = d.get_hour();", "3:15 no method named `get_hour` found for struct `Date` in the current scope (a similar name exists: `get_hours`)"],

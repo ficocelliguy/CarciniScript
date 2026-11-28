@@ -1063,17 +1063,25 @@ pub fn strip_cfg(text: &mut String) -> bool {
         if node.kind() == SyntaxKind::SOURCE_FILE {
             continue;
         }
-        // A feature-gated `#[cfg]` on a block's tail expression is decided with every feature
-        // off, as a script has none: kept, `let x = { #[cfg(feature = "x")] { 5u8 } };` would be
-        // a `u8` where rustc has `()`. (A gated item stays, since the file's other code may use
-        // it; nothing names a tail expression.)
+        // A feature-gated `#[cfg]` on a block's tail expression, or on an element of an array,
+        // a tuple or a call's arguments, is decided with every feature off, as a script has
+        // none: kept, `let x = { #[cfg(feature = "x")] { 5u8 } };` would be a `u8` where rustc
+        // has `()`, and `[1, #[cfg(feature = "x")] 2]` two elements. (A gated item stays, since
+        // the file's other code may use it; nothing names an expression.)
         let off = off
             || (undecided
-                && node
+                && (node
                     .parent()
                     .and_then(ast::StmtList::cast)
                     .and_then(|l| l.tail_expr())
                     .is_some_and(|t| *t.syntax() == node)
+                    || ast::Expr::can_cast(node.kind())
+                        && node.parent().is_some_and(|p| {
+                            matches!(
+                                p.kind(),
+                                SyntaxKind::ARRAY_EXPR | SyntaxKind::TUPLE_EXPR | SyntaxKind::ARG_LIST
+                            )
+                        }))
                 && {
                     let mut j = 0;
                     !matches!(
@@ -1129,7 +1137,9 @@ pub fn strip_cfg(text: &mut String) -> bool {
     }
     // `#[cfg(..)]` on a macro's arguments (`vec![#[cfg(unix)] 1, 2]`, `sum!(1, #[cfg(feature =
     // "x")] 2)`): not items, so the attribute is read off the token tree. Off, the argument goes
-    // too (through its comma); otherwise just the attribute.
+    // too (through its comma); otherwise just the attribute. In the std macros whose arguments
+    // are expressions (`vec!`, `format!`, `assert_eq!`, ..), a feature-gated one is decided with
+    // every feature off, as for an array element; another macro's may be items the file uses.
     // (Not a call of a `macro_rules!` whose matchers take attributes themselves, `#[cfg(w =
     // $w:literal)]` or `$(#[$m:meta])*`: it gets them as written, and its expansion is stripped.)
     let attr_macros: Vec<String> = file
@@ -1141,6 +1151,14 @@ pub fn strip_cfg(text: &mut String) -> bool {
         .collect();
     for mc in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
         let Some(tt) = mc.token_tree() else { continue };
+        let expr_args = macro_name(&mc).is_some_and(|n| {
+            matches!(
+                n.as_str(),
+                "vec" | "format" | "print" | "println" | "eprint" | "eprintln" | "write"
+                    | "writeln" | "assert" | "assert_eq" | "assert_ne" | "debug_assert"
+                    | "debug_assert_eq" | "debug_assert_ne" | "concat" | "panic"
+            )
+        });
         if mc.syntax().ancestors().skip(1).any(|a| ast::MacroCall::can_cast(a.kind())) {
             continue;
         }
@@ -1197,7 +1215,14 @@ pub fn strip_cfg(text: &mut String) -> bool {
             let pred = attr[4..n - 2].to_vec();
             let mut k = 0;
             let val = cfg_pred3(&pred, &mut k, debug, true);
-            let off = matches!(val, Ok(Some(false)) if k == pred.len());
+            let off = matches!(val, Ok(Some(false)) if k == pred.len())
+                || expr_args && matches!(val, Ok(None)) && k == pred.len() && {
+                    let mut k = 0;
+                    !matches!(
+                        cfg_pred3(&pred, &mut k, debug, false),
+                        Ok(Some(true)) if k == pred.len()
+                    )
+                };
             let a = usize::from(toks[i].text_range().start());
             let mut b = end(j);
             if off {

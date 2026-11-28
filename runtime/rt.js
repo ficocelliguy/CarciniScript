@@ -3737,6 +3737,8 @@
     // slot is (`let r = &mut x;` of a `&mut i32`-typed `r`, `Some(&mut x)`, a `&mut i32` field):
     // `[1]` reads and writes it too.
     $cellSlot(c) {
+      // (A pointer into a buffer reads `[1]` already, and must stay movable.)
+      if (c.$buf !== undefined) return c;
       return {
         // (The box itself, for `ptr::eq`.)
         $base: c.$base ?? c,
@@ -3815,6 +3817,8 @@
     // index is checked once, here, as Rust does when it makes the reference).
     $placeSlot(o, k, loc) {
       if (loc !== null && !(k >= 0 && k < o.length)) rt.$oob(o, k, loc);
+      // (An element of a Vec or slice: a pointer into it, which `p.add(1)` can move.)
+      if (Array.isArray(o) && typeof k === "number") return rt.$bufPtr(o, k, loc ?? "<unknown>");
       if (o instanceof Deque) {
         k = o.$p(k);
         o = o.b;
@@ -4509,7 +4513,8 @@
         if (!(i >= 0 && i < c.length)) rt.$oob(c, i, loc);
         return c instanceof Deque ? c.b[c.$p(i)] : c[i];
       }
-      const f = opFn(c, "index");
+      // (`$op$index` picks among several impls by the index: a number or a range, say.)
+      const f = typeof c?.$op$index === "function" ? c.$op$index : opFn(c, "index");
       if (typeof f === "function") return f.call(c, i);
       throw new TypeError(`${loc}: this value can't be indexed`);
     },
@@ -4528,7 +4533,7 @@
           c[i] = $v;
         });
       }
-      const f = opFn(c, "index_mut");
+      const f = typeof c?.$op$index_mut === "function" ? c.$op$index_mut : opFn(c, "index_mut");
       if (typeof f === "function") return f.call(c, i);
       throw new TypeError(`${loc}: this value can't be indexed`);
     },
@@ -4555,7 +4560,53 @@
     },
     // `ptr::eq(a, b)`: the same object, or slots over the same box.
     $ptrEq(a, b) {
+      if (a?.$buf !== undefined) return a.$buf === b?.$buf && a.$at === b.$at;
       return a === b || (a != null && b != null && (a.$base ?? a) === (b.$base ?? b));
+    },
+    // `v.as_ptr()` / `p.add(n)` of numbers, strings or bools: a pointer at element `i` of the Vec,
+    // array or slice `a`. `[0]` / `[1]` read and write the element, bounds-checked where Rust's
+    // access would be undefined behavior (`loc`: where the pointer was made).
+    $bufPtr(a, i, loc) {
+      const at = () => {
+        if (i >= 0 && i < a.length) return i;
+        throw new CarciniPanic(`pointer access out of bounds: the buffer's len is ${a.length} but the offset is ${i}`, loc);
+      };
+      return {
+        $buf: a,
+        $at: i,
+        get 0() {
+          return a[at()];
+        },
+        set 0(v) {
+          a[at()] = v;
+        },
+        get 1() {
+          return a[at()];
+        },
+        set 1(v) {
+          a[at()] = v;
+        },
+      };
+    },
+    // `p.add(n)` / `sub` / `offset`: the pointer `n` elements on in the same buffer.
+    $ptrAdd(p, n, loc) {
+      if (p?.$buf === undefined) {
+        throw new CarciniPanic("pointer arithmetic is only supported on pointers into a Vec, array or slice (`as_ptr()`)", loc);
+      }
+      return rt.$bufPtr(p.$buf, p.$at + Number(n), loc);
+    },
+    // `p == q` / `p < end` of raw pointers: their order in one buffer, else 0 for the same place
+    // and 1 for different ones.
+    $ptrCmp(a, b) {
+      if (a?.$buf !== undefined && a.$buf === b?.$buf) return Math.sign(a.$at - b.$at);
+      return rt.$ptrEq(a, b) ? 0 : 1;
+    },
+    // `p.offset_from(q)`: how many elements `q` is before `p` in their buffer.
+    $ptrDiff(p, q, loc) {
+      if (p?.$buf === undefined || p.$buf !== q?.$buf) {
+        throw new CarciniPanic("`offset_from` needs two pointers into the same Vec, array or slice", loc);
+      }
+      return p.$at - q.$at;
     },
     // `p.as_mut()` of a pointer to a number, string or bool: null, or a slot (`[1]` too) over
     // the place its cell or slot reads and writes.
@@ -4878,7 +4929,16 @@
     },
     // `t.as_ref()` with an impl's `T: AsRef<[u8]>`: a string's UTF-8 bytes, else the bytes as they are.
     $asRefBytes(v) {
-      return typeof v === "string" ? rt.$utf8(v) : v;
+      return typeof v === "string" ? rt.$utf8(v) : rt.$asRefAny(v);
+    },
+    // `t.as_ref()` with a function's own `T: AsRef<X>` that stayed generic: a string or array as
+    // it is, else your type's `as_ref` (or `borrow` / `as_mut`).
+    $asRefAny(v) {
+      if (v == null || typeof v !== "object" || Array.isArray(v)) return v;
+      for (const k of ["AsRef$as_ref", "as_ref", "Borrow$borrow", "borrow", "AsMut$as_mut", "as_mut"]) {
+        if (typeof v[k] === "function") return v[k]();
+      }
+      return v;
     },
     // `s.as_bytes()`: UTF-8.
     $utf8(s) {

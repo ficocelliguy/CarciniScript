@@ -90,6 +90,7 @@ impl Checker<'_> {
         let saved_async = std::mem::replace(&mut self.in_async, is_async);
         // A closure body can't `break` out of the loop around it.
         let saved_loops = std::mem::take(&mut self.loops);
+        let tries = self.open_tries.len();
         if let Some(body) = c.body() {
             let found = self.infer(&body, Some(&ret));
             if !self.unify(&found, &ret) {
@@ -101,6 +102,7 @@ impl Checker<'_> {
                 self.error(body.syntax(), msg);
             }
         }
+        self.settle_open_tries(tries);
         self.ret_ty = saved_ret;
         self.in_async = saved_async;
         self.loops = saved_loops;

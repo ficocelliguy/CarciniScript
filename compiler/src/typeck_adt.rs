@@ -948,6 +948,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.try_error_bounds.clear();
         self.borrow_args.clear();
         let mut impl_params: Vec<(String, Option<ast::TypeBoundList>)> = Vec::new();
         if let Some(gp) = imp.generic_param_list() {
@@ -1085,6 +1086,8 @@ impl Checker<'_> {
             }
             self.record_op_bounds(&n, &lists);
             self.record_bound_args(&n, &lists);
+            // (`impl<E: From<E1>> P<E>`: `E::from(e)` and `?` in the methods.)
+            self.record_from_bound(&n, &lists, false);
             // `impl<L: IntoIterator> W<L>`: `self.0.into_iter()`, `-> L::IntoIter`.
             let wcs: Vec<ast::WhereClause> = imp.where_clause().into_iter().collect();
             self.note_into_iter_param(&n, &lists, &wcs);
@@ -1421,6 +1424,22 @@ impl Checker<'_> {
         match &ty {
             Ty::Adt(n, _) => match self.adts.defs.get(n) {
                 Some(def) if t == "Default" => def.has_default(),
+                // (`impl AsRef<OsStr> for Flag`: its `as_ref` is an ordinary method; `Into` is
+                // a `From` impl on the target, checked where `.into()` converts.)
+                Some(def) if matches!(t, "AsRef" | "AsMut" | "Borrow" | "BorrowMut" | "Into") => {
+                    def.implements(t)
+                        || t == "Into"
+                        || {
+                            let m = match t {
+                                "AsRef" => "as_ref",
+                                "AsMut" => "as_mut",
+                                "Borrow" => "borrow",
+                                _ => "borrow_mut",
+                            };
+                            self.adts.method(n, m).is_some()
+                                || self.adts.method(n, &format!("{t}${m}")).is_some()
+                        }
+                }
                 Some(def) => def.implements(t),
                 None => true,
             },
@@ -1824,6 +1843,35 @@ impl Checker<'_> {
             .into_iter()
             .map(|(n, t)| (n, self.lower_type(&t)))
             .collect();
+        // (`impl A1 for S` with `trait A1: A0`: `Self::Output` is `S`'s `A0` impl's, unchecked
+        // when that trait is generic or the impl names its own parameters.)
+        let mut assoc = assoc;
+        if let Some(tr) = trait_name.as_deref() {
+            for (s, a) in self.super_assoc_types(tr) {
+                if assoc.contains_key(&a) {
+                    continue;
+                }
+                let given = self
+                    .adts
+                    .traits
+                    .get(&s)
+                    .is_some_and(|d| d.type_params.is_empty())
+                    .then(|| {
+                        self.adts
+                            .impl_assoc
+                            .get(&(type_name.clone(), s.clone()))?
+                            .get(&a)
+                            .cloned()
+                    })
+                    .flatten()
+                    .filter(|t| {
+                        let mut ps = Vec::new();
+                        t.collect_params(&mut ps);
+                        ps.is_empty()
+                    });
+                assoc.insert(a, given.unwrap_or(Ty::Unknown));
+            }
+        }
         let saved_assoc = std::mem::replace(&mut self.impl_assoc, assoc);
         for item in imp
             .assoc_item_list()
@@ -2277,6 +2325,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.try_error_bounds.clear();
         self.borrow_args.clear();
     }
 
@@ -2573,6 +2622,7 @@ impl Checker<'_> {
             self.const_tys.clear();
             self.from_args.clear();
             self.try_from_args.clear();
+            self.try_error_bounds.clear();
             self.borrow_args.clear();
         }
     }

@@ -446,6 +446,7 @@ impl Checker<'_> {
         params: &[crate::ty::Ty],
         ref_params: &[Option<String>],
         args: &[ast::Expr],
+        turbofish: &[ast::Type],
     ) {
         if self.adts.twin_borrowed.is_empty()
             && !self.adts.ext_types.iter().any(|k| crate::adt::is_wrapper_key(k))
@@ -454,7 +455,7 @@ impl Checker<'_> {
             return;
         }
         let mut sides = Vec::new();
-        for (p, bounds) in type_params {
+        for (pi, (p, bounds)) in type_params.iter().enumerate() {
             let twin = bounds.iter().any(|b| self.twin_trait(b));
             let wraps = bounds.iter().any(|b| self.wrapper_trait(b));
             if !twin && !wraps {
@@ -467,6 +468,13 @@ impl Checker<'_> {
                 .find(|(_, (t, _))| matches!(t, crate::ty::Ty::Param(q) if q == p))
                 .map(|(i, (_, a))| (i, a))
             else {
+                // (`dep::<Box<u8>>()`: the wrappers the turbofish writes.)
+                if wraps && let Some(t) = turbofish.get(pi) {
+                    let kinds = written_wraps(t);
+                    if !kinds.is_empty() {
+                        sides.push((p.clone(), Some(false), self.range(t.syntax()), kinds));
+                    }
+                }
                 continue;
             };
             let side = if twin { self.owned_expr(a, "", 0) } else { Some(false) };
@@ -507,7 +515,7 @@ impl Checker<'_> {
             }
             ast::Expr::CallExpr(c) => {
                 if let Some(ast::Expr::PathExpr(p)) = c.expr()
-                    && p.syntax().text() == "Box::new"
+                    && matches!(p.syntax().text().to_string().as_str(), "Box::new" | "Rc::new" | "Arc::new")
                     && let Some(x) = c.arg_list().and_then(|l| l.args().next())
                 {
                     out.push("box");
@@ -636,7 +644,7 @@ fn written_wraps(t: &ast::Type) -> Vec<&'static str> {
                 if p.path()
                     .and_then(|p| p.segment())
                     .and_then(|s| s.name_ref())
-                    .is_some_and(|n| n.text() == "Box") =>
+                    .is_some_and(|n| matches!(n.text().to_string().as_str(), "Box" | "Rc" | "Arc")) =>
             {
                 out.push("box");
                 match p
@@ -703,7 +711,7 @@ impl Checker<'_> {
         };
         let bounds = super::generic::plain_bounds(&f);
         let ref_params = self.adts.method(adt, method).map(|m| m.ref_params.clone()).unwrap_or_default();
-        self.note_twin_targs(r, &bounds, params, &ref_params, args);
+        self.note_twin_targs(r, &bounds, params, &ref_params, args, &[]);
     }
 }
 

@@ -253,6 +253,13 @@ pub(crate) fn with_prelude(
         "TokioSender",
         "TokioUnboundedSender",
         "TokioReceiver",
+        "TokioOneshot",
+        "TokioWatch",
+        "TokioBroadcast",
+        "TokioNotify",
+        "TokioInterval",
+        "TokioMissedTickBehavior",
+        "TokioRecvError",
     ];
     if tokio_names.iter().any(|n| text.contains(n)) && !text.contains("// (tokio prelude)") {
         out.push(TOKIO);
@@ -360,6 +367,13 @@ pub(crate) fn with_prelude(
         "TokioReceiver",
         "__tokio_channel",
         "__tokio_unbounded_channel",
+        "TokioOneshot",
+        "__tokio_oneshot_channel",
+        "TokioWatch",
+        "__tokio_watch_channel",
+        "TokioBroadcast",
+        "__tokio_broadcast_channel",
+        "TokioNotify",
         "TaskContext",
         "TaskWaker",
         "__future_",

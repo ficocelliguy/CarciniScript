@@ -167,6 +167,23 @@ impl Checker<'_> {
         let a0 = args.first();
         let a1 = args.get(1);
         let count = |c: &mut Self, n: usize| c.arg_count(m.syntax(), "method", n, args.len());
+        // `r.unwrap()` / `r.expect(..)` print the error: `E` must be `Debug` (a type parameter,
+        // or `T::Error` of a `T: TryFrom<X>`; other errors are checked where they're made).
+        if matches!(method, "unwrap" | "expect")
+            && let Ty::Param(p) = self.shallow(&e)
+            && (!p.contains("::")
+                || p
+                    .strip_suffix("::Error")
+                    .is_some_and(|s| self.try_from_args.contains_key(s)))
+            && !self.param_has(&p, "Debug")
+        {
+            let msg = format!("`{}` doesn't implement `std::fmt::Debug`", self.describe(&e));
+            self.error_help(
+                m.syntax(),
+                msg,
+                &format!("required by a bound in `Result::<T, E>::{method}`"),
+            );
+        }
         let res = |t: Ty, e: Ty| Ty::Result(Box::new(t), Box::new(e));
         let opt = |t: Ty| Ty::Option(Box::new(t));
         Some(match method {

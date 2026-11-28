@@ -1,0 +1,23 @@
+sent to Ok(2)
+sent to Ok(3) receivers 3
+len 2 2 1
+Ok(1) Ok(2) Err(Empty)
+Ok(2) Err(Empty)
+tx len 2
+tx len after drop 0
+0: [10, 20, 30, 90] then channel closed Closed
+1: [11, 21, 31, 91] then channel closed Closed
+Ok(1) true
+Err(Lagged(3))
+lagged 3
+Ok("m3") Ok("m4")
+try lagged 11: channel lagged by 11
+Ok("m16") Err(Empty)
+send err channel closed SendError("x")
+Ok(5) true
+Ok(true) [1, 2]
+false Ok(false)
+[1, 2] Ok(true) [7]
+counts [1, 2, 3]
+[7] true
+ticks [2, 3, 4]

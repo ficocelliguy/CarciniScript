@@ -271,6 +271,41 @@ fn op_path(
     Some((first, m, o, u, prim.then_some(name)))
 }
 
+/// The file's structs and enums that derive `Clone` and have no inherent `fn clone`.
+fn derived_clone_types(file: &ast::SourceFile) -> Vec<String> {
+    use ra_ap_syntax::ast::{HasAttrs, HasName};
+    let derives = |attrs: ast::AstChildren<ast::Attr>| {
+        attrs.into_iter().any(|a| {
+            let t = a.syntax().text().to_string();
+            t.contains("derive") && t.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == "Clone")
+        })
+    };
+    let inherent_clone: Vec<String> = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Impl::cast)
+        .filter(|i| i.trait_().is_none())
+        .filter(|i| {
+            i.assoc_item_list().is_some_and(|l| {
+                l.assoc_items().any(|a| matches!(a, ast::AssocItem::Fn(f) if f.name().is_some_and(|n| n.text() == "clone")))
+            })
+        })
+        .filter_map(|i| match i.self_ty()? {
+            ast::Type::PathType(p) => Some(p.path()?.segment()?.name_ref()?.text().to_string()),
+            _ => None,
+        })
+        .collect();
+    file.syntax()
+        .descendants()
+        .filter_map(|n| match ast::Adt::cast(n)? {
+            ast::Adt::Struct(s) if derives(s.attrs()) => Some(s.name()?.text().to_string()),
+            ast::Adt::Enum(e) if derives(e.attrs()) => Some(e.name()?.text().to_string()),
+            _ => None,
+        })
+        .filter(|n| !inherent_clone.contains(n))
+        .collect()
+}
+
 /// The (type, trait) pairs of the file's `impl Add for V`s (`std::ops::Add<V>`, `impl<T> Add for
 /// V<T>`), where `V` has no inherent method of the trait's (which `V::add` would call).
 fn op_impl_types(file: &ast::SourceFile, traits: &[String]) -> Vec<(String, String)> {
@@ -379,6 +414,9 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         .map(at)
         .collect();
     let op_types = op_impl_types(&file, &traits);
+    // The file's types with a derived `Clone` and no inherent `clone`: `Bx::clone(&b)` is
+    // `(b).clone()`.
+    let clone_types = derived_clone_types(&file);
     // The file's own types (a `struct Cell` isn't `std::cell::Cell`).
     let own_types: Vec<String> = (1..toks.len())
         .filter(|&k| matches!(toks[k - 1].kind(), SyntaxKind::STRUCT_KW | SyntaxKind::ENUM_KW | SyntaxKind::TYPE_KW | SyntaxKind::UNION_KW))
@@ -580,7 +618,13 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             && (i == 0 || !matches!(at(i - 1).as_str(), "::" | "." | "<" | "as"))
             && type_param_in_scope(&toks[i]))
         .then(|| at(i));
-        let prim = if clone_of.is_some() {
+        let clone_type = clone_of.is_none()
+            && at(i + 1) == "::"
+            && at(i + 2) == "clone"
+            && at(i + 3) == "("
+            && (i == 0 || !matches!(at(i - 1).as_str(), "::" | "." | "<" | "as"))
+            && clone_types.contains(&at(i));
+        let prim = if clone_of.is_some() || clone_type {
             "Clone".to_string()
         } else {
             at(i)
@@ -721,10 +765,10 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                 continue;
             }
             let last = j - 1;
-            // (`T::clone(x)` of an `x` that isn't a `&..` written out.)
+            // (`T::clone(x)` / `T::clone(&x)`: through the `let`, so `Deref` applies to an
+            // `x: Bx<T>`.)
             if let Some(t) = &clone_of
                 && at(j) == ")"
-                && drop_to.is_none()
             {
                 edits.push((
                     start(first_tok),
@@ -805,6 +849,7 @@ pub fn has_type_anchors(text: &str) -> bool {
 /// anything changed.
 pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
     let file = crate::macros::parse_tree(text);
+    let clone_types = derived_clone_types(&file);
     let toks: Vec<SyntaxToken> = file
         .syntax()
         .descendants_with_tokens()
@@ -828,6 +873,38 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
+        // `Bx::<T>::clone(x)` of a type with a derived `Clone`: `Clone::clone(x)`.
+        if clone_types.iter().any(|t| t == at(i))
+            && colons(i + 1)
+            && !in_rules(&toks[i])
+            && (i == 0 || !matches!(at(i - 1), "::" | ":" | "." | "<" | "as"))
+        {
+            let open = if at(i + 1) == "::" { i + 2 } else { i + 3 };
+            if at(open) == "<" {
+                let mut depth = 0usize;
+                let mut g = open;
+                while g < toks.len() {
+                    match at(g) {
+                        "<" => depth += 1,
+                        ">" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ";" | "{" | "}" | "(" | ")" => break,
+                        _ => {}
+                    }
+                    g += 1;
+                }
+                let kc = if at(g + 1) == "::" { g + 2 } else { g + 3 };
+                if depth == 0 && at(g) == ">" && colons(g + 1) && at(kc) == "clone" && at(kc + 1) == "(" {
+                    edits.push((start(i), end(g), "Clone".to_string()));
+                    i = g + 1;
+                    continue;
+                }
+            }
+        }
         if at(i) != "<" || in_rules(&toks[i]) {
             i += 1;
             continue;
@@ -942,6 +1019,18 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
                 edits.push((start(o), start(o), "::".to_string()));
             }
             edits.push((end(a - 1), end(c), String::new()));
+            i = c + 1;
+            continue;
+        }
+        // `<Bx<P>>::clone(&b)` of a type with a derived `Clone`: `Clone::clone(&b)`, which
+        // `expand` writes as `(b).clone()`.
+        let kc = if at(c + 1) == "::" { c + 2 } else { c + 3 };
+        if clone_types.iter().any(|t| t == at(i + 1))
+            && colons(c + 1)
+            && at(kc) == "clone"
+            && at(kc + 1) == "("
+        {
+            edits.push((start(i), end(c), "Clone".to_string()));
             i = c + 1;
             continue;
         }

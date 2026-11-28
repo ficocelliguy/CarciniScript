@@ -633,6 +633,8 @@ fn is_pure(e: &ast::Expr) -> bool {
         ast::Expr::PrefixExpr(p) => p.expr().is_some_and(|i| is_pure(&i)),
         ast::Expr::FieldExpr(f) => f.expr().is_some_and(|i| is_pure(&i)),
         ast::Expr::CastExpr(c) => c.expr().is_some_and(|i| is_pure(&i)),
+        // (`grid[(r, c)].name.push('!')`.)
+        ast::Expr::TupleExpr(t) => t.fields().all(|f| is_pure(&f)),
         ast::Expr::IndexExpr(ix) => {
             ix.base().is_some_and(|b| is_pure(&b)) && ix.index().is_some_and(|i| is_pure(&i))
         }
@@ -1531,6 +1533,14 @@ impl<'a> Codegen<'a> {
             crate::adt::Conv::TryVec { len: None, .. } => value.wrap("κσ.Ok(κσ.$clone(", "))"),
             crate::adt::Conv::TryChar => value.wrap("κσ.$tryChar(", ")"),
             crate::adt::Conv::Wrap { js } => value.wrap(&format!("{js}("), ")"),
+            crate::adt::Conv::ParamFrom { param, src } => value.wrap(
+                &format!(
+                    "κσ.$tfrom({}, {}, ",
+                    self.dict_of(&Ty::Param(param)),
+                    js_string(&src)
+                ),
+                ")",
+            ),
         }
     }
 
@@ -2315,7 +2325,7 @@ impl<'a> Codegen<'a> {
         let drops_here = !params.is_empty()
             || list.statements().any(|s| match s {
                 ast::Stmt::LetStmt(l) => {
-                    self.let_drops(&l).is_some() || self.let_guard(&l).is_some()
+                    !self.let_drops(&l).is_empty() || self.let_guard(&l).is_some()
                 }
                 _ => false,
             });
@@ -2345,11 +2355,12 @@ impl<'a> Codegen<'a> {
                     "if ({flag}) {{ {flag} = false; κσ.$drop({js}); }}"
                 )));
             }
-            if let (Some(dk), ast::Stmt::LetStmt(l)) = (&list_js, &stmt)
-                && let Some(name) = self.let_drops(l)
-                && let Some(local) = self.lookup(name.text()).cloned()
-            {
-                self.track_drop(dk, &local.js);
+            if let (Some(dk), ast::Stmt::LetStmt(l)) = (&list_js, &stmt) {
+                for name in self.let_drops(l) {
+                    if let Some(local) = self.lookup(name.text()).cloned() {
+                        self.track_drop(dk, &local.js);
+                    }
+                }
             }
         }
         let ty = match list.tail_expr() {
@@ -2582,24 +2593,44 @@ impl<'a> Codegen<'a> {
             && walk(self, &t.view(), &mut Vec::new())
     }
 
-    /// The name a `let` binds when its value needs dropping at the end of the block.
-    fn let_drops(&self, l: &ast::LetStmt) -> Option<ast::Name> {
-        let Some(ast::Pat::IdentPat(ip)) = l.pat() else {
-            return None;
-        };
-        let name = ip.name()?;
-        if ip.pat().is_some() || l.let_else().is_some() || ip.ref_token().is_some() {
-            return None;
+    /// The names a `let` binds whose values need dropping at the end of the block: its one
+    /// name, or the by-value names of a tuple pattern (`let (tx, rx) = channel();`).
+    fn let_drops(&self, l: &ast::LetStmt) -> Vec<ast::Name> {
+        let mut out = Vec::new();
+        if l.let_else().is_some() {
+            return out;
         }
         // (A `let r = &x;` borrows: `x`'s owner drops it.)
         if l.initializer()
             .is_some_and(|i| matches!(strip_parens_expr(&i), ast::Expr::RefExpr(_)))
             || l.ty().is_some_and(|t| t.syntax().text().contains_char('&'))
         {
-            return None;
+            return out;
         }
-        let t = self.ty_of(name.syntax())?;
-        self.needs_drop(&t).then_some(name)
+        fn names(cg: &Codegen, p: &ast::Pat, out: &mut Vec<ast::Name>) {
+            match p {
+                ast::Pat::IdentPat(ip) => {
+                    if ip.pat().is_some() || ip.ref_token().is_some() {
+                        return;
+                    }
+                    if let Some(name) = ip.name()
+                        && cg.ty_of(name.syntax()).is_some_and(|t| cg.needs_drop(&t))
+                    {
+                        out.push(name);
+                    }
+                }
+                ast::Pat::TuplePat(tp) => {
+                    for f in tp.fields() {
+                        names(cg, &f, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(p) = l.pat() {
+            names(self, &p, &mut out);
+        }
+        out
     }
 
     /// `let g = cell.borrow();` / `let mut g = cell.borrow_mut();`: the call, the cell, and
@@ -3939,6 +3970,20 @@ impl<'a> Codegen<'a> {
                 let (pf, t) = self.emit_expr(&inner, expected);
                 (pf.wrap("[", "]"), t)
             }
+            // `&mut v[i] as *mut i32`: a pointer at that element, which `add` can move.
+            ast::Expr::RefExpr(r)
+                if self.types.ptrs.elems.contains(&self.range_of(r.syntax()))
+                    && let Some(ast::Expr::IndexExpr(ix)) = r.expr().map(|e| strip_parens_expr(&e))
+                    && let (Some(base), Some(index)) = (ix.base(), ix.index()) =>
+            {
+                let (bf, _) = self.emit_expr(&base, None);
+                let (xf, xt) = self.emit_expr(&index, None);
+                let xf = self.by_value(&index, xf, &xt);
+                let loc = self.location(ix.syntax());
+                let mut f = Frag::text("κσ.$placeSlot(");
+                f.append(bf).push(", ").append(xf).push(format!(", {loc:?})"));
+                (f, self.ty_of(ix.syntax()).unwrap_or(Ty::Unknown))
+            }
             // `&mut node.left` for a `&mut Option<..>` parameter: a cell over the slot.
             ast::Expr::RefExpr(r) if self.types.slot_args.contains(&self.range_of(r.syntax())) => {
                 let Some(inner) = r.expr() else {
@@ -4647,6 +4692,23 @@ impl<'a> Codegen<'a> {
         (Frag::text("undefined"), Ty::Unknown)
     }
 
+    /// `v.as_ptr()`, or `p.add(n)` / `sub` / `offset` of a pointer into a buffer: a call that
+    /// makes a buffer pointer (a cell), which `*` reads through.
+    fn buf_ptr_call(&self, e: &ast::Expr) -> bool {
+        let ast::Expr::MethodCallExpr(m) = strip_parens_expr(e) else {
+            return false;
+        };
+        let r = self.range_of(m.syntax());
+        self.types.ptrs.bufs.contains(&r)
+            || self.types.ptrs.methods.get(&r) == Some(&true)
+                && m.name_ref().is_some_and(|n| {
+                    matches!(
+                        n.text().to_string().as_str(),
+                        "add" | "sub" | "offset" | "wrapping_add" | "wrapping_sub" | "wrapping_offset"
+                    )
+                })
+    }
+
     fn emit_prefix(&mut self, p: &ast::PrefixExpr, expected: Option<&Ty>) -> (Frag, Ty) {
         let Some(inner) = p.expr() else {
             return (Frag::text("undefined"), Ty::Unknown);
@@ -4659,6 +4721,11 @@ impl<'a> Codegen<'a> {
             return (self.convert(conv, f).at(self.off(p.syntax())), ty);
         }
         match p.op_kind() {
+            // `*p.add(i)` / `*v.as_ptr()`: the element the moved pointer's cell reads.
+            Some(UnaryOp::Deref) if self.buf_ptr_call(&inner) => {
+                let (f, t) = self.emit_expr(&inner, expected);
+                (f.wrap("(", ")[0]"), t)
+            }
             Some(UnaryOp::Deref) => self.emit_expr(&inner, expected),
             // `-a` on a `T`: by its class.
             Some(UnaryOp::Neg) if matches!(self.ty_of(inner.syntax()), Some(Ty::Param(_))) => {
@@ -4800,6 +4867,24 @@ impl<'a> Codegen<'a> {
                 f = f.wrap("κσ.$pord(", &format!(", \"{o}\")"));
             }
             return (f.at(self.off(b.syntax())), ty);
+        }
+        // `p == q` / `p < end` of raw pointers: by where they point (`κσ.$ptrCmp`).
+        if let BinaryOp::CmpOp(cmp) = op
+            && self.types.ptrs.cmps.contains(&self.range_of(b.syntax()))
+        {
+            let (lf, _) = self.emit_expr(&lhs, None);
+            let (rf, _) = self.emit_expr(&rhs, None);
+            let o = match cmp {
+                ast::CmpOp::Eq { negated: false } => "===",
+                ast::CmpOp::Eq { negated: true } => "!==",
+                ast::CmpOp::Ord { ordering: ast::Ordering::Less, strict: true } => "<",
+                ast::CmpOp::Ord { ordering: ast::Ordering::Less, strict: false } => "<=",
+                ast::CmpOp::Ord { ordering: ast::Ordering::Greater, strict: true } => ">",
+                ast::CmpOp::Ord { ordering: ast::Ordering::Greater, strict: false } => ">=",
+            };
+            let mut f = Frag::text("κσ.$ptrCmp(");
+            f.append(lf).push(", ").append(rf).push(format!(") {o} 0"));
+            return (f.wrap("(", ")").at(self.off(b.syntax())), Ty::Bool);
         }
         // `x != y` / `a < b` through a `T: PartialEq<R>` / `PartialOrd<R>` bound: `a`'s own impl
         // when `b` isn't of its class.
@@ -7512,6 +7597,14 @@ impl<'a> Codegen<'a> {
             f.append(a).push("))");
             return (f, Ty::Unit);
         }
+        // `v.as_ptr()` of numbers, strings or bools: a pointer at element 0 that can move.
+        if self.types.ptrs.bufs.contains(&self.range_of(&node)) {
+            let (rf, _) = self.emit_expr(&recv, None);
+            let loc = self.location(&node);
+            let ty = self.ty_of(&node).unwrap_or(Ty::Unknown);
+            let f = rf.wrap("κσ.$bufPtr(", &format!(", 0, {loc:?})"));
+            return (f.at(name_off), ty);
+        }
         // `p.is_null()`, `p.as_ref()`, .. on a raw pointer (a cell for numbers).
         if let Some(&in_cell) = self.types.ptrs.methods.get(&self.range_of(&node)) {
             let (rf, _) = self.emit_expr(&recv, None);
@@ -7521,6 +7614,21 @@ impl<'a> Codegen<'a> {
                 ("as_mut", true) => rf.wrap("κσ.$ptrSlot(", ")"),
                 ("as_ref", true) => rf.wrap("κσ.$ptrGet(", ")"),
                 ("read", true) => rf.wrap("(", ")[0]"),
+                ("add" | "sub" | "offset" | "wrapping_add" | "wrapping_sub" | "wrapping_offset" | "offset_from", true) => {
+                    let a = match m.arg_list().and_then(|a| a.args().next()) {
+                        Some(a) => self.emit_expr(&a, None).0,
+                        None => Frag::text("undefined"),
+                    };
+                    let loc = self.location(&node);
+                    let (head, neg) = match method.as_str() {
+                        "offset_from" => ("κσ.$ptrDiff(", ""),
+                        "sub" | "wrapping_sub" => ("κσ.$ptrAdd(", "-"),
+                        _ => ("κσ.$ptrAdd(", ""),
+                    };
+                    let mut f = rf.wrap(head, &format!(", {neg}("));
+                    f.append(a).push(&format!("), {loc:?})"));
+                    f
+                }
                 ("write", true) => {
                     let v = match m.arg_list().and_then(|a| a.args().next()) {
                         Some(a) => {

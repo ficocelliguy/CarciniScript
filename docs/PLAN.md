@@ -276,19 +276,6 @@ files (comments and strings stripped; `gapscan.mjs` and `msgq.mjs` in the 2026-1
 scratchpad). Most of these items skip a check rather than reject a program, so they can't fail a
 survey file; for those the count is files using the construct, and none would flip.
 
-- [ ] **A `char` passed to an `impl Into<String>` parameter.** `fn f(s: impl Into<String>)`
-  given `'c'` is "mismatched types"; `&str` and `String` arguments work, and so do `let s: String
-  = 'x'.into()` and `u8::try_from(c)` (fixed with the std `From` / `TryFrom` impls in `2ada847`).
-  Estimate: 1 hour where an `impl Into<X>` argument is checked. Importance: low to medium.
-  Corpus: 0–1 files. Only smol_str's tests turn a char literal into a `String`, and 20 files
-  take `impl Into<String>` (an upper bound).
-- [ ] **tokio: `time::interval`, `sync::oneshot`, `broadcast`, `watch`, `Notify`, and
-  `#[tokio::test]`.** None are in `tokio_prelude.rs`; `oneshot` and `interval` are what a script
-  reaches for, and the test build skips `#[tokio::test]` functions. Estimate: half a day for the
-  primitives (the prelude already has timers and queues), 1 hour for `#[tokio::test]` (a `#[test]`
-  whose body is awaited). Importance: medium.
-  Corpus: about 1 file (webpki-roots' `#[tokio::test]`); the registry has no tokio sources, and
-  futures-util's 3 `oneshot` files use futures' own channel.
 - [ ] **Proc-macro API edges.** `syn::Expr` / `syn::Type` matched as enums (they are token lists
   here), `Span` values beyond `call_site()`, `ParseStream::step` / `cursor`. Estimate: 1 day for a
   token-list-backed `Expr` enum with the common variants; the rest as needed. Importance: low.
@@ -296,26 +283,9 @@ survey file; for those the count is files using the construct, and none would fl
   variants, 12 use `Span` beyond `call_site()`, 6 use `step` / `cursor`. None fail on it in the
   survey, since `syn` names count as another crate there (133 files report `Expr` / `Type` as
   unresolved).
-- [ ] **Smaller checks the compiler skips:** `pub(in crate::..)` visibility (the `super` forms are
-  checked); `T::Error` of a `TryFrom<X>` bound; `#[cfg(..)]` on an element inside a macro's
-  arguments (`vec![#[cfg(..)] x]`); exhaustiveness of a `match` on an enum from another crate.
-  Each an hour or two. Importance: low (none changes what runs).
-  Corpus (none fail, as the checks are skipped): `pub(in ..)` 31 files (mostly ring); `T::Error`
-  of a `TryFrom` bound 2 (http `header/map.rs`, serde_json issue845); `#[cfg]` on a `vec!`
-  element 3, about 20 counting `assert_eq!` / `format!` / `concat!` arguments (cfg'd items
-  passed to the program's own `macro_rules!` work); a `match` on an enum from outside the file
-  roughly 640 by a pattern proxy (arms naming a non-std enum the file doesn't define), an upper
-  bound on the matches that would go unchecked.
 - [ ] **`js` crate:** `requestIdleCallback` / `cancelIdleCallback`, and `crypto.subtle.digest` as
   an `async fn` returning `Vec<u8>`. Estimate: 1 hour in `bindings/js.rs`. Importance: low.
   Corpus: 0 files (no web-sys / js-sys caller of either).
-- [ ] **Raw pointer arithmetic inside one buffer.** Pointers to numbers in fields, returns and
-  `as_mut()` landed 2026-11-27 (`fixtures/ptr_prim_fields.rs`); left: a slot is already (array,
-  index), so `p.add(n)` / `sub` / `offset` could make a slot at index + n, `offset_from` subtract
-  indexes, and `as_ptr()` / `as_mut_ptr()` of a Vec or slice be the slot at 0, with `read` /
-  `write` bounds-checked. Casts between pointee types, integer/pointer casts and `transmute` stay
-  not planned. Estimate: 1–2 days. Importance: low. Corpus: the 136 files with pointer errors
-  also cast pointers or hit another gap.
 
 ## Corpus gaps by files affected (2026-11-27)
 
@@ -330,15 +300,6 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
 
 ### Language gaps
 
-- [ ] **A `&mut` inside a tuple your own function returns is treated as owned.** `let (s, d) =
-  view(&s, &mut d)` with `fn view(..) -> (&[u32], &mut [u32])`, then `&mut d[..n]`: "cannot
-  borrow `d` as mutable" (`agentC/q11_iter_mut_items.rs`, `bv`). The rest of the rebinding
-  family landed 2026-11-27 (`fixtures/rebind_mut_ref.rs`): `let t = v;` with `v: &mut Vec<u8>`,
-  `let t = if c { a } else { b }` (the borrow checker gives the result fresh regions, so two
-  parameters' lifetimes needn't match), a `match` whose arms each give a `&mut`, `if let Some(s)
-  = o` / `let s = o?` with `o: Option<&mut T>` (a parameter, a typed `let`, or `let o =
-  v.get_mut(i)`), `as_mut_slice()`, the `&mut` items of a user iterator (`type Item = &'a mut
-  T`) and of `.zip(dst.chunks_mut(n))`. 1 file. Importance: low.
 - [ ] **Impls over types that are one type in JS that behave differently still conflict.** `[u8;
   1]` vs `[u8; 2]` with different bodies (`agentB/c6*`; the run-time length could pick), `[u8;
   N]` vs `[u8]` doing different things (phf_shared `array_impl!(u8)`), `X` vs `&X` (`c11b`) and
@@ -361,19 +322,15 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   marker traits for such types (`Cow<str>` / `Cow<[T]>`). Conflict errors are gone from about a
   dozen corpus files (bitvec, log, miow, quote, rand, regex, ring, stable_deref_trait), most
   with other errors left. Importance: low to medium.
-- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** `<Rc<u8>>::f()` /
-  `<Box<u8>>::f()` with `impl<T: Tr> Tr for Rc<T>` ("no function .. found for struct `Rc`";
-  `<Box<u8> as Tr>::f()` works); `S::default()` in an associated fn of `impl<K, V, S:
-  BuildHasher + Default> Tr for HashMap<K, V, S>` (winnow; `S` isn't among the map's type
+- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** `S::default()` in an
+  associated fn of `impl<K, V, S: BuildHasher + Default> Tr for HashMap<K, V, S>` (winnow; `S` isn't among the map's type
   arguments); `Z::default()` in a method with `self` of a blanket `impl<Z: DefaultIsZeroes>
   Zeroize for Z` (zeroize); `Default::default()` / `unwrap_or_default()` on a projection
   parameter (`I::Item: Default`, itertools' `concat`: no caller hands over its class); `>>` / `&`
   / `|` / `^` on the param of a blanket impl (`impl<I> Half for I where I: Shr<usize, Output =
   I>`: the method needs `I`'s class, which a call on a number would have to pass); bounds on
   projections (`<T as Shr<u32>>::Output: PartialEq<T>`, `u8: TryFrom<<T as BitAnd>::Output>`,
-  `where &'a T: Add<T>` with `<&'a T as Add<T>>::Output`); `.fmt(f)` / `.len()` through a std
-  supertrait of a same-file trait (`dyn PreciseIterator`.len()); `T::clone(&x)` with `x: Bx<T>`
-  (an explicit `&`) still compiles to `x.clone()`; a `&mut self` method of a HashMap/HashSet impl
+  `where &'a T: Add<T>` with `<&'a T as Add<T>>::Output`); a `&mut self` method of a HashMap/HashSet impl
   reached through `$dcallMutT` doesn't get the map class's `elem`. Landed 2026-11-27
   (`fixtures/into_iter_param_bounds.rs`): `IntoIterator` bounds on a parameter that stays one
   (inline, impl or method `where`, `for<'a> &'a L: IntoIterator`, `where &'a I: IntoIterator`,
@@ -381,7 +338,11 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   either's 21 errors, strsim), `T::clone(b)` through `Deref`, `Default::default()` settling to a
   `T: Default` in a closure; and (`fixtures/map_impl_param_calls.rs`) `K::f()` / `Self::f()` in
   methods of `HashMap<K, V>` / `HashSet<T>` / `Vec<T>` impls, `<Cell<u8>>::f()` through a blanket
-  impl, `Trait::f(args)` whose `Self` settles later. Probes in `agentD/q9*`, `q12*`, `q15*` and
+  impl, `Trait::f(args)` whose `Self` settles later. And (`fixtures/iter_supertrait_clone_paths.rs`) a
+  same-file trait whose supertraits are iterator traits (`trait PreciseIterator: Iterator +
+  ExactSizeIterator {}`, or one with a blanket impl over iterators) as a bound or `dyn`, its
+  values iterators (`it.len()`, `t.next()`); `T::clone(&x)` through `Deref`; `Bx::clone(&b)` /
+  `<Bx<P>>::clone(&b)` / `Bx::<T>::clone(x)` of a derived `Clone`. Probes in `agentD/q9*`, `q12*`, `q15*` and
   `agentC/q19`, `q21`. Fewer than the 23 files the entry started with. Importance: low to medium.
 - [ ] **Derives over std types: `NonZero<char>` fields are not `Copy`** (it maps to `String`). The
   rest of the row landed 2026-11-27 (`fixtures/derive_std_fields.rs`): `slice::IterMut` fields
@@ -389,25 +350,13 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   derive bounded on it, `TypeId` fields are `Copy` / `Hash` / `Ord`, `dyn Any` is `Debug`; and
   `#[cfg_attr(not(feature = "x"), derive(..))]` applies, with features off, as rustc builds a lone
   file (`fixtures/cfg_attr_derives.rs`). A file or two. Importance: low.
-- [ ] **Indexing user types, remaining shapes.** Calling the impl's method by name
-  (`sv.index(1..2)`, `v.index_mut(0)`: "no method named `index`"); `I: SliceIndex<str>`; with no
+- [ ] **Indexing user types, remaining shapes.** `I: SliceIndex<str>`; with no
   `Deref`, `&mut v[a..b]` through your `index_mut` is a view only inside its body (a use site
   gets a copy); `Output = String` through a bound (`c[i].push(..)`) is untested; ascii's
   `[Self::Inner]` in a trait method signature. `impl<T, I: SliceIndex<[T]>> Index<I>` /
   `IndexMut<I>` (smallvec, thin-vec, bumpalo; `fixtures/index_slice_index.rs`) and `c[ix] = e` /
   `c[ix] += 1` through a `C: IndexMut<Ix>` bound (`fixtures/index_param_assign.rs`) landed
   2026-11-27. A few files. Importance: low.
-- [ ] **Inference shapes.** `B: Into<Vec<u8>>` pins `B` to `Vec<u8>` and `T: AsRef<str>` pins `T` to
-  `String` instead of inferring from the argument; `Box::new(t)` to `Box<dyn Tr>` when `Tr` has a
-  blanket impl (3 files); a closure using `?` with no return annotation takes its error type from
-  the operand; unsuffixed integer locals default to `i32` before a later `with_capacity(c)` pins
-  them (1 flip); `.into()` whose target is only known later stays `String` (1 flip); `impl<A>
-  Tr1<A> for S where Self: Tr0<A>` forwarding (1 flip); `o.unwrap_or_default()` on an `Option`
-  whose type isn't known yet. Probes `agentE/q26*`, `q7*`, `q13*`, `q17*`, `q20*`, `q4*`, `q28*`,
-  `q22*`. About 7 files, 2 flips (an `Option` as `impl IntoIterator`, the other 2, landed
-  2026-11-27: `fixtures/option_into_iter_args.rs`; `map.get(q)` under `K: Borrow<Q>` or `String:
-  Borrow<Q>` with a `&Q`, 11 files, too: `fixtures/borrow_q_lookup.rs`).
-  Importance: low to medium.
 
 ### Survey tooling notes
 
@@ -448,6 +397,14 @@ by design or long-standing differences from rustc are in `RUST_GAPS.md`.
   `Bx::get(&mut b).push(3)` throws "Bx.get(...).push is not a function" (rustc prints `[1, 3]`):
   the fn returns a slot (`$placeSlot`) and the caller uses it as the object. Found 2026-11-27
   writing `fixtures/into_iter_param_bounds.rs`.
+- [ ] **`or_default()` on a map entry whose value is a `V: Default` parameter.** `fn f<V: Default +
+  AddAssign<u8>>(m: &mut HashMap<u8, V>) { *m.entry(1).or_default() += 1; }` (also in a method of
+  `impl<V: Default + ..> Tr for HashMap<u8, V>`) is "the trait bound `V: Default` is not
+  satisfied" (rustc accepts). Found 2026-11-27 probing winnow's `S::default()` shape.
+- [ ] **`unwrap()` of a `Result<_, <T as Tr>::Er>` isn't checked for `Debug`.** `trait Tr { type
+  Er; fn mk() -> Result<u8, Self::Er>; } fn h<T: Tr>() -> u8 { T::mk().unwrap() }` compiles
+  (rustc: "`<T as Tr>::Er` doesn't implement `Debug`"); a type parameter's and a `TryFrom`
+  bound's `T::Error` are checked. Found 2026-11-27 adding that check.
 
 ## Risks
 

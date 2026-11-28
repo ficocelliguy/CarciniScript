@@ -72,9 +72,16 @@ fn visible_from(n: &SyntaxNode, path: &[String]) -> Option<Vec<String>> {
         t => {
             // `pub(in crate::a::b)`, `pub(in super)`, `pub(in self::x)`.
             let inner = t.strip_prefix("pub(in")?.strip_suffix(')')?;
-            // (`crate::` may be a bigger crate than this file: not checked, like `crate::` paths.)
-            if inner.starts_with("crate") {
-                return None;
+            // `crate::a::b` naming one of the item's enclosing modules here. (Another one means
+            // this file is a module of a bigger crate, where `crate::` is something else: not
+            // checked, like `crate::` paths.)
+            if let Some(rest) = inner.strip_prefix("crate") {
+                let segs: Vec<String> = rest
+                    .split("::")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                return path.starts_with(&segs).then_some(segs);
             }
             let mut out = path.to_vec();
             for (i, seg) in inner.split("::").enumerate() {

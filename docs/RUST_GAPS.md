@@ -215,8 +215,9 @@ There is one JS thread, and scripts share it with the game.
   panicking task ends the script instead of giving `Err(JoinError)`. `select!` polls its branches
   in order (tokio picks at random) and can't cancel a losing `async fn` (a JS promise runs on;
   a channel's `recv()` is cancel-safe). Locks never wait, so a tokio `Mutex` held across an
-  `.await` doesn't keep other tasks out. No `interval`, `oneshot`, `broadcast`, `watch` or
-  `Notify`, and `time::timeout` with `use tokio::time;` must be spelled `tokio::time::timeout`.
+  `.await` doesn't keep other tasks out. An `interval`'s ticks are JS timers, as late as the
+  host's timer resolution. `time::timeout` with `use tokio::time;` must be spelled
+  `tokio::time::timeout`.
 - **Async fns and blocks are JS promises**, which start when called and can't be polled to
   completion synchronously: `poll` on one is `Pending` until it settles (then the waker is
   woken), so a hand-written `block_on` loop over an async fn never ends; drive those with
@@ -229,9 +230,14 @@ There is one JS thread, and scripts share it with the game.
 ## Raw pointers
 
 - **Pointers have no addresses.** A raw pointer is the object it points at (or a cell for a
-  number, string, bool or Option), so there's no pointer arithmetic, no casts between pointers
-  and integers, and `transmute` only reinterprets same-size numbers, `char` and `bool`. All of
-  these are errors.
+  number, string, bool or Option), so there are no casts between pointers and integers or
+  between pointee types, and `transmute` only reinterprets same-size numbers, `char` and `bool`.
+  All of these are errors. Pointer arithmetic works only inside one buffer: a pointer from
+  `as_ptr()` / `as_mut_ptr()` or `&mut v[i]` of a Vec, array or slice of numbers, strings or
+  bools is (buffer, index), so `add` / `sub` / `offset` / `offset_from` and `==` / `<` work on
+  it; arithmetic on any other pointer is an error (a struct pointee) or a panic (a pointer to a
+  local). Reading or writing past the buffer's end panics where Rust's is undefined behavior, and
+  a pointer stays valid after the Vec grows.
 - **Dangling pointers don't dangle.** A pointer outlives what it points at: reading through it
   after the value is dropped (or after `Box::from_raw` freed it) still sees the last value
   instead of being undefined behavior. A null pointer read throws a JS `TypeError`, not a
@@ -374,7 +380,11 @@ There is one JS thread, and scripts share it with the game.
   still applies to what you write, but CarciniScript accepts some forms rustc would reject.
 - **Exhaustiveness is approximate.** Catch-all arms, `true`/`false`, `None`/`Some(_)` and integer
   or char ranges are understood, but checking gives up on very large matches (it assumes
-  they're covered).
+  they're covered). A `match` on an enum of a crate that isn't bundled isn't checked: its
+  variants aren't known here (std's and the bundled crates' enums are).
+- **`T::Error` of a `T: TryFrom<X>` bound is checked only for `Debug` / `Display`** (`{:?}`,
+  `unwrap()`), from a `where T::Error: Debug` or an `Error = E` binding; other uses take any
+  type.
 - **`RefCell` tracks the borrows `let` holds.** `let g = c.borrow_mut();` holds its borrow until
   the block ends (or `drop(g)`), and a conflicting `borrow` / `borrow_mut` panics as rustc's does.
   A guard kept any other way doesn't hold it: in a struct field, returned or passed on, bound

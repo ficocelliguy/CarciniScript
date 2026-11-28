@@ -828,6 +828,9 @@ pub enum Conv {
     TryChar,
     /// A runtime function of the value (`?` into an `anyhow::Error`: `κσ.$anyhow.from(e)`).
     Wrap { js: String },
+    /// Into the type parameter `param` through its `From<src>` bound (`?` in a fn returning
+    /// `Result<_, E>` with `E: From<E1>`): `κσ.$tfrom($E, "src", x)`, as `E::from(x)`.
+    ParamFrom { param: String, src: String },
 }
 
 impl Adts {
@@ -1501,7 +1504,7 @@ pub fn is_tests_path(filename: &str) -> bool {
 
 /// Whether `src` may have code only a test build compiles.
 pub fn has_test_code(src: &str) -> bool {
-    src.contains("#[test]") || src.contains("cfg(test)")
+    src.contains("#[test]") || src.contains("cfg(test)") || src.contains("#[tokio::test")
 }
 
 /// Whether the token at `offset` in `file` (parsed as written) is in code only a test build
@@ -1525,7 +1528,7 @@ pub fn test_code_at(file: &ast::SourceFile, offset: usize) -> bool {
 pub fn is_test_fn(f: &ast::Fn) -> bool {
     f.attrs().any(|a| {
         let text: String = a.syntax().text().to_string().split_whitespace().collect();
-        text == "#[test]"
+        text == "#[test]" || text.starts_with("#[tokio::test")
     })
 }
 
@@ -1549,7 +1552,7 @@ pub fn test_only(node: &ra_ap_syntax::SyntaxNode) -> bool {
         };
         attrs.iter().any(|a| {
             let text: String = a.syntax().text().to_string().split_whitespace().collect();
-            text == "#[test]" || text == "#[cfg(test)]"
+            text == "#[test]" || text == "#[cfg(test)]" || text.starts_with("#[tokio::test")
         })
     })
 }
@@ -1559,12 +1562,14 @@ pub fn test_only(node: &ra_ap_syntax::SyntaxNode) -> bool {
 /// per file: the checker and codegen ask many times.
 pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
     thread_local! {
-        static LAST: std::cell::RefCell<Option<(ra_ap_syntax::SyntaxNode, Vec<ast::Item>)>> =
+        static LAST: std::cell::RefCell<Option<(ra_ap_syntax::SyntaxNode, bool, Vec<ast::Item>)>> =
             const { std::cell::RefCell::new(None) };
     }
     LAST.with(|last| {
-        if let Some((node, items)) = &*last.borrow()
+        // (Keyed by the build too: a test build keeps the `#[test]` items a normal one drops.)
+        if let Some((node, test, items)) = &*last.borrow()
             && node == file.syntax()
+            && *test == test_build()
         {
             return items.clone();
         }
@@ -1670,7 +1675,7 @@ pub fn all_items(file: &ast::SourceFile) -> Vec<ast::Item> {
         // Impls for types that are one type in JS (`[T; N]` and `[T]`, `X` and `&X`) that repeat or
         // hand on to another impl of their trait: that one serves.
         let items = crate::erased_twins::drop_erased_twins(items);
-        *last.borrow_mut() = Some((file.syntax().clone(), items.clone()));
+        *last.borrow_mut() = Some((file.syntax().clone(), test_build(), items.clone()));
         items
     })
 }

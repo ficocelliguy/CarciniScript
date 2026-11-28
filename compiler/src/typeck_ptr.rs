@@ -35,6 +35,15 @@ pub struct Ptrs {
     pub cell_fields: HashSet<String>,
     /// Functions and methods declared `-> *mut T` / `-> *const T`, by name.
     pub ret_fns: HashSet<String>,
+    /// `v.as_ptr()` / `v.as_mut_ptr()` of a Vec, array or slice of numbers, strings or bools, by
+    /// the call's range: a pointer at element 0 that `add` / `sub` / `offset` can move.
+    pub bufs: HashSet<(usize, usize)>,
+    /// `p == q` / `p < end` between raw pointers, by the comparison's range: by where they
+    /// point.
+    pub cmps: HashSet<(usize, usize)>,
+    /// `&mut v[i] as *mut T` of a Vec, array or slice, by the `&`'s range: a pointer at element
+    /// `i` that can move (`κσ.$placeSlot`).
+    pub elems: HashSet<(usize, usize)>,
 }
 
 /// Whether a type is a raw pointer (`*const T` / `*mut T`).
@@ -126,7 +135,7 @@ impl Checker<'_> {
     /// Whether `e` is a raw pointer: a pointer local or field, a cast to a pointer type,
     /// `ptr::null()`, `Box::into_raw(..)`.
     pub(super) fn is_ptr(&self, e: &ast::Expr) -> bool {
-        match strip_parens(e) {
+        match unsafe_tail(e) {
             ast::Expr::PathExpr(p) => p
                 .path()
                 .and_then(|p| p.as_single_name_ref())
@@ -138,11 +147,42 @@ impl Checker<'_> {
                 .name_ref()
                 .is_some_and(|n| self.ptrs.fields.contains(n.text().to_string().as_str())),
             ast::Expr::CallExpr(c) => ptr_fn(&c).is_some() || self.ptr_ret_call(&c),
-            ast::Expr::MethodCallExpr(m) => m
-                .name_ref()
-                .is_some_and(|n| self.ptrs.ret_fns.contains(n.text().to_string().as_str())),
+            ast::Expr::MethodCallExpr(m) => {
+                self.ptr_made(&m)
+                    || m.name_ref()
+                        .is_some_and(|n| self.ptrs.ret_fns.contains(n.text().to_string().as_str()))
+            }
             _ => false,
         }
+    }
+
+    /// A method call that makes a pointer into a buffer: `v.as_ptr()`, or `p.add(n)` / `sub` /
+    /// `offset` of one (checked already).
+    pub(super) fn ptr_made(&self, m: &ast::MethodCallExpr) -> bool {
+        let r = self.range(m.syntax());
+        if self.ptrs.bufs.contains(&r) {
+            return true;
+        }
+        m.name_ref().is_some_and(|n| {
+            matches!(
+                n.text().to_string().as_str(),
+                "add" | "sub" | "offset" | "wrapping_add" | "wrapping_sub" | "wrapping_offset"
+            )
+        }) && self.ptrs.methods.get(&r) == Some(&true)
+    }
+
+    /// `v.as_ptr()` / `v.as_mut_ptr()` of a Vec, array or slice: a pointer at its first element, `e`.
+    pub(super) fn buf_ptr(&mut self, m: &ast::MethodCallExpr, e: Ty) -> Option<Ty> {
+        if !self.cellable(&e) {
+            self.error(
+                m.syntax(),
+                "`as_ptr()` of a Vec or slice of structs or collections isn't supported (only numbers, strings and bools); use indices",
+            );
+            return Some(Ty::Unknown);
+        }
+        let r = self.range(m.syntax());
+        self.ptrs.bufs.insert(r);
+        Some(e)
     }
 
     /// The value of a raw pointer field holding a number, string or bool (`Counter { p: &mut x
@@ -216,6 +256,13 @@ impl Checker<'_> {
                     {
                         let rr = self.range(r.syntax());
                         self.slot_args.insert(rr);
+                        if let ast::Expr::IndexExpr(ix) = &other
+                            && let Some(base) = ix.base()
+                            && let Some(t) = self.raw.get(&self.range(base.syntax())).cloned()
+                            && matches!(self.zonk(&t), Ty::Vec(_))
+                        {
+                            self.ptrs.elems.insert(rr);
+                        }
                     }
                     other => self.error(
                         other.syntax(),
@@ -240,6 +287,8 @@ impl Checker<'_> {
                 }
             }
             ast::Expr::CallExpr(c) if ptr_fn(&c).is_some() => {}
+            // `v.as_ptr()`, `p.add(n)`: a pointer into a buffer, already a cell.
+            ast::Expr::MethodCallExpr(m) if self.ptr_made(&m) => {}
             // A call of your `-> *mut i32` (it returns the slot), a pointer field (it holds one).
             ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_) | ast::Expr::FieldExpr(_)
                 if self.is_ptr(e) =>
@@ -317,11 +366,25 @@ impl Checker<'_> {
         else {
             return;
         };
-        if local.decl.is_some_and(|d| self.ptrs.cells.contains(&d)) {
+        // (A pointer parameter of a number holds its cell too: `p = p.add(1)` moves it.)
+        if local.decl.is_some_and(|d| {
+            self.ptrs.cells.contains(&d) || self.ptrs.locals.contains(&d) && self.cellable(&local.ty)
+        }) {
             let r = self.range(b.syntax());
             self.ptrs.repoints.insert(r);
             self.ptr_cell(&rhs);
         }
+    }
+
+    /// `p == q` / `p < end` between raw pointers (both checked, `t` the pointee): compared by
+    /// where they point, so each side is passed as its cell.
+    pub(super) fn ptr_cmp(&mut self, b: &ast::BinExpr, lhs: &ast::Expr, rhs: &ast::Expr, t: &Ty) {
+        if self.cellable(t) {
+            self.ptr_cell(lhs);
+            self.ptr_cell(rhs);
+        }
+        let r = self.range(b.syntax());
+        self.ptrs.cmps.insert(r);
     }
 
     /// `p.is_null()`, `p.as_ref()`, `p.as_mut()` on a raw pointer; `None` for other methods.
@@ -336,6 +399,19 @@ impl Checker<'_> {
             return None;
         }
         let t = self.infer(recv, None);
+        self.ptr_method_on(m, recv, method, args, t)
+    }
+
+    /// The same, with the pointer's type known: `v.as_ptr().add(1)` (only a checked receiver
+    /// shows it makes a pointer).
+    pub(super) fn ptr_method_on(
+        &mut self,
+        m: &ast::MethodCallExpr,
+        recv: &ast::Expr,
+        method: &str,
+        args: &[ast::Expr],
+        t: Ty,
+    ) -> Option<Ty> {
         let in_cell = self.cellable(&t);
         let out = match method {
             "is_null" => Ty::Bool,
@@ -367,9 +443,43 @@ impl Checker<'_> {
                 }
                 Ty::Unit
             }
+            // Within one buffer (`v.as_ptr()`): the slot at another index, or the distance.
             "add" | "sub" | "offset" | "wrapping_add" | "wrapping_sub" | "wrapping_offset"
-            | "byte_add" | "byte_sub" | "offset_from" | "addr" | "cast" | "cast_mut"
-            | "cast_const" => {
+                if in_cell =>
+            {
+                let n = if matches!(method, "offset" | "wrapping_offset") {
+                    Ty::Int(IntKind::Isize)
+                } else {
+                    Ty::Int(IntKind::Usize)
+                };
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let Some(a) = args.first() {
+                    self.check(a, &n);
+                }
+                t
+            }
+            "offset_from" if in_cell => {
+                self.arg_count(m.syntax(), "method", 1, args.len());
+                if let Some(a) = args.first() {
+                    self.check(a, &t);
+                    self.ptr_cell(a);
+                }
+                Ty::Int(IntKind::Isize)
+            }
+            "add" | "sub" | "offset" | "wrapping_add" | "wrapping_sub" | "wrapping_offset"
+            | "offset_from" => {
+                self.error(
+                    m.syntax(),
+                    format!(
+                        "`{method}()` on a raw pointer to a struct or collection isn't supported (only pointers to numbers, strings or bools in a Vec, array or slice move)"
+                    ),
+                );
+                for a in args {
+                    self.infer(a, None);
+                }
+                return Some(Ty::Unknown);
+            }
+            "byte_add" | "byte_sub" | "addr" | "cast" | "cast_mut" | "cast_const" => {
                 let msg = format!(
                     "`{method}()` on a raw pointer isn't supported: values have no memory layout to point into (use indices into the Vec)"
                 );

@@ -63,6 +63,11 @@ pub(super) const KNOWN_BOUNDS: &[&str] = &[
     "ToString",
     // (`T: Into<f64>`: its target is recorded; serde's bounds are checked where JSON is read.)
     "Into",
+    // (`S: AsRef<str>` that `-> Wrap<S>` keeps generic: `as_ref()` converts at run time.)
+    "AsRef",
+    "AsMut",
+    "Borrow",
+    "BorrowMut",
     "Serialize",
     "Deserialize",
     "DeserializeOwned",
@@ -510,6 +515,31 @@ pub fn subst(t: &Ty, m: &HashMap<String, Ty>) -> Ty {
     }
 }
 
+/// Whether the type parameter `name` appears in `f`'s signature only as a whole parameter type
+/// (`s: S`, `s: &S`, `s: &mut S`), so it can be taken as its conversion bound's target.
+pub(super) fn conv_param_plain(f: &ast::Fn, name: &str) -> bool {
+    let named = |t: &ast::PathType| {
+        t.path()
+            .is_some_and(|p| p.qualifier().is_none() && p.syntax().text() == name)
+    };
+    let mut types: Vec<ast::Type> = f
+        .param_list()
+        .into_iter()
+        .flat_map(|l| l.params())
+        .filter_map(|p| p.ty())
+        .collect();
+    types.extend(f.ret_type().and_then(|r| r.ty()));
+    types.iter().all(|t| {
+        t.syntax().descendants().filter_map(ast::PathType::cast).filter(named).all(|pt| {
+            let top = match pt.syntax().parent().and_then(ast::RefType::cast) {
+                Some(r) => r.syntax().clone(),
+                None => pt.syntax().clone(),
+            };
+            top.parent().is_some_and(|p| ast::Param::can_cast(p.kind()))
+        })
+    })
+}
+
 impl Checker<'_> {
     /// A function's written return type. `-> impl Debug` (std's formatting and comparison
     /// traits) is the body's own type, as in rustc, so `{:?}` prints a tuple as one: a type
@@ -536,6 +566,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.try_error_bounds.clear();
         self.borrow_args.clear();
         let mut params = Vec::new();
         // Bounds that name other parameters come after the plain ones: `Fut: Future<Output = T>`,
@@ -593,13 +624,16 @@ impl Checker<'_> {
                 continue;
             }
             // `S: Into<String>` / `S: AsRef<str>`: the target type, like `impl Into<String>`.
+            // (Unless `S` is named elsewhere in the signature, `-> Wrap<S>`, `&[S]`: then it
+            // stays a parameter, the caller's own type, and `as_ref()` / `into()` convert it
+            // where they're called.)
             if let Some(target) = lists.iter().find_map(super::conversion_target) {
                 let t = self.lower_type(&target);
                 // `T: Into<f64>` stays a parameter (any number type converts); `.into()` makes
                 // the target.
                 if matches!(t, Ty::Int(_) | Ty::Float { .. }) {
                     self.into_targets.insert(name.clone(), t);
-                } else {
+                } else if conv_param_plain(f, &name) {
                     self.generics.insert(name, t);
                     continue;
                 }
@@ -632,7 +666,9 @@ impl Checker<'_> {
                 continue;
             }
             // `I: Iterator<Item = T>`: the runtime's iterator, like `impl Iterator<Item = T>`.
-            if let Some(item) = lists.iter().find_map(super::bounds_iterator_item) {
+            if let Some(item) = lists.iter().find_map(|l| {
+                super::bounds_iterator_item(l).or_else(|| self.iter_trait_item(l))
+            }) {
                 let elem = match item {
                     Some(t) => self.lower_type(&t),
                     None => self.item_param(f, &name, report, &mut params),
@@ -980,15 +1016,33 @@ impl Checker<'_> {
                     if tr == "Borrow" {
                         self.borrow_args.push((Ty::Param(name.to_string()), x));
                     } else if tr == "From" {
-                        self.from_args.insert(name.to_string(), x);
+                        // (`E: From<E1> + From<E4>`: a call or `?` picks by its argument.)
+                        let xs = self.from_args.entry(name.to_string()).or_default();
+                        if !xs.contains(&x) {
+                            xs.push(x);
+                        }
                     } else {
                         // (`T: TryFrom<u64> + TryFrom<i64>`: a call picks by its argument;
-                        // `T::Error` is left unchecked.)
+                        // `T::Error` is left unchecked, but for `Debug` / `Display`, which
+                        // `param_has` answers from a `where T::Error: Debug` or, kept under the
+                        // key `T::Error`, a binding `TryFrom<X, Error = E>`.)
                         self.try_from_args
                             .entry(name.to_string())
                             .or_default()
                             .push(x);
                         self.lenient_projs.insert(format!("{name}::Error"));
+                        let bound_error = seg.generic_arg_list().into_iter().flat_map(|l| l.generic_args()).find_map(|g| match g {
+                            ast::GenericArg::AssocTypeArg(a)
+                                if a.name_ref().is_some_and(|n| n.text() == "Error") =>
+                            {
+                                a.ty()
+                            }
+                            _ => None,
+                        });
+                        if let Some(e) = bound_error {
+                            let e = self.lower_type(&e);
+                            self.try_from_args.insert(format!("{name}::Error"), vec![e]);
+                        }
                     }
                 }
             }
@@ -1255,6 +1309,7 @@ impl Checker<'_> {
         self.const_tys.clear();
         self.from_args.clear();
         self.try_from_args.clear();
+        self.try_error_bounds.clear();
         self.borrow_args.clear();
     }
 
@@ -1424,6 +1479,33 @@ impl Checker<'_> {
     /// Whether type parameter `name` (in the function being checked) has bound `b`, directly or
     /// through a subtrait (`Ord` gives `PartialOrd`, `Copy` gives `Clone`, ...).
     pub(super) fn param_has(&self, name: &str, b: &str) -> bool {
+        // `T::Error` of a `T: TryFrom<X>` printed or unwrapped: a `where T::Error: Debug`, or the
+        // bound's `Error = E`. (Its other uses stay unchecked.)
+        if matches!(b, "Debug" | "Display")
+            && name
+                .strip_suffix("::Error")
+                .is_some_and(|s| self.try_from_args.contains_key(s))
+        {
+            if let Some(e) = self.try_from_args.get(name).and_then(|e| e.first()) {
+                return !self.lacks_fmt(&self.shallow(e), b == "Debug");
+            }
+            // (Through a user trait's supertraits too: `where T::Error: MyError` with `trait
+            // MyError: Debug`.)
+            let mut todo: Vec<String> = self.try_error_bounds.get(name).cloned().unwrap_or_default();
+            let mut seen: Vec<String> = Vec::new();
+            while let Some(t) = todo.pop() {
+                if t == b || t == "Error" {
+                    return true;
+                }
+                if !seen.contains(&t) {
+                    if let Some(d) = self.adts.traits.get(&t) {
+                        todo.extend(d.supers.iter().cloned());
+                    }
+                    seen.push(t);
+                }
+            }
+            return false;
+        }
         // A trait's own associated type or type parameter (`Shape::Unit`): unchecked.
         if self.is_template(name) {
             return true;
