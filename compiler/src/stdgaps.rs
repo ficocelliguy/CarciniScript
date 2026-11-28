@@ -876,9 +876,12 @@ fn rewrite_other(
     let (a, end) = (toks[q].start, toks[i].end);
     // `NonZeroU32` is a `u32`; `NonZeroU32::new(x)` is `u32::__nz_new(x)`, an `Option<u32>`.
     let int = match name {
+        // (`NonZero<char>` too, a `char`.)
         "NonZero" if txt(i + 1) == "<" && txt(i + 3) == ">" => {
             let int = txt(i + 2).to_string();
-            crate::ty::IntKind::from_name(&int)?;
+            if int != "char" {
+                crate::ty::IntKind::from_name(&int)?;
+            }
             edits.push((a, toks[i + 3].end, int.clone()));
             return Some(i + 4);
         }
@@ -889,7 +892,20 @@ fn rewrite_other(
                 && txt(i + 5) == "::" =>
         {
             let int = txt(i + 3).to_string();
-            crate::ty::IntKind::from_name(&int)?;
+            if int != "char" {
+                crate::ty::IntKind::from_name(&int)?;
+            }
+            // (`NonZero::<u8>::new(x)`: `u8::__nz_new(x)`.)
+            // (As a value, `.find_map(NonZero::<char>::new)`: a closure.)
+            if let f @ ("new" | "new_unchecked") = txt(i + 6) {
+                let to = if txt(i + 7) == "(" {
+                    format!("{int}::__nz_{f}")
+                } else {
+                    format!("(|__nz: {int}| {int}::__nz_{f}(__nz))")
+                };
+                edits.push((a, toks[i + 6].end, to));
+                return Some(i + 7);
+            }
             edits.push((a, toks[i + 4].end, int));
             return Some(i + 5);
         }

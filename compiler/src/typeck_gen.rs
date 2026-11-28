@@ -756,7 +756,7 @@ impl Checker<'_> {
 
     /// `I: IntoIterator` / `I: Iterator` without `Item = ..`: its items are a type parameter of
     /// their own, `I::Item` (a fresh type per call), with the bounds `where I::Item: ..` gives.
-    fn item_param(
+    pub(super) fn item_param(
         &mut self,
         f: &ast::Fn,
         name: &str,
@@ -1560,6 +1560,25 @@ impl Checker<'_> {
             || (!name.contains("::")
                 && bounds.iter().any(|x| self.adts.traits.contains_key(x))
                 && self.bound_traits(name).iter().any(meets))
+            || (name.contains("::") && {
+                // (`where T::Er: Dbg` with `trait Dbg: Debug`.)
+                let mut todo: Vec<&String> = bounds.iter().collect();
+                let mut seen: Vec<&String> = Vec::new();
+                let mut found = false;
+                while let Some(t) = todo.pop() {
+                    if meets(t) {
+                        found = true;
+                        break;
+                    }
+                    if !seen.contains(&t) {
+                        if let Some(d) = self.adts.traits.get(t) {
+                            todo.extend(d.supers.iter());
+                        }
+                        seen.push(t);
+                    }
+                }
+                found
+            })
     }
 
     /// Whether a concrete type meets a bound.
@@ -1875,7 +1894,10 @@ impl Checker<'_> {
                 })
             })
         });
-        let arrays = array_impls || tuple_alts || generic_vec;
+        // And with a blanket impl whose methods call `T::default()`: the class of `T` (else
+        // `κσ.$dcall` guesses it from the value, which can't tell `u16` from `u32`).
+        let blanket_class = self.adts.blanket_class_uses.contains(b);
+        let arrays = array_impls || tuple_alts || generic_vec || blanket_class;
         // And with impls on `str` and `String` (or `[T]` and `Vec<T>`) that differ: one type in JS.
         let twins = self.twin_trait(b);
         // And with an impl for `&T` (`Box<T>`) that does more than `T`'s: a reference passed for

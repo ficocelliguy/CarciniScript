@@ -111,7 +111,7 @@ impl Checker<'_> {
     }
 
     /// The type a turbofish names (`random::<f64>()`), else a fresh variable.
-    fn turbofish_or_fresh(&mut self, gl: Option<ast::GenericArgList>) -> Ty {
+    pub(super) fn turbofish_or_fresh(&mut self, gl: Option<ast::GenericArgList>) -> Ty {
         let given = gl
             .and_then(|l| l.generic_args().next())
             .and_then(|g| match g {

@@ -274,6 +274,8 @@ pub struct Types {
     /// `T::from(x)` with `T: From<X>`: `X`'s name, by the call's range (the class's
     /// `$from$X`, or the number conversion).
     pub param_froms: HashMap<(usize, usize), String>,
+    /// `S::default()` for a map's hasher parameter: `undefined` (see `param_static_call`).
+    pub hasher_defaults: std::collections::HashSet<(usize, usize)>,
     /// `<T as Tr>::make()` / `Tr::make()` where a `T` is expected, for a type parameter `T`: `T`,
     /// by the call's range (emitted as `T::make()`).
     pub param_paths: HashMap<(usize, usize), String>,
@@ -438,6 +440,7 @@ impl<'a> Checker<'a> {
             twin_targs: HashMap::new(),
             dyn_twins: Default::default(),
             str_writers: Default::default(),
+            dyn_refs: Default::default(),
             const_paths: HashMap::new(),
             str_locals: Default::default(),
             ref_vecs: Default::default(),
@@ -512,6 +515,7 @@ impl<'a> Checker<'a> {
             crate_items: crates::crate_imports(src),
             stored_uses: Default::default(),
             param_froms: HashMap::new(),
+            hasher_defaults: Default::default(),
             param_paths: HashMap::new(),
             unbound_targs: Default::default(),
             generic_calls: Vec::new(),
@@ -868,6 +872,7 @@ pub fn check(
     let quote_reps = std::mem::take(&mut c.quote_reps);
     let js_calls = std::mem::take(&mut c.js_calls);
     let param_froms = std::mem::take(&mut c.param_froms);
+    let hasher_defaults = std::mem::take(&mut c.hasher_defaults);
     let param_paths = std::mem::take(&mut c.param_paths);
     let mut crate_calls = std::mem::take(&mut c.crate_calls);
     for cc in crate_calls.values_mut() {
@@ -938,6 +943,7 @@ pub fn check(
             quote_reps,
             js_calls,
             param_froms,
+            hasher_defaults,
             param_paths,
             stored,
             crate_calls,
@@ -1062,6 +1068,10 @@ struct Checker<'a> {
     dyn_twins: std::collections::HashSet<(usize, usize)>,
     /// Strings and `Formatter`s coerced to a `dyn fmt::Write`, by range (see `dyn_nums`).
     str_writers: std::collections::HashSet<(usize, usize)>,
+    /// `&mut x` of a number, string, bool, char or fieldless enum place coerced to a
+    /// `&mut dyn Trait`: a `κσ.$dynRef` over the place's cell, so a `&mut self` method writes
+    /// it (see `dyn_nums`).
+    dyn_refs: std::collections::HashSet<(usize, usize)>,
     /// See `Types::const_paths` (zonked when the file is done).
     const_paths: HashMap<(usize, usize), (Ty, String)>,
     /// `let` locals whose initializer is certainly a `&str` (`let s = "a";`, `let t = s;`,
@@ -1198,6 +1208,7 @@ struct Checker<'a> {
     const_derivable: std::collections::HashSet<(String, String)>,
     /// `T::from(x)` calls: `X`'s name by range.
     param_froms: HashMap<(usize, usize), String>,
+    hasher_defaults: std::collections::HashSet<(usize, usize)>,
     /// `<T as Tr>::make()` calls: `T` by range.
     param_paths: HashMap<(usize, usize), String>,
     /// Struct literals of structs with const parameters: (range, struct, type arguments).
@@ -1895,6 +1906,7 @@ impl<'a> Checker<'a> {
         }
         if let Ty::Dyn(tr, _) = self.shallow(expected) {
             self.note_dyn_twin(n, found, &tr);
+            self.note_dyn_ref(n, found, &tr);
         }
         // A `String` or a `Formatter` into a `&mut dyn fmt::Write` (a struct field, a closure's
         // parameter, a `Box`): a writer object over the place (`κσ.$fmtWriter`).
@@ -3446,10 +3458,9 @@ impl<'a> Checker<'a> {
             });
         let init_ty = l.initializer().map(|init| {
             // `let r: &T = b;` with `b: &Bx<T>` and `impl Deref for Bx<T>`: deref coercion, as
-            // at an argument.
+            // at an argument; also `let t: &str = &cow;` / `let v: &Vec<u8> = &stack;`.
             if let Some(d) = &declared
                 && matches!(l.ty(), Some(ast::Type::RefType(_)))
-                && matches!(self.shallow(d), Ty::Param(_))
             {
                 return self.check(&init, d);
             }
@@ -3915,6 +3926,10 @@ impl<'a> Checker<'a> {
         let e = strip_unwraps(e).0;
         match &e {
             ast::Expr::CallExpr(c) => {
+                // `let r = Bx::get(&mut b);` with `fn get(this: &mut Self) -> &mut T`.
+                if let Some(sig) = self.assoc_call_sig(c) {
+                    return sig.ret_mut_ref;
+                }
                 let Some(ast::Expr::PathExpr(p)) = c.expr() else {
                     return false;
                 };
@@ -5335,6 +5350,28 @@ impl<'a> Checker<'a> {
         t
     }
 
+    /// See `dyn_refs`.
+    fn note_dyn_ref(&mut self, n: &SyntaxNode, found: &Ty, tr: &str) {
+        if tr == "FmtWrite" || tr == "Any" {
+            return;
+        }
+        let Some(ast::Expr::RefExpr(re)) = ast::Expr::cast(n.clone()).map(|e| strip_parens(&e)) else {
+            return;
+        };
+        if re.mut_token().is_none() {
+            return;
+        }
+        let value = match self.shallow(found) {
+            Ty::Int(_) | Ty::IntLit | Ty::Float { .. } | Ty::Bool | Ty::Char | Ty::Str => true,
+            Ty::Adt(a, _) => self.adts.is_atom(&a),
+            _ => false,
+        };
+        if value {
+            let r = self.range(n);
+            self.dyn_refs.insert(r);
+        }
+    }
+
     /// `dyn_nums`: the coercions whose trait has impls on two or more number types.
     fn finish_dyn_nums(&mut self) -> HashMap<(usize, usize), String> {
         let mut out = HashMap::new();
@@ -5359,6 +5396,14 @@ impl<'a> Checker<'a> {
         }
         for r in std::mem::take(&mut self.str_writers) {
             out.insert(r, "$fmtWriter".to_string());
+        }
+        // (`$ref`, or `$ref:u32` when the number is tagged too.)
+        for r in std::mem::take(&mut self.dyn_refs) {
+            let k = match out.get(&r) {
+                Some(k) => format!("$ref:{k}"),
+                None => "$ref".to_string(),
+            };
+            out.insert(r, k);
         }
         out
     }
@@ -5683,6 +5728,12 @@ impl<'a> Checker<'a> {
                     Some(t) if !matches!(self.shallow(t), Ty::Var(_) | Ty::Unknown) => {
                         let ok = match self.shallow(t) {
                             Ty::Adt(..) => self.implements(t, "Default"),
+                            // (A map's hasher `S`: nothing, see `param_static_call`.)
+                            Ty::Param(p) if self.hasher_param(&p) => {
+                                let r = self.range(c.syntax());
+                                self.hasher_defaults.insert(r);
+                                true
+                            }
                             // (`T: Default` on the function or the `impl`: as `T::default()`.)
                             Ty::Param(p) if self.param_has(&p, "Default") => {
                                 self.note_dict(&p, c.syntax());
@@ -7168,8 +7219,9 @@ impl<'a> Checker<'a> {
         // `T::E::mk(..)` with `T: Has` and `trait Has { type E: Mk; }`: `T`'s class's `$at$E`.
         if let [p, a, f] = names.as_slice()
             && p != "Self"
-            && self.param_bounds.contains_key(p)
-            && !self.bound_traits(&format!("{p}::{a}")).is_empty()
+            // (Or `I::Item::default()`: `I::Item` of an `I: Iterator`, a parameter of its own.)
+            && ((self.param_bounds.contains_key(p) && !self.bound_traits(&format!("{p}::{a}")).is_empty())
+                || self.dict_param(&format!("{p}::{a}")))
         {
             let p = format!("{p}::{a}");
             if let Some(t) = self.param_static_call(c, &p, f, &args) {
@@ -8312,8 +8364,14 @@ impl<'a> Checker<'a> {
                 Ty::Unknown => true,
                 z @ Ty::Adt(..) => self.implements(&z, "Default"),
                 Ty::Extern(n) => self.iface_has_default(&n),
+                // (A map's hasher `S`: nothing, see `param_static_call`.)
+                Ty::Param(p) if self.hasher_param(&p) => {
+                    let r = self.range(&node);
+                    self.hasher_defaults.insert(r);
+                    true
+                }
                 // (`map_or_else(|| Default::default(), ..)` of a `V: Default`.)
-                Ty::Param(p) if !p.contains("::") && self.param_has(&p, "Default") => {
+                Ty::Param(p) if self.dict_param(&p) && self.param_has(&p, "Default") => {
                     self.note_dict(&p, &node);
                     true
                 }
@@ -8915,7 +8973,21 @@ impl<'a> Checker<'a> {
             Ty::RefCell(inner) => {
                 let inner = *inner;
                 return match method.as_str() {
-                    "borrow" | "borrow_mut" | "get" | "into_inner" => {
+                    // `let r: &RefCell<i32> = Borrow::borrow(&cell);` (the pre-pass's
+                    // `(&cell).borrow()`): std's `impl<T> Borrow<T> for T`, the cell itself.
+                    // (A method call on a cell never gives a `&RefCell`.)
+                    "borrow" | "borrow_mut"
+                        if args.is_empty()
+                            && matches!(strip_parens(&recv), ast::Expr::RefExpr(r)
+                                if (method == "borrow_mut") == r.mut_token().is_some())
+                            && expected.is_some_and(|e| matches!(self.shallow(e), Ty::RefCell(_))) =>
+                    {
+                        Ty::RefCell(Box::new(inner))
+                    }
+                    "borrow" | "borrow_mut" | "get" | "get_mut" | "into_inner" => {
+                        if method == "get_mut" {
+                            self.check_mutable(&recv, Mutation::Borrow);
+                        }
                         self.arg_count(m.syntax(), "method", 0, args.len());
                         inner
                     }
@@ -9262,7 +9334,7 @@ impl<'a> Checker<'a> {
                         // (A `T: Default`: by `T`'s class. Not a projection's, `I::Item`, whose
                         // class no caller hands over.)
                         if let Ty::Param(p) = &resolved
-                            && !p.contains("::")
+                            && self.dict_param(p)
                             && self.param_has(p, "Default")
                         {
                             self.note_dict(p, m.syntax());
@@ -9460,6 +9532,11 @@ impl<'a> Checker<'a> {
                         let ok = match &resolved {
                             Ty::Adt(..) => self.implements(&resolved, "Default"),
                             Ty::Extern(n) => self.iface_has_default(n),
+                            // (A `V: Default` parameter: by `V`'s class.)
+                            Ty::Param(p) if self.dict_param(p) && self.param_has(p, "Default") => {
+                                self.note_dict(p, m.syntax());
+                                true
+                            }
                             other => other.has_default(),
                         };
                         if !ok {
@@ -9677,6 +9754,19 @@ impl<'a> Checker<'a> {
                         format!("cannot assign to data in an index of `{p}` (add an `IndexMut` bound: `{p}: IndexMut<..>`)"),
                     );
                 }
+            }
+            // (`c[i].push(..)` with `Output = String`: the string is a value, so its methods
+            // take the place too.)
+            if self.shallow(&out) == Ty::Str
+                && self.param_has(&p, "IndexMut")
+                && ix
+                    .syntax()
+                    .parent()
+                    .and_then(ast::MethodCallExpr::cast)
+                    .is_some_and(|m| m.receiver().is_some_and(|r| r.syntax() == ix.syntax()))
+            {
+                let r = self.range(ix.syntax());
+                self.index_places.insert(r);
             }
             let r = self.range(ix.syntax());
             self.param_indexes.insert(r);
@@ -11960,7 +12050,7 @@ impl Checker<'_> {
     /// Ask for `param`'s class where the function can take it (for an operator on a `T`). With
     /// `need` (the operator), an `impl<T>`'s parameter in a method with `self` is an error.
     pub(super) fn param_class(&mut self, param: &str, node: &SyntaxNode, need: Option<&str>) {
-        if param == "Self" || param.contains("::") {
+        if param == "Self" || !self.dict_param(param) {
             return;
         }
         let own = self.cur_fn.clone().filter(|f| match f.split_once("::") {
@@ -11973,6 +12063,10 @@ impl Checker<'_> {
             }
             // An `impl<T>`'s parameter in a method with `self`: the struct's values carry it.
             (None, _) if self.store_class(param) => {}
+            // (A blanket impl's `self >> 1`: the receiver's class, handed over.)
+            (None, _)
+                if self.cur_fn.as_deref().is_some_and(|f| f.contains("$all::"))
+                    && self.elem_class(param) => {}
             (None, Some(op)) => self.error(
                 node,
                 format!("{op} on a type parameter of an `impl` isn't supported yet in methods with `self` of an enum or a trait (it works in a struct's `impl<T> S<T>`, on a function's or method's own type parameters, and in associated functions)"),
@@ -12023,6 +12117,16 @@ impl Checker<'_> {
         let Some((ty, m)) = f.split_once("::") else {
             return false;
         };
+        // (A method with `self` of a blanket `impl<Z: Default> Tr for Z`: `Z` is the receiver's
+        // type, whose class a caller that knows it hands over too.)
+        if let Some(tr) = ty.strip_suffix("$all") {
+            let blanket = self.adts.blanket_params.get(tr).is_some_and(|p| p == param)
+                && self.adts.method(ty, m).is_some_and(|s| s.receiver.is_some());
+            if blanket {
+                self.elem_methods.insert(f);
+            }
+            return blanket;
+        }
         if !matches!(ty, "Vec" | "RefCell" | "HashMap" | "HashSet")
             && crate::adt::tuple_arity(ty).is_none()
             && !crate::adt::is_wrapper_key(ty)
@@ -12065,6 +12169,10 @@ impl Checker<'_> {
         if param == "Self" {
             return;
         }
+        // (`I::Item` of an `I: Iterator`: a parameter of its own.)
+        if param.contains("::") && self.dict_param(param) && self.try_note_dict(param) {
+            return;
+        }
         // (`Self::Error` in a trait's default method: the implementing class's getter.)
         if let Some(a) = param.strip_prefix("Self::") {
             self.self_assoc_dicts.insert(a.to_string());
@@ -12088,6 +12196,15 @@ impl Checker<'_> {
         }
     }
 
+    /// Whether a type parameter can carry a class: a plain one (`T`), or a projection that is a
+    /// parameter of the function being checked (`I::Item` of an `I: Iterator` without `Item =
+    /// ..`, see `item_param`), which callers hand over like `T`'s.
+    pub(super) fn dict_param(&self, p: &str) -> bool {
+        !p.contains("::")
+            || (self.generics.get(p) == Some(&Ty::Param(p.to_string()))
+                && self.cur_fn.as_deref().is_some_and(|f| self.need_names(f).iter().any(|n| n == p)))
+    }
+
     /// Note that the function being checked needs `param`'s class, when it can have one: a free
     /// function's type parameter, a method's own (`fn parse<T: Parse>(&self)`), or an `impl<T>
     /// S<T>`'s in a method with `self`, which the struct's or enum's values carry. False where
@@ -12106,6 +12223,17 @@ impl Checker<'_> {
         }
     }
 
+    /// A map's hasher parameter with no class to hand over: an `S: BuildHasher` of an impl
+    /// for `HashMap<K, V, S>` / `HashSet<T, S>` (the map types leave `S` out).
+    fn hasher_param(&mut self, param: &str) -> bool {
+        self.param_has(param, "BuildHasher")
+            && !self.cur_fn.clone().is_some_and(|f| match f.split_once("::") {
+                Some((ty, m)) => self.own_dict_param(ty, m, param),
+                None => true,
+            })
+            && !self.store_class(param)
+    }
+
     /// `T::make(..)` for a static function of a bound of `T`, or `T::default()`.
     fn param_static_call(
         &mut self,
@@ -12114,6 +12242,14 @@ impl Checker<'_> {
         f: &str,
         args: &[ast::Expr],
     ) -> Option<Ty> {
+        // `S::default()` for a map's hasher (`impl<K, V, S: BuildHasher + Default> Tr for
+        // HashMap<K, V, S>`): `S` isn't among the map's type arguments, and a map ignores its
+        // hasher, so it's `RandomState::default()`, nothing at run time.
+        if f == "default" && args.is_empty() && self.hasher_param(param) {
+            let r = self.range(c.syntax());
+            self.hasher_defaults.insert(r);
+            return Some(Ty::Param(param.to_string()));
+        }
         let pty = Ty::Param(param.to_string());
         let mut bounds = self.bound_traits(param);
         // (In a blanket impl's associated function, `T` implements its trait too.)

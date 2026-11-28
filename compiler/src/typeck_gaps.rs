@@ -451,6 +451,7 @@ impl Checker<'_> {
             }
             // `NonZeroU32::get` (a `NonZero*` is its integer here).
             (Ty::Int(k), "get") if args.is_empty() => Ty::Int(k),
+            (Ty::Char, "get") if args.is_empty() => Ty::Char,
             _ => return None,
         })
     }
@@ -583,6 +584,30 @@ impl Checker<'_> {
                     self.check(a, &Ty::Vec(Box::new(Ty::Int(IntKind::U8))));
                 }
                 Ty::Float { f32: *float == "f32" }
+            }
+            // (`NonZero<char>` is a `char`.)
+            ["char", "__nz_new"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Char);
+                }
+                Ty::Option(Box::new(Ty::Char))
+            }
+            ["char", "__nz_new_unchecked"] => {
+                count(self, 1);
+                if let Some(a) = a0 {
+                    self.check(a, &Ty::Char);
+                }
+                Ty::Char
+            }
+            // `NonZero::new(x)`: `Some(x)` unless `x` is zero, of `x`'s type.
+            [.., "NonZero", f @ ("new" | "new_unchecked")] => {
+                count(self, 1);
+                let t = match a0 {
+                    Some(a) => self.infer(a, None),
+                    None => Ty::Unknown,
+                };
+                if *f == "new" { Ty::Option(Box::new(t)) } else { t }
             }
             [int, "__nz_new"] if IntKind::from_name(int).is_some() => {
                 count(self, 1);

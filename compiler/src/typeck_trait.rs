@@ -531,6 +531,11 @@ impl Checker<'_> {
             .filter(|tm| tm.has_default && !given.iter().any(|(n, _)| *n == tm.name))
         {
             let mut sig = subst_method(&tm.sig, &m);
+            // (A blanket impl's `&mut self` default takes the receiver's cell, as its own
+            // methods do: see `typeck_adt.rs`.)
+            if type_name.ends_with("$all") && sig.receiver == Some(crate::adt::Receiver::MutRef) {
+                sig.cell_self = true;
+            }
             // (A tuple's: with its elements, which pick between impls for two tuples of one
             // length; the second's default under a key of its own, as its own methods are.)
             if let Some(args) = &tuple_args {

@@ -565,6 +565,42 @@ impl Codegen<'_> {
                 }
             }
         }
+        // An immutable enum's `&mut self` trait defaults take the receiver's cell as `this`
+        // (they are in its `$mut`), so each gets a copy of its own here, ahead of the shared
+        // `Trait$defaults` the mixin would add (which reads `this` as the value).
+        if self.types.adts.is_atom(&def.name) {
+            for imp in impls {
+                let (Some(tr), _) = crate::adt::impl_parts(imp) else { continue };
+                let given: Vec<String> = imp
+                    .assoc_item_list()
+                    .into_iter()
+                    .flat_map(|l| l.assoc_items())
+                    .filter_map(|i| match i {
+                        ast::AssocItem::Fn(f) => Some(f.name()?.text().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let defaults: Vec<ast::Fn> = self
+                    .file_traits
+                    .iter()
+                    .filter(|t| t.name().is_some_and(|n| n.text() == tr.as_str()))
+                    .flat_map(|t| t.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()))
+                    .filter_map(|i| match i {
+                        ast::AssocItem::Fn(f) if f.body().is_some() => Some(f),
+                        _ => None,
+                    })
+                    .filter(|f| f.name().is_some_and(|n| !given.contains(&n.text().to_string())))
+                    .collect();
+                for f in defaults {
+                    let Some(n) = f.name() else { continue };
+                    if let Some(sig) = self.types.adts.method(&def.name, n.text().as_ref()).cloned()
+                        && sig.receiver == Some(crate::adt::Receiver::MutRef)
+                    {
+                        self.emit_method_fn(&f, sig, Ty::Adt(def.name.clone(), vec![]), "}", None);
+                    }
+                }
+            }
+        }
         self.self_adt = saved;
 
         self.emit_derives(&def, &cls, node);
@@ -796,7 +832,7 @@ impl Codegen<'_> {
             }
         }
         for d in &dicts {
-            params.push(Frag::text(format!("${d}")));
+            params.push(Frag::text(format!("${}", d.replace("::", "$"))));
         }
         let mut dbgs = dbg_key
             .and_then(|k| self.types.dbg_params.get(&k).cloned())
@@ -933,6 +969,10 @@ impl Codegen<'_> {
             Ty::Param(_) if self.ext_class.as_deref().is_some_and(crate::adt::is_wrapper_key) => {
                 self.ext_class.as_deref()
             }
+            // (A blanket impl's method: the receiver's class, its `T`.)
+            Ty::Param(p) if p != "Self" && self.blanket_key.is_some() => {
+                self.blanket_key.as_deref()
+            }
             _ => None,
         };
         if let Some(key) = elem_key
@@ -942,6 +982,13 @@ impl Codegen<'_> {
             ))
         {
             let tuple = matches!(self_ty, Ty::Tuple(_) | Ty::Map(..));
+            if let Ty::Param(p) = &self_ty {
+                super::CONST_SCOPE.with(|s| s.borrow_mut().insert(p.clone(), "$elem".into()));
+                // (A blanket impl's `Self::default()` too.)
+                if self.blanket_key.is_some() {
+                    super::CONST_SCOPE.with(|s| s.borrow_mut().insert("Self".into(), "$elem".into()));
+                }
+            }
             for (i, a) in sig.impl_args.iter().enumerate() {
                 if let Ty::Param(p) = a {
                     let js = if tuple { format!("$elem?.[{i}]") } else { "$elem".into() };
@@ -1101,6 +1148,10 @@ impl Codegen<'_> {
         let saved_ext = std::mem::replace(
             &mut self.ext_class,
             (!key.ends_with("$all")).then(|| key.to_string()),
+        );
+        let saved_blanket_key = std::mem::replace(
+            &mut self.blanket_key,
+            key.ends_with("$all").then(|| key.to_string()),
         );
         self.line(Frag::text(format!("class $ext${key} {{")));
         self.out.indent += 1;
@@ -1336,6 +1387,7 @@ impl Codegen<'_> {
             }
             self.extra_consts = saved_extra;
         }
+        self.blanket_key = saved_blanket_key;
         self.ext_class = saved_ext;
         self.out.indent -= 1;
         self.line(Frag::text("}"));

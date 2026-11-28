@@ -999,6 +999,7 @@ fn compile_text(
         view_args: Vec::new(),
         dict_scope: Vec::new(),
         blanket_this: None,
+        blanket_key: None,
         trait_const_args: HashMap::new(),
         param_consts: Default::default(),
         tparam_consts: HashMap::new(),
@@ -1196,6 +1197,8 @@ struct Codegen<'a> {
     /// Emitting a blanket impl's associated function (`impl<T: Default> Make for T`): its `T`,
     /// whose class is `this`.
     pub(super) blanket_this: Option<String>,
+    /// Emitting a blanket impl's class (`$ext$Tr$all`): its key.
+    pub(super) blanket_key: Option<String>,
     /// For each impl of a trait with const parameters (`impl Buf<4> for A`), by (type key,
     /// trait): the JS accessors of its const arguments (`() => 4`, `(s) => s.$M`), which its
     /// copy of the trait's default methods takes (`Buf$defaults(..)`).
@@ -2168,7 +2171,7 @@ impl<'a> Codegen<'a> {
             .cloned()
             .unwrap_or_default();
         for d in &dicts {
-            params.push(Frag::text(format!("${d}")));
+            params.push(Frag::text(format!("${}", d.replace("::", "$"))));
         }
         // `{:?}` of a `T` in the body: the caller's formatter for it.
         let dbgs = self
@@ -2651,7 +2654,10 @@ impl<'a> Codegen<'a> {
             _ => return None,
         };
         let recv = m.receiver()?;
-        matches!(self.ty_of(recv.syntax()), Some(Ty::RefCell(_))).then_some((m, recv, mutable))
+        // (Not `let r: &RefCell<_> = Borrow::borrow(&cell);`, the cell itself.)
+        (matches!(self.ty_of(recv.syntax()), Some(Ty::RefCell(_)))
+            && !matches!(self.ty_of(m.syntax()), Some(Ty::RefCell(_))))
+        .then_some((m, recv, mutable))
     }
 
     /// A local (by its JS name) that now owns a value to drop: its flag, and the closure.
@@ -3884,7 +3890,24 @@ impl<'a> Codegen<'a> {
             return (frag.wrap("(", &format!("){steps}.{m}")).at(start), target);
         }
         // A number into a `dyn Trait` with impls on two number types: tagged with its own.
-        if let Some(k) = self.types.dyn_nums.get(&r) {
+        if let Some(k) = self.types.dyn_nums.get(&r).cloned() {
+            // `&mut x` of a number, string or fieldless enum into a `&mut dyn Trait`: a wrapper over
+            // the place's cell, so a `&mut self` method through it writes `x`.
+            if let Some(rest) = k.strip_prefix("$ref") {
+                if let ast::Expr::RefExpr(re) = strip_parens_expr(e)
+                    && let Some(p) = re.expr()
+                {
+                    let p = self.emit_expr(&p, None).0;
+                    let mut c = Frag::text("κσ.$dynRef(κσ.$cell(() => ");
+                    c.append(p.clone()).push(", ($v) => { ").append(p).push(" = $v; })");
+                    match rest.strip_prefix(':') {
+                        Some(k) => c.push(&format!(", \"{k}\")")),
+                        None => c.push(")"),
+                    };
+                    return (c.at(start), ty);
+                }
+                return (frag.at(start), ty);
+            }
             // A `String` or `Formatter` into a `dyn fmt::Write`: a writer over the place, so
             // what's written lands in it.
             if k == "$fmtWriter" {
@@ -5948,7 +5971,7 @@ impl<'a> Codegen<'a> {
             }
         };
         if self.dict_scope.contains(&first) {
-            return Some(format!("${first}"));
+            return Some(format!("${}", first.replace("::", "$")));
         }
         // (`T::E::mk(..)`: `T`'s class's getter for its impl's `type E`.)
         if let Some((t, a)) = first.split_once("::")
@@ -6220,7 +6243,7 @@ impl<'a> Codegen<'a> {
                 }
                 view
             }
-            Ty::Param(p) if self.dict_scope.contains(p) => format!("${p}"),
+            Ty::Param(p) if self.dict_scope.contains(p) => format!("${}", p.replace("::", "$")),
             // (A trait default's copy in `$ext$i32`: `Self` is `i32`, so its `self / two`
             // truncates.)
             Ty::Param(p)
@@ -6551,6 +6574,11 @@ impl<'a> Codegen<'a> {
         ) {
             return out;
         }
+        // `S::default()` for a map's hasher: nothing, as `RandomState::default()` is.
+        if self.types.hasher_defaults.contains(&self.range_of(c.syntax())) {
+            let ty = self.ty_of(c.syntax()).unwrap_or(Ty::Unknown);
+            return (Frag::mapped(self.off(c.syntax()), "undefined"), ty);
+        }
         // `T::make(..)` with `T`'s class at hand (`$T.make(..)`), `Self::make(..)` in a trait's
         // default method.
         // (`T::len(x)` with a `self` method: a method call on `x`, below.)
@@ -6665,10 +6693,21 @@ impl<'a> Codegen<'a> {
                     if key.ends_with("$all") {
                         parts.push(Frag::text(debug_fn(&rt).unwrap_or_else(|| "String".into())));
                     }
-                    let mut out = Frag::mapped(
-                        self.off(c.syntax()),
-                        format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&self.twin_key(c.syntax(), &q.method))),
-                    );
+                    let method = self.twin_key(c.syntax(), &q.method);
+                    // (A blanket impl's method that uses `T::f()`: the receiver's class too.)
+                    let mut out = if key.ends_with("$all")
+                        && self.types.elem_methods.contains(&format!("{key}::{method}"))
+                    {
+                        Frag::mapped(
+                            self.off(c.syntax()),
+                            format!("κσ.$callElem({}, $ext${key}.prototype.{}, ", self.dict_of(&rt), adt_gen::prop(&method)),
+                        )
+                    } else {
+                        Frag::mapped(
+                            self.off(c.syntax()),
+                            format!("$ext${key}.prototype.{}.call(", adt_gen::prop(&method)),
+                        )
+                    };
                     out.append(Frag::join(parts, ", ")).push(")");
                     return (out, ty);
                 }
@@ -7850,6 +7889,8 @@ impl<'a> Codegen<'a> {
                         "[{}]",
                         es.iter().map(|e| self.dict_of(e)).collect::<Vec<_>>().join(", ")
                     )),
+                    // (A blanket impl's: the receiver's own.)
+                    t if key.ends_with("$all") => Some(self.dict_of(t)),
                     _ => None,
                 }
             } else {
@@ -8053,6 +8094,10 @@ impl<'a> Codegen<'a> {
         if let Ty::RefCell(inner) = &rt {
             let name_off = self.off(name.syntax());
             let ret = self.ty_of(m.syntax()).unwrap_or(Ty::Unknown);
+            // `Borrow::borrow(&cell)` as a `&RefCell`: the cell (see `Checker::method`).
+            if matches!(method.as_str(), "borrow" | "borrow_mut") && matches!(ret, Ty::RefCell(_)) {
+                return (rf.clone(), ret);
+            }
             let arg = m
                 .arg_list()
                 .and_then(|a| a.args().next())
@@ -8079,7 +8124,8 @@ impl<'a> Codegen<'a> {
                         .push(format!(", {})", method == "try_borrow_mut"));
                     f
                 }
-                "get" | "into_inner" => {
+                // (`get_mut` needs no flag check: the `&mut self` rules out a live borrow.)
+                "get" | "get_mut" | "into_inner" => {
                     let mut f = rf.clone();
                     f.push(".").append(Frag::mapped(name_off, "v"));
                     f
@@ -9327,6 +9373,11 @@ impl<'a> Codegen<'a> {
                 f.append(thunk).push(", true");
             }
             // The default is only built when the key is missing.
+            // (A `V: Default`'s: its class's.)
+            "or_default" if matches!(*v, Ty::Param(_)) && self.dict_of(&v) != "undefined" => {
+                let d = self.dict_of(&v);
+                f.push(format!("() => {d}.default(), true"));
+            }
             _ => {
                 let made = default_value(&v).unwrap_or_else(|| "undefined".into());
                 f.push(format!("() => {made}, true"));

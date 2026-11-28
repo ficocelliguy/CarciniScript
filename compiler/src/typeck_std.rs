@@ -887,7 +887,12 @@ impl Checker<'_> {
             }
             ["iter", "empty"] => {
                 count(self, 0);
-                iter_of(self.fresh(VarKind::General))
+                // (`iter::empty::<String>()`: the turbofish names the items.)
+                let gl = match c.expr() {
+                    Some(ast::Expr::PathExpr(p)) => p.path().and_then(|p| p.segment()).and_then(|s| { use ra_ap_syntax::ast::HasGenericArgs; s.generic_arg_list() }),
+                    _ => None,
+                };
+                iter_of(self.turbofish_or_fresh(gl))
             }
             ["iter", "repeat_n"] => {
                 count(self, 2);

@@ -605,6 +605,10 @@ impl Checker<'_> {
     pub(super) fn fn_ret_slot(&self, e: &ast::Expr) -> Option<bool> {
         match strip_parens(e) {
             ast::Expr::CallExpr(c) => {
+                if let Some(sig) = self.assoc_call_sig(&c) {
+                    let inst = self.raw.get(&self.range(c.syntax())).unwrap_or(&Ty::Unknown);
+                    return self.call_ret_slot(sig.ret_slot, &sig.ret, inst);
+                }
                 let ast::Expr::PathExpr(p) = c.expr()? else {
                     return None;
                 };
@@ -624,6 +628,22 @@ impl Checker<'_> {
                 let inst = self.raw.get(&self.range(m.syntax())).unwrap_or(&Ty::Unknown);
                 self.call_ret_slot(sig.ret_slot, &sig.ret, inst)
             }
+            _ => None,
+        }
+    }
+
+    /// The signature of the file's associated function or method that a path call names
+    /// (`Bx::get(&mut b)`, `Self::at(this, 0)`).
+    pub(super) fn assoc_call_sig(&self, c: &ast::CallExpr) -> Option<&crate::adt::Method> {
+        let ast::Expr::PathExpr(p) = c.expr()? else {
+            return None;
+        };
+        let segs = super::adt_check::path_segs(p.path());
+        if segs.len() < 2 {
+            return None;
+        }
+        match self.resolve(&segs)? {
+            crate::adt::Resolved::Assoc(adt, m) => self.adts.method(&adt, &m),
             _ => None,
         }
     }

@@ -350,6 +350,28 @@
     }
   }
 
+  // `&mut x` of a number, string or fieldless enum as a `&mut dyn Trait`: over the place's cell
+  // `c`, so a `&mut self` method called through it writes `x`. Tagged with its number type
+  // (`k`) as a `DynNum` is when the trait has impls on two number types.
+  class DynRef extends DynNum {
+    constructor(c, k) {
+      super(undefined, k);
+      this.c = c;
+    }
+    get v() {
+      return this.c[0];
+    }
+    set v(x) {
+      if (this.c) this.c[0] = x;
+    }
+    toString() {
+      return this.k ? super.toString() : String(this.c[0]);
+    }
+    $dbg() {
+      return this.k ? super.$dbg() : rt.$dbgAny(this.c[0]);
+    }
+  }
+
   // Rust's VecDeque<T>: a ring buffer. `b` is the backing array, `h` the head's position in it and
   // `n` the length; element `i` is at `b[(h + i) % b.length]`, so `pop_front` and `push_front`
   // are O(1). The compiler indexes a deque through `$i` (checked) / `$p`; everything a `Vec`
@@ -3227,6 +3249,9 @@
     $dynNum(v, k) {
       return new DynNum(v, k);
     },
+    $dynRef(c, k) {
+      return new DynRef(c, k);
+    },
     $newRegs() {
       return { kinds: {}, blankets: [] };
     },
@@ -3276,7 +3301,10 @@
     // `w.put(..)` for a `w: &mut W` (its cell `c`): an impl's `&mut self` method on a string or
     // number (listed in its class's `$mut`) gets the cell as `this`, others the value.
     $dcallMut(regs, c, name, ...args) {
+      const known = rt.$blanketCls;
+      rt.$blanketCls = undefined;
       const x = c[0];
+      if (x instanceof DynRef && !x.k) return rt.$dcallMut(regs, x.c, name, ...args);
       // (Through a cell over its value, written back.)
       if (x instanceof DynNum) {
         const cell = [x.v];
@@ -3302,12 +3330,16 @@
       // (A blanket impl's method that assigns `*self` takes the cell too.)
       for (const cls of regs.blankets) {
         if (typeof cls.prototype[name] === "function") {
-          return cls.prototype[name].call(cls.$mut?.has(name) ? c : x, ...args);
+          return rt.$blanketCall(regs, cls, name, cls.$mut?.has(name) ? c : x, x, args, known);
         }
       }
+      rt.$blanketCls = known;
       return rt.$dcall(regs, x, name, ...args);
     },
     $dcall(regs, x, name, ...args) {
+      const known = rt.$blanketCls;
+      rt.$blanketCls = undefined;
+      if (x instanceof DynRef && !x.k) return rt.$dcall(regs, x.c[0], name, ...args);
       if (x instanceof DynNum) return rt.$dcallT(regs, { kind: x.k, own: x.k === "$own" }, x.v, name, ...args);
       // (A range value is an `Iter` over a `RangeIt`: your `Range` impls before its own methods.)
       if (x instanceof Iter && x.it instanceof RangeIt) {
@@ -3357,9 +3389,35 @@
         if (typeof r.cls.prototype[name] === "function") return r.cls.prototype[name].call(x, ...args);
       }
       for (const cls of regs.blankets) {
-        if (typeof cls.prototype[name] === "function") return cls.prototype[name].call(x, ...args);
+        if (typeof cls.prototype[name] === "function") return rt.$blanketCall(regs, cls, name, x, x, args, known);
       }
       return x.constructor.$mut?.has(name) ? x[name].call(c, ...args) : x[name](...args);
+    },
+    // The class of `T` a `$dcallT` / `$dcallMutT` knew when it fell through to `$dcall`, for a
+    // blanket impl's method that takes it (taken by `$blanketCall`).
+    $blanketCls: undefined,
+    // A blanket impl's method (`impl<Z: Default> Zeroize for Z`) found by `$dcall`: one that uses
+    // `Z::default()` takes the receiver's class (`$takeElem`), the caller's if it knew one, else
+    // the value's own.
+    $blanketCall(regs, cls, name, self, x, args, known) {
+      const f = cls.prototype[name];
+      return cls.$elem?.has(name) ? rt.$callElem(known ?? rt.$valClass(regs, x), f, self, ...args) : f.call(self, ...args);
+    },
+    // A value's class as a type parameter's (`$numT` for a number, with your impls for an
+    // integer or float type: the first registered whose kind fits).
+    $valClass(regs, x) {
+      if (typeof x === "number") {
+        const r = (regs.kinds.number ?? []).find((r) => r.integral === Number.isInteger(x));
+        const kind = r?.cls.name.startsWith("$ext$") ? r.cls.name.slice(5) : Number.isInteger(x) ? "i32" : "f64";
+        return rt.$numT(kind, r?.cls);
+      }
+      if (typeof x === "bigint") return rt.$prims.big;
+      if (typeof x === "string") return rt.$prims.str;
+      if (typeof x === "boolean") return rt.$prims.bool;
+      if (x === null) return rt.$prims.option;
+      if (Array.isArray(x)) return rt.$prims.vec;
+      if (typeof x === "object" && x.constructor !== Object) return x.constructor;
+      return undefined;
     },
     // `i128` / `u128` are BigInts, wrapped to their width like Rust's release builds.
     $w128(x, signed, bits = 128) {
@@ -5999,6 +6057,8 @@
           }
         }
       }
+      // (A blanket impl's method there takes `cls`.)
+      if (typeof cls === "function" || typeof cls?.default === "function") rt.$blanketCls = cls;
       return rt.$dcallMut(regs, c, name, ...args);
     },
     $dcallT(regs, cls, x, name, ...args) {
@@ -6050,6 +6110,7 @@
           }
         }
       }
+      if (typeof cls === "function" || typeof cls?.default === "function") rt.$blanketCls = cls;
       return rt.$dcall(regs, x, name, ...args);
     },
     // A number type as a type parameter's class (`T = u8`): its `default()` and kind, for

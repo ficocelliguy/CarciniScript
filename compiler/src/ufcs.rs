@@ -21,7 +21,13 @@ const PRIMS: &[&str] = &[
 /// `std::error::Error::source`); their receivers' types aren't written into the closures.
 const OTHERS: &[&str] = &[
     "Vec", "Option", "Result", "Into", "From", "Clone", "ToString", "Error", "Deref", "DerefMut",
+    "AsRef", "AsMut", "Borrow", "BorrowMut",
 ];
+
+/// The std conversion traits of `OTHERS` whose argument may be written on the trait
+/// (`AsRef::<str>::as_ref(&n)`, `Borrow::<str>::borrow(&w)`): it's dropped, and the receiver's
+/// method (`(n).as_ref()`) settles by the expected type, as a method call does.
+const CONV_TRAITS: &[&str] = &["AsRef", "AsMut", "Borrow", "BorrowMut"];
 
 /// The `std::ops` / `std::cmp` traits whose methods are an operator: `Add::add(a, b)`,
 /// `<V as Add>::add(a, b)` and `i32::add(1, 2)` are `((a) + (b))`, and `.fold(0, Add::add)` takes
@@ -70,7 +76,11 @@ fn arity(prim: &str, method: &str) -> Option<usize> {
         ("Into", "into") | ("Clone", "clone") | ("ToString", "to_string") => return Some(0),
         ("Error", "source" | "description") => return Some(0),
         ("Deref", "deref") | ("DerefMut", "deref_mut") => return Some(0),
-        ("Vec" | "Option" | "Result" | "Into" | "From" | "Clone" | "ToString" | "Error" | "Deref" | "DerefMut", _) => {
+        ("AsRef", "as_ref") | ("AsMut", "as_mut") | ("Borrow", "borrow") | ("BorrowMut", "borrow_mut") => {
+            return Some(0);
+        }
+        ("Vec" | "Option" | "Result" | "Into" | "From" | "Clone" | "ToString" | "Error" | "Deref" | "DerefMut"
+        | "AsRef" | "AsMut" | "Borrow" | "BorrowMut", _) => {
             return None;
         }
         // `u64::from_str(s)` is `s.parse::<u64>()`, see `emitted`.
@@ -637,7 +647,49 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
         } else {
             (0, false)
         };
-        let m = i + 1 + sep_len;
+        let mut m = i + 1 + sep_len;
+        let conv = CONV_TRAITS.contains(&prim.as_str());
+        // (A trait of the file's own named `Borrow` isn't std's.)
+        if conv && traits.contains(&prim) {
+            i += 1;
+            continue;
+        }
+        // `AsRef::<str>::as_ref`: past the trait's arguments to the method.
+        if ok && conv && at(m) == "<" {
+            let mut depth = 0usize;
+            let mut g = m;
+            while g < toks.len() {
+                match at(g).as_str() {
+                    "<" => depth += 1,
+                    ">" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    ">>" if depth >= 2 => {
+                        depth -= 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    ";" | "{" | "}" | "(" | ")" => break,
+                    _ => {}
+                }
+                g += 1;
+            }
+            if depth == 0 && g < toks.len() {
+                if at(g + 1) == "::" {
+                    m = g + 2;
+                } else if at(g + 1) == ":" && at(g + 2) == ":" {
+                    m = g + 3;
+                }
+            }
+            if m >= toks.len() {
+                i += 1;
+                continue;
+            }
+        }
         let prev = if i > 0 { at(i - 1) } else { String::new() };
         let other = OTHERS.contains(&prim.as_str());
         // `std::error::Error::source`, `std::vec::Vec::len`: from the path's start.
@@ -658,6 +710,7 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
                             | "string"
                             | "result"
                             | "ops"
+                            | "borrow"
                     )
             };
             loop {
@@ -734,7 +787,10 @@ pub fn expand(text: &mut String, map: &mut OffsetMap) -> bool {
             // `str::len(&s)` → `(s).len()`
             let mut first = open + 1;
             let mut drop_to = None;
-            if at(first) == "&" || at(first) == "&&" {
+            // (`Borrow::borrow(&cell)` keeps its `&`: `(&cell).borrow()` is the blanket
+            // `impl<T> Borrow<T> for T` where a `&RefCell<T>` is expected, see `Checker::method`.)
+            let keep_ref = matches!((prim.as_str(), method.as_str()), ("Borrow", "borrow") | ("BorrowMut", "borrow_mut"));
+            if !keep_ref && (at(first) == "&" || at(first) == "&&") {
                 first += 1;
                 if at(first) == "mut" {
                     first += 1;
@@ -997,6 +1053,25 @@ pub fn expand_type_anchors(text: &mut String, map: &mut OffsetMap) -> bool {
             {
                 edits.push((start(i), end(a), String::new()));
                 edits.push((start(c), end(c), String::new()));
+                i = c + 1;
+                continue;
+            }
+            // `<Name as AsRef<str>>::as_ref(&n)`, `<W as Borrow<str>>::borrow(&w)`: as
+            // `AsRef::as_ref(&n)` (the trait's argument dropped, as `expand` does).
+            let tr = (a + 1..c).find(|&k| {
+                toks[k].kind() == SyntaxKind::IDENT
+                    && !matches!(at(k), "std" | "core" | "alloc" | "convert" | "borrow")
+            });
+            if let Some(t) = tr
+                && CONV_TRAITS.contains(&at(t))
+                && (a + 1..t).all(|k| matches!(at(k), "std" | "core" | "alloc" | "convert" | "borrow" | "::" | ":"))
+                && (t + 1 == c || at(t + 1) == "<")
+                && colons(c + 1)
+                && toks.get(kc).is_some_and(|t| t.kind() == SyntaxKind::IDENT)
+                && at(kc + 1) == "("
+            {
+                edits.push((start(i), end(a), String::new()));
+                edits.push((end(t), end(c), String::new()));
                 i = c + 1;
                 continue;
             }

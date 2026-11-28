@@ -168,13 +168,22 @@ impl Checker<'_> {
         let a1 = args.get(1);
         let count = |c: &mut Self, n: usize| c.arg_count(m.syntax(), "method", n, args.len());
         // `r.unwrap()` / `r.expect(..)` print the error: `E` must be `Debug` (a type parameter,
-        // or `T::Error` of a `T: TryFrom<X>`; other errors are checked where they're made).
+        // `T::Error` of a `T: TryFrom<X>`, or `T::Er` of a `T: Tr` with your `trait Tr { type
+        // Er; }`; other errors are checked where they're made).
         if matches!(method, "unwrap" | "expect")
             && let Ty::Param(p) = self.shallow(&e)
             && (!p.contains("::")
                 || p
                     .strip_suffix("::Error")
-                    .is_some_and(|s| self.try_from_args.contains_key(s)))
+                    .is_some_and(|s| self.try_from_args.contains_key(s))
+                || p.split_once("::").is_some_and(|(s, a)| {
+                    s != "Self"
+                        && !a.contains("::")
+                        && self.param_bounds.contains_key(s)
+                        && self.bound_traits(s).iter().any(|t| {
+                            self.adts.traits.get(t).is_some_and(|d| d.assoc_types.iter().any(|x| x == a))
+                        })
+                }))
             && !self.param_has(&p, "Debug")
         {
             let msg = format!("`{}` doesn't implement `std::fmt::Debug`", self.describe(&e));

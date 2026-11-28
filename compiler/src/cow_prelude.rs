@@ -100,3 +100,32 @@ impl<'a, T: Clone> From<Cow<'a, [T]>> for Vec<T> {
         c.into_owned()
     }
 }
+
+// `cow == "x"`, `"x" == cow`, `cow == s` with `s: String`.
+impl<'a, 'b> PartialEq<&'b str> for Cow<'a, str> {
+    fn eq(&self, other: &&'b str) -> bool {
+        let a: &str = self;
+        a == *other
+    }
+}
+
+impl<'a> PartialEq<String> for Cow<'a, str> {
+    fn eq(&self, other: &String) -> bool {
+        let a: &str = self;
+        a == other.as_str()
+    }
+}
+
+impl<'a, 'b> PartialEq<Cow<'a, str>> for &'b str {
+    fn eq(&self, other: &Cow<'a, str>) -> bool {
+        let b: &str = other;
+        *self == b
+    }
+}
+
+impl<'a> PartialEq<Cow<'a, str>> for String {
+    fn eq(&self, other: &Cow<'a, str>) -> bool {
+        let b: &str = other;
+        self.as_str() == b
+    }
+}

@@ -765,6 +765,7 @@ impl Checker<'_> {
                 }),
                 _ => (0, false),
             });
+            let mut items: Vec<String> = Vec::new();
             for p in gps {
                 match p {
                     ast::GenericParam::TypeParam(tp) => {
@@ -803,18 +804,35 @@ impl Checker<'_> {
                             if super::crates::bounds_rng(l) {
                                 return Some(Ty::Rng);
                             }
-                            // `I: IntoIterator<Item = T>`: any iterable of `T`.
+                            // `I: IntoIterator<Item = T>`: any iterable of `T`. Without `Item =
+                            // ..`, its items are a parameter of the method's own, `I::Item`
+                            // (`-> I::Item`, `where I::Item: Default`), as a function's are.
                             if let Some(item) = super::bounds_into_iter_item(l) {
                                 let elem = match item {
                                     Some(t) => self.lower_type(&t),
-                                    None => self.fresh(super::VarKind::General),
+                                    None => {
+                                        let t = self.item_param(f, &n, false, &mut Vec::new());
+                                        items.push(format!("{n}::Item"));
+                                        t
+                                    }
                                 };
+                                self.generics.insert(
+                                    format!("{n}::IntoIter"),
+                                    Ty::Iter {
+                                        elem: Box::new(elem.clone()),
+                                        mutable: false,
+                                    },
+                                );
                                 return Some(Ty::IntoIter(Box::new(elem)));
                             }
                             let item = super::bounds_iterator_item(l)?;
                             let elem = match item {
                                 Some(t) => self.lower_type(&t),
-                                None => self.fresh(super::VarKind::General),
+                                None => {
+                                    let t = self.item_param(f, &n, false, &mut Vec::new());
+                                    items.push(format!("{n}::Item"));
+                                    t
+                                }
                             };
                             Some(Ty::Iter {
                                 elem: Box::new(elem),
@@ -856,6 +874,8 @@ impl Checker<'_> {
                 })
                 .collect();
             own.sort_by_key(|n| order.iter().position(|x| x == n));
+            // (`I::Item`s after the written ones.)
+            own.extend(items);
         }
         // `fn log(&self) where T: Display` on `impl<T> Value<T>`: the impl's `T`, bounded
         // further in this method.
@@ -1528,6 +1548,28 @@ impl Checker<'_> {
                 .filter(|n| *n != param)
                 .collect();
             self.adts.blanket_others.insert(tr.clone(), others);
+            let class_use = imp.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()).any(|it| {
+                matches!(&it, ast::AssocItem::Fn(f) if f.param_list().and_then(|p| p.self_param()).is_some())
+                    && it.syntax().descendants().filter_map(ast::Path::cast).any(|p| {
+                        p.qualifier().is_none()
+                            && p.syntax().parent().and_then(ast::Path::cast).is_some()
+                            && p.segment().and_then(|s| s.name_ref().map(|n| n.text().to_string()).or_else(|| s.self_type_token().map(|_| "Self".into())))
+                                .is_some_and(|n| n == param || n == "Self")
+                    })
+            });
+            // (Or bounded by an operator trait: `self >> 1` goes by the class too.)
+            let op_bound = bounds.iter().any(|b| {
+                matches!(
+                    b.rsplit("::").next().unwrap_or(b).split('<').next().unwrap_or_default(),
+                    "Add" | "Sub" | "Mul" | "Div" | "Rem" | "Shl" | "Shr" | "BitAnd" | "BitOr" | "BitXor"
+                        | "Neg" | "Not" | "AddAssign" | "SubAssign" | "MulAssign" | "DivAssign"
+                        | "RemAssign" | "ShlAssign" | "ShrAssign" | "BitAndAssign" | "BitOrAssign"
+                        | "BitXorAssign"
+                )
+            });
+            if class_use || op_bound {
+                self.adts.blanket_class_uses.insert(tr.clone());
+            }
             self.adts.blanket_params.insert(tr.clone(), param);
             self.adts.blankets.insert(tr, bounds);
         }
@@ -1940,6 +1982,11 @@ impl Checker<'_> {
             // (A `&mut self` method on a string, number, bool, char or `Option` takes a cell as
             // `this`: see `codegen_adt::cell_self`.)
             method.impl_args = impl_args.clone();
+            // (Every `&mut self` method of a blanket impl takes the receiver's cell: `self` may be
+            // a number, and one calling another that assigns `*self` must hand on the cell.)
+            if type_name.ends_with("$all") && method.receiver == Some(crate::adt::Receiver::MutRef) {
+                method.cell_self = true;
+            }
             method.trait_params = trait_only_params(imp);
             // `impl Inv for &f32` (next to `impl Inv for f32`, one type in JS): under `inv$ref`,
             // picked per call (`pick_ref_impl`).
@@ -3013,6 +3060,7 @@ impl Checker<'_> {
                         )
                     })
                     .unwrap_or_default();
+                let declared = method.ret.clone();
                 let method = self.method_inst(&method, None);
                 // (`Auto::always(Vec::new())` with `struct Auto<S: RawStream>`.)
                 if method.impl_args.iter().any(|a| matches!(a, Ty::Var(_))) {
@@ -3066,6 +3114,10 @@ impl Checker<'_> {
                         }
                     }
                 }
+                // `*Cx::num(&mut c) += 1` / `Bx::get(&mut b).push(3)` with `fn num(this: &mut
+                // Self) -> &mut u8`: the call is a slot, as a method call's is.
+                let call = ast::Expr::CallExpr(c.clone());
+                self.note_call_slot(&call, method.ret_slot, &declared, &method.ret);
                 Some(if method.is_async {
                     Ty::Future(Box::new(method.ret))
                 } else {

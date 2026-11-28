@@ -263,6 +263,9 @@ pub struct Adts {
     pub blankets: HashMap<String, Vec<String>>,
     /// The type parameter each blanket impl is for (`T`), by trait.
     pub blanket_params: HashMap<String, String>,
+    /// The traits whose blanket impl's methods name `T::..` / `Self::..` (`T::default()`), which
+    /// then take the receiver's class.
+    pub blanket_class_uses: std::collections::HashSet<String>,
     /// A blanket impl's other type parameters (`U` of `impl<U, T> Tr<U> for T`), by trait: fresh at
     /// each call.
     pub blanket_others: HashMap<String, Vec<String>>,

@@ -322,13 +322,7 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   marker traits for such types (`Cow<str>` / `Cow<[T]>`). Conflict errors are gone from about a
   dozen corpus files (bitvec, log, miow, quote, rand, regex, ring, stable_deref_trait), most
   with other errors left. Importance: low to medium.
-- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** `S::default()` in an
-  associated fn of `impl<K, V, S: BuildHasher + Default> Tr for HashMap<K, V, S>` (winnow; `S` isn't among the map's type
-  arguments); `Z::default()` in a method with `self` of a blanket `impl<Z: DefaultIsZeroes>
-  Zeroize for Z` (zeroize); `Default::default()` / `unwrap_or_default()` on a projection
-  parameter (`I::Item: Default`, itertools' `concat`: no caller hands over its class); `>>` / `&`
-  / `|` / `^` on the param of a blanket impl (`impl<I> Half for I where I: Shr<usize, Output =
-  I>`: the method needs `I`'s class, which a call on a number would have to pass); bounds on
+- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** Bounds on
   projections (`<T as Shr<u32>>::Output: PartialEq<T>`, `u8: TryFrom<<T as BitAnd>::Output>`,
   `where &'a T: Add<T>` with `<&'a T as Add<T>>::Output`); a `&mut self` method of a HashMap/HashSet impl
   reached through `$dcallMutT` doesn't get the map class's `elem`. Landed 2026-11-27
@@ -342,21 +336,26 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
   same-file trait whose supertraits are iterator traits (`trait PreciseIterator: Iterator +
   ExactSizeIterator {}`, or one with a blanket impl over iterators) as a bound or `dyn`, its
   values iterators (`it.len()`, `t.next()`); `T::clone(&x)` through `Deref`; `Bx::clone(&b)` /
-  `<Bx<P>>::clone(&b)` / `Bx::<T>::clone(x)` of a derived `Clone`. Probes in `agentD/q9*`, `q12*`, `q15*` and
+  `<Bx<P>>::clone(&b)` / `Bx::<T>::clone(x)` of a derived `Clone`. And 2026-11-28
+  (`fixtures/blanket_param_class.rs`): `Z::default()` / `Self::default()` / `T::zero()` and `>>`
+  on the parameter in a method with `self` of a blanket impl (zeroize's `impl<Z:
+  DefaultIsZeroes> Zeroize for Z`, `impl<I: Shr<..>> Half for I`), handed the receiver's class by
+  direct, by-path and generic-bound calls (`$dcall` without one guesses it from the value). And
+  (`fixtures/iter_item_default.rs`): `Default::default()` / `unwrap_or_default()` /
+  `I::Item::default()` and operators on `I::Item` of a function's `I: Iterator` / `I:
+  IntoIterator` (itertools' `concat`), its class handed over like a type parameter's; and
+  (`fixtures/hasher_param_default.rs`) `S::default()` / `Default::default()` for the hasher of
+  an impl for `HashMap<K, V, S>` / `HashSet<T, S>` (winnow's `Accumulate`). And 2026-11-28 (`fixtures/method_iter_item.rs`): a method's own `I: Iterator` / `I:
+  IntoIterator` with `-> Option<I::Item>` / `-> Vec<I::Item>` / `where I::Item: ..`. Probes in `agentD/q9*`, `q12*`, `q15*` and
   `agentC/q19`, `q21`. Fewer than the 23 files the entry started with. Importance: low to medium.
-- [ ] **Derives over std types: `NonZero<char>` fields are not `Copy`** (it maps to `String`). The
-  rest of the row landed 2026-11-27 (`fixtures/derive_std_fields.rs`): `slice::IterMut` fields
-  (and `Enumerate` of one) derive `Debug`, a field typed by an `Fn`-bounded parameter leaves the
-  derive bounded on it, `TypeId` fields are `Copy` / `Hash` / `Ord`, `dyn Any` is `Debug`; and
-  `#[cfg_attr(not(feature = "x"), derive(..))]` applies, with features off, as rustc builds a lone
-  file (`fixtures/cfg_attr_derives.rs`). A file or two. Importance: low.
 - [ ] **Indexing user types, remaining shapes.** `I: SliceIndex<str>`; with no
   `Deref`, `&mut v[a..b]` through your `index_mut` is a view only inside its body (a use site
-  gets a copy); `Output = String` through a bound (`c[i].push(..)`) is untested; ascii's
+  gets a copy); ascii's
   `[Self::Inner]` in a trait method signature. `impl<T, I: SliceIndex<[T]>> Index<I>` /
   `IndexMut<I>` (smallvec, thin-vec, bumpalo; `fixtures/index_slice_index.rs`) and `c[ix] = e` /
   `c[ix] += 1` through a `C: IndexMut<Ix>` bound (`fixtures/index_param_assign.rs`) landed
-  2026-11-27. A few files. Importance: low.
+  2026-11-27. `c[i].push(..)` with `Output = String` through a bound landed 2026-11-28
+  (`fixtures/index_bound_string_output.rs`). A few files. Importance: low.
 
 ### Survey tooling notes
 
@@ -382,29 +381,10 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
 Found in passing and not fixed yet (checked against the current tree, 2026-11-26). Gaps that are
 by design or long-standing differences from rustc are in `RUST_GAPS.md`.
 
-- [ ] **A std conversion trait's method by path on your type.** `Borrow::<str>::borrow(&w)` with
-  your `impl Borrow<str> for W` is "the standard library function `Borrow::<str>::borrow` is not
-  supported", and `AsRef::as_ref(&n)` / `<Name as AsRef<str>>::as_ref(&n)` with `impl AsRef<str>
-  for Name` are "cannot find function" (rustc accepts all three); `let b: &str = w.borrow();`
-  works. Found 2026-11-27 writing `fixtures/std_impl_bodies.rs` and
-  `fixtures/std_name_captures.rs`.
-- [ ] **`Cow<str>` against a `&str`.** `let t: &str = &c;` with `c: Cow<str>` is "expected `&str`,
-  found `Cow<String>`" (as an argument `&c` works), and `c == "x"` is "expected `Cow<String>`,
-  found `&str`" (std has `impl PartialEq<&str> for Cow<str>`). Found 2026-11-27 writing
-  `fixtures/utf8_str_cow.rs`.
-- [ ] **An associated fn returning `&mut T` of the impl's parameter, used as a place.** `impl<T>
-  Bx<T> { fn get(this: &mut Self) -> &mut T { &mut this.v } }` with `v: Box<T>`, then
-  `Bx::get(&mut b).push(3)` throws "Bx.get(...).push is not a function" (rustc prints `[1, 3]`):
-  the fn returns a slot (`$placeSlot`) and the caller uses it as the object. Found 2026-11-27
-  writing `fixtures/into_iter_param_bounds.rs`.
-- [ ] **`or_default()` on a map entry whose value is a `V: Default` parameter.** `fn f<V: Default +
-  AddAssign<u8>>(m: &mut HashMap<u8, V>) { *m.entry(1).or_default() += 1; }` (also in a method of
-  `impl<V: Default + ..> Tr for HashMap<u8, V>`) is "the trait bound `V: Default` is not
-  satisfied" (rustc accepts). Found 2026-11-27 probing winnow's `S::default()` shape.
-- [ ] **`unwrap()` of a `Result<_, <T as Tr>::Er>` isn't checked for `Debug`.** `trait Tr { type
-  Er; fn mk() -> Result<u8, Self::Er>; } fn h<T: Tr>() -> u8 { T::mk().unwrap() }` compiles
-  (rustc: "`<T as Tr>::Er` doesn't implement `Debug`"); a type parameter's and a `TryFrom`
-  bound's `T::Error` are checked. Found 2026-11-27 adding that check.
+- [ ] **Format arguments don't hold their borrows.** `println!("{} {}", n, f(&mut n))` (or a
+  block argument that calls `s.push('a')` after `s`) compiles and prints the changed value; rustc
+  rejects it with E0502, since the earlier arguments stay borrowed until the call. Found
+  2026-11-28 writing `fixtures/dyn_mut_value_types.rs`.
 
 ## Risks
 

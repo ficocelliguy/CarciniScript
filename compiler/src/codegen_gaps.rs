@@ -316,6 +316,8 @@ impl Codegen<'_> {
                 )
             }
             (Ty::Int(_), "get") if args.is_empty() => rf.clone(),
+            // (`NonZero<char>::get`.)
+            (Ty::Char, "get") if args.is_empty() => rf.clone(),
             // Your own `Hasher`'s provided `write_u32(x)`: the bytes to its `write`.
             (Ty::Adt(n, _), m2)
                 if m2.starts_with("write_")
@@ -439,6 +441,23 @@ impl Codegen<'_> {
                     vec![b, Frag::text(format!("{}, {little}", *float == "f32"))],
                 )
             }
+            // (`char::__nz_new`, and `NonZero::new(x)` by `x`'s type.)
+            ["char", "__nz_new"] => {
+                let mut f = Frag::text("((x) => x === \"\\0\" ? null : x)(");
+                f.append(self.gap_arg(a0)).push(")");
+                f
+            }
+            [.., "NonZero", "new"] => {
+                let zero = match a0.and_then(|a| self.ty_of(a.syntax())) {
+                    Some(Ty::Char) => "\"\\0\"",
+                    Some(Ty::Int(k)) if k.is_big() => "0n",
+                    _ => "0",
+                };
+                let mut f = Frag::text(format!("((x) => x === {zero} ? null : x)("));
+                f.append(self.gap_arg(a0)).push(")");
+                f
+            }
+            ["char", "__nz_new_unchecked"] | [.., "NonZero", "new_unchecked"] => self.gap_arg(a0),
             [int, "__nz_new"] if IntKind::from_name(int).is_some() => {
                 let k = IntKind::from_name(int)?;
                 let x = self.gap_arg(a0);
