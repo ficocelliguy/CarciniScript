@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/logo-light.png">
-    <img alt="CarciniScript: because everything becomes crab" src="docs/logo-light.png" width="600">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ficocelliguy/CarciniScript/refs/heads/main/docs/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/ficocelliguy/CarciniScript/refs/heads/main/docs/logo-light.png">
+    <img alt="CarciniScript: because everything becomes crab" src="https://raw.githubusercontent.com/ficocelliguy/CarciniScript/refs/heads/main/docs/logo-light.png" width="600">
   </picture>
 </p>
 

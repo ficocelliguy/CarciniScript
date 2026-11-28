@@ -196,6 +196,23 @@ impl Checker<'_> {
                 self.range_bounds(a0);
                 opt(Ty::Str)
             }
+            // (`s.get(r)` with a range value, or an `i: I` of `I: SliceIndex<str>`.)
+            (Ty::Str, "get")
+                if args.len() == 1 && {
+                    let t = self.infer(&args[0], None);
+                    match self.shallow(&t) {
+                        Ty::Range(e, _) => self.unify(&e, &USIZE),
+                        Ty::Iter { elem, .. } => self.unify(&elem, &USIZE),
+                        Ty::Param(p) => self
+                            .slice_index_params
+                            .get(&p)
+                            .is_some_and(|(e, o)| *e == Ty::Str && *o == Some(Ty::Str)),
+                        _ => false,
+                    }
+                } =>
+            {
+                opt(Ty::Str)
+            }
             // ---- Vec and slices
             (Ty::Vec(e), "into_boxed_slice" | "into_vec") => {
                 count(self, 0);

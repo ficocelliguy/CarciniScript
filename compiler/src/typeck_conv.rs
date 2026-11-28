@@ -595,6 +595,25 @@ impl Checker<'_> {
         if fits.is_empty() {
             return keys;
         }
+        // (`W<&T>`'s next to `W<Vec<T>>`'s for a `W<Vec<u8>>` receiver: the `Vec` impl, as a
+        // `&T` never is one in rustc; see `Adts::ref_param_args`.)
+        let fits = if fits.len() > 1 {
+            let ctor = |t: &Ty| !matches!(t, Ty::Param(_) | Ty::Unknown | Ty::Var(_) | Ty::IntLit);
+            let not_ref: Vec<String> = fits
+                .iter()
+                .filter(|k| {
+                    let refs = self.adts.ref_param_args.get(&format!("{ty}::{k}"));
+                    !targs
+                        .iter()
+                        .enumerate()
+                        .any(|(i, t)| ctor(t) && refs.and_then(|r| r.get(i)) == Some(&true))
+                })
+                .cloned()
+                .collect();
+            if not_ref.is_empty() { fits } else { not_ref }
+        } else {
+            fits
+        };
         // (`[u8]` next to `[T]` for a settled `u8` receiver: the concrete impl, as
         // specialization would.)
         let open = |ts: &[Ty]| {

@@ -163,10 +163,15 @@ impl Codegen<'_> {
                 | "as_encoded_bytes_str",
             ) => rf.clone(),
             (Ty::Str, "into_string") => helper("okOf", vec![]),
-            (Ty::Str, "get") => {
-                let r = self.gap_range(a0)?;
-                helper("strGet", vec![r])
-            }
+            (Ty::Str, "get") => match self.gap_range(a0) {
+                Some(r) => helper("strGet", vec![r]),
+                // (A range value, or an `i: I` of `I: SliceIndex<str>`.)
+                None if args.len() == 1 => {
+                    let r = self.gap_arg(a0);
+                    helper("strGetBy", vec![r])
+                }
+                None => return None,
+            },
             // ---- Vec and slices
             (Ty::Vec(_), "into_boxed_slice" | "into_vec") => rf.clone(),
             (Ty::Vec(_), "capacity") => {

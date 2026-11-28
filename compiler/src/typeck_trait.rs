@@ -500,6 +500,8 @@ impl Checker<'_> {
         let n_diags = self.diags.len();
         let self_args = match imp.self_ty().map(|t| self.lower_type(&t)) {
             Some(Ty::Adt(_, args)) => args,
+            // (`impl<I: Iterator> Tr for I`: a blanket impl, not one for std's iterators.)
+            Some(Ty::Iter { .. }) if crate::adt::blanket_parts(imp).is_some() => Vec::new(),
             Some(t) => crate::adt::ext_args(&t),
             None => Vec::new(),
         };
@@ -577,27 +579,21 @@ impl Checker<'_> {
                 .twin_borrowed
                 .contains(&(type_name.to_string(), tr.to_string()));
         if own_twin {
-            // (A default method's `self.m()` can't tell the two apart.)
-            let inherited: Vec<String> = def
+            // (The default methods it inherits get copies of their own, `m$own`, whose `self.m()`
+            // calls reach the owned impl's methods: see `Codegen::own_copy`.)
+            for m in def
                 .methods
                 .iter()
                 .filter(|m| m.has_default && !given.iter().any(|(n, _)| *n == m.name))
-                .map(|m| format!("`{}`", m.name))
-                .collect();
-            if !inherited.is_empty() {
-                let node = imp
-                    .self_ty()
-                    .map(|t| t.syntax().clone())
-                    .unwrap_or_else(|| imp.syntax().clone());
-                let (owned, borrowed) = if type_name == "String" {
-                    ("String", "str")
-                } else {
-                    ("Vec<T>", "[T]")
-                };
-                self.error(
-                    &node,
-                    format!("`{tr}` is implemented for both `{borrowed}` and `{owned}` with different behavior (one type in JS): the `{owned}` impl must also write the default methods it inherits ({}), which can't tell the two apart", inherited.join(", ")),
-                );
+            {
+                if let Some(sig) = self.adts.method(type_name, &m.name).cloned() {
+                    self.adts
+                        .methods
+                        .entry(type_name.to_string())
+                        .or_default()
+                        .insert(format!("{}$own", m.name), sig);
+                    self.adts.own_twins.insert(format!("{type_name}::{}", m.name));
+                }
             }
             return;
         }

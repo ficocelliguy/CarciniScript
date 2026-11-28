@@ -2632,6 +2632,14 @@ pub fn preprocess_with(
         crate::alias::expand(&mut text, &mut map);
         changed = true;
     }
+    // `impl Tr for [u8; 1]` next to `[u8; 2]`: one impl picking by the length.
+    if crate::array_len_impls::has_array_impls(&text) {
+        changed |= crate::array_len_impls::expand(&mut text, &mut map);
+    }
+    // (Before `<S as Tr<A>>::ID` becomes `S::ID`: a generic trait's consts per trait argument.)
+    if crate::inst_consts::has_instantiation_consts(&text) {
+        changed |= crate::inst_consts::expand_trait_args(&mut text, &mut map);
+    }
     // (Before `<S as Tr>::ID` becomes `S::ID`: an inherent `ID` beside the trait's is `ID__self`.)
     if crate::const_shadow::has_shadowed_consts(&text) {
         changed |= crate::const_shadow::expand(&mut text, &mut map);

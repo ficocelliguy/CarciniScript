@@ -279,6 +279,13 @@ impl Checker<'_> {
         }
         match self_ty {
             crate::ty::Ty::Dyn(_, _) => return,
+            // (`self.m()` in the trait's default method: the owned impl has a copy of its own,
+            // `m$own`, whose calls reach its methods; see `Codegen::own_copy`.)
+            crate::ty::Ty::Param(p)
+                if p == "Self" && matches!(&self.self_ty, Some(crate::ty::Ty::Param(s)) if s == "Self") =>
+            {
+                return;
+            }
             crate::ty::Ty::Param(p) if self.try_note_dict(p) => {
                 let r = self.range(node);
                 self.class_dispatch.insert(r);
@@ -427,7 +434,7 @@ impl Checker<'_> {
     /// Whether trait `tr` has an impl for `&T`, `&mut T` or `Box<T>` that does more than `T`'s
     /// (`adt::wrapper_impl`).
     pub(super) fn wrapper_trait(&self, tr: &str) -> bool {
-        ["ref", "refmut", "box"]
+        ["ref", "refmut", "box", "rc", "arc"]
             .iter()
             .any(|k| self.adts.ext_types.contains(&format!("{tr}${k}")))
             || self.adts.ref_impl_traits.contains(tr)
@@ -515,10 +522,15 @@ impl Checker<'_> {
             }
             ast::Expr::CallExpr(c) => {
                 if let Some(ast::Expr::PathExpr(p)) = c.expr()
-                    && matches!(p.syntax().text().to_string().as_str(), "Box::new" | "Rc::new" | "Arc::new")
+                    && let Some(kind) = p
+                        .syntax()
+                        .text()
+                        .to_string()
+                        .strip_suffix("::new")
+                        .and_then(crate::adt::wrapper_kind)
                     && let Some(x) = c.arg_list().and_then(|l| l.args().next())
                 {
-                    out.push("box");
+                    out.push(kind);
                     out.extend(self.arg_wraps(&x, depth + 1));
                 }
             }
@@ -627,6 +639,63 @@ impl Checker<'_> {
         }
         out
     }
+
+    /// For generic calls whose callee bounds a type parameter by a generic trait with consts per
+    /// trait argument (`T: MultipleOf<Nano, O>`, `impl MultipleOf<Nano, f64> for Micro { const
+    /// VALUE }` next to `<Nano, u16>`'s): the class passed for it reads that impl's consts by the
+    /// trait's names, `alt:VALUE=VALUE__1` in `dict_owned` (`κσ.$altT`).
+    pub(super) fn finish_trait_arg_dicts(
+        &mut self,
+        params: &std::collections::HashMap<String, Vec<String>>,
+        args: &std::collections::HashMap<(usize, usize), Vec<crate::ty::Ty>>,
+        owned: &mut std::collections::HashMap<(usize, usize), Vec<Vec<String>>>,
+    ) {
+        use crate::ty::Ty;
+        if self.adts.trait_arg_consts.is_empty() {
+            return;
+        }
+        let callees: std::collections::HashMap<(usize, usize), String> = self
+            .generic_calls
+            .iter()
+            .map(|(r, _, callee, _)| (*r, callee.clone()))
+            .collect();
+        for (r, p, tr, bargs) in std::mem::take(&mut self.bound_arg_calls) {
+            let (Some(callee), Some(tys)) = (callees.get(&r), args.get(&r)) else {
+                continue;
+            };
+            let Some(names) = params.get(callee) else { continue };
+            let Some(i) = names.iter().position(|n| *n == p) else { continue };
+            let key = match tys.get(i).map(|t| self.zonk(t)) {
+                Some(Ty::Adt(n, _)) => n,
+                Some(t) => match crate::adt::ext_key_of(&t) {
+                    Some(k) => k.to_string(),
+                    None => continue,
+                },
+                None => continue,
+            };
+            let Some(entries) = self.adts.trait_arg_consts.get(&(key, tr)) else { continue };
+            let bargs: Vec<Ty> = bargs.iter().map(|a| self.zonk(a)).collect();
+            let fits = |ta: &[Ty]| {
+                ta.len() == bargs.len() && !ta.iter().zip(&bargs).any(|(a, b)| crate::adt::disjoint_args(a, b))
+            };
+            // (Only when the arguments pick one impl.)
+            let mut picked: Vec<&Vec<Ty>> = entries.iter().map(|(ta, ..)| ta).filter(|ta| fits(ta)).collect();
+            picked.dedup();
+            let [ta] = picked.as_slice() else { continue };
+            let map: Vec<String> = entries
+                .iter()
+                .filter(|(a, base, renamed)| a == *ta && base != renamed)
+                .map(|(_, base, renamed)| format!("{base}={renamed}"))
+                .collect();
+            if map.is_empty() {
+                continue;
+            }
+            let wraps = owned.entry(r).or_insert_with(|| vec![Vec::new(); names.len()]);
+            if let Some(w) = wraps.get_mut(i) {
+                w.push(format!("alt:{}", map.join(",")));
+            }
+        }
+    }
 }
 
 /// The references and boxes a written type puts around its value, outermost first.
@@ -641,12 +710,13 @@ fn written_wraps(t: &ast::Type) -> Vec<&'static str> {
                 r.ty()
             }
             ast::Type::PathType(p)
-                if p.path()
+                if let Some(kind) = p
+                    .path()
                     .and_then(|p| p.segment())
                     .and_then(|s| s.name_ref())
-                    .is_some_and(|n| matches!(n.text().to_string().as_str(), "Box" | "Rc" | "Arc")) =>
+                    .and_then(|n| crate::adt::wrapper_kind(&n.text())) =>
             {
-                out.push("box");
+                out.push(kind);
                 match p
                     .path()
                     .and_then(|p| p.segment())
@@ -800,9 +870,10 @@ impl Checker<'_> {
 
 impl Checker<'_> {
     /// `x.inv()` where `impl Inv for &f32` sits next to `impl Inv for f32` (one type in JS; see
-    /// `adt::concrete_ref_impl`): the reference's impl (`inv$ref`) when the receiver is written
-    /// as such a reference and the method takes `self` by value, which is where rustc's probe
-    /// finds it first, or when the type has no impl of its own. Recorded for codegen.
+    /// `adt::concrete_ref_impl`), or `impl Tr for &A` next to `impl Tr for A`: the impl rustc's
+    /// method probe finds first for the receiver as written (`x`, `&x`, a local declared `&A`),
+    /// trying each autoderef step by value, then `&`, then `&mut`; the reference's impl
+    /// (`inv$ref`) also when the type has no impl of its own. Recorded for codegen.
     pub(super) fn pick_ref_impl(
         &mut self,
         m: &ast::MethodCallExpr,
@@ -810,9 +881,59 @@ impl Checker<'_> {
         rt: &crate::ty::Ty,
         method: String,
     ) -> String {
-        let Some(key) = crate::adt::ext_key_of(&self.shallow(rt)) else {
-            return method;
+        let key = match self.shallow(rt) {
+            crate::ty::Ty::Adt(n, _) => n,
+            t => match crate::adt::ext_key_of(&t) {
+                Some(k) => k.to_string(),
+                None => return method,
+            },
         };
+        let key = key.as_str();
+        // (By the probe, when the type has its own impl beside a reference's.)
+        if let Some(own) = self.adts.method(key, &method).map(|s| s.receiver) {
+            use crate::adt::Receiver;
+            // Each impl's self type (as its references) and its key.
+            let mut impls: Vec<(&[&str], String, Option<Receiver>)> = vec![(&[], method.clone(), own)];
+            for (kind, layers) in [("ref", &["&"][..]), ("refmut", &["&mut"][..])] {
+                let k = format!("{method}${kind}");
+                if let Some(s) = self.adts.method(key, &k) {
+                    impls.push((layers, k, s.receiver));
+                }
+            }
+            if impls.len() == 1 {
+                return method;
+            }
+            let written: Vec<&str> = match self.written_ref(recv) {
+                None => vec![],
+                Some(false) => vec!["&"],
+                Some(true) => vec!["&mut"],
+            };
+            let mut steps = vec![written.clone()];
+            if !written.is_empty() {
+                steps.push(Vec::new());
+            }
+            for u in &steps {
+                for adj in [None, Some("&"), Some("&mut")] {
+                    let target: Vec<&str> = adj.into_iter().chain(u.iter().copied()).collect();
+                    for (layers, k, recv_kind) in &impls {
+                        let by: Option<&str> = match recv_kind {
+                            Some(Receiver::Ref) => Some("&"),
+                            Some(Receiver::MutRef) => Some("&mut"),
+                            _ => None,
+                        };
+                        let recv_ty: Vec<&str> = by.into_iter().chain(layers.iter().copied()).collect();
+                        if recv_ty == target {
+                            if *k != method {
+                                let r = self.range(m.syntax());
+                                self.method_keys.insert(r, k.clone());
+                            }
+                            return k.clone();
+                        }
+                    }
+                }
+            }
+            return method;
+        }
         for kind in ["refmut", "ref"] {
             let k = format!("{method}${kind}");
             let Some(sig) = self.adts.method(key, &k) else {
@@ -832,7 +953,7 @@ impl Checker<'_> {
 
     /// Whether `e` is written as a reference: `&x` / `&mut x`, or a local or parameter declared
     /// as one (`r: &f32`, `let r = &mut s;`). Some(true) for `&mut`; None when it isn't one.
-    fn written_ref(&self, e: &ast::Expr) -> Option<bool> {
+    pub(super) fn written_ref(&self, e: &ast::Expr) -> Option<bool> {
     match e {
         ast::Expr::ParenExpr(p) => self.written_ref(&p.expr()?),
         ast::Expr::RefExpr(r) => Some(r.mut_token().is_some()),

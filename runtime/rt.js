@@ -2932,6 +2932,15 @@
     $okOf(x) {
       return new Res(0, x);
     },
+    // `s.get(r)` with a range value `r` (or an `I: SliceIndex<str>`): as `$strGet`.
+    $strGetBy(s, r) {
+      if (!(r instanceof Iter && r.it instanceof RangeIt)) return null;
+      try {
+        return rt.$sliceBy("$strSlice", s, r, "");
+      } catch {
+        return null;
+      }
+    },
     // `s.get(lo..hi)`: `None` out of bounds or off a char boundary.
     $strGet(s, lo, hi, inclusive) {
       try {
@@ -5891,6 +5900,8 @@
       for (const { cls, statics } of regs.wraps?.[kind] ?? []) {
         for (const [k, n] of Object.entries(statics)) {
           o[k] = (...a) => {
+            // (An impl for a concrete box, `impl Tr for Box<str>`: takes no class.)
+            if (n < 0) return cls[k](...a);
             const out = a.slice(0, n);
             out.push(inner);
             return cls[k](...out);
@@ -5907,6 +5918,10 @@
     $wrapCall(regs, cls, x, name, args) {
       const w = (regs.wraps?.[cls.wrap] ?? []).find((r) => typeof r.cls.prototype[name] === "function");
       if (w) return rt.$callElem(cls.elem, w.cls.prototype[name], x, ...args);
+      // (`impl Tr for &A` next to `impl Tr for A`: the struct's own `m$ref`.)
+      if (x !== null && typeof x === "object" && typeof x[`${name}$${cls.wrap}`] === "function") {
+        return x[`${name}$${cls.wrap}`](...args);
+      }
       // (`impl Inv for &f32` next to `impl Inv for f32`: the referent's class's `inv$ref`.)
       const kind = cls.elem?.kind;
       const r = (regs.kinds[Array.isArray(x) ? "array" : typeof x] ?? []).find(
@@ -6050,6 +6065,19 @@
         const f = arr.prototype[arr.$alts ? rt.$tupAlt(arr, name, x, cls.elem) : name];
         return arr.$elem?.has(name) ? rt.$callElem(cls.elem, f, x, ...args) : f.call(x, ...args);
       }
+      // (An `Option`'s, a `HashMap<K, V>`'s or a `HashSet<T>`'s class: its impl, handed the
+      // element's class, as `$dcallT` does; the cell when the method assigns `*self`.)
+      const coll = cls?.opt ? "option" : cls?.elem === undefined ? null
+        : x instanceof HashMap ? (x instanceof BTreeMap ? null : "map")
+        : x instanceof HashSet && !(x instanceof BTreeSet) ? "set" : null;
+      if (coll) {
+        for (const r of regs.kinds[coll] ?? []) {
+          const f = r.cls.prototype[name];
+          if (typeof f !== "function") continue;
+          const self = r.cls.$mut?.has(name) ? c : x;
+          return r.cls.$elem?.has(name) ? rt.$callElem(cls.elem, f, self, ...args) : f.call(self, ...args);
+        }
+      }
       if (kind !== undefined) {
         for (const r of regs.kinds[typeof x] ?? []) {
           if (r.cls.name === "$ext$" + kind && typeof r.cls.prototype[name] === "function") {
@@ -6066,6 +6094,10 @@
       const alt = cls?.$altMap;
       if (alt && Object.prototype.hasOwnProperty.call(alt, name) && x !== null && typeof x === "object" && typeof x[alt[name]] === "function") {
         return x[alt[name]](...args);
+      }
+      // (A function pointer's: the impl for its arity, on your impls' class `$ext$FnPtr`.)
+      if (alt && Object.prototype.hasOwnProperty.call(alt, name) && typeof x === "function" && typeof cls.prototype?.[alt[name]] === "function") {
+        return cls.prototype[alt[name]].call(x, ...args);
       }
       if (cls?.wrap) return rt.$wrapCall(regs, cls, x, name, args);
       if (cls?.own) {

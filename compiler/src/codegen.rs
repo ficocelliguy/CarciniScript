@@ -1006,6 +1006,7 @@ fn compile_text(
         extra_consts: Vec::new(),
         ext_class: None,
         ext_alt_self: None,
+        own_copy: false,
         in_trait_default: false,
         default_trait: String::new(),
         loop_dests: Vec::new(),
@@ -1217,6 +1218,9 @@ struct Codegen<'a> {
     pub(super) extra_consts: Vec<(String, String, Ty)>,
     /// Emitting the class of your trait impls for a built-in type (`$ext$i32`): its key.
     pub(super) ext_class: Option<String>,
+    /// Emitting a default method's copy for the owned twin (`impl Tr for String` next to
+    /// `impl Tr for str` that differ, `m$own`): its `self.m()` calls take the owned impl's `m$own`.
+    pub(super) own_copy: bool,
     /// In a default method's copy for one of several instantiations (`Cell<u16>` next to
     /// `Cell<u8>`): what `Self::` is, reading that impl's consts (`κσ.$altT`).
     pub(super) ext_alt_self: Option<String>,
@@ -5085,7 +5089,8 @@ impl<'a> Codegen<'a> {
                 };
                 // `*r = v` / `*self = v` with `r` a `&mut` to a struct or enum (or a `Vec`, map,
                 // set or other collection): the JS variable holds the object itself, so replace
-                // its contents in place.
+                // its contents in place. (An iterator's too: `*self = saved` in an impl for
+                // `vec::IntoIter<T>`.)
                 let through_ref = match strip_refs(&lhs) {
                     ast::Expr::PrefixExpr(p) if p.op_kind() == Some(UnaryOp::Deref) => {
                         matches!(
@@ -5101,7 +5106,7 @@ impl<'a> Codegen<'a> {
                     && through_ref
                     && matches!(
                         lt,
-                        Ty::Adt(..) | Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..)
+                        Ty::Adt(..) | Ty::Vec(_) | Ty::Map(..) | Ty::Set(_) | Ty::Coll(..) | Ty::Iter { .. }
                     )
                     && !self.types.adts.atom_ty(&lt)
                 {
@@ -6119,6 +6124,16 @@ impl<'a> Codegen<'a> {
                     for w in owned.and_then(|o| o.get(i)).into_iter().flatten() {
                         d = match w.as_str() {
                             "own" => format!("κσ.$ownT({d})"),
+                            // (`T: MultipleOf<Nano, f64>`: that impl's consts by the trait's
+                            // names.)
+                            k if k.starts_with("alt:") => {
+                                let es: Vec<String> = k[4..]
+                                    .split(',')
+                                    .filter_map(|e| e.split_once('='))
+                                    .map(|(b, r)| format!("{}: {}", js_string(&adt_gen::prop(b)), js_string(&adt_gen::prop(r))))
+                                    .collect();
+                                format!("κσ.$altT({d}, {{ {} }})", es.join(", "))
+                            }
                             k => format!("κσ.$wrapT($extRegs, \"{k}\", {d})"),
                         };
                     }
@@ -6379,6 +6394,11 @@ impl<'a> Codegen<'a> {
                     Coll::IndexSet => "IndexSet",
                 };
                 format!("κσ.$prims.{k}")
+            }
+            // (A function pointer with your impls: their associated functions and consts, those
+            // of `fn(A) -> R` by its arity, `impl<A, R> Tr for fn(A) -> R`.)
+            Ty::Closure { .. } | Ty::Fn if self.types.adts.ext_types.contains("FnPtr") => {
+                self.alt_view("FnPtr", &crate::adt::ext_args(t), "$ext$FnPtr".into())
             }
             _ => "undefined".into(),
         }
@@ -7329,6 +7349,29 @@ impl<'a> Codegen<'a> {
             e,
             ast::Expr::PathExpr(_) | ast::Expr::FieldExpr(_) | ast::Expr::IndexExpr(_)
         ) {
+            // (`if let Some(v) = o` with `o: &mut Option<T>`: `v` reads `$unsome(o[0])`, and
+            // writing it fills the option again.)
+            if let Some(opt) = rf
+                .plain()
+                .strip_prefix("κσ.$unsome(")
+                .and_then(|s| s.strip_suffix(')'))
+                .filter(|s| {
+                    // (One call: `$unsome(a)` of `$unsome(a) + f(b)` is not.)
+                    let mut depth = 0i32;
+                    s.chars().all(|c| {
+                        depth += match c {
+                            '(' => 1,
+                            ')' => -1,
+                            _ => 0,
+                        };
+                        depth >= 0
+                    }) && depth == 0
+                })
+            {
+                return Frag::text(format!(
+                    "κσ.$cell(() => κσ.$unsome({opt}), ($v) => {{ {opt} = κσ.$some($v); }})"
+                ));
+            }
             let mut f = Frag::text("κσ.$cell(() => ");
             f.append(rf.clone())
                 .push(", ($v) => { ")
@@ -7826,6 +7869,13 @@ impl<'a> Codegen<'a> {
                 Some(k) => k.clone(),
                 // (`self.kind()` in a default method's copy for one of several tuple impls:
                 // that impl's, by `self`'s elements.)
+                // (`self.m()` in a default method's copy for the owned twin: its `m$own`.)
+                None if self.own_copy
+                    && matches!(strip_parens_expr(&recv), ast::Expr::PathExpr(p) if p.syntax().text() == "self")
+                    && self.types.adts.own_twins.contains(&format!("{key}::{method}")) =>
+                {
+                    format!("{method}$own")
+                }
                 None => match self.lookup("self").map(|l| l.ty.clone()) {
                     Some(Ty::Tuple(es)) => self.tuple_alt_key(&key, &method, &es),
                     Some(Ty::RefCell(e)) => self.tuple_alt_key(&key, &method, &[*e]),

@@ -1003,11 +1003,9 @@ impl Checker<'_> {
                     let mut bounds = bounds;
                     if let Some(wc) = imp.where_clause() {
                         for pred in wc.predicates() {
-                            if let Some(ast::Type::PathType(pt)) = pred.ty()
-                                && pt
-                                    .path()
-                                    .and_then(|p| p.as_single_name_ref())
-                                    .is_some_and(|x| x.text() == n.as_str())
+                            // (And `where &'a T: Add<T>`: `T`'s operator.)
+                            if super::generic::where_param_subject(&pred).as_deref()
+                                == Some(n.as_str())
                             {
                                 bounds.extend(pred.type_bound_list().into_iter().flat_map(|l| {
                                     l.bounds()
@@ -1095,11 +1093,7 @@ impl Checker<'_> {
         for (n, inline) in impl_params {
             let mut lists: Vec<ast::TypeBoundList> = inline.into_iter().collect();
             for pred in imp.where_clause().into_iter().flat_map(|w| w.predicates()) {
-                if let Some(ast::Type::PathType(pt)) = pred.ty()
-                    && pt
-                        .path()
-                        .and_then(|p| p.as_single_name_ref())
-                        .is_some_and(|x| x.text() == n.as_str())
+                if super::generic::where_param_subject(&pred).as_deref() == Some(n.as_str())
                     && let Some(l) = pred.type_bound_list()
                 {
                     lists.push(l);
@@ -1721,8 +1715,40 @@ impl Checker<'_> {
             Ty::Param(p) if type_name.ends_with("$all") => vec![Ty::Param(p.clone())],
             // (And a `&T` impl's: its methods take `T`'s class, `$elem`.)
             Ty::Param(p) if crate::adt::is_wrapper_key(&type_name) => vec![Ty::Param(p.clone())],
+            // (`impl<I: Iterator> Tr for I`: a blanket impl, not one for std's iterators.)
+            Ty::Iter { .. } if crate::adt::blanket_parts(imp).is_some() => Vec::new(),
             // `impl Total for HashMap<String, i64>` / `impl<T> Tr for Option<T>`.
             t => crate::adt::ext_args(t),
+        };
+        // (Which arguments are written `&T` for one of the impl's parameters `T`.)
+        let ref_args: Vec<bool> = match imp.self_ty() {
+            Some(ast::Type::PathType(p)) if trait_name.is_none() && !impl_args.is_empty() => {
+                let params: Vec<String> = imp
+                    .generic_param_list()
+                    .into_iter()
+                    .flat_map(|l| l.type_or_const_params())
+                    .filter_map(|p| match p {
+                        ast::TypeOrConstParam::Type(t) => Some(t.name()?.text().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                p.path()
+                    .and_then(|p| p.segment())
+                    .and_then(|s| s.generic_arg_list())
+                    .into_iter()
+                    .flat_map(|l| l.generic_args())
+                    .filter_map(|g| match g {
+                        ast::GenericArg::TypeArg(ta) => Some(matches!(
+                            ta.ty(),
+                            Some(ast::Type::RefType(r)) if matches!(r.ty(), Some(ast::Type::PathType(q))
+                                if q.path().and_then(|q| q.as_single_name_ref()).is_some_and(|n| params.iter().any(|x| *x == n.text())))
+                        )),
+                        ast::GenericArg::ConstArg(_) => Some(false),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
         };
         let saved = self.self_ty.replace(self_ty);
         // `type Target = Vec<i32>;`
@@ -1962,6 +1988,33 @@ impl Checker<'_> {
                                 n.text().to_string(),
                             ));
                         }
+                    }
+                    // (`VALUE__1`: this impl's `VALUE` for its trait arguments, see
+                    // `inst_consts::expand_trait_args`.)
+                    if let Some(tr) = trait_name.as_deref()
+                        && let Some(def) = self.adts.traits.get(tr)
+                        && !def.type_params.is_empty()
+                        && let Some(ast::Type::PathType(tp)) = imp.trait_()
+                    {
+                        let base = crate::inst_consts::trait_const_base(n.text().as_ref(), &def.consts)
+                            .to_string();
+                        let written: Vec<ast::Type> = tp
+                            .path()
+                            .and_then(|p| p.segment())
+                            .and_then(|s| s.generic_arg_list())
+                            .into_iter()
+                            .flat_map(|l| l.generic_args())
+                            .filter_map(|g| match g {
+                                ast::GenericArg::TypeArg(ta) => ta.ty(),
+                                _ => None,
+                            })
+                            .collect();
+                        let targs: Vec<Ty> = written.iter().map(|t| self.lower_type(t)).collect();
+                        self.adts
+                            .trait_arg_consts
+                            .entry((type_name.clone(), tr.to_string()))
+                            .or_default()
+                            .push((targs, base, n.text().to_string()));
                     }
                     let consts = self.adts.assoc_consts.entry(type_name.clone()).or_default();
                     if consts.insert(n.text().to_string(), ty).is_some() {
@@ -2285,13 +2338,17 @@ impl Checker<'_> {
                     .get(&format!("{type_name}::{n}"))
                     .cloned()
                     .unwrap_or_else(|| vec![n.clone()]);
+                // (`&T` is never a `Vec<T>` or a struct: see `Adts::ref_param_args`.)
+                let ctor = |t: &Ty| !matches!(t, Ty::Param(_) | Ty::Unknown | Ty::Var(_));
                 let disjoint = keys.iter().all(|k| {
+                    let theirs = self.adts.ref_param_args.get(&format!("{type_name}::{k}"));
                     existing.get(k).is_some_and(|m| {
                         m.impl_args.len() == impl_args.len()
-                            && m.impl_args
-                                .iter()
-                                .zip(&impl_args)
-                                .any(|(a, b)| crate::adt::disjoint_args(a, b))
+                            && m.impl_args.iter().zip(&impl_args).enumerate().any(|(i, (a, b))| {
+                                crate::adt::disjoint_args(a, b)
+                                    || theirs.and_then(|r| r.get(i)) == Some(&true) && ctor(b)
+                                    || ref_args.get(i) == Some(&true) && ctor(a)
+                            })
                     })
                 });
                 if disjoint {
@@ -2302,6 +2359,9 @@ impl Checker<'_> {
                         .or_insert_with(|| vec![n.clone()]);
                     let key = format!("{n}${}", alts.len());
                     alts.push(key.clone());
+                    if ref_args.contains(&true) {
+                        self.adts.ref_param_args.insert(format!("{type_name}::{key}"), ref_args.clone());
+                    }
                     let at = self.range(name.syntax()).0;
                     self.adts.alt_keys_at.insert(at, key.clone());
                     self.adts.inherent_alts.insert(format!("{type_name}::{n}"));
@@ -2354,6 +2414,9 @@ impl Checker<'_> {
             }
             // Trait methods (`fmt`, `default`) live alongside inherent ones under their own name.
             if trait_name.is_none() {
+                if ref_args.contains(&true) {
+                    self.adts.ref_param_args.insert(key.clone(), ref_args.clone());
+                }
                 self.adts.inherent_methods.insert(key);
             }
             let methods = self.adts.methods.entry(type_name.clone()).or_default();
@@ -3317,6 +3380,9 @@ impl Checker<'_> {
         method: &str,
         args: &[ast::Expr],
     ) -> Ty {
+        // (`impl Tr for &A` next to `impl Tr for A`: by how the receiver is written.)
+        let picked = self.pick_ref_impl(m, recv, &Ty::Adt(adt.to_string(), targs.to_vec()), method.to_string());
+        let method = picked.as_str();
         if let Some(sig) = self.adts.method(adt, method).cloned()
             && sig.receiver.is_some()
         {
@@ -3345,7 +3411,8 @@ impl Checker<'_> {
                 self.generic_calls
                     .push((r, caller, format!("{adt}::{method}"), own));
             }
-            if sig.receiver == Some(Receiver::MutRef) {
+            // (A `&A` impl's `&mut self` borrows the reference, not the `A` behind it.)
+            if sig.receiver == Some(Receiver::MutRef) && !method.ends_with("$ref") {
                 self.check_mutable(recv, Mutation::Borrow);
             }
             self.arg_count(m.syntax(), "method", sig.params.len(), args.len());

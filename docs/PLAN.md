@@ -297,63 +297,68 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
 
 ### Language gaps
 
-- [ ] **Impls over types that are one type in JS that behave differently still conflict.** `[u8;
-  1]` vs `[u8; 2]` with different bodies (`agentB/c6*`; the run-time length could pick), `[u8;
-  N]` vs `[u8]` doing different things (phf_shared `array_impl!(u8)`), `X` vs `&X` (`c11b`) and
-  `&T` vs `&mut T` (`c3`) doing different things, `Rc<T>` vs `Box<T>` with associated functions
-  only (`<Rc<u8>>::f()`, `agentD/q9c`), `Cell<T>` vs `RefCell<T>` (both `Ty::RefCell`, `q9b`),
-  `Box<[T]>` vs `[T]` (wasm-bindgen `describe.rs`), `HashMap<K, V, S1>` / `<K, V, S2>` (`c5c`;
-  the hasher isn't in the type), `Cell<*mut T>` beside `Cell<u8>` (radium), fn pointers of
-  different arity carrying consts (`c14`, js-sys `impl_fn!`, 52 errors in one file), the
-  iterators sharing one `Iter` (`vec::IntoIter` / `array::IntoIter` / `vec::Drain` /
-  `string::Drain` / `slice::Iter`; `c8`, itertools `peeking_take_while.rs`), inherent
-  `Split<&T>` vs `Split<Ptr<T>>` and `W<&T>` vs `W<Vec<T>>` (`c19b` / `c19d`), `B<dyn Any>` vs
-  `B<dyn Any + Send>`'s `downcast` (`c18`), generic-trait consts per trait argument (`impl
-  MultipleOf<Nano, u16> for Micro { const VALUE }`, `c17` / time-core), and the unchanged `str`
-  / `String` and `[T]` / `Vec<T>` twin rules (borsh, clap, itertools, bytes). Landed 2026-11-27
-  (`fixtures/instantiation_trait_impls.rs`): one trait for several instantiations (`W<u8>` /
-  `W<u16>`, `Cell<u8>` / `Cell<u16>`, `UniformInt<$ty>`, `Wrapping<u32>` / `<u64>`) picked by
-  the type arguments, also through a type parameter; impls for JS-identical types (`[T; N]` /
-  `[T]`, `X` / `&X`, `&T` / `&mut T`, `Rc<T>` / `Box<T>`, `dyn Tr` / `+ Send`, `Path` /
-  `PathBuf`) that do the same thing or forward to one another share one (`erased_twins.rs`);
-  marker traits for such types (`Cow<str>` / `Cow<[T]>`). Conflict errors are gone from about a
-  dozen corpus files (bitvec, log, miow, quote, rand, regex, ring, stable_deref_trait), most
-  with other errors left. Importance: low to medium.
-- [ ] **Methods and calls through type-parameter bounds, remaining shapes.** A `&mut self` method of a HashMap/HashSet impl
-  reached through `$dcallMutT` doesn't get the map class's `elem`. Landed 2026-11-27
-  (`fixtures/into_iter_param_bounds.rs`): `IntoIterator` bounds on a parameter that stays one
-  (inline, impl or method `where`, `for<'a> &'a L: IntoIterator`, `where &'a I: IntoIterator`,
-  `H::Item: IntoIterator`, `L::IntoIter` / `L::Item` / `<&L as IntoIterator>::Item` types:
-  either's 21 errors, strsim), `T::clone(b)` through `Deref`, `Default::default()` settling to a
-  `T: Default` in a closure; and (`fixtures/map_impl_param_calls.rs`) `K::f()` / `Self::f()` in
-  methods of `HashMap<K, V>` / `HashSet<T>` / `Vec<T>` impls, `<Cell<u8>>::f()` through a blanket
-  impl, `Trait::f(args)` whose `Self` settles later. And (`fixtures/iter_supertrait_clone_paths.rs`) a
-  same-file trait whose supertraits are iterator traits (`trait PreciseIterator: Iterator +
-  ExactSizeIterator {}`, or one with a blanket impl over iterators) as a bound or `dyn`, its
-  values iterators (`it.len()`, `t.next()`); `T::clone(&x)` through `Deref`; `Bx::clone(&b)` /
-  `<Bx<P>>::clone(&b)` / `Bx::<T>::clone(x)` of a derived `Clone`. And 2026-11-28
-  (`fixtures/blanket_param_class.rs`): `Z::default()` / `Self::default()` / `T::zero()` and `>>`
-  on the parameter in a method with `self` of a blanket impl (zeroize's `impl<Z:
-  DefaultIsZeroes> Zeroize for Z`, `impl<I: Shr<..>> Half for I`), handed the receiver's class by
-  direct, by-path and generic-bound calls (`$dcall` without one guesses it from the value). And
-  (`fixtures/iter_item_default.rs`): `Default::default()` / `unwrap_or_default()` /
-  `I::Item::default()` and operators on `I::Item` of a function's `I: Iterator` / `I:
-  IntoIterator` (itertools' `concat`), its class handed over like a type parameter's; and
-  (`fixtures/hasher_param_default.rs`) `S::default()` / `Default::default()` for the hasher of
-  an impl for `HashMap<K, V, S>` / `HashSet<T, S>` (winnow's `Accumulate`). And 2026-11-28 (`fixtures/method_iter_item.rs`): a method's own `I: Iterator` / `I:
-  IntoIterator` with `-> Option<I::Item>` / `-> Vec<I::Item>` / `where I::Item: ..`. And 2026-11-28 (`fixtures/projection_op_bounds.rs`): bounds on operator
-  projections (`where <T as Shr<u32>>::Output: PartialEq<T>`, `u8: TryFrom<<T as
-  BitAnd>::Output>`) and `where &'a T: Add<T>` with `<&'a T as Add<T>>::Output`, in functions
-  and impl methods. Probes in `agentD/q9*`, `q12*`, `q15*` and
-  `agentC/q19`, `q21`. Fewer than the 23 files the entry started with. Importance: low to medium.
-- [ ] **Indexing user types, remaining shapes.** `I: SliceIndex<str>`; with no
+- [ ] **Impls over types that are one type in JS that behave differently, remaining shapes.**
+  Still conflicts: `Cell<*mut T>` beside `Cell<u8>` (radium; a raw pointer lowers to what it
+  points at, so nothing tells it from a number); std's iterators (all one `Iter`) with
+  different bodies (itertools `peeking_take_while.rs`: `as_slice()` for `vec::IntoIter`,
+  `as_str()` for `string::Drain`, a clone for the rest; nothing at run time says which std
+  iterator a value is); `[u8; N]` vs `[u8]` with bodies that differ other than by forwarding
+  (arrays are `Vec`s before type checking; phf's real impl forwards and compiles); two boxes of
+  one kind in one trait (`impl Tr for Box<str>` and `impl Tr for Box<Path>`: one `Tr$box`
+  class). Landed 2026-11-27 (`fixtures/instantiation_trait_impls.rs`): one trait for several
+  instantiations (`W<u8>` / `W<u16>`, `Cell<u8>` / `Cell<u16>`, `UniformInt<$ty>`,
+  `Wrapping<u32>` / `<u64>`) picked by the type arguments, also through a type parameter; impls
+  for JS-identical types (`[T; N]` / `[T]`, `X` / `&X`, `&T` / `&mut T`, `Rc<T>` / `Box<T>`,
+  `dyn Tr` / `+ Send`, `Path` / `PathBuf`) that do the same thing or forward to one another
+  share one (`erased_twins.rs`); marker traits for such types (`Cow<str>` / `Cow<[T]>`).
+  Conflict errors are gone from about a dozen corpus files (bitvec, log, miow, quote, rand,
+  regex, ring, stable_deref_trait), most with other errors left. And 2026-11-28
+  (`fixtures/cell_iter_impl_twins.rs`): std's `Cell<T>` / `RefCell<T>` (`q9b`) and std's
+  iterators (`vec::IntoIter`, `array::IntoIter`, `vec::Drain`, `string::Drain`, `slice::Iter`,
+  ..; `c8`) doing the same thing share one, a struct of the file with one of those names
+  excepted; the impl's parameters of an impl for a std iterator bind from the receiver's items
+  (`v.pn()` was `Option<T>`); `*self = saved` in one replaces the iterator's state; and a trait
+  with an `Iterator` supertrait and methods of its own, implemented only for std's iterators
+  (itertools' `PeekingNext`), is an iterator as a bound (`it.next()`, `Self::Item`). Also
+  2026-11-28, impls that differ:
+  - generic-trait consts per trait argument (`impl MultipleOf<Nano, u16> for Micro { const
+    VALUE }`, `c17` / time-core; `<X as Tr<A>>::K` and `<Self as Tr<A>>::K`, and through a `T:
+    Tr<A>` bound): `fixtures/trait_arg_consts.rs`;
+  - fn pointers of different arity carrying consts (`c14`, js-sys `impl_fn!`), also through a
+    type parameter: `fixtures/fn_ptr_arity_impls.rs`;
+  - `[u8; 1]` vs `[u8; 2]` with different bodies (`agentB/c6*`): one impl that matches on
+    `self.len()`, `fixtures/array_len_impls.rs`;
+  - `Rc<T>` / `Arc<T>` vs `Box<T>` wrapper impls with associated functions only
+    (`<Rc<u8>>::f()`, `agentD/q9c`): `fixtures/box_rc_arc_impls.rs`;
+  - `X` vs `&X` for a type of the file (`c11b`): `fixtures/ref_beside_own_impls.rs`;
+  - `&T` vs `&mut T` blankets (`c3`), picked by how the receiver is written (`&x` / `&mut x`,
+    or a binding's declared type; an error when it can't tell):
+    `fixtures/ref_mut_blanket_impls.rs`;
+  - inherent `Split<&T>` vs `Split<Ptr<T>>` (`c19b` / `c19d`): `fixtures/ref_arg_inherent_impls.rs`;
+  - `Box<str>` vs `String` and `Box<Path>` vs `PathBuf` (clap's `ValueParserFactory`), `Box<[T]>`
+    vs `[T]` (wasm-bindgen describe), associated functions: `fixtures/boxed_concrete_impls.rs`;
+  - the `[T]` / `Vec<T>` (and `str` / `String`) twin rule with default methods: the owned impl
+    gets its own copies of the defaults it inherits (borsh's `Write`, `c16*`):
+    `fixtures/twin_default_methods.rs`;
+  - `HashMap<K, V, S>` vs `HashMap<K, V>` (`c5c`, ahash's `HashMapExt`): one impl, std's
+    default's, where they differ only in building the map with the hasher; and `HashMap::new()`
+    beside a trait's `new` is std's (it called the trait's, recursing):
+    `fixtures/hashmap_hasher_impls.rs`;
+  - `B<dyn Any>` vs `B<dyn Any + Send>` (`c18`) already shared one; its `self.0.downcast()`
+    with the type argument only in the return type is still "needs its type argument".
+
+  Importance: low.
+- [ ] **Indexing user types, remaining shapes.** With no
   `Deref`, `&mut v[a..b]` through your `index_mut` is a view only inside its body (a use site
   gets a copy); ascii's
   `[Self::Inner]` in a trait method signature. `impl<T, I: SliceIndex<[T]>> Index<I>` /
   `IndexMut<I>` (smallvec, thin-vec, bumpalo; `fixtures/index_slice_index.rs`) and `c[ix] = e` /
   `c[ix] += 1` through a `C: IndexMut<Ix>` bound (`fixtures/index_param_assign.rs`) landed
   2026-11-27. `c[i].push(..)` with `Output = String` through a bound landed 2026-11-28
-  (`fixtures/index_bound_string_output.rs`). A few files. Importance: low.
+  (`fixtures/index_bound_string_output.rs`). `I: SliceIndex<str>` on a function's or
+  method's parameter (`&s[i]`, `s.get(i)`, `I::Output` as `str`) and `s.get(r)` with a range
+  value landed 2026-11-28 (`fixtures/slice_index_str.rs`); `I: SliceIndex<[T]>` on a free
+  function is still rejected (see Known bugs for why). A few files. Importance: low.
 
 ### Survey tooling notes
 
@@ -379,7 +384,28 @@ how many it is the only blocker in; both skip browser-impossible files. Ordered 
 Found in passing and not fixed yet (checked against the current tree, 2026-11-26). Gaps that are
 by design or long-standing differences from rustc are in `RUST_GAPS.md`.
 
-None open.
+- **`{:?}` of an `I::Output` of `I: SliceIndex<[T]>` prints JS's `String()` of it.** `fn pick<I:
+  SliceIndex<[i32]>>(&self, i: I) -> &I::Output` in an impl, `println!("{:?} {:?}",
+  w.pick(1..3), w.pick(0))`: rustc `[20, 30] 10`, here `20,30 10.0`. The projection stays
+  unchecked (`lenient_projs`), so the call's type is unknown and the formatter guesses; it
+  needs the projection resolved at the call site (a range gives `[T]`, a `usize` gives `T`).
+  That is also why the bound stays rejected on free functions.
+- **An `impl Tr` argument handed on to a generic function that needs its class passes
+  `undefined`.** `fn get<T: Tr>(_: T) -> u32 { T::V }`, `fn per(x: impl Tr) -> u32 { get(x) }`,
+  `per(3u8)`: rustc `1`, here a panic reading `V` of `undefined`. The `impl Tr` parameter takes
+  no class of its own to pass along. (2026-11-28.)
+- **A method call on a `Box<T>` value misses `impl<T: Tr> Tr for Box<T>`.** With `impl Name for
+  u8` and `impl<T: Name> Name for Box<T>`, `Box::new(1u8).name()`: rustc `box`, here `u8`
+  (the box is erased, so the call goes to the inner value's impl). Generic calls and paths
+  (`<Box<u8>>::f()`) already reach it. (2026-11-28.)
+- **A generic trait's associated function without arguments, called by path with its trait
+  arguments, takes the first impl.** `impl Conv<u8> for A { fn make() -> u32 { 1 } }` and
+  `impl Conv<u16> for A { .. 2 }`, `<A as Conv<u16>>::make()`: rustc `2`, here `1`. Methods and
+  consts pick by the trait arguments; this path doesn't. (2026-11-28.)
+- **`W<&T>` beside `W<Vec<T>>`: a receiver `W(&v)` with `v: Vec<_>` takes the `Vec` impl.**
+  `impl<T> W<&T> { fn kind() .. "ref" }`, `impl<T> W<Vec<T>> { .. "vec" }`, `W(&v).kind()`:
+  rustc `ref`, here `vec` (the reference is erased from the type argument; a written `W<&T>`
+  annotation or a non-`Vec` referent picks right). (2026-11-28.)
 
 ## Risks
 

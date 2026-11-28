@@ -554,6 +554,7 @@ impl<'a> Checker<'a> {
             slice_index_params: HashMap::new(),
             pending_projections: Vec::new(),
             pending_trait_args: Vec::new(),
+            bound_arg_calls: Vec::new(),
             file_trait_names: Default::default(),
             conversions: HashMap::new(),
         }
@@ -819,7 +820,8 @@ pub fn check(
     for v in stored.values_mut() {
         v.sort();
     }
-    let dict_owned = c.finish_twin_dicts(&dict_params, &dict_args);
+    let mut dict_owned = c.finish_twin_dicts(&dict_params, &dict_args);
+    c.finish_trait_arg_dicts(&dict_params, &dict_args, &mut dict_owned);
     let const_paths: HashMap<(usize, usize), (Ty, String)> = std::mem::take(&mut c.const_paths)
         .into_iter()
         .map(|(r, (t, k))| (r, (c.zonk(&t), k)))
@@ -1286,6 +1288,7 @@ struct Checker<'a> {
     /// Projections a `where` clause constrains (`where I::Item: PartialEq<T>`): unchecked.
     pub(super) lenient_projs: std::collections::HashSet<String>,
     /// `I: SliceIndex<[T]>` (`Output = O` when written): `T`, and `O`; `I::Output` is unchecked.
+    /// (`I: SliceIndex<str>`: `str` for both.)
     pub(super) slice_index_params: HashMap<String, (Ty, Option<Ty>)>,
     /// Generic calls' projections waiting for their type argument: (`S`'s variable, trait,
     /// associated type, the projection's variable).
@@ -1293,6 +1296,10 @@ struct Checker<'a> {
     /// Generic calls' bound arguments waiting for their type argument (`S: Store<T>`): (`S`'s
     /// variable, trait, the arguments' types).
     pub(super) pending_trait_args: Vec<(Ty, String, Vec<Ty>)>,
+    /// Generic calls whose callee bounds a type parameter by a generic user trait (`T:
+    /// MultipleOf<Nano, O>`): (the call, the parameter, the trait, its arguments here), for
+    /// `finish_trait_arg_dicts`.
+    pub(super) bound_arg_calls: Vec<((usize, usize), String, String, Vec<Ty>)>,
     /// The file's trait names, known before its traits are collected: struct fields lowered
     /// first may name them (`struct Scene(Vec<Box<dyn Shape>>)`).
     pub(super) file_trait_names: std::collections::HashSet<String>,
@@ -6246,6 +6253,29 @@ impl<'a> Checker<'a> {
             .filter_map(|s| s.name_ref())
             .map(|n| n.text().to_string())
             .collect();
+        // `Self::ARITY` in `impl<A, R> Tr for fn(A) -> R`, `<fn(u8) -> u8 as Tr>::ARITY`: a const
+        // of your impls for function pointers.
+        if let (Some(q), Some(konst)) = (path.qualifier(), segs.last())
+            && q.qualifier().is_none()
+            && let Some(qs) = q.segment()
+            && self.adts.ext_types.contains("FnPtr")
+        {
+            let fn_ty = if qs.self_type_token().is_some() {
+                self.self_ty.clone().filter(|t| matches!(t, Ty::Closure { .. }))
+            } else {
+                match qs.type_anchor().and_then(|a| a.ty()) {
+                    Some(t @ (ast::Type::FnPtrType(_) | ast::Type::ForType(_))) => Some(self.lower_type(&t)),
+                    _ => None,
+                }
+            };
+            if let Some(fn_ty) = fn_ty
+                && let Some(t) = self.adts.assoc_consts.get("FnPtr").and_then(|c| c.get(konst)).cloned()
+            {
+                let r = self.range(p.syntax());
+                self.const_paths.insert(r, (fn_ty, konst.clone()));
+                return t;
+            }
+        }
         if let [single] = self.strip_modules(&segs).as_slice() {
             if let Some(t) = self.consts.get(single).cloned() {
                 if self.static_muts.contains(single)
@@ -7335,7 +7365,11 @@ impl<'a> Checker<'a> {
             }
             // `i32::zero()`: an associated function of a trait you implemented for a built-in
             // type.
+            // (Not `HashMap::new()` beside `impl HashMapExt for HashMap<K, V>`'s `fn new()`: std's
+            // inherent function comes before a trait's.)
             if let [t, f] = ns.as_slice()
+                && !(matches!(*f, "new" | "with_capacity")
+                    && matches!(*t, "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque" | "Vec" | "String" | "BinaryHeap"))
                 && let Some(key) = crate::adt::ext_key(t)
                 && self.adts.ext_types.contains(key)
                 && let Some(sig) = self.adts.method(key, f).cloned()
@@ -8025,9 +8059,11 @@ impl<'a> Checker<'a> {
                     .map(|(n, _)| n.clone())
                     .zip(self.last_type_args.iter().cloned())
                     .collect();
+                let r = self.range(c.syntax());
                 for (p, tr, args) in &bound_args {
                     if let Some(sv) = m.get(p) {
-                        let args = args.iter().map(|a| generic::subst(a, &m)).collect();
+                        let args: Vec<Ty> = args.iter().map(|a| generic::subst(a, &m)).collect();
+                        self.bound_arg_calls.push((r, p.clone(), tr.clone(), args.clone()));
                         self.pending_trait_args.push((sv.clone(), tr.clone(), args));
                     }
                 }
@@ -8663,7 +8699,30 @@ impl<'a> Checker<'a> {
         }
         // A blanket impl's method (`5.shout()` with `impl<T: Display> Shout for T`), when the
         // receiver has no method of that name itself and meets the impl's bounds.
-        if let Some((key, sig)) = self.blanket_method(&rt, &method) {
+        // (`impl<T> Tr for &T` next to `impl<T> Tr for &mut T`: by how the receiver is written.)
+        let ref_twin = ["ref", "refmut"].iter().find_map(|k| self.blanket_method(&rt, &format!("{method}${k}")));
+        let picked = match (self.blanket_method(&rt, &method), ref_twin) {
+            (Some(b), _) => Some(b),
+            (None, Some((key, _))) => {
+                let k = match self.written_ref(&recv) {
+                    Some(true) => format!("{method}$refmut"),
+                    Some(false) => format!("{method}$ref"),
+                    None => {
+                        self.error(
+                            recv.syntax(),
+                            format!("can't tell whether this is a `&` or a `&mut` reference, whose impls of `{}` differ (one type in JS): write the receiver as `&x` / `&mut x`, or bind it with a declared type", key.trim_end_matches("$all")),
+                        );
+                        format!("{method}$ref")
+                    }
+                };
+                let r = self.range(m.syntax());
+                self.method_keys.insert(r, k.clone());
+                self.adts.method(&key, &k).cloned().map(|s| (key, s))
+            }
+            _ => None,
+        };
+        if let Some((key, sig)) = picked {
+            let method = self.method_keys.get(&self.range(m.syntax())).cloned().unwrap_or(method.clone());
             if sig.receiver == Some(crate::adt::Receiver::MutRef) {
                 self.check_mutable(&recv, Mutation::Borrow);
             }
@@ -11180,7 +11239,13 @@ impl Checker<'_> {
             let seg = p.path()?.segment()?;
             let n = seg.name_ref()?.text().to_string();
             let def = self.adts.traits.get(&n)?;
-            if !def.methods.is_empty() && !self.adts.blankets.contains_key(&n) {
+            // (Or one implemented only for std's iterators, which are all the runtime's `Iter`:
+            // itertools' `PeekingNext` for `vec::IntoIter<T>` and `slice::Iter<'a, T>`.)
+            let only_iters = || {
+                let mut impls = self.adts.trait_impls.iter().filter(|(_, trs)| trs.contains(&n));
+                impls.clone().next().is_some() && impls.all(|(k, _)| k == "Iter")
+            };
+            if !def.methods.is_empty() && !self.adts.blankets.contains_key(&n) && !only_iters() {
                 return None;
             }
             let mut todo = def.supers.clone();
@@ -11758,9 +11823,7 @@ impl Checker<'_> {
             return None;
         };
         let n = p.path()?.segment()?.name_ref()?.text().to_string();
-        if !matches!(n.as_str(), "Box" | "Rc" | "Arc") {
-            return None;
-        }
+        let kind = crate::adt::wrapper_kind(&n)?;
         let with_fn: Vec<&String> = self
             .adts
             .traits
@@ -11775,7 +11838,7 @@ impl Checker<'_> {
         let boxed: Vec<&String> = with_fn
             .iter()
             .copied()
-            .filter(|t| self.adts.method(&format!("{t}$box"), method).is_some())
+            .filter(|t| self.adts.method(&format!("{t}${kind}"), method).is_some())
             .collect();
         match (boxed.as_slice(), with_fn.as_slice()) {
             ([t], _) | ([], [t]) => Some((*t).clone()),

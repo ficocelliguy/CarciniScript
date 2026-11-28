@@ -302,6 +302,17 @@ pub struct Adts {
     /// arguments, the trait's name `ZERO`, this impl's `ZERO__1`). The class passed for such a
     /// type parameter reads them by the trait's name (`κσ.$altT`).
     pub alt_consts: HashMap<String, Vec<(Vec<Ty>, String, String)>>,
+    /// A generic trait's consts renamed per trait argument (`impl MultipleOf<Nano, f64> for
+    /// Micro { const VALUE }` next to `MultipleOf<Nano, u16>`'s, see
+    /// `inst_consts::expand_trait_args`), by (type, trait): (the impl's trait arguments, the
+    /// trait's name `VALUE`, this impl's `VALUE__1`). The class passed for `T: MultipleOf<Nano,
+    /// f64>` reads them by the trait's name (`κσ.$altT`).
+    pub trait_arg_consts: HashMap<(String, String), Vec<(Vec<Ty>, String, String)>>,
+    /// For inherent methods of an impl with type arguments, by `"Type::key"`: which arguments
+    /// are written as a reference to one of the impl's parameters (`impl<'a, T> W<&'a T>`). Such
+    /// an argument is never a `Vec<T>` or a struct in rustc, though erased here, so `W<&T>`'s
+    /// methods sit next to `W<Vec<T>>`'s, which a receiver of that shape takes.
+    pub ref_param_args: HashMap<String, Vec<bool>>,
     /// The `"Type::method"`s of inherent methods: an `impl AsRef<..>` beside an inherent `as_ref`
     /// puts its method under `AsRef$as_ref`.
     pub inherent_methods: std::collections::HashSet<String>,
@@ -620,9 +631,14 @@ pub fn ext_args(t: &Ty) -> Vec<Ty> {
         Ty::Vec(e) | Ty::Option(e) | Ty::Set(e) | Ty::Range(e, _)
         // (`impl<T: Tr> Tr for Cell<T>` / `RefCell<T>`.)
         | Ty::RefCell(e) => vec![(**e).clone()],
+        // (`impl<T> Tr for vec::IntoIter<T>` / `slice::Iter<'a, T>`: the runtime's iterator.)
+        Ty::Iter { elem, .. } => vec![(**elem).clone()],
         Ty::Map(k, v) | Ty::Result(k, v) => vec![(**k).clone(), (**v).clone()],
         Ty::Coll(_, view) => ext_args(view),
         Ty::Tuple(es) => es.clone(),
+        // (`impl<R> Tr for fn() -> R` next to `impl<A, R> Tr for fn(A) -> R`: picked by the
+        // arity, which a function value's type knows.)
+        Ty::Closure { params, .. } => vec![Ty::ConstVal(params.len().to_string())],
         _ => vec![],
     }
 }
@@ -1120,7 +1136,7 @@ pub fn blanket_impl(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
     Some(b)
 }
 
-fn blanket_parts(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
+pub fn blanket_parts(imp: &ast::Impl) -> Option<(String, String, Vec<String>)> {
     let (Some(tr), self_name) = impl_parts(imp) else {
         return None;
     };
@@ -1797,6 +1813,10 @@ pub fn impl_type_param_pos(imp: &ast::Impl, param: &str) -> Option<usize> {
 /// whose `T` is a reference (`g(&x)` for `fn g<T: Tr>(t: T)`) reaches it by the class it passes
 /// (`κσ.$wrapT("ref", ..)`); references and boxes are erased otherwise.
 pub fn wrapper_impl(imp: &ast::Impl) -> Option<(String, String)> {
+    // (`impl Tr for Box<str>` next to `impl Tr for String`: likewise, see `boxed_beside_own`.)
+    if let Some(kind) = boxed_beside_own(imp) {
+        return Some((format!("{}${kind}", impl_parts(imp).0?), String::new()));
+    }
     if !wrapping_impl(imp) || forwarding_impl(imp) {
         return None;
     }
@@ -1808,7 +1828,10 @@ pub fn wrapper_impl(imp: &ast::Impl) -> Option<(String, String)> {
     let kind = match imp.self_ty()? {
         ast::Type::RefType(r) if r.mut_token().is_some() => "refmut",
         ast::Type::RefType(_) => "ref",
-        _ => "box",
+        // (`Box<T>`, `Rc<T>` and `Arc<T>` each their own: `impl<T: Tr> Tr for Rc<T>` next to
+        // `Box<T>`'s, told apart by the class a caller passes.)
+        ast::Type::PathType(p) => wrapper_kind(&p.path()?.segment()?.name_ref()?.text())?,
+        _ => return None,
     };
     Some((format!("{tr}${kind}"), p))
 }
@@ -1822,6 +1845,11 @@ pub fn concrete_ref_impl(imp: &ast::Impl) -> Option<&'static str> {
     let ast::Type::RefType(r) = imp.self_ty()? else {
         return None;
     };
+    // (`impl<T> Tr for &T` next to `impl<T> Tr for &mut T`: blankets told apart by the
+    // receiver's reference.)
+    if !wrapping_impl(imp) && ref_mut_blanket_twin(imp) {
+        return Some(if r.mut_token().is_some() { "refmut" } else { "ref" });
+    }
     if wrapped_param(imp).is_some() {
         return None;
     }
@@ -1829,16 +1857,161 @@ pub fn concrete_ref_impl(imp: &ast::Impl) -> Option<&'static str> {
         return None;
     };
     let n = p.path()?.segment()?.name_ref()?.text().to_string();
+    let kind = if r.mut_token().is_some() { "refmut" } else { "ref" };
+    // (`impl Tr for &A` next to `impl Tr for A`, for a trait of the file: likewise, see
+    // `ref_beside_own`.)
+    if ext_key(&n).is_none() && ref_beside_own(imp, &n) {
+        return Some(kind);
+    }
     // (`impl Tr for &str` is `str`'s impl.)
     if n == "str" || !matches!(ext_key(&n)?, "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "i128" | "u128" | "f32" | "f64" | "bool" | "char" | "String") {
         return None;
     }
-    Some(if r.mut_token().is_some() { "refmut" } else { "ref" })
+    Some(kind)
+}
+
+/// `impl Tr for Box<str>` (or `Rc<X>` / `Arc<X>` of a type that isn't a parameter) with a sibling
+/// impl of `Tr` for what is the same type in JS (`String`, `str`; `PathBuf` for `Box<Path>`;
+/// `[T]` for `Box<[T]>`): its kind (`box`, `rc`, `arc`), so it is a wrapper's class of its own
+/// (`Tr$box`), reached as `wrapper_impl`'s are.
+fn boxed_beside_own(imp: &ast::Impl) -> Option<&'static str> {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let ast::Type::PathType(p) = imp.self_ty()? else {
+        return None;
+    };
+    let seg = p.path()?.segment()?;
+    let kind = wrapper_kind(&seg.name_ref()?.text())?;
+    let [ast::GenericArg::TypeArg(a)] = &seg.generic_arg_list()?.generic_args().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let inner = a.ty()?;
+    // (Its class in JS: `str` / `String` alike, `Path` / `PathBuf`, slices / arrays / `Vec`.)
+    fn class(t: &ast::Type) -> Option<String> {
+        Some(match t {
+            ast::Type::RefType(r) => return class(&r.ty()?),
+            ast::Type::SliceType(_) | ast::Type::ArrayType(_) => "Vec".into(),
+            ast::Type::PathType(p) => match p.path()?.segment()?.name_ref()?.text().to_string().as_str() {
+                "str" | "String" => "String".into(),
+                "Path" | "PathBuf" => "PathBuf".into(),
+                "Vec" => "Vec".into(),
+                n => n.to_string(),
+            },
+            _ => return None,
+        })
+    }
+    let c = class(&inner)?;
+    if let ast::Type::PathType(ip) = &inner
+        && let Some(n) = ip.path().and_then(|p| p.as_single_name_ref())
+        && imp
+            .generic_param_list()
+            .is_some_and(|l| l.generic_params().any(|g| matches!(g, ast::GenericParam::TypeParam(tp) if tp.name().is_some_and(|x| x.text() == n.text()))))
+    {
+        return None;
+    }
+    let tr = impl_parts(imp).0?;
+    let parent = imp.syntax().parent()?;
+    // (Only one such box of this kind per trait: `Box<str>` and `Box<Path>` would be one class.)
+    let boxes = parent
+        .children()
+        .filter_map(ast::Impl::cast)
+        .filter(|o| {
+            impl_parts(o).0.as_deref() == Some(tr.as_str())
+                && matches!(o.self_ty(), Some(ast::Type::PathType(q))
+                    if q.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()).and_then(|n| wrapper_kind(&n.text())) == Some(kind)
+                        && wrapped_param(o).is_none())
+        })
+        .count();
+    if boxes > 1 {
+        return None;
+    }
+    parent
+        .children()
+        .filter_map(ast::Impl::cast)
+        .any(|o| {
+            o.syntax() != imp.syntax()
+                && impl_parts(&o).0.as_deref() == Some(tr.as_str())
+                && o.self_ty().and_then(|t| class(&t)).as_deref() == Some(c.as_str())
+                && !matches!(o.self_ty(), Some(ast::Type::PathType(q)) if q.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()).is_some_and(|n| wrapper_kind(&n.text()).is_some()))
+        })
+        .then_some(kind)
+}
+
+/// Whether `imp` is `impl<T> Tr for &T` (or `&mut T`) with a sibling impl of `Tr` for the other
+/// kind of reference to a parameter of its own: two blankets one type in JS.
+fn ref_mut_blanket_twin(imp: &ast::Impl) -> bool {
+    // (The reference's mutability, when the self type is a reference to a bare parameter.)
+    let ref_to_param = |i: &ast::Impl| -> Option<bool> {
+        let ast::Type::RefType(r) = i.self_ty()? else {
+            return None;
+        };
+        let ast::Type::PathType(p) = r.ty()? else {
+            return None;
+        };
+        let n = p.path()?.as_single_name_ref()?.text().to_string();
+        let is_param = i.generic_param_list()?.generic_params().any(|g| {
+            matches!(g, ast::GenericParam::TypeParam(tp) if tp.name().is_some_and(|x| x.text() == n.as_str()))
+        });
+        is_param.then_some(r.mut_token().is_some())
+    };
+    let trait_name = |i: &ast::Impl| match i.trait_() {
+        Some(ast::Type::PathType(p)) => p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()).map(|n| n.text().to_string()),
+        _ => None,
+    };
+    let (Some(m), Some(tr), Some(parent)) = (ref_to_param(imp), trait_name(imp), imp.syntax().parent()) else {
+        return false;
+    };
+    // (Twins with the same items are one impl here: `erased_twins` keeps the first.)
+    let items = |i: &ast::Impl| {
+        i.assoc_item_list()
+            .map(|l| l.syntax().text().to_string().chars().filter(|c| !c.is_whitespace()).collect::<String>())
+    };
+    parent.children().filter_map(ast::Impl::cast).any(|o| {
+        o.syntax() != imp.syntax()
+            && trait_name(&o).as_deref() == Some(tr.as_str())
+            && ref_to_param(&o) == Some(!m)
+            && items(&o) != items(imp)
+    })
+}
+
+/// Whether `imp`, an impl of a trait the file declares for `&n` (or `&mut n`), has a sibling
+/// impl of that trait for `n` itself: two impls rustc keeps apart by the receiver's references.
+fn ref_beside_own(imp: &ast::Impl, n: &str) -> bool {
+    let last = |t: Option<ast::Type>| match t {
+        Some(ast::Type::PathType(p)) => p.path().and_then(|p| p.segment()).and_then(|s| s.name_ref()).map(|n| n.text().to_string()),
+        _ => None,
+    };
+    let Some(tr) = last(imp.trait_()) else {
+        return false;
+    };
+    let Some(parent) = imp.syntax().parent() else {
+        return false;
+    };
+    let root = imp.syntax().ancestors().last().unwrap_or_else(|| parent.clone());
+    let declared = root
+        .descendants()
+        .filter_map(ast::Trait::cast)
+        .any(|t| t.name().is_some_and(|x| x.text() == tr.as_str()));
+    declared
+        && parent.children().filter_map(ast::Impl::cast).any(|o| {
+            o.syntax() != imp.syntax()
+                && last(o.trait_()).as_deref() == Some(tr.as_str())
+                && last(o.self_ty()).as_deref() == Some(n)
+        })
+}
+
+/// The wrapper kind a `Box` / `Rc` / `Arc` is (`Tr$box`, `Tr$rc`, `Tr$arc`).
+pub fn wrapper_kind(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Box" => "box",
+        "Rc" => "rc",
+        "Arc" => "arc",
+        _ => return None,
+    })
 }
 
 /// Whether `key` is a `wrapper_impl`'s class key.
 pub fn is_wrapper_key(key: &str) -> bool {
-    key.ends_with("$ref") || key.ends_with("$refmut") || key.ends_with("$box")
+    ["$ref", "$refmut", "$box", "$rc", "$arc"].iter().any(|k| key.ends_with(k))
 }
 
 /// What a value of `t` looks like at run time, for telling a generic trait's impls apart by

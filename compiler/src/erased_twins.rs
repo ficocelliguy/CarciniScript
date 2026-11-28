@@ -14,6 +14,92 @@ use ra_ap_syntax::{
     ast::HasName,
 };
 
+/// What the file names itself and what it takes from std, for telling std's `Cell` and
+/// iterator types from a struct of the same name.
+#[derive(Default)]
+struct StdNames {
+    /// Structs, enums, unions and type aliases the file declares.
+    local: HashSet<String>,
+    /// Iterator type names brought in from std by a `use`.
+    used_iters: HashSet<String>,
+}
+
+thread_local! {
+    static STD_NAMES: std::cell::RefCell<StdNames> = std::cell::RefCell::new(StdNames::default());
+}
+
+/// std's iterator and adapter types (`vec::IntoIter`, `array::IntoIter`, `vec::Drain`,
+/// `string::Drain`, `slice::Iter`, ..).
+const STD_ITERS: &[&str] = &[
+    "Iter", "IterMut", "IntoIter", "Drain", "Chars", "CharIndices", "Bytes", "Keys", "Values",
+    "ValuesMut", "IntoKeys", "IntoValues", "Peekable", "Enumerate", "Rev", "Skip", "Take", "Zip",
+    "Map", "Filter", "FilterMap", "Lines", "Split", "SplitWhitespace", "Windows", "Chunks",
+    "ChunksExact", "StepBy", "Cycle", "Chain", "Flatten", "FlatMap", "Fuse", "Inspect", "TakeWhile",
+    "SkipWhile", "Scan", "Once", "Repeat", "Empty", "Successors", "FromFn", "Cloned", "Copied",
+];
+
+/// The first segment of a path that starts in std (`std::`, or one of its modules that hold
+/// iterator types).
+const STD_ROOTS: &[&str] = &[
+    "std", "core", "alloc", "vec", "array", "slice", "string", "str", "iter", "collections",
+    "hash_map", "hash_set", "btree_map", "btree_set", "vec_deque", "option", "result",
+];
+
+impl StdNames {
+    fn of(items: &[ast::Item]) -> Self {
+        let mut s = StdNames::default();
+        for item in items {
+            let name = match item {
+                ast::Item::Struct(x) => x.name(),
+                ast::Item::Enum(x) => x.name(),
+                ast::Item::Union(x) => x.name(),
+                ast::Item::TypeAlias(x) => x.name(),
+                ast::Item::Use(u) => {
+                    let Some(tree) = u.use_tree() else { continue };
+                    let mut stack = vec![(tree, false)];
+                    while let Some((t, under_std)) = stack.pop() {
+                        let first = t
+                            .path()
+                            .and_then(|p| p.first_segment())
+                            .and_then(|s| s.name_ref())
+                            .map(|n| n.text().to_string());
+                        let std = under_std || first.as_deref().is_some_and(|f| matches!(f, "std" | "core" | "alloc"));
+                        if let Some(l) = t.use_tree_list() {
+                            stack.extend(l.use_trees().map(|c| (c, std)));
+                        } else if std
+                            && t.rename().is_none()
+                            && let Some(n) = t.path().and_then(|p| p.segment()).and_then(|s| s.name_ref())
+                            && STD_ITERS.contains(&n.text().as_ref())
+                        {
+                            s.used_iters.insert(n.text().to_string());
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(n) = name {
+                s.local.insert(n.text().to_string());
+            }
+        }
+        s
+    }
+
+    /// Whether `path` (whose last segment is `name`) names one of std's iterator types.
+    fn is_std_iter(&self, path: &ast::Path, name: &str) -> bool {
+        if !STD_ITERS.contains(&name) {
+            return false;
+        }
+        match path.qualifier() {
+            Some(q) => q
+                .first_segment()
+                .and_then(|s| s.name_ref())
+                .is_some_and(|n| STD_ROOTS.contains(&n.text().as_ref()) && !self.local.contains(&n.text().to_string())),
+            None => self.used_iters.contains(name) && !self.local.contains(name),
+        }
+    }
+}
+
 /// The impl's type and const parameter names.
 fn impl_params(imp: &ast::Impl) -> HashSet<String> {
     imp.generic_param_list()
@@ -60,13 +146,30 @@ fn erased_key(t: &ast::Type, ps: &HashSet<String>) -> Option<String> {
             if let ("Box" | "Rc" | "Arc", [ast::GenericArg::TypeArg(a)]) = (name.as_str(), args.as_slice()) {
                 return erased_key(&a.ty()?, ps);
             }
+            // (std's iterators are all the runtime's `Iter`, whatever they iterate.)
+            if STD_NAMES.with(|s| s.borrow().is_std_iter(&path, &name)) {
+                return Some("$Iter".into());
+            }
             let name = match name.as_str() {
                 "Path" => "PathBuf".to_string(),
+                // (A `Cell` is a `RefCell` at run time.)
+                "Cell" if STD_NAMES.with(|s| {
+                    let s = s.borrow();
+                    !s.local.contains("Cell") && !s.local.contains("RefCell")
+                }) =>
+                {
+                    "RefCell".to_string()
+                }
                 _ => name,
             };
             if args.is_empty() {
                 return Some(name);
             }
+            // (A map's or set's hasher doesn't exist in JS: `HashMap<K, V, S>` is `HashMap<K, V>`.)
+            let args = match hasher_pos(&name) {
+                Some(n) if args.len() > n => &args[..n],
+                _ => &args[..],
+            };
             let ks: Vec<String> = args
                 .iter()
                 .map(|g| match g {
@@ -77,6 +180,42 @@ fn erased_key(t: &ast::Type, ps: &HashSet<String>) -> Option<String> {
             format!("{name}<{}>", ks.join(","))
         }
         t => tokens(t.syntax(), ps),
+    })
+}
+
+/// How many type arguments come before a std map's or set's hasher (`HashMap<K, V, S>`: 2).
+fn hasher_pos(name: &str) -> Option<usize> {
+    match name {
+        "HashMap" | "IndexMap" => Some(2),
+        "HashSet" | "IndexSet" => Some(1),
+        _ => None,
+    }
+}
+
+/// In an impl for a map or set, a call that builds one with a hasher, or by the type's path
+/// (`Self::with_hasher(Default::default())`, `HashMap::new()`, `HashMap::with_capacity_and_hasher(n,
+/// s)`), as the shape without the hasher (`Self::new()`, `Self::with_capacity(n)`): hashers don't
+/// exist in JS.
+fn hasher_free_call(c: &ast::CallExpr, ps: &HashSet<String>) -> Option<String> {
+    use ra_ap_syntax::ast::HasArgList;
+    let ast::Expr::PathExpr(p) = c.expr()? else {
+        return None;
+    };
+    let path = p.path()?;
+    let f = path.segment()?.name_ref()?.text().to_string();
+    let owner = path.qualifier()?.segment()?.syntax().text().to_string();
+    let owner = owner.split('<').next().unwrap_or_default().trim().to_string();
+    if !matches!(owner.as_str(), "Self" | "HashMap" | "HashSet" | "IndexMap" | "IndexSet") {
+        return None;
+    }
+    let args: Vec<ast::Expr> = c.arg_list()?.args().collect();
+    let arg = |e: &ast::Expr| tokens(e.syntax(), ps);
+    Some(match (f.as_str(), args.as_slice()) {
+        ("new" | "default", []) | ("with_hasher", [_]) => "Self :: new ( ) ".to_string(),
+        ("with_capacity", [n]) | ("with_capacity_and_hasher", [n, _]) => {
+            format!("Self :: with_capacity ( {}) ", arg(n))
+        }
+        _ => return None,
     })
 }
 
@@ -120,7 +259,9 @@ fn tokens(n: &SyntaxNode, ps: &HashSet<String>) -> String {
 /// impl's parameters as `$P`.
 /// (Its own bindings, parameters first, by position: `v__h1` and `v__h3`, a macro's hygienic
 /// names for one `v`, are the same.)
-fn shape(f: &ast::Fn, ps: &HashSet<String>) -> Option<String> {
+/// (`hash`: in an impl for a map or set, calls that build one compare without the hasher, see
+/// `hasher_free_call`.)
+fn shape(f: &ast::Fn, ps: &HashSet<String>, hash: bool) -> Option<String> {
     let mut locals: HashMap<String, usize> = HashMap::new();
     for ip in f.syntax().descendants().filter_map(ast::IdentPat::cast) {
         if let Some(n) = ip.name() {
@@ -128,7 +269,7 @@ fn shape(f: &ast::Fn, ps: &HashSet<String>) -> Option<String> {
             locals.entry(n.text().to_string()).or_insert(k);
         }
     }
-    fn walk(n: &SyntaxNode, ps: &HashSet<String>, locals: &HashMap<String, usize>, out: &mut String) {
+    fn walk(n: &SyntaxNode, ps: &HashSet<String>, locals: &HashMap<String, usize>, hash: bool, out: &mut String) {
         for el in n.children_with_tokens() {
             match el {
                 NodeOrToken::Token(t) => {
@@ -150,17 +291,20 @@ fn shape(f: &ast::Fn, ps: &HashSet<String>) -> Option<String> {
                     let is_self = ast::Expr::cast(c.clone())
                         .and_then(crate::adt::strip_views)
                         .is_some_and(|e| matches!(&e, ast::Expr::PathExpr(p) if p.syntax().text() == "self"));
+                    let hasher_free = if hash { ast::CallExpr::cast(c.clone()).and_then(|x| hasher_free_call(&x, ps)) } else { None };
                     if is_self {
                         out.push_str("self ");
+                    } else if let Some(s) = hasher_free {
+                        out.push_str(&s);
                     } else {
-                        walk(&c, ps, locals, out);
+                        walk(&c, ps, locals, hash, out);
                     }
                 }
             }
         }
     }
     let mut out = String::new();
-    walk(f.body()?.syntax(), ps, &locals, &mut out);
+    walk(f.body()?.syntax(), ps, &locals, hash, &mut out);
     Some(out)
 }
 
@@ -170,6 +314,8 @@ struct Entry {
     fns: Vec<ast::Fn>,
     consts: Vec<ast::Const>,
     macros: bool,
+    /// An impl for a map or set (see `shape`).
+    hash: bool,
 }
 
 impl Entry {
@@ -180,6 +326,7 @@ impl Entry {
             fns: Vec::new(),
             consts: Vec::new(),
             macros: false,
+            hash: false,
         };
         for item in imp.assoc_item_list().into_iter().flat_map(|l| l.assoc_items()) {
             match item {
@@ -222,7 +369,7 @@ impl Entry {
                     .fns
                     .iter()
                     .find(|g| g.name().map(|n| n.text().to_string()) == f.name().map(|n| n.text().to_string()))
-                    .is_some_and(|g| shape(g, &kept.ps).is_some_and(|s| Some(s) == shape(f, &self.ps)))
+                    .is_some_and(|g| shape(g, &kept.ps, self.hash).is_some_and(|s| Some(s) == shape(f, &self.ps, self.hash)))
         });
         let const_ok = self.consts.iter().all(|k| {
             kept.consts
@@ -240,6 +387,7 @@ impl Entry {
 /// `items` without the impls that only repeat another impl of their trait for a self type that
 /// is the same type in JS.
 pub fn drop_erased_twins(items: Vec<ast::Item>) -> Vec<ast::Item> {
+    STD_NAMES.with(|s| *s.borrow_mut() = StdNames::of(&items));
     // (trait, self type in JS) -> the impls, in order.
     let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
@@ -263,20 +411,41 @@ pub fn drop_erased_twins(items: Vec<ast::Item>) -> Vec<ast::Item> {
         groups.entry((tr, st)).or_default().push(i);
     }
     let mut drop: HashSet<usize> = HashSet::new();
-    for (_, idxs) in groups {
+    for ((_, st), idxs) in groups {
+        let hash = ["HashMap<", "HashSet<", "IndexMap<", "IndexSet<"].iter().any(|h| st.starts_with(h));
         if idxs.len() < 2 {
             continue;
         }
         let mut entries: Vec<Entry> = idxs
             .iter()
             .filter_map(|&i| match &items[i] {
-                ast::Item::Impl(imp) => Some(Entry::new(i, imp)),
+                ast::Item::Impl(imp) => Some(Entry { hash, ..Entry::new(i, imp) }),
                 _ => None,
             })
             .collect();
         // (An impl that hands calls on goes after the ones it hands them on to: `impl Write for
         // Pipe` whose `flush` is `<&Pipe as Write>::flush(..)` after `impl Write for &Pipe`.)
-        entries.sort_by_key(|e| (e.fns.iter().filter(|f| crate::adt::forwards(f)).count(), e.idx));
+        // (And a map's impl with a hasher after the one without: the one kept is std's default.)
+        let with_hasher = |i: usize| match &items[i] {
+            ast::Item::Impl(imp) => match imp.self_ty() {
+                Some(ast::Type::PathType(p)) => p
+                    .path()
+                    .and_then(|p| p.segment())
+                    .is_some_and(|s| {
+                        let n = s.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
+                        let count = s
+                            .generic_arg_list()
+                            .into_iter()
+                            .flat_map(|l| l.generic_args())
+                            .filter(|g| !matches!(g, ast::GenericArg::LifetimeArg(_)))
+                            .count();
+                        hasher_pos(&n).is_some_and(|k| count > k)
+                    }),
+                _ => false,
+            },
+            _ => false,
+        };
+        entries.sort_by_key(|e| (with_hasher(e.idx), e.fns.iter().filter(|f| crate::adt::forwards(f)).count(), e.idx));
         let mut kept: Vec<Entry> = Vec::new();
         for e in entries {
             // (Inherent impls are each their own unless they repeat one another.)
@@ -333,5 +502,22 @@ mod tests {
         let file = ra_ap_syntax::SourceFile::parse(src, ra_ap_syntax::Edition::Edition2021).tree();
         let items = crate::adt::all_items(&file);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn drops_std_cell_and_iter_twins_only() {
+        let parse = |src: &str| {
+            let file = ra_ap_syntax::SourceFile::parse(src, ra_ap_syntax::Edition::Edition2021).tree();
+            crate::adt::all_items(&file).len()
+        };
+        let std_cells = "use std::cell::{Cell, RefCell};\npub trait T { fn f(); }\nimpl T for Cell<u8> { fn f() {} }\nimpl T for RefCell<u8> { fn f() {} }\n";
+        assert_eq!(parse(std_cells), 3);
+        // (A struct of the file named `Cell` is its own class.)
+        let own_cell = "use std::cell::RefCell;\npub struct Cell<X>(X);\npub trait T { fn f(); }\nimpl T for Cell<u8> { fn f() {} }\nimpl T for RefCell<u8> { fn f() {} }\n";
+        assert_eq!(parse(own_cell), 5);
+        let iters = "pub trait T { fn f(&self); }\nimpl<A> T for std::vec::IntoIter<A> { fn f(&self) {} }\nimpl<'a> T for std::string::Drain<'a> { fn f(&self) {} }\n";
+        assert_eq!(parse(iters), 2);
+        let own_iter = "pub struct IntoIter;\npub trait T { fn f(&self); }\nimpl T for IntoIter { fn f(&self) {} }\nimpl<A> T for std::vec::IntoIter<A> { fn f(&self) {} }\n";
+        assert_eq!(parse(own_iter), 4);
     }
 }

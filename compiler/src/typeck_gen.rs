@@ -449,6 +449,19 @@ pub(super) fn bound_names(lists: &[ast::TypeBoundList]) -> Vec<(String, SyntaxNo
     out
 }
 
+/// Whether the bound `b` is `SliceIndex<str>` (`Output = str` or not).
+fn str_slice_index(b: &SyntaxNode) -> bool {
+    use ra_ap_syntax::ast::HasGenericArgs;
+    let Some(ast::Type::PathType(p)) = ast::TypeBound::cast(b.clone()).and_then(|b| b.ty()) else {
+        return false;
+    };
+    p.path()
+        .and_then(|p| p.segment())
+        .and_then(|s| s.generic_arg_list())
+        .and_then(|l| l.generic_args().next())
+        .is_some_and(|g| matches!(g, ast::GenericArg::TypeArg(t) if t.syntax().text() == "str"))
+}
+
 /// The parameter or projection a `where` predicate's subject names: `I::Item` for `I::Item`,
 /// `<I as IntoIterator>::Item` and `<I::Item as IntoIterator>::Item` alike (`I::Item::Item`).
 fn where_subject(t: &ast::Type) -> Option<String> {
@@ -704,6 +717,9 @@ impl Checker<'_> {
             for (b, bnode) in bound_names(&lists) {
                 if KNOWN_BOUNDS.contains(&b.as_str()) || self.adts.traits.contains_key(&b) {
                     bounds.push(b);
+                } else if b == "SliceIndex" && str_slice_index(&bnode) {
+                    // (`I: SliceIndex<str>`: a range into a string, see
+                    // `record_slice_index_bound`.)
                 } else if report {
                     self.error(
                         &bnode,
@@ -954,13 +970,19 @@ impl Checker<'_> {
                 .flat_map(|l| l.generic_args())
             {
                 match g {
-                    ast::GenericArg::TypeArg(ta) => {
-                        if let Some(ast::Type::SliceType(st)) = ta.ty()
-                            && let Some(t) = st.ty()
-                        {
-                            elem = Some(self.lower_type(&t));
+                    ast::GenericArg::TypeArg(ta) => match ta.ty() {
+                        Some(ast::Type::SliceType(st)) => {
+                            if let Some(t) = st.ty() {
+                                elem = Some(self.lower_type(&t));
+                            }
                         }
-                    }
+                        // (`I: SliceIndex<str>`: a range, whose `Output` is `str`.)
+                        Some(ast::Type::PathType(p)) if p.syntax().text() == "str" => {
+                            elem = Some(Ty::Str);
+                            out = Some(Ty::Str);
+                        }
+                        _ => {}
+                    },
                     ast::GenericArg::AssocTypeArg(a)
                         if a.name_ref().is_some_and(|n| n.text() == "Output") =>
                     {
@@ -970,6 +992,9 @@ impl Checker<'_> {
                 }
             }
             if let Some(elem) = elem {
+                if out == Some(Ty::Str) {
+                    self.generics.insert(format!("{name}::Output"), Ty::Str);
+                }
                 self.lenient_projs.insert(format!("{name}::Output"));
                 self.slice_index_params.insert(name.to_string(), (elem, out));
             }
@@ -997,6 +1022,15 @@ impl Checker<'_> {
             return None;
         };
         let (elem, out) = self.slice_index_params.get(&p).cloned()?;
+        // (`I: SliceIndex<str>`: `&s[i]` is a part of the string.)
+        if elem == Ty::Str && out == Some(Ty::Str) {
+            if !matches!(self.shallow(bt), Ty::Str | Ty::Unknown | Ty::Var(_)) {
+                return None;
+            }
+            let r = self.range(node);
+            self.slice_param_indexes.insert(r);
+            return Some(Ty::Str);
+        }
         match self.shallow(bt) {
             Ty::Vec(e) => {
                 self.unify(&e, &elem);
@@ -1761,6 +1795,8 @@ impl Checker<'_> {
                 // value either way, so `T: Copy` takes it, as `GraphMap<&str, _>`'s nodes.)
                 Ty::Str => true,
                 Ty::Vec(_) | Ty::Set(_) | Ty::Map(..) | Ty::Coll(..) => false,
+                // (`impl Tr + Copy` keeps only `Tr`, and a `&dyn Tr` is `Copy`.)
+                Ty::Dyn(..) => true,
                 other => self.implements(other, "Copy"),
             },
             other => self.implements(t, other),
@@ -1922,7 +1958,7 @@ impl Checker<'_> {
             d.methods.iter().any(|tm| {
                 self.adts.inherent_alts.iter().any(|k| {
                     k.rsplit_once("::").is_some_and(|(ty, m)| {
-                        m == tm.name && (self.adts.defs.contains_key(ty) || ty == "RefCell") && crate::adt::tuple_arity(ty).is_none()
+                        m == tm.name && (self.adts.defs.contains_key(ty) || ty == "RefCell" || ty == "FnPtr") && crate::adt::tuple_arity(ty).is_none()
                     })
                 })
             })

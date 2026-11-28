@@ -1384,6 +1384,13 @@ impl Codegen<'_> {
                 }
             } else if let Some(sig) = self.types.adts.method(key, n.text()).cloned() {
                 self.emit_method_fn(&f, sig, self_ty.clone(), "}", None);
+                // (And a copy for the owned twin, `m$own`, whose `self.m()` reach its methods.)
+                let own = format!("{}$own", n.text());
+                if let Some(sig) = self.types.adts.method(key, &own).cloned() {
+                    let saved = std::mem::replace(&mut self.own_copy, true);
+                    self.emit_method_fn(&f, sig, self_ty.clone(), "}", Some(own));
+                    self.own_copy = saved;
+                }
             }
             self.extra_consts = saved_extra;
         }
@@ -1541,13 +1548,18 @@ impl Codegen<'_> {
                 .flatten()
                 .filter(|(m, s)| {
                     s.receiver.is_none()
-                        && self
-                            .types
-                            .dict_params
-                            .get(&format!("{key}::{m}"))
-                            .is_some_and(|ps| !ps.is_empty())
+                        && (s.impl_args.is_empty()
+                            || self
+                                .types
+                                .dict_params
+                                .get(&format!("{key}::{m}"))
+                                .is_some_and(|ps| !ps.is_empty()))
                 })
-                .map(|(m, s)| format!("{}: {}", super::js_string(&prop(m)), s.params.len()))
+                // (An impl for a concrete box, `impl Tr for Box<str>`, takes no class: -1.)
+                .map(|(m, s)| {
+                    let n = if s.impl_args.is_empty() { -1 } else { s.params.len() as isize };
+                    format!("{}: {n}", super::js_string(&prop(m)))
+                })
                 .collect();
             statics.sort();
             self.line(Frag::text(format!(
@@ -1815,7 +1827,7 @@ impl Codegen<'_> {
         let mut names: Vec<&String> = adts
             .method_alts
             .keys()
-            .filter(|k| k.starts_with(&prefix) && adts.inherent_alts.contains(*k) && adts.defs.contains_key(adt))
+            .filter(|k| k.starts_with(&prefix) && adts.inherent_alts.contains(*k) && (adts.defs.contains_key(adt) || adt == "FnPtr"))
             .collect();
         names.sort();
         for k in names {
